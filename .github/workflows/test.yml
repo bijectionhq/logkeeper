@@ -1,0 +1,21 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Test server and client
+        run: cargo +1.94.1 test --locked --all-features
