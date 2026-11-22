@@ -26,8 +26,8 @@ async fn main() -> ExitCode {
 
 async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let [listen, data_dir, id] = args else { return Err(USAGE.into()); };
-    if id.is_empty() || id.len() > 256 || id.chars().any(char::is_whitespace) || id.chars().any(char::is_control) {
-        return Err("The journal ID must contain 1 to 256 bytes without whitespace or control characters".into());
+    if !logkeeper::valid_journal_identity(id) {
+        return Err("The journal ID must be a nonzero canonical UUID".into());
     }
     let address: SocketAddr = listen.parse()?;
     let listener = TcpListener::bind(address).await?;

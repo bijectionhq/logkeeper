@@ -6,12 +6,14 @@
 
 mod client;
 mod error;
+mod endpoint;
 mod records;
 mod history;
 mod protocol;
 mod local;
 mod server;
 
+pub use endpoint::{JournalEndpoint, valid_journal_identity};
 pub use error::{Error, ErrorKind, Result};
 pub use records::{AppendReceipt, LogMetadata, LogOffset, LogRecord, ReadReservation, ReplayHead};
 pub use client::{CopyFrom, Loglet, QuorumLog, QuorumRange, QuorumTail, RetainedAudit, StreamConfig, audit_retained, certify_committed_prefix, close_empty_journal, copy_retained, drop_stream, open_reader, open_reader_on, open_writer, open_writer_on, retire, retire_journal_copy, seal, trim};

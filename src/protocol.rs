@@ -177,6 +177,15 @@ pub(crate) struct DigestPage {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub(crate) struct Identify {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct JournalIdentity {
+    #[prost(string, tag = "1")]
+    pub journal: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub(crate) struct CloseJournal {
     #[prost(string, tag = "1")]
     pub journal: String,
@@ -213,8 +222,10 @@ pub(crate) enum RequestBody {
     #[prost(message, tag = "15")]
     ReadIndex(LogletCheck),
     #[prost(message, tag = "16")]
+    Identify(Identify),
+    #[prost(message, tag = "18")]
     RetireJournalCopy(RetireJournalCopy),
-    #[prost(message, tag = "17")]
+    #[prost(message, tag = "19")]
     CloseJournal(CloseJournal),
 }
 
@@ -222,8 +233,10 @@ pub(crate) enum RequestBody {
 pub(crate) struct Request {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17")]
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19")]
     pub body: Option<RequestBody>,
+    #[prost(string, tag = "17")]
+    pub target_journal: String,
 }
 
 /// An `Accepted` reply to an Append, Overwrite, Commit or Check announces that the stream's promise on this server was still at most the request's epoch when the server decided it, which was after the request was sent.
@@ -302,13 +315,15 @@ pub enum ResponseBody {
     Failed(Failed),
     #[prost(message, tag = "7")]
     PageDigest(PageDigest),
+    #[prost(message, tag = "8")]
+    JournalIdentity(JournalIdentity),
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Response {
     #[prost(uint64, tag = "1")]
     pub id: u64,
-    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7")]
+    #[prost(oneof = "ResponseBody", tags = "2, 3, 4, 5, 6, 7, 8")]
     pub body: Option<ResponseBody>,
 }
 

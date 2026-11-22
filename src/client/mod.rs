@@ -9,8 +9,10 @@ mod writer;
 use bytes::Bytes;
 use ensemble::{Ack, Ensemble, MAXIMUM_BATCH_BYTES, MAXIMUM_BATCH_ENTRIES, check_retained};
 use futures::stream::{FuturesUnordered, StreamExt};
-use crate::{AppendReceipt, Error, LogMetadata, LogOffset, LogRecord, ReadReservation, ReplayHead, Result};
+use crate::{AppendReceipt, LogMetadata, LogOffset, LogRecord, ReadReservation, ReplayHead};
 use crate::records::RECORD_OVERHEAD_BYTES;
+use crate::{Error, Result};
+use crate::{JournalEndpoint, valid_journal_identity};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +25,7 @@ pub use audit::{RetainedAudit, audit_retained, certify_committed_prefix};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamConfig {
-    pub servers: Vec<String>,
+    pub servers: Vec<JournalEndpoint>,
     pub stream: String,
     pub write_quorum: usize,
     pub maximum_message_bytes: usize,
@@ -33,7 +35,7 @@ pub struct StreamConfig {
 /// A chain lists a stream's loglets oldest first; one stream name names the stream on every ensemble, and a server may belong to several of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Loglet {
-    pub servers: Vec<String>,
+    pub servers: Vec<JournalEndpoint>,
     pub start_lsn: i64,
 }
 
@@ -80,8 +82,17 @@ fn validate(config: &StreamConfig) -> crate::Result<()> {
     if config.servers.is_empty() || config.stream.is_empty() {
         return Err(Error::incorrect("rtdb.logkeeper/invalid-stream-config", "a stream needs a name and at least one server"));
     }
-    if config.servers.iter().collect::<BTreeSet<_>>().len() != config.servers.len() {
+    if config.servers.iter().map(JournalEndpoint::address).collect::<BTreeSet<_>>().len() != config.servers.len() {
         return Err(Error::incorrect("rtdb.logkeeper/invalid-stream-config", "a server address can occupy only one slot per ensemble"));
+    }
+    let mut journals = BTreeSet::new();
+    for journal in config.servers.iter().filter_map(JournalEndpoint::journal) {
+        if !valid_journal_identity(journal) || !journals.insert(journal) {
+            return Err(Error::incorrect("rtdb.logkeeper/invalid-stream-config", "each member slot needs a distinct journal identity"));
+        }
+    }
+    if !journals.is_empty() && journals.len() != config.servers.len() {
+        return Err(Error::incorrect("rtdb.logkeeper/invalid-stream-config", "a member ensemble needs an identity for every slot"));
     }
     if config.write_quorum == 0 || config.write_quorum > config.servers.len() {
         return Err(Error::incorrect("rtdb.logkeeper/invalid-stream-config", format!("write quorum {} must be between 1 and the {} servers", config.write_quorum, config.servers.len())));
@@ -223,7 +234,7 @@ pub async fn drop_stream(config: &StreamConfig, epoch: u64) -> crate::Result<()>
             Ok(Ack::Refused(refused)) => format!("promised epoch {}", refused.promised),
             Err(error) => error.to_string(),
         };
-        failures.push(format!("{}: {failure}", config.servers[server]));
+        failures.push(format!("{}: {failure}", config.servers[server].address()));
     }
     if failures.is_empty() { return Ok(()); }
     Err(Error::Remote { key: config.stream.clone(), message: format!("stream drop is incomplete: {}", failures.join("; ")) })
@@ -247,14 +258,14 @@ pub async fn retire(config: &StreamConfig, epoch: u64) -> crate::Result<()> {
 pub async fn retire_journal_copy(server: &str, journal: &str, stream: &str, epoch: u64) -> crate::Result<()> {
     use crate::protocol::{RequestBody, ResponseBody, Retire, RetireJournalCopy};
 
-    if journal.is_empty() || stream.is_empty() || epoch == 0 {
+    if !valid_journal_identity(journal) || stream.is_empty() || epoch == 0 {
         return Err(Error::incorrect("rtdb.logkeeper/retire-copy", "Copy retirement requires a journal, stream and nonzero epoch"));
     }
     let request = RequestBody::RetireJournalCopy(RetireJournalCopy {
         retirement: Some(Retire { stream: stream.to_owned(), epoch }),
         journal: journal.to_owned(),
     });
-    let reply = connection::connection(server).call(request).await?;
+    let reply = connection::connection(server).call(connection::Binding::Expected(Arc::from(journal)), request).await?;
     match reply {
         ResponseBody::Accepted(_) => Ok(()),
         ResponseBody::Failed(error) => Err(connection::remote(server, error.message)),
@@ -266,11 +277,11 @@ pub async fn retire_journal_copy(server: &str, journal: &str, stream: &str, epoc
 pub async fn close_empty_journal(server: &str, journal: &str) -> crate::Result<()> {
     use crate::protocol::{CloseJournal, RequestBody, ResponseBody};
 
-    if journal.is_empty() {
+    if !valid_journal_identity(journal) {
         return Err(Error::incorrect("rtdb.logkeeper/close-journal", "Closure requires the durable journal identity"));
     }
     let request = RequestBody::CloseJournal(CloseJournal { journal: journal.to_owned() });
-    match connection::connection(server).call(request).await? {
+    match connection::connection(server).call(connection::Binding::Expected(Arc::from(journal)), request).await? {
         ResponseBody::Accepted(_) => Ok(()),
         ResponseBody::Failed(error) => Err(connection::remote(server, error.message)),
         other => Err(connection::remote(server, format!("journal closure was not accepted: {other:?}"))),

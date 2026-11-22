@@ -102,7 +102,7 @@ impl Store {
                 return self.check_after_durability(&check.stream, admission, |state| state.read_index(check.epoch, ensemble));
             }
             RequestBody::Read(_) | RequestBody::Fetch(_) | RequestBody::Check(_) | RequestBody::Retire(_) |
-            RequestBody::RetireJournalCopy(_) | RequestBody::CloseJournal(_) | RequestBody::DigestPage(_) => return Outcome::Now(failed("not a direct mutation")),
+            RequestBody::Identify(_) | RequestBody::RetireJournalCopy(_) | RequestBody::CloseJournal(_) | RequestBody::DigestPage(_) => return Outcome::Now(failed("not a direct mutation")),
         };
         let slot = self.slot(&stream);
         let mut state = slot.state.lock();

@@ -12,10 +12,10 @@ Use Rust 1.94.1 or newer.
 
 ```sh
 cargo test --locked --all-features
-cargo run --locked -- 127.0.0.1:7654 ./journal-data local-journal-a
+cargo run --locked -- 127.0.0.1:7654 ./journal-data 65f66914-8889-40a8-91f6-a31476b84014
 ```
 
-Run a separate process with its own address, directory, and identity for each ensemble member.
+Run a separate process with its own address, directory, and nonzero UUID for each ensemble member.
 Use three independent journals and a quorum of two to tolerate one journal failure.
 A restart uses the same durable directory and journal identity.
 The serving process takes an exclusive journal lock before accepting traffic.
@@ -27,15 +27,19 @@ A deployment that needs its own discovery, credential, or placement policy can e
 Pin a release tag and consume the Rust client from this repository.
 
 ```toml
-logkeeper = { git = "https://github.com/bijectionhq/logkeeper", tag = "v0.1.0" }
+logkeeper = { git = "https://github.com/bijectionhq/logkeeper", tag = "v0.2.0" }
 ```
 
 A single authority allocates increasing epochs for a stream and supplies an ensemble with intersecting write quorums.
 The caller owns checkpoint publication and sets the safe trim boundary.
 The journal owns the persisted promise, commit position, and record retention for that stream.
 The server, client and journal format ship together.
+Version 0.2 adds the durable journal identity handshake from [RTDB](https://github.com/bijectionhq/rtdb/commit/65d0a3d9f1340372d4bd71453b7af980fe02b91f).
+For identity-bound streams, the client verifies the journal on connection and requires that identity on operations.
+Version 0.1 remains available for installations using the earlier elastic-cell wire layout.
+Upgrade those clients and journal services together before using version 0.2 administrative operations.
 The `simulation` feature exposes state-machine hooks for tests, with compatibility tied to the pinned release.
 
 The initial release extracts the journal from [RTDB Multi](https://github.com/bijectionhq/rtdb/tree/d445003c4f/rust/crates/logkeeper).
-It preserves the on-disk record and wire formats.
+It preserves the original on-disk records.
 RTDB's adapter continues to own its storage types, checkpoint policy, and directory membership.
