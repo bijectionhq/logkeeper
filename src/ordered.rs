@@ -75,6 +75,12 @@ pub struct Grant {
     pub key_generation: u64,
 }
 
+impl Grant {
+    fn identity(self) -> (Enrollment, u64, u64) {
+        (self.enrollment, self.epoch, self.key_generation)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriterState {
     pub epoch: u64,
@@ -495,11 +501,9 @@ pub struct State {
     command_history: Fingerprint,
     voter_scope: Fingerprint,
     successor: Option<Fingerprint>,
-    writer_epoch: u64,
-    key_generation: u64,
+    authority: writer::Authority<Grant>,
     enrollment_serial: u64,
     roster: BTreeMap<Uuid, Enrollment>,
-    grant: Option<Grant>,
     /// The last lease end issued to each enrollment that is enrolled or
     /// still owns a hold.
     leases: BTreeMap<Enrollment, u64>,
@@ -565,11 +569,13 @@ impl State {
             command_history: [0; 32],
             voter_scope: [0; 32],
             successor: None,
-            writer_epoch: 0,
-            key_generation: 1,
+            authority: writer::Authority {
+                epoch: 0,
+                key_generation: 1,
+                grant: None,
+            },
             enrollment_serial: 0,
             roster: BTreeMap::new(),
-            grant: None,
             leases: BTreeMap::new(),
             window,
             spent: 0,
@@ -610,8 +616,8 @@ impl State {
     }
     pub fn writer_state(&self) -> WriterState {
         WriterState {
-            epoch: self.writer_epoch,
-            grant: self.grant,
+            epoch: self.authority.epoch,
+            grant: self.authority.grant,
         }
     }
     pub fn head(&self) -> Cut {
@@ -827,8 +833,12 @@ impl State {
 
     fn writer(&self, principal: Principal, grant: Grant) -> Result<(), Refusal> {
         writer::authorize(
-            principal == Principal::Worker(grant.enrollment),
-            self.grant == Some(grant),
+            match principal {
+                Principal::Worker(enrollment) => Some(enrollment),
+                _ => None,
+            },
+            self.authority.grant.map(Grant::identity),
+            grant.identity(),
         )
     }
 
@@ -850,7 +860,7 @@ impl State {
         key_generation: u64,
         checkpoint: Checkpoint,
     ) -> Result<Outcome, Refusal> {
-        let epoch = writer::next_epoch(self.writer_epoch)?;
+        let epoch = writer::next_epoch(self.authority.epoch)?;
         let grant = Grant {
             enrollment,
             epoch,
@@ -865,9 +875,7 @@ impl State {
             self.head,
             HoldKind::Recovery,
         )?;
-        self.writer_epoch = epoch;
-        self.key_generation = key_generation;
-        self.grant = Some(grant);
+        self.authority.install(epoch, key_generation, grant);
         Ok(Outcome::Granted { grant, recovery })
     }
 
@@ -1016,9 +1024,10 @@ impl State {
                 self.enrollment_serial = serial;
                 self.roster.insert(worker, enrollment);
                 let replaced_holder = self
+                    .authority
                     .grant
                     .is_some_and(|grant| grant.enrollment.worker == worker);
-                writer::withdraw(&mut self.grant, replaced_holder);
+                self.authority.withdraw(replaced_holder);
                 self.prune_leases();
                 Ok(Outcome::Enrolled(enrollment))
             }
@@ -1031,9 +1040,10 @@ impl State {
                 }
                 self.roster.remove(&enrollment.worker);
                 let withdrew_holder = self
+                    .authority
                     .grant
                     .is_some_and(|grant| grant.enrollment == enrollment);
-                writer::withdraw(&mut self.grant, withdrew_holder);
+                self.authority.withdraw(withdrew_holder);
                 self.prune_leases();
                 Ok(Outcome::Withdrawn)
             }
@@ -1051,11 +1061,11 @@ impl State {
                 {
                     return Err(Refusal::Stale);
                 }
-                self.install_grant(principal, id, candidate, self.key_generation)
+                self.install_grant(principal, id, candidate, self.authority.key_generation)
             }
             Command::PublishAndRotate { grant, checkpoint } => {
                 Self::custodian(principal)?;
-                if self.grant != Some(grant)
+                if self.authority.grant != Some(grant)
                     || self.head != checkpoint.cut
                     || self.checkpoint == checkpoint
                 {
@@ -1182,7 +1192,7 @@ impl State {
                     || preparation.root == [0; 32]
                     || !self.checkpoint_open(preparation.base)
                     || (preparation.erasure
-                        && (self.grant != Some(preparation.source)
+                        && (self.authority.grant != Some(preparation.source)
                             || preparation.base != self.checkpoint
                             || preparation.checkpoint != self.head))
                 {
@@ -1378,7 +1388,7 @@ impl State {
             }
             Command::Vacate { grant } => {
                 self.writer(principal, grant)?;
-                writer::vacate(&mut self.grant);
+                self.authority.vacate();
                 Ok(Outcome::Vacated)
             }
             Command::SealCohort {

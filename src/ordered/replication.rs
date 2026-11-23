@@ -231,11 +231,11 @@ impl Chosen {
         if request.placement != self.receipt.placement
             || request.principal != self.receipt.principal
             || request.id != self.receipt.request
-            || grant.key_generation.checked_add(1) != Some(self.state.key_generation)
+            || grant.key_generation.checked_add(1) != Some(self.state.authority.key_generation)
             || checkpoint != self.state.checkpoint()
             || self.state.records.iter().any(|record| {
                 record.result.lsn >= checkpoint.cut.next_lsn
-                    && record.grant.key_generation != self.state.key_generation
+                    && record.grant.key_generation != self.state.authority.key_generation
             })
         {
             return None;
@@ -247,7 +247,7 @@ impl Chosen {
             prefix: self.prefix,
             position: self.state.position(),
             checkpoint,
-            key_generation: self.state.key_generation,
+            key_generation: self.state.authority.key_generation,
             voters: self.images.clone(),
         };
         evidence.covers(self.receipt).then_some(evidence)

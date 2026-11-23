@@ -53,7 +53,7 @@ impl State {
             output.put_slice(&successor);
         }
         writer_state(&mut output, self.writer_state());
-        output.put_u64(self.key_generation);
+        output.put_u64(self.authority.key_generation);
         output.put_u64(self.enrollment_serial);
         window(&mut output, self.window);
         output.put_u64(self.spent);
@@ -131,9 +131,9 @@ impl State {
         state.voter_scope = input.take()?;
         state.successor = input.optional(|input| input.take())?;
         let writer = input.writer_state()?;
-        state.writer_epoch = writer.epoch;
-        state.grant = writer.grant;
-        state.key_generation = input.u64()?;
+        state.authority.epoch = writer.epoch;
+        state.authority.grant = writer.grant;
+        state.authority.key_generation = input.u64()?;
         state.enrollment_serial = input.u64()?;
         state.window = input.window()?;
         state.spent = input.u64()?;
@@ -186,8 +186,8 @@ impl State {
                 != (state.checkpoint.custody.provider == [0; 32])
             || (state.checkpoint.custody.revision == 1 && state.checkpoint != initial.checkpoint)
             || state.head.next_lsn > state.position
-            || state.writer_epoch > state.position
-            || !(1..=state.writer_epoch.max(1)).contains(&state.key_generation)
+            || state.authority.epoch > state.position
+            || !(1..=state.authority.epoch.max(1)).contains(&state.authority.key_generation)
             || state.enrollment_serial > state.position
         {
             return Err(Refusal::Invalid);
@@ -330,10 +330,10 @@ impl State {
             }
             self.roster.insert(member.worker, member);
         }
-        if let Some(writer) = self.grant {
+        if let Some(writer) = self.authority.grant {
             if writer.epoch == 0
-                || writer.epoch != self.writer_epoch
-                || writer.key_generation != self.key_generation
+                || writer.epoch != self.authority.epoch
+                || writer.key_generation != self.authority.key_generation
                 || self.roster.get(&writer.enrollment.worker) != Some(&writer.enrollment)
             {
                 return Err(Refusal::Invalid);
@@ -343,11 +343,11 @@ impl State {
     }
 
     fn valid_historical_grant(&self, grant: Grant) -> bool {
-        grant.epoch <= self.writer_epoch
-            && (1..=grant.epoch.min(self.key_generation)).contains(&grant.key_generation)
-            && (grant.epoch != self.writer_epoch
-                || (grant.key_generation == self.key_generation
-                    && self.grant.is_none_or(|writer| writer == grant)))
+        grant.epoch <= self.authority.epoch
+            && (1..=grant.epoch.min(self.authority.key_generation)).contains(&grant.key_generation)
+            && (grant.epoch != self.authority.epoch
+                || (grant.key_generation == self.authority.key_generation
+                    && self.authority.grant.is_none_or(|writer| writer == grant)))
     }
 
     fn read_records(&mut self, input: &mut Input) -> Result<(), Refusal> {

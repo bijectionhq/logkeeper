@@ -951,7 +951,7 @@ mod tests {
                 checkpoint,
                 "alternate slot crossed the rotation fence backward"
             );
-            assert_eq!(state.key_generation, 2);
+            assert_eq!(state.authority.key_generation, 2);
             assert_eq!(accepted.prefix.identity(group.identity()), evidence.prefix);
             let image = witness.slots.images[recovered.index];
             assert_eq!(recovered.generation, image.generation);
