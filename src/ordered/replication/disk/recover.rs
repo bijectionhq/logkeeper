@@ -2,14 +2,18 @@
 
 use super::selection::{authenticates_body, slot_body_length, slot_header_matches};
 use super::{
-    Error, File, Fingerprint, Group, Selected, Uuid, load_state, read_slot_body,
-    read_slot_header,
+    Error, File, Fingerprint, Group, Selected, Uuid, load_state, read_slot_body, read_slot_header,
 };
+
+#[cfg(verus_keep_ghost)]
+use super::eligible_slot;
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
 
 pub(crate) const HEADER: usize = 8 + 32 + 16 + 8 + 8 + 32;
 
 #[derive(Clone, Copy)]
-pub(super) struct SlotHeader {
+pub(crate) struct SlotHeader {
     pub raw: [u8; HEADER],
     pub empty: bool,
     pub magic: [u8; 8],
@@ -20,7 +24,13 @@ pub(super) struct SlotHeader {
     pub digest: Fingerprint,
 }
 
-pub(super) fn recover_slot(
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires size >= HEADER,
+    ensures (*old(file)).snapshot() == final(file).snapshot(),
+        out matches Ok((used, Some((selected, digest)))) ==>
+            eligible_slot(old(file), group, voter, size, index, used, selected, digest),
+))]
+pub(crate) fn recover_slot(
     file: &mut File,
     index: usize,
     group: &Group,

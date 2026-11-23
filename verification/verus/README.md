@@ -39,5 +39,8 @@ The runner makes a fresh copy for the baseline and for each control. Success
 requires the baseline to verify and each control to produce exactly its
 declared proof failures while meeting its verification count.
 
-See [ordered admission](ordered_admission/README.md) for the first area and
-its [manifest](ordered_admission/area.json).
+The area READMEs describe the checked production functions and Lean mappings.
+
+- [Ordered admission](ordered_admission/README.md)
+- [Mirrored voter media](mirrored_voter_media/README.md)
+- [Rotation slot evidence](rotation_slot_evidence/README.md)

@@ -1,16 +1,22 @@
 //! Decisions used when collecting rotation slot attestations.
 
-use super::{Ballot, Checkpoint, Fingerprint, Outcome, Receipt, Uuid};
-use super::BTreeSet;
+use super::{BTreeSet, Ballot, Checkpoint, Fingerprint, Outcome, Receipt, Uuid};
 use crate::ordered::admission::matches_fingerprint;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(verus_keep_ghost)]
+use super::{covers_rotation, record_matches, valid_voter_prefix, well_formed, zeros};
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+#[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
+#[derive(Clone, Copy)]
 pub struct SlotImage {
     pub generation: u64,
     pub digest: Fingerprint,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
+#[derive(Clone, Copy)]
 pub struct SlotPair {
     /// Index of the selected image in the physical A/B order.
     pub selected: u8,
@@ -18,8 +24,15 @@ pub struct SlotPair {
 }
 
 impl SlotPair {
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures out == well_formed(*self),
+    ))]
     pub fn is_mirrored(&self) -> bool {
         let zero = [0; 32];
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(zero@ =~= zeros());
+        }
         if self.selected > 1 {
             return false;
         }
@@ -33,7 +46,8 @@ impl SlotPair {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(verus_keep_ghost), derive(Debug))]
+#[derive(Clone, Copy)]
 pub struct Vote {
     pub voter: Uuid,
     pub ballot: Ballot,
@@ -42,12 +56,21 @@ pub struct Vote {
     pub read_back: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
+#[derive(Clone)]
 pub struct VoterSlots {
     pub voter: Uuid,
     pub slots: SlotPair,
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (configured.members@.contains(id) && !old(seen).members@.contains(id)),
+        final(seen).members@ == if configured.members@.contains(id) {
+            old(seen).members@.insert(id)
+        } else {
+            old(seen).members@
+        },
+))]
 pub(crate) fn register_peer(
     configured: &BTreeSet<Uuid>,
     seen: &mut BTreeSet<Uuid>,
@@ -56,10 +79,21 @@ pub(crate) fn register_peer(
     configured.contains(&id) && seen.insert(id)
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == cohort_size / 2 + 1, 2 * out as int > cohort_size as int,
+))]
 pub(crate) fn strict_majority(cohort_size: usize) -> usize {
     cohort_size / 2 + 1
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == record_matches(vote, expected, ballot, digest, read_back),
+        out ==> final(voters)@.len() == old(voters)@.len() + 1
+            && final(voters)@.drop_last() == old(voters)@
+            && final(voters)@.last().voter == expected
+            && final(voters)@.last().slots == vote.slots,
+        !out ==> final(voters)@ == old(voters)@,
+))]
 pub(crate) fn record_vote(
     voters: &mut Vec<VoterSlots>,
     expected: Uuid,
@@ -84,15 +118,49 @@ pub(crate) fn record_vote(
     true
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == valid_voter_prefix(voters@, voters@.len() as int),
+))]
 pub(crate) fn valid_voters(voters: &[VoterSlots]) -> bool {
     let mut index = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant valid_voter_prefix(voters@, index as int),
+        decreases voters@.len() - index,
+    ))]
     while index < voters.len() {
         let current = &voters[index];
         if current.voter.as_u128() == 0 || !current.slots.is_mirrored() {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(voters@[index as int] == *current);
+                assert(current.voter.0 == 0 || !well_formed(current.slots));
+                assert(!valid_voter_prefix(voters@, voters@.len() as int));
+            }
             return false;
         }
         if index > 0 && voters[index - 1].voter.as_u128() >= current.voter.as_u128() {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(voters@[index as int] == *current);
+                assert(voters@[index as int - 1].voter.0 >= voters@[index as int].voter.0);
+                assert(!valid_voter_prefix(voters@, voters@.len() as int));
+            }
             return false;
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert forall|i: int| 0 <= i <= index implies
+                #[trigger] voters@[i].voter.0 != 0 && well_formed(voters@[i].slots) by {
+                if i == index as int {
+                    assert(voters@[i] == *current);
+                }
+            }
+            assert forall|i: int| 0 < i <= index implies
+                voters@[i - 1].voter.0 < #[trigger] voters@[i].voter.0 by {
+                if i == index as int {
+                    assert(voters@[i] == *current);
+                }
+            }
         }
         index += 1;
     }
@@ -101,7 +169,8 @@ pub(crate) fn valid_voters(voters: &[VoterSlots]) -> bool {
 
 /// Both images on each member of an accepting majority encode the named
 /// prefix. Every later eligible recovery inherits that prefix.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
+#[derive(Clone)]
 pub struct RotationSlots {
     pub group: Fingerprint,
     pub cohort_size: usize,
@@ -114,11 +183,16 @@ pub struct RotationSlots {
 }
 
 impl RotationSlots {
+    #[cfg_attr(verus_keep_ghost, verus_spec(out =>
+        ensures out == covers_rotation(self, receipt),
+    ))]
     pub fn covers(&self, receipt: Receipt) -> bool {
         let Ok(Outcome::Granted { grant, recovery }) = receipt.outcome else {
             return false;
         };
         let zero = [0; 32];
+        #[cfg(verus_keep_ghost)]
+        proof! { assert(zero@ =~= zeros()); }
         !matches_fingerprint(&self.group, &zero)
             && self.ballot.round != 0
             && !self.ballot.nonce.is_nil()

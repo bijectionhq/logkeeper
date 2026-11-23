@@ -1,0 +1,216 @@
+{
+  "summary": "Separate configured voters attest the exact rotation fence, and the encoder preserves both physical images.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 44,
+  "controls": {
+    "count-half-as-majority": {
+      "defect": "The rotation receipt can certify a half quorum.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "self.voters.len() == strict_majority(self.cohort_size)",
+          "replace": "self.voters.len() == self.cohort_size / 2"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "covers",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "allow-duplicate-voter": {
+      "defect": "A voter can occupy two rows in the majority.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "voters[index - 1].voter.as_u128() >= current.voter.as_u128()",
+          "replace": "voters[index - 1].voter.as_u128() > current.voter.as_u128()"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "valid_voters",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "accept-unexpected-voter": {
+      "defect": "An attestation can be collected under a different peer identity.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "    if vote.voter.as_u128() != expected.as_u128()\n        || vote.ballot.round != ballot.round",
+          "replace": "    if vote.ballot.round != ballot.round"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "record_vote",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "accept-without-readback": {
+      "defect": "A regular accept acknowledgment can stand in for verified slot reads.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "        || vote.read_back != read_back\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "record_vote",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "substitute-selected-index": {
+      "defect": "Collection records slot A as selected regardless of the authenticated reply.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "        slots: vote.slots,",
+          "replace": "        slots: SlotPair { selected: 0, images: vote.slots.images },"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "record_vote",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "accept-unrelated-key-generation": {
+      "defect": "A retained receipt can be certified at a generation other than its immediate successor.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/rotation.rs",
+          "find": "            || grant.key_generation.checked_add(1) != Some(self.state.authority.key_generation)\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/rotation.rs",
+          "function": "rotation_slots",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "encode-first-digest-twice": {
+      "defect": "Signing and wire encoding overwrite the second physical image digest with the first.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/service/rotation.rs",
+          "find": "            output.put_slice(&second.digest);",
+          "replace": "            output.put_slice(&first.digest);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/service/rotation.rs",
+          "function": "encode",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "admit-unconfigured-peer-with-weakened-contract": {
+      "defect": "The admission decision and its contract accept a peer absent from the installed roster.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "    configured.contains(&id) && seen.insert(id)",
+          "replace": "    seen.insert(id)"
+        },
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "    ensures out == (configured.members@.contains(id) && !old(seen).members@.contains(id)),\n        final(seen).members@ == if configured.members@.contains(id) {\n            old(seen).members@.insert(id)\n        } else {\n            old(seen).members@\n        },",
+          "replace": "    ensures out == !old(seen).members@.contains(id),\n        final(seen).members@ == old(seen).members@.insert(id),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/rotation_slot_evidence/laws.rs",
+          "function": "only_new_configured_peers_can_enter_the_round",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "accept-wrong-prefix": {
+      "defect": "A vote from the right ballot can attest a different prefix.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "        || !matches_fingerprint(&vote.digest, &digest)\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "record_vote",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "accept-wrong-ballot": {
+      "defect": "An accept from a different ballot round can attest the same prefix.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "        || vote.ballot.round != ballot.round\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "record_vote",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "accept-wrong-recovery-cut": {
+      "defect": "A signed rotation can attest a receipt whose held recovery extends past the clean checkpoint.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "            && recovery.through == self.checkpoint.cut\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "covers",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    }
+  }
+}

@@ -1,0 +1,167 @@
+{
+  "summary": "Checked voter-slot eligibility, generation selection, two-sync mirroring and exact two-slot readback.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 38,
+  "controls": {
+    "reply-after-one-sync": {
+      "defect": "The caller returns a slot pair after syncing only the alternate.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/mirror.rs",
+          "find": "let (_, alternate) = self.install(media, next.clone())?;\n        let (selected, image) = self.install(media, next)?;",
+          "replace": "let (selected, alternate) = self.install(media, next.clone())?;\n        let image = alternate;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/disk/mirror.rs",
+          "function": "mirror",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "select-older-with-weakened-contract": {
+      "defect": "Both the selector and its contract prefer the lower generation.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/selection.rs",
+          "find": "if b > a { 1 } else { 0 }",
+          "replace": "if b < a { 1 } else { 0 }"
+        },
+        {
+          "file": "verification/verus/mirrored_voter_media/production.rs",
+          "find": "else if a < b { Ok(Some(1)) }",
+          "replace": "else if a > b { Ok(Some(1)) }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/mirrored_voter_media/laws.rs",
+          "function": "selection_prefers_the_newer_generation",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "accept-out-of-bounds-body": {
+      "defect": "The header can name more body bytes than fit in the slot.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/selection.rs",
+          "find": "    bounded_body_length(length, 2, payload_limit)",
+          "replace": "    bounded_body_length(length, 2, usize::MAX)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/disk/selection.rs",
+          "function": "slot_body_length",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "accept-torn-body": {
+      "defect": "A mismatched body checksum is ignored during recovery.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/recover.rs",
+          "find": "if !authenticates_body(&observed, &header.digest) {",
+          "replace": "if false {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/disk/recover.rs",
+          "function": "recover_slot",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "accept-foreign-header": {
+      "defect": "An authenticated image from another group can participate in recovery.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/selection.rs",
+          "find": "        && matches_fingerprint(addressed, group)\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/disk/selection.rs",
+          "function": "slot_header_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "read-first-slot-twice": {
+      "defect": "Readback omits the second physical image.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/mirror.rs",
+          "find": "self.read_back_slot(media, 1, size, ballot, digest, slots.images[1])",
+          "replace": "self.read_back_slot(media, 0, size, ballot, digest, slots.images[1])"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/disk/mirror.rs",
+          "function": "read_back",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "read-back-wrong-prefix": {
+      "defect": "The slot can carry a different accepted prefix from the fence.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/selection.rs",
+          "find": "        && matches_fingerprint(observed_prefix, expected_prefix)\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/disk/selection.rs",
+          "function": "read_back_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    },
+    "discard-sole-survivor-with-weakened-contract": {
+      "defect": "The selector and its contract discard valid slot B when slot A tore.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/selection.rs",
+          "find": "(None, Some(_)) => Ok(Some(1)),",
+          "replace": "(None, Some(_)) => Ok(None),"
+        },
+        {
+          "file": "verification/verus/mirrored_voter_media/production.rs",
+          "find": "(None, Some(_)) => Ok(Some(1)),",
+          "replace": "(None, Some(_)) => Ok(None),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/mirrored_voter_media/laws.rs",
+          "function": "any_surviving_slot_keeps_the_acknowledged_rank",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 37
+    }
+  }
+}
