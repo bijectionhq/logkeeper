@@ -122,6 +122,7 @@ impl Reply {
                 window(&mut output, route.window);
                 output.put_u64(route.window_spent);
                 output.put_u64(route.reusable_bytes);
+                output.put_u64(route.ordinary_limit);
                 output.put_u64(route.maintenance_limit);
                 output.put_u64(route.maintenance_retained);
                 output.put_u64(route.retry_positions);
@@ -204,6 +205,7 @@ impl Reply {
                 window: input.window()?,
                 window_spent: input.u64()?,
                 reusable_bytes: input.u64()?,
+                ordinary_limit: input.u64()?,
                 maintenance_limit: input.u64()?,
                 maintenance_retained: input.u64()?,
                 retry_positions: input.u64()?,
