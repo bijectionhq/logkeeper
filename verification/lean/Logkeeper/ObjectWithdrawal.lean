@@ -32,6 +32,17 @@ theorem order_preserves_separation {before after : State}
   | withdraw unreferenced => exact fun _ => unreferenced
   | recover => exact safe
 
+inductive Trace : State → State → Prop where
+  | empty (s : State) : Trace s s
+  | next {start here after : State} (earlier : Trace start here) (step : Step here after) :
+      Trace start after
+
+theorem trace_preserves_separation {start finish : State}
+    (safe : Safe start) (trace : Trace start finish) : Safe finish := by
+  induction trace with
+  | empty => exact safe
+  | next _ step preceding => exact order_preserves_separation preceding step
+
 def empty : State := ⟨fun _ => False, false⟩
 def withdrawn : State := ⟨fun _ => False, true⟩
 def late : State := ⟨fun r => r = .suffix ∨ False, true⟩
@@ -45,5 +56,23 @@ def AcquireWithoutFence (s t : State) : Prop :=
 theorem unchecked_acquire_violates_separation :
     AcquireWithoutFence withdrawn late ∧ ¬ Safe late :=
   ⟨rfl, fun safe => safe rfl .suffix (Or.inl rfl)⟩
+
+def held : State := ⟨fun r => r = .hold ∨ False, false⟩
+
+theorem reachable_hold : Step empty held :=
+  Step.acquire empty .hold rfl
+
+def WithdrawWithoutReferences (s t : State) : Prop :=
+  t = ⟨s.referenced, true⟩
+
+theorem unchecked_withdrawal_violates_separation :
+    ∃ blocked, WithdrawWithoutReferences held blocked ∧ ¬ Safe blocked :=
+  ⟨⟨held.referenced, true⟩, rfl, fun safe => safe rfl .hold (Or.inl rfl)⟩
+
+#print axioms trace_preserves_separation
+#print axioms reachable_fence
+#print axioms reachable_hold
+#print axioms unchecked_acquire_violates_separation
+#print axioms unchecked_withdrawal_violates_separation
 
 end Logkeeper.ObjectWithdrawal

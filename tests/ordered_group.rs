@@ -833,3 +833,182 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     assert_eq!(state.reconcile_append(&newest), Ok(result));
     assert_eq!(state.command_history(), chosen.state().command_history());
 }
+
+#[tokio::test]
+async fn exact_object_withdrawal_survives_compaction_and_cohort_repair() {
+    use logkeeper::ordered::ObjectWithdrawal;
+
+    let placement = Placement {
+        deployment: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        group: Uuid::new_v4(),
+        generation: 1,
+    };
+    let limits = Limits {
+        enrolled_workers: 1,
+        replay_holds: 2,
+        retry_positions: 64,
+        retained_data_bytes: 1 << 16,
+        maintenance_bytes: 1 << 12,
+        serving_lease: 30_000,
+        clock_drift: 1_000,
+    };
+    let initial = Checkpoint {
+        cut: Cut {
+            next_lsn: 0,
+            history: [1; 32],
+        },
+        root: [0; 32],
+        manifest: [0; 32],
+        custody: Custody {
+            allocation: Uuid::new_v4(),
+            revision: 1,
+            provider: [0; 32],
+        },
+    };
+    let window = Window {
+        allocation: Uuid::new_v4(),
+        serial: 1,
+        bytes: 1 << 12,
+    };
+    let peers = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    let group = Group::new(placement, limits, initial, window, peers, 1 << 20).unwrap();
+    let disks = std::array::from_fn::<_, 3, _>(|_| tempfile::tempdir().unwrap());
+    let voters: Vec<_> = disks
+        .iter()
+        .zip(peers)
+        .map(|(disk, id)| DurableVoter::initialize(group.clone(), id, disk.path()).unwrap())
+        .collect();
+    let request = |principal, command| Request {
+        placement,
+        principal,
+        id: RequestId {
+            nonce: Uuid::new_v4(),
+            expires_at: 64,
+        },
+        command,
+    };
+    let administrator = Principal::Administrator;
+    let custodian = Principal::Custodian;
+    let enrolled = group
+        .choose(
+            &voters,
+            1,
+            request(
+                administrator,
+                Command::Enroll {
+                    worker: Uuid::new_v4(),
+                    expected: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let Ok(Outcome::Enrolled(enrollment)) = enrolled.receipt().outcome else {
+        panic!("enrollment refused");
+    };
+    let worker = Principal::Worker(enrollment);
+    let installed = group
+        .choose(
+            &voters,
+            2,
+            request(
+                worker,
+                Command::Grant {
+                    expected: enrolled.state().writer_state(),
+                    candidate: enrollment,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let Ok(Outcome::Granted { grant, .. }) = installed.receipt().outcome else {
+        panic!("grant refused");
+    };
+    let object = ObjectWithdrawal {
+        name: [6; 32],
+        version: [7; 32],
+    };
+    let withdrawal = request(custodian, Command::WithdrawObject { object });
+    let original = group
+        .choose(&voters, 3, withdrawal.clone())
+        .await
+        .unwrap()
+        .receipt();
+    assert!(
+        matches!(original.outcome, Ok(Outcome::ObjectWithdrawn(fence)) if fence.object == object)
+    );
+
+    let mut before = [0; 32];
+    for round in 4..20 {
+        let refused = group
+            .choose(
+                &voters,
+                round,
+                request(Principal::RouteReader, Command::Barrier { grant }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.receipt().outcome, Err(Refusal::Unauthorized));
+        before = refused.prefix();
+    }
+    group.compact(&voters, 20).await.unwrap();
+    let recovered = group.choose(&voters, 21, withdrawal.clone()).await.unwrap();
+    assert_eq!(recovered.receipt(), original);
+    assert_ne!(recovered.prefix(), before);
+
+    let target_ids = [peers[1], peers[2], Uuid::new_v4()];
+    let successor = Group::new(placement, limits, initial, window, target_ids, 1 << 20)
+        .unwrap()
+        .successor(group.identity())
+        .unwrap();
+    group
+        .choose(
+            &voters,
+            22,
+            request(
+                administrator,
+                Command::SealCohort {
+                    expected: group.identity(),
+                    successor: successor.identity(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let seed = group.repair_seed(&voters, 23, &successor).await.unwrap();
+    let media = std::array::from_fn::<_, 3, _>(|_| tempfile::tempdir().unwrap());
+    let repaired: Vec<_> = media
+        .iter()
+        .zip(target_ids)
+        .map(|(disk, id)| {
+            DurableVoter::reserve_repair(&successor, id, disk.path()).unwrap();
+            DurableVoter::initialize_repaired(successor.clone(), id, disk.path(), &seed).unwrap()
+        })
+        .collect();
+    let recovered = successor
+        .choose(&repaired, 1, withdrawal)
+        .await
+        .unwrap()
+        .receipt();
+    assert_eq!(recovered, original);
+    let late = successor
+        .choose(
+            &repaired,
+            2,
+            request(
+                worker,
+                Command::Append {
+                    class: AppendClass::Data,
+                    grant,
+                    expected_next: 0,
+                    timestamp: 1,
+                    payload: Bytes::from_static(b"late"),
+                    references: Some(vec![object.name]),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(late.receipt().outcome, Err(Refusal::Conflict));
+}

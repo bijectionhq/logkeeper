@@ -33,7 +33,7 @@ Its premises are the decoder projection, the digest-bound adopted roots, and the
 | C1 | Both | Bring the design onto main and port shared results into the Lean package | Studies imported. Recovery certificate shared and instantiated by RTDB. |
 | C2 | Both | D01: retry reads as fresh admissions | Landed. Logkeeper `895bc30` removes exact read reissue and adds `ReleaseRead`. RTDB `76f4ad2189` issues fresh barriers and releases lost reads by identity. |
 | C3 | Both | D02 erasure by key-generation rotation | Landed: `RotateKey` with generations kept through vacancy (A474-A475), generation-bound sealing and `rtdb/erased-under-view` (A476), and an RTDB erasure coordinator behind an explicit custody interface with native fixtures (A494). Open: exact-head clean closure and successor rewrite (A477, A494), authenticated evidence for every crash-selectable slot (A495), and a qualified atomic deadline authority (A496). |
-| C4 | RTDB | Reclamation inside the current writer's prefix | Landed: installed deletes become durable reclamation candidates, and old offloaded payloads are nominated (A490). Physical removal inside a live prefix needs an exact-object withdrawal fence in Logkeeper and RTDB reader drains (A491-A492). |
+| C4 | RTDB | Reclamation inside the current writer's prefix | Landed: installed deletes become durable reclamation candidates, and old offloaded payloads are nominated (A490). W1 adds ordered exact-object withdrawal (A491-A492). Local in-prefix disposal requires the RTDB reader and provider drain. In-prefix S3 disposal remains open. |
 | C5 | RTDB | Production typed closure and conformance replay | Landed in RTDB `e7e429626b` with the Lean composition `e6b5c5ff91`. The closure is not yet used by reclamation or checkpoint custody. |
 | C6 | RTDB | Recovery at a cut inside a pending block | Reduced. RTDB roots sit at block boundaries, and held records after a boundary belong to the next block, so recovery at any cut is the root plus the suffix through that cut (Study 110's closure). Under D01 and D04 no self-contained image at an arbitrary cut is required; forks and exports at a basis already use base and suffix replay (`find_held_publication`). Source inspection at RTDB `fd3d6dcb32`: the published cut is the boundary plus one (`journal/hosted.rs:380-388`) and `retain_selected` trims only through it (`:563-573`). A proof against the driver remains. |
 | C7 | Both | Worker disposal and dead workers blocking trim | Landed: the serving lease and per-read check, the operator command, and automatic custodian disposal from a bounded withdrawn-hold-owner query (Logkeeper `a5d21eb`, A478, A493). |
@@ -68,6 +68,6 @@ Fences have stream lifetime.
 The physical custodian must independently establish that earlier I/O has drained and that the provider effect matches the version named by the receipt.
 
 `Logkeeper.ObjectWithdrawal` models one immutable object, two admission states and four reference roles.
-It proves separation after an arbitrary modeled step and constructs a reachable fence.
-The negative control permits a suffix acquisition after that fence and witnesses a violation.
+It proves separation along arbitrary modeled traces and constructs reachable fence and held states.
+The negative controls admit a suffix after a fence and authorize withdrawal with a live hold, witnessing a violation in each case.
 The model assumes exact references and recovery of the chosen state and does not verify the Rust codec, provider or RTDB projection.
