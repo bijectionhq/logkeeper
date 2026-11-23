@@ -1,0 +1,108 @@
+{
+  "summary": "Compact-image row admission for persistent key generation, retained hold receipts, leases and object fences.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 8,
+  "controls": {
+    "allow-zero-generation": {
+      "defect": "A vacant state may decode with generation zero.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "generation != 0 && generation <= epoch.max(1)",
+          "replace": "generation <= epoch.max(1)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "function": "generation_in_range",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "allow-unretained-lease-owner": {
+      "defect": "A lease is retained after its owner has neither a roster entry nor a hold.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "        && retained\n        && lease_end >= duration",
+          "replace": "        && lease_end >= duration"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "function": "lease_row_valid",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "allow-future-fence": {
+      "defect": "A fence is accepted at a journal time after the image time.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "position != 0 && position <= last_position && time <= last_time && key_increases",
+          "replace": "position != 0 && position <= last_position && key_increases"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "function": "fence_row_valid",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "allow-missing-hold-receipt": {
+      "defect": "Even with a weakened receipt contract, a hold needs its retained receipt.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "        None => false,",
+          "replace": "        None => true,"
+        },
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "ensures out == holdReceiptMatches(admitted_at, receipt_position),",
+          "replace": "ensures out == (holdReceiptMatches(admitted_at, receipt_position) || receipt_position is None),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/compact_image/laws.rs",
+          "function": "a_checked_hold_has_a_matching_receipt",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "allow-out-of-order-fence": {
+      "defect": "A fence duplicates or precedes the highest previously retained key.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "position != 0 && position <= last_position && time <= last_time && key_increases",
+          "replace": "position != 0 && position <= last_position && time <= last_time"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "function": "fence_row_valid",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    }
+  }
+}

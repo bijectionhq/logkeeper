@@ -39,3 +39,11 @@ exact mutation retry to `same_chosen_append`.
 Run `python3 run_ordered_reducer.py` for the ordered-model theorem and mutation
 checks. Run `python3 run_ordered_correspondence.py --verus /path/to/verus` to
 compare the Lean decisions with the Verus specs on the shared cases.
+
+`Logkeeper.Codec` specifies the ordered decision header, canonical Boolean
+markers and declared length bounds. `Logkeeper.CompactImage` specifies the
+snapshot generation, hold receipt, lease and fence row checks. Run
+`python3 run_codec.py` from this directory to check both modules, their axiom
+reports and the three negative controls. The Verus correspondence is recorded
+in the [ordered codec](../verus/ordered_codec/README.md) and
+[compact image](../verus/compact_image/README.md) proof areas.

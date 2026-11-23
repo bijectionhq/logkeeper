@@ -1,0 +1,141 @@
+{
+  "summary": "Exact version, journal-time bytes, optional flag spellings and bounded body lengths in the shipped ordered codecs.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 13,
+  "controls": {
+    "accept-future-command-version": {
+      "defect": "A later command version is treated as v8.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "    version == COMMAND_VERSION\n",
+          "replace": "    version >= COMMAND_VERSION\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "has_command_version",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "reverse-journal-time": {
+      "defect": "Decode reads the low byte as the high byte.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "        frame[1], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7], frame[8],",
+          "replace": "        frame[8], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7], frame[1],"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "read_decision_time",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "swap-encoded-flag": {
+      "defect": "The encoder uses the opposite flag for presence.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "    if value { 1 } else { 0 }\n}\n\n#[cfg_attr",
+          "replace": "    if value { 0 } else { 1 }\n}\n\n#[cfg_attr"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "encode_flag",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "allow-alternate-true-marker": {
+      "defect": "Even with a weakened decoder contract, byte 2 cannot alias true.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "_ => None,",
+          "replace": "_ => Some(true),"
+        },
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "else if tag == 1 { Some(true) } else { None }",
+          "replace": "else { Some(true) }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_codec/laws.rs",
+          "function": "noncanonical_flag_is_rejected",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "ignore-body-maximum": {
+      "defect": "Even with a weakened length contract, a body above the capacity must be refused.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "if declared < minimum as u64 || declared > maximum as u64 {",
+          "replace": "if declared < minimum as u64 || declared > usize::MAX as u64 {"
+        },
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "length as int == declared && bodyLengthBounded(declared as int, minimum as int, maximum as int),",
+          "replace": "length as int == declared && minimum as int <= declared <= usize::MAX,"
+        },
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "None => !bodyLengthBounded(declared as int, minimum as int, maximum as int),",
+          "replace": "None => declared < minimum as int || declared > usize::MAX,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_codec/laws.rs",
+          "function": "body_over_limit_is_rejected",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "accept-short-journal-time": {
+      "defect": "Even with a weakened decoder contract, a truncated header cannot yield a journal time.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "        Some(time) => decisionHeaderMatches(frame@, time@),",
+          "replace": "        Some(time) => frame@.len() < 9 || decisionHeaderMatches(frame@, time@),"
+        },
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "    if frame.len() < 9 || !has_command_version(frame[0]) {",
+          "replace": "    if frame.len() < 9 { return Some([0; 8]); }\n    if !has_command_version(frame[0]) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_codec/laws.rs",
+          "function": "short_decision_header_is_rejected",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 12
+    }
+  }
+}
