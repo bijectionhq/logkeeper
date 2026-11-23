@@ -9,7 +9,7 @@ pub use sign::BarrierVerifier;
 pub use tls::{Credentials, Endpoint};
 
 use crate::ordered::{
-    Checkpoint, Enrollment, Fingerprint, Limits, Placement, Principal, Window,
+    Checkpoint, Enrollment, Fingerprint, Limits, Placement, Principal, Refusal, Window,
     replication::{
         DurableVoter, Group,
         transport::{RemoteVoter, serve_voter},
@@ -27,7 +27,10 @@ use std::fs::{self, File};
 use std::io::{self, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use tls::{APPLICATION, TlsPeers, VOTER, invalid};
 use tokio::io::AsyncReadExt;
@@ -420,9 +423,9 @@ async fn dispatch(
 /// An application route resolved during installation and usable during
 /// directory outage. Each endpoint is independently pinned.
 pub struct Client {
-    group: Fingerprint,
     placement: Placement,
-    endpoints: Vec<Endpoint>,
+    cohorts: Vec<(Fingerprint, Vec<Endpoint>)>,
+    current: AtomicUsize,
     connector: TlsConnector,
     max_frame: usize,
     deadline: Duration,
@@ -438,6 +441,16 @@ pub struct ApplicationRoute {
     pub maximum_frame: usize,
     pub exchange_ms: u64,
     pub verification_keys: Vec<[u8; 32]>,
+    #[serde(default)]
+    pub successors: Vec<SuccessorRoute>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuccessorRoute {
+    pub predecessor: Fingerprint,
+    pub group: Fingerprint,
+    pub endpoints: Vec<Endpoint>,
 }
 
 impl Client {
@@ -448,10 +461,24 @@ impl Client {
         }
         let connector = credentials.client(APPLICATION)?;
         let barriers = BarrierVerifier::new(route.placement, route.verification_keys)?;
+        let mut cohorts = vec![(route.group, route.endpoints)];
+        for next in route.successors {
+            if next.endpoints.is_empty()
+                || cohorts
+                    .last()
+                    .is_none_or(|(prior, _)| *prior != next.predecessor)
+                || cohorts.iter().any(|(id, _)| *id == next.group)
+            {
+                return Err(invalid(
+                    "the installed voter routes do not form one successor chain",
+                ));
+            }
+            cohorts.push((next.group, next.endpoints));
+        }
         Ok(Self {
-            group: route.group,
             placement: route.placement,
-            endpoints: route.endpoints,
+            cohorts,
+            current: AtomicUsize::new(0),
             connector,
             max_frame: route.maximum_frame,
             deadline: Duration::from_millis(route.exchange_ms),
@@ -460,10 +487,33 @@ impl Client {
     }
 
     pub async fn call(&self, operation: Operation) -> Result<Reply, wire::WireError> {
+        let current = self.current.load(Ordering::Acquire);
         let mut unavailable = wire::WireError::Timeout;
-        for endpoint in &self.endpoints {
+        for (index, (group, endpoints)) in self.cohorts.iter().enumerate().skip(current) {
+            match self.call_cohort(*group, endpoints, &operation).await {
+                Ok(Reply::Refused(Refusal::CohortSealed)) if index + 1 < self.cohorts.len() => {}
+                Ok(reply) => {
+                    if !matches!(&reply, Reply::Refused(_)) {
+                        self.current.fetch_max(index, Ordering::AcqRel);
+                    }
+                    return Ok(reply);
+                }
+                Err(error) => unavailable = error,
+            }
+        }
+        Err(unavailable)
+    }
+
+    async fn call_cohort(
+        &self,
+        group: Fingerprint,
+        endpoints: &[Endpoint],
+        operation: &Operation,
+    ) -> Result<Reply, wire::WireError> {
+        let mut unavailable = wire::WireError::Timeout;
+        for endpoint in endpoints {
             let reply = timeout(self.deadline, async {
-                let channel = tls::open(&self.connector, endpoint, APPLICATION, self.group).await?;
+                let channel = tls::open(&self.connector, endpoint, APPLICATION, group).await?;
                 let reply = wire::exchange(
                     channel,
                     self.placement,
@@ -473,7 +523,7 @@ impl Client {
                 )
                 .await?;
                 if let (Reply::Decision(decision), Operation::Execute(original)) =
-                    (&reply, &operation)
+                    (&reply, operation)
                     && let Some(proof) = decision.barrier
                 {
                     self.barriers.verify(proof, original)?;

@@ -178,7 +178,11 @@ impl<R: Replica> Coordinator<R> {
         }
         let chosen = self
             .ordered(|round| self.group.choose(&self.peers, round, request.clone()))
-            .await?;
+            .await
+            .map_err(|error| match error {
+                Error::Journal(replication::Error::Sealed) => Refusal::CohortSealed.into(),
+                error => error,
+            })?;
         if chosen.state().successor.is_some()
             && !matches!(
                 chosen.receipt().outcome,
