@@ -270,6 +270,7 @@ impl Input {
             0 => Ok(Principal::Administrator),
             1 => Ok(Principal::Worker(self.enrollment()?)),
             2 => Ok(Principal::Custodian),
+            3 => Ok(Principal::RouteReader),
             _ => Err(Refusal::Invalid),
         }
     }
@@ -369,6 +370,7 @@ fn principal(output: &mut BytesMut, value: Principal) {
             enrollment(output, worker);
         }
         Principal::Custodian => output.put_u8(2),
+        Principal::RouteReader => output.put_u8(3),
     }
 }
 

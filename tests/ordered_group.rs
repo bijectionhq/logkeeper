@@ -40,7 +40,9 @@ async fn application<R: Replica>(
     let (client, server) = tokio::io::duplex(4096);
     let (reply, served) = tokio::join!(
         wire::exchange(client, placement, operation, 16_384, DEADLINE),
-        wire::serve(coordinator, server, session, 16_384, DEADLINE),
+        wire::serve(coordinator, server, session, 16_384, DEADLINE, |_| panic!(
+            "unexpected barrier in test exchange"
+        )),
     );
     served.unwrap();
     reply.unwrap()

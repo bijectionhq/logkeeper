@@ -1,9 +1,9 @@
 //! Bounded application RPC on a channel authenticated for an installed group.
 
-use super::{Coordinator, Decision, Error, ReplayPage, Route, Session};
+use super::{Coordinator, Error, ReplayPage, Route, Session};
 use crate::ordered::{
-    AppendResult, Command, Cut, Grant, Hold, Placement, Refusal, Request, append_fingerprint,
-    replication::Replica,
+    AppendResult, BarrierClaim, Command, Cut, Fingerprint, Grant, Hold, Placement, Receipt,
+    Refusal, Request, append_fingerprint, replication::Replica,
 };
 use bytes::Bytes;
 use std::io;
@@ -14,6 +14,7 @@ use tokio::time::timeout;
 const MAGIC: &[u8; 8] = b"LKAPPC01";
 const REPLAY_OVERHEAD: usize = 1 + 128 + 40 + 8;
 
+#[derive(Clone)]
 pub enum Operation {
     Route,
     Execute(Request),
@@ -34,6 +35,24 @@ pub enum Reply {
     Reconciled(AppendResult),
     Replay(ReplayPage),
     Refused(Refusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Signature {
+    pub issuer: Fingerprint,
+    pub proof: [u8; 64],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SignedBarrier {
+    pub claim: BarrierClaim,
+    pub signature: Signature,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decision {
+    pub receipt: Receipt,
+    pub barrier: Option<SignedBarrier>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +96,7 @@ pub async fn serve<R: Replica>(
     session: Session,
     maximum_frame: usize,
     deadline: Duration,
+    sign: impl FnOnce(BarrierClaim) -> io::Result<Signature>,
 ) -> Result<(), WireError> {
     timeout(deadline, async {
         let frame = read_frame(&mut channel, maximum_frame).await?;
@@ -87,10 +107,24 @@ pub async fn serve<R: Replica>(
         }
         let outcome = match operation {
             Operation::Route => coordinator.route(session).await.map(Reply::Route),
-            Operation::Execute(request) => coordinator
-                .execute(session, request)
-                .await
-                .map(Reply::Decision),
+            Operation::Execute(request) => match coordinator.execute(session, request).await {
+                Ok(decision) => {
+                    let barrier = decision
+                        .barrier
+                        .map(|claim| {
+                            Ok::<_, io::Error>(SignedBarrier {
+                                claim,
+                                signature: sign(claim)?,
+                            })
+                        })
+                        .transpose()?;
+                    Ok(Reply::Decision(Decision {
+                        receipt: decision.receipt,
+                        barrier,
+                    }))
+                }
+                Err(error) => Err(error),
+            },
             Operation::Reconcile { grant, original } => coordinator
                 .reconcile(session, grant, &original)
                 .await

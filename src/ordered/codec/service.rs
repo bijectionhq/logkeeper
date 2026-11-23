@@ -5,8 +5,8 @@ use super::{
 use crate::ordered::{
     BarrierClaim, Outcome, Placement, Principal, Receipt, Refusal, Request,
     service::{
-        Decision, ReplayPage, Route,
-        wire::{Operation, Reply},
+        ReplayPage, Route,
+        wire::{Decision, Operation, Reply, Signature, SignedBarrier},
     },
 };
 use bytes::{BufMut, Bytes, BytesMut};
@@ -90,7 +90,9 @@ impl Reply {
                 snapshot::result(&mut output, receipt.outcome);
                 output.put_u8(u8::from(decision.barrier.is_some()));
                 if let Some(barrier) = decision.barrier {
-                    output.put_slice(&barrier.encode());
+                    output.put_slice(&barrier.signature.issuer);
+                    output.put_slice(&barrier.signature.proof);
+                    output.put_slice(&barrier.claim.encode());
                 }
             }
             Self::Reconciled(append) => {
@@ -159,8 +161,15 @@ impl Input {
             position: self.u64()?,
             outcome: self.result()?,
         };
-        let barrier = self.optional(|input| BarrierClaim::decode(std::mem::take(&mut input.0)))?;
-        if let Some(claim) = barrier
+        let barrier = self.optional(|input| {
+            let signature = Signature {
+                issuer: input.take()?,
+                proof: input.take()?,
+            };
+            let claim = BarrierClaim::decode(std::mem::take(&mut input.0))?;
+            Ok(SignedBarrier { claim, signature })
+        })?;
+        if let Some(SignedBarrier { claim, .. }) = barrier
             && (receipt.outcome
                 != Ok(Outcome::Barrier {
                     grant: claim.grant(),

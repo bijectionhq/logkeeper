@@ -53,7 +53,12 @@ The embedding service authenticates coordinator and worker identities before cho
 Checkpoint publication and replenishment require the custodian identity at the exact current grant.
 The custodian establishes reconstructability and reserves physical allocations before ordering those commands.
 
-The standalone daemon still serves the original protocol.
+The standalone daemon's `ordered-daemon` feature exposes `logkeeper ordered initialize <manifest>` and `logkeeper ordered serve <manifest>`.
+Initialize provisions a fresh voter directory once.
+Serve recovers only installed directories and accepts mutual TLS 1.3 using the endpoint certificate pins and roles in the installed manifest.
+Peer certificates used for voter traffic have no worker or custodian role in that group.
+Application clients retain the installed route and receipt verification keys independently of the serving daemon.
+
 The ordered implementation can compact an accepted prefix into a bounded recovery base.
 A voter replaces its local selected file atomically and confirms the exact selected image after syncing it.
 Running voters can reclaim payloads below the authorized trim floor from their selected files.

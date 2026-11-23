@@ -4,6 +4,8 @@
 //! position. A command's position and the stream's data frontier are separate.
 
 mod codec;
+#[cfg(feature = "ordered-daemon")]
+pub mod daemon;
 pub mod replication;
 pub mod service;
 
@@ -22,6 +24,7 @@ pub type Fingerprint = [u8; 32];
 const APPEND_RECORD_CHARGE_BYTES: u64 = 208;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
 pub struct Placement {
     pub deployment: Uuid,
     pub incarnation: Uuid,
@@ -30,6 +33,7 @@ pub struct Placement {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
 pub struct Enrollment {
     pub worker: Uuid,
     pub serial: u64,
@@ -49,12 +53,14 @@ pub struct WriterState {
 
 /// An exclusive data frontier and the identity of the prefix before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
 pub struct Cut {
     pub next_lsn: u64,
     pub history: Fingerprint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
 pub struct Window {
     pub allocation: Uuid,
     pub serial: u64,
@@ -62,12 +68,14 @@ pub struct Window {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
 pub struct Custody {
     pub allocation: Uuid,
     pub revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
 pub struct Checkpoint {
     pub cut: Cut,
     pub root: Fingerprint,
@@ -90,6 +98,7 @@ pub enum Principal {
     Administrator,
     Worker(Enrollment),
     Custodian,
+    RouteReader,
 }
 
 /// An invocation identifier with an immutable retry limit in journal order.
@@ -270,6 +279,7 @@ impl<'a> HeldReplay<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
 pub struct Limits {
     pub enrolled_workers: usize,
     pub replay_holds: usize,

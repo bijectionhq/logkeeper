@@ -115,7 +115,10 @@ impl<R: Replica> Coordinator<R> {
     /// Binds the principal in the chosen frame to the authenticated session.
     pub async fn execute(&self, session: Session, request: Request) -> Result<Decision, Error> {
         self.admit(session)?;
-        if request.placement != session.placement || request.principal != session.principal {
+        if session.principal == Principal::RouteReader
+            || request.placement != session.placement
+            || request.principal != session.principal
+        {
             return Err(Refusal::Unauthorized.into());
         }
         let chosen = self
