@@ -768,9 +768,7 @@ impl State {
                 .holds
                 .get(&key.1)
                 .is_some_and(|entry| entry.origin == key.0);
-            if !admission::retains_receipt(position, until, live_hold) {
-                self.outcomes.remove(&key);
-            }
+            receipt::remove_expired(&mut self.outcomes, key, position, until, live_hold);
         }
         let placement = self.placement;
         let principal = request.principal;
@@ -1413,9 +1411,13 @@ impl State {
                     .get(&hold.id)
                     .filter(|entry| entry.hold == hold)
                     .ok_or(Refusal::Stale)?;
-                if hold.id.expires_at <= self.position {
-                    self.outcomes.remove(&(entry.origin, hold.id));
-                }
+                receipt::remove_expired(
+                    &mut self.outcomes,
+                    (entry.origin, hold.id),
+                    self.position,
+                    hold.id.expires_at,
+                    false,
+                );
                 self.holds.remove(&hold.id);
                 self.prune_leases();
                 Ok(Outcome::Released)
@@ -1446,9 +1448,13 @@ impl State {
                 // on the expiry schedule. It keeps a delayed copy of the
                 // original barrier from admitting a second hold under the same
                 // identity; past its window it leaves with the hold.
-                if read.expires_at <= self.position {
-                    self.outcomes.remove(&key);
-                }
+                receipt::remove_expired(
+                    &mut self.outcomes,
+                    key,
+                    self.position,
+                    read.expires_at,
+                    false,
+                );
                 self.holds.remove(&read);
                 self.prune_leases();
                 Ok(Outcome::Released)
@@ -1474,19 +1480,21 @@ impl State {
                 }
                 let trim = usize::try_from(through.next_lsn - self.floor.next_lsn)
                     .map_err(|_| Refusal::Invalid)?;
-                let mut result = TrimResult {
+                let result = TrimResult {
                     from: self.floor,
                     through,
                     ordinary_bytes: 0,
                     maintenance_bytes: 0,
                 };
-                for record in self.records.drain(..trim) {
-                    let charge = record.result.byte_end - record.result.byte_start;
-                    match record.result.class {
-                        AppendClass::Data => result.ordinary_bytes += charge,
-                        AppendClass::Maintenance => result.maintenance_bytes += charge,
-                    }
-                }
+                let result =
+                    writer::drain_prefix(&mut self.records, trim, result, |mut result, record| {
+                        let charge = record.result.byte_end - record.result.byte_start;
+                        match record.result.class {
+                            AppendClass::Data => result.ordinary_bytes += charge,
+                            AppendClass::Maintenance => result.maintenance_bytes += charge,
+                        }
+                        result
+                    });
                 self.retained_bytes -= result.ordinary_bytes;
                 self.maintenance_retained -= result.maintenance_bytes;
                 self.floor = through;
@@ -1623,9 +1631,13 @@ impl State {
             .collect::<Vec<_>>();
         for entry in retired {
             self.holds.remove(&entry.hold.id);
-            if entry.hold.id.expires_at <= self.position {
-                self.outcomes.remove(&(entry.origin, entry.hold.id));
-            }
+            receipt::remove_expired(
+                &mut self.outcomes,
+                (entry.origin, entry.hold.id),
+                self.position,
+                entry.hold.id.expires_at,
+                false,
+            );
         }
         self.prune_leases();
     }

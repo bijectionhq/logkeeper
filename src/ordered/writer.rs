@@ -84,3 +84,21 @@ pub(super) fn commit_append<R>(records: &mut VecDeque<R>, head: &mut Cut, record
     records.push_back(record);
     *head = cut;
 }
+
+pub(super) fn drain_prefix<R, A, F: Fn(A, R) -> A>(
+    records: &mut VecDeque<R>,
+    count: usize,
+    mut accumulated: A,
+    accumulate: F,
+) -> A {
+    assert!(count <= records.len());
+    let mut removed = 0;
+    while removed < count {
+        let record = records
+            .pop_front()
+            .expect("trim prefix checked against record count");
+        accumulated = accumulate(accumulated, record);
+        removed += 1;
+    }
+    accumulated
+}

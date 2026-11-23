@@ -42,3 +42,15 @@ pub(super) fn record_after_apply<K: Ord, R, O, E>(
     outcomes.insert(key, retained);
     true
 }
+
+pub(super) fn remove_expired<K: Ord, R>(
+    outcomes: &mut BTreeMap<K, RetainedOutcome<R>>,
+    key: K,
+    position: u64,
+    expires_at: u64,
+    owns_live_hold: bool,
+) {
+    if !admission::retains_receipt(position, expires_at, owns_live_hold) {
+        outcomes.remove(&key);
+    }
+}
