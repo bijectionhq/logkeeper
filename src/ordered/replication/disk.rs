@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
-const MAGIC: &[u8; 8] = b"LKORV001";
+const MAGIC: &[u8; 8] = b"LKORV002";
 const STATE: &str = "ordered.state";
 const STAGING: &str = "ordered.next";
 const LOCK: &str = "ordered.lock";
@@ -152,7 +152,7 @@ impl Inner {
 
     fn accept(&self, group: Fingerprint, ballot: Ballot, prefix: Prefix) -> Result<Vote, Error> {
         self.check(group, ballot)?;
-        if prefix.frames.is_empty() {
+        if prefix.is_empty() {
             return Err(Error::Prefix);
         }
         self.group.replay(&prefix)?;

@@ -5,6 +5,7 @@ use logkeeper::ordered::{
     BarrierClaim, Checkpoint, Command, Cut, Fingerprint, Limits, Outcome, Placement, Principal,
     Refusal, Request, RequestId, Window,
 };
+use std::num::NonZeroU64;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -125,13 +126,14 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         panic!("writer was not granted");
     };
 
+    let original_payload = Bytes::from_static(&[0xc7; 2048]);
     let append = request(
         Principal::Worker(first_enrollment),
         Command::Append {
             grant: first_grant,
             expected_next: 0,
             timestamp: 11,
-            payload: Bytes::from_static(b"chosen"),
+            payload: original_payload.clone(),
         },
     );
     let first_append = group.choose(&peers[..2], 4, append.clone()).await.unwrap();
@@ -143,19 +145,23 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     // Discard the in-memory voters after the choice and reopen only two of the
     // original durable identities. The original caller lost its reply.
     peers.clear();
-    let peers: Vec<_> = [1, 2]
-        .into_iter()
-        .map(|index| {
-            let identity = voter_ids[index];
-            let voter =
-                DurableVoter::recover(group.clone(), identity, directories[index].path()).unwrap();
-            let connector = LocalPeer {
-                voter,
-                group: group.identity(),
-            };
-            RemoteVoter::new(&group, identity, connector, DEADLINE).unwrap()
-        })
-        .collect();
+    let reopen = |members: [usize; 2]| {
+        members
+            .into_iter()
+            .map(|index| {
+                let identity = voter_ids[index];
+                let voter =
+                    DurableVoter::recover(group.clone(), identity, directories[index].path())
+                        .unwrap();
+                let connector = LocalPeer {
+                    voter,
+                    group: group.identity(),
+                };
+                RemoteVoter::new(&group, identity, connector, DEADLINE).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let peers = reopen([1, 2]);
 
     let replacement_request = request(
         Principal::Administrator,
@@ -215,6 +221,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         Principal::Worker(second_enrollment),
         Command::Barrier {
             grant: second_grant,
+            nonce: NonZeroU64::MIN,
         },
     );
     barrier_request.id.expires_at = 8;
@@ -222,10 +229,11 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         .choose(&peers, 8, barrier_request.clone())
         .await
         .unwrap();
-    let Outcome::Barrier { grant, read } = barrier.receipt().outcome.unwrap() else {
+    let Outcome::Barrier { grant, nonce, read } = barrier.receipt().outcome.unwrap() else {
         panic!("fresh barrier was refused");
     };
     assert_eq!(grant, second_grant);
+    assert_eq!(nonce, NonZeroU64::MIN);
     assert_eq!(read.through, original.cut);
     assert_eq!(read.checkpoint, seed);
     let claim = barrier.barrier_claim().unwrap();
@@ -237,7 +245,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let records: Vec<_> = replay.records().collect();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].result, original);
-    assert_eq!(records[0].payload, Bytes::from_static(b"chosen"));
+    assert_eq!(records[0].payload, original_payload);
 
     let next = group
         .choose(
@@ -300,6 +308,13 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     };
     let blocked = group.choose(&peers, 12, trim()).await.unwrap();
     assert_eq!(blocked.receipt().outcome, Err(Refusal::Unavailable));
+    let media = directories[1].path().join("ordered.state");
+    let retained = std::fs::read(&media).unwrap();
+    assert!(
+        retained
+            .windows(original_payload.len())
+            .any(|range| range == original_payload.as_ref())
+    );
 
     for (round, hold) in [(13, first_recovery), (14, recovery), (15, read)] {
         let release = request(Principal::Worker(hold.owner), Command::Release { hold });
@@ -320,9 +335,61 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         Err(Refusal::Unavailable)
     ));
     assert_eq!(trimmed.state().spent_bytes(), next.byte_end);
+    let reclaimed = std::fs::read(media).unwrap();
+    assert!(reclaimed.len() < retained.len());
+    assert!(
+        !reclaimed
+            .windows(original_payload.len())
+            .any(|range| range == original_payload.as_ref())
+    );
+
+    drop(peers);
+    let peers = reopen([0, 1]);
     let reopened = group.recover(&peers, 17).await.unwrap();
     assert_eq!(reopened.position(), trimmed.state().position());
+    assert_eq!(
+        reopened.command_history(),
+        trimmed.state().command_history()
+    );
     assert_eq!(reopened.writer_state(), trimmed.state().writer_state());
     assert_eq!(reopened.floor(), published.cut);
     assert_eq!(reopened.window(), window);
+
+    let marker = |nonce| {
+        request(
+            reader,
+            Command::Barrier {
+                grant: second_grant,
+                nonce,
+            },
+        )
+    };
+    let spent = group
+        .choose(&peers, 18, marker(NonZeroU64::MIN))
+        .await
+        .unwrap();
+    assert_eq!(spent.receipt().outcome, Err(Refusal::Stale));
+
+    let pending = marker(NonZeroU64::new(3).unwrap());
+    let ahead = group.choose(&peers, 19, pending.clone()).await.unwrap();
+    assert_eq!(ahead.receipt().outcome, Err(Refusal::ReadPending));
+    let abandoned = group
+        .choose(
+            &peers,
+            20,
+            request(
+                reader,
+                Command::AbandonRead {
+                    grant: second_grant,
+                    nonce: NonZeroU64::new(2).unwrap(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(abandoned.receipt().outcome, Ok(Outcome::ReadAbandoned));
+    let admitted = group.choose(&peers, 21, pending).await.unwrap();
+    let proof = admitted.barrier_claim().unwrap();
+    assert_eq!(proof.nonce().get(), 3);
+    assert_eq!(proof.read().through, published.cut);
 }

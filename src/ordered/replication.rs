@@ -37,6 +37,7 @@ pub struct Group {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prefix {
+    base: Option<Bytes>,
     frames: Vec<Bytes>,
     bytes: usize,
 }
@@ -88,13 +89,14 @@ impl Chosen {
 
     /// Supplies the exact successful application to a scoped receipt issuer.
     pub fn barrier_claim(&self) -> Option<BarrierClaim> {
-        let Outcome::Barrier { grant, read } = self.receipt.outcome.ok()? else {
+        let Outcome::Barrier { grant, nonce, read } = self.receipt.outcome.ok()? else {
             return None;
         };
         self.state.held_replay(self.receipt.principal, read).ok()?;
         Some(BarrierClaim {
             placement: self.receipt.placement,
             grant,
+            nonce,
             read,
         })
     }
@@ -137,6 +139,14 @@ impl Group {
         }
         if roster.len() < 3 || roster.len() % 2 == 0 || max_prefix_bytes == 0 {
             return Err(Refusal::Invalid);
+        }
+        let data_bytes = usize::try_from(window.bytes).map_err(|_| Refusal::Capacity)?;
+        let minimum = limits
+            .base_control_bytes()
+            .and_then(|control| control.checked_add(data_bytes))
+            .ok_or(Refusal::Capacity)?;
+        if max_prefix_bytes < minimum {
+            return Err(Refusal::Capacity);
         }
         let initial = State::new(placement, limits, checkpoint, window)?;
         let mut hash = Sha256::new();
@@ -185,7 +195,12 @@ impl Group {
         if prefix.bytes > self.max_prefix_bytes {
             return Err(Error::Capacity);
         }
-        let mut state = self.initial.clone();
+        let mut state = match &prefix.base {
+            Some(base) => {
+                State::decode_base(&self.initial, base.clone()).map_err(|_| Error::Prefix)?
+            }
+            None => self.initial.clone(),
+        };
         for frame in &prefix.frames {
             let request = Request::decode(frame.clone()).map_err(|_| Error::Prefix)?;
             if request.placement != state.placement() {
@@ -201,9 +216,27 @@ impl Group {
 impl Prefix {
     fn empty() -> Self {
         Self {
+            base: None,
             frames: Vec::new(),
-            bytes: 0,
+            bytes: 1,
         }
+    }
+
+    fn from_base(base: Bytes, limit: usize) -> Result<Self, Error> {
+        let bytes = base
+            .len()
+            .checked_add(9)
+            .filter(|size| *size <= limit)
+            .ok_or(Error::Capacity)?;
+        Ok(Self {
+            base: Some(base),
+            frames: Vec::new(),
+            bytes,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.base.is_none() && self.frames.is_empty()
     }
 
     fn append(&mut self, frame: Bytes, limit: usize) -> Result<(), Error> {
@@ -217,6 +250,11 @@ impl Prefix {
     }
 
     fn encode_into(&self, output: &mut BytesMut) {
+        output.put_u8(u8::from(self.base.is_some()));
+        if let Some(base) = &self.base {
+            output.put_u64(base.len() as u64);
+            output.put_slice(base);
+        }
         for frame in &self.frames {
             output.put_u64(frame.len() as u64);
             output.put_slice(frame);
@@ -227,18 +265,18 @@ impl Prefix {
         if input.len() > limit {
             return Err(Error::Capacity);
         }
-        let mut prefix = Self::empty();
-        while !input.is_empty() {
-            if input.len() < 8 {
-                return Err(Error::Prefix);
-            }
-            let size = usize::try_from(input.get_u64()).map_err(|_| Error::Prefix)?;
-            if size == 0 || size > input.len() {
-                return Err(Error::Prefix);
-            }
-            prefix.append(input.split_to(size), limit)?;
+        if input.is_empty() {
+            return Err(Error::Prefix);
         }
-        if prefix.frames.is_empty() {
+        let mut prefix = match input.get_u8() {
+            0 => Self::empty(),
+            1 => Self::from_base(take_body(&mut input)?, limit)?,
+            _ => return Err(Error::Prefix),
+        };
+        while !input.is_empty() {
+            prefix.append(take_body(&mut input)?, limit)?;
+        }
+        if prefix.is_empty() {
             return Err(Error::Prefix);
         }
         Ok(prefix)
@@ -246,14 +284,30 @@ impl Prefix {
 
     fn identity(&self, group: Fingerprint) -> Fingerprint {
         let mut hash = Sha256::new();
-        hash.update(b"logkeeper.ordered-prefix.v1");
+        hash.update(b"logkeeper.ordered-prefix.v2");
         hash.update(group);
+        hash.update([u8::from(self.base.is_some())]);
+        if let Some(base) = &self.base {
+            hash.update((base.len() as u64).to_be_bytes());
+            hash.update(base);
+        }
         for frame in &self.frames {
             hash.update((frame.len() as u64).to_be_bytes());
             hash.update(frame);
         }
         hash.finalize().into()
     }
+}
+
+fn take_body(input: &mut Bytes) -> Result<Bytes, Error> {
+    if input.len() < 8 {
+        return Err(Error::Prefix);
+    }
+    let size = usize::try_from(input.get_u64()).map_err(|_| Error::Prefix)?;
+    if size == 0 || size > input.len() {
+        return Err(Error::Prefix);
+    }
+    Ok(input.split_to(size))
 }
 
 /// An authenticated endpoint for one voter in the installed cohort.
@@ -286,11 +340,28 @@ impl Group {
     pub async fn recover<R: Replica>(&self, peers: &[R], round: u64) -> Result<State, Error> {
         let (prepared, prefix) = self.prepare(peers, round).await?;
         let state = self.replay(&prefix)?;
-        if !prefix.frames.is_empty() {
+        if !prefix.is_empty() {
             let digest = prefix.identity(self.identity);
             self.confirm(peers, prepared, &prefix, digest).await?;
         }
         Ok(state)
+    }
+
+    /// Rewrites the recovered image as a compact base when that saves bytes.
+    /// Each acknowledging voter atomically replaces its local selected file.
+    pub async fn compact<R: Replica>(&self, peers: &[R], round: u64) -> Result<(), Error> {
+        let (prepared, mut prefix) = self.prepare(peers, round).await?;
+        if !prefix.is_empty() {
+            let state = self.replay(&prefix)?;
+            if let Ok(base) = Prefix::from_base(state.encode_base(), self.max_prefix_bytes)
+                && base.bytes < prefix.bytes
+            {
+                prefix = base;
+            }
+            let digest = prefix.identity(self.identity);
+            self.confirm(peers, prepared, &prefix, digest).await?;
+        }
+        Ok(())
     }
 
     /// Orders one command or returns an uncertain outcome. An identical retry
@@ -312,9 +383,20 @@ impl Group {
             // Re-accept this prefix before releasing its receipt.
             receipt
         } else {
-            prefix.append(request.encode(), self.max_prefix_bytes)?;
+            let frame = request.encode();
             let position = state.position().checked_add(1).ok_or(Error::Capacity)?;
-            state.apply(position, request).map_err(|_| Error::Prefix)?
+            let receipt = state.apply(position, request).map_err(|_| Error::Prefix)?;
+            let appended = prefix.append(frame, self.max_prefix_bytes);
+            if appended.is_err() || matches!(receipt.outcome, Ok(Outcome::Trimmed(_))) {
+                let compact = Prefix::from_base(state.encode_base(), self.max_prefix_bytes);
+                match (appended, compact) {
+                    (Err(_), Ok(base)) => prefix = base,
+                    (Ok(()), Ok(base)) if base.bytes < prefix.bytes => prefix = base,
+                    (Err(error), Err(_)) => return Err(error),
+                    (Ok(()), _) => {}
+                }
+            }
+            receipt
         };
         let ballot = prepared.ballot;
         let digest = prefix.identity(self.identity);

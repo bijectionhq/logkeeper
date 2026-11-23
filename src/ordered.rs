@@ -8,7 +8,9 @@ pub mod replication;
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroU64;
 use uuid::Uuid;
 
 pub type Fingerprint = [u8; 32];
@@ -16,7 +18,7 @@ pub type Fingerprint = [u8; 32];
 // The stream's paid byte cursor includes a fixed charge for each record's
 // identity and framing. The physical store accounts for its own replicas,
 // staging, and metadata in addition to these stream charges.
-const APPEND_RECORD_CHARGE_BYTES: u64 = 64;
+const APPEND_RECORD_CHARGE_BYTES: u64 = 192;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
@@ -108,6 +110,11 @@ pub enum Command {
     },
     Barrier {
         grant: Grant,
+        nonce: NonZeroU64,
+    },
+    AbandonRead {
+        grant: Grant,
+        nonce: NonZeroU64,
     },
     /// The storage owner establishes the exact root and manifest before the
     /// authenticated command can be chosen.
@@ -138,6 +145,7 @@ pub struct Request {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendResult {
+    pub position: u64,
     pub lsn: u64,
     pub cut: Cut,
     pub allocation: Uuid,
@@ -149,9 +157,17 @@ pub struct AppendResult {
 pub enum Outcome {
     Enrolled(Enrollment),
     Withdrawn,
-    Granted { grant: Grant, recovery: Hold },
+    Granted {
+        grant: Grant,
+        recovery: Hold,
+    },
     Appended(AppendResult),
-    Barrier { grant: Grant, read: Hold },
+    Barrier {
+        grant: Grant,
+        nonce: NonZeroU64,
+        read: Hold,
+    },
+    ReadAbandoned,
     Published(Checkpoint),
     Protected(Hold),
     Released,
@@ -168,6 +184,7 @@ pub enum Refusal {
     Expired,
     Capacity,
     Unavailable,
+    ReadPending,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +201,7 @@ pub struct Receipt {
 pub struct BarrierClaim {
     placement: Placement,
     grant: Grant,
+    nonce: NonZeroU64,
     read: Hold,
 }
 
@@ -198,6 +216,10 @@ impl BarrierClaim {
 
     pub fn read(self) -> Hold {
         self.read
+    }
+
+    pub fn nonce(self) -> NonZeroU64 {
+        self.nonce
     }
 }
 
@@ -268,10 +290,12 @@ pub struct State {
     placement: Placement,
     limits: Limits,
     position: u64,
+    command_history: Fingerprint,
     writer_epoch: u64,
     enrollment_serial: u64,
     roster: BTreeMap<Uuid, Enrollment>,
     grant: Option<Grant>,
+    read_floor: u64,
     window: Window,
     spent: u64,
     floor: Cut,
@@ -308,10 +332,12 @@ impl State {
             placement,
             limits,
             position: 0,
+            command_history: [0; 32],
             writer_epoch: 0,
             enrollment_serial: 0,
             roster: BTreeMap::new(),
             grant: None,
+            read_floor: 0,
             window,
             spent: 0,
             floor: checkpoint.cut,
@@ -329,6 +355,9 @@ impl State {
     }
     pub fn position(&self) -> u64 {
         self.position
+    }
+    pub fn command_history(&self) -> Fingerprint {
+        self.command_history
     }
     pub fn writer_state(&self) -> WriterState {
         WriterState {
@@ -433,6 +462,8 @@ impl State {
             return Err(ApplyError::Position);
         }
         self.position = position;
+        let fingerprint = fingerprint(&request);
+        self.command_history = extend_command_history(self.command_history, position, fingerprint);
         while let Some((&(until, key), _)) = self.expiry.first_key_value() {
             if until > position {
                 break;
@@ -463,7 +494,6 @@ impl State {
             return Ok(receipt(Err(Refusal::Invalid)));
         }
         let key = (principal, id);
-        let fingerprint = fingerprint(&request);
         if let Some(previous) = self.outcomes.get(&key) {
             return Ok(if previous.fingerprint == fingerprint {
                 previous.receipt
@@ -477,7 +507,15 @@ impl State {
         if id.expires_at - position > self.limits.retry_positions {
             return Ok(receipt(Err(Refusal::Invalid)));
         }
+        let reading = matches!(&request.command, Command::Barrier { .. });
         let receipt = receipt(self.decide(principal, id, fingerprint, request.command));
+        if receipt.outcome == Err(Refusal::ReadPending)
+            || (reading && receipt.outcome == Err(Refusal::Capacity))
+        {
+            // A blocked admission has taken neither the nonce nor a hold.
+            // The same request can still acquire them once the condition clears.
+            return Ok(receipt);
+        }
         self.outcomes.insert(
             key,
             RetainedOutcome {
@@ -497,6 +535,21 @@ impl State {
             return Err(Refusal::Stale);
         }
         Ok(())
+    }
+
+    fn next_read(
+        &self,
+        principal: Principal,
+        grant: Grant,
+        nonce: NonZeroU64,
+    ) -> Result<(), Refusal> {
+        self.writer(principal, grant)?;
+        let expected = self.read_floor.checked_add(1).ok_or(Refusal::Stale)?;
+        match nonce.get().cmp(&expected) {
+            Ordering::Equal => Ok(()),
+            Ordering::Less => Err(Refusal::Stale),
+            Ordering::Greater => Err(Refusal::ReadPending),
+        }
     }
 
     fn cut(&self, next_lsn: u64) -> Option<Cut> {
@@ -608,6 +661,7 @@ impl State {
                 let recovery = self.protect(principal, id, candidate, self.head)?;
                 self.writer_epoch = epoch;
                 self.grant = Some(grant);
+                self.read_floor = 0;
                 Ok(Outcome::Granted { grant, recovery })
             }
             Command::Append {
@@ -634,6 +688,7 @@ impl State {
                 let history = append_fingerprint(self.head, grant, id, timestamp, &payload);
                 let cut = Cut { next_lsn, history };
                 let result = AppendResult {
+                    position: self.position,
                     lsn: expected_next,
                     cut,
                     allocation: self.window.allocation,
@@ -652,10 +707,16 @@ impl State {
                 self.spent = byte_end;
                 Ok(Outcome::Appended(result))
             }
-            Command::Barrier { grant } => {
-                self.writer(principal, grant)?;
+            Command::Barrier { grant, nonce } => {
+                self.next_read(principal, grant, nonce)?;
                 let read = self.protect(principal, id, grant.enrollment, self.head)?;
-                Ok(Outcome::Barrier { grant, read })
+                self.read_floor = nonce.get();
+                Ok(Outcome::Barrier { grant, nonce, read })
+            }
+            Command::AbandonRead { grant, nonce } => {
+                self.next_read(principal, grant, nonce)?;
+                self.read_floor = nonce.get();
+                Ok(Outcome::ReadAbandoned)
             }
             Command::Publish { grant, checkpoint } => {
                 self.writer(principal, grant)?;
@@ -750,5 +811,18 @@ fn fingerprint(request: &Request) -> Fingerprint {
     let mut hash = Sha256::new();
     hash.update(b"logkeeper.ordered-request.v1");
     hash.update(request.encode());
+    hash.finalize().into()
+}
+
+fn extend_command_history(
+    previous: Fingerprint,
+    position: u64,
+    request: Fingerprint,
+) -> Fingerprint {
+    let mut hash = Sha256::new();
+    hash.update(b"logkeeper.ordered-history.v1");
+    hash.update(previous);
+    hash.update(position.to_be_bytes());
+    hash.update(request);
     hash.finalize().into()
 }

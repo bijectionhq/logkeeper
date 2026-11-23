@@ -3,7 +3,10 @@ use super::{
     Principal, Refusal, Request, RequestId, WriterState,
 };
 use bytes::{BufMut, Bytes, BytesMut};
+use std::num::NonZeroU64;
 use uuid::Uuid;
+
+mod snapshot;
 
 const VERSION: u8 = 1;
 const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR01";
@@ -14,13 +17,7 @@ impl Request {
         let mut output = BytesMut::new();
         output.put_u8(VERSION);
         placement(&mut output, self.placement);
-        match self.principal {
-            Principal::Administrator => output.put_u8(0),
-            Principal::Worker(worker) => {
-                output.put_u8(1);
-                enrollment(&mut output, worker);
-            }
-        }
+        principal(&mut output, self.principal);
         request_id(&mut output, self.id);
         match &self.command {
             Command::Enroll { worker, expected } => {
@@ -40,11 +37,7 @@ impl Request {
                 candidate,
             } => {
                 output.put_u8(2);
-                output.put_u64(expected.epoch);
-                output.put_u8(u8::from(expected.grant.is_some()));
-                if let Some(expected) = expected.grant {
-                    grant(&mut output, expected);
-                }
+                writer_state(&mut output, *expected);
                 enrollment(&mut output, *candidate);
             }
             Command::Append {
@@ -59,9 +52,21 @@ impl Request {
                 output.put_i64(*timestamp);
                 output.put_slice(payload);
             }
-            Command::Barrier { grant: writer } => {
+            Command::Barrier {
+                grant: writer,
+                nonce,
+            } => {
                 output.put_u8(4);
                 grant(&mut output, *writer);
+                output.put_u64(nonce.get());
+            }
+            Command::AbandonRead {
+                grant: writer,
+                nonce,
+            } => {
+                output.put_u8(9);
+                grant(&mut output, *writer);
+                output.put_u64(nonce.get());
             }
             Command::Publish {
                 grant: writer,
@@ -89,11 +94,7 @@ impl Request {
             }
             Command::Release { hold } => {
                 output.put_u8(7);
-                request_id(&mut output, hold.id);
-                enrollment(&mut output, hold.owner);
-                output.put_u64(hold.admitted_at);
-                checkpoint(&mut output, hold.checkpoint);
-                cut(&mut output, hold.through);
+                hold_row(&mut output, *hold);
             }
         }
         output.freeze()
@@ -107,11 +108,7 @@ impl Request {
             return Err(Refusal::Invalid);
         }
         let placement = input.placement()?;
-        let principal = match input.read_byte()? {
-            0 => Principal::Administrator,
-            1 => Principal::Worker(input.enrollment()?),
-            _ => return Err(Refusal::Invalid),
-        };
+        let principal = input.principal()?;
         let id = input.request_id()?;
         let command = match input.read_byte()? {
             0 => Command::Enroll {
@@ -122,10 +119,7 @@ impl Request {
                 enrollment: input.enrollment()?,
             },
             2 => Command::Grant {
-                expected: WriterState {
-                    epoch: input.u64()?,
-                    grant: input.optional(Input::grant)?,
-                },
+                expected: input.writer_state()?,
                 candidate: input.enrollment()?,
             },
             3 => Command::Append {
@@ -136,6 +130,7 @@ impl Request {
             },
             4 => Command::Barrier {
                 grant: input.grant()?,
+                nonce: input.nonce()?,
             },
             5 => Command::Publish {
                 grant: input.grant()?,
@@ -146,17 +141,15 @@ impl Request {
                 through: input.cut()?,
             },
             7 => Command::Release {
-                hold: Hold {
-                    id: input.request_id()?,
-                    owner: input.enrollment()?,
-                    admitted_at: input.u64()?,
-                    checkpoint: input.checkpoint()?,
-                    through: input.cut()?,
-                },
+                hold: input.hold()?,
             },
             8 => Command::Trim {
                 grant: input.grant()?,
                 through: input.cut()?,
+            },
+            9 => Command::AbandonRead {
+                grant: input.grant()?,
+                nonce: input.nonce()?,
             },
             _ => return Err(Refusal::Invalid),
         };
@@ -179,6 +172,7 @@ impl BarrierClaim {
         output.put_slice(BARRIER_DOMAIN);
         placement(&mut output, self.placement);
         grant(&mut output, self.grant);
+        output.put_u64(self.nonce.get());
         request_id(&mut output, self.read.id);
         output.put_u64(self.read.admitted_at);
         checkpoint(&mut output, self.read.checkpoint);
@@ -195,6 +189,7 @@ impl BarrierClaim {
         }
         let placement = input.placement()?;
         let grant = input.grant()?;
+        let nonce = input.nonce()?;
         let id = input.request_id()?;
         let admitted_at = input.u64()?;
         let checkpoint = input.checkpoint()?;
@@ -210,6 +205,7 @@ impl BarrierClaim {
         Ok(Self {
             placement,
             grant,
+            nonce,
             read: Hold {
                 id,
                 owner: grant.enrollment,
@@ -245,11 +241,23 @@ impl Input {
         Ok(u64::from_be_bytes(self.take()?))
     }
 
+    fn nonce(&mut self) -> Result<NonZeroU64, Refusal> {
+        NonZeroU64::new(self.u64()?).ok_or(Refusal::Invalid)
+    }
+
     fn request_id(&mut self) -> Result<RequestId, Refusal> {
         Ok(RequestId {
             nonce: self.uuid()?,
             expires_at: self.u64()?,
         })
+    }
+
+    fn principal(&mut self) -> Result<Principal, Refusal> {
+        match self.read_byte()? {
+            0 => Ok(Principal::Administrator),
+            1 => Ok(Principal::Worker(self.enrollment()?)),
+            _ => Err(Refusal::Invalid),
+        }
     }
 
     fn placement(&mut self) -> Result<Placement, Refusal> {
@@ -272,6 +280,23 @@ impl Input {
         Ok(Grant {
             enrollment: self.enrollment()?,
             epoch: self.u64()?,
+        })
+    }
+
+    fn writer_state(&mut self) -> Result<WriterState, Refusal> {
+        Ok(WriterState {
+            epoch: self.u64()?,
+            grant: self.optional(Self::grant)?,
+        })
+    }
+
+    fn hold(&mut self) -> Result<Hold, Refusal> {
+        Ok(Hold {
+            id: self.request_id()?,
+            owner: self.enrollment()?,
+            admitted_at: self.u64()?,
+            checkpoint: self.checkpoint()?,
+            through: self.cut()?,
         })
     }
 
@@ -310,6 +335,16 @@ fn request_id(output: &mut BytesMut, value: RequestId) {
     output.put_u64(value.expires_at);
 }
 
+fn principal(output: &mut BytesMut, value: Principal) {
+    match value {
+        Principal::Administrator => output.put_u8(0),
+        Principal::Worker(worker) => {
+            output.put_u8(1);
+            enrollment(output, worker);
+        }
+    }
+}
+
 fn placement(output: &mut BytesMut, value: Placement) {
     uuid(output, value.deployment);
     uuid(output, value.incarnation);
@@ -325,6 +360,22 @@ fn enrollment(output: &mut BytesMut, value: Enrollment) {
 fn grant(output: &mut BytesMut, value: Grant) {
     enrollment(output, value.enrollment);
     output.put_u64(value.epoch);
+}
+
+fn writer_state(output: &mut BytesMut, value: WriterState) {
+    output.put_u64(value.epoch);
+    output.put_u8(u8::from(value.grant.is_some()));
+    if let Some(authority) = value.grant {
+        grant(output, authority);
+    }
+}
+
+fn hold_row(output: &mut BytesMut, value: Hold) {
+    request_id(output, value.id);
+    enrollment(output, value.owner);
+    output.put_u64(value.admitted_at);
+    checkpoint(output, value.checkpoint);
+    cut(output, value.through);
 }
 
 fn cut(output: &mut BytesMut, value: Cut) {

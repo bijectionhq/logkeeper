@@ -52,7 +52,8 @@ channel and its replay API returns the exact journal interval of a live hold.
 Callers establish coordinator identity, worker enrollment and checkpoint custody
 at the integration boundary.
 
-The standalone daemon still serves the original protocol. The ordered
-implementation persists the accepted command prefix in full. Trim advances
-the logical replay floor. Physical reclamation, replenishment of paid append
-windows and cohort repair require their own installed-group protocols.
+The standalone daemon still serves the original protocol.
+The ordered implementation can compact an accepted prefix into a bounded recovery base.
+A voter replaces its local selected file atomically and confirms the exact selected image after syncing it.
+Running voters can reclaim payloads below the authorized trim floor from their selected files.
+Replenishment of paid append windows and repair of unavailable cohort members require their own installed-group protocols.
