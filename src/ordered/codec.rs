@@ -625,3 +625,115 @@ impl Input {
         Ok(item)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(command: Command) -> Request {
+        Request {
+            placement: Placement {
+                deployment: Uuid::from_u128(1),
+                incarnation: Uuid::from_u128(2),
+                group: Uuid::from_u128(3),
+                generation: 1,
+            },
+            principal: Principal::Administrator,
+            id: RequestId {
+                nonce: Uuid::from_u128(4),
+                expires_at: 10,
+            },
+            command,
+        }
+    }
+
+    #[test]
+    fn fixed_enroll_command_and_decision_reject_every_prefix_and_an_extra_byte() {
+        let command = request(Command::Enroll {
+            worker: Uuid::from_u128(5),
+            expected: None,
+        });
+        let time = 0x0123_4567_89ab_cdef;
+        let request_frame = command.encode();
+        let decision_frame = encode_decision(time, &command);
+        assert_eq!(Request::decode(request_frame.clone()).unwrap(), command);
+        assert_eq!(
+            decode_decision(decision_frame.clone()).unwrap(),
+            (time, command)
+        );
+        for end in 0..request_frame.len() {
+            assert_eq!(
+                Request::decode(request_frame.slice(..end)),
+                Err(Refusal::Invalid)
+            );
+        }
+        for end in 0..decision_frame.len() {
+            assert_eq!(
+                decode_decision(decision_frame.slice(..end)),
+                Err(Refusal::Invalid)
+            );
+        }
+        let mut extra = request_frame.to_vec();
+        extra.push(0);
+        assert_eq!(Request::decode(extra.into()), Err(Refusal::Invalid));
+        let mut extra = decision_frame.to_vec();
+        extra.push(0);
+        assert_eq!(decode_decision(extra.into()), Err(Refusal::Invalid));
+
+        let mut invalid_marker = request_frame.to_vec();
+        *invalid_marker.last_mut().unwrap() = 2;
+        assert_eq!(
+            Request::decode(invalid_marker.into()),
+            Err(Refusal::Invalid)
+        );
+    }
+
+    #[test]
+    fn append_payload_uses_all_remaining_command_and_decision_bytes() {
+        let append = |payload: &'static [u8]| {
+            let enrollment = Enrollment {
+                worker: Uuid::from_u128(5),
+                serial: 1,
+            };
+            let mut request = request(Command::Append {
+                class: AppendClass::Data,
+                grant: Grant {
+                    enrollment,
+                    epoch: 1,
+                    key_generation: 1,
+                },
+                expected_next: 0,
+                timestamp: 7,
+                payload: Bytes::from_static(payload),
+                references: None,
+            });
+            request.principal = Principal::Worker(enrollment);
+            request
+        };
+        let short = append(b"a");
+        let original = append(b"ab");
+        let long = append(b"abc");
+        let time = 17;
+        let frame = original.encode();
+        let decision = encode_decision(time, &original);
+
+        let short_frame = frame.slice(..frame.len() - 1);
+        let short_decision = decision.slice(..decision.len() - 1);
+        assert_eq!(short_frame, short.encode());
+        assert_eq!(short_decision, encode_decision(time, &short));
+        assert_eq!(Request::decode(short_frame).unwrap(), short);
+        assert_eq!(decode_decision(short_decision).unwrap(), (time, short));
+
+        let mut extra = frame.to_vec();
+        extra.push(b'c');
+        let mut extra_decision = decision.to_vec();
+        extra_decision.push(b'c');
+        assert_eq!(extra, long.encode());
+        assert_eq!(extra_decision, encode_decision(time, &long));
+        assert_eq!(Request::decode(extra.into()).unwrap(), long);
+        assert_eq!(
+            decode_decision(extra_decision.into()).unwrap(),
+            (time, long)
+        );
+    }
+}

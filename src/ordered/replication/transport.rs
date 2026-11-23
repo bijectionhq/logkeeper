@@ -328,3 +328,67 @@ fn timed_out(_: tokio::time::error::Elapsed) -> Error {
         "ordered voter exchange timed out",
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ReplyBytes(Vec<u8>);
+
+    impl Connector for ReplyBytes {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn connect(&self, _: Fingerprint, _: Uuid) -> Result<Self::Stream, Error> {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let reply = self.0.clone();
+            tokio::spawn(async move {
+                check_magic(&mut server).await.unwrap();
+                assert_eq!(server.read_u8().await.unwrap(), ACCEPT);
+                read_array::<32>(&mut server).await.unwrap();
+                read_ballot(&mut server).await.unwrap();
+                assert_eq!(server.read_u8().await.unwrap(), 0);
+                read_prefix(&mut server, 64).await.unwrap();
+                server.write_all(&reply).await.unwrap();
+            });
+            Ok(client)
+        }
+    }
+
+    #[tokio::test]
+    async fn vote_reader_leaves_trailing_bytes_and_slot_validation_to_its_caller() {
+        let group = [1; 32];
+        let voter = Uuid::from_u128(1);
+        let ballot = Ballot {
+            round: 1,
+            nonce: Uuid::from_u128(2),
+        };
+        let prefix = Prefix::from_base(Bytes::from_static(b"compact image"), 64).unwrap();
+        for selected in [1, 2] {
+            let mut response = Vec::new();
+            response_header(&mut response, VOTE, voter, ballot)
+                .await
+                .unwrap();
+            response.write_all(&[2; 32]).await.unwrap();
+            response.write_u8(0).await.unwrap();
+            response.write_u8(selected).await.unwrap();
+            for generation in [1, 2] {
+                response.write_u64(generation).await.unwrap();
+                response
+                    .write_all(&[generation as u8; 32])
+                    .await
+                    .unwrap();
+            }
+            response.push(0xff);
+            let remote = RemoteVoter {
+                connector: ReplyBytes(response),
+                group,
+                voter,
+                max_prefix_bytes: 64,
+                deadline: Duration::from_secs(5),
+            };
+            let vote = remote.accept(group, ballot, &prefix, false).await.unwrap();
+            assert_eq!(vote.slots.selected, selected);
+            assert_eq!(vote.slots.is_mirrored(), selected == 1);
+        }
+    }
+}

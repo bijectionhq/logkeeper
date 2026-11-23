@@ -1537,3 +1537,190 @@ fn exact_withdrawal_orders_against_the_retained_tail_preparation_and_held_root()
         Ok(Outcome::ObjectWithdrawn(fence))
     );
 }
+
+fn codec_initial_state() -> State {
+    State::new(
+        Placement {
+            deployment: Uuid::from_u128(1),
+            incarnation: Uuid::from_u128(2),
+            group: Uuid::from_u128(3),
+            generation: 1,
+        },
+        Limits {
+            enrolled_workers: 1,
+            replay_holds: 3,
+            retry_positions: 4,
+            retained_data_bytes: 8192,
+            maintenance_bytes: 4096,
+            serving_lease: 1000,
+            clock_drift: 100,
+        },
+        Checkpoint {
+            cut: Cut {
+                next_lsn: 0,
+                history: [1; 32],
+            },
+            root: [0; 32],
+            manifest: [0; 32],
+            custody: Custody {
+                allocation: Uuid::from_u128(4),
+                revision: 1,
+                provider: [0; 32],
+            },
+        },
+        Window {
+            allocation: Uuid::from_u128(5),
+            serial: 1,
+            bytes: 4096,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn compact_image_accepts_explicit_empty_object_control() {
+    let initial = codec_initial_state();
+    let mut state = initial.clone();
+    enroll(&mut state);
+    let canonical = state.encode_base();
+    assert_eq!(
+        State::decode_base(&initial, canonical.clone())
+            .unwrap()
+            .encode_base(),
+        canonical
+    );
+
+    let mut explicit = canonical.to_vec();
+    explicit.extend_from_slice(&0u64.to_be_bytes());
+    assert!(matches!(
+        State::decode_base(&initial, explicit.clone().into()),
+        Err(Refusal::Invalid)
+    ));
+    explicit.extend_from_slice(&0u64.to_be_bytes());
+    let decoded = State::decode_base(&initial, explicit.clone().into()).unwrap();
+    assert_ne!(decoded.encode_base().as_ref(), explicit.as_slice());
+    assert_eq!(decoded.encode_base(), canonical);
+}
+
+#[test]
+fn compact_image_accepts_reordered_old_roots_but_rejects_duplicate_revisions() {
+    let initial = codec_initial_state();
+    let mut state = initial.clone();
+    let enrollment = enroll(&mut state);
+    let worker = Principal::Worker(enrollment);
+    let custodian = Principal::Custodian;
+    let (writer, startup) = grant(&mut state, enrollment);
+    assert_eq!(
+        apply(&mut state, worker, Command::Release { hold: startup }).outcome,
+        Ok(Outcome::Released)
+    );
+
+    let checkpoints = [2, 3, 4].map(|revision| {
+        let next = state.head().next_lsn;
+        let appended = apply(
+            &mut state,
+            worker,
+            Command::Append {
+                class: AppendClass::Data,
+                grant: writer,
+                expected_next: next,
+                timestamp: 0,
+                payload: Bytes::from_static(b"checkpoint boundary"),
+                references: None,
+            },
+        );
+        assert!(matches!(appended.outcome, Ok(Outcome::Appended(_))));
+        let checkpoint = Checkpoint {
+            cut: state.head(),
+            root: [1; 32],
+            manifest: [2; 32],
+            custody: Custody {
+                allocation: Uuid::from_u128(revision as u128),
+                revision,
+                provider: [3; 32],
+            },
+        };
+        let preparation = CheckpointPreparation {
+            erasure: false,
+            checkpoint: checkpoint.cut,
+            root: checkpoint.root,
+            source: writer,
+            base: state.checkpoint(),
+            custody: checkpoint.custody,
+            usable_bytes: 4096,
+            descriptor: [4; 32],
+        };
+        assert_eq!(
+            apply(
+                &mut state,
+                custodian,
+                Command::PrepareCheckpoint {
+                    preparation,
+                    references: None,
+                },
+            )
+            .outcome,
+            Ok(Outcome::CheckpointPrepared(preparation))
+        );
+        assert_eq!(
+            apply(&mut state, custodian, Command::Publish { checkpoint }).outcome,
+            Ok(Outcome::Published(checkpoint))
+        );
+        checkpoint
+    });
+
+    let canonical = state.encode_base();
+    let cut_bytes = |checkpoint: Checkpoint| {
+        let mut cut = checkpoint.cut.next_lsn.to_be_bytes().to_vec();
+        cut.extend_from_slice(&checkpoint.cut.history);
+        cut
+    };
+    const ROOT_ROW_BYTES: usize = 160 + 1;
+    let first = cut_bytes(checkpoints[0]);
+    let start = canonical
+        .windows(first.len())
+        .position(|bytes| bytes == first)
+        .unwrap();
+    let middle = start + ROOT_ROW_BYTES;
+    let end = middle + ROOT_ROW_BYTES;
+    assert!(canonical[middle..].starts_with(&cut_bytes(checkpoints[1])));
+    let mut reordered = canonical.to_vec();
+    reordered[start..end].rotate_left(ROOT_ROW_BYTES);
+    assert_ne!(&reordered[..], canonical.as_ref());
+    assert_eq!(
+        State::decode_base(&initial, reordered.into())
+            .unwrap()
+            .encode_base(),
+        canonical
+    );
+
+    let mut duplicate = canonical.to_vec();
+    duplicate[middle..end].copy_from_slice(&canonical[start..middle]);
+    assert!(matches!(
+        State::decode_base(&initial, duplicate.into()),
+        Err(Refusal::Invalid)
+    ));
+}
+
+#[test]
+fn compact_image_rejects_a_hold_without_its_exact_admission_receipt() {
+    let initial = codec_initial_state();
+    let mut valid = initial.clone();
+    let enrollment = enroll(&mut valid);
+    let (_, startup) = grant(&mut valid, enrollment);
+    assert!(State::decode_base(&initial, valid.encode_base()).is_ok());
+
+    let key = (Principal::Worker(enrollment), startup.id);
+    let mut missing = valid.clone();
+    assert!(missing.outcomes.remove(&key).is_some());
+    assert!(matches!(
+        State::decode_base(&initial, missing.encode_base()),
+        Err(Refusal::Invalid)
+    ));
+
+    valid.outcomes.get_mut(&key).unwrap().receipt.outcome = Ok(Outcome::Released);
+    assert!(matches!(
+        State::decode_base(&initial, valid.encode_base()),
+        Err(Refusal::Invalid)
+    ));
+}
