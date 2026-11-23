@@ -1,4 +1,6 @@
-use crate::production::{Authority, Cut, append_next, authorize, commit_append, drain_prefix, next_epoch};
+use crate::production::{Authority, Cut, append_next, authorize, commit_append, next_epoch};
+use crate::retention::{trim_records, trimCredit, well_formed_debits};
+use crate::AppendClass;
 use std::collections::VecDeque;
 use vstd::laws_eq::obeys_concrete_eq;
 use vstd::prelude::*;
@@ -126,16 +128,19 @@ pub fn applied_append_extends_history<G, R>(
     }
 }
 
-pub fn trim_keeps_the_logical_history<G, R, A, F: Fn(A, R) -> A>(
-    records: &mut VecDeque<R>, count: usize, initial: A, accumulate: F,
+pub fn trim_keeps_the_logical_history<G, R, P: Fn(&R) -> (AppendClass, u64, u64)>(
+    records: &mut VecDeque<R>, count: usize, ordinary: &mut u64, maintenance: &mut u64,
+    project: P, debit: Ghost<Map<R, (AppendClass, u64, u64)>>,
     Ghost(compacted): Ghost<Seq<R>>, Ghost(grant): Ghost<Option<G>>, Ghost(previous): Ghost<G>,
 )
     requires count <= old(records)@.len(),
-        forall|value: A, record: R| accumulate.requires((value, record)),
+        well_formed_debits(project, debit@, old(records)@),
+        (*old(ordinary) as nat, *old(maintenance) as nat)
+            == trimCredit(old(records)@, old(records)@.len(), debit@),
 {
     let ghost original = records@;
     let ghost before = abstract_state(grant, previous, compacted, original);
-    let _ = drain_prefix(records, count, initial, accumulate);
+    let _ = trim_records(records, count, ordinary, maintenance, project, debit);
     let ghost newly_compacted = compacted + original.take(count as int);
     assert(abstract_state(grant, previous, newly_compacted, records@) =~= before);
 }

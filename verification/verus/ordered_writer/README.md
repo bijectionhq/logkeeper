@@ -50,12 +50,12 @@ trace-level history and fencing results.
 This table records a source inspection of the command dispatcher. The Verus
 entry point covers the imported operations and their composition laws. The
 complete dispatcher proof, its grant and LSN argument wiring, and establishment
-of the trace witnesses by compact-image decoding remain open. Trim's fold
-callback is used for accounting. The verified property of the deque operation
-is removal of the exact prefix.
+of the trace witnesses by compact-image decoding remain open. The history law
+uses `retention::trim_records`, whose queue and credit contracts are verified
+over the same shipped source in the [ordered trim area](../ordered_trim/README.md).
 
 The runner declares and checks controls for ignoring the grant epoch, skipping
 an LSN, reusing an epoch, failing to withdraw or vacate, prepending an append,
-and trimming from the tail. The shared
+and trimming an extra record from the tail. The shared
 [correspondence check](../../lean/run_ordered_correspondence.py) compares Lean
 evaluation with Verus specs on boundary cases.

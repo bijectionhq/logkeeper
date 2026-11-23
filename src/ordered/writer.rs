@@ -116,36 +116,3 @@ pub(super) fn commit_append<R>(records: &mut VecDeque<R>, head: &mut Cut, record
     records.push_back(record);
     *head = cut;
 }
-
-#[cfg_attr(verus_keep_ghost, verus_spec(
-    requires count <= old(records)@.len(),
-        forall|value: A, record: R| accumulate.requires((value, record)),
-    ensures final(records)@ == old(records)@.skip(count as int),
-))]
-pub(super) fn drain_prefix<R, A, F: Fn(A, R) -> A>(
-    records: &mut VecDeque<R>,
-    count: usize,
-    mut accumulated: A,
-    accumulate: F,
-) -> A {
-    assert!(count <= records.len());
-    #[cfg(verus_keep_ghost)]
-    proof_decl! { let ghost original = records@; }
-    let mut removed = 0;
-    #[cfg_attr(verus_keep_ghost, verus_spec(
-        invariant removed <= count <= original.len(),
-            records@ == original.skip(removed as int),
-            forall|value: A, record: R| accumulate.requires((value, record)),
-        decreases count - removed,
-    ))]
-    while removed < count {
-        let record = records
-            .pop_front()
-            .expect("trim prefix checked against record count");
-        accumulated = accumulate(accumulated, record);
-        removed += 1;
-        #[cfg(verus_keep_ghost)]
-        proof! { assert(records@ =~= original.skip(removed as int)); }
-    }
-    accumulated
-}
