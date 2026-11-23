@@ -60,7 +60,9 @@ Peer certificates used for voter traffic have no worker or custodian role in tha
 Application clients retain the installed route and receipt verification keys independently of the serving daemon.
 
 The ordered implementation can compact an accepted prefix into a bounded recovery base.
-A voter replaces its local selected file atomically and confirms the exact selected image after syncing it.
-Running voters can reclaim payloads below the authorized trim floor from their selected files.
+Provisioning reserves two durable slots per voter and group.
+To select a new slot the voter syncs its exact body before the generation header, leaving the prior selected slot intact until both steps finish.
+Reusing a slot clears residual bytes from its previous body.
+An installed voter needs a filesystem that honours file preallocation and the configured durability barriers.
 Ordered window renewal preserves historical window identities and installs a fresh byte cursor.
 The embedding service still needs physical capacity admission and repair of unavailable cohort members.
