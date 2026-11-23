@@ -131,7 +131,7 @@ def main():
         scratch = Path(scratch_path)
         sources = scratch / "src/ordered"
         sources.mkdir(parents=True)
-        for name in ("writer.rs", "receipt.rs", "admission.rs"):
+        for name in ("writer.rs", "refusal.rs", "receipt.rs", "admission.rs"):
             shutil.copyfile(REPO / "src/ordered" / name, sources / name)
         for area, (namespace, cases) in CASES.items():
             check_area(lake, verus, scratch, area, namespace, cases)

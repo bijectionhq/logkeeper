@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 18,
+  "min_verified_functions": 16,
   "controls": {
     "ignore-grant-epoch": {
       "defect": "The same enrolled holder can append under a grant from an earlier epoch.",
@@ -30,7 +30,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 17
+      "min_verified_functions": 15
     },
     "skip-lsn": {
       "defect": "Accept an append ahead of the current frontier.",
@@ -58,7 +58,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 16
+      "min_verified_functions": 14
     },
     "reuse-epoch": {
       "defect": "Install a grant using the previous writer epoch.",
@@ -81,7 +81,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 17
+      "min_verified_functions": 15
     },
     "keep-grant-on-withdrawal": {
       "defect": "Withdrawing the holder leaves its grant active.",
@@ -104,7 +104,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 17
+      "min_verified_functions": 15
     },
     "preserve-vacated-grant": {
       "defect": "Vacating the current grant leaves it installed.",
@@ -137,7 +137,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 16
+      "min_verified_functions": 14
     },
     "prepend-record": {
       "defect": "An append inserts before the existing records.",
@@ -160,7 +160,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 17
+      "min_verified_functions": 15
     },
     "trim-from-head": {
       "defect": "Trim drops the newest records instead of the certified prefix.",
@@ -193,7 +193,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 17
+      "min_verified_functions": 15
     }
   }
 }

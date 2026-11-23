@@ -2,24 +2,12 @@
 
 use std::collections::VecDeque;
 
+use super::Refusal;
+
 #[cfg(verus_keep_ghost)]
 use vstd::laws_eq::obeys_concrete_eq;
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
-
-#[derive(Clone, Copy)]
-#[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
-pub enum Refusal {
-    WrongPlacement,
-    Unauthorized,
-    Stale,
-    Conflict,
-    Invalid,
-    Expired,
-    Capacity,
-    Unavailable,
-    CohortSealed,
-}
 
 /// An exclusive data frontier and the identity of the prefix before it.
 #[derive(Clone, Copy)]

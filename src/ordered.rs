@@ -6,11 +6,15 @@
 #[cfg(test)]
 mod acceptance;
 mod admission;
+mod budget;
 mod codec;
 #[cfg(feature = "ordered-daemon")]
 pub mod daemon;
+mod object_withdrawal;
 mod receipt;
+mod refusal;
 pub mod replication;
+mod retention;
 pub mod service;
 mod writer;
 
@@ -23,25 +27,10 @@ use uuid::Uuid;
 
 pub type Fingerprint = [u8; 32];
 
-/// Fixed stream charge for each record's identity and framing. Replica media
-/// also budget for staging and their own metadata.
-pub const APPEND_RECORD_CHARGE_BYTES: u64 = 217;
+pub use budget::{APPEND_RECORD_CHARGE_BYTES, AppendClass};
+pub use refusal::Refusal;
+
 const ACTIVATION_HOLD_SLOTS: usize = 4;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AppendClass {
-    Data,
-    Maintenance,
-}
-
-impl AppendClass {
-    fn tag(self) -> u8 {
-        match self {
-            Self::Data => 0,
-            Self::Maintenance => 1,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
@@ -88,7 +77,7 @@ pub struct WriterState {
     pub grant: Option<Grant>,
 }
 
-pub use writer::{Cut, Refusal};
+pub use writer::Cut;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
@@ -1079,24 +1068,16 @@ impl State {
                 let next_lsn = writer::append_next(self.head.next_lsn, expected_next)?;
                 self.admit_object_references(references.as_deref())?;
                 let bytes = record_charge(payload.len(), references.as_deref())?;
-                let (byte_start, byte_end) = match class {
-                    AppendClass::Data => (
-                        self.spent,
-                        admission::debit(self.spent, bytes, self.window.bytes)
-                            .ok_or(Refusal::Capacity)?,
-                    ),
-                    AppendClass::Maintenance => (0, bytes),
-                };
-                let retained_bytes = match class {
-                    AppendClass::Data => {
-                        admission::debit(self.retained_bytes, bytes, self.ordinary_capacity())
-                    }
-                    AppendClass::Maintenance => admission::debit(
-                        self.maintenance_retained,
-                        bytes,
-                        self.limits.maintenance_bytes,
-                    ),
-                }
+                let debit = budget::append_debit(
+                    class,
+                    bytes,
+                    self.spent,
+                    self.window.bytes,
+                    self.retained_bytes,
+                    self.ordinary_capacity(),
+                    self.maintenance_retained,
+                    self.limits.maintenance_bytes,
+                )
                 .ok_or(Refusal::Capacity)?;
                 let history = append_fingerprint(
                     self.head,
@@ -1114,8 +1095,8 @@ impl State {
                     lsn: expected_next,
                     cut,
                     window: self.window,
-                    byte_start,
-                    byte_end,
+                    byte_start: debit.start,
+                    byte_end: debit.end,
                 };
                 let record = Record {
                     result,
@@ -1129,10 +1110,10 @@ impl State {
                 writer::commit_append(&mut self.records, &mut self.head, record, cut);
                 match class {
                     AppendClass::Data => {
-                        self.spent = byte_end;
-                        self.retained_bytes = retained_bytes;
+                        self.spent = debit.end;
+                        self.retained_bytes = debit.retained;
                     }
-                    AppendClass::Maintenance => self.maintenance_retained = retained_bytes,
+                    AppendClass::Maintenance => self.maintenance_retained = debit.retained,
                 };
                 Ok(Outcome::Appended(result))
             }
@@ -1449,39 +1430,38 @@ impl State {
                 if selected != self.checkpoint {
                     return Err(Refusal::Stale);
                 }
-                if through.next_lsn > selected.cut.next_lsn
+                if !retention::within_checkpoint(through.next_lsn, selected.cut.next_lsn)
                     || self.cut(through.next_lsn) != Some(through)
                 {
                     return Err(Refusal::Invalid);
                 }
-                if self.holds.values().map(|entry| entry.hold).any(|hold| {
+                let pinned = self.holds.values().map(|entry| entry.hold).any(|hold| {
                     admission::pins_suffix(
                         hold.start.next_lsn,
                         hold.through.next_lsn,
                         through.next_lsn,
                     )
-                }) {
-                    return Err(Refusal::Unavailable);
-                }
-                let trim = usize::try_from(through.next_lsn - self.floor.next_lsn)
-                    .map_err(|_| Refusal::Invalid)?;
+                });
+                let trim = retention::trim_length(self.floor.next_lsn, through.next_lsn, pinned)?;
+                let (ordinary_bytes, maintenance_bytes) = retention::trim_records(
+                    &mut self.records,
+                    trim,
+                    &mut self.retained_bytes,
+                    &mut self.maintenance_retained,
+                    |record| {
+                        (
+                            record.result.class,
+                            record.result.byte_start,
+                            record.result.byte_end,
+                        )
+                    },
+                );
                 let result = TrimResult {
                     from: self.floor,
                     through,
-                    ordinary_bytes: 0,
-                    maintenance_bytes: 0,
+                    ordinary_bytes,
+                    maintenance_bytes,
                 };
-                let result =
-                    writer::drain_prefix(&mut self.records, trim, result, |mut result, record| {
-                        let charge = record.result.byte_end - record.result.byte_start;
-                        match record.result.class {
-                            AppendClass::Data => result.ordinary_bytes += charge,
-                            AppendClass::Maintenance => result.maintenance_bytes += charge,
-                        }
-                        result
-                    });
-                self.retained_bytes -= result.ordinary_bytes;
-                self.maintenance_retained -= result.maintenance_bytes;
                 self.floor = through;
                 Ok(Outcome::Trimmed(result))
             }
@@ -1489,18 +1469,11 @@ impl State {
     }
 
     fn admit_object_references(&self, references: Option<&[ObjectName]>) -> Result<(), Refusal> {
-        match references {
-            Some(names) if !valid_object_names(names) => Err(Refusal::Invalid),
-            Some(names)
-                if names
-                    .iter()
-                    .any(|name| self.object_fences.contains_key(name)) =>
-            {
-                Err(Refusal::Conflict)
-            }
-            None if !self.object_fences.is_empty() => Err(Refusal::Unavailable),
-            _ => Ok(()),
-        }
+        object_withdrawal::admit_object_references(
+            references,
+            references.is_none_or(valid_object_names),
+            &self.object_fences,
+        )
     }
 
     fn charge_object_control(&self, charge: usize) -> Result<(), Refusal> {
@@ -1542,30 +1515,24 @@ impl State {
     }
 
     fn withdraw_object(&mut self, object: ObjectWithdrawal) -> Result<ObjectFence, Refusal> {
-        if object.name == [0; 32] || object.version == [0; 32] {
-            return Err(Refusal::Invalid);
-        }
-        if let Some(fence) = self.object_fences.get(&object.name).copied() {
-            return if fence.object == object {
-                Ok(fence)
-            } else {
-                Err(Refusal::Conflict)
-            };
-        }
-        if !self.has_complete_object_references() {
-            return Err(Refusal::Unavailable);
-        }
-        if self
-            .root_references
-            .values()
-            .chain(
-                self.records
-                    .iter()
-                    .filter_map(|record| record.references.as_ref()),
-            )
-            .any(|names| names.binary_search(&object.name).is_ok())
-        {
-            return Err(Refusal::Conflict);
+        if let Some(fence) = object_withdrawal::withdraw_object(
+            &self.object_fences,
+            &object.name,
+            object.name != [0; 32] && object.version != [0; 32],
+            |fence| fence.object == object,
+            || self.has_complete_object_references(),
+            || {
+                self.root_references
+                    .values()
+                    .chain(
+                        self.records
+                            .iter()
+                            .filter_map(|record| record.references.as_ref()),
+                    )
+                    .any(|names| names.binary_search(&object.name).is_ok())
+            },
+        )? {
+            return Ok(fence);
         }
         self.charge_object_control(WITHDRAWAL_BYTES)?;
         let fence = ObjectFence {
@@ -1573,7 +1540,7 @@ impl State {
             position: self.position,
             time: self.time,
         };
-        self.object_fences.insert(object.name, fence);
+        object_withdrawal::install_fence(&mut self.object_fences, object.name, fence);
         Ok(fence)
     }
 
@@ -1739,10 +1706,7 @@ fn valid_object_names(names: &[ObjectName]) -> bool {
 }
 
 fn record_charge(payload_len: usize, references: Option<&[ObjectName]>) -> Result<u64, Refusal> {
-    let overhead = references.map_or(0, |names| 4 + 32 * names.len() as u64);
-    (payload_len as u64)
-        .checked_add(APPEND_RECORD_CHARGE_BYTES + overhead)
-        .ok_or(Refusal::Capacity)
+    budget::record_charge(payload_len, references.map(<[ObjectName]>::len)).ok_or(Refusal::Capacity)
 }
 
 fn fingerprint(request: &Request) -> Fingerprint {
