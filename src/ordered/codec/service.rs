@@ -235,6 +235,7 @@ impl Reply {
                     cut(&mut output, head.next);
                     output.put_i64(head.timestamp);
                     output.put_u64(head.payload_bytes);
+                    output.put_u64(head.record_bytes);
                 }
             }
         }
@@ -296,6 +297,7 @@ impl Reply {
                     next: input.cut()?,
                     timestamp: i64::from_be_bytes(input.take()?),
                     payload_bytes: input.u64()?,
+                    record_bytes: input.u64()?,
                 })
             })?),
             6 => Self::Released(input.hold()?),

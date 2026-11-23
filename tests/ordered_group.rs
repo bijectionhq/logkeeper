@@ -1011,4 +1011,87 @@ async fn exact_object_withdrawal_survives_compaction_and_cohort_repair() {
         .await
         .unwrap();
     assert_eq!(late.receipt().outcome, Err(Refusal::Conflict));
+
+    let names = (10..18).map(|index| [index; 32]).collect::<Vec<_>>();
+    let appended = successor
+        .choose(
+            &repaired,
+            3,
+            request(
+                worker,
+                Command::Append {
+                    class: AppendClass::Data,
+                    grant,
+                    expected_next: 0,
+                    timestamp: 2,
+                    payload: Bytes::from_static(b"references"),
+                    references: Some(names.clone()),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let Ok(Outcome::Appended(row)) = appended.receipt().outcome else {
+        panic!("unfenced references refused");
+    };
+    let chosen = successor
+        .choose(
+            &repaired,
+            4,
+            request(
+                worker,
+                Command::Protect {
+                    grant,
+                    through: row.cut,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let Ok(Outcome::Protected(hold)) = chosen.receipt().outcome else {
+        panic!("replay hold refused");
+    };
+    let coordinator = Coordinator::new(successor, repaired);
+    let session = Session::authenticated(placement, worker);
+    let head = application(
+        &coordinator,
+        placement,
+        session,
+        wire::Operation::ReplayHead {
+            hold,
+            from: initial.cut,
+        },
+    )
+    .await;
+    let wire::Reply::ReplayHead(Some(head)) = head else {
+        panic!("replay head absent");
+    };
+    assert_eq!(head.payload_bytes, 10);
+    assert_eq!(
+        head.record_bytes,
+        head.payload_bytes
+            + logkeeper::ordered::APPEND_RECORD_CHARGE_BYTES
+            + 4
+            + 32 * names.len() as u64
+    );
+    for maximum_bytes in [head.record_bytes - 1, head.record_bytes] {
+        let reply = application(
+            &coordinator,
+            placement,
+            session,
+            wire::Operation::Replay {
+                hold,
+                from: initial.cut,
+                maximum_bytes,
+            },
+        )
+        .await;
+        if maximum_bytes == head.record_bytes {
+            assert!(
+                matches!(reply, wire::Reply::Replay(page) if page.records.len() == 1 && page.records[0].references.as_ref() == Some(&names))
+            );
+        } else {
+            assert!(matches!(reply, wire::Reply::Refused(Refusal::Capacity)));
+        }
+    }
 }

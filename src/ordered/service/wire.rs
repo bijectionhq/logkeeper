@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-const MAGIC: &[u8; 8] = b"LKAPPC10";
+const MAGIC: &[u8; 8] = b"LKAPPC11";
 const REPLAY_OVERHEAD: usize = 1 + 160 + 40 + 8;
 const WITHDRAWN_WORKERS_OVERHEAD: usize = 1 + 1;
 const WITHDRAWN_WORKER_MAX_BYTES: usize = 16 + 8 + 1 + 8;
@@ -329,6 +329,11 @@ impl Reply {
                 Some(head) => {
                     from.next_lsn.checked_add(1) == Some(head.next.next_lsn)
                         && head.next.next_lsn <= hold.through.next_lsn
+                        && head.record_bytes.checked_sub(head.payload_bytes).is_some_and(|metadata| {
+                            metadata == super::super::APPEND_RECORD_CHARGE_BYTES
+                                || metadata.checked_sub(super::super::APPEND_RECORD_CHARGE_BYTES + 4)
+                                    .is_some_and(|references| references % 32 == 0 && references / 32 <= super::super::MAX_OBJECT_REFERENCES as u64)
+                        })
                 }
                 None => *from == hold.through,
             },
@@ -348,6 +353,8 @@ impl ReplayPage {
             let result = record.result;
             if result.lsn != previous.next_lsn
                 || result.lsn.checked_add(1) != Some(result.cut.next_lsn)
+                || result.byte_end.checked_sub(result.byte_start)
+                    != super::super::record_charge(record.payload.len(), record.references.as_deref()).ok()
                 || result.cut.history
                     != append_fingerprint(
                         previous,

@@ -79,6 +79,7 @@ pub struct ReplayHead {
     pub next: Cut,
     pub timestamp: i64,
     pub payload_bytes: u64,
+    pub record_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -374,6 +375,7 @@ impl<R: Replica> Coordinator<R> {
             next: entry.result.cut,
             timestamp: entry.timestamp,
             payload_bytes: entry.payload.len() as u64,
+            record_bytes: entry.result.byte_end - entry.result.byte_start,
         }))
     }
 
