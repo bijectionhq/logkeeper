@@ -1,6 +1,6 @@
 use crate::production::{
     bodyLengthBounded, commandVersion, decision_header, decode_flag, encode_flag,
-    has_command_version, read_decision_time, bounded_body_length,
+    has_command_version, object_name_count, read_decision_time, bounded_body_length,
 };
 use vstd::prelude::*;
 
@@ -45,6 +45,13 @@ fn body_over_limit_is_rejected(declared: u64, minimum: usize, maximum: usize)
     let decoded = bounded_body_length(declared, minimum, maximum);
     assert(!bodyLengthBounded(declared as int, minimum as int, maximum as int));
     assert(decoded is None);
+}
+
+fn a_torn_object_name_is_rejected(declared: u32, maximum: usize, remaining: usize)
+    requires remaining < 32 * declared as int,
+{
+    let count = object_name_count(declared, maximum, remaining);
+    assert(count is None);
 }
 
 }

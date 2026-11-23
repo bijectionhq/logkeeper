@@ -26,6 +26,10 @@ pub(crate) open spec fn bodyLengthBounded(declared: int, minimum: int, maximum: 
     minimum <= declared <= maximum
 }
 
+pub(crate) open spec fn objectNameCountFits(declared: int, maximum: int, remaining: int) -> bool {
+    declared <= maximum && 32 * declared <= remaining
+}
+
 }
 
 pub(super) const COMMAND_VERSION: u8 = 8;
@@ -110,6 +114,12 @@ pub(crate) fn bounded_body_length(
     Some(declared as usize)
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures match out {
+        Some(count) => count as int == declared && objectNameCountFits(declared as int, maximum as int, remaining as int),
+        None => !objectNameCountFits(declared as int, maximum as int, remaining as int),
+    },
+))]
 pub(super) fn object_name_count(declared: u32, maximum: usize, remaining: usize) -> Option<usize> {
     bounded_body_length(u64::from(declared), 0, maximum.min(remaining / 32))
 }

@@ -37,6 +37,13 @@ pub(crate) open spec fn holdReceiptMatches(admitted_at: u64, receipt_position: O
     receipt_position == Some(admitted_at)
 }
 
+pub(crate) open spec fn rootReferenceRowValid(revision: u64, previous: Option<u64>, known: bool) -> bool {
+    known && match previous {
+        Some(key) => key < revision,
+        None => true,
+    }
+}
+
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
@@ -91,6 +98,9 @@ pub(super) fn hold_receipt_matches(admitted_at: u64, receipt_position: Option<u6
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == rootReferenceRowValid(revision, previous, known),
+))]
 pub(super) fn root_reference_row_valid(
     revision: u64,
     previous: Option<u64>,

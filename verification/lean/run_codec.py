@@ -18,7 +18,7 @@ def main():
     codec = ROOT / "Logkeeper" / "Codec.lean"
     image = ROOT / "Logkeeper" / "CompactImage.lean"
     check_lean_theorems(ROOT, command, codec, count=7, case="codec")
-    check_lean_theorems(ROOT, command, image, count=6, case="compact-image")
+    check_lean_theorems(ROOT, command, image, count=8, case="compact-image")
     check_lean_mutation(
         ROOT, command, codec, "codec-ignore-maximum",
         [("minimum ≤ declared ∧ declared ≤ maximum", "minimum ≤ declared ∧ True")],
@@ -28,6 +28,16 @@ def main():
         ROOT, command, image, "compact-image-vacancy-resets-generation",
         [("{ writer with holder := none }", "{ writer with holder := none, keyGeneration := 1 }")],
         "  rfl\n",
+    )
+    check_lean_mutation(
+        ROOT, command, image, "compact-image-accept-torn-object-name",
+        [("count ≤ maximum ∧ 32 * count ≤ remaining", "count ≤ maximum ∧ count ≤ remaining")],
+        "  omega\n\ndef rootReferenceRowValid",
+    )
+    check_lean_mutation(
+        ROOT, command, image, "compact-image-accept-unknown-root",
+        [("known = true ∧ match previous with", "True ∧ match previous with")],
+        "  accepted\n",
     )
     check_lean_mutation(
         ROOT, command, image, "compact-image-accept-missing-receipt",

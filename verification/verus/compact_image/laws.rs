@@ -1,5 +1,6 @@
 use crate::production::{
     fence_row_valid, generation_in_range, hold_receipt_matches, lease_row_valid,
+    root_reference_row_valid,
 };
 use vstd::prelude::*;
 
@@ -38,6 +39,11 @@ fn accepted_fence_has_bounded_coordinates(
 fn a_checked_hold_has_a_matching_receipt(admitted_at: u64, receipt: Option<u64>) {
     let accepted = hold_receipt_matches(admitted_at, receipt);
     assert(accepted ==> receipt == Some(admitted_at));
+}
+
+fn accepted_reference_has_known_root_and_increasing_key(revision: u64, previous: u64, known: bool) {
+    let accepted = root_reference_row_valid(revision, Some(previous), known);
+    assert(accepted ==> known && previous < revision);
 }
 
 }

@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 13,
+  "min_verified_functions": 15,
   "controls": {
     "accept-future-command-version": {
       "defect": "A later command version is treated as v8.",
@@ -25,7 +25,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 14
     },
     "reverse-journal-time": {
       "defect": "Decode reads the low byte as the high byte.",
@@ -43,7 +43,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 14
     },
     "swap-encoded-flag": {
       "defect": "The encoder uses the opposite flag for presence.",
@@ -61,7 +61,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 14
     },
     "allow-alternate-true-marker": {
       "defect": "Even with a weakened decoder contract, byte 2 cannot alias true.",
@@ -84,7 +84,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 14
     },
     "ignore-body-maximum": {
       "defect": "Even with a weakened length contract, a body above the capacity must be refused.",
@@ -110,9 +110,14 @@
           "file": "verification/verus/ordered_codec/laws.rs",
           "function": "body_over_limit_is_rejected",
           "category": "assertion failed"
+        },
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "object_name_count",
+          "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 13
     },
     "accept-short-journal-time": {
       "defect": "Even with a weakened decoder contract, a truncated header cannot yield a journal time.",
@@ -135,7 +140,25 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 12
+      "min_verified_functions": 14
+    },
+    "accept-torn-object-name": {
+      "defect": "A count may exceed the number of complete 32-byte names left in the input.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "maximum.min(remaining / 32)",
+          "replace": "maximum.min(remaining)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "object_name_count",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 14
     }
   }
 }

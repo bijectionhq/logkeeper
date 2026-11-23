@@ -59,6 +59,25 @@ theorem every_checked_hold_has_a_matching_receipt (holds : List (Nat × Option N
   intro row member
   exact ⟨row.1, checked row member, rfl⟩
 
+def objectNameCountFits (count maximum remaining : Nat) : Prop :=
+  count ≤ maximum ∧ 32 * count ≤ remaining
+
+theorem bounded_object_name_count_exact (count maximum remaining : Nat) :
+    (count ≤ maximum ∧ count ≤ remaining / 32) ↔ objectNameCountFits count maximum remaining := by
+  unfold objectNameCountFits
+  omega
+
+def rootReferenceRowValid (revision : Nat) (previous : Option Nat) (known : Bool) : Prop :=
+  known = true ∧ match previous with
+  | some key => key < revision
+  | none => True
+
+theorem accepted_reference_has_known_root_and_increasing_key
+    (revision previous : Nat) (known : Bool)
+    (accepted : rootReferenceRowValid revision (some previous) known) :
+    known = true ∧ previous < revision :=
+  accepted
+
 def strictlyIncreasingKeys (keys : List Nat) : Prop := keys.Pairwise (· < ·)
 
 theorem strictly_increasing_keys_are_unique (keys : List Nat) (ordered : strictlyIncreasingKeys keys) :
@@ -70,6 +89,8 @@ theorem strictly_increasing_keys_are_unique (keys : List Nat) (ordered : strictl
 #print axioms accepted_lease_has_retained_owner_and_bounds
 #print axioms accepted_fence_has_bounded_coordinates
 #print axioms every_checked_hold_has_a_matching_receipt
+#print axioms bounded_object_name_count_exact
+#print axioms accepted_reference_has_known_root_and_increasing_key
 #print axioms strictly_increasing_keys_are_unique
 
 end Logkeeper.CompactImage

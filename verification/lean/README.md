@@ -42,8 +42,8 @@ compare the Lean decisions with the Verus specs on the shared cases.
 
 `Logkeeper.Codec` specifies the ordered decision header, canonical Boolean
 markers and declared length bounds. `Logkeeper.CompactImage` specifies the
-snapshot generation, hold receipt, lease and fence row checks. Run
+snapshot generation, hold receipt, lease, fence and object reference checks. Run
 `python3 run_codec.py` from this directory to check both modules, their axiom
-reports and the three negative controls. The Verus correspondence is recorded
+reports and the five negative controls. The Verus correspondence is recorded
 in the [ordered codec](../verus/ordered_codec/README.md) and
 [compact image](../verus/compact_image/README.md) proof areas.
