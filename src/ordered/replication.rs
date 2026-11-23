@@ -140,7 +140,8 @@ impl Group {
         if roster.len() < 3 || roster.len() % 2 == 0 || max_prefix_bytes == 0 {
             return Err(Refusal::Invalid);
         }
-        let data_bytes = usize::try_from(window.bytes).map_err(|_| Refusal::Capacity)?;
+        let data_bytes =
+            usize::try_from(limits.retained_data_bytes).map_err(|_| Refusal::Capacity)?;
         let minimum = limits
             .base_control_bytes()
             .and_then(|control| control.checked_add(data_bytes))
@@ -158,7 +159,10 @@ impl Group {
         hash.update(checkpoint.cut.history);
         hash.update(checkpoint.root);
         hash.update(checkpoint.manifest);
+        hash.update(checkpoint.custody.allocation.as_bytes());
+        hash.update(checkpoint.custody.revision.to_be_bytes());
         hash.update(window.allocation.as_bytes());
+        hash.update(window.serial.to_be_bytes());
         hash.update(window.bytes.to_be_bytes());
         for limit in [
             limits.enrolled_workers,
@@ -173,6 +177,7 @@ impl Group {
             );
         }
         hash.update(limits.retry_positions.to_be_bytes());
+        hash.update(limits.retained_data_bytes.to_be_bytes());
         for voter in &roster {
             hash.update(voter.as_bytes());
         }

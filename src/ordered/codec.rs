@@ -1,6 +1,6 @@
 use super::{
-    BarrierClaim, Checkpoint, Command, Cut, Enrollment, Fingerprint, Grant, Hold, Placement,
-    Principal, Refusal, Request, RequestId, WriterState,
+    BarrierClaim, Checkpoint, Command, Custody, Cut, Enrollment, Fingerprint, Grant, Hold,
+    Placement, Principal, Refusal, Request, RequestId, Window, WriterState,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use std::num::NonZeroU64;
@@ -76,6 +76,14 @@ impl Request {
                 grant(&mut output, *writer);
                 checkpoint(&mut output, *offered);
             }
+            Command::FundWindow {
+                grant: writer,
+                window: allocation,
+            } => {
+                output.put_u8(10);
+                grant(&mut output, *writer);
+                window(&mut output, *allocation);
+            }
             Command::Protect {
                 grant: writer,
                 through,
@@ -150,6 +158,10 @@ impl Request {
             9 => Command::AbandonRead {
                 grant: input.grant()?,
                 nonce: input.nonce()?,
+            },
+            10 => Command::FundWindow {
+                grant: input.grant()?,
+                window: input.window()?,
             },
             _ => return Err(Refusal::Invalid),
         };
@@ -256,6 +268,7 @@ impl Input {
         match self.read_byte()? {
             0 => Ok(Principal::Administrator),
             1 => Ok(Principal::Worker(self.enrollment()?)),
+            2 => Ok(Principal::Custodian),
             _ => Err(Refusal::Invalid),
         }
     }
@@ -311,6 +324,18 @@ impl Input {
             cut: self.cut()?,
             root: self.take()?,
             manifest: self.take()?,
+            custody: Custody {
+                allocation: self.uuid()?,
+                revision: self.u64()?,
+            },
+        })
+    }
+
+    fn window(&mut self) -> Result<Window, Refusal> {
+        Ok(Window {
+            allocation: self.uuid()?,
+            serial: self.u64()?,
+            bytes: self.u64()?,
         })
     }
 
@@ -342,6 +367,7 @@ fn principal(output: &mut BytesMut, value: Principal) {
             output.put_u8(1);
             enrollment(output, worker);
         }
+        Principal::Custodian => output.put_u8(2),
     }
 }
 
@@ -387,4 +413,12 @@ fn checkpoint(output: &mut BytesMut, value: Checkpoint) {
     cut(output, value.cut);
     output.put_slice(&value.root);
     output.put_slice(&value.manifest);
+    uuid(output, value.custody.allocation);
+    output.put_u64(value.custody.revision);
+}
+
+fn window(output: &mut BytesMut, value: Window) {
+    uuid(output, value.allocation);
+    output.put_u64(value.serial);
+    output.put_u64(value.bytes);
 }

@@ -2,8 +2,8 @@ use bytes::Bytes;
 use logkeeper::ordered::replication::transport::{Connector, RemoteVoter, serve_voter};
 use logkeeper::ordered::replication::{DurableVoter, Error, Group, Replica};
 use logkeeper::ordered::{
-    BarrierClaim, Checkpoint, Command, Cut, Fingerprint, Limits, Outcome, Placement, Principal,
-    Refusal, Request, RequestId, Window,
+    BarrierClaim, Checkpoint, Command, Custody, Cut, Fingerprint, Limits, Outcome, Placement,
+    Principal, Refusal, Request, RequestId, Window,
 };
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -45,9 +45,14 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         },
         root: [2; 32],
         manifest: [3; 32],
+        custody: Custody {
+            allocation: Uuid::new_v4(),
+            revision: 1,
+        },
     };
     let window = Window {
         allocation: Uuid::new_v4(),
+        serial: 1,
         bytes: 4096,
     };
     let voter_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
@@ -57,6 +62,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             enrolled_workers: 2,
             replay_holds: 4,
             retry_positions: 64,
+            retained_data_bytes: 8192,
         },
         seed,
         window,
@@ -164,7 +170,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let peers = reopen([1, 2]);
 
     let replacement_request = request(
-        Principal::Administrator,
+        Principal::Worker(second_enrollment),
         Command::Grant {
             expected: previous,
             candidate: second_enrollment,
@@ -267,7 +273,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         panic!("successor could not append");
     };
     assert_eq!(next.lsn, 1);
-    assert_eq!(next.allocation, original.allocation);
+    assert_eq!(next.window, original.window);
     assert_eq!(next.byte_start, original.byte_end);
     let reissued = group.choose(&peers, 10, barrier_request).await.unwrap();
     assert_eq!(reissued.receipt(), barrier.receipt());
@@ -277,6 +283,10 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         cut: next.cut,
         root: [4; 32],
         manifest: [5; 32],
+        custody: Custody {
+            allocation: Uuid::new_v4(),
+            revision: 2,
+        },
     };
     let worker = Principal::Worker(second_enrollment);
     let publication = group
@@ -284,7 +294,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             &peers,
             11,
             request(
-                worker,
+                Principal::Custodian,
                 Command::Publish {
                     grant: second_grant,
                     checkpoint: published,
@@ -392,4 +402,67 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let proof = admitted.barrier_claim().unwrap();
     assert_eq!(proof.nonce().get(), 3);
     assert_eq!(proof.read().through, published.cut);
+
+    let unsupported = group
+        .choose(
+            &peers,
+            22,
+            request(
+                worker,
+                Command::Publish {
+                    grant: second_grant,
+                    checkpoint: published,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unsupported.receipt().outcome, Err(Refusal::Unauthorized));
+
+    let next_window = Window {
+        allocation: Uuid::new_v4(),
+        serial: 2,
+        bytes: 4096,
+    };
+    let funded = group
+        .choose(
+            &peers,
+            23,
+            request(
+                Principal::Custodian,
+                Command::FundWindow {
+                    grant: second_grant,
+                    window: next_window,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        funded.receipt().outcome,
+        Ok(Outcome::WindowFunded(next_window))
+    );
+    assert_eq!(funded.state().head(), published.cut);
+    assert_eq!(funded.state().spent_bytes(), 0);
+    let appended = group
+        .choose(
+            &peers,
+            24,
+            request(
+                worker,
+                Command::Append {
+                    grant: second_grant,
+                    expected_next: published.cut.next_lsn,
+                    timestamp: 14,
+                    payload: Bytes::from_static(b"after funding"),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let Outcome::Appended(result) = appended.receipt().outcome.unwrap() else {
+        panic!("the next funded allocation was refused");
+    };
+    assert_eq!(result.window, next_window);
+    assert_eq!(result.byte_start, 0);
 }

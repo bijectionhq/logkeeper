@@ -49,11 +49,13 @@ RTDB's adapter continues to own its storage types, checkpoint policy, and direct
 The `logkeeper::ordered` module implements fixed-cohort grant, append, barrier,
 checkpoint and trim decisions. Its voter transport takes an already authenticated
 channel and its replay API returns the exact journal interval of a live hold.
-Callers establish coordinator identity, worker enrollment and checkpoint custody
-at the integration boundary.
+The embedding service authenticates coordinator and worker identities before choosing any command.
+Checkpoint publication and replenishment require the custodian identity at the exact current grant.
+The custodian establishes reconstructability and reserves physical allocations before ordering those commands.
 
 The standalone daemon still serves the original protocol.
 The ordered implementation can compact an accepted prefix into a bounded recovery base.
 A voter replaces its local selected file atomically and confirms the exact selected image after syncing it.
 Running voters can reclaim payloads below the authorized trim floor from their selected files.
-Replenishment of paid append windows and repair of unavailable cohort members require their own installed-group protocols.
+Ordered window renewal preserves historical window identities and installs a fresh byte cursor.
+The embedding service still needs physical capacity admission and repair of unavailable cohort members.

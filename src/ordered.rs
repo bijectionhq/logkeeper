@@ -18,7 +18,7 @@ pub type Fingerprint = [u8; 32];
 // The stream's paid byte cursor includes a fixed charge for each record's
 // identity and framing. The physical store accounts for its own replicas,
 // staging, and metadata in addition to these stream charges.
-const APPEND_RECORD_CHARGE_BYTES: u64 = 192;
+const APPEND_RECORD_CHARGE_BYTES: u64 = 208;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
@@ -56,7 +56,14 @@ pub struct Cut {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Window {
     pub allocation: Uuid,
+    pub serial: u64,
     pub bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Custody {
+    pub allocation: Uuid,
+    pub revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +71,7 @@ pub struct Checkpoint {
     pub cut: Cut,
     pub root: Fingerprint,
     pub manifest: Fingerprint,
+    pub custody: Custody,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +88,7 @@ pub struct Hold {
 pub enum Principal {
     Administrator,
     Worker(Enrollment),
+    Custodian,
 }
 
 /// An invocation identifier with an immutable retry limit in journal order.
@@ -116,11 +125,15 @@ pub enum Command {
         grant: Grant,
         nonce: NonZeroU64,
     },
-    /// The storage owner establishes the exact root and manifest before the
-    /// authenticated command can be chosen.
+    /// The custodian attests the exact reconstructable root and manifest.
     Publish {
         grant: Grant,
         checkpoint: Checkpoint,
+    },
+    /// Install the custodian's next funded allocation in journal order.
+    FundWindow {
+        grant: Grant,
+        window: Window,
     },
     Protect {
         grant: Grant,
@@ -148,7 +161,7 @@ pub struct AppendResult {
     pub position: u64,
     pub lsn: u64,
     pub cut: Cut,
-    pub allocation: Uuid,
+    pub window: Window,
     pub byte_start: u64,
     pub byte_end: u64,
 }
@@ -169,6 +182,7 @@ pub enum Outcome {
     },
     ReadAbandoned,
     Published(Checkpoint),
+    WindowFunded(Window),
     Protected(Hold),
     Released,
     Trimmed(Cut),
@@ -259,6 +273,7 @@ pub struct Limits {
     pub enrolled_workers: usize,
     pub replay_holds: usize,
     pub retry_positions: u64,
+    pub retained_data_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -298,6 +313,7 @@ pub struct State {
     read_floor: u64,
     window: Window,
     spent: u64,
+    retained_bytes: u64,
     floor: Cut,
     head: Cut,
     checkpoint: Checkpoint,
@@ -320,8 +336,12 @@ impl State {
             || placement.group.is_nil()
             || placement.generation == 0
             || checkpoint.cut.next_lsn != 0
+            || checkpoint.custody.allocation.is_nil()
+            || checkpoint.custody.revision != 1
             || window.allocation.is_nil()
+            || window.serial != 1
             || window.bytes == 0
+            || window.bytes > limits.retained_data_bytes
             || limits.enrolled_workers == 0
             || limits.replay_holds == 0
             || limits.retry_positions == 0
@@ -340,6 +360,7 @@ impl State {
             read_floor: 0,
             window,
             spent: 0,
+            retained_bytes: 0,
             floor: checkpoint.cut,
             head: checkpoint.cut,
             checkpoint,
@@ -645,7 +666,9 @@ impl State {
                 expected,
                 candidate,
             } => {
-                if principal != Principal::Administrator {
+                if principal != Principal::Administrator
+                    && principal != Principal::Worker(candidate)
+                {
                     return Err(Refusal::Unauthorized);
                 }
                 if self.writer_state() != expected
@@ -685,13 +708,17 @@ impl State {
                     .checked_add(bytes)
                     .filter(|end| *end <= self.window.bytes)
                     .ok_or(Refusal::Capacity)?;
+                let retained_bytes = self
+                    .retained_bytes
+                    .checked_add(bytes)
+                    .ok_or(Refusal::Capacity)?;
                 let history = append_fingerprint(self.head, grant, id, timestamp, &payload);
                 let cut = Cut { next_lsn, history };
                 let result = AppendResult {
                     position: self.position,
                     lsn: expected_next,
                     cut,
-                    allocation: self.window.allocation,
+                    window: self.window,
                     byte_start: self.spent,
                     byte_end,
                 };
@@ -705,6 +732,7 @@ impl State {
                 });
                 self.head = cut;
                 self.spent = byte_end;
+                self.retained_bytes = retained_bytes;
                 Ok(Outcome::Appended(result))
             }
             Command::Barrier { grant, nonce } => {
@@ -719,7 +747,7 @@ impl State {
                 Ok(Outcome::ReadAbandoned)
             }
             Command::Publish { grant, checkpoint } => {
-                self.writer(principal, grant)?;
+                self.custodian(principal, grant)?;
                 if checkpoint.cut.next_lsn < self.checkpoint.cut.next_lsn
                     || self.cut(checkpoint.cut.next_lsn) != Some(checkpoint.cut)
                 {
@@ -728,8 +756,34 @@ impl State {
                 if checkpoint.cut == self.checkpoint.cut && checkpoint != self.checkpoint {
                     return Err(Refusal::Conflict);
                 }
+                if checkpoint != self.checkpoint
+                    && (checkpoint.custody.allocation.is_nil()
+                        || Some(checkpoint.custody.revision)
+                            != self.checkpoint.custody.revision.checked_add(1))
+                {
+                    return Err(Refusal::Invalid);
+                }
                 self.checkpoint = checkpoint;
                 Ok(Outcome::Published(checkpoint))
+            }
+            Command::FundWindow { grant, window } => {
+                self.custodian(principal, grant)?;
+                if window.allocation.is_nil()
+                    || window.bytes == 0
+                    || Some(window.serial) != self.window.serial.checked_add(1)
+                {
+                    return Err(Refusal::Invalid);
+                }
+                if self
+                    .retained_bytes
+                    .checked_add(window.bytes)
+                    .is_none_or(|bytes| bytes > self.limits.retained_data_bytes)
+                {
+                    return Err(Refusal::Capacity);
+                }
+                self.window = window;
+                self.spent = 0;
+                Ok(Outcome::WindowFunded(window))
             }
             Command::Protect { grant, through } => {
                 self.writer(principal, grant)?;
@@ -766,11 +820,23 @@ impl State {
                 }
                 let trim = usize::try_from(through.next_lsn - self.floor.next_lsn)
                     .map_err(|_| Refusal::Invalid)?;
-                self.records.drain(..trim);
+                for record in self.records.drain(..trim) {
+                    self.retained_bytes -= record.result.byte_end - record.result.byte_start;
+                }
                 self.floor = through;
                 Ok(Outcome::Trimmed(through))
             }
         }
+    }
+
+    fn custodian(&self, principal: Principal, grant: Grant) -> Result<(), Refusal> {
+        if principal != Principal::Custodian {
+            return Err(Refusal::Unauthorized);
+        }
+        if self.grant != Some(grant) {
+            return Err(Refusal::Stale);
+        }
+        Ok(())
     }
 }
 

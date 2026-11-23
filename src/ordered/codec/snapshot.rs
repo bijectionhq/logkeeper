@@ -1,5 +1,6 @@
 use super::{
-    Input, checkpoint, cut, enrollment, grant, hold_row, principal, request_id, uuid, writer_state,
+    Input, checkpoint, cut, enrollment, grant, hold_row, principal, request_id, window,
+    writer_state,
 };
 use crate::ordered::{
     APPEND_RECORD_CHARGE_BYTES, AppendResult, Command, HeldAdmission, Outcome, Principal, Receipt,
@@ -16,9 +17,9 @@ impl super::super::Limits {
         // encoded size of each bounded control row. Retained data has its own
         // byte charge and a full outcome row can outlive its data.
         let roster = self.enrolled_workers.checked_mul(24)?;
-        let holds = self.replay_holds.checked_mul(225)?;
+        let holds = self.replay_holds.checked_mul(249)?;
         let retries = usize::try_from(self.retry_positions).ok()?;
-        let outcomes = retries.checked_add(self.replay_holds)?.checked_mul(330)?;
+        let outcomes = retries.checked_add(self.replay_holds)?.checked_mul(354)?;
         512usize
             .checked_add(roster)?
             .checked_add(holds)?
@@ -35,8 +36,7 @@ impl State {
         writer_state(&mut output, self.writer_state());
         output.put_u64(self.enrollment_serial);
         output.put_u64(self.read_floor);
-        uuid(&mut output, self.window.allocation);
-        output.put_u64(self.window.bytes);
+        window(&mut output, self.window);
         output.put_u64(self.spent);
         cut(&mut output, self.floor);
         cut(&mut output, self.head);
@@ -85,19 +85,22 @@ impl State {
         state.grant = writer.grant;
         state.enrollment_serial = input.u64()?;
         state.read_floor = input.u64()?;
-        state.window = Window {
-            allocation: input.uuid()?,
-            bytes: input.u64()?,
-        };
+        state.window = input.window()?;
         state.spent = input.u64()?;
         state.floor = input.cut()?;
         state.head = input.cut()?;
         state.checkpoint = input.checkpoint()?;
         if state.position == 0
-            || state.window != initial.window
+            || state.window.allocation.is_nil()
+            || state.window.serial == 0
+            || state.window.bytes == 0
+            || (state.window.serial == 1 && state.window != initial.window)
             || state.spent > state.window.bytes
             || state.floor.next_lsn > state.checkpoint.cut.next_lsn
             || state.checkpoint.cut.next_lsn > state.head.next_lsn
+            || state.checkpoint.custody.allocation.is_nil()
+            || state.checkpoint.custody.revision == 0
+            || (state.checkpoint.custody.revision == 1 && state.checkpoint != initial.checkpoint)
             || state.head.next_lsn > state.position
             || state.writer_epoch > state.position
             || state.enrollment_serial > state.position
@@ -150,7 +153,7 @@ impl State {
         }
         let mut previous = self.floor;
         let mut previous_position = 0;
-        let mut previous_byte = None;
+        let mut previous_window: Option<(Window, u64)> = None;
         for _ in 0..count {
             let result = input.append_result()?;
             let grant = input.grant()?;
@@ -176,10 +179,19 @@ impl State {
                 || result.lsn.checked_add(1) != Some(result.cut.next_lsn)
                 || result.cut.history
                     != append_fingerprint(previous, grant, request, timestamp, &payload)
-                || result.allocation != self.window.allocation
-                || result.byte_end > self.spent
+                || result.window.allocation.is_nil()
+                || result.window.serial == 0
+                || result.window.serial > self.window.serial
+                || (result.window.serial == self.window.serial && result.window != self.window)
+                || result.byte_end > result.window.bytes
                 || result.byte_end.checked_sub(result.byte_start) != length
-                || previous_byte.is_some_and(|end| result.byte_start != end)
+                || previous_window.is_some_and(|(window, end)| {
+                    if result.window.serial == window.serial {
+                        result.window != window || result.byte_start != end
+                    } else {
+                        result.window.serial < window.serial || result.byte_start != 0
+                    }
+                })
                 || request.nonce.is_nil()
                 || request.expires_at <= result.position
                 || request_fingerprint != fingerprint(&original)
@@ -188,7 +200,11 @@ impl State {
             }
             previous = result.cut;
             previous_position = result.position;
-            previous_byte = Some(result.byte_end);
+            previous_window = Some((result.window, result.byte_end));
+            self.retained_bytes = self
+                .retained_bytes
+                .checked_add(length.ok_or(Refusal::Invalid)?)
+                .ok_or(Refusal::Invalid)?;
             self.records.push_back(Record {
                 result,
                 grant,
@@ -199,7 +215,13 @@ impl State {
             });
         }
         if previous != self.head
-            || previous_byte.is_some_and(|end| end != self.spent)
+            || previous_window.is_some_and(|(window, end)| {
+                self.spent != if window == self.window { end } else { 0 }
+            })
+            || self
+                .retained_bytes
+                .checked_add(self.window.bytes - self.spent)
+                .is_none_or(|bytes| bytes > self.limits.retained_data_bytes)
             || self.cut(self.checkpoint.cut.next_lsn) != Some(self.checkpoint.cut)
         {
             return Err(Refusal::Invalid);
@@ -317,7 +339,7 @@ impl Input {
             position: self.u64()?,
             lsn: self.u64()?,
             cut: self.cut()?,
-            allocation: self.uuid()?,
+            window: self.window()?,
             byte_start: self.u64()?,
             byte_end: self.u64()?,
         })
@@ -342,6 +364,7 @@ impl Input {
             7 => Outcome::Released,
             8 => Outcome::Trimmed(self.cut()?),
             9 => Outcome::ReadAbandoned,
+            10 => Outcome::WindowFunded(self.window()?),
             32 => return Ok(Err(Refusal::WrongPlacement)),
             33 => return Ok(Err(Refusal::Unauthorized)),
             34 => return Ok(Err(Refusal::Stale)),
@@ -359,7 +382,7 @@ fn append_result(output: &mut BytesMut, value: AppendResult) {
     output.put_u64(value.position);
     output.put_u64(value.lsn);
     cut(output, value.cut);
-    uuid(output, value.allocation);
+    window(output, value.window);
     output.put_u64(value.byte_start);
     output.put_u64(value.byte_end);
 }
@@ -407,6 +430,10 @@ fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
             cut(output, through);
         }
         Ok(Outcome::ReadAbandoned) => output.put_u8(9),
+        Ok(Outcome::WindowFunded(allocation)) => {
+            output.put_u8(10);
+            window(output, allocation);
+        }
         Err(refusal) => output.put_u8(match refusal {
             Refusal::WrongPlacement => 32,
             Refusal::Unauthorized => 33,
