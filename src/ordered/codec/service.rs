@@ -137,6 +137,10 @@ impl Reply {
                 if let Some(chosen) = route.last_data {
                     cut(&mut output, chosen);
                 }
+                output.put_u8(u8::from(route.last_maintenance.is_some()));
+                if let Some(chosen) = route.last_maintenance {
+                    cut(&mut output, chosen);
+                }
                 cut(&mut output, route.floor);
                 checkpoint(&mut output, route.checkpoint);
                 output.put_u8(u8::from(route.preparing.is_some()));
@@ -219,6 +223,7 @@ impl Reply {
                 history: input.take()?,
                 head: input.cut()?,
                 last_data: input.optional(Input::cut)?,
+                last_maintenance: input.optional(Input::cut)?,
                 floor: input.cut()?,
                 checkpoint: input.checkpoint()?,
                 preparing: input.optional(Input::checkpoint_preparation)?,

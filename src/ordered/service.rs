@@ -42,6 +42,7 @@ pub struct Route {
     pub history: Fingerprint,
     pub head: Cut,
     pub last_data: Option<Cut>,
+    pub last_maintenance: Option<Cut>,
     pub floor: Cut,
     pub checkpoint: Checkpoint,
     pub preparing: Option<CheckpointPreparation>,
@@ -162,6 +163,12 @@ impl<R: Replica> Coordinator<R> {
                 .iter()
                 .rev()
                 .find(|record| record.result.class == super::AppendClass::Data)
+                .map(|record| record.result.cut),
+            last_maintenance: state
+                .records
+                .iter()
+                .rev()
+                .find(|record| record.result.class == super::AppendClass::Maintenance)
                 .map(|record| record.result.cut),
             floor: state.floor(),
             checkpoint: state.checkpoint(),
