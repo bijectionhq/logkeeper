@@ -1524,14 +1524,17 @@ impl State {
             |fence| fence.object == object,
             || self.has_complete_object_references(),
             || {
-                self.root_references
-                    .values()
-                    .chain(
-                        self.records
-                            .iter()
-                            .filter_map(|record| record.references.as_ref()),
-                    )
-                    .any(|names| names.binary_search(&object.name).is_ok())
+                object_withdrawal::has_live_reference(
+                    &self.root_references,
+                    &self.records,
+                    |names| names.binary_search(&object.name).is_ok(),
+                    |record| {
+                        record
+                            .references
+                            .as_ref()
+                            .is_some_and(|names| names.binary_search(&object.name).is_ok())
+                    },
+                )
             },
         )? {
             return Ok(fence);

@@ -1,7 +1,7 @@
 //! Name-keyed admission, exact retry and fence insertion.
 
 use super::Refusal;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 pub(super) fn admit_object_references<K: Ord, F>(
     references: Option<&[K]>,
@@ -54,4 +54,13 @@ pub(super) fn withdraw_object<K: Ord, F: Copy>(
 
 pub(super) fn install_fence<K: Ord, F>(fences: &mut BTreeMap<K, F>, name: K, fence: F) {
     fences.insert(name, fence);
+}
+
+pub(super) fn has_live_reference<K, R>(
+    roots: &BTreeMap<u64, Vec<K>>,
+    records: &VecDeque<R>,
+    in_root: impl Fn(&Vec<K>) -> bool,
+    in_record: impl Fn(&R) -> bool,
+) -> bool {
+    roots.values().any(in_root) || records.iter().any(in_record)
 }
