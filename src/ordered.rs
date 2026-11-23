@@ -15,6 +15,7 @@ pub mod service;
 mod writer;
 
 use bytes::Bytes;
+use receipt::ReceiptBook;
 use receipt::RetainedOutcome;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -379,14 +380,7 @@ pub enum Outcome {
     Trimmed(TrimResult),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Receipt {
-    pub placement: Placement,
-    pub principal: Principal,
-    pub request: RequestId,
-    pub position: u64,
-    pub outcome: Result<Outcome, Refusal>,
-}
+pub type Receipt = receipt::Receipt<Placement, Principal, RequestId, Result<Outcome, Refusal>>;
 
 /// The exact subject of an applied, protected fresh-read attestation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -522,7 +516,7 @@ pub struct State {
     root_references: BTreeMap<u64, Vec<ObjectName>>,
     object_fences: BTreeMap<ObjectName, ObjectFence>,
     holds: BTreeMap<RequestId, HeldAdmission>,
-    outcomes: BTreeMap<RequestKey, RetainedOutcome<Receipt>>,
+    outcomes: ReceiptBook<Placement, Principal, RequestId, Result<Outcome, Refusal>>,
     expiry: BTreeMap<(u64, RequestKey), ()>,
 }
 
@@ -810,16 +804,7 @@ impl State {
             return Ok(receipt(Err(Refusal::Invalid)));
         }
         let receipt = receipt(self.decide(principal, id, fingerprint, request.command));
-        if !receipt::record_after_apply(
-            &mut self.outcomes,
-            key,
-            reading,
-            &receipt.outcome,
-            RetainedOutcome {
-                fingerprint,
-                receipt,
-            },
-        ) {
+        if !receipt::record_after_apply(&mut self.outcomes, reading, fingerprint, receipt) {
             // A refused read holds nothing and is never replayed, so it leaves
             // no state behind. Only an admitted read retains its receipt, as
             // the provenance of its hold.

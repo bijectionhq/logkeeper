@@ -3,11 +3,22 @@
 use super::admission;
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Receipt<P, I, K, A> {
+    pub placement: P,
+    pub principal: I,
+    pub request: K,
+    pub position: u64,
+    pub outcome: A,
+}
+
 #[derive(Clone)]
 pub(super) struct RetainedOutcome<R> {
     pub(super) fingerprint: [u8; 32],
     pub(super) receipt: R,
 }
+
+pub(super) type ReceiptBook<P, I, K, A> = BTreeMap<(I, K), RetainedOutcome<Receipt<P, I, K, A>>>;
 
 pub(super) fn replay_mutation<R: Copy>(stored: &[u8], presented: &[u8], original: R) -> Option<R> {
     if admission::matches_fingerprint(stored, presented) {
@@ -29,17 +40,22 @@ pub(super) fn replay<R: Copy>(
     replay_mutation(stored, presented, original)
 }
 
-pub(super) fn record_after_apply<K: Ord, R, O, E>(
-    outcomes: &mut BTreeMap<K, RetainedOutcome<R>>,
-    key: K,
+pub(super) fn record_after_apply<P, I: Ord + Copy, K: Ord + Copy, O, E>(
+    outcomes: &mut ReceiptBook<P, I, K, Result<O, E>>,
     reading: bool,
-    applied: &Result<O, E>,
-    retained: RetainedOutcome<R>,
+    fingerprint: [u8; 32],
+    receipt: Receipt<P, I, K, Result<O, E>>,
 ) -> bool {
-    if reading && applied.is_err() {
+    if reading && receipt.outcome.is_err() {
         return false;
     }
-    outcomes.insert(key, retained);
+    outcomes.insert(
+        (receipt.principal, receipt.request),
+        RetainedOutcome {
+            fingerprint,
+            receipt,
+        },
+    );
     true
 }
 
