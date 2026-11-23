@@ -1,6 +1,8 @@
 //! Validation and selection of physical voter slots.
 
-use super::{Error, MAGIC, bounded_body_length, matches_fingerprint};
+use super::{Error, bounded_body_length, matches_fingerprint};
+
+pub(crate) const MAGIC: &[u8; 8] = b"LKORV005";
 
 pub(super) fn slot_body_length(length: u64, payload_limit: usize) -> Option<usize> {
     bounded_body_length(length, 2, payload_limit)
@@ -11,14 +13,14 @@ pub(super) fn authenticates_body(observed: &[u8], stored: &[u8]) -> bool {
 }
 
 pub(super) fn slot_header_matches(
-    magic: u64,
+    magic: &[u8],
     addressed: &[u8],
     group: &[u8],
     witness: u128,
     voter: u128,
     generation: u64,
 ) -> bool {
-    magic == u64::from_be_bytes(*MAGIC)
+    matches_fingerprint(magic, MAGIC)
         && matches_fingerprint(addressed, group)
         && witness == voter
         && generation != 0

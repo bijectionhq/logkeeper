@@ -18,11 +18,10 @@ use uuid::Uuid;
 mod mirror;
 mod selection;
 
-use selection::{
+use selection::{MAGIC, 
     authenticates_body, read_back_matches, select_slot, slot_body_length, slot_header_matches,
 };
 
-const MAGIC: &[u8; 8] = b"LKORV005";
 const SLOTS: [&str; 2] = ["ordered.slot-a", "ordered.slot-b"];
 const LOCK: &str = "ordered.lock";
 const RESERVATION: &str = "ordered.reserve";
@@ -555,7 +554,8 @@ fn recover_slot(
     }
     let split = HEADER - 32;
     let mut descriptor = &header[..split];
-    let magic = descriptor.get_u64();
+    let magic = &descriptor[..8];
+    descriptor.advance(8);
     let addressed: Fingerprint = descriptor[..32].try_into().map_err(|_| Error::Prefix)?;
     descriptor.advance(32);
     let witness = Uuid::from_slice(&descriptor[..16]).map_err(|_| Error::Prefix)?;

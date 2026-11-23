@@ -10,8 +10,8 @@ mod evidence;
 pub mod transport;
 
 pub use disk::DurableVoter;
-pub use evidence::{SlotImage, SlotPair, Vote, VoterSlots};
-use evidence::{record_vote, strict_majority, valid_voters};
+pub use evidence::{RotationSlots, SlotImage, SlotPair, Vote, VoterSlots};
+use evidence::{record_vote, strict_majority};
 
 use super::{
     BarrierClaim, Checkpoint, Command, Fingerprint, Limits, Outcome, Placement, Receipt, Refusal,
@@ -96,44 +96,6 @@ pub struct Promise {
     pub voter: Uuid,
     pub ballot: Ballot,
     pub accepted: Option<Accepted>,
-}
-
-/// Both images on each member of an accepting majority encode the named
-/// prefix. Every later eligible recovery inherits that prefix.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RotationSlots {
-    pub group: Fingerprint,
-    pub cohort_size: usize,
-    pub ballot: Ballot,
-    pub prefix: Fingerprint,
-    pub position: u64,
-    pub checkpoint: Checkpoint,
-    pub key_generation: u64,
-    pub voters: Vec<VoterSlots>,
-}
-
-impl RotationSlots {
-    pub fn covers(&self, receipt: Receipt) -> bool {
-        let Ok(Outcome::Granted { grant, recovery }) = receipt.outcome else {
-            return false;
-        };
-        self.group != [0; 32]
-            && self.ballot.round != 0
-            && !self.ballot.nonce.is_nil()
-            && self.prefix != [0; 32]
-            && receipt.position != 0
-            && self.position >= receipt.position
-            && self.checkpoint == recovery.checkpoint
-            && recovery.admitted_at == receipt.position
-            && recovery.start == self.checkpoint.cut
-            && recovery.through == self.checkpoint.cut
-            && self.key_generation == grant.key_generation
-            && self.key_generation > 1
-            && self.cohort_size >= 3
-            && self.cohort_size % 2 == 1
-            && self.voters.len() == strict_majority(self.cohort_size)
-            && valid_voters(&self.voters)
-    }
 }
 
 pub struct Chosen {
