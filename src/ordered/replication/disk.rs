@@ -819,10 +819,10 @@ mod tests {
         let first = [peers[0].clone(), peers[2].clone()];
         let second = [peers[0].clone(), peers[1].clone()];
         let third = [peers[1].clone(), peers[2].clone()];
-        let request = |round: u64, principal, command| Request {
+        let request = |observed_position: u64, principal, command| Request {
             placement,
             principal,
-            id: RequestId::fresh(round - 1, 16).unwrap(),
+            id: RequestId::fresh(observed_position, limits.retry_positions).unwrap(),
             command,
         };
         let enrollment = group
@@ -830,7 +830,7 @@ mod tests {
                 &first,
                 1,
                 request(
-                    1,
+                    0,
                     Principal::Administrator,
                     Command::Enroll {
                         worker: Uuid::new_v4(),
@@ -844,12 +844,12 @@ mod tests {
             panic!()
         };
         let worker = Principal::Worker(enrolled);
-        let grant = group
+        let granted = group
             .choose(
                 &first,
                 2,
                 request(
-                    2,
+                    enrollment.state().position(),
                     worker,
                     Command::Grant {
                         expected: enrollment.state().writer_state(),
@@ -859,7 +859,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let Ok(Outcome::Granted { grant, .. }) = grant.receipt().outcome else {
+        let Ok(Outcome::Granted { grant, .. }) = granted.receipt().outcome else {
             panic!()
         };
         let append = group
@@ -867,7 +867,7 @@ mod tests {
                 &first,
                 3,
                 request(
-                    3,
+                    granted.state().position(),
                     worker,
                     Command::Append {
                         class: AppendClass::Data,
@@ -896,7 +896,7 @@ mod tests {
                 &second,
                 4,
                 request(
-                    4,
+                    append.state().position(),
                     Principal::Custodian,
                     Command::PrepareCheckpoint {
                         preparation: CheckpointPreparation {
@@ -920,7 +920,7 @@ mod tests {
             Ok(Outcome::CheckpointPrepared(_))
         ));
         let invocation = request(
-            6,
+            prepare.state().position(),
             Principal::Custodian,
             Command::PublishAndRotate { grant, checkpoint },
         );
@@ -963,17 +963,15 @@ mod tests {
         }
 
         let changed = [stale, reopened];
-        assert_eq!(
-            group.recover(&changed, 7).await.unwrap().checkpoint(),
-            checkpoint
-        );
+        let recovered = group.recover(&changed, 7).await.unwrap();
+        assert_eq!(recovered.checkpoint(), checkpoint);
         let successor_voters = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         let successor = Group::new(placement, limits, base, window, successor_voters, 64 << 10)
             .unwrap()
             .successor(group.identity())
             .unwrap();
         let seal = request(
-            7,
+            recovered.position(),
             Principal::Administrator,
             Command::SealCohort {
                 expected: group.identity(),
