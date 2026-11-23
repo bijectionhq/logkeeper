@@ -1334,3 +1334,15 @@ Workstreams C3, C7, C9, C11 and C12 in [the co-design plan](codesign.md).
 | A487 | C12 | A chosen append can refuse at application, and a fully matched retained request can arrive without authorization. | Record a positive receipt only after a successful applied outcome, and require current authorization independently of receipt identity at lookup. |
 | A488 | C12 | Keeping the serving quorum and readable cut does not give newly acknowledged input first-loss coverage during an unclassified outage. | Check new input against the current protection interval even when serving admission succeeded. |
 | A489 | C12 | A provider can delete the only version backing an ordinary admitted read after the old root releases. | Keep ordinary physical read custody as an independent withdrawal guard through completion or effective stop. |
+
+## Co-design follow-up agents · 2026-11-23
+
+| ID | Workstream | Finding | Design amendment |
+| --- | --- | --- | --- |
+| A490 | C4 | Installed serving-store deletes returned success without keeping a candidate. | Keep idempotent, grant- and provider-bound candidate records for owned objects, and nominate older offloaded payloads from installed block collection. |
+| A491 | C4 | Route and suffix inspection, per-root close and trim give no exact-object withdrawal fence shared by append, publication and read admission. | Order exact withdrawal against durable references for every selector, preparation, retained typed replay suffix and live hold, then drain RTDB leases and provider operations before any exact removal. |
+| A492 | C4 | The current writer keeps its local prefix lock and may renew its scoped S3 credentials. | Keep whole-prefix retirement for superseded grants, and inside a current prefix apply exact-key generation fences and qualified provider effects. |
+| A493 | C7b | Expiry eligibility takes effect only through a chosen decision, which an idle journal never makes. | Installed custody pages withdrawn hold owners, attempts a fresh disposal when due, retries an uncertain outcome by its identity, and disposes before trim. |
+| A494 | C3b | The exact-head rotation can use the existing command, but RTDB's native checkpoint ends before its upload, and post-restart confirmation can reopen retained material. | Stage an erasure-specific clean closure through the quiesced head, bind the absorbed interval and confirmation evidence into it, and resume with the original rotation invocation. |
+| A495 | C3b | A chosen rotation receipt can coexist with a valid older local slot on an acknowledging voter after the voting subset changes. | Require authenticated evidence for every crash-selectable recovery image and a durable selection fence before custody commits and arms revocation. Specify the quorum and cohort-repair obligations before enabling the coordinator. |
+| A496 | C3b | The deadline is exercised by a scheduled key expiry and an in-memory receipt in a fixture. | Qualify an authority that atomically records the receipt and the irrevocable deadline, including outstanding operations and held views. |
