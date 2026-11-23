@@ -1,7 +1,7 @@
 //! Fixed-group prefix agreement over the ordered reducer.
 //!
 //! Each ballot is used for one proposed extension. Recovery adopts the
-//! greatest accepted ballot, then the longest prefix within that ballot.
+//! greatest accepted ballot and its exact prefix.
 //! Transport implementations supply authenticated replies from the named
 //! durable journals in the installed cohort.
 
@@ -273,7 +273,26 @@ pub trait Replica: Sync {
     ) -> impl Future<Output = Result<Vote, Error>> + Send;
 }
 
+struct PreparedRound {
+    ballot: Ballot,
+    voters: BTreeSet<Uuid>,
+    newest_refusal: Option<Ballot>,
+}
+
 impl Group {
+    /// Recovers the image confirmed by a durable quorum, without consuming a command slot.
+    /// The returned image supplies observations and exact predecessors for a
+    /// later command, which still enters a fresh round and rechecks authority.
+    pub async fn recover<R: Replica>(&self, peers: &[R], round: u64) -> Result<State, Error> {
+        let (prepared, prefix) = self.prepare(peers, round).await?;
+        let state = self.replay(&prefix)?;
+        if !prefix.frames.is_empty() {
+            let digest = prefix.identity(self.identity);
+            self.confirm(peers, prepared, &prefix, digest).await?;
+        }
+        Ok(state)
+    }
+
     /// Orders one command or returns an uncertain outcome. An identical retry
     /// uses the original request identity and deadline. The caller increments
     /// its proposed round after receiving a newer durable promise.
@@ -283,7 +302,38 @@ impl Group {
         round: u64,
         request: Request,
     ) -> Result<Chosen, Error> {
-        if request.placement != self.initial.placement() || round == 0 {
+        if request.placement != self.initial.placement() {
+            return Err(Error::Group);
+        }
+        let (prepared, mut prefix) = self.prepare(peers, round).await?;
+        let mut state = self.replay(&prefix)?;
+        let receipt = if let Some(receipt) = state.retained_receipt(&request) {
+            // A promise can expose a value that had only one old vote.
+            // Re-accept this prefix before releasing its receipt.
+            receipt
+        } else {
+            prefix.append(request.encode(), self.max_prefix_bytes)?;
+            let position = state.position().checked_add(1).ok_or(Error::Capacity)?;
+            state.apply(position, request).map_err(|_| Error::Prefix)?
+        };
+        let ballot = prepared.ballot;
+        let digest = prefix.identity(self.identity);
+        let voters = self.confirm(peers, prepared, &prefix, digest).await?;
+        Ok(Chosen {
+            ballot,
+            prefix: digest,
+            voters,
+            receipt,
+            state,
+        })
+    }
+
+    async fn prepare<R: Replica>(
+        &self,
+        peers: &[R],
+        round: u64,
+    ) -> Result<(PreparedRound, Prefix), Error> {
+        if round == 0 {
             return Err(Error::Group);
         }
         let mut identities = BTreeSet::new();
@@ -305,7 +355,7 @@ impl Group {
             .iter()
             .map(|peer| async move { (peer.identity(), peer.prepare(self.identity, ballot).await) })
             .collect();
-        let mut promised = BTreeSet::new();
+        let mut voters = BTreeSet::new();
         let mut winner: Option<Accepted> = None;
         let mut refusal = None;
         while let Some((expected, reply)) = prepares.next().await {
@@ -317,8 +367,8 @@ impl Group {
                         }
                         choose_base(&mut winner, accepted)?;
                     }
-                    promised.insert(expected);
-                    if promised.len() >= self.quorum() {
+                    voters.insert(expected);
+                    if voters.len() >= self.quorum() {
                         break;
                     }
                 }
@@ -328,32 +378,38 @@ impl Group {
                 _ => {}
             }
         }
-        drop(prepares);
-        if promised.len() < self.quorum() {
+        if voters.len() < self.quorum() {
             return Err(refusal.map_or(Error::Quorum, Error::Deposed));
         }
+        Ok((
+            PreparedRound {
+                ballot,
+                voters,
+                newest_refusal: refusal,
+            },
+            winner.map_or_else(Prefix::empty, |accepted| accepted.prefix),
+        ))
+    }
 
-        let mut prefix = winner.map_or_else(Prefix::empty, |accepted| accepted.prefix);
-        let mut state = self.replay(&prefix)?;
-        let receipt = if let Some(receipt) = state.retained_receipt(&request) {
-            // Recovering from a promise can expose a value that had only one
-            // old vote. Re-accept this prefix before releasing its receipt.
-            receipt
-        } else {
-            prefix.append(request.encode(), self.max_prefix_bytes)?;
-            let position = state.position().checked_add(1).ok_or(Error::Capacity)?;
-            state.apply(position, request).map_err(|_| Error::Prefix)?
-        };
-        let digest = prefix.identity(self.identity);
-
-        let prefix_ref = &prefix;
+    async fn confirm<R: Replica>(
+        &self,
+        peers: &[R],
+        prepared: PreparedRound,
+        prefix: &Prefix,
+        digest: Fingerprint,
+    ) -> Result<Vec<Uuid>, Error> {
+        let PreparedRound {
+            ballot,
+            voters: promised,
+            newest_refusal: mut refusal,
+        } = prepared;
         let mut accepts: FuturesUnordered<_> = peers
             .iter()
             .filter(|peer| promised.contains(&peer.identity()))
             .map(|peer| async move {
                 (
                     peer.identity(),
-                    peer.accept(self.identity, ballot, prefix_ref).await,
+                    peer.accept(self.identity, ballot, prefix).await,
                 )
             })
             .collect();
@@ -365,13 +421,7 @@ impl Group {
                 {
                     voters.insert(expected);
                     if voters.len() >= self.quorum() {
-                        return Ok(Chosen {
-                            ballot,
-                            prefix: digest,
-                            voters: voters.into_iter().collect(),
-                            receipt,
-                            state,
-                        });
+                        return Ok(voters.into_iter().collect());
                     }
                 }
                 Err(Error::Deposed(newer)) => {
@@ -390,17 +440,10 @@ fn choose_base(winner: &mut Option<Accepted>, candidate: Accepted) -> Result<(),
             return Ok(());
         }
         if candidate.ballot == current.ballot {
-            let shared = candidate
-                .prefix
-                .frames
-                .len()
-                .min(current.prefix.frames.len());
-            if candidate.prefix.frames[..shared] != current.prefix.frames[..shared] {
+            if candidate.prefix != current.prefix {
                 return Err(Error::Diverged);
             }
-            if candidate.prefix.frames.len() <= current.prefix.frames.len() {
-                return Ok(());
-            }
+            return Ok(());
         }
     }
     *winner = Some(candidate);

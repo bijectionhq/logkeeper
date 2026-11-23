@@ -320,4 +320,9 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         Err(Refusal::Unavailable)
     ));
     assert_eq!(trimmed.state().spent_bytes(), next.byte_end);
+    let reopened = group.recover(&peers, 17).await.unwrap();
+    assert_eq!(reopened.position(), trimmed.state().position());
+    assert_eq!(reopened.writer_state(), trimmed.state().writer_state());
+    assert_eq!(reopened.floor(), published.cut);
+    assert_eq!(reopened.window(), window);
 }
