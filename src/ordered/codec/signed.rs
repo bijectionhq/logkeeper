@@ -1,17 +1,19 @@
+use super::Input;
 use crate::ordered::{
-    BarrierClaim, Checkpoint, Cut, Enrollment, Placement, Receipt, RequestId,
+    BarrierClaim, Checkpoint, Cut, Enrollment, Hold, Placement, Receipt, Refusal, RequestId,
     replication::RotationSlots,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use uuid::Uuid;
 
-pub(super) const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR04";
+pub const BARRIER_DOMAIN: &str = "LKBRAR04";
+pub const ROTATION_DOMAIN: &str = "logkeeper.ordered-rotation-slots.v1";
 
 impl BarrierClaim {
     /// Canonical bytes for the journal's scoped receipt issuer to authenticate.
     pub fn encode(&self) -> Bytes {
         let mut output = BytesMut::new();
-        output.put_slice(BARRIER_DOMAIN);
+        output.put_slice(BARRIER_DOMAIN.as_bytes());
         placement(&mut output, self.placement);
         enrollment(&mut output, self.read.owner);
         request_id(&mut output, self.read.id);
@@ -20,12 +22,50 @@ impl BarrierClaim {
         cut(&mut output, self.read.through);
         output.freeze()
     }
+
+    /// Parses a claim. The receiver still authenticates the original bytes
+    /// against the installed journal scope before relying on their contents.
+    pub fn decode(frame: Bytes) -> Result<Self, Refusal> {
+        decode_barrier_claim(frame)
+    }
+}
+
+pub(crate) fn decode_barrier_claim(frame: Bytes) -> Result<BarrierClaim, Refusal> {
+    let mut input = Input(frame);
+    if &input.take::<8>()? != BARRIER_DOMAIN.as_bytes() {
+        return Err(Refusal::Invalid);
+    }
+    let placement = input.placement()?;
+    let owner = input.enrollment()?;
+    let id = input.request_id()?;
+    let admitted_at = input.u64()?;
+    let checkpoint = input.checkpoint()?;
+    let through = input.cut()?;
+    if !input.0.is_empty()
+        || checkpoint.cut.next_lsn > through.next_lsn
+        || (checkpoint.cut.next_lsn == through.next_lsn && checkpoint.cut != through)
+        || admitted_at == 0
+        || admitted_at >= id.expires_at
+    {
+        return Err(Refusal::Invalid);
+    }
+    Ok(BarrierClaim {
+        placement,
+        read: Hold {
+            id,
+            owner,
+            admitted_at,
+            checkpoint,
+            start: checkpoint.cut,
+            through,
+        },
+    })
 }
 
 impl RotationSlots {
-    pub(in crate::ordered) fn signing_bytes(&self, decision: Receipt) -> Bytes {
+    pub(in super::super) fn signing_bytes(&self, decision: Receipt) -> Bytes {
         let mut output = BytesMut::new();
-        output.put_slice(b"logkeeper.ordered-rotation-slots.v1");
+        output.put_slice(ROTATION_DOMAIN.as_bytes());
         super::service::receipt(&mut output, decision);
         self.encode(&mut output);
         output.freeze()

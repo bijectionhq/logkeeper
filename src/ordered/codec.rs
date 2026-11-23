@@ -1,7 +1,7 @@
 use super::{
-    AppendClass, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut,
-    Enrollment, Fingerprint, Grant, Hold, MAX_OBJECT_REFERENCES, ObjectName, ObjectWithdrawal,
-    Placement, Principal, Refusal, Request, RequestId, Window, WriterState, valid_object_names,
+    AppendClass, Checkpoint, CheckpointPreparation, Command, Custody, Cut, Enrollment, Fingerprint,
+    Grant, Hold, MAX_OBJECT_REFERENCES, ObjectName, ObjectWithdrawal, Placement, Principal,
+    Refusal, Request, RequestId, Window, WriterState, valid_object_names,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use uuid::Uuid;
@@ -17,7 +17,7 @@ use frame::{
     object_name_count, read_decision_time,
 };
 
-use signed::{BARRIER_DOMAIN, checkpoint, cut, enrollment, placement, request_id, uuid};
+use signed::{checkpoint, cut, enrollment, placement, request_id, uuid};
 
 impl Request {
     /// The exact bytes used by ordered replication and crash replay.
@@ -316,42 +316,6 @@ pub(in crate::ordered) fn decode_decision(frame: Bytes) -> Result<(u64, Request)
     body.put_slice(&frame[..1]);
     body.put_slice(&frame[9..]);
     Ok((time, Request::decode(body.freeze())?))
-}
-
-impl BarrierClaim {
-    /// Parses a claim. The receiver still authenticates the original bytes
-    /// against the installed journal scope before relying on their contents.
-    pub fn decode(frame: Bytes) -> Result<Self, Refusal> {
-        let mut input = Input(frame);
-        if &input.take::<8>()? != BARRIER_DOMAIN {
-            return Err(Refusal::Invalid);
-        }
-        let placement = input.placement()?;
-        let owner = input.enrollment()?;
-        let id = input.request_id()?;
-        let admitted_at = input.u64()?;
-        let checkpoint = input.checkpoint()?;
-        let through = input.cut()?;
-        if !input.0.is_empty()
-            || checkpoint.cut.next_lsn > through.next_lsn
-            || (checkpoint.cut.next_lsn == through.next_lsn && checkpoint.cut != through)
-            || admitted_at == 0
-            || admitted_at >= id.expires_at
-        {
-            return Err(Refusal::Invalid);
-        }
-        Ok(Self {
-            placement,
-            read: Hold {
-                id,
-                owner,
-                admitted_at,
-                checkpoint,
-                start: checkpoint.cut,
-                through,
-            },
-        })
-    }
 }
 
 struct Input(Bytes);

@@ -1,4 +1,5 @@
 use super::{invalid, verify_bytes};
+use crate::ordered::daemon::receipt_keys::fingerprints_match;
 use crate::ordered::{
     BarrierClaim, Command, Fingerprint, Placement, Principal, Receipt, Request,
     service::wire::{Signature, SignedBarrier, SignedRotationSlots},
@@ -17,49 +18,52 @@ pub struct BarrierVerifier {
 impl BarrierVerifier {
     /// Authenticates the exact successful marker for the supplied invocation.
     /// The consumer still has to open and materialize the protected basis.
-    pub fn verify(&self, proof: SignedBarrier, expected: &Request) -> io::Result<BarrierClaim> {
+    pub fn verify(
+        &self,
+        attestation: SignedBarrier,
+        expected: &Request,
+    ) -> io::Result<BarrierClaim> {
         let Command::Barrier = &expected.command else {
             return Err(invalid(
                 "a read receipt requires an original read invocation",
             ));
         };
-        let claim = proof.claim;
-        if claim.placement() != self.scope
+        let claim = attestation.claim;
+        if claim.placement != self.scope
             || expected.placement != self.scope
-            || expected.principal != Principal::Worker(claim.read().owner)
-            || claim.read().id != expected.id
+            || expected.principal != Principal::Worker(claim.read.owner)
+            || claim.read.id != expected.id
         {
             return Err(invalid("read receipt addresses a different invocation"));
         }
-        self.verify_signature(proof.signature, claim.encode().as_ref())?;
+        self.verify_signature(attestation.signature, claim.encode().as_ref())?;
         Ok(claim)
     }
 
-    pub(in crate::ordered::daemon) fn verify_rotation(
+    pub(in super::super) fn verify_rotation(
         &self,
-        proof: &SignedRotationSlots,
+        attestation: &SignedRotationSlots,
         group: Fingerprint,
         receipt: Receipt,
     ) -> io::Result<()> {
         if receipt.placement != self.scope
-            || proof.evidence.group != group
-            || !proof.evidence.covers(receipt)
+            || !fingerprints_match(&attestation.evidence.group, &group)
+            || !attestation.evidence.covers(receipt)
         {
             return Err(invalid(
                 "rotation slots address a different installed decision",
             ));
         }
         self.verify_signature(
-            proof.signature,
-            proof.evidence.signing_bytes(receipt).as_ref(),
+            attestation.signature,
+            attestation.evidence.signing_bytes(receipt).as_ref(),
         )
     }
 
     fn verify_signature(&self, signature: Signature, body: &[u8]) -> io::Result<()> {
-        let authority = self
-            .keys
-            .get(&signature.issuer)
-            .ok_or_else(|| invalid("unrecognized journal receipt key"))?;
+        let Some(authority) = self.keys.get(&signature.issuer) else {
+            return Err(invalid("unrecognized journal receipt key"));
+        };
         verify_bytes(authority, body, &signature.proof)
     }
 }

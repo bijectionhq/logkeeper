@@ -5,21 +5,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use uuid::Uuid;
 
-pub(super) struct ReceiptKeys {
-    pub(super) active: BTreeMap<Uuid, [u8; 32]>,
-    pub(super) predecessor: Vec<[u8; 32]>,
-    pub(super) retained: Vec<[u8; 32]>,
+pub(crate) struct ReceiptKeys {
+    pub(crate) active: BTreeMap<Uuid, [u8; 32]>,
+    pub(crate) predecessor: Vec<[u8; 32]>,
+    pub(crate) retained: Vec<[u8; 32]>,
 }
 
 impl ReceiptKeys {
-    pub(super) fn barrier_keys(&self) -> BTreeSet<[u8; 32]> {
+    pub(crate) fn barrier_keys(&self) -> BTreeSet<[u8; 32]> {
         let mut keys = active_keys(&self.active);
         keys.extend(&self.predecessor);
         keys.extend(&self.retained);
         keys
     }
 
-    pub(super) fn validate_successor_keys(&self, source: &Self) -> io::Result<()> {
+    pub(crate) fn validate_successor_keys(&self, source: &Self) -> io::Result<()> {
         let active = active_keys(&source.active);
         let mut index = 0;
         while index < self.predecessor.len() {
@@ -38,11 +38,14 @@ impl ReceiptKeys {
         Ok(())
     }
 
-    pub(super) fn repair_package_key(&self, issuer: &Fingerprint) -> Option<&[u8; 32]> {
-        for key in &self.predecessor {
-            if fingerprint(key) == *issuer {
+    pub(crate) fn repair_package_key(&self, issuer: &Fingerprint) -> Option<&[u8; 32]> {
+        let mut index = 0;
+        while index < self.predecessor.len() {
+            let key = &self.predecessor[index];
+            if fingerprints_match(&fingerprint(key), issuer) {
                 return Some(key);
             }
+            index += 1;
         }
         None
     }
@@ -54,4 +57,15 @@ fn fingerprint(key: &[u8; 32]) -> Fingerprint {
 
 fn active_keys(active: &BTreeMap<Uuid, [u8; 32]>) -> BTreeSet<[u8; 32]> {
     active.values().copied().collect()
+}
+
+pub(crate) fn fingerprints_match(left: &Fingerprint, right: &Fingerprint) -> bool {
+    let mut index = 0;
+    while index < left.len() {
+        if left[index] != right[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
 }
