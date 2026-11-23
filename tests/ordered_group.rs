@@ -376,10 +376,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         trimmed.receipt().outcome,
         Ok(Outcome::Trimmed(published.cut))
     );
-    assert_eq!(
-        trimmed.state().reconcile_append(&append),
-        Err(Refusal::Unavailable)
-    );
+    assert_eq!(trimmed.state().reconcile_append(&append), Ok(original));
     assert!(matches!(
         trimmed.state().held_replay(reader, read),
         Err(Refusal::Unavailable)
@@ -410,6 +407,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     assert_eq!(reopened.writer_state(), trimmed.state().writer_state());
     assert_eq!(reopened.floor(), published.cut);
     assert_eq!(reopened.window(), window);
+    assert_eq!(reopened.reconcile_append(&append), Ok(original));
 
     let marker = |nonce| {
         request(

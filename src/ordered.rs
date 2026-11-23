@@ -548,8 +548,8 @@ impl State {
         })
     }
 
-    /// Reconciles the actual retained append. Position equality alone supplies
-    /// no evidence that the caller's record was chosen.
+    /// Reconciles the exact original receipt or the retained data record.
+    /// A chosen receipt can outlive physical replay retention.
     pub fn reconcile_append(&self, request: &Request) -> Result<AppendResult, Refusal> {
         let Command::Append {
             grant,
@@ -565,6 +565,15 @@ impl State {
         }
         if request.principal != Principal::Worker(grant.enrollment) {
             return Err(Refusal::Unauthorized);
+        }
+        if let Some(previous) = self.outcomes.get(&(request.principal, request.id)) {
+            if previous.fingerprint != fingerprint(request) {
+                return Err(Refusal::Conflict);
+            }
+            return match previous.receipt.outcome? {
+                Outcome::Appended(append) => Ok(append),
+                _ => Err(Refusal::Conflict),
+            };
         }
         let record = self.record(*expected_next).ok_or(Refusal::Unavailable)?;
         if record.request != request.id
