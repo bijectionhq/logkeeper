@@ -1167,7 +1167,6 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
             &mut state,
             worker,
             Command::ProtectRange {
-                grant: new,
                 from: 0,
                 through: checkpoint.cut.next_lsn,
             }
