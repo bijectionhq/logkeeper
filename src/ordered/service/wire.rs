@@ -3,7 +3,8 @@
 use super::{Coordinator, Error, ReplayHead, ReplayPage, Route, Session};
 use crate::ordered::{
     AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Fingerprint,
-    Grant, Hold, Placement, Receipt, Refusal, Request, append_fingerprint, replication::Replica,
+    Grant, Hold, Outcome, Placement, Receipt, Refusal, Request, append_fingerprint,
+    replication::Replica,
 };
 use bytes::Bytes;
 use std::io;
@@ -234,6 +235,16 @@ impl Reply {
                 decision.receipt.placement == placement
                     && decision.receipt.principal == request.principal
                     && decision.receipt.request == request.id
+                    && match (&request.command, decision.receipt.outcome) {
+                        (
+                            Command::Barrier { grant },
+                            Ok(Outcome::Barrier { grant: issued, .. }),
+                        ) => *grant == issued,
+                        (Command::Barrier { .. }, Ok(_)) | (_, Ok(Outcome::Barrier { .. })) => {
+                            false
+                        }
+                        _ => true,
+                    }
             }
             (Self::Reconciled(result), Operation::Reconcile { original, .. }) => {
                 matches!(&original.command, Command::Append { class, expected_next, .. } if result.lsn == *expected_next && result.class == *class)
@@ -332,4 +343,37 @@ async fn write_frame(
     channel.write_all(&bytes).await?;
     channel.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn application_framing_requires_the_protocol_magic_and_bounded_length() {
+        let mut packet = Vec::new();
+        let body = Bytes::from_static(b"encoded application request");
+        write_frame(&mut packet, body.clone(), body.len())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut packet.as_slice(), body.len())
+                .await
+                .unwrap(),
+            body
+        );
+        assert!(matches!(
+            read_frame(&mut packet.as_slice(), body.len() - 1).await,
+            Err(WireError::Frame)
+        ));
+        assert!(matches!(
+            read_frame(&mut &packet[..packet.len() - 1], body.len()).await,
+            Err(WireError::Io(_))
+        ));
+        packet[0] ^= 1;
+        assert!(matches!(
+            read_frame(&mut packet.as_slice(), body.len()).await,
+            Err(WireError::Frame)
+        ));
+    }
 }

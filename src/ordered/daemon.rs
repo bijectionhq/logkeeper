@@ -71,8 +71,12 @@ pub struct InstalledGroup {
     pub clients: Vec<ClientPin>,
     #[serde(default)]
     pub predecessor: Option<Fingerprint>,
+    /// Repair authorities from the immediate predecessor's active voter roster.
     #[serde(default)]
     pub predecessor_keys: Vec<[u8; 32]>,
+    /// Historical verification only. These keys cannot authorize repair.
+    #[serde(default)]
+    pub retained_barrier_keys: Vec<[u8; 32]>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +134,37 @@ struct GroupConfig {
     max_frame: usize,
     receipt_keys: BTreeMap<Uuid, [u8; 32]>,
     predecessor_keys: Vec<[u8; 32]>,
+    retained_barrier_keys: Vec<[u8; 32]>,
+}
+
+impl GroupConfig {
+    fn barrier_keys(&self) -> BTreeSet<[u8; 32]> {
+        self.receipt_keys
+            .values()
+            .chain(&self.predecessor_keys)
+            .chain(&self.retained_barrier_keys)
+            .copied()
+            .collect()
+    }
+
+    fn validate_successor_keys(&self, source: &Self) -> io::Result<()> {
+        let active: BTreeSet<_> = source.receipt_keys.values().copied().collect();
+        if self
+            .predecessor_keys
+            .iter()
+            .any(|key| !active.contains(key))
+        {
+            return Err(invalid(
+                "a repair key is outside the active predecessor roster",
+            ));
+        }
+        if !source.barrier_keys().is_subset(&self.barrier_keys()) {
+            return Err(invalid(
+                "the successor dropped installed barrier verification keys",
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct Admission {
@@ -224,6 +259,7 @@ impl InstalledGroup {
             max_frame: self.maximum_application_frame,
             receipt_keys,
             predecessor_keys: self.predecessor_keys,
+            retained_barrier_keys: self.retained_barrier_keys,
         })
     }
 }
@@ -254,17 +290,14 @@ impl Manifest {
                 invalid("the installation contains several cohorts for the deployment").into(),
             );
         }
+        let verification_keys = config.barrier_keys().into_iter().collect();
         Ok(ApplicationRoute {
             group,
             placement: config.group.placement(),
             endpoints: config.members.into_values().collect(),
             maximum_frame: config.max_frame,
             exchange_ms: manifest.exchange_ms,
-            verification_keys: config
-                .receipt_keys
-                .into_values()
-                .chain(config.predecessor_keys)
-                .collect(),
+            verification_keys,
             successors: Vec::new(),
         })
     }
@@ -470,6 +503,7 @@ pub struct ApplicationRoute {
     pub endpoints: Vec<Endpoint>,
     pub maximum_frame: usize,
     pub exchange_ms: u64,
+    /// Trusted public keys for every signing cohort in this logical placement.
     pub verification_keys: Vec<[u8; 32]>,
     #[serde(default)]
     pub successors: Vec<SuccessorRoute>,

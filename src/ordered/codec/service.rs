@@ -298,18 +298,16 @@ impl Input {
             let claim = BarrierClaim::decode(std::mem::take(&mut input.0))?;
             Ok(SignedBarrier { claim, signature })
         })?;
-        if let Some(SignedBarrier { claim, .. }) = barrier
-            && (receipt.outcome
-                != Ok(Outcome::Barrier {
-                    grant: claim.grant(),
-                    read: claim.read(),
-                })
-                || receipt.placement != claim.placement()
-                || receipt.principal != Principal::Worker(claim.grant().enrollment)
-                || receipt.request != claim.read().id
-                || receipt.position != claim.read().admitted_at)
-        {
-            return Err(Refusal::Invalid);
+        match (receipt.outcome, barrier) {
+            (Ok(Outcome::Barrier { grant, read }), Some(SignedBarrier { claim, .. }))
+                if grant == claim.grant()
+                    && read == claim.read()
+                    && receipt.placement == claim.placement()
+                    && receipt.principal == Principal::Worker(grant.enrollment)
+                    && receipt.request == read.id
+                    && receipt.position == read.admitted_at => {}
+            (Ok(Outcome::Barrier { .. }), _) | (_, Some(_)) => return Err(Refusal::Invalid),
+            (_, None) => {}
         }
         Ok(Decision { receipt, barrier })
     }

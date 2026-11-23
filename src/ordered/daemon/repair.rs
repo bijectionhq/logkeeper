@@ -72,6 +72,7 @@ impl Manifest {
         let source = groups
             .remove(&predecessor)
             .ok_or_else(|| invalid("the source manifest lacks the exact predecessor"))?;
+        destination.validate_successor_keys(&source)?;
         let issuer = sign::Issuer::load(&manifest.barrier_key)?;
         if source.receipt_keys.get(&manifest.voter) != Some(&issuer.public_key())
             || !destination.predecessor_keys.contains(&issuer.public_key())
