@@ -2,6 +2,8 @@
 
 use super::admission::debit;
 
+pub const MAX_OBJECT_REFERENCES: usize = 16_384;
+
 /// Fixed stream charge for each record's identity and framing. Replica media
 /// also budget for staging and their own metadata.
 pub const APPEND_RECORD_CHARGE_BYTES: u64 = 217;

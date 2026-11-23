@@ -3,6 +3,28 @@
 use super::{AppendClass, Refusal, writer};
 use std::collections::VecDeque;
 
+pub(super) struct TrimSelection {
+    pub floor: u64,
+    pub through: u64,
+    pub checkpoint: u64,
+    pub exact_cut: bool,
+}
+
+pub(super) fn trim<R, P: Fn(&R) -> (AppendClass, u64, u64)>(
+    selection: TrimSelection,
+    has_live_pin: impl Fn() -> bool,
+    records: &mut VecDeque<R>,
+    ordinary: &mut u64,
+    maintenance: &mut u64,
+    project: P,
+) -> Result<(u64, u64), Refusal> {
+    if !within_checkpoint(selection.through, selection.checkpoint) || !selection.exact_cut {
+        return Err(Refusal::Invalid);
+    }
+    let count = trim_length(selection.floor, selection.through, has_live_pin())?;
+    Ok(trim_records(records, count, ordinary, maintenance, project))
+}
+
 pub(super) fn within_checkpoint(through: u64, checkpoint: u64) -> bool {
     through <= checkpoint
 }

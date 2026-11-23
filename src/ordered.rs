@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 pub type Fingerprint = [u8; 32];
 
-pub use budget::{APPEND_RECORD_CHARGE_BYTES, AppendClass};
+pub use budget::{APPEND_RECORD_CHARGE_BYTES, AppendClass, MAX_OBJECT_REFERENCES};
 pub use refusal::Refusal;
 
 const ACTIVATION_HOLD_SLOTS: usize = 4;
@@ -186,7 +186,6 @@ impl RequestId {
 /// references to a physical object, including references derived during replay.
 pub type ObjectName = Fingerprint;
 
-pub const MAX_OBJECT_REFERENCES: usize = 16_384;
 const MAX_OBJECT_CONTROL_BYTES: usize = 2 << 20;
 const WITHDRAWAL_BYTES: usize = 80;
 
@@ -1430,22 +1429,25 @@ impl State {
                 if selected != self.checkpoint {
                     return Err(Refusal::Stale);
                 }
-                if !retention::within_checkpoint(through.next_lsn, selected.cut.next_lsn)
-                    || self.cut(through.next_lsn) != Some(through)
-                {
-                    return Err(Refusal::Invalid);
-                }
-                let pinned = self.holds.values().map(|entry| entry.hold).any(|hold| {
-                    admission::pins_suffix(
-                        hold.start.next_lsn,
-                        hold.through.next_lsn,
-                        through.next_lsn,
-                    )
-                });
-                let trim = retention::trim_length(self.floor.next_lsn, through.next_lsn, pinned)?;
-                let (ordinary_bytes, maintenance_bytes) = retention::trim_records(
+                let selection = retention::TrimSelection {
+                    floor: self.floor.next_lsn,
+                    through: through.next_lsn,
+                    checkpoint: selected.cut.next_lsn,
+                    exact_cut: self.cut(through.next_lsn) == Some(through),
+                };
+                let holds = &self.holds;
+                let (ordinary_bytes, maintenance_bytes) = retention::trim(
+                    selection,
+                    || {
+                        holds.values().any(|entry| {
+                            admission::pins_suffix(
+                                entry.hold.start.next_lsn,
+                                entry.hold.through.next_lsn,
+                                through.next_lsn,
+                            )
+                        })
+                    },
                     &mut self.records,
-                    trim,
                     &mut self.retained_bytes,
                     &mut self.maintenance_retained,
                     |record| {
@@ -1455,7 +1457,7 @@ impl State {
                             record.result.byte_end,
                         )
                     },
-                );
+                )?;
                 let result = TrimResult {
                     from: self.floor,
                     through,
