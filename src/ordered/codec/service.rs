@@ -40,6 +40,10 @@ impl Operation {
                 cut(&mut output, *from);
                 output.put_u64(*maximum_bytes);
             }
+            Self::Release { hold } => {
+                output.put_u8(5);
+                hold_row(&mut output, *hold);
+            }
             Self::ReplayHead { hold, from } => {
                 output.put_u8(4);
                 hold_row(&mut output, *hold);
@@ -67,6 +71,9 @@ impl Operation {
             4 => Self::ReplayHead {
                 hold: input.hold()?,
                 from: input.cut()?,
+            },
+            5 => Self::Release {
+                hold: input.hold()?,
             },
             _ => return Err(Refusal::Invalid),
         };
@@ -133,6 +140,10 @@ impl Reply {
                 output.put_u8(4);
                 snapshot::result(&mut output, Err(*refusal));
             }
+            Self::Released(hold) => {
+                output.put_u8(6);
+                hold_row(&mut output, *hold);
+            }
             Self::ReplayHead(head) => {
                 output.put_u8(5);
                 output.put_u8(u8::from(head.is_some()));
@@ -195,6 +206,7 @@ impl Reply {
                     payload_bytes: input.u64()?,
                 })
             })?),
+            6 => Self::Released(input.hold()?),
             _ => return Err(Refusal::Invalid),
         };
         input.finish(reply)

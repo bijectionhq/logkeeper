@@ -218,6 +218,39 @@ impl<R: Replica> Coordinator<R> {
         Ok(state.reconcile_append(original)?)
     }
 
+    /// A withdrawn enrollment can release its old exact hold without
+    /// reacquiring visibility into the current writer or admitting new work.
+    pub async fn release(&self, session: Session, hold: Hold) -> Result<(), Error> {
+        if session.principal != Principal::Worker(hold.owner) {
+            return Err(Refusal::Unauthorized.into());
+        }
+        let state = self.recover(session).await?;
+        if state
+            .holds
+            .get(&hold.id)
+            .is_none_or(|entry| entry.hold != hold)
+        {
+            return Ok(());
+        }
+        let request = Request {
+            placement: state.placement(),
+            principal: session.principal,
+            id: RequestId {
+                nonce: uuid::Uuid::new_v4(),
+                expires_at: state
+                    .position()
+                    .checked_add(state.limits.retry_positions)
+                    .ok_or(Refusal::Capacity)?,
+            },
+            command: Command::Release { hold },
+        };
+        match self.execute(session, request).await?.receipt.outcome {
+            Ok(Outcome::Released) | Err(Refusal::Stale) => Ok(()),
+            Err(reason) => Err(reason.into()),
+            _ => Err(replication::Error::Group.into()),
+        }
+    }
+
     /// Reads a bounded continuation of the exact ordered hold. The caller
     /// keeps the hold until it has finished using the provider checkpoint and
     /// every page of the suffix.

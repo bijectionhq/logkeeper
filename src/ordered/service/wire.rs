@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 const MAGIC: &[u8; 8] = b"LKAPPC01";
-const REPLAY_OVERHEAD: usize = 1 + 128 + 40 + 8;
+const REPLAY_OVERHEAD: usize = 1 + 160 + 40 + 8;
 
 #[derive(Clone)]
 pub enum Operation {
@@ -31,6 +31,9 @@ pub enum Operation {
         hold: Hold,
         from: Cut,
     },
+    Release {
+        hold: Hold,
+    },
 }
 
 pub enum Reply {
@@ -39,6 +42,7 @@ pub enum Reply {
     Reconciled(AppendResult),
     Replay(ReplayPage),
     ReplayHead(Option<ReplayHead>),
+    Released(Hold),
     Refused(Refusal),
 }
 
@@ -152,6 +156,10 @@ pub async fn serve<R: Replica>(
                 .replay_head(session, hold, from)
                 .await
                 .map(Reply::ReplayHead),
+            Operation::Release { hold } => coordinator
+                .release(session, hold)
+                .await
+                .map(|()| Reply::Released(hold)),
         };
         let reply = match outcome {
             Ok(reply) => reply,
@@ -167,6 +175,7 @@ pub async fn serve<R: Replica>(
 impl Reply {
     fn matches(&self, placement: Placement, operation: &Operation) -> bool {
         match (self, operation) {
+            (Self::Released(released), Operation::Release { hold }) => released == hold,
             (Self::Route(route), Operation::Route) => route.placement == placement,
             (Self::Decision(decision), Operation::Execute(request)) => {
                 decision.receipt.placement == placement
