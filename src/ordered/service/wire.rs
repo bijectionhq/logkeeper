@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-const MAGIC: &[u8; 8] = b"LKAPPC01";
+const MAGIC: &[u8; 8] = b"LKAPPC02";
 const REPLAY_OVERHEAD: usize = 1 + 160 + 40 + 8;
 
 #[derive(Clone)]
@@ -34,6 +34,10 @@ pub enum Operation {
     Release {
         hold: Hold,
     },
+    CheckpointCut {
+        grant: Grant,
+        next: u64,
+    },
 }
 
 pub enum Reply {
@@ -43,6 +47,7 @@ pub enum Reply {
     Replay(ReplayPage),
     ReplayHead(Option<ReplayHead>),
     Released(Hold),
+    CheckpointCut(Cut),
     Refused(Refusal),
 }
 
@@ -156,6 +161,10 @@ pub async fn serve<R: Replica>(
                 .replay_head(session, hold, from)
                 .await
                 .map(Reply::ReplayHead),
+            Operation::CheckpointCut { grant, next } => coordinator
+                .checkpoint_cut(session, grant, next)
+                .await
+                .map(Reply::CheckpointCut),
             Operation::Release { hold } => coordinator
                 .release(session, hold)
                 .await
@@ -175,6 +184,9 @@ pub async fn serve<R: Replica>(
 impl Reply {
     fn matches(&self, placement: Placement, operation: &Operation) -> bool {
         match (self, operation) {
+            (Self::CheckpointCut(cut), Operation::CheckpointCut { next, .. }) => {
+                cut.next_lsn == *next
+            }
             (Self::Released(released), Operation::Release { hold }) => released == hold,
             (Self::Route(route), Operation::Route) => route.placement == placement,
             (Self::Decision(decision), Operation::Execute(request)) => {
@@ -183,7 +195,7 @@ impl Reply {
                     && decision.receipt.request == request.id
             }
             (Self::Reconciled(result), Operation::Reconcile { original, .. }) => {
-                matches!(&original.command, Command::Append { expected_next, .. } if result.lsn == *expected_next)
+                matches!(&original.command, Command::Append { class, expected_next, .. } if result.lsn == *expected_next && result.class == *class)
             }
             (Self::Replay(page), Operation::Replay { hold, from, .. }) => {
                 if page.checkpoint != hold.checkpoint || page.through != hold.through {
@@ -197,6 +209,7 @@ impl Reply {
                         || result.cut.history
                             != append_fingerprint(
                                 previous,
+                                result.class,
                                 record.grant,
                                 record.request,
                                 record.timestamp,

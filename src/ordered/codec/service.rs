@@ -40,6 +40,14 @@ impl Operation {
                 cut(&mut output, *from);
                 output.put_u64(*maximum_bytes);
             }
+            Self::CheckpointCut {
+                grant: writer,
+                next,
+            } => {
+                output.put_u8(6);
+                grant(&mut output, *writer);
+                output.put_u64(*next);
+            }
             Self::Release { hold } => {
                 output.put_u8(5);
                 hold_row(&mut output, *hold);
@@ -75,6 +83,10 @@ impl Operation {
             5 => Self::Release {
                 hold: input.hold()?,
             },
+            6 => Self::CheckpointCut {
+                grant: input.grant()?,
+                next: input.u64()?,
+            },
             _ => return Err(Refusal::Invalid),
         };
         input.finish((placement, operation))
@@ -92,6 +104,10 @@ impl Reply {
                 output.put_u64(route.position);
                 output.put_slice(&route.history);
                 cut(&mut output, route.head);
+                output.put_u8(u8::from(route.last_data.is_some()));
+                if let Some(chosen) = route.last_data {
+                    cut(&mut output, chosen);
+                }
                 cut(&mut output, route.floor);
                 checkpoint(&mut output, route.checkpoint);
                 output.put_u8(u8::from(route.preparing.is_some()));
@@ -106,6 +122,8 @@ impl Reply {
                 window(&mut output, route.window);
                 output.put_u64(route.window_spent);
                 output.put_u64(route.reusable_bytes);
+                output.put_u64(route.maintenance_limit);
+                output.put_u64(route.maintenance_retained);
                 output.put_u64(route.retry_positions);
             }
             Self::Decision(decision) => {
@@ -140,6 +158,10 @@ impl Reply {
                 output.put_u8(4);
                 snapshot::result(&mut output, Err(*refusal));
             }
+            Self::CheckpointCut(selected) => {
+                output.put_u8(7);
+                cut(&mut output, *selected);
+            }
             Self::Released(hold) => {
                 output.put_u8(6);
                 hold_row(&mut output, *hold);
@@ -166,6 +188,7 @@ impl Reply {
                 position: input.u64()?,
                 history: input.take()?,
                 head: input.cut()?,
+                last_data: input.optional(Input::cut)?,
                 floor: input.cut()?,
                 checkpoint: input.checkpoint()?,
                 preparing: input.optional(Input::checkpoint_preparation)?,
@@ -181,6 +204,8 @@ impl Reply {
                 window: input.window()?,
                 window_spent: input.u64()?,
                 reusable_bytes: input.u64()?,
+                maintenance_limit: input.u64()?,
+                maintenance_retained: input.u64()?,
                 retry_positions: input.u64()?,
             }),
             1 => Self::Decision(input.decision()?),
@@ -207,6 +232,7 @@ impl Reply {
                 })
             })?),
             6 => Self::Released(input.hold()?),
+            7 => Self::CheckpointCut(input.cut()?),
             _ => return Err(Refusal::Invalid),
         };
         input.finish(reply)

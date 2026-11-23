@@ -576,3 +576,105 @@ fn read_ballot(input: &mut Bytes) -> Result<Option<Ballot>, Error> {
         _ => Err(Error::Prefix),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ordered::{
+        Checkpoint, Command, Custody, Cut, Limits, Outcome, Placement, Principal, Request,
+        RequestId, Window,
+    };
+
+    #[tokio::test]
+    async fn a_torn_inactive_slot_preserves_the_acknowledged_prefix() {
+        let voters = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let placement = Placement {
+            deployment: Uuid::new_v4(),
+            incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(),
+            generation: 1,
+        };
+        let group = Group::new(
+            placement,
+            Limits {
+                enrolled_workers: 2,
+                replay_holds: 2,
+                retry_positions: 16,
+                retained_data_bytes: 4096,
+                maintenance_bytes: 1024,
+            },
+            Checkpoint {
+                cut: Cut {
+                    next_lsn: 0,
+                    history: [1; 32],
+                },
+                root: [0; 32],
+                manifest: [0; 32],
+                custody: Custody {
+                    allocation: Uuid::new_v4(),
+                    revision: 1,
+                    provider: [0; 32],
+                },
+            },
+            Window {
+                allocation: Uuid::new_v4(),
+                serial: 1,
+                bytes: 1024,
+            },
+            voters,
+            64 << 10,
+        )
+        .unwrap();
+        let volumes = voters.map(|_| tempfile::tempdir().unwrap());
+        let peers = voters
+            .iter()
+            .zip(&volumes)
+            .map(|(id, volume)| {
+                DurableVoter::initialize(group.clone(), *id, volume.path()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let invocation = Request {
+            placement,
+            principal: Principal::Administrator,
+            id: RequestId::fresh(0, 16).unwrap(),
+            command: Command::Enroll {
+                worker: Uuid::new_v4(),
+                expected: None,
+            },
+        };
+        let chosen = group.choose(&peers, 1, invocation.clone()).await.unwrap();
+        assert!(matches!(chosen.receipt().outcome, Ok(Outcome::Enrolled(_))));
+        let used = chosen
+            .voters()
+            .iter()
+            .map(|id| {
+                let at = voters.iter().position(|&voter| voter == *id).unwrap();
+                let disk = peers[at].inner.media.lock();
+                let committed = disk.selected.as_ref().unwrap().index;
+                (at, 1 - committed)
+            })
+            .collect::<Vec<_>>();
+        drop(peers);
+        for &(at, inactive) in &used {
+            // Reproduce a body torn before publishing the new generation
+            // header. The previously selected vote must remain recoverable.
+            let path = volumes[at].path().join(SLOTS[inactive]);
+            let mut file = OpenOptions::new().write(true).open(path).unwrap();
+            file.seek(SeekFrom::Start(HEADER as u64)).unwrap();
+            file.write_all(&[0xff; 61]).unwrap();
+            file.sync_all().unwrap();
+        }
+        let reopened = used
+            .iter()
+            .map(|&(at, _)| {
+                DurableVoter::recover(group.clone(), voters[at], volumes[at].path()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let retried = group.choose(&reopened, 2, invocation).await.unwrap();
+        assert_eq!(retried.receipt(), chosen.receipt());
+        assert_eq!(
+            retried.state().command_history(),
+            chosen.state().command_history()
+        );
+    }
+}

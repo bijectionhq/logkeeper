@@ -1,7 +1,7 @@
 use super::{
-    BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut, Enrollment,
-    Fingerprint, Grant, Hold, Placement, Principal, Refusal, Request, RequestId, Window,
-    WriterState,
+    AppendClass, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut,
+    Enrollment, Fingerprint, Grant, Hold, Placement, Principal, Refusal, Request, RequestId,
+    Window, WriterState,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use std::num::NonZeroU64;
@@ -10,7 +10,7 @@ use uuid::Uuid;
 mod service;
 mod snapshot;
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR01";
 
 impl Request {
@@ -43,12 +43,14 @@ impl Request {
                 enrollment(&mut output, *candidate);
             }
             Command::Append {
+                class,
                 grant: writer,
                 expected_next,
                 timestamp,
                 payload,
             } => {
                 output.put_u8(3);
+                output.put_u8(class.tag());
                 grant(&mut output, *writer);
                 output.put_u64(*expected_next);
                 output.put_i64(*timestamp);
@@ -187,6 +189,7 @@ impl Request {
                 candidate: input.enrollment()?,
             },
             3 => Command::Append {
+                class: input.append_class()?,
                 grant: input.grant()?,
                 expected_next: input.u64()?,
                 timestamp: i64::from_be_bytes(input.take()?),
@@ -328,6 +331,14 @@ impl Input {
             .as_ref()
             .try_into()
             .map_err(|_| Refusal::Invalid)
+    }
+
+    fn append_class(&mut self) -> Result<AppendClass, Refusal> {
+        match self.read_byte()? {
+            0 => Ok(AppendClass::Data),
+            1 => Ok(AppendClass::Maintenance),
+            _ => Err(Refusal::Invalid),
+        }
     }
 
     fn read_byte(&mut self) -> Result<u8, Refusal> {

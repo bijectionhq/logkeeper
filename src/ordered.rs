@@ -3,6 +3,9 @@
 //! The replication owner supplies one authenticated command at each chosen
 //! position. A command's position and the stream's data frontier are separate.
 
+#[cfg(test)]
+mod acceptance;
+mod admission;
 mod codec;
 #[cfg(feature = "ordered-daemon")]
 pub mod daemon;
@@ -20,7 +23,23 @@ pub type Fingerprint = [u8; 32];
 
 /// Fixed stream charge for each record's identity and framing. Replica media
 /// also budget for staging and their own metadata.
-pub const APPEND_RECORD_CHARGE_BYTES: u64 = 208;
+pub const APPEND_RECORD_CHARGE_BYTES: u64 = 209;
+const ACTIVATION_HOLD_SLOTS: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppendClass {
+    Data,
+    Maintenance,
+}
+
+impl AppendClass {
+    fn tag(self) -> u8 {
+        match self {
+            Self::Data => 0,
+            Self::Maintenance => 1,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
@@ -187,6 +206,7 @@ pub enum Command {
         candidate: Enrollment,
     },
     Append {
+        class: AppendClass,
         grant: Grant,
         expected_next: u64,
         timestamp: i64,
@@ -265,6 +285,7 @@ pub struct Request {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendResult {
+    pub class: AppendClass,
     pub position: u64,
     pub lsn: u64,
     pub cut: Cut,
@@ -393,7 +414,10 @@ pub struct Limits {
     pub enrolled_workers: usize,
     pub replay_holds: usize,
     pub retry_positions: u64,
+    /// Total paid bytes for both retained log classes.
     pub retained_data_bytes: u64,
+    /// A standing part of the physical capacity that ordinary appends cannot spend.
+    pub maintenance_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -414,6 +438,14 @@ struct RetainedOutcome {
 struct HeldAdmission {
     hold: Hold,
     origin: Principal,
+    kind: HoldKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldKind {
+    Ordinary,
+    Recovery,
+    Root(RequestId),
 }
 
 /// The applied image of one stream in a fixed placement.
@@ -436,6 +468,7 @@ pub struct State {
     window: Window,
     spent: u64,
     retained_bytes: u64,
+    maintenance_retained: u64,
     floor: Cut,
     head: Cut,
     checkpoint: Checkpoint,
@@ -466,7 +499,15 @@ impl State {
             || window.allocation.is_nil()
             || window.serial != 1
             || window.bytes == 0
-            || window.bytes > limits.retained_data_bytes
+            || limits.maintenance_bytes == 0
+            || limits
+                .retained_data_bytes
+                .checked_sub(limits.maintenance_bytes)
+                .is_none_or(|ordinary| window.bytes > ordinary)
+            || limits
+                .replay_holds
+                .checked_add(ACTIVATION_HOLD_SLOTS)
+                .is_none()
             || limits.enrolled_workers == 0
             || limits.replay_holds == 0
             || limits.retry_positions == 0
@@ -488,6 +529,7 @@ impl State {
             window,
             spent: 0,
             retained_bytes: 0,
+            maintenance_retained: 0,
             floor: checkpoint.cut,
             head: checkpoint.cut,
             checkpoint,
@@ -531,6 +573,10 @@ impl State {
         self.spent
     }
 
+    fn ordinary_capacity(&self) -> u64 {
+        self.limits.retained_data_bytes - self.limits.maintenance_bytes
+    }
+
     pub fn record(&self, lsn: u64) -> Option<&Record> {
         let index = usize::try_from(lsn.checked_sub(self.floor.next_lsn)?).ok()?;
         self.records.get(index)
@@ -572,6 +618,7 @@ impl State {
     /// A chosen receipt can outlive physical replay retention.
     pub fn reconcile_append(&self, request: &Request) -> Result<AppendResult, Refusal> {
         let Command::Append {
+            class,
             grant,
             expected_next,
             timestamp,
@@ -587,7 +634,7 @@ impl State {
             return Err(Refusal::Unauthorized);
         }
         if let Some(previous) = self.outcomes.get(&(request.principal, request.id)) {
-            if previous.fingerprint != fingerprint(request) {
+            if !admission::matches_fingerprint(&previous.fingerprint, &fingerprint(request)) {
                 return Err(Refusal::Conflict);
             }
             return match previous.receipt.outcome? {
@@ -597,7 +644,8 @@ impl State {
         }
         let record = self.record(*expected_next).ok_or(Refusal::Unavailable)?;
         if record.request != request.id
-            || record.request_fingerprint != fingerprint(request)
+            || record.result.class != *class
+            || !admission::matches_fingerprint(&record.request_fingerprint, &fingerprint(request))
             || record.grant != *grant
             || record.timestamp != *timestamp
             || record.payload != *payload
@@ -609,8 +657,9 @@ impl State {
 
     fn retained_receipt(&self, request: &Request) -> Option<Receipt> {
         let previous = self.outcomes.get(&(request.principal, request.id))?;
-        (request.placement == self.placement && previous.fingerprint == fingerprint(request))
-            .then_some(previous.receipt)
+        (request.placement == self.placement
+            && admission::matches_fingerprint(&previous.fingerprint, &fingerprint(request)))
+        .then_some(previous.receipt)
     }
 
     pub fn apply(&mut self, position: u64, request: Request) -> Result<Receipt, ApplyError> {
@@ -625,11 +674,11 @@ impl State {
                 break;
             }
             let _ = self.expiry.pop_first();
-            if self
+            let live_hold = self
                 .holds
                 .get(&key.1)
-                .is_none_or(|entry| entry.origin != key.0)
-            {
+                .is_some_and(|entry| entry.origin == key.0);
+            if !admission::retains_receipt(position, until, live_hold) {
                 self.outcomes.remove(&key);
             }
         }
@@ -651,11 +700,13 @@ impl State {
         }
         let key = (principal, id);
         if let Some(previous) = self.outcomes.get(&key) {
-            return Ok(if previous.fingerprint == fingerprint {
-                previous.receipt
-            } else {
-                receipt(Err(Refusal::Conflict))
-            });
+            return Ok(
+                if admission::matches_fingerprint(&previous.fingerprint, &fingerprint) {
+                    previous.receipt
+                } else {
+                    receipt(Err(Refusal::Conflict))
+                },
+            );
         }
         if id.expires_at <= position {
             return Ok(receipt(Err(Refusal::Expired)));
@@ -743,7 +794,15 @@ impl State {
         {
             return Err(Refusal::Unavailable);
         }
-        self.admit_hold(origin, id, owner, self.checkpoint, start, through)
+        self.admit_hold(
+            origin,
+            id,
+            owner,
+            self.checkpoint,
+            start,
+            through,
+            HoldKind::Ordinary,
+        )
     }
 
     fn admit_hold(
@@ -754,11 +813,19 @@ impl State {
         checkpoint: Checkpoint,
         start: Cut,
         through: Cut,
+        kind: HoldKind,
     ) -> Result<Hold, Refusal> {
         if self.holds.contains_key(&id) {
             return Err(Refusal::Conflict);
         }
-        if self.holds.len() >= self.limits.replay_holds {
+        let ordinary = self
+            .holds
+            .values()
+            .filter(|entry| entry.kind == HoldKind::Ordinary)
+            .count();
+        if kind == HoldKind::Ordinary && ordinary >= self.limits.replay_holds
+            || kind != HoldKind::Ordinary && self.holds.len() - ordinary >= ACTIVATION_HOLD_SLOTS
+        {
             return Err(Refusal::Capacity);
         }
         let hold = Hold {
@@ -769,7 +836,7 @@ impl State {
             start,
             through,
         };
-        self.holds.insert(id, HeldAdmission { hold, origin });
+        self.holds.insert(id, HeldAdmission { hold, origin, kind });
         Ok(hold)
     }
 
@@ -844,13 +911,22 @@ impl State {
                     enrollment: candidate,
                     epoch,
                 };
-                let recovery = self.protect(principal, id, candidate, self.head)?;
+                let recovery = self.admit_hold(
+                    principal,
+                    id,
+                    candidate,
+                    self.checkpoint,
+                    self.checkpoint.cut,
+                    self.head,
+                    HoldKind::Recovery,
+                )?;
                 self.writer_epoch = epoch;
                 self.grant = Some(grant);
                 self.read_floor = 0;
                 Ok(Outcome::Granted { grant, recovery })
             }
             Command::Append {
+                class,
                 grant,
                 expected_next,
                 timestamp,
@@ -866,23 +942,34 @@ impl State {
                 let bytes = length
                     .checked_add(APPEND_RECORD_CHARGE_BYTES)
                     .ok_or(Refusal::Capacity)?;
-                let byte_end = self
-                    .spent
-                    .checked_add(bytes)
-                    .filter(|end| *end <= self.window.bytes)
-                    .ok_or(Refusal::Capacity)?;
-                let retained_bytes = self
-                    .retained_bytes
-                    .checked_add(bytes)
-                    .ok_or(Refusal::Capacity)?;
-                let history = append_fingerprint(self.head, grant, id, timestamp, &payload);
+                let (byte_start, byte_end) = match class {
+                    AppendClass::Data => (
+                        self.spent,
+                        admission::debit(self.spent, bytes, self.window.bytes)
+                            .ok_or(Refusal::Capacity)?,
+                    ),
+                    AppendClass::Maintenance => (0, bytes),
+                };
+                let retained_bytes = match class {
+                    AppendClass::Data => {
+                        admission::debit(self.retained_bytes, bytes, self.ordinary_capacity())
+                    }
+                    AppendClass::Maintenance => admission::debit(
+                        self.maintenance_retained,
+                        bytes,
+                        self.limits.maintenance_bytes,
+                    ),
+                }
+                .ok_or(Refusal::Capacity)?;
+                let history = append_fingerprint(self.head, class, grant, id, timestamp, &payload);
                 let cut = Cut { next_lsn, history };
                 let result = AppendResult {
+                    class,
                     position: self.position,
                     lsn: expected_next,
                     cut,
                     window: self.window,
-                    byte_start: self.spent,
+                    byte_start,
                     byte_end,
                 };
                 self.records.push_back(Record {
@@ -894,8 +981,13 @@ impl State {
                     request_fingerprint,
                 });
                 self.head = cut;
-                self.spent = byte_end;
-                self.retained_bytes = retained_bytes;
+                match class {
+                    AppendClass::Data => {
+                        self.spent = byte_end;
+                        self.retained_bytes = retained_bytes;
+                    }
+                    AppendClass::Maintenance => self.maintenance_retained = retained_bytes,
+                };
                 Ok(Outcome::Appended(result))
             }
             Command::Barrier { grant, nonce } => {
@@ -1042,13 +1134,8 @@ impl State {
                 {
                     return Err(Refusal::Invalid);
                 }
-                if self
-                    .retained_bytes
-                    .checked_add(window.bytes)
-                    .is_none_or(|bytes| bytes > self.limits.retained_data_bytes)
-                {
-                    return Err(Refusal::Capacity);
-                }
+                admission::debit(self.retained_bytes, window.bytes, self.ordinary_capacity())
+                    .ok_or(Refusal::Capacity)?;
                 self.window = window;
                 self.spent = 0;
                 Ok(Outcome::WindowFunded(window))
@@ -1083,9 +1170,13 @@ impl State {
                 if self
                     .holds
                     .get(&source.id)
-                    .is_none_or(|entry| entry.hold != source)
+                    .is_none_or(|entry| entry.hold != source || entry.kind != HoldKind::Recovery)
                 {
                     return Err(Refusal::Unavailable);
+                }
+                let kind = HoldKind::Root(source.id);
+                if self.holds.values().any(|entry| entry.kind == kind) {
+                    return Err(Refusal::Conflict);
                 }
                 let checkpoint = source.checkpoint;
                 let hold = self.admit_hold(
@@ -1095,6 +1186,7 @@ impl State {
                     checkpoint,
                     checkpoint.cut,
                     checkpoint.cut,
+                    kind,
                 )?;
                 Ok(Outcome::Protected(hold))
             }
@@ -1139,15 +1231,22 @@ impl State {
                     return Err(Refusal::Invalid);
                 }
                 if self.holds.values().map(|entry| entry.hold).any(|hold| {
-                    hold.through.next_lsn > hold.start.next_lsn
-                        && through.next_lsn > hold.start.next_lsn
+                    admission::pins_suffix(
+                        hold.start.next_lsn,
+                        hold.through.next_lsn,
+                        through.next_lsn,
+                    )
                 }) {
                     return Err(Refusal::Unavailable);
                 }
                 let trim = usize::try_from(through.next_lsn - self.floor.next_lsn)
                     .map_err(|_| Refusal::Invalid)?;
                 for record in self.records.drain(..trim) {
-                    self.retained_bytes -= record.result.byte_end - record.result.byte_start;
+                    let charge = record.result.byte_end - record.result.byte_start;
+                    match record.result.class {
+                        AppendClass::Data => self.retained_bytes -= charge,
+                        AppendClass::Maintenance => self.maintenance_retained -= charge,
+                    }
                 }
                 self.floor = through;
                 Ok(Outcome::Trimmed(through))
@@ -1215,13 +1314,15 @@ fn add_cut(hash: &mut Sha256, cut: Cut) {
 
 fn append_fingerprint(
     previous: Cut,
+    class: AppendClass,
     grant: Grant,
     request: RequestId,
     timestamp: i64,
     payload: &Bytes,
 ) -> Fingerprint {
     let mut hash = Sha256::new();
-    hash.update(b"logkeeper.applied-append.v1");
+    hash.update(b"logkeeper.applied-append.v2");
+    hash.update([class.tag()]);
     add_cut(&mut hash, previous);
     add_grant(&mut hash, grant);
     hash.update(request.nonce.as_bytes());

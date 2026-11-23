@@ -3,14 +3,14 @@ use super::{
     request_id, window, writer_state,
 };
 use crate::ordered::{
-    APPEND_RECORD_CHARGE_BYTES, AppendResult, Command, HeldAdmission, Outcome, Principal, Receipt,
-    Record, Refusal, Request, RetainedCheckpoint, RetainedOutcome, State, Window,
-    append_fingerprint, fingerprint,
+    ACTIVATION_HOLD_SLOTS, APPEND_RECORD_CHARGE_BYTES, AppendClass, AppendResult, Command,
+    HeldAdmission, HoldKind, Outcome, Principal, Receipt, Record, Refusal, Request,
+    RetainedCheckpoint, RetainedOutcome, State, Window, admission, append_fingerprint, fingerprint,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::BTreeSet;
 
-const MAGIC: &[u8; 8] = b"LKBASE01";
+const MAGIC: &[u8; 8] = b"LKBASE02";
 
 impl super::super::Limits {
     pub(in crate::ordered) fn base_control_bytes(self) -> Option<usize> {
@@ -18,9 +18,10 @@ impl super::super::Limits {
         // encoded size of each bounded control row. Retained data has its own
         // byte charge and a full outcome row can outlive its data.
         let roster = self.enrolled_workers.checked_mul(24)?;
-        let holds = self.replay_holds.checked_mul(336)?;
+        let hold_slots = self.replay_holds.checked_add(ACTIVATION_HOLD_SLOTS)?;
+        let holds = hold_slots.checked_mul(368)?;
         let retries = usize::try_from(self.retry_positions).ok()?;
-        let outcomes = retries.checked_add(self.replay_holds)?.checked_mul(448)?;
+        let outcomes = retries.checked_add(hold_slots)?.checked_mul(448)?;
         let checkpoint_retention = self.replay_holds.checked_mul(161)?;
         1024usize
             .checked_add(roster)?
@@ -71,6 +72,14 @@ impl State {
         for admission in self.holds.values() {
             hold_row(&mut output, admission.hold);
             principal(&mut output, admission.origin);
+            match admission.kind {
+                HoldKind::Ordinary => output.put_u8(0),
+                HoldKind::Recovery => output.put_u8(1),
+                HoldKind::Root(parent) => {
+                    output.put_u8(2);
+                    request_id(&mut output, parent);
+                }
+            }
         }
         output.put_u64(self.outcomes.len() as u64);
         for ((issuer, id), retained) in &self.outcomes {
@@ -231,32 +240,34 @@ impl State {
                 principal: Principal::Worker(grant.enrollment),
                 id: *request,
                 command: Command::Append {
+                    class: result.class,
                     grant: *grant,
                     expected_next: result.lsn,
                     timestamp: *timestamp,
                     payload: payload.clone(),
                 },
             };
-            let length = (payload.len() as u64).checked_add(APPEND_RECORD_CHARGE_BYTES);
+            let length = (payload.len() as u64)
+                .checked_add(APPEND_RECORD_CHARGE_BYTES)
+                .ok_or(Refusal::Invalid)?;
             if result.position <= previous_position
                 || result.position > self.position
                 || result.lsn != previous.next_lsn
                 || result.lsn.checked_add(1) != Some(result.cut.next_lsn)
                 || result.cut.history
-                    != append_fingerprint(previous, *grant, *request, *timestamp, payload)
+                    != append_fingerprint(
+                        previous,
+                        result.class,
+                        *grant,
+                        *request,
+                        *timestamp,
+                        payload,
+                    )
                 || result.window.allocation.is_nil()
                 || result.window.serial == 0
                 || result.window.serial > self.window.serial
                 || (result.window.serial == self.window.serial && result.window != self.window)
-                || result.byte_end > result.window.bytes
-                || result.byte_end.checked_sub(result.byte_start) != length
-                || previous_window.is_some_and(|(window, end)| {
-                    if result.window.serial == window.serial {
-                        result.window != window || result.byte_start != end
-                    } else {
-                        result.window.serial < window.serial || result.byte_start != 0
-                    }
-                })
+                || result.byte_end.checked_sub(result.byte_start) != Some(length)
                 || request.nonce.is_nil()
                 || request.expires_at <= result.position
                 || *request_fingerprint != fingerprint(&original)
@@ -265,21 +276,48 @@ impl State {
             }
             previous = result.cut;
             previous_position = result.position;
-            previous_window = Some((result.window, result.byte_end));
-            self.retained_bytes = self
-                .retained_bytes
-                .checked_add(length.ok_or(Refusal::Invalid)?)
-                .ok_or(Refusal::Invalid)?;
+            match result.class {
+                AppendClass::Data => {
+                    if result.byte_end > result.window.bytes
+                        || previous_window.is_some_and(|(window, end)| {
+                            if result.window.serial == window.serial {
+                                result.window != window || result.byte_start != end
+                            } else {
+                                result.window.serial < window.serial || result.byte_start != 0
+                            }
+                        })
+                    {
+                        return Err(Refusal::Invalid);
+                    }
+                    previous_window = Some((result.window, result.byte_end));
+                    self.retained_bytes =
+                        admission::debit(self.retained_bytes, length, self.ordinary_capacity())
+                            .ok_or(Refusal::Invalid)?;
+                }
+                AppendClass::Maintenance => {
+                    if result.byte_start != 0 {
+                        return Err(Refusal::Invalid);
+                    }
+                    self.maintenance_retained = admission::debit(
+                        self.maintenance_retained,
+                        length,
+                        self.limits.maintenance_bytes,
+                    )
+                    .ok_or(Refusal::Invalid)?;
+                }
+            }
             self.records.push_back(entry);
         }
         if previous != self.head
             || previous_window.is_some_and(|(window, end)| {
                 self.spent != if window == self.window { end } else { 0 }
             })
-            || self
-                .retained_bytes
-                .checked_add(self.window.bytes - self.spent)
-                .is_none_or(|bytes| bytes > self.limits.retained_data_bytes)
+            || admission::debit(
+                self.retained_bytes,
+                self.window.bytes - self.spent,
+                self.ordinary_capacity(),
+            )
+            .is_none()
             || self.cut(self.checkpoint.cut.next_lsn) != Some(self.checkpoint.cut)
         {
             return Err(Refusal::Invalid);
@@ -288,9 +326,39 @@ impl State {
     }
 
     fn read_holds(&mut self, input: &mut Input) -> Result<(), Refusal> {
-        for _ in 0..input.count(self.limits.replay_holds)? {
+        let mut ordinary = 0;
+        let mut activation = 0;
+        let mut roots = BTreeSet::new();
+        for _ in 0..input.count(self.limits.replay_holds + ACTIVATION_HOLD_SLOTS)? {
             let hold = input.hold()?;
             let origin = input.principal()?;
+            let kind = match input.read_byte()? {
+                0 => {
+                    ordinary += 1;
+                    HoldKind::Ordinary
+                }
+                1 => {
+                    activation += 1;
+                    HoldKind::Recovery
+                }
+                2 => {
+                    activation += 1;
+                    let parent = input.request_id()?;
+                    if parent == hold.id
+                        || parent.nonce.is_nil()
+                        || !roots.insert(parent)
+                        || hold.start != hold.checkpoint.cut
+                        || hold.through != hold.checkpoint.cut
+                    {
+                        return Err(Refusal::Invalid);
+                    }
+                    HoldKind::Root(parent)
+                }
+                _ => return Err(Refusal::Invalid),
+            };
+            if ordinary > self.limits.replay_holds || activation > ACTIVATION_HOLD_SLOTS {
+                return Err(Refusal::Invalid);
+            }
             if hold.admitted_at == 0
                 || hold.admitted_at > self.position
                 || hold.admitted_at >= hold.id.expires_at
@@ -308,14 +376,16 @@ impl State {
             {
                 return Err(Refusal::Invalid);
             }
-            self.holds.insert(hold.id, HeldAdmission { hold, origin });
+            self.holds
+                .insert(hold.id, HeldAdmission { hold, origin, kind });
         }
         Ok(())
     }
 
     fn read_outcomes(&mut self, input: &mut Input) -> Result<(), Refusal> {
         let retries = usize::try_from(self.limits.retry_positions).unwrap_or(usize::MAX);
-        let count = input.count(retries.saturating_add(self.limits.replay_holds))?;
+        let count = input
+            .count(retries.saturating_add(self.limits.replay_holds + ACTIVATION_HOLD_SLOTS))?;
         for _ in 0..count {
             let issuer = input.principal()?;
             let id = input.request_id()?;
@@ -336,14 +406,15 @@ impl State {
             {
                 return Err(Refusal::Invalid);
             }
-            if id.expires_at > self.position {
-                self.expiry.insert((id.expires_at, key), ());
-            } else if self
+            let live_hold = self
                 .holds
                 .get(&id)
-                .is_none_or(|entry| entry.origin != issuer)
-            {
+                .is_some_and(|entry| entry.origin == issuer);
+            if !admission::retains_receipt(self.position, id.expires_at, live_hold) {
                 return Err(Refusal::Invalid);
+            }
+            if id.expires_at > self.position {
+                self.expiry.insert((id.expires_at, key), ());
             }
             let receipt = Receipt {
                 placement: self.placement,
@@ -367,9 +438,13 @@ impl State {
                 .get(&(entry.origin, hold.id))
                 .ok_or(Refusal::Invalid)?
                 .receipt;
-            let admitted = match receipt.outcome {
-                Ok(Outcome::Granted { recovery, .. }) => recovery,
-                Ok(Outcome::Barrier { read, .. }) | Ok(Outcome::Protected(read)) => read,
+            let admitted = match (entry.kind, receipt.outcome) {
+                (HoldKind::Recovery, Ok(Outcome::Granted { recovery, .. })) => recovery,
+                (
+                    HoldKind::Ordinary,
+                    Ok(Outcome::Barrier { read, .. } | Outcome::Protected(read)),
+                ) => read,
+                (HoldKind::Root(_), Ok(Outcome::Protected(read))) => read,
                 _ => return Err(Refusal::Invalid),
             };
             if admitted != hold || receipt.position != hold.admitted_at {
@@ -396,6 +471,7 @@ impl Input {
 
     pub(super) fn append_result(&mut self) -> Result<AppendResult, Refusal> {
         Ok(AppendResult {
+            class: self.append_class()?,
             position: self.u64()?,
             lsn: self.u64()?,
             cut: self.cut()?,
@@ -458,6 +534,7 @@ impl Input {
 }
 
 pub(super) fn append_result(output: &mut BytesMut, value: AppendResult) {
+    output.put_u8(value.class.tag());
     output.put_u64(value.position);
     output.put_u64(value.lsn);
     cut(output, value.cut);

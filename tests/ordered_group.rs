@@ -3,8 +3,8 @@ use logkeeper::ordered::replication::transport::{Connector, RemoteVoter, serve_v
 use logkeeper::ordered::replication::{DurableVoter, Error, Group, Replica};
 use logkeeper::ordered::service::{Coordinator, Session, wire};
 use logkeeper::ordered::{
-    BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut, Fingerprint, Limits,
-    Outcome, Placement, Principal, Refusal, Request, RequestId, Window,
+    AppendClass, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut,
+    Fingerprint, Limits, Outcome, Placement, Principal, Refusal, Request, RequestId, Window,
 };
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -80,6 +80,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         replay_holds: 4,
         retry_positions: 64,
         retained_data_bytes: 8192,
+        maintenance_bytes: 1024,
     };
     let group = Group::new(placement, limits, seed, window, voter_ids, 1 << 20).unwrap();
     let directories = std::array::from_fn::<_, 3, _>(|_| tempfile::tempdir().unwrap());
@@ -148,6 +149,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let append = request(
         Principal::Worker(first_enrollment),
         Command::Append {
+            class: AppendClass::Data,
             grant: first_grant,
             expected_next: 0,
             timestamp: 11,
@@ -225,6 +227,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             request(
                 Principal::Worker(first_enrollment),
                 Command::Append {
+                    class: AppendClass::Data,
                     grant: first_grant,
                     expected_next: 1,
                     timestamp: 12,
@@ -272,6 +275,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             request(
                 Principal::Worker(second_enrollment),
                 Command::Append {
+                    class: AppendClass::Data,
                     grant: second_grant,
                     expected_next: 1,
                     timestamp: 13,
@@ -493,6 +497,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let newest = request(
         worker,
         Command::Append {
+            class: AppendClass::Data,
             grant: second_grant,
             expected_next: published.cut.next_lsn,
             timestamp: 14,
@@ -599,6 +604,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let old_append = request(
         worker,
         Command::Append {
+            class: AppendClass::Data,
             grant: second_grant,
             expected_next: result.cut.next_lsn,
             timestamp: 15,

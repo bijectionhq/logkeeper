@@ -204,7 +204,7 @@ impl Group {
         }
         let mut initial = State::new(placement, limits, checkpoint, window)?;
         let mut hash = Sha256::new();
-        hash.update(b"logkeeper.ordered-group.v1");
+        hash.update(b"logkeeper.ordered-group.v2");
         hash.update(placement.deployment.as_bytes());
         hash.update(placement.incarnation.as_bytes());
         hash.update(placement.group.as_bytes());
@@ -232,6 +232,7 @@ impl Group {
         }
         hash.update(limits.retry_positions.to_be_bytes());
         hash.update(limits.retained_data_bytes.to_be_bytes());
+        hash.update(limits.maintenance_bytes.to_be_bytes());
         for voter in &roster {
             hash.update(voter.as_bytes());
         }

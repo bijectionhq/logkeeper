@@ -41,6 +41,7 @@ pub struct Route {
     pub position: u64,
     pub history: Fingerprint,
     pub head: Cut,
+    pub last_data: Option<Cut>,
     pub floor: Cut,
     pub checkpoint: Checkpoint,
     pub preparing: Option<CheckpointPreparation>,
@@ -48,6 +49,8 @@ pub struct Route {
     pub window: Window,
     pub window_spent: u64,
     pub reusable_bytes: u64,
+    pub maintenance_limit: u64,
+    pub maintenance_retained: u64,
     pub retry_positions: u64,
 }
 
@@ -153,6 +156,12 @@ impl<R: Replica> Coordinator<R> {
             position: state.position(),
             history: state.command_history(),
             head: state.head(),
+            last_data: state
+                .records
+                .iter()
+                .rev()
+                .find(|record| record.result.class == super::AppendClass::Data)
+                .map(|record| record.result.cut),
             floor: state.floor(),
             checkpoint: state.checkpoint(),
             preparing: state.preparing,
@@ -161,7 +170,9 @@ impl<R: Replica> Coordinator<R> {
                 .flatten(),
             window: state.window(),
             window_spent: state.spent_bytes(),
-            reusable_bytes: state.limits.retained_data_bytes - state.retained_bytes,
+            reusable_bytes: state.ordinary_capacity() - state.retained_bytes,
+            maintenance_limit: state.limits.maintenance_bytes,
+            maintenance_retained: state.maintenance_retained,
             retry_positions: state.limits.retry_positions,
         })
     }
@@ -209,6 +220,22 @@ impl<R: Replica> Coordinator<R> {
         let state = self.recover(session).await?;
         state.writer(session.principal, grant)?;
         Ok(state.reconcile_append(original)?)
+    }
+
+    /// Selects a prospective checkpoint cut for the current custodian.
+    /// PrepareCheckpoint rechecks this selection before any provider effect.
+    pub async fn checkpoint_cut(
+        &self,
+        session: Session,
+        grant: Grant,
+        next: u64,
+    ) -> Result<Cut, Error> {
+        let state = self.recover(session).await?;
+        state.custodian(session.principal, grant)?;
+        if next <= state.checkpoint.cut.next_lsn {
+            return Err(Refusal::Stale.into());
+        }
+        state.cut(next).ok_or_else(|| Refusal::Unavailable.into())
     }
 
     /// A withdrawn enrollment can release its old exact hold without
