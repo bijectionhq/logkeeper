@@ -9,3 +9,4 @@ import Logkeeper.OrderedWriter
 import Logkeeper.OrderedReceipt
 import Logkeeper.Codec
 import Logkeeper.CompactImage
+import Logkeeper.OrderedBudgets

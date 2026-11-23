@@ -77,6 +77,71 @@ def trimCredit (decisions : List Decision) (oldFloor newFloor : Nat) : Credit :=
   (((application decisions).drop oldFloor).take (newFloor - oldFloor)).foldl
     (fun credit record => credit.addDebit record.debit) ⟨0, 0⟩
 
+/-- A hold's replay interval and the removed prefix are both half-open.
+A nonempty live interval starts at or after the old floor. -/
+def pinsSuffix (start finish newFloor : Nat) : Prop :=
+  start < finish ∧ start < newFloor
+
+def trimPrefixSafe (oldFloor newFloor checkpoint : Nat) (live : List (Nat × Nat)) : Prop :=
+  ∀ lsn, oldFloor ≤ lsn → lsn < newFloor →
+    lsn < checkpoint ∧ ∀ hold ∈ live, ¬ (hold.1 ≤ lsn ∧ lsn < hold.2)
+
+theorem trim_preserves_replay {oldFloor newFloor checkpoint : Nat} {live : List (Nat × Nat)}
+    (atCheckpoint : newFloor ≤ checkpoint)
+    (noPin : ∀ hold ∈ live, ¬ pinsSuffix hold.1 hold.2 newFloor) :
+    trimPrefixSafe oldFloor newFloor checkpoint live := by
+  intro lsn _ beforeTrim
+  refine ⟨by omega, fun hold member covers => ?_⟩
+  exact noPin hold member ⟨by omega, by omega⟩
+
+def creditFor (lane : ChargeClass) (records : List Append) : Nat :=
+  (records.map fun record => if record.debit.chargeClass = lane then record.debit.bytes else 0).sum
+
+private theorem credit_fold (records : List Append) (initial : Credit) :
+    records.foldl (fun acc record => acc.addDebit record.debit) initial =
+      ⟨initial.ordinary + creditFor .ordinary records,
+       initial.maintenance + creditFor .maintenance records⟩ := by
+  induction records generalizing initial with
+  | nil => simp [creditFor]
+  | cons record tail ih =>
+    rw [List.foldl_cons, ih]
+    cases h : record.debit.chargeClass <;>
+      simp [Credit.addDebit, creditFor, h, Nat.add_assoc]
+
+theorem trim_credit_matches_removed_records (history : List Decision) (oldFloor newFloor : Nat) :
+    let removed := ((application history).drop oldFloor).take (newFloor - oldFloor)
+    trimCredit history oldFloor newFloor = ⟨creditFor .ordinary removed, creditFor .maintenance removed⟩ := by
+  dsimp [trimCredit]
+  rw [credit_fold]
+  simp
+
+theorem reachable_trim_prefix :
+    trimPrefixSafe 2 5 5 [(5, 9), (2, 2)] := by
+  apply trim_preserves_replay (by decide)
+  intro hold member
+  simp at member
+  rcases member with rfl | rfl <;> simp [pinsSuffix]
+
+theorem omitted_pin_removes_needed_record : ¬ trimPrefixSafe 2 5 5 [(4, 9)] := by
+  intro safe
+  exact (safe 4 (by decide) (by decide)).2 (4, 9) (by simp) (by decide)
+
+theorem trim_beyond_checkpoint_removes_needed_record : ¬ trimPrefixSafe 2 5 4 [] := by
+  intro safe
+  exact (by decide : ¬ 4 < 4) (safe 4 (by decide) (by decide)).1
+
+theorem wrong_class_changes_credit (receipt : AppendReceipt) :
+    trimCredit [.append ⟨receipt, .mk .ordinary 7⟩] 0 1 ≠
+      trimCredit [.append ⟨receipt, .mk .maintenance 7⟩] 0 1 := by
+  simp [trimCredit, application, Credit.addDebit]
+
+#print axioms trim_preserves_replay
+#print axioms trim_credit_matches_removed_records
+#print axioms reachable_trim_prefix
+#print axioms omitted_pin_removes_needed_record
+#print axioms trim_beyond_checkpoint_removes_needed_record
+#print axioms wrong_class_changes_credit
+
 /-- The certificate selects this exact decoded decision list, independently
 of the encoding of its compact physical image. -/
 structure Seal (ledger : PrefixAgreement.Ledger Voter Decision) where
