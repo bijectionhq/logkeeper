@@ -214,6 +214,7 @@ impl Group {
         hash.update(checkpoint.manifest);
         hash.update(checkpoint.custody.allocation.as_bytes());
         hash.update(checkpoint.custody.revision.to_be_bytes());
+        hash.update(checkpoint.custody.provider);
         hash.update(window.allocation.as_bytes());
         hash.update(window.serial.to_be_bytes());
         hash.update(window.bytes.to_be_bytes());

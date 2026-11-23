@@ -417,6 +417,7 @@ impl Input {
             custody: Custody {
                 allocation: self.uuid()?,
                 revision: self.u64()?,
+                provider: self.take()?,
             },
             usable_bytes: self.u64()?,
             descriptor: self.take()?,
@@ -431,6 +432,7 @@ impl Input {
             custody: Custody {
                 allocation: self.uuid()?,
                 revision: self.u64()?,
+                provider: self.take()?,
             },
         })
     }
@@ -522,6 +524,7 @@ fn checkpoint_preparation(output: &mut BytesMut, item: CheckpointPreparation) {
     checkpoint(output, item.base);
     uuid(output, item.custody.allocation);
     output.put_u64(item.custody.revision);
+    output.put_slice(&item.custody.provider);
     output.put_u64(item.usable_bytes);
     output.put_slice(&item.descriptor);
 }
@@ -532,6 +535,7 @@ fn checkpoint(output: &mut BytesMut, value: Checkpoint) {
     output.put_slice(&value.manifest);
     uuid(output, value.custody.allocation);
     output.put_u64(value.custody.revision);
+    output.put_slice(&value.custody.provider);
 }
 
 fn window(output: &mut BytesMut, value: Window) {

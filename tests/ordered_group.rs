@@ -66,6 +66,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         custody: Custody {
             allocation: Uuid::new_v4(),
             revision: 1,
+            provider: [7; 32],
         },
     };
     let window = Window {
@@ -297,6 +298,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         custody: Custody {
             allocation: Uuid::new_v4(),
             revision: 2,
+            provider: [7; 32],
         },
     };
     let worker = Principal::Worker(second_enrollment);

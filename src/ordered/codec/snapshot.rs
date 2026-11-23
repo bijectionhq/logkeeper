@@ -18,10 +18,10 @@ impl super::super::Limits {
         // encoded size of each bounded control row. Retained data has its own
         // byte charge and a full outcome row can outlive its data.
         let roster = self.enrolled_workers.checked_mul(24)?;
-        let holds = self.replay_holds.checked_mul(289)?;
+        let holds = self.replay_holds.checked_mul(336)?;
         let retries = usize::try_from(self.retry_positions).ok()?;
-        let outcomes = retries.checked_add(self.replay_holds)?.checked_mul(394)?;
-        let checkpoint_retention = self.replay_holds.checked_mul(129)?;
+        let outcomes = retries.checked_add(self.replay_holds)?.checked_mul(448)?;
+        let checkpoint_retention = self.replay_holds.checked_mul(161)?;
         1024usize
             .checked_add(roster)?
             .checked_add(holds)?
@@ -114,6 +114,7 @@ impl State {
             if checkpoint.custody.revision == 0
                 || checkpoint.custody.revision >= state.checkpoint.custody.revision
                 || checkpoint.custody.allocation.is_nil()
+                || checkpoint.custody.provider == [0; 32]
                 || checkpoint.manifest == [0; 32]
                 || checkpoint.cut.next_lsn >= state.checkpoint.cut.next_lsn
                 || state
@@ -141,6 +142,8 @@ impl State {
             || state.checkpoint.cut.next_lsn > state.head.next_lsn
             || state.checkpoint.custody.allocation.is_nil()
             || state.checkpoint.custody.revision == 0
+            || (state.checkpoint.manifest == [0; 32])
+                != (state.checkpoint.custody.provider == [0; 32])
             || (state.checkpoint.custody.revision == 1 && state.checkpoint != initial.checkpoint)
             || state.head.next_lsn > state.position
             || state.writer_epoch > state.position
@@ -161,6 +164,7 @@ impl State {
                     || Some(item.custody.revision)
                         != state.checkpoint.custody.revision.checked_add(1)
                     || item.custody.allocation.is_nil()
+                    || item.custody.provider == [0; 32]
                     || item.root == [0; 32]
                     || item.usable_bytes == 0
                     || (item.base != initial.checkpoint && !state.checkpoint_open(item.base))

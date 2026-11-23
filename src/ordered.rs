@@ -87,6 +87,7 @@ pub struct Window {
 pub struct Custody {
     pub allocation: Uuid,
     pub revision: u64,
+    pub provider: Fingerprint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,6 +444,7 @@ impl State {
             || checkpoint.cut.next_lsn != 0
             || checkpoint.custody.allocation.is_nil()
             || checkpoint.custody.revision != 1
+            || (checkpoint.manifest == [0; 32]) != (checkpoint.custody.provider == [0; 32])
             || window.allocation.is_nil()
             || window.serial != 1
             || window.bytes == 0
@@ -902,6 +904,7 @@ impl State {
                     || self.cut(preparation.checkpoint.next_lsn) != Some(preparation.checkpoint)
                     || preparation.source != grant
                     || preparation.custody.allocation.is_nil()
+                    || preparation.custody.provider == [0; 32]
                     || Some(preparation.custody.revision)
                         != self.checkpoint.custody.revision.checked_add(1)
                     || preparation.usable_bytes == 0
@@ -1144,6 +1147,7 @@ impl State {
                 && checkpoint.root == [0; 32]
                 && checkpoint.cut.next_lsn == 0
                 && checkpoint.custody.revision == 1
+                && checkpoint.custody.provider == [0; 32]
                 && self
                     .holds
                     .values()
