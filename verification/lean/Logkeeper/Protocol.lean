@@ -34,7 +34,7 @@ inductive ChargeClass where
   deriving DecidableEq
 
 structure Debit where
-  class : ChargeClass
+  chargeClass : ChargeClass
   bytes : Nat
   deriving DecidableEq
 
@@ -44,7 +44,7 @@ structure Credit where
   deriving DecidableEq
 
 def Credit.addDebit (credit : Credit) (debit : Debit) : Credit :=
-  match debit.class with
+  match debit.chargeClass with
   | .ordinary => { credit with ordinary := credit.ordinary + debit.bytes }
   | .maintenance => { credit with maintenance := credit.maintenance + debit.bytes }
 
@@ -100,7 +100,7 @@ theorem compatible {ledger : PrefixAgreement.Ledger Voter Decision}
   DurableAcceptor.durable_replica_histories_agree evidence.ballots evidence.replicas
     evidence.reached evidence.accepts evidence.reported first.chosen later.chosen
 
-private theorem agrees_at_position {xs ys : List Decision}
+private theorem agrees_at_position {xs ys : List Decision} {position : Nat} {left right : Decision}
     (extendsHistory : xs <+: ys)
     (atFirst : xs[position]? = some left) (atLater : ys[position]? = some right) :
     left = right := by
@@ -109,6 +109,7 @@ private theorem agrees_at_position {xs ys : List Decision}
   exact Option.some.inj atLater
 
 theorem same_chosen_decision {ledger : PrefixAgreement.Ledger Voter Decision}
+    {position : Nat} {left right : Decision}
     (evidence : Evidence ledger) (first later : Seal ledger)
     (atFirst : first.decisions[position]? = some left)
     (atLater : later.decisions[position]? = some right) : left = right := by
@@ -145,6 +146,7 @@ theorem transfer_extends_chosen_history
   exact oldPrefix.trans newPrefix
 
 theorem same_append_after_transfer
+    {position : Nat} {left right : Append}
     {source : PrefixAgreement.Ledger SourceVoter Decision}
     {destination : PrefixAgreement.Ledger DestinationVoter Decision}
     (oldVoters : Evidence source) (newVoters : Evidence destination)
@@ -158,6 +160,7 @@ theorem same_append_after_transfer
     atFirst atLater)
 
 theorem same_chosen_append {ledger : PrefixAgreement.Ledger Voter Decision}
+    {position : Nat} {left right : Append}
     (evidence : Evidence ledger) (first later : Seal ledger)
     (atFirst : first.decisions[position]? = some (.append left))
     (atLater : later.decisions[position]? = some (.append right)) : left = right :=
