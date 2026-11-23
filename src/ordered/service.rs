@@ -224,12 +224,12 @@ impl<R: Replica> Coordinator<R> {
         Ok(state.reconcile_append(original)?)
     }
 
-    /// Selects a prospective checkpoint cut for the current custodian.
-    /// PrepareCheckpoint rechecks this selection before any provider effect.
+    /// Resolves a retained cut at or beyond the selected checkpoint.
+    /// PrepareCheckpoint rechecks its advancing target before any provider effect.
     pub async fn checkpoint_cut(&self, session: Session, next: u64) -> Result<Cut, Error> {
         State::custodian(session.principal)?;
         let state = self.recover(session).await?;
-        if next <= state.checkpoint.cut.next_lsn {
+        if next < state.checkpoint.cut.next_lsn {
             return Err(Refusal::Stale.into());
         }
         state.cut(next).ok_or_else(|| Refusal::Unavailable.into())
@@ -274,27 +274,46 @@ impl<R: Replica> Coordinator<R> {
     ) -> Result<ReplayPage, Error> {
         let state = self.recover(session).await?;
         let (replay, skip) = replay_from(&state, session, hold, from)?;
-        let checkpoint = replay.checkpoint();
-        let through = replay.through();
-        let mut remaining = maximum_bytes;
-        let mut records = Vec::new();
-        for record in replay.records().skip(skip) {
-            let size = usize::try_from(record.result.byte_end - record.result.byte_start)
-                .map_err(|_| Refusal::Capacity)?;
-            let Some(next) = remaining.checked_sub(size) else {
-                if records.is_empty() {
-                    return Err(Refusal::Capacity.into());
-                }
-                break;
-            };
-            remaining = next;
-            records.push(record.clone());
+        replay_page(
+            replay.checkpoint(),
+            replay.through(),
+            replay.records().skip(skip),
+            maximum_bytes,
+        )
+    }
+
+    /// Read the chosen input of a live checkpoint preparation. The selected
+    /// base and preparation must still be exact, even across writer replacement.
+    pub async fn checkpoint_replay(
+        &self,
+        session: Session,
+        preparation: CheckpointPreparation,
+        base: Checkpoint,
+        from: Cut,
+        maximum_bytes: usize,
+    ) -> Result<ReplayPage, Error> {
+        State::custodian(session.principal)?;
+        let state = self.recover(session).await?;
+        if state.preparing != Some(preparation) || state.checkpoint() != base {
+            return Err(Refusal::Stale.into());
         }
-        Ok(ReplayPage {
-            checkpoint,
+        let through = preparation.checkpoint;
+        if from.next_lsn < base.cut.next_lsn
+            || from.next_lsn > through.next_lsn
+            || state.cut(from.next_lsn) != Some(from)
+        {
+            return Err(Refusal::Invalid.into());
+        }
+        let first = usize::try_from(from.next_lsn - state.floor().next_lsn)
+            .map_err(|_| Refusal::Invalid)?;
+        let count =
+            usize::try_from(through.next_lsn - from.next_lsn).map_err(|_| Refusal::Invalid)?;
+        replay_page(
+            base,
             through,
-            records,
-        })
+            state.records.iter().skip(first).take(count),
+            maximum_bytes,
+        )
     }
 
     pub async fn replay_head(
@@ -356,6 +375,32 @@ impl<R: Replica> Coordinator<R> {
             .map_or(replication::Error::Quorum, replication::Error::Deposed)
             .into())
     }
+}
+
+fn replay_page<'a>(
+    checkpoint: Checkpoint,
+    through: Cut,
+    records: impl Iterator<Item = &'a Record>,
+    mut remaining: usize,
+) -> Result<ReplayPage, Error> {
+    let mut page = Vec::new();
+    for record in records {
+        let size = usize::try_from(record.result.byte_end - record.result.byte_start)
+            .map_err(|_| Refusal::Capacity)?;
+        let Some(next) = remaining.checked_sub(size) else {
+            if page.is_empty() {
+                return Err(Refusal::Capacity.into());
+            }
+            break;
+        };
+        remaining = next;
+        page.push(record.clone());
+    }
+    Ok(ReplayPage {
+        checkpoint,
+        through,
+        records: page,
+    })
 }
 
 fn replay_from(

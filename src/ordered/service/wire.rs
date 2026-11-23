@@ -2,8 +2,8 @@
 
 use super::{Coordinator, Error, ReplayHead, ReplayPage, Route, Session};
 use crate::ordered::{
-    AppendResult, BarrierClaim, Command, Cut, Fingerprint, Grant, Hold, Placement, Receipt,
-    Refusal, Request, append_fingerprint, replication::Replica,
+    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Fingerprint,
+    Grant, Hold, Placement, Receipt, Refusal, Request, append_fingerprint, replication::Replica,
 };
 use bytes::Bytes;
 use std::io;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-const MAGIC: &[u8; 8] = b"LKAPPC03";
+const MAGIC: &[u8; 8] = b"LKAPPC04";
 const REPLAY_OVERHEAD: usize = 1 + 160 + 40 + 8;
 
 #[derive(Clone)]
@@ -36,6 +36,12 @@ pub enum Operation {
     },
     CheckpointCut {
         next: u64,
+    },
+    CheckpointReplay {
+        preparation: CheckpointPreparation,
+        base: Checkpoint,
+        from: Cut,
+        maximum_bytes: u64,
     },
 }
 
@@ -156,6 +162,21 @@ pub async fn serve<R: Replica>(
                     .await
                     .map(Reply::Replay)
             }
+            Operation::CheckpointReplay {
+                preparation,
+                base,
+                from,
+                maximum_bytes,
+            } => {
+                let offered = usize::try_from(maximum_bytes).unwrap_or(usize::MAX);
+                let limit = maximum_frame
+                    .checked_sub(REPLAY_OVERHEAD)
+                    .ok_or(WireError::Frame)?;
+                coordinator
+                    .checkpoint_replay(session, preparation, base, from, offered.min(limit))
+                    .await
+                    .map(Reply::Replay)
+            }
             Operation::ReplayHead { hold, from } => coordinator
                 .replay_head(session, hold, from)
                 .await
@@ -197,31 +218,17 @@ impl Reply {
                 matches!(&original.command, Command::Append { class, expected_next, .. } if result.lsn == *expected_next && result.class == *class)
             }
             (Self::Replay(page), Operation::Replay { hold, from, .. }) => {
-                if page.checkpoint != hold.checkpoint || page.through != hold.through {
-                    return false;
-                }
-                let mut previous = *from;
-                for record in &page.records {
-                    let result = record.result;
-                    if result.lsn != previous.next_lsn
-                        || result.lsn.checked_add(1) != Some(result.cut.next_lsn)
-                        || result.cut.history
-                            != append_fingerprint(
-                                previous,
-                                result.class,
-                                record.grant,
-                                record.request,
-                                record.timestamp,
-                                &record.payload,
-                            )
-                    {
-                        return false;
-                    }
-                    previous = result.cut;
-                }
-                previous == hold.through
-                    || (!page.records.is_empty() && previous.next_lsn < hold.through.next_lsn)
+                page.matches(hold.checkpoint, *from, hold.through)
             }
+            (
+                Self::Replay(page),
+                Operation::CheckpointReplay {
+                    preparation,
+                    base,
+                    from,
+                    ..
+                },
+            ) => page.matches(*base, *from, preparation.checkpoint),
             (Self::ReplayHead(head), Operation::ReplayHead { hold, from }) => match head {
                 Some(head) => {
                     from.next_lsn.checked_add(1) == Some(head.next.next_lsn)
@@ -232,6 +239,34 @@ impl Reply {
             (Self::Refused(_), _) => true,
             _ => false,
         }
+    }
+}
+
+impl ReplayPage {
+    fn matches(&self, base: Checkpoint, from: Cut, through: Cut) -> bool {
+        if self.checkpoint != base || self.through != through {
+            return false;
+        }
+        let mut previous = from;
+        for record in &self.records {
+            let result = record.result;
+            if result.lsn != previous.next_lsn
+                || result.lsn.checked_add(1) != Some(result.cut.next_lsn)
+                || result.cut.history
+                    != append_fingerprint(
+                        previous,
+                        result.class,
+                        record.grant,
+                        record.request,
+                        record.timestamp,
+                        &record.payload,
+                    )
+            {
+                return false;
+            }
+            previous = result.cut;
+        }
+        previous == through || (!self.records.is_empty() && previous.next_lsn < through.next_lsn)
     }
 }
 

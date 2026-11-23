@@ -40,6 +40,18 @@ impl Operation {
                 cut(&mut output, *from);
                 output.put_u64(*maximum_bytes);
             }
+            Self::CheckpointReplay {
+                preparation,
+                base,
+                from,
+                maximum_bytes,
+            } => {
+                output.put_u8(7);
+                checkpoint_preparation(&mut output, *preparation);
+                checkpoint(&mut output, *base);
+                cut(&mut output, *from);
+                output.put_u64(*maximum_bytes);
+            }
             Self::CheckpointCut { next } => {
                 output.put_u8(6);
                 output.put_u64(*next);
@@ -80,6 +92,12 @@ impl Operation {
                 hold: input.hold()?,
             },
             6 => Self::CheckpointCut { next: input.u64()? },
+            7 => Self::CheckpointReplay {
+                preparation: input.checkpoint_preparation()?,
+                base: input.checkpoint()?,
+                from: input.cut()?,
+                maximum_bytes: input.u64()?,
+            },
             _ => return Err(Refusal::Invalid),
         };
         input.finish((placement, operation))
