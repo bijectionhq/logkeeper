@@ -12,7 +12,7 @@ pub mod transport;
 
 pub use disk::DurableVoter;
 pub use evidence::{RotationSlots, SlotImage, SlotPair, Vote, VoterSlots};
-use evidence::{record_vote, strict_majority};
+use evidence::{record_vote, register_peer, strict_majority};
 
 use super::{
     BarrierClaim, Checkpoint, Command, Fingerprint, Limits, Outcome, Placement, Receipt, Refusal,
@@ -600,7 +600,7 @@ impl Group {
         let mut identities = BTreeSet::new();
         for peer in peers {
             let id = peer.identity();
-            if !self.voters.contains(&id) || !identities.insert(id) {
+            if !register_peer(&self.voters, &mut identities, id) {
                 return Err(Error::Group);
             }
         }

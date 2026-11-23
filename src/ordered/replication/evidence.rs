@@ -1,6 +1,7 @@
 //! Decisions used when collecting rotation slot attestations.
 
 use super::{Ballot, Checkpoint, Fingerprint, Outcome, Receipt, Uuid};
+use super::BTreeSet;
 use crate::ordered::admission::matches_fingerprint;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +46,14 @@ pub struct Vote {
 pub struct VoterSlots {
     pub voter: Uuid,
     pub slots: SlotPair,
+}
+
+pub(crate) fn register_peer(
+    configured: &BTreeSet<Uuid>,
+    seen: &mut BTreeSet<Uuid>,
+    id: Uuid,
+) -> bool {
+    configured.contains(&id) && seen.insert(id)
 }
 
 pub(crate) fn strict_majority(cohort_size: usize) -> usize {
