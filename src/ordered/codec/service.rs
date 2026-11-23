@@ -5,7 +5,7 @@ use super::{
 use crate::ordered::{
     BarrierClaim, Outcome, Placement, Principal, Receipt, Refusal, Request,
     service::{
-        ReplayPage, Route,
+        ReplayHead, ReplayPage, Route,
         wire::{Decision, Operation, Reply, Signature, SignedBarrier},
     },
 };
@@ -39,6 +39,11 @@ impl Operation {
                 cut(&mut output, *from);
                 output.put_u64(*maximum_bytes);
             }
+            Self::ReplayHead { hold, from } => {
+                output.put_u8(4);
+                hold_row(&mut output, *hold);
+                cut(&mut output, *from);
+            }
         }
         output.freeze()
     }
@@ -57,6 +62,10 @@ impl Operation {
                 hold: input.hold()?,
                 from: input.cut()?,
                 maximum_bytes: input.u64()?,
+            },
+            4 => Self::ReplayHead {
+                hold: input.hold()?,
+                from: input.cut()?,
             },
             _ => return Err(Refusal::Invalid),
         };
@@ -112,6 +121,15 @@ impl Reply {
                 output.put_u8(4);
                 snapshot::result(&mut output, Err(*refusal));
             }
+            Self::ReplayHead(head) => {
+                output.put_u8(5);
+                output.put_u8(u8::from(head.is_some()));
+                if let Some(head) = head {
+                    cut(&mut output, head.next);
+                    output.put_i64(head.timestamp);
+                    output.put_u64(head.payload_bytes);
+                }
+            }
         }
         output.freeze()
     }
@@ -146,6 +164,13 @@ impl Reply {
                 })
             }
             4 => Self::Refused(input.result()?.err().ok_or(Refusal::Invalid)?),
+            5 => Self::ReplayHead(input.optional(|input| {
+                Ok(ReplayHead {
+                    next: input.cut()?,
+                    timestamp: i64::from_be_bytes(input.take()?),
+                    payload_bytes: input.u64()?,
+                })
+            })?),
             _ => return Err(Refusal::Invalid),
         };
         input.finish(reply)

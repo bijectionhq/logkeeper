@@ -105,6 +105,16 @@ impl Request {
                 output.put_u8(7);
                 hold_row(&mut output, *hold);
             }
+            Command::ProtectRange {
+                grant: writer,
+                from,
+                through,
+            } => {
+                output.put_u8(11);
+                grant(&mut output, *writer);
+                output.put_u64(*from);
+                output.put_u64(*through);
+            }
         }
         output.freeze()
     }
@@ -163,6 +173,11 @@ impl Request {
             10 => Command::FundWindow {
                 grant: input.grant()?,
                 window: input.window()?,
+            },
+            11 => Command::ProtectRange {
+                grant: input.grant()?,
+                from: input.u64()?,
+                through: input.u64()?,
             },
             _ => return Err(Refusal::Invalid),
         };
@@ -224,6 +239,7 @@ impl BarrierClaim {
                 owner: grant.enrollment,
                 admitted_at,
                 checkpoint,
+                start: checkpoint.cut,
                 through,
             },
         })
@@ -311,6 +327,7 @@ impl Input {
             owner: self.enrollment()?,
             admitted_at: self.u64()?,
             checkpoint: self.checkpoint()?,
+            start: self.cut()?,
             through: self.cut()?,
         })
     }
@@ -404,6 +421,7 @@ fn hold_row(output: &mut BytesMut, value: Hold) {
     enrollment(output, value.owner);
     output.put_u64(value.admitted_at);
     checkpoint(output, value.checkpoint);
+    cut(output, value.start);
     cut(output, value.through);
 }
 

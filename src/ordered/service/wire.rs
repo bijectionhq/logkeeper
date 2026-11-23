@@ -1,6 +1,6 @@
 //! Bounded application RPC on a channel authenticated for an installed group.
 
-use super::{Coordinator, Error, ReplayPage, Route, Session};
+use super::{Coordinator, Error, ReplayHead, ReplayPage, Route, Session};
 use crate::ordered::{
     AppendResult, BarrierClaim, Command, Cut, Fingerprint, Grant, Hold, Placement, Receipt,
     Refusal, Request, append_fingerprint, replication::Replica,
@@ -27,6 +27,10 @@ pub enum Operation {
         from: Cut,
         maximum_bytes: u64,
     },
+    ReplayHead {
+        hold: Hold,
+        from: Cut,
+    },
 }
 
 pub enum Reply {
@@ -34,6 +38,7 @@ pub enum Reply {
     Decision(Decision),
     Reconciled(AppendResult),
     Replay(ReplayPage),
+    ReplayHead(Option<ReplayHead>),
     Refused(Refusal),
 }
 
@@ -143,6 +148,10 @@ pub async fn serve<R: Replica>(
                     .await
                     .map(Reply::Replay)
             }
+            Operation::ReplayHead { hold, from } => coordinator
+                .replay_head(session, hold, from)
+                .await
+                .map(Reply::ReplayHead),
         };
         let reply = match outcome {
             Ok(reply) => reply,
@@ -192,6 +201,13 @@ impl Reply {
                 previous == hold.through
                     || (!page.records.is_empty() && previous.next_lsn < hold.through.next_lsn)
             }
+            (Self::ReplayHead(head), Operation::ReplayHead { hold, from }) => match head {
+                Some(head) => {
+                    from.next_lsn.checked_add(1) == Some(head.next.next_lsn)
+                        && head.next.next_lsn <= hold.through.next_lsn
+                }
+                None => *from == hold.through,
+            },
             (Self::Refused(_), _) => true,
             _ => false,
         }

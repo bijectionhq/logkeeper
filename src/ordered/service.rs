@@ -58,6 +58,13 @@ pub struct ReplayPage {
     pub records: Vec<Record>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayHead {
+    pub next: Cut,
+    pub timestamp: i64,
+    pub payload_bytes: u64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -155,17 +162,9 @@ impl<R: Replica> Coordinator<R> {
         maximum_bytes: usize,
     ) -> Result<ReplayPage, Error> {
         let state = self.recover(session).await?;
-        let replay = state.held_replay(session.principal, hold)?;
-        if from.next_lsn < replay.checkpoint().cut.next_lsn
-            || from.next_lsn > replay.through().next_lsn
-            || (from != replay.checkpoint().cut && state.cut(from.next_lsn) != Some(from))
-        {
-            return Err(Refusal::Invalid.into());
-        }
+        let (replay, skip) = replay_from(&state, session, hold, from)?;
         let checkpoint = replay.checkpoint();
         let through = replay.through();
-        let skip = usize::try_from(from.next_lsn - checkpoint.cut.next_lsn)
-            .map_err(|_| Refusal::Invalid)?;
         let mut remaining = maximum_bytes;
         let mut records = Vec::new();
         for record in replay.records().skip(skip) {
@@ -185,6 +184,21 @@ impl<R: Replica> Coordinator<R> {
             through,
             records,
         })
+    }
+
+    pub async fn replay_head(
+        &self,
+        session: Session,
+        hold: Hold,
+        from: Cut,
+    ) -> Result<Option<ReplayHead>, Error> {
+        let state = self.recover(session).await?;
+        let (replay, skip) = replay_from(&state, session, hold, from)?;
+        Ok(replay.records().nth(skip).map(|entry| ReplayHead {
+            next: entry.result.cut,
+            timestamp: entry.timestamp,
+            payload_bytes: entry.payload.len() as u64,
+        }))
     }
 
     fn admit(&self, session: Session) -> Result<(), Error> {
@@ -226,4 +240,22 @@ impl<R: Replica> Coordinator<R> {
             .map_or(replication::Error::Quorum, replication::Error::Deposed)
             .into())
     }
+}
+
+fn replay_from(
+    state: &State,
+    session: Session,
+    hold: Hold,
+    from: Cut,
+) -> Result<(super::HeldReplay<'_>, usize), Error> {
+    let replay = state.held_replay(session.principal, hold)?;
+    if from.next_lsn < replay.start().next_lsn
+        || from.next_lsn > replay.through().next_lsn
+        || (from != replay.start() && state.cut(from.next_lsn) != Some(from))
+    {
+        return Err(Refusal::Invalid.into());
+    }
+    let skip =
+        usize::try_from(from.next_lsn - replay.start().next_lsn).map_err(|_| Refusal::Invalid)?;
+    Ok((replay, skip))
 }

@@ -17,9 +17,9 @@ impl super::super::Limits {
         // encoded size of each bounded control row. Retained data has its own
         // byte charge and a full outcome row can outlive its data.
         let roster = self.enrolled_workers.checked_mul(24)?;
-        let holds = self.replay_holds.checked_mul(249)?;
+        let holds = self.replay_holds.checked_mul(289)?;
         let retries = usize::try_from(self.retry_positions).ok()?;
-        let outcomes = retries.checked_add(self.replay_holds)?.checked_mul(354)?;
+        let outcomes = retries.checked_add(self.replay_holds)?.checked_mul(394)?;
         512usize
             .checked_add(roster)?
             .checked_add(holds)?
@@ -228,13 +228,14 @@ impl State {
                 || hold.admitted_at >= hold.id.expires_at
                 || hold.id.nonce.is_nil()
                 || hold.checkpoint.cut.next_lsn > self.checkpoint.cut.next_lsn
-                || hold.checkpoint.cut.next_lsn > hold.through.next_lsn
+                || hold.start.next_lsn > hold.through.next_lsn
+                || hold.through.next_lsn > self.head.next_lsn
                 || self
                     .holds
                     .last_key_value()
                     .is_some_and(|(id, _)| *id >= hold.id)
-                || (hold.checkpoint.cut != hold.through
-                    && (self.cut(hold.checkpoint.cut.next_lsn) != Some(hold.checkpoint.cut)
+                || (hold.start != hold.through
+                    && (self.cut(hold.start.next_lsn) != Some(hold.start)
                         || self.cut(hold.through.next_lsn) != Some(hold.through)))
             {
                 return Err(Refusal::Invalid);

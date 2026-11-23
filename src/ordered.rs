@@ -89,6 +89,7 @@ pub struct Hold {
     pub owner: Enrollment,
     pub admitted_at: u64,
     pub checkpoint: Checkpoint,
+    pub start: Cut,
     pub through: Cut,
 }
 
@@ -148,6 +149,11 @@ pub enum Command {
     Protect {
         grant: Grant,
         through: Cut,
+    },
+    ProtectRange {
+        grant: Grant,
+        from: u64,
+        through: u64,
     },
     Release {
         hold: Hold,
@@ -260,6 +266,7 @@ pub struct Record {
 /// The exact source interval protected by an admitted hold.
 pub struct HeldReplay<'a> {
     checkpoint: Checkpoint,
+    start: Cut,
     through: Cut,
     records: std::collections::vec_deque::Iter<'a, Record>,
 }
@@ -271,6 +278,10 @@ impl<'a> HeldReplay<'a> {
 
     pub fn through(&self) -> Cut {
         self.through
+    }
+
+    pub fn start(&self) -> Cut {
+        self.start
     }
 
     pub fn records(self) -> impl ExactSizeIterator<Item = &'a Record> {
@@ -433,21 +444,18 @@ impl State {
                 .ok_or(Refusal::Unavailable)?;
             usize::try_from(offset).map_err(|_| Refusal::Unavailable)
         };
-        // A hold exactly on its checkpoint requires no journal records, even
-        // when a newer published checkpoint has allowed the suffix to advance.
-        let (start, end) = if hold.checkpoint.cut == hold.through {
+        // An empty interval remains usable past the replay floor.
+        let (start, end) = if hold.start == hold.through {
             (0, 0)
         } else {
-            (
-                index(hold.checkpoint.cut.next_lsn)?,
-                index(hold.through.next_lsn)?,
-            )
+            (index(hold.start.next_lsn)?, index(hold.through.next_lsn)?)
         };
         if end < start || end > self.records.len() {
             return Err(Refusal::Unavailable);
         }
         Ok(HeldReplay {
             checkpoint: hold.checkpoint,
+            start: hold.start,
             through: hold.through,
             records: self.records.range(start..end),
         })
@@ -599,7 +607,19 @@ impl State {
         owner: Enrollment,
         through: Cut,
     ) -> Result<Hold, Refusal> {
-        if through.next_lsn < self.checkpoint.cut.next_lsn
+        self.protect_range(origin, id, owner, self.checkpoint.cut, through)
+    }
+
+    fn protect_range(
+        &mut self,
+        origin: Principal,
+        id: RequestId,
+        owner: Enrollment,
+        start: Cut,
+        through: Cut,
+    ) -> Result<Hold, Refusal> {
+        if through.next_lsn < start.next_lsn
+            || self.cut(start.next_lsn) != Some(start)
             || self.cut(through.next_lsn) != Some(through)
         {
             return Err(Refusal::Unavailable);
@@ -615,6 +635,7 @@ impl State {
             owner,
             admitted_at: self.position,
             checkpoint: self.checkpoint,
+            start,
             through,
         };
         self.holds.insert(id, HeldAdmission { hold, origin });
@@ -801,6 +822,24 @@ impl State {
                 let hold = self.protect(principal, id, grant.enrollment, through)?;
                 Ok(Outcome::Protected(hold))
             }
+            Command::ProtectRange {
+                grant,
+                from,
+                through,
+            } => {
+                let Principal::Worker(enrollment) = principal else {
+                    return Err(Refusal::Unauthorized);
+                };
+                if self.roster.get(&enrollment.worker) != Some(&enrollment)
+                    || self.grant != Some(grant)
+                {
+                    return Err(Refusal::Stale);
+                }
+                let start = self.cut(from).ok_or(Refusal::Unavailable)?;
+                let through = self.cut(through).ok_or(Refusal::Unavailable)?;
+                let hold = self.protect_range(principal, id, enrollment, start, through)?;
+                Ok(Outcome::Protected(hold))
+            }
             Command::Release { hold } => {
                 if principal != Principal::Worker(hold.owner) {
                     return Err(Refusal::Unauthorized);
@@ -824,8 +863,8 @@ impl State {
                     return Err(Refusal::Invalid);
                 }
                 if self.holds.values().map(|entry| entry.hold).any(|hold| {
-                    hold.through.next_lsn > hold.checkpoint.cut.next_lsn
-                        && through.next_lsn > hold.checkpoint.cut.next_lsn
+                    hold.through.next_lsn > hold.start.next_lsn
+                        && through.next_lsn > hold.start.next_lsn
                 }) {
                     return Err(Refusal::Unavailable);
                 }
