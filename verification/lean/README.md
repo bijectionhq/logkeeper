@@ -21,8 +21,16 @@ The model assumes checked images, authenticated correct coordinators,
 and exact repair and compaction bases. It abstracts disk barriers, wire
 signatures and encoding to their inspected implementations.
 
-Run `python3 run_selection_fence.py` from this directory to build the package
-and check the one-slot control. Set `LAKE_BIN` if Lake is outside the path.
+The selection reference also gives the exact selector, the two-sync reply
+gate and rotation evidence from distinct members of a strict configured
+majority. Each attestation names the selected index and both physical
+descriptors of the same ballot and prefix. The production correspondences
+are in [mirrored voter media](../verus/mirrored_voter_media/README.md)
+and [rotation slot evidence](../verus/rotation_slot_evidence/README.md).
+
+Run `python3 run_selection_fence.py` from this directory to build the package,
+check the theorem axioms and run the five negative controls. Set `LAKE_BIN`
+if Lake is outside the path.
 
 `Logkeeper.OrderedAdmission` defines the local debit, suffix pin, receipt
 expiry and fingerprint decisions used by the
