@@ -21,7 +21,7 @@ pub type Fingerprint = [u8; 32];
 
 /// Fixed stream charge for each record's identity and framing. Replica media
 /// also budget for staging and their own metadata.
-pub const APPEND_RECORD_CHARGE_BYTES: u64 = 209;
+pub const APPEND_RECORD_CHARGE_BYTES: u64 = 217;
 const ACTIVATION_HOLD_SLOTS: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +69,7 @@ pub struct Enrollment {
 pub struct Grant {
     pub enrollment: Enrollment,
     pub epoch: u64,
+    pub key_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -202,6 +203,11 @@ pub enum Command {
     Grant {
         expected: WriterState,
         candidate: Enrollment,
+    },
+    /// Advance the payload key generation at the selected checkpoint's exact cut.
+    RotateKey {
+        grant: Grant,
+        checkpoint: Checkpoint,
     },
     Append {
         class: AppendClass,
@@ -493,6 +499,7 @@ pub struct State {
     voter_scope: Fingerprint,
     successor: Option<Fingerprint>,
     writer_epoch: u64,
+    key_generation: u64,
     enrollment_serial: u64,
     roster: BTreeMap<Uuid, Enrollment>,
     grant: Option<Grant>,
@@ -558,6 +565,7 @@ impl State {
             voter_scope: [0; 32],
             successor: None,
             writer_epoch: 0,
+            key_generation: 1,
             enrollment_serial: 0,
             roster: BTreeMap::new(),
             grant: None,
@@ -811,6 +819,30 @@ impl State {
         Ok(())
     }
 
+    fn install_grant(
+        &mut self,
+        principal: Principal,
+        id: RequestId,
+        enrollment: Enrollment,
+        key_generation: u64,
+    ) -> Result<Outcome, Refusal> {
+        let epoch = self.writer_epoch.checked_add(1).ok_or(Refusal::Capacity)?;
+        let grant = Grant { enrollment, epoch, key_generation };
+        let recovery = self.admit_hold(
+            principal,
+            id,
+            enrollment,
+            self.checkpoint,
+            self.checkpoint.cut,
+            self.head,
+            HoldKind::Recovery,
+        )?;
+        self.writer_epoch = epoch;
+        self.key_generation = key_generation;
+        self.grant = Some(grant);
+        Ok(Outcome::Granted { grant, recovery })
+    }
+
     fn cut(&self, next_lsn: u64) -> Option<Cut> {
         if next_lsn == self.floor.next_lsn {
             return Some(self.floor);
@@ -957,23 +989,18 @@ impl State {
                 {
                     return Err(Refusal::Stale);
                 }
-                let epoch = expected.epoch.checked_add(1).ok_or(Refusal::Capacity)?;
-                let grant = Grant {
-                    enrollment: candidate,
-                    epoch,
-                };
-                let recovery = self.admit_hold(
-                    principal,
-                    id,
-                    candidate,
-                    self.checkpoint,
-                    self.checkpoint.cut,
-                    self.head,
-                    HoldKind::Recovery,
-                )?;
-                self.writer_epoch = epoch;
-                self.grant = Some(grant);
-                Ok(Outcome::Granted { grant, recovery })
+                self.install_grant(principal, id, candidate, self.key_generation)
+            }
+            Command::RotateKey { grant, checkpoint } => {
+                self.writer(principal, grant)?;
+                if self.checkpoint != checkpoint || self.head != checkpoint.cut {
+                    return Err(Refusal::Stale);
+                }
+                if checkpoint.manifest == [0; 32] {
+                    return Err(Refusal::Invalid);
+                }
+                let next = grant.key_generation.checked_add(1).ok_or(Refusal::Capacity)?;
+                self.install_grant(principal, id, grant.enrollment, next)
             }
             Command::Append {
                 class,
@@ -1450,6 +1477,7 @@ fn add_enrollment(hash: &mut Sha256, enrollment: Enrollment) {
 fn add_grant(hash: &mut Sha256, grant: Grant) {
     add_enrollment(hash, grant.enrollment);
     hash.update(grant.epoch.to_be_bytes());
+    hash.update(grant.key_generation.to_be_bytes());
 }
 
 fn add_cut(hash: &mut Sha256, cut: Cut) {
@@ -1466,7 +1494,7 @@ fn append_fingerprint(
     payload: &Bytes,
 ) -> Fingerprint {
     let mut hash = Sha256::new();
-    hash.update(b"logkeeper.applied-append.v2");
+    hash.update(b"logkeeper.applied-append.v3");
     hash.update([class.tag()]);
     add_cut(&mut hash, previous);
     add_grant(&mut hash, grant);

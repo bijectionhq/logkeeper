@@ -9,8 +9,8 @@ use uuid::Uuid;
 mod service;
 mod snapshot;
 
-const VERSION: u8 = 4;
-const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR02";
+const VERSION: u8 = 5;
+const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR03";
 
 impl Request {
     /// The exact bytes used by ordered replication and crash replay.
@@ -40,6 +40,11 @@ impl Request {
                 output.put_u8(2);
                 writer_state(&mut output, *expected);
                 enrollment(&mut output, *candidate);
+            }
+            Command::RotateKey { grant: writer, checkpoint: root } => {
+                output.put_u8(22);
+                grant(&mut output, *writer);
+                checkpoint(&mut output, *root);
             }
             Command::Append {
                 class,
@@ -173,6 +178,10 @@ impl Request {
             2 => Command::Grant {
                 expected: input.writer_state()?,
                 candidate: input.enrollment()?,
+            },
+            22 => Command::RotateKey {
+                grant: input.grant()?,
+                checkpoint: input.checkpoint()?,
             },
             3 => Command::Append {
                 class: input.append_class()?,
@@ -395,6 +404,7 @@ impl Input {
         Ok(Grant {
             enrollment: self.enrollment()?,
             epoch: self.u64()?,
+            key_generation: self.u64()?,
         })
     }
 
@@ -507,6 +517,7 @@ fn enrollment(output: &mut BytesMut, value: Enrollment) {
 fn grant(output: &mut BytesMut, value: Grant) {
     enrollment(output, value.enrollment);
     output.put_u64(value.epoch);
+    output.put_u64(value.key_generation);
 }
 
 fn writer_state(output: &mut BytesMut, value: WriterState) {

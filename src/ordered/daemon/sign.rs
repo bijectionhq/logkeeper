@@ -132,6 +132,7 @@ mod tests {
                 serial: 1,
             },
             epoch: 1,
+            key_generation: 1,
         };
         let cut = Cut {
             next_lsn: 0,

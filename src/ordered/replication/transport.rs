@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-const MAGIC: &[u8; 8] = b"LKORPC01";
+const MAGIC: &[u8; 8] = b"LKORPC02";
 const PREPARE: u8 = 1;
 const ACCEPT: u8 = 2;
 const PROMISE: u8 = 3;

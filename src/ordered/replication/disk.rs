@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
-const MAGIC: &[u8; 8] = b"LKORV003";
+const MAGIC: &[u8; 8] = b"LKORV004";
 const SLOTS: [&str; 2] = ["ordered.slot-a", "ordered.slot-b"];
 const LOCK: &str = "ordered.lock";
 const RESERVATION: &str = "ordered.reserve";

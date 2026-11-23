@@ -4,7 +4,7 @@ use super::{
 };
 use crate::ordered::{
     ACTIVATION_HOLD_SLOTS, APPEND_RECORD_CHARGE_BYTES, AppendClass, AppendResult, Command,
-    HeldAdmission, HoldKind, Outcome, Principal, Receipt, Record, Refusal, Request,
+    Grant, HeldAdmission, HoldKind, Outcome, Principal, Receipt, Record, Refusal, Request,
     RetainedCheckpoint, RetainedOutcome, State, Window, admission, append_fingerprint, fingerprint,
 };
 use bytes::{BufMut, Bytes, BytesMut};
@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use crate::ordered::TrimResult;
 
-const MAGIC: &[u8; 8] = b"LKBASE04";
+const MAGIC: &[u8; 8] = b"LKBASE05";
 
 impl super::super::Limits {
     pub(in crate::ordered) fn base_control_bytes(self) -> Option<usize> {
@@ -51,6 +51,7 @@ impl State {
             output.put_slice(&successor);
         }
         writer_state(&mut output, self.writer_state());
+        output.put_u64(self.key_generation);
         output.put_u64(self.enrollment_serial);
         window(&mut output, self.window);
         output.put_u64(self.spent);
@@ -118,6 +119,7 @@ impl State {
         let writer = input.writer_state()?;
         state.writer_epoch = writer.epoch;
         state.grant = writer.grant;
+        state.key_generation = input.u64()?;
         state.enrollment_serial = input.u64()?;
         state.window = input.window()?;
         state.spent = input.u64()?;
@@ -168,6 +170,7 @@ impl State {
             || (state.checkpoint.custody.revision == 1 && state.checkpoint != initial.checkpoint)
             || state.head.next_lsn > state.position
             || state.writer_epoch > state.position
+            || !(1..=state.writer_epoch.max(1)).contains(&state.key_generation)
             || state.enrollment_serial > state.position
         {
             return Err(Refusal::Invalid);
@@ -245,12 +248,21 @@ impl State {
         if let Some(writer) = self.grant {
             if writer.epoch == 0
                 || writer.epoch != self.writer_epoch
+                || writer.key_generation != self.key_generation
                 || self.roster.get(&writer.enrollment.worker) != Some(&writer.enrollment)
             {
                 return Err(Refusal::Invalid);
             }
         }
         Ok(())
+    }
+
+    fn valid_historical_grant(&self, grant: Grant) -> bool {
+        grant.epoch <= self.writer_epoch
+            && (1..=grant.epoch.min(self.key_generation)).contains(&grant.key_generation)
+            && (grant.epoch != self.writer_epoch
+                || (grant.key_generation == self.key_generation
+                    && self.grant.is_none_or(|writer| writer == grant)))
     }
 
     fn read_records(&mut self, input: &mut Input) -> Result<(), Refusal> {
@@ -261,6 +273,7 @@ impl State {
         }
         let mut previous = self.floor;
         let mut previous_position = 0;
+        let mut previous_grant: Option<Grant> = None;
         let mut previous_window: Option<(Window, u64)> = None;
         for _ in 0..count {
             let entry = input.record()?;
@@ -289,6 +302,12 @@ impl State {
                 .ok_or(Refusal::Invalid)?;
             if result.position <= previous_position
                 || result.position > self.position
+                || !self.valid_historical_grant(*grant)
+                || previous_grant.is_some_and(|old| {
+                    grant.epoch < old.epoch
+                        || grant.key_generation < old.key_generation
+                        || (grant.epoch == old.epoch && *grant != old)
+                })
                 || result.lsn != previous.next_lsn
                 || result.lsn.checked_add(1) != Some(result.cut.next_lsn)
                 || result.cut.history
@@ -313,6 +332,7 @@ impl State {
             }
             previous = result.cut;
             previous_position = result.position;
+            previous_grant = Some(*grant);
             match result.class {
                 AppendClass::Data => {
                     if result.byte_end > result.window.bytes

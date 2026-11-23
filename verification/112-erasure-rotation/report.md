@@ -52,3 +52,22 @@ A generation tag on the grant needs a Logkeeper grant field and a codec change.
 JAVA_BIN=/path/to/jdk/bin/java LEAN_BIN=/path/to/elan/bin/lean \
   python3 verification/112-erasure-rotation/run.py
 ```
+
+## Logkeeper implementation review
+
+The C3 patch proposes an ordered rotation that compares the exact current grant, exact published checkpoint, and data head.
+The head must still equal the checkpoint cut when the decision applies.
+An intervening append makes the rotation stale.
+An accepted rotation advances the writer epoch and key generation together, retaining the same worker enrollment and admitting an empty-suffix recovery hold at the checkpoint.
+Ordinary writer replacement preserves the generation, including after a vacancy.
+The record hash covers the grant's key generation, and held replay returns each record's original grant.
+
+The application reducer checks journal identities and the published cut.
+RTDB must establish that the selected checkpoint is semantically clean and that every crash-selectable slot carries a clean recovery image before committing revocation.
+The model's two slots denote those crash-selectable images.
+The reducer's selected checkpoint is the ordered recovery basis used to condition the grant change.
+
+The implementation test exercises a stale cut, stale grant, a grant with the wrong generation at the current writer epoch, retained old-view replay, and vacant-state recovery after rotation.
+The Logkeeper suite passed 76 tests, with one throughput test ignored.
+Removing the exact-head check or bypassing the append fence failed the corresponding assertion in the rotation test.
+The bounded model continues to cover one rotation, two selectable slots, at most one append from each modeled generation, one crash selection, and one held read.
