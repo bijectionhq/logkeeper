@@ -55,3 +55,12 @@ snapshot generation, hold receipt, lease, fence and object reference checks. Run
 reports and the five negative controls. The Verus correspondence is recorded
 in the [ordered codec](../verus/ordered_codec/README.md) and
 [compact image](../verus/compact_image/README.md) proof areas.
+
+`Logkeeper.DisposalLease` and `Logkeeper.ErasureCommit` specify the serving
+lease, disposal and exact rotation guards. Run
+`python3 run_ordered_lease_rotation.py` for the theorem and mutation checks.
+
+`Logkeeper.Premises.BarrierKeys` and `SignatureScope` give the reference
+for [ordered receipt signatures and repair keys](../verus/receipt_signatures/README.md).
+The package build checks the arbitrary-chain retention theorem, the exact
+signature and repair laws, and their reachability and negative witnesses.
