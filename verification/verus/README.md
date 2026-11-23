@@ -41,6 +41,16 @@ declared proof failures while meeting its verification count.
 
 The area READMEs describe the checked production functions and Lean mappings.
 
-- [Ordered admission](ordered_admission/README.md)
+- [Compact image](compact_image/README.md)
 - [Mirrored voter media](mirrored_voter_media/README.md)
+- [Object withdrawal](object_withdrawal/README.md)
+- [Ordered admission](ordered_admission/README.md)
+- [Ordered budgets](ordered_budgets/README.md)
+- [Ordered codec](ordered_codec/README.md)
+- [Ordered receipt retention and retry](ordered_receipt/README.md)
+- [Ordered rotation](ordered_rotation/README.md)
+- [Ordered serving lease](ordered_serving_lease/README.md)
+- [Ordered trim](ordered_trim/README.md)
+- [Ordered writer](ordered_writer/README.md)
+- [Receipt signatures and repair keys](receipt_signatures/README.md)
 - [Rotation slot evidence](rotation_slot_evidence/README.md)

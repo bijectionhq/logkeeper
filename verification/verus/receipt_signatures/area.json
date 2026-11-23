@@ -1,0 +1,370 @@
+{
+  "summary": "Ordered receipt scope, signing domains and predecessor key policy.",
+  "flags": [
+    "--edition=2024",
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "reference",
+    "--verify-module",
+    "contracts",
+    "--verify-module",
+    "ordered"
+  ],
+  "min_verified_functions": 71,
+  "controls": {
+    "non-barrier-invocation": {
+      "defect": "An otherwise matching invocation for another command can receive a barrier.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "find": "        let Command::Barrier = &expected.command else {\n            return Err(invalid(\n                \"a read receipt requires an original read invocation\",\n            ));\n        };\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "function": "verify",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "foreign-claim-placement": {
+      "defect": "A signed claim for a different logical placement can cross the installed route.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "find": "if claim.placement != self.scope\n            || expected.placement",
+          "replace": "if expected.placement"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "function": "verify",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "foreign-request-placement": {
+      "defect": "The expected invocation can address a different logical placement.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "find": "            || expected.placement != self.scope\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "function": "verify",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "another-reader-enrollment": {
+      "defect": "A different reader or enrollment can use a signed claim.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "find": "            || expected.principal != Principal::Worker(claim.read.owner)\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "function": "verify",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "another-invocation": {
+      "defect": "A signed claim can be used with a different full RequestId.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "find": "            || claim.read.id != expected.id\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "function": "verify",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "skip-signature-verification": {
+      "defect": "Matching coordinates suffice without the installed issuer's signature.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "find": "        self.verify_signature(attestation.signature, claim.encode().as_ref())?;\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "function": "verify",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "wrong-signed-through-cut": {
+      "defect": "Signing uses the start cut where the through cut belongs.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/signed.rs",
+          "find": "        cut(&mut output, self.read.through);",
+          "replace": "        cut(&mut output, self.read.start);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/signed.rs",
+          "function": "encode",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "noncanonical-start": {
+      "defect": "Decoding uses the through cut as its start instead of the checkpoint cut.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/signed.rs",
+          "find": "            start: checkpoint.cut,",
+          "replace": "            start: through,"
+        },
+        {
+          "file": "src/ordered/codec/signed.rs",
+          "find": "    ensures out matches Ok(claim) ==> canonicalStart(claim),",
+          "replace": "    ensures true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/receipt_signatures/laws.rs",
+          "function": "decoded_claim_has_canonical_start",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "unsigned-successful-barrier": {
+      "defect": "The decoder permits a successful barrier without a signed claim.",
+      "mutate": [
+        {
+          "file": "src/ordered/service/wire/receipt.rs",
+          "find": "(Ok(Outcome::Barrier { .. }), None) | (_, Some(_)) => false,",
+          "replace": "(_, Some(_)) => false,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/service/wire/receipt.rs",
+          "function": "barrier_receipt_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "different-receipt-cut": {
+      "defect": "A matching receipt identity permits an outcome hold that differs from the signed hold.",
+      "mutate": [
+        {
+          "file": "src/ordered/service/wire/receipt.rs",
+          "find": "            read == claim.read\n                && receipt.placement",
+          "replace": "            receipt.placement"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/service/wire/receipt.rs",
+          "function": "barrier_receipt_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "different-receipt-request": {
+      "defect": "The channel receipt scope omits the request identity.",
+      "mutate": [
+        {
+          "file": "src/ordered/service/wire/receipt.rs",
+          "find": "        && receipt.request == request.id\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/service/wire/receipt.rs",
+          "function": "receipt_scope_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "drop-retained-from-route": {
+      "defect": "The emitted key set omits retained historic keys.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "find": "        keys.extend(&self.retained);\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "function": "barrier_keys",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "immediate-only-retention": {
+      "defect": "The successor only has to retain the predecessor's current active public keys.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "find": "!source.barrier_keys().is_subset(&self.barrier_keys())",
+          "replace": "!active.is_subset(&self.barrier_keys())"
+        },
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "find": "(out is Ok) == validSuccessorKeys(source, self),",
+          "replace": "(out is Ok) == (self.predecessor@.to_set().subset_of(source.active@.values())\n            && source.active@.values().subset_of(verificationKeys(self))),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/receipt_signatures/laws.rs",
+          "function": "valid_successor_extends_rotations",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "historical-repair-authority": {
+      "defect": "The seal permits repair keys from the predecessor's whole verification set.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "find": "let active = active_keys(&source.active);",
+          "replace": "let active = source.barrier_keys();"
+        },
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "find": "active@ == source.active@.values(),",
+          "replace": "active@ == verificationKeys(source),"
+        },
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "find": "(out is Ok) == validSuccessorKeys(source, self),",
+          "replace": "(out is Ok) == (self.predecessor@.to_set().subset_of(verificationKeys(source))\n            && verificationKeys(source).subset_of(verificationKeys(self))),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/receipt_signatures/laws.rs",
+          "function": "repair_authority_is_active",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "install-uses-history": {
+      "defect": "Installation looks up signatures among historical verification keys.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "find": "        while index < self.predecessor.len() {\n            let key = &self.predecessor[index];",
+          "replace": "        while index < self.retained.len() {\n            let key = &self.retained[index];"
+        },
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "find": "                proof! { assert(self.predecessor@[index as int] == *key); }",
+          "replace": "                proof! { assert(self.retained@[index as int] == *key); }"
+        },
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "find": "            invariant index <= self.predecessor@.len(),\n            decreases self.predecessor@.len() - index,",
+          "replace": "            invariant index <= self.retained@.len(),\n            decreases self.retained@.len() - index,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/daemon/receipt_keys.rs",
+          "function": "repair_package_key",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "rotation-uses-barrier-domain": {
+      "defect": "The rotation preimage starts with the barrier domain.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/signed.rs",
+          "find": "        output.put_slice(ROTATION_DOMAIN.as_bytes());",
+          "replace": "        output.put_slice(BARRIER_DOMAIN.as_bytes());"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/signed.rs",
+          "function": "signing_bytes",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    },
+    "rotation-checks-another-decision": {
+      "defect": "Rotation verification reconstructs the preimage for the wrong decision position.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "find": "attestation.evidence.signing_bytes(receipt).as_ref()",
+          "replace": "attestation.evidence.signing_bytes(Receipt { position: 0, ..receipt }).as_ref()"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/daemon/sign/verification.rs",
+          "function": "verify_rotation",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 70
+    }
+  },
+  "functions": [
+    "BarrierVerifier::verify",
+    "BarrierVerifier::verify_signature",
+    "BarrierVerifier::verify_rotation",
+    "BarrierClaim::encode",
+    "decode_barrier_claim",
+    "RotationSlots::signing_bytes",
+    "barrier_receipt_matches",
+    "receipt_scope_matches",
+    "ReceiptKeys::barrier_keys",
+    "ReceiptKeys::validate_successor_keys",
+    "ReceiptKeys::repair_package_key",
+    "verify_repair_signature"
+  ]
+}
