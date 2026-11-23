@@ -21,6 +21,7 @@ FUNCTION = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?"
     r"(?:(?:open|closed|proof|spec|exec|const|unsafe|async)\s+)*fn\s+(\w+)\s*[<(]"
 )
+LOOP = re.compile(r"^\s*(?:'[a-zA-Z_]\w*:\s*)?(?:while|for|loop)\b")
 ERROR = re.compile(r"^(?:error|error\[\w+\]): (.+)$", re.MULTILINE)
 LOCATION = re.compile(r"^\s*--> (.+?):(\d+):\d+\s*$", re.MULTILINE)
 TIMEOUT_SECONDS = 120
@@ -70,6 +71,9 @@ def function_at(path, line):
             in_contract = True
         if match := FUNCTION.match(source):
             function = match[1]
+            in_contract = False
+        if in_contract and LOOP.match(source):
+            # A Verus loop attribute belongs to the enclosing function.
             in_contract = False
         if index >= line and not in_contract:
             return function
