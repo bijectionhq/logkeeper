@@ -15,6 +15,7 @@ pub mod service;
 mod writer;
 
 use bytes::Bytes;
+use receipt::RetainedOutcome;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use uuid::Uuid;
@@ -80,16 +81,7 @@ pub struct WriterState {
     pub grant: Option<Grant>,
 }
 
-/// An exclusive data frontier and the identity of the prefix before it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "ordered-daemon",
-    derive(serde::Deserialize, serde::Serialize)
-)]
-pub struct Cut {
-    pub next_lsn: u64,
-    pub history: Fingerprint,
-}
+pub use writer::{Cut, Refusal};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
@@ -381,8 +373,6 @@ pub enum Outcome {
     Trimmed(TrimResult),
 }
 
-pub use writer::Refusal;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Receipt {
     pub placement: Placement,
@@ -478,12 +468,6 @@ pub enum ApplyError {
 
 type RequestKey = (Principal, RequestId);
 
-#[derive(Clone)]
-struct RetainedOutcome {
-    fingerprint: Fingerprint,
-    receipt: Receipt,
-}
-
 #[derive(Clone, Copy)]
 struct HeldAdmission {
     hold: Hold,
@@ -534,7 +518,7 @@ pub struct State {
     root_references: BTreeMap<u64, Vec<ObjectName>>,
     object_fences: BTreeMap<ObjectName, ObjectFence>,
     holds: BTreeMap<RequestId, HeldAdmission>,
-    outcomes: BTreeMap<RequestKey, RetainedOutcome>,
+    outcomes: BTreeMap<RequestKey, RetainedOutcome<Receipt>>,
     expiry: BTreeMap<(u64, RequestKey), ()>,
 }
 
@@ -822,19 +806,21 @@ impl State {
             return Ok(receipt(Err(Refusal::Invalid)));
         }
         let receipt = receipt(self.decide(principal, id, fingerprint, request.command));
-        if !receipt::record_after_apply(reading, &receipt.outcome) {
+        if !receipt::record_after_apply(
+            &mut self.outcomes,
+            key,
+            reading,
+            &receipt.outcome,
+            RetainedOutcome {
+                fingerprint,
+                receipt,
+            },
+        ) {
             // A refused read holds nothing and is never replayed, so it leaves
             // no state behind. Only an admitted read retains its receipt, as
             // the provenance of its hold.
             return Ok(receipt);
         }
-        self.outcomes.insert(
-            key,
-            RetainedOutcome {
-                fingerprint,
-                receipt,
-            },
-        );
         self.expiry.insert((id.expires_at, key), ());
         Ok(receipt)
     }
@@ -1138,7 +1124,7 @@ impl State {
                     byte_start,
                     byte_end,
                 };
-                self.records.push_back(Record {
+                let record = Record {
                     result,
                     grant,
                     timestamp,
@@ -1146,8 +1132,8 @@ impl State {
                     references,
                     request: id,
                     request_fingerprint,
-                });
-                self.head = cut;
+                };
+                writer::commit_append(&mut self.records, &mut self.head, record, cut);
                 match class {
                     AppendClass::Data => {
                         self.spent = byte_end;
@@ -1392,7 +1378,7 @@ impl State {
             }
             Command::Vacate { grant } => {
                 self.writer(principal, grant)?;
-                self.grant = None;
+                writer::vacate(&mut self.grant);
                 Ok(Outcome::Vacated)
             }
             Command::SealCohort {
