@@ -1,0 +1,65 @@
+# Mechanism independence
+
+The 15 numbered mechanisms in [M](requirements.md#m--candidate-mechanisms) each have a breaking single-guard weakening at a named reference boundary.
+The evidence uses the [shared Lean package](lean/README.md), the funded chosen reducer and projected kernel in [Study 68](68-core-reference/report.md), and the receipt, recovery, protection and provider studies built around those boundaries.
+The table specifies the transition or predicate that changes and the decisions that stay enforced in that experiment.
+The controls establish necessity at those boundaries. A distributed proof of independence across all mechanisms in one execution remains open.
+
+## Owner decisions
+
+| Candidate | Baseline status |
+| --- | --- |
+| Read reissue and exact lost-reply recovery | Retired by D01. A new invocation re-admits at the logical basis. An admitted read keeps its own protected basis until it completes or its hold can settle. Mutations retain exact reconciliation. |
+| Delivery book and terminal witnesses specific to it | Retired by D01. Independent physical custody still applies to work already entitled to use its exact inputs. |
+| Read nonce floor, including ordered abandonment | Retired by D01. Exact invocation binding on the fresh admission and non-reused custody identities still matter. |
+| Selective read window and its width and verifier policy | Retired by D01. The optional fused exact-read variants in Studies 93–96 also depend on the retired delivery and nonce machinery. |
+| Exact historical feed | Outside the D04 baseline. Watches restart from a certified snapshot after the retention floor passes their cursor. |
+
+D02 keeps holds during journal-key erasure and separates logical unreadability at the deadline from later physical settlement.
+D03 preserves first-loss protection during an unclassified outage.
+D05 limits the portable claim to installed journals.
+D06 leaves throughput and latency as qualification obligations.
+
+## Guard controls
+
+| Mechanism | Single change and protected decisions | Baseline, reachable control and requirement broken |
+| --- | --- | --- |
+| M01 · Next LSN | Skip equality to the current next LSN. Keep the installed writer, both budgets and the same append effect. | A funded append at LSN 0 reaches the one-record fixture. The ordered reducer refuses changed data also addressed to LSN 0. The mutant accepts that request and adds its bytes at LSN 1. **S03** fails. The recovery and retention limits are two records each. [Core programs](68-core-reference/CorePrograms.lean) · [Weakening](68-core-reference/Weakening.lean) |
+| M02 · Writer fence | Skip exact installed-writer equality. Keep the current LSN and both budgets. | Choose the funded append, read and install the higher writer. The old grant can then extend the history in the mutant at a valid head. **S03 / P04** fail. The baseline funded reducer refuses it. [Core programs](68-core-reference/CorePrograms.lean) · [Weakening](68-core-reference/Weakening.lean) |
+| M03 · Fault-envelope write coverage | Skip the new input's coverage check at acknowledgement. Keep serving quorum, exact serving inputs, the credible loss set, and withdrawal and renewal rules. | With three AZs, one prior input and one new candidate, B and C open and the B-only candidate is acknowledged in two transitions. `PromisesIntact` fails for loss of B. **S02 / P210** fail. The unclassified-loss baseline with injected physical loss covers 37 states and acknowledges after independent replication in a three-transition witness. [Study 105](105-service-scope-protection/report.md) · [Runner](105-service-scope-protection/run.py) |
+| M04 · Positive applied reply | Accept quorum choice in place of successful application when recording the append result. Keep the same frame, lineage, request and ordered position. | After the exact higher writer fence, a chosen stale command at position 5 refuses. The normal receipt fold puts no row at LSN 1. The mutant records that command as successful while LSN 1 is absent from committed history. **S20 / P25** fail. The linked application model also reaches `ReplyNeverConfirmsRefusedCommand` in three transitions, with 6,665 safe baseline states at two commands and a six-transition witness of choice followed by refusal. [Funded witness](69-retained-receipts/MoveProgram.lean) · [Study 28](28-ordered-application/report.md) |
+| M05 · Checkpoint and replay gates | Skip the active replay floor in trim. Keep the exact writer, monotone authorized trim and published checkpoint bound. | Publish at cut 1 while an exact hold on LSN 0 remains. Normal trim refuses. The mutant advances to cut 1 and violates `Kernel.Valid.replaySafe`. **S06 / P06** fail. The converse control drops only the checkpoint bound while every replay constraint is satisfied. [Core programs](68-core-reference/CorePrograms.lean) · [Weakening](68-core-reference/Weakening.lean) |
+| M06 · Funded seal | Allow one pool receipt to satisfy the complete vector gate at the ordered source seal. Keep exact receipt binding, the single source decision, irreversible seal and target installation checks. | Plan one move, prepare one pool, seal. `FullCommittedVector` fails in three transitions. **S37 / P120** fail. Two pools of capacity two yield 272 safe states and a seven-transition witness of resuming the exact fully funded move after coordinator loss. The ordered Lean program uses that same source reducer. [Study 70](70-distributed-preparation/report.md) |
+| M07 · Stable disposition | Skip stable fenced absence when settling the exact withdrawing version. Keep the ordered withdrawal, original version, closure for effect dispatch and the read and root checks. | Settle while A still holds bytes. `ChargedUntilAbsent` fails in five transitions. **S31 / P222** fail. The settlement baseline has 82 states and the offline-effect baseline 130. Separate witnesses settle through both crash selectors. [Study 108](108-withdrawal-recovery/report.md) |
+| M08 · Independent resource bounds | Skip the recovery-room check. Keep retained-room check, valid head and installed writer. | The one-record fixture has recovery limit one and retention limit two. The mutant appends a second record and exceeds recovery while retention still fits. **B01** fails. The converse fixture exchanges the limits and drops only retained room. The funded ordered trace supplies the reachable prefix. [Core programs](68-core-reference/CorePrograms.lean) · [Weakening](68-core-reference/Weakening.lean) |
+| M09 · Authenticated scope | Skip authorization at exact retained-result lookup. Keep current lineage, retained range and the complete original request binding. | The funded append reaches a view with the original row. The normal lookup refuses the unauthorized caller. The mutant discloses the exact requested result. **S09** fails. Separately, omitting only lineage equality in the one-append and one-move TLC receipt model discloses a matching other-lineage key in four transitions, violating `ExactReturnedReceipt` and **P116**, against 17,433 states of the baseline and a nine-transition exact lookup witness. [Funded witness](69-retained-receipts/MoveProgram.lean) · [Study 69](69-retained-receipts/report.md) |
+| M10 · Membership closure | Let an ordinary sample stand in for a report backed by an effective durable predecessor fence. Keep scoped rank and exact target installation. | In the sealed-change model with two configurations and one record, later predecessor votes extend the sealed prefix. `SealedScopeCannotExtendRecoveredPrefix` fails in six transitions. **S10 / S24** fail. The reference has 8,186 states and a nine-transition witness where late evidence legitimately completes a covered predecessor prefix. The packaged quorum lemma supplies the fence intersection obligation. [Study 32](32-configuration-closure/report.md) · [JournalRefinement](lean/Logkeeper/JournalRefinement.lean) |
+| M11 · Physical read custody | Ignore the still-admitted physical read at withdrawal. Keep the older-root check and exact provider authorization. | Release the old root and withdraw A while the ordinary read is still open. A's deletion violates `ExactHolds` in five transitions. **S11 / P12** fail. The baseline has three copies, one read, one root hold and 15 reachable states. Finishing the read lets A be deleted in six transitions. The scenario uses ordinary physical read custody under D01. [Study 108](108-withdrawal-recovery/report.md) · [Runner](108-withdrawal-recovery/run.py) |
+| M12 · Durable original registration | Ignore the custodian's exact canceled-reference fence on acquisition. Keep the immutable plan, target identity, offered-and-not-held check, provider byte and withdrawal checks, and the separate ordered publish rule. | In Study 109's three-AZ, two-root model, a delayed grant reopens the canceled original reference. `ClosedStaysClosed` fails in six transitions. **S12 / P226** fail. The cancellation baseline covers 26 states with an issued grant whose reply was lost. The Lean composition uses exact release from the same registration reducer as the core custody path. [Study 109](109-dynamic-protection/report.md) |
+| M13 · Receiver floor | Skip comparison with the installed channel floor. Keep durable issuer plans, exact release markers until compaction and independent live-grant custody. | Queue an acquire, close, release and compact it. The delayed acquire is accepted after seven transitions, violating `ClosedCannotResurrect`. **S13 / P17** fail. With two serials and window one, 2,260 states satisfy the receipt-backed baseline and the baseline reaches delayed rejection in seven transitions. The Lean mutation also fails the receiver-floor law. [Study 20](20-registration-recovery/report.md) |
+| M14 · Non-reused channel | Skip admission against the exact current channel handle. Keep the original grant key, floor accounting and other acquisition guards. | Queue an old acquire, retire its channel, open the successor and deliver the old request. `LateAcquireDoesNotRecreateChannelInterest` fails in five transitions. **S14 / P18** fail. The two-handle baseline covers 11,640 states and reaches the exact delayed refusal in five transitions. The shared custodian-recovery model carries the same channel state. [Study 21](21-custody-channel-lifecycle/report.md) |
+| M15 · Exact physical checkpoint replacement | Let the old logical-path grant pass for the replacement's physical generation. Keep the input set, logical identity, old custody and the other certificate guards. | Study 110's one relocated member and two generations yield seven safe states. The baseline admits the replacement after acquiring its own grant in four transitions. Omitting the generation comparison admits the replacement supported by the original grant in three, violating `ExactCarrier`. **S15 / P229** fail. Study 22 separately weakens the exact current referrer's revision and violates `RootInExactScope` in four transitions, against 512 states for one referrer and a four-transition offline installation witness. [RecoveryCertificate](lean/Logkeeper/RecoveryCertificate.lean) · [Study 110](110-rtdb-recovery-closure/report.md) · [Study 22](22-residence-transfer/report.md) |
+
+The logical fixtures use the funded chosen reducer with authenticated funding as a premise.
+The older bounded checks for M10, M13 and M14 exercise definitions that the shared core imports through `ConfigurationClosure` and `CustodianRecovery`.
+The late studies for M03, M07, M11, M12 and M15 exercise the protection, physical custody and certificate projections.
+No common trace here simultaneously advances the funded writer, channel book, provider and physical referrer CAS through a real handoff.
+In particular, M15's catalog revision check is a separate residence-transfer projection. The cross-repo `ReplayCertificate` composition checks the required physical carrier once its exact binding is supplied.
+
+Every numbered mechanism has a breaking weakening in this scope.
+Some implementation checks may duplicate a guard at another layer. For example, exact lineage appears in both lookup authorization and matching a receipt's original binding. The lineage TLC control tests the combined boundary predicate, and the Lean authorization control isolates a separate conjunct while keeping both lineage checks.
+Removing a redundant layer requires proving the other layer still dominates its relevant entry points. The [readiness matrix](readiness.md) records where those production refinements remain open.
+
+## Reproduction
+
+Run the shared package with Lean 4.35.0 and each cited study with its `run.py`.
+The study runners check the declared failure law and distinguish reachability witnesses from failing guard controls.
+
+```sh
+(cd verification/lean && ~/.elan/bin/lake build)
+export LEAN_BIN="$HOME/.elan/bin/lean"
+export JAVA_BIN=/Users/sachaichbiah/cycle3/jdk/Contents/Home/bin/java
+for study in verification/{20,21,22,28,32,68,69,70,105,108,109,110}-*; do
+  python3 -u "$study/run.py" || exit
+done
+```

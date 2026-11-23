@@ -4,7 +4,9 @@
 
 End-to-end implementation follows the verified design.
 The design still needs the proofs below.
-The [requirements](requirements.md) define the baseline, and the [evidence matrix](evidence.md) records the strength of each study.
+The [requirements](requirements.md) define the baseline.
+The [combined readiness matrix](readiness.md) records each safety, liveness, acceptance and qualification obligation against evidence from both repositories.
+The [study evidence ledger](evidence.md) records the individual study results.
 
 ## What the design must establish
 
@@ -12,7 +14,7 @@ The [requirements](requirements.md) define the baseline, and the [evidence matri
 | --- | --- | --- |
 | Validity | Each safety and resource law holds in a common reference machine or through a proved refinement into it. Each liveness law says exactly which environment and fairness it uses. | The regional reducer composes exact borrows, append windows, and the prepared move vector against one pool ledger. The recovered source admission checks all selectable dependencies and separates current serving readiness from the protection interval. The remaining work includes discharging the exact codec, custody, fault interval, and certificate premises and consolidating the linked reducers and liveness conditions. |
 | Expressiveness | The acceptance programs run in the same reference with their expected outputs and refusals. | The funded chosen reducer executes the logical writer, fence, replay, trim and retirement programs. The full suite still needs its distributed end-to-end cases in the common reference. |
-| Independence | Every proposed mechanism has a weakening that preserves the other mechanisms and breaks a named requirement or acceptance program. | Five one-guard countermodels are checked in the common logical stream state space, covering parts of M02, M05 and M08. Independence of the full mechanism list and redundant enforcement across layers still need analysis. |
+| Independence | Every baseline mechanism has a weakening that preserves the other mechanisms and breaks a named requirement or acceptance program. | The [independence audit](mechanism-independence.md) checks one guard for each of M01–M15 at its reference boundary and records the D01 retirements. Distributed composition of the projections and independent enforcement at production entry points remain open. |
 | Coherent fault and capacity contracts | Provider, quorum, routing, and RTDB assumptions are explicit and their composition preserves the checked laws. | A one-AZ fault envelope, finite recovery and custody budgets, and conditional progress are explicit. Exact media and provider durability, transfer and repair reservations, and usage across multiple streams still need composition. |
 
 The baseline uses bounded per-stream recovery, ordered-command read cuts, and deployment-scoped erasure.
@@ -76,7 +78,7 @@ Exact provider disposition and aggregate physical capacity require evidence from
 [Study 65](65-funded-window-move/report.md) connects the prepared vector to the exact source seal and funded destination window in the shared pool ledger. Installation keeps pointwise occupancy and the predecessor borrow's original debit unchanged.
 [Study 66](66-move-recovery/report.md) replays the combined activation through either certified source base and merges only its scope. The model preserves independently settled pool claims and existing neighbor cursors and checks current custody at fresh admission.
 [Study 67](67-full-admission/report.md) links fresh admission to the full recovered scope and current quorum and immutable input support. The stable-outage model shows why a one-AZ envelope must preserve its remaining allowance while degraded.
-[Study 68](68-core-reference/report.md) projects every funded chosen command to the original logical kernel and checks the writer and replay programs with five constructive weakening cases.
+[Study 68](68-core-reference/report.md) projects every funded chosen command to the original logical kernel and checks the writer and replay programs with six constructive weakening cases.
 [Study 69](69-retained-receipts/report.md) carries exact lost append results through either certified receipt basis and the exact funded activation. The receipt predicate checks the retained committed range and does not append.
 [Study 70](70-distributed-preparation/report.md) derives the exact source seal from paid allocations and their certified local receipts, then executes the funded successor and retained result program.
 It also checks abort racing delayed preparation under finite fairness.
