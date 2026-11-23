@@ -221,7 +221,6 @@ pub enum Command {
         nonce: NonZeroU64,
     },
     PrepareCheckpoint {
-        grant: Grant,
         preparation: CheckpointPreparation,
     },
     CloseCheckpoint {
@@ -239,12 +238,10 @@ pub enum Command {
     },
     /// The custodian attests the exact reconstructable root and manifest.
     Publish {
-        grant: Grant,
         checkpoint: Checkpoint,
     },
     /// Install the custodian's next funded allocation in journal order.
     FundWindow {
-        grant: Grant,
         window: Window,
     },
     Protect {
@@ -270,7 +267,7 @@ pub enum Command {
         hold: Hold,
     },
     Trim {
-        grant: Grant,
+        selected: Checkpoint,
         through: Cut,
     },
 }
@@ -292,6 +289,16 @@ pub struct AppendResult {
     pub window: Window,
     pub byte_start: u64,
     pub byte_end: u64,
+}
+
+/// The exact logical range released by the chosen trim. Physical reuse
+/// remains the media owner's responsibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrimResult {
+    pub from: Cut,
+    pub through: Cut,
+    pub ordinary_bytes: u64,
+    pub maintenance_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -319,7 +326,7 @@ pub enum Outcome {
     Released,
     Vacated,
     CohortSealed(Fingerprint),
-    Trimmed(Cut),
+    Trimmed(TrimResult),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1001,8 +1008,8 @@ impl State {
                 self.read_floor = nonce.get();
                 Ok(Outcome::ReadAbandoned)
             }
-            Command::PrepareCheckpoint { grant, preparation } => {
-                self.custodian(principal, grant)?;
+            Command::PrepareCheckpoint { preparation } => {
+                Self::custodian(principal)?;
                 if let Some(pending) = self.preparing {
                     return if pending == preparation {
                         Ok(Outcome::CheckpointPrepared(pending))
@@ -1012,7 +1019,6 @@ impl State {
                 }
                 if preparation.checkpoint.next_lsn <= self.checkpoint.cut.next_lsn
                     || self.cut(preparation.checkpoint.next_lsn) != Some(preparation.checkpoint)
-                    || preparation.source != grant
                     || preparation.custody.allocation.is_nil()
                     || preparation.custody.provider == [0; 32]
                     || Some(preparation.custody.revision)
@@ -1030,8 +1036,8 @@ impl State {
                 self.preparing = Some(preparation);
                 Ok(Outcome::CheckpointPrepared(preparation))
             }
-            Command::Publish { grant, checkpoint } => {
-                self.custodian(principal, grant)?;
+            Command::Publish { checkpoint } => {
+                Self::custodian(principal)?;
                 if checkpoint == self.checkpoint {
                     return Ok(Outcome::Published(checkpoint));
                 }
@@ -1126,8 +1132,8 @@ impl State {
                 }
                 Ok(Outcome::WorkerDisposed(enrollment))
             }
-            Command::FundWindow { grant, window } => {
-                self.custodian(principal, grant)?;
+            Command::FundWindow { window } => {
+                Self::custodian(principal)?;
                 if window.allocation.is_nil()
                     || window.bytes == 0
                     || Some(window.serial) != self.window.serial.checked_add(1)
@@ -1223,9 +1229,12 @@ impl State {
                 self.holds.remove(&hold.id);
                 Ok(Outcome::Released)
             }
-            Command::Trim { grant, through } => {
-                self.writer(principal, grant)?;
-                if through.next_lsn > self.checkpoint.cut.next_lsn
+            Command::Trim { selected, through } => {
+                Self::custodian(principal)?;
+                if selected != self.checkpoint {
+                    return Err(Refusal::Stale);
+                }
+                if through.next_lsn > selected.cut.next_lsn
                     || self.cut(through.next_lsn) != Some(through)
                 {
                     return Err(Refusal::Invalid);
@@ -1241,15 +1250,23 @@ impl State {
                 }
                 let trim = usize::try_from(through.next_lsn - self.floor.next_lsn)
                     .map_err(|_| Refusal::Invalid)?;
+                let mut result = TrimResult {
+                    from: self.floor,
+                    through,
+                    ordinary_bytes: 0,
+                    maintenance_bytes: 0,
+                };
                 for record in self.records.drain(..trim) {
                     let charge = record.result.byte_end - record.result.byte_start;
                     match record.result.class {
-                        AppendClass::Data => self.retained_bytes -= charge,
-                        AppendClass::Maintenance => self.maintenance_retained -= charge,
+                        AppendClass::Data => result.ordinary_bytes += charge,
+                        AppendClass::Maintenance => result.maintenance_bytes += charge,
                     }
                 }
+                self.retained_bytes -= result.ordinary_bytes;
+                self.maintenance_retained -= result.maintenance_bytes;
                 self.floor = through;
-                Ok(Outcome::Trimmed(through))
+                Ok(Outcome::Trimmed(result))
             }
         }
     }
@@ -1286,14 +1303,12 @@ impl State {
             .copied()
     }
 
-    fn custodian(&self, principal: Principal, grant: Grant) -> Result<(), Refusal> {
-        if principal != Principal::Custodian {
-            return Err(Refusal::Unauthorized);
+    fn custodian(principal: Principal) -> Result<(), Refusal> {
+        if principal == Principal::Custodian {
+            Ok(())
+        } else {
+            Err(Refusal::Unauthorized)
         }
-        if self.grant != Some(grant) {
-            return Err(Refusal::Stale);
-        }
-        Ok(())
     }
 }
 

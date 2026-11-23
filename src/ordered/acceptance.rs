@@ -180,32 +180,30 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
         apply(
             &mut state,
             Principal::Custodian,
-            Command::PrepareCheckpoint {
-                grant: successor,
-                preparation,
-            }
+            Command::PrepareCheckpoint { preparation }
         )
         .outcome,
         Ok(Outcome::CheckpointPrepared(_))
     ));
     assert_eq!(
+        apply(&mut state, worker, Command::Vacate { grant: successor }).outcome,
+        Ok(Outcome::Vacated)
+    );
+    assert_eq!(
         apply(
             &mut state,
             Principal::Custodian,
-            Command::Publish {
-                grant: successor,
-                checkpoint
-            }
+            Command::Publish { checkpoint }
         )
         .outcome,
         Ok(Outcome::Published(checkpoint))
     );
     let trim = Command::Trim {
-        grant: successor,
+        selected: checkpoint,
         through: checkpoint.cut,
     };
     assert_eq!(
-        apply(&mut state, worker, trim.clone()).outcome,
+        apply(&mut state, Principal::Custodian, trim.clone()).outcome,
         Err(Refusal::Unavailable)
     );
     for hold in [first_start, startup, read] {
@@ -220,8 +218,13 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
         );
     }
     assert_eq!(
-        apply(&mut state, worker, trim).outcome,
-        Ok(Outcome::Trimmed(checkpoint.cut))
+        apply(&mut state, Principal::Custodian, trim).outcome,
+        Ok(Outcome::Trimmed(TrimResult {
+            from: initial.floor,
+            through: checkpoint.cut,
+            ordinary_bytes: charge,
+            maintenance_bytes: 2 * charge,
+        }))
     );
 
     let image = state.encode_base();
@@ -239,16 +242,27 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
         apply(
             &mut recovered,
             Principal::Custodian,
-            Command::FundWindow {
-                grant: successor,
-                window
-            }
+            Command::FundWindow { window }
         )
         .outcome,
         Ok(Outcome::WindowFunded(window))
     );
+    assert!(recovered.writer_state().grant.is_none());
+    let (renewed, _) = grant(&mut recovered, second);
+    let next = recovered.head.next_lsn;
     assert!(matches!(
-        append(&mut recovered, AppendClass::Data),
+        apply(
+            &mut recovered,
+            worker,
+            Command::Append {
+                class: AppendClass::Data,
+                grant: renewed,
+                expected_next: next,
+                timestamp: 3,
+                payload: Bytes::from_static(b"n"),
+            }
+        )
+        .outcome,
         Ok(Outcome::Appended(_))
     ));
 }

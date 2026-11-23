@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use logkeeper::ordered::TrimResult;
 use logkeeper::ordered::replication::transport::{Connector, RemoteVoter, serve_voter};
 use logkeeper::ordered::replication::{DurableVoter, Error, Group, Replica};
 use logkeeper::ordered::service::{Coordinator, Session, wire};
@@ -321,10 +322,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             11,
             request(
                 Principal::Custodian,
-                Command::PrepareCheckpoint {
-                    grant: second_grant,
-                    preparation,
-                },
+                Command::PrepareCheckpoint { preparation },
             ),
         )
         .await
@@ -340,7 +338,6 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             request(
                 Principal::Custodian,
                 Command::Publish {
-                    grant: second_grant,
                     checkpoint: published,
                 },
             ),
@@ -353,9 +350,9 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     );
     let trim = || {
         request(
-            worker,
+            Principal::Custodian,
             Command::Trim {
-                grant: second_grant,
+                selected: published,
                 through: published.cut,
             },
         )
@@ -380,7 +377,13 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let trimmed = group.choose(&peers, 17, trim()).await.unwrap();
     assert_eq!(
         trimmed.receipt().outcome,
-        Ok(Outcome::Trimmed(published.cut))
+        Ok(Outcome::Trimmed(TrimResult {
+            from: seed.cut,
+            through: published.cut,
+            ordinary_bytes: (original.byte_end - original.byte_start)
+                + (next.byte_end - next.byte_start),
+            maintenance_bytes: 0,
+        }))
     );
     assert_eq!(trimmed.state().reconcile_append(&append), Ok(original));
     assert!(matches!(
@@ -460,7 +463,6 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             request(
                 worker,
                 Command::Publish {
-                    grant: second_grant,
                     checkpoint: published,
                 },
             ),
@@ -481,7 +483,6 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             request(
                 Principal::Custodian,
                 Command::FundWindow {
-                    grant: second_grant,
                     window: next_window,
                 },
             ),
@@ -534,7 +535,6 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let forged = request(
         Principal::Custodian,
         Command::Publish {
-            grant: second_grant,
             checkpoint: published,
         },
     );

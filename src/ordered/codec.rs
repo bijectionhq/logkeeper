@@ -10,7 +10,7 @@ use uuid::Uuid;
 mod service;
 mod snapshot;
 
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR01";
 
 impl Request {
@@ -72,12 +72,8 @@ impl Request {
                 grant(&mut output, *writer);
                 output.put_u64(nonce.get());
             }
-            Command::PrepareCheckpoint {
-                grant: writer,
-                preparation,
-            } => {
+            Command::PrepareCheckpoint { preparation } => {
                 output.put_u8(15);
-                grant(&mut output, *writer);
                 checkpoint_preparation(&mut output, *preparation);
             }
             Command::CloseCheckpoint { checkpoint: root } => {
@@ -101,35 +97,26 @@ impl Request {
                 output.put_slice(disposition);
             }
             Command::Publish {
-                grant: writer,
                 checkpoint: offered,
             } => {
                 output.put_u8(5);
-                grant(&mut output, *writer);
                 checkpoint(&mut output, *offered);
             }
-            Command::FundWindow {
-                grant: writer,
-                window: allocation,
-            } => {
+            Command::FundWindow { window: allocation } => {
                 output.put_u8(10);
-                grant(&mut output, *writer);
                 window(&mut output, *allocation);
             }
             Command::Protect {
                 grant: writer,
                 through,
-            }
-            | Command::Trim {
-                grant: writer,
-                through,
             } => {
-                output.put_u8(if matches!(&self.command, Command::Protect { .. }) {
-                    6
-                } else {
-                    8
-                });
+                output.put_u8(6);
                 grant(&mut output, *writer);
+                cut(&mut output, *through);
+            }
+            Command::Trim { selected, through } => {
+                output.put_u8(8);
+                checkpoint(&mut output, *selected);
                 cut(&mut output, *through);
             }
             Command::Release { hold } => {
@@ -200,7 +187,6 @@ impl Request {
                 nonce: input.nonce()?,
             },
             5 => Command::Publish {
-                grant: input.grant()?,
                 checkpoint: input.checkpoint()?,
             },
             6 => Command::Protect {
@@ -211,7 +197,7 @@ impl Request {
                 hold: input.hold()?,
             },
             8 => Command::Trim {
-                grant: input.grant()?,
+                selected: input.checkpoint()?,
                 through: input.cut()?,
             },
             9 => Command::AbandonRead {
@@ -219,7 +205,6 @@ impl Request {
                 nonce: input.nonce()?,
             },
             10 => Command::FundWindow {
-                grant: input.grant()?,
                 window: input.window()?,
             },
             11 => Command::ProtectRange {
@@ -238,7 +223,6 @@ impl Request {
                 successor: input.take()?,
             },
             15 => Command::PrepareCheckpoint {
-                grant: input.grant()?,
                 preparation: input.checkpoint_preparation()?,
             },
             16 => Command::CloseCheckpoint {

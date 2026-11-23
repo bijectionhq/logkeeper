@@ -226,14 +226,9 @@ impl<R: Replica> Coordinator<R> {
 
     /// Selects a prospective checkpoint cut for the current custodian.
     /// PrepareCheckpoint rechecks this selection before any provider effect.
-    pub async fn checkpoint_cut(
-        &self,
-        session: Session,
-        grant: Grant,
-        next: u64,
-    ) -> Result<Cut, Error> {
+    pub async fn checkpoint_cut(&self, session: Session, next: u64) -> Result<Cut, Error> {
+        State::custodian(session.principal)?;
         let state = self.recover(session).await?;
-        state.custodian(session.principal, grant)?;
         if next <= state.checkpoint.cut.next_lsn {
             return Err(Refusal::Stale.into());
         }

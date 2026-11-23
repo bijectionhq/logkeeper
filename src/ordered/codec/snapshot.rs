@@ -10,7 +10,9 @@ use crate::ordered::{
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::BTreeSet;
 
-const MAGIC: &[u8; 8] = b"LKBASE02";
+use crate::ordered::TrimResult;
+
+const MAGIC: &[u8; 8] = b"LKBASE03";
 
 impl super::super::Limits {
     pub(in crate::ordered) fn base_control_bytes(self) -> Option<usize> {
@@ -509,7 +511,12 @@ impl Input {
             5 => Outcome::Published(self.checkpoint()?),
             6 => Outcome::Protected(self.hold()?),
             7 => Outcome::Released,
-            8 => Outcome::Trimmed(self.cut()?),
+            8 => Outcome::Trimmed(TrimResult {
+                from: self.cut()?,
+                through: self.cut()?,
+                ordinary_bytes: self.u64()?,
+                maintenance_bytes: self.u64()?,
+            }),
             9 => Outcome::ReadAbandoned,
             10 => Outcome::WindowFunded(self.window()?),
             11 => Outcome::Vacated,
@@ -591,9 +598,12 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
             hold_row(output, hold);
         }
         Ok(Outcome::Released) => output.put_u8(7),
-        Ok(Outcome::Trimmed(through)) => {
+        Ok(Outcome::Trimmed(result)) => {
             output.put_u8(8);
-            cut(output, through);
+            cut(output, result.from);
+            cut(output, result.through);
+            output.put_u64(result.ordinary_bytes);
+            output.put_u64(result.maintenance_bytes);
         }
         Ok(Outcome::ReadAbandoned) => output.put_u8(9),
         Ok(Outcome::WindowFunded(allocation)) => {

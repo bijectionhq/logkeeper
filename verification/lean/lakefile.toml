@@ -1,0 +1,5 @@
+name = "logkeeper"
+defaultTargets = ["Logkeeper"]
+
+[[lean_lib]]
+name = "Logkeeper"

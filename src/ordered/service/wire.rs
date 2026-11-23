@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-const MAGIC: &[u8; 8] = b"LKAPPC02";
+const MAGIC: &[u8; 8] = b"LKAPPC03";
 const REPLAY_OVERHEAD: usize = 1 + 160 + 40 + 8;
 
 #[derive(Clone)]
@@ -35,7 +35,6 @@ pub enum Operation {
         hold: Hold,
     },
     CheckpointCut {
-        grant: Grant,
         next: u64,
     },
 }
@@ -161,8 +160,8 @@ pub async fn serve<R: Replica>(
                 .replay_head(session, hold, from)
                 .await
                 .map(Reply::ReplayHead),
-            Operation::CheckpointCut { grant, next } => coordinator
-                .checkpoint_cut(session, grant, next)
+            Operation::CheckpointCut { next } => coordinator
+                .checkpoint_cut(session, next)
                 .await
                 .map(Reply::CheckpointCut),
             Operation::Release { hold } => coordinator

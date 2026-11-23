@@ -40,12 +40,8 @@ impl Operation {
                 cut(&mut output, *from);
                 output.put_u64(*maximum_bytes);
             }
-            Self::CheckpointCut {
-                grant: writer,
-                next,
-            } => {
+            Self::CheckpointCut { next } => {
                 output.put_u8(6);
-                grant(&mut output, *writer);
                 output.put_u64(*next);
             }
             Self::Release { hold } => {
@@ -83,10 +79,7 @@ impl Operation {
             5 => Self::Release {
                 hold: input.hold()?,
             },
-            6 => Self::CheckpointCut {
-                grant: input.grant()?,
-                next: input.u64()?,
-            },
+            6 => Self::CheckpointCut { next: input.u64()? },
             _ => return Err(Refusal::Invalid),
         };
         input.finish((placement, operation))
