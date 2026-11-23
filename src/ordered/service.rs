@@ -5,8 +5,8 @@
 //! handing a request to this service.
 
 use super::{
-    AppendResult, BarrierClaim, Checkpoint, Cut, Fingerprint, Grant, Hold, Placement, Principal,
-    Receipt, Record, Refusal, Request, State, Window, WriterState,
+    AppendResult, BarrierClaim, Checkpoint, Command, Cut, Fingerprint, Grant, Hold, Outcome,
+    Placement, Principal, Receipt, Record, Refusal, Request, RequestId, State, Window, WriterState,
     replication::{self, Group, Replica},
 };
 use std::future::Future;
@@ -43,6 +43,8 @@ pub struct Route {
     pub floor: Cut,
     pub checkpoint: Checkpoint,
     pub window: Window,
+    pub window_spent: u64,
+    pub reusable_bytes: u64,
     pub retry_positions: u64,
 }
 
@@ -97,6 +99,49 @@ impl<R: Replica> Coordinator<R> {
         }
     }
 
+    #[cfg(feature = "ordered-daemon")]
+    pub(in crate::ordered) async fn seal_for_repair(
+        &self,
+        destination: &Group,
+    ) -> Result<replication::RepairSeed, Error> {
+        if destination.placement() != self.group.placement()
+            || destination.predecessor() != Some(self.group.identity())
+        {
+            return Err(replication::Error::Group.into());
+        }
+        let state = self
+            .ordered(|round| self.group.recover(&self.peers, round))
+            .await?;
+        if state.successor.is_none() {
+            let expires_at = state
+                .position()
+                .checked_add(state.limits.retry_positions)
+                .ok_or(Refusal::Capacity)?;
+            let request = Request {
+                placement: state.placement(),
+                principal: Principal::Administrator,
+                id: RequestId {
+                    nonce: uuid::Uuid::new_v4(),
+                    expires_at,
+                },
+                command: Command::SealCohort {
+                    expected: self.group.identity(),
+                    successor: destination.identity(),
+                },
+            };
+            let chosen = self
+                .ordered(|round| self.group.choose(&self.peers, round, request.clone()))
+                .await?;
+            match chosen.receipt().outcome {
+                Ok(Outcome::CohortSealed(exact)) if exact == destination.identity() => {}
+                Err(reason) => return Err(reason.into()),
+                _ => return Err(replication::Error::Group.into()),
+            }
+        }
+        self.ordered(|round| self.group.repair_seed(&self.peers, round, destination))
+            .await
+    }
+
     /// Returns the current writer binding and exact recovery coordinates
     /// from the installed group. Routing callers can treat discovery as a hint.
     pub async fn route(&self, session: Session) -> Result<Route, Error> {
@@ -115,6 +160,8 @@ impl<R: Replica> Coordinator<R> {
             floor: state.floor(),
             checkpoint: state.checkpoint(),
             window: state.window(),
+            window_spent: state.spent_bytes(),
+            reusable_bytes: state.limits.retained_data_bytes - state.retained_bytes,
             retry_positions: state.limits.retry_positions,
         })
     }
@@ -123,6 +170,7 @@ impl<R: Replica> Coordinator<R> {
     pub async fn execute(&self, session: Session, request: Request) -> Result<Decision, Error> {
         self.admit(session)?;
         if session.principal == Principal::RouteReader
+            || matches!(&request.command, Command::SealCohort { .. })
             || request.placement != session.placement
             || request.principal != session.principal
         {
@@ -131,6 +179,14 @@ impl<R: Replica> Coordinator<R> {
         let chosen = self
             .ordered(|round| self.group.choose(&self.peers, round, request.clone()))
             .await?;
+        if chosen.state().successor.is_some()
+            && !matches!(
+                chosen.receipt().outcome,
+                Ok(super::Outcome::CohortSealed(_))
+            )
+        {
+            return Err(Refusal::CohortSealed.into());
+        }
         Ok(Decision {
             receipt: chosen.receipt(),
             barrier: chosen.barrier_claim(),
@@ -210,8 +266,13 @@ impl<R: Replica> Coordinator<R> {
 
     async fn recover(&self, session: Session) -> Result<State, Error> {
         self.admit(session)?;
-        self.ordered(|round| self.group.recover(&self.peers, round))
-            .await
+        let state = self
+            .ordered(|round| self.group.recover(&self.peers, round))
+            .await?;
+        if state.successor.is_some() {
+            return Err(Refusal::CohortSealed.into());
+        }
+        Ok(state)
     }
 
     async fn ordered<T, F>(&self, mut attempt: impl FnMut(u64) -> F) -> Result<T, Error>

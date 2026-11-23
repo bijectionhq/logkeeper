@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 const USAGE: &str = "Usage: logkeeper <listen-address> <journal-directory> <journal-id>";
 
 #[cfg(feature = "ordered-daemon")]
-const USAGE: &str = "Usage: logkeeper <listen-address> <journal-directory> <journal-id>\n       logkeeper ordered <initialize|serve> <installed-manifest.json>";
+const USAGE: &str = "Usage: logkeeper <listen-address> <journal-directory> <journal-id>\n       logkeeper ordered <initialize|serve> <installed-manifest.json>\n       logkeeper ordered reserve-repair <target-manifest> <deployment-id> <ticket>\n       logkeeper ordered seal-repair <source-manifest> <target-group.json> <package> <ticket>...\n       logkeeper ordered install-repair <target-manifest> <deployment-id> <package>";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -65,11 +65,21 @@ async fn run_ordered(args: &[String]) -> Result<(), Box<dyn std::error::Error + 
     use logkeeper::ordered::daemon::Manifest;
     use std::path::Path;
 
-    let [_, mode, path] = args else { return Err(USAGE.into()); };
+    let [_, mode, path, rest @ ..] = args else { return Err(USAGE.into()); };
     let manifest = Manifest::read(Path::new(path))?;
-    match mode.as_str() {
-        "initialize" => manifest.initialize()?,
-        "serve" => {
+    match (mode.as_str(), rest) {
+        ("initialize", []) => manifest.initialize()?,
+        ("reserve-repair", [deployment, output]) => {
+            manifest.reserve_repair(deployment.parse()?, Path::new(output))?;
+        }
+        ("seal-repair", [destination, output, tickets @ ..]) => {
+            let tickets = tickets.iter().map(Path::new).collect::<Vec<_>>();
+            manifest.seal_repair(Path::new(destination), &tickets, Path::new(output)).await?;
+        }
+        ("install-repair", [deployment, package]) => {
+            manifest.install_repair(deployment.parse()?, Path::new(package))?;
+        }
+        ("serve", []) => {
             let cancellation = CancellationToken::new();
             let serving = manifest.run(cancellation.clone());
             tokio::pin!(serving);

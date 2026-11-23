@@ -123,6 +123,14 @@ impl Request {
                 output.put_u8(13);
                 grant(&mut output, *writer);
             }
+            Command::SealCohort {
+                expected,
+                successor,
+            } => {
+                output.put_u8(14);
+                output.put_slice(expected);
+                output.put_slice(successor);
+            }
         }
         output.freeze()
     }
@@ -192,6 +200,10 @@ impl Request {
             },
             13 => Command::Vacate {
                 grant: input.grant()?,
+            },
+            14 => Command::SealCohort {
+                expected: input.take()?,
+                successor: input.take()?,
             },
             _ => return Err(Refusal::Invalid),
         };

@@ -33,6 +33,11 @@ impl State {
         output.put_slice(MAGIC);
         output.put_u64(self.position);
         output.put_slice(&self.command_history);
+        output.put_slice(&self.voter_scope);
+        output.put_u8(u8::from(self.successor.is_some()));
+        if let Some(successor) = self.successor {
+            output.put_slice(&successor);
+        }
         writer_state(&mut output, self.writer_state());
         output.put_u64(self.enrollment_serial);
         output.put_u64(self.read_floor);
@@ -74,6 +79,8 @@ impl State {
         let mut state = initial.clone();
         state.position = input.u64()?;
         state.command_history = input.take()?;
+        state.voter_scope = input.take()?;
+        state.successor = input.optional(|input| input.take())?;
         let writer = input.writer_state()?;
         state.writer_epoch = writer.epoch;
         state.grant = writer.grant;
@@ -85,6 +92,10 @@ impl State {
         state.head = input.cut()?;
         state.checkpoint = input.checkpoint()?;
         if state.position == 0
+            || state.voter_scope != initial.voter_scope
+            || state
+                .successor
+                .is_some_and(|next| next == [0; 32] || next == state.voter_scope)
             || state.window.allocation.is_nil()
             || state.window.serial == 0
             || state.window.bytes == 0
@@ -369,6 +380,7 @@ impl Input {
             9 => Outcome::ReadAbandoned,
             10 => Outcome::WindowFunded(self.window()?),
             11 => Outcome::Vacated,
+            12 => Outcome::CohortSealed(self.take()?),
             32 => return Ok(Err(Refusal::WrongPlacement)),
             33 => return Ok(Err(Refusal::Unauthorized)),
             34 => return Ok(Err(Refusal::Stale)),
@@ -378,6 +390,7 @@ impl Input {
             38 => return Ok(Err(Refusal::Capacity)),
             39 => return Ok(Err(Refusal::Unavailable)),
             40 => return Ok(Err(Refusal::ReadPending)),
+            41 => return Ok(Err(Refusal::CohortSealed)),
             _ => return Err(Refusal::Invalid),
         }))
     }
@@ -450,6 +463,10 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
             window(output, allocation);
         }
         Ok(Outcome::Vacated) => output.put_u8(11),
+        Ok(Outcome::CohortSealed(successor)) => {
+            output.put_u8(12);
+            output.put_slice(&successor);
+        }
         Err(refusal) => output.put_u8(match refusal {
             Refusal::WrongPlacement => 32,
             Refusal::Unauthorized => 33,
@@ -460,6 +477,7 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
             Refusal::Capacity => 38,
             Refusal::Unavailable => 39,
             Refusal::ReadPending => 40,
+            Refusal::CohortSealed => 41,
         }),
     }
 }

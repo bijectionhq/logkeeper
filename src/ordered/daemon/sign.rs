@@ -23,7 +23,19 @@ impl Issuer {
     }
 
     pub(super) fn sign(&self, claim: BarrierClaim) -> io::Result<Signature> {
-        let signature = self.key.sign(&claim.encode());
+        self.sign_bytes(&claim.encode())
+    }
+
+    pub(super) fn public_key(&self) -> [u8; 32] {
+        self.key
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("Ed25519 public keys have 32 bytes")
+    }
+
+    pub(super) fn sign_bytes(&self, bytes: &[u8]) -> io::Result<Signature> {
+        let signature = self.key.sign(bytes);
         let proof = signature
             .as_ref()
             .try_into()
@@ -33,6 +45,12 @@ impl Issuer {
             proof,
         })
     }
+}
+
+pub(super) fn verify_bytes(public: &[u8; 32], body: &[u8], signature: &[u8]) -> io::Result<()> {
+    UnparsedPublicKey::new(&ED25519, public)
+        .verify(body, signature)
+        .map_err(|_| super::invalid("invalid installed-journal signature"))
 }
 
 /// Verification material installed independently of the route to a current
@@ -83,9 +101,7 @@ impl BarrierVerifier {
             .keys
             .get(&proof.signature.issuer)
             .ok_or_else(|| super::invalid("unrecognized read receipt key"))?;
-        UnparsedPublicKey::new(&ED25519, authority)
-            .verify(&claim.encode(), &proof.signature.proof)
-            .map_err(|_| super::invalid("invalid read receipt signature"))?;
+        verify_bytes(authority, &claim.encode(), &proof.signature.proof)?;
         Ok(claim)
     }
 }

@@ -74,20 +74,13 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         bytes: 4096,
     };
     let voter_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
-    let group = Group::new(
-        placement,
-        Limits {
-            enrolled_workers: 2,
-            replay_holds: 4,
-            retry_positions: 64,
-            retained_data_bytes: 8192,
-        },
-        seed,
-        window,
-        voter_ids,
-        1 << 20,
-    )
-    .unwrap();
+    let limits = Limits {
+        enrolled_workers: 2,
+        replay_holds: 4,
+        retry_positions: 64,
+        retained_data_bytes: 8192,
+    };
+    let group = Group::new(placement, limits, seed, window, voter_ids, 1 << 20).unwrap();
     let directories = std::array::from_fn::<_, 3, _>(|_| tempfile::tempdir().unwrap());
     let mut peers: Vec<_> = voter_ids
         .into_iter()
@@ -486,7 +479,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     assert_eq!(result.window, next_window);
     assert_eq!(result.byte_start, 0);
 
-    let coordinator = Coordinator::new(group, peers);
+    let coordinator = Coordinator::new(group.clone(), peers);
     let session = Session::authenticated(placement, worker);
     let route = application(&coordinator, placement, session, wire::Operation::Route).await;
     let wire::Reply::Route(route) = route else {
@@ -500,7 +493,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         session,
         wire::Operation::Reconcile {
             grant: second_grant,
-            original: newest,
+            original: newest.clone(),
         },
     )
     .await;
@@ -539,4 +532,70 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     assert!(
         matches!(historic, wire::Reply::Replay(page) if page.records.is_empty() && page.through == published.cut)
     );
+
+    let replacement_id = Uuid::new_v4();
+    let repaired = Group::new(
+        placement,
+        limits,
+        seed,
+        window,
+        [voter_ids[0], voter_ids[1], replacement_id],
+        1 << 20,
+    )
+    .unwrap()
+    .successor(group.identity())
+    .unwrap();
+    let new_media = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let surviving_ids = [voter_ids[1], replacement_id];
+    for (dir, voter) in new_media.iter().zip(surviving_ids) {
+        DurableVoter::reserve_repair(&repaired, voter, dir.path()).unwrap();
+        assert!(matches!(
+            DurableVoter::recover(repaired.clone(), voter, dir.path()),
+            Err(Error::Stopped)
+        ));
+    }
+
+    drop(coordinator);
+    let old_peers = reopen([0, 1]);
+    let seal = request(
+        Principal::Administrator,
+        Command::SealCohort {
+            expected: group.identity(),
+            successor: repaired.identity(),
+        },
+    );
+    let chosen = group.choose(&old_peers, 100, seal).await.unwrap();
+    assert_eq!(
+        chosen.receipt().outcome,
+        Ok(Outcome::CohortSealed(repaired.identity()))
+    );
+    let old_append = request(
+        worker,
+        Command::Append {
+            grant: second_grant,
+            expected_next: result.cut.next_lsn,
+            timestamp: 15,
+            payload: Bytes::from_static(b"old voter scope"),
+        },
+    );
+    assert!(matches!(
+        group.choose(&old_peers, 101, old_append).await,
+        Err(Error::Sealed)
+    ));
+
+    let inherited = group.repair_seed(&old_peers, 102, &repaired).await.unwrap();
+    let new_peers: Vec<_> = new_media
+        .iter()
+        .zip(surviving_ids)
+        .map(|(dir, voter)| {
+            DurableVoter::initialize_repaired(repaired.clone(), voter, dir.path(), &inherited)
+                .unwrap()
+        })
+        .collect();
+    let state = repaired.recover(&new_peers, 2).await.unwrap();
+    assert_eq!(state.writer_state().grant, Some(second_grant));
+    assert_eq!(state.head(), result.cut);
+    assert_eq!(state.window(), next_window);
+    assert_eq!(state.reconcile_append(&newest), Ok(result));
+    assert_eq!(state.command_history(), chosen.state().command_history());
 }

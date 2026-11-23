@@ -33,6 +33,46 @@ pub struct Group {
     initial: State,
     voters: BTreeSet<Uuid>,
     max_prefix_bytes: usize,
+    predecessor: Option<Fingerprint>,
+}
+
+pub struct RepairSeed {
+    predecessor: Fingerprint,
+    destination: Fingerprint,
+    base: Bytes,
+}
+
+impl RepairSeed {
+    pub(in crate::ordered) fn encode(&self) -> Bytes {
+        let mut bytes = BytesMut::with_capacity(72 + self.base.len());
+        bytes.put_slice(b"LKSEED01");
+        bytes.put_slice(&self.predecessor);
+        bytes.put_slice(&self.destination);
+        bytes.put_slice(&self.base);
+        bytes.freeze()
+    }
+
+    /// The installation boundary verifies the predecessor's signature before decoding.
+    pub(in crate::ordered) fn decode(mut bytes: Bytes) -> Result<Self, Error> {
+        if bytes.len() <= 72 || &bytes.split_to(8)[..] != b"LKSEED01" {
+            return Err(Error::Prefix);
+        }
+        let predecessor = bytes
+            .split_to(32)
+            .as_ref()
+            .try_into()
+            .map_err(|_| Error::Prefix)?;
+        let destination = bytes
+            .split_to(32)
+            .as_ref()
+            .try_into()
+            .map_err(|_| Error::Prefix)?;
+        Ok(Self {
+            predecessor,
+            destination,
+            base: bytes,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,11 +158,24 @@ pub enum Error {
     Diverged,
     #[error("the ordered voter has stopped accepting work")]
     Stopped,
+    #[error("the installed voter configuration was sealed for repair")]
+    Sealed,
     #[error("ordered journal I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
 
 impl Group {
+    #[cfg(feature = "ordered-daemon")]
+    pub(in crate::ordered) fn bind_voters(mut self, commitment: Fingerprint) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"logkeeper.ordered-voter-policy.v1");
+        hash.update(self.identity);
+        hash.update(commitment);
+        self.identity = hash.finalize().into();
+        self.initial.voter_scope = self.identity;
+        self
+    }
+
     pub fn new(
         placement: Placement,
         limits: Limits,
@@ -149,7 +202,7 @@ impl Group {
         if max_prefix_bytes < minimum {
             return Err(Refusal::Capacity);
         }
-        let initial = State::new(placement, limits, checkpoint, window)?;
+        let mut initial = State::new(placement, limits, checkpoint, window)?;
         let mut hash = Sha256::new();
         hash.update(b"logkeeper.ordered-group.v1");
         hash.update(placement.deployment.as_bytes());
@@ -181,12 +234,69 @@ impl Group {
         for voter in &roster {
             hash.update(voter.as_bytes());
         }
+        let identity = hash.finalize().into();
+        initial.voter_scope = identity;
         Ok(Self {
-            identity: hash.finalize().into(),
+            identity,
             initial,
             voters: roster,
             max_prefix_bytes,
+            predecessor: None,
         })
+    }
+
+    /// Names a physical successor without changing the logical placement.
+    pub fn successor(mut self, predecessor: Fingerprint) -> Result<Self, Refusal> {
+        if predecessor == [0; 32] || self.predecessor.is_some() {
+            return Err(Refusal::Invalid);
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"logkeeper.ordered-successor.v1");
+        hash.update(predecessor);
+        hash.update(self.identity);
+        self.identity = hash.finalize().into();
+        self.initial.voter_scope = self.identity;
+        self.predecessor = Some(predecessor);
+        Ok(self)
+    }
+
+    /// Captures the exact source selected by the old quorum's seal. The
+    /// successor retains the original placement, data, grants, and custody.
+    pub async fn repair_seed<R: Replica>(
+        &self,
+        peers: &[R],
+        round: u64,
+        destination: &Group,
+    ) -> Result<RepairSeed, Error> {
+        if destination.predecessor != Some(self.identity)
+            || destination.placement() != self.placement()
+        {
+            return Err(Error::Group);
+        }
+        let mut state = self.recover(peers, round).await?;
+        if state.successor != Some(destination.identity) {
+            return Err(Error::Sealed);
+        }
+        state.voter_scope = destination.identity;
+        state.successor = None;
+        let seed = RepairSeed {
+            predecessor: self.identity,
+            destination: destination.identity,
+            base: state.encode_base(),
+        };
+        destination.install_seed(&seed)?;
+        Ok(seed)
+    }
+
+    fn install_seed(&self, seed: &RepairSeed) -> Result<Prefix, Error> {
+        if self.predecessor != Some(seed.predecessor) || self.identity != seed.destination {
+            return Err(Error::Group);
+        }
+        let prefix = Prefix::from_base(seed.base.clone(), self.max_prefix_bytes)?;
+        if self.replay(&prefix)?.successor.is_some() {
+            return Err(Error::Sealed);
+        }
+        Ok(prefix)
     }
 
     pub fn identity(&self) -> Fingerprint {
@@ -194,6 +304,12 @@ impl Group {
     }
     pub fn placement(&self) -> Placement {
         self.initial.placement()
+    }
+    pub fn predecessor(&self) -> Option<Fingerprint> {
+        self.predecessor
+    }
+    pub fn maximum_prefix_bytes(&self) -> usize {
+        self.max_prefix_bytes
     }
     pub fn quorum(&self) -> usize {
         self.voters.len() / 2 + 1
@@ -207,7 +323,8 @@ impl Group {
             Some(base) => {
                 State::decode_base(&self.initial, base.clone()).map_err(|_| Error::Prefix)?
             }
-            None => self.initial.clone(),
+            None if self.predecessor.is_none() => self.initial.clone(),
+            None => return Err(Error::Prefix),
         };
         for frame in &prefix.frames {
             let request = Request::decode(frame.clone()).map_err(|_| Error::Prefix)?;
@@ -391,6 +508,9 @@ impl Group {
             // Re-accept this prefix before releasing its receipt.
             receipt
         } else {
+            if state.successor.is_some() {
+                return Err(Error::Sealed);
+            }
             let frame = request.encode();
             let position = state.position().checked_add(1).ok_or(Error::Capacity)?;
             let receipt = state.apply(position, request).map_err(|_| Error::Prefix)?;

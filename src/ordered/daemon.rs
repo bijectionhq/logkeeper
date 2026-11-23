@@ -1,6 +1,7 @@
 //! Installed-group daemon with separate mutually authenticated voter and
 //! application protocols.
 
+mod repair;
 mod sign;
 mod tls;
 
@@ -20,6 +21,7 @@ use crate::ordered::{
 };
 use crate::server::durability::sync_directory;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -63,6 +65,10 @@ pub struct InstalledGroup {
     pub maximum_application_frame: usize,
     pub voters: Vec<VoterRoute>,
     pub clients: Vec<ClientPin>,
+    #[serde(default)]
+    pub predecessor: Option<Fingerprint>,
+    #[serde(default)]
+    pub predecessor_keys: Vec<[u8; 32]>,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +77,7 @@ pub struct VoterRoute {
     pub voter: Uuid,
     pub zone: String,
     pub endpoint: Endpoint,
+    pub receipt_key: [u8; 32],
 }
 
 #[derive(Deserialize)]
@@ -117,6 +124,8 @@ struct GroupConfig {
     voters: BTreeSet<Fingerprint>,
     clients: BTreeMap<Fingerprint, Principal>,
     max_frame: usize,
+    receipt_keys: BTreeMap<Uuid, [u8; 32]>,
+    predecessor_keys: Vec<[u8; 32]>,
 }
 
 struct Admission {
@@ -144,19 +153,25 @@ impl InstalledGroup {
         let mut voters = BTreeSet::new();
         let mut zones = BTreeSet::new();
         let mut addresses = BTreeSet::new();
+        let mut receipt_keys = BTreeMap::new();
+        let mut unique_keys = BTreeSet::new();
+        let mut failure_zones = BTreeMap::new();
         for route in self.voters {
             if route.zone.is_empty()
-                || !zones.insert(route.zone)
+                || !zones.insert(route.zone.clone())
                 || !addresses.insert(route.endpoint.address)
                 || !voters.insert(route.endpoint.certificate)
+                || !unique_keys.insert(route.receipt_key)
                 || members.insert(route.voter, route.endpoint).is_some()
             {
                 return Err(invalid(
                     "ordered voters require distinct identities, routes, and zones",
                 ));
             }
+            receipt_keys.insert(route.voter, route.receipt_key);
+            failure_zones.insert(route.voter, route.zone);
         }
-        let group = Group::new(
+        let mut group = Group::new(
             self.placement,
             self.limits,
             self.initial_checkpoint,
@@ -165,6 +180,26 @@ impl InstalledGroup {
             self.maximum_prefix_bytes,
         )
         .map_err(|reason| invalid(format_args!("invalid journal group: {reason:?}")))?;
+        let mut anchor = Sha256::new();
+        for (voter, endpoint) in &members {
+            let zone = &failure_zones[voter];
+            anchor.update(voter.as_bytes());
+            anchor.update(endpoint.certificate);
+            anchor.update(receipt_keys[voter]);
+            anchor.update((zone.len() as u64).to_be_bytes());
+            anchor.update(zone.as_bytes());
+        }
+        group = group.bind_voters(anchor.finalize().into());
+        if let Some(predecessor) = self.predecessor {
+            if self.predecessor_keys.is_empty() {
+                return Err(invalid(
+                    "a successor requires its predecessor verification keys",
+                ));
+            }
+            group = group
+                .successor(predecessor)
+                .map_err(|reason| invalid(format_args!("invalid successor: {reason:?}")))?;
+        }
         let mut clients = BTreeMap::new();
         for peer in self.clients {
             let principal = Principal::from(peer.role);
@@ -183,6 +218,8 @@ impl InstalledGroup {
             voters,
             clients,
             max_frame: self.maximum_application_frame,
+            receipt_keys,
+            predecessor_keys: self.predecessor_keys,
         })
     }
 }
@@ -224,6 +261,12 @@ impl Manifest {
         let acceptor = manifest.credentials.server()?;
         let connector = manifest.credentials.client(VOTER)?;
         let issuer = Arc::new(sign::Issuer::load(&manifest.barrier_key)?);
+        if groups
+            .values()
+            .any(|config| config.receipt_keys.get(&manifest.voter) != Some(&issuer.public_key()))
+        {
+            return Err(invalid("the configured receipt signer is not the installed voter").into());
+        }
         let listen = manifest.listen;
         let admission = Arc::new(Admission::new(manifest.maximum_connections));
         let rooms = tokio::task::spawn_blocking(move || -> Result<_, Failure> {

@@ -65,4 +65,7 @@ To select a new slot the voter syncs its exact body before the generation header
 Reusing a slot clears residual bytes from its previous body.
 An installed voter needs a filesystem that honours file preallocation and the configured durability barriers.
 Ordered window renewal preserves historical window identities and installs a fresh byte cursor.
-The embedding service still needs physical capacity admission and repair of unavailable cohort members.
+Physical capacity is admitted before a voter can join.
+A repair reserves media with `reserve-repair`, orders the exact successor with `seal-repair` on an old coordinator, and consumes the signed package with `install-repair` on each prepared successor.
+The predecessor serves no fresh commands after choosing its seal.
+The successor preserves the original writer, retained receipts, checkpoint holds and paid append cursor.

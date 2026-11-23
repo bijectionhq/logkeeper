@@ -87,6 +87,8 @@ impl Reply {
                 cut(&mut output, route.floor);
                 checkpoint(&mut output, route.checkpoint);
                 window(&mut output, route.window);
+                output.put_u64(route.window_spent);
+                output.put_u64(route.reusable_bytes);
                 output.put_u64(route.retry_positions);
             }
             Self::Decision(decision) => {
@@ -146,6 +148,8 @@ impl Reply {
                 floor: input.cut()?,
                 checkpoint: input.checkpoint()?,
                 window: input.window()?,
+                window_spent: input.u64()?,
+                reusable_bytes: input.u64()?,
                 retry_positions: input.u64()?,
             }),
             1 => Self::Decision(input.decision()?),

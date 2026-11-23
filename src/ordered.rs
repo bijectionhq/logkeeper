@@ -188,6 +188,10 @@ pub enum Command {
     Vacate {
         grant: Grant,
     },
+    SealCohort {
+        expected: Fingerprint,
+        successor: Fingerprint,
+    },
     Release {
         hold: Hold,
     },
@@ -235,6 +239,7 @@ pub enum Outcome {
     Protected(Hold),
     Released,
     Vacated,
+    CohortSealed(Fingerprint),
     Trimmed(Cut),
 }
 
@@ -249,6 +254,7 @@ pub enum Refusal {
     Capacity,
     Unavailable,
     ReadPending,
+    CohortSealed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,6 +368,8 @@ pub struct State {
     limits: Limits,
     position: u64,
     command_history: Fingerprint,
+    voter_scope: Fingerprint,
+    successor: Option<Fingerprint>,
     writer_epoch: u64,
     enrollment_serial: u64,
     roster: BTreeMap<Uuid, Enrollment>,
@@ -409,6 +417,8 @@ impl State {
             limits,
             position: 0,
             command_history: [0; 32],
+            voter_scope: [0; 32],
+            successor: None,
             writer_epoch: 0,
             enrollment_serial: 0,
             roster: BTreeMap::new(),
@@ -577,6 +587,9 @@ impl State {
         }
         if id.expires_at <= position {
             return Ok(receipt(Err(Refusal::Expired)));
+        }
+        if self.successor.is_some() {
+            return Ok(receipt(Err(Refusal::CohortSealed)));
         }
         if id.expires_at - position > self.limits.retry_positions {
             return Ok(receipt(Err(Refusal::Invalid)));
@@ -912,6 +925,19 @@ impl State {
                 self.writer(principal, grant)?;
                 self.grant = None;
                 Ok(Outcome::Vacated)
+            }
+            Command::SealCohort {
+                expected,
+                successor,
+            } => {
+                if principal != Principal::Administrator {
+                    return Err(Refusal::Unauthorized);
+                }
+                if expected != self.voter_scope || successor == [0; 32] || successor == expected {
+                    return Err(Refusal::Invalid);
+                }
+                self.successor = Some(successor);
+                Ok(Outcome::CohortSealed(successor))
             }
             Command::Release { hold } => {
                 if principal != Principal::Worker(hold.owner) {

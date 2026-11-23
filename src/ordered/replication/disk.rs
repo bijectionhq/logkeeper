@@ -1,4 +1,6 @@
-use super::{Accepted, Ballot, Error, Fingerprint, Group, Prefix, Promise, Replica, Vote};
+use super::{
+    Accepted, Ballot, Error, Fingerprint, Group, Prefix, Promise, RepairSeed, Replica, Vote,
+};
 use crate::server::durability::sync_directory;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fs2::FileExt;
@@ -13,6 +15,7 @@ use uuid::Uuid;
 const MAGIC: &[u8; 8] = b"LKORV003";
 const SLOTS: [&str; 2] = ["ordered.slot-a", "ordered.slot-b"];
 const LOCK: &str = "ordered.lock";
+const RESERVATION: &str = "ordered.reserve";
 const MAX_HEADER_BYTES: usize = 256;
 const HEADER: usize = 8 + 32 + 16 + 8 + 8 + 32;
 
@@ -47,6 +50,12 @@ struct VoterState {
 }
 
 impl DurableVoter {
+    pub fn reserved_bytes(group: &Group) -> Result<u64, Error> {
+        (slot_size(group)? as u64)
+            .checked_mul(2)
+            .ok_or(Error::Capacity)
+    }
+
     pub(super) fn group(&self) -> Fingerprint {
         self.inner.group.identity
     }
@@ -57,82 +66,136 @@ impl DurableVoter {
 
     /// Creates the initial empty decision record in a provisioned directory.
     pub fn initialize(group: Group, identity: Uuid, directory: &Path) -> Result<Self, Error> {
-        Self::open(group, identity, directory, true)
+        if group.predecessor.is_some() {
+            return Err(Error::Group);
+        }
+        Self::open(
+            group,
+            identity,
+            directory,
+            Some(VoterState::default()),
+            true,
+        )
+    }
+
+    /// Reserves both successor slots without creating an eligible voter.
+    pub fn reserve_repair(group: &Group, identity: Uuid, directory: &Path) -> Result<u64, Error> {
+        if group.predecessor.is_none() || !group.voters.contains(&identity) {
+            return Err(Error::Group);
+        }
+        let lock = lock(directory)?;
+        let size = slot_size(group)?;
+        if directory.join(RESERVATION).try_exists()? {
+            let _slots = slots(directory, size, false)?;
+            let _ticket = read_reservation(directory, group, identity, size)?;
+            return Self::reserved_bytes(group);
+        }
+        let _slots = slots(directory, size, true)?;
+        let mut ticket = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(directory.join(RESERVATION))?;
+        ticket.write_all(&reservation(group, identity, size))?;
+        ticket.write_all(&[0])?;
+        ticket.sync_all()?;
+        sync_directory(directory)?;
+        drop(lock);
+        Self::reserved_bytes(group)
+    }
+
+    /// Starts paid successor media with the exact image sealed by its predecessor.
+    pub fn initialize_repaired(
+        group: Group,
+        identity: Uuid,
+        directory: &Path,
+        seed: &RepairSeed,
+    ) -> Result<Self, Error> {
+        let prefix = group.install_seed(seed)?;
+        let ballot = Ballot {
+            round: 1,
+            nonce: Uuid::from_u128(1),
+        };
+        Self::open(
+            group,
+            identity,
+            directory,
+            Some(VoterState {
+                promised: Some(ballot),
+                accepted: Some(Accepted { ballot, prefix }),
+            }),
+            false,
+        )
     }
 
     /// Recovers the original journal record. Missing media gives no vote.
     pub fn recover(group: Group, identity: Uuid, directory: &Path) -> Result<Self, Error> {
-        Self::open(group, identity, directory, false)
+        Self::open(group, identity, directory, None, false)
     }
 
     fn open(
         group: Group,
         identity: Uuid,
         directory: &Path,
-        initialize: bool,
+        bootstrap: Option<VoterState>,
+        create: bool,
     ) -> Result<Self, Error> {
         if !group.voters.contains(&identity) {
             return Err(Error::Group);
         }
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(directory.join(LOCK))?;
-        FileExt::try_lock_exclusive(&lock)?;
-        let size = group
-            .max_prefix_bytes
-            .checked_add(MAX_HEADER_BYTES)
-            .ok_or(Error::Capacity)?;
-        let open = |name| -> Result<File, Error> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(initialize)
-                .open(directory.join(name))?;
-            if initialize {
-                FileExt::allocate(&file, size as u64)?;
-                file.sync_all()?;
-            }
-            if file.metadata()?.len() != size as u64 {
+        let lock = lock(directory)?;
+        let size = slot_size(&group)?;
+        let ticket = group
+            .predecessor
+            .map(|_| read_reservation(directory, &group, identity, size))
+            .transpose()?;
+        if bootstrap.is_none() && ticket.as_ref().is_some_and(|(_, installed)| !installed) {
+            return Err(Error::Stopped);
+        }
+        let mut slots = slots(directory, size, create)?;
+        let mut used = [0; 2];
+        let recovered = if create {
+            None
+        } else {
+            recover_media(&mut slots, &mut used, &group, identity, size)?
+        };
+        let selected = if let Some(known) = recovered {
+            if let Some(expected) = bootstrap
+                && (known.state.promised != expected.promised
+                    || known.state.accepted.as_ref().map(|vote| &vote.prefix)
+                        != expected.accepted.as_ref().map(|vote| &vote.prefix))
+            {
                 return Err(Error::Group);
             }
-            Ok(file)
-        };
-        let mut slots = [open(SLOTS[0])?, open(SLOTS[1])?];
-        let mut used = [0; 2];
-        let selected = if initialize {
+            known
+        } else if let Some(state) = bootstrap {
+            if ticket.as_ref().is_some_and(|(_, installed)| *installed) {
+                return Err(Error::Stopped);
+            }
             let selected = Selected {
                 index: 0,
                 generation: 1,
-                state: VoterState::default(),
+                state,
             };
-            used[0] = persist(&mut slots[0], group.identity, identity, &selected, 0, size)?;
-            sync_directory(directory)?;
+            used[0] = persist(
+                &mut slots[0],
+                group.identity,
+                identity,
+                &selected,
+                used[0],
+                size,
+            )?;
+            if create {
+                sync_directory(directory)?;
+            }
             selected
         } else {
-            let mut recovered: Option<Selected> = None;
-            for (index, file) in slots.iter_mut().enumerate() {
-                let (written, candidate) = recover_slot(file, index, &group, identity, size)?;
-                used[index] = written;
-                if let Some(candidate) = candidate {
-                    if recovered
-                        .as_ref()
-                        .is_some_and(|chosen| chosen.generation == candidate.generation)
-                    {
-                        return Err(Error::Diverged);
-                    }
-                    if recovered
-                        .as_ref()
-                        .is_none_or(|chosen| chosen.generation < candidate.generation)
-                    {
-                        recovered = Some(candidate);
-                    }
-                }
-            }
-            recovered.ok_or(Error::Prefix)?
+            return Err(Error::Prefix);
         };
+        if let Some((mut ticket, false)) = ticket {
+            ticket.seek(SeekFrom::Start(32))?;
+            ticket.write_all(&[1])?;
+            ticket.sync_all()?;
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 group,
@@ -146,6 +209,102 @@ impl DurableVoter {
             }),
         })
     }
+}
+
+fn lock(directory: &Path) -> Result<File, Error> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(LOCK))?;
+    FileExt::try_lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
+fn slot_size(group: &Group) -> Result<usize, Error> {
+    group
+        .max_prefix_bytes
+        .checked_add(MAX_HEADER_BYTES)
+        .ok_or(Error::Capacity)
+}
+
+fn slots(directory: &Path, size: usize, create: bool) -> Result<[File; 2], Error> {
+    let open = |name| -> Result<File, Error> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(create)
+            .open(directory.join(name))?;
+        if create {
+            FileExt::allocate(&file, size as u64)?;
+            file.sync_all()?;
+        }
+        if file.metadata()?.len() != size as u64 {
+            return Err(Error::Group);
+        }
+        Ok(file)
+    };
+    Ok([open(SLOTS[0])?, open(SLOTS[1])?])
+}
+
+fn reservation(group: &Group, identity: Uuid, size: usize) -> Fingerprint {
+    let mut hash = Sha256::new();
+    hash.update(b"logkeeper.repair-reservation.v1");
+    hash.update(group.identity);
+    hash.update(identity.as_bytes());
+    hash.update((size as u64).to_be_bytes());
+    hash.finalize().into()
+}
+
+fn read_reservation(
+    directory: &Path,
+    group: &Group,
+    identity: Uuid,
+    size: usize,
+) -> Result<(File, bool), Error> {
+    let mut ticket = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join(RESERVATION))?;
+    let mut stored = [0; 33];
+    ticket.read_exact(&mut stored)?;
+    if ticket.metadata()?.len() != 33
+        || stored[..32] != reservation(group, identity, size)
+        || stored[32] > 1
+    {
+        return Err(Error::Group);
+    }
+    Ok((ticket, stored[32] == 1))
+}
+
+fn recover_media(
+    slots: &mut [File; 2],
+    used: &mut [usize; 2],
+    group: &Group,
+    identity: Uuid,
+    size: usize,
+) -> Result<Option<Selected>, Error> {
+    let mut recovered: Option<Selected> = None;
+    for (index, file) in slots.iter_mut().enumerate() {
+        let (written, candidate) = recover_slot(file, index, group, identity, size)?;
+        used[index] = written;
+        if let Some(candidate) = candidate {
+            if recovered
+                .as_ref()
+                .is_some_and(|chosen| chosen.generation == candidate.generation)
+            {
+                return Err(Error::Diverged);
+            }
+            if recovered
+                .as_ref()
+                .is_none_or(|chosen| chosen.generation < candidate.generation)
+            {
+                recovered = Some(candidate);
+            }
+        }
+    }
+    Ok(recovered)
 }
 
 impl Replica for DurableVoter {
