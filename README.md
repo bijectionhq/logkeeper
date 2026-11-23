@@ -58,14 +58,22 @@ Initialize provisions a fresh voter directory once.
 Serve recovers only installed directories and accepts mutual TLS 1.3 using the endpoint certificate pins and roles in the installed manifest.
 Peer certificates used for voter traffic have no worker or custodian role in that group.
 Application clients retain the installed route and receipt verification keys independently of the serving daemon.
+Keep every previously trusted barrier receipt public key for the lifetime of the logical placement, including its incarnation and generation.
+Rotate signers through a cohort successor and distribute the updated trusted `ApplicationRoute.verification_keys` to clients before using its new signers.
+Set `predecessor_keys` from the immediate predecessor's active voter roster and carry older public keys in `retained_barrier_keys`.
+The seal checks that the successor carries the source's full verification set and that its repair keys come from the source's active roster.
+Use the same trusted destination manifest for the seal, reservation, installation, and route publication.
+Old public keys verify issued receipts offline. A verified receipt still needs a live hold and its protected basis to serve a read.
+Retire old private keys once their cohort and repair signing are finished. Retaining the public keys is sufficient for offline verification.
 
 The ordered implementation can compact an accepted prefix into a bounded recovery base.
 Provisioning reserves two durable slots per voter and group.
 To select a new slot the voter syncs its exact body before the generation header, leaving the prior selected slot intact until both steps finish.
+Recovery syncs the selected slot and its directory before admitting another rotation, including after a warm restart that observes a still-volatile header.
 Reusing a slot clears residual bytes from its previous body.
 An installed voter needs a filesystem that honours file preallocation and the configured durability barriers.
 Ordered window renewal preserves historical window identities and installs a fresh byte cursor.
-Physical capacity is admitted before a voter can join.
+Each new voter preallocates both files before joining. The volume owner funds their physical footprint, metadata and all co-resident allocations. See the [installation premises](verification/evidence.md#c9-installed-boundaries).
 A repair reserves media with `reserve-repair`, orders the exact successor with `seal-repair` on an old coordinator, and consumes the signed package with `install-repair` on each prepared successor.
 The predecessor serves no fresh commands after choosing its seal.
 The successor preserves the original writer, retained receipts, checkpoint holds and paid append cursor.

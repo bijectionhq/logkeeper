@@ -221,6 +221,8 @@ pub enum Command {
     CloseCheckpoint {
         checkpoint: Checkpoint,
     },
+    /// The authenticated custodian attests stable disposition of this exact
+    /// closed checkpoint and its provider effects.
     SettleCheckpoint {
         checkpoint: Checkpoint,
         disposition: Fingerprint,

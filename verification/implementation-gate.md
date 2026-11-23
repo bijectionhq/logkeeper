@@ -42,6 +42,12 @@ Exact provider import attestations, the complete control-image and frame encodin
 These steps provide the completion evidence from running code.
 RTDB's `LogService` contract in `allium/rtdb-multi.allium` covers epoch and position checks, distinct durable journals, and standalone process-bound transport.
 
+## Installed Logkeeper boundaries
+
+The [C9 evidence](evidence.md#c9-installed-boundaries) records the application frame and signer checks, the ordered voter recovery barriers, and the remaining provider and physical volume contracts.
+The remaining deployment qualification includes trustworthy manifest distribution, real failure-domain placement, and power-loss trials on the installed storage stack.
+Exact provider disposition and aggregate physical capacity require evidence from the provisioned providers and volumes.
+
 ## Current composition
 
 [Study 42](42-recovery-capacity/report.md) checks one full-pool handoff in a shared reference with ranked quorum recovery, exact stream replay, physical custody, and numeric residency and workspace.
@@ -94,12 +100,12 @@ The RTDB Multi authority transfer, direct certified route and checkpoint publica
 It proves joint withdrawal and grant fencing, matching by current enrollment, and authenticated retirement of a vacancy.
 [Study 78](78-sealed-worker-roster/report.md) binds the canonical roster and watermark to the chosen seal and requires the target install predicate to cover the same retained body.
 It checks the stale-roster and rolled-back-watermark failures under equal data frontiers.
-The actual eligibility and import attestations, authenticated wire framing, and transport still need refinement.
+The actual eligibility and import attestations and the complete transfer encoding still need refinement. The installed application framing and its transport trust boundary are recorded under C9.
 [Study 79](79-rtdb-failover/report.md) composes ranked reopen, exact retry, same-placement grant, fresh marker and prepaid append.
 The composed program runs under the stated authenticity, eligibility, custody and headroom premises.
 The bounded cases exercise all three single-AZ faults and preserve refusal when exact coverage is missing.
 [Study 80](80-applied-barrier-receipt/report.md) proves that a positive marker receipt names its actual chosen successful result, and that an issued reply can complete locally under scoped authentication and protected materialization.
-Real signing authority and verification evidence retention and rotation still need refinement.
+The installed signer and retained-key policy are recorded under C9. The protected RTDB materialization and deployment trust qualification remain open.
 [Study 81](81-recoverable-read-admission/report.md) proves exact reissue by authenticated invocation from the recovered bounded admission row and its paired hold.
 [Study 82](82-joint-read-recovery/report.md) checks the combined named read section, its ordered checkpoint and seal selection, original dependency coverage and target reissue.
 Refine the actual certifying source projection and the complete combined wire body, key and custody adapters, and physical endpoint stop.
