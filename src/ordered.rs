@@ -155,6 +155,24 @@ pub struct RequestId {
     pub expires_at: u64,
 }
 
+impl RequestId {
+    /// Allocates an invocation from an observed chosen position. The retry
+    /// horizon starts at the next possible decision slot.
+    pub fn fresh(position: u64, retry_positions: u64) -> Result<Self, Refusal> {
+        if retry_positions == 0 {
+            return Err(Refusal::Invalid);
+        }
+        let expires_at = position
+            .checked_add(1)
+            .and_then(|first| first.checked_add(retry_positions))
+            .ok_or(Refusal::Capacity)?;
+        Ok(Self {
+            nonce: Uuid::new_v4(),
+            expires_at,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Enroll {
