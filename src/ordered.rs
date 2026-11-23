@@ -5,6 +5,7 @@
 
 mod codec;
 pub mod replication;
+pub mod service;
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};

@@ -47,14 +47,8 @@ impl State {
             enrollment(&mut output, *member);
         }
         output.put_u64(self.records.len() as u64);
-        for record in &self.records {
-            append_result(&mut output, record.result);
-            grant(&mut output, record.grant);
-            output.put_i64(record.timestamp);
-            request_id(&mut output, record.request);
-            output.put_slice(&record.request_fingerprint);
-            output.put_u64(record.payload.len() as u64);
-            output.put_slice(&record.payload);
+        for entry in &self.records {
+            record(&mut output, entry);
         }
         output.put_u64(self.holds.len() as u64);
         for admission in self.holds.values() {
@@ -155,20 +149,23 @@ impl State {
         let mut previous_position = 0;
         let mut previous_window: Option<(Window, u64)> = None;
         for _ in 0..count {
-            let result = input.append_result()?;
-            let grant = input.grant()?;
-            let timestamp = i64::from_be_bytes(input.take()?);
-            let request = input.request_id()?;
-            let request_fingerprint = input.take()?;
-            let payload = input.payload()?;
+            let entry = input.record()?;
+            let Record {
+                result,
+                grant,
+                timestamp,
+                request,
+                request_fingerprint,
+                payload,
+            } = &entry;
             let original = Request {
                 placement: self.placement,
                 principal: Principal::Worker(grant.enrollment),
-                id: request,
+                id: *request,
                 command: Command::Append {
-                    grant,
+                    grant: *grant,
                     expected_next: result.lsn,
-                    timestamp,
+                    timestamp: *timestamp,
                     payload: payload.clone(),
                 },
             };
@@ -178,7 +175,7 @@ impl State {
                 || result.lsn != previous.next_lsn
                 || result.lsn.checked_add(1) != Some(result.cut.next_lsn)
                 || result.cut.history
-                    != append_fingerprint(previous, grant, request, timestamp, &payload)
+                    != append_fingerprint(previous, *grant, *request, *timestamp, payload)
                 || result.window.allocation.is_nil()
                 || result.window.serial == 0
                 || result.window.serial > self.window.serial
@@ -194,7 +191,7 @@ impl State {
                 })
                 || request.nonce.is_nil()
                 || request.expires_at <= result.position
-                || request_fingerprint != fingerprint(&original)
+                || *request_fingerprint != fingerprint(&original)
             {
                 return Err(Refusal::Invalid);
             }
@@ -205,14 +202,7 @@ impl State {
                 .retained_bytes
                 .checked_add(length.ok_or(Refusal::Invalid)?)
                 .ok_or(Refusal::Invalid)?;
-            self.records.push_back(Record {
-                result,
-                grant,
-                timestamp,
-                payload,
-                request,
-                request_fingerprint,
-            });
+            self.records.push_back(entry);
         }
         if previous != self.head
             || previous_window.is_some_and(|(window, end)| {
@@ -269,6 +259,7 @@ impl State {
                 || position > self.position
                 || position >= id.expires_at
                 || id.expires_at - position > self.limits.retry_positions
+                || outcome == Err(Refusal::ReadPending)
                 || self
                     .outcomes
                     .last_key_value()
@@ -321,7 +312,7 @@ impl State {
 }
 
 impl Input {
-    fn count(&mut self, maximum: usize) -> Result<usize, Refusal> {
+    pub(super) fn count(&mut self, maximum: usize) -> Result<usize, Refusal> {
         let count = usize::try_from(self.u64()?).map_err(|_| Refusal::Invalid)?;
         if count > maximum || count > self.0.len() {
             return Err(Refusal::Invalid);
@@ -329,12 +320,12 @@ impl Input {
         Ok(count)
     }
 
-    fn payload(&mut self) -> Result<Bytes, Refusal> {
+    pub(super) fn payload(&mut self) -> Result<Bytes, Refusal> {
         let length = self.count(usize::MAX)?;
         Ok(self.0.split_to(length))
     }
 
-    fn append_result(&mut self) -> Result<AppendResult, Refusal> {
+    pub(super) fn append_result(&mut self) -> Result<AppendResult, Refusal> {
         Ok(AppendResult {
             position: self.u64()?,
             lsn: self.u64()?,
@@ -345,7 +336,18 @@ impl Input {
         })
     }
 
-    fn result(&mut self) -> Result<Result<Outcome, Refusal>, Refusal> {
+    pub(super) fn record(&mut self) -> Result<Record, Refusal> {
+        Ok(Record {
+            result: self.append_result()?,
+            grant: self.grant()?,
+            timestamp: i64::from_be_bytes(self.take()?),
+            request: self.request_id()?,
+            request_fingerprint: self.take()?,
+            payload: self.payload()?,
+        })
+    }
+
+    pub(super) fn result(&mut self) -> Result<Result<Outcome, Refusal>, Refusal> {
         Ok(Ok(match self.read_byte()? {
             0 => Outcome::Enrolled(self.enrollment()?),
             1 => Outcome::Withdrawn,
@@ -373,12 +375,13 @@ impl Input {
             37 => return Ok(Err(Refusal::Expired)),
             38 => return Ok(Err(Refusal::Capacity)),
             39 => return Ok(Err(Refusal::Unavailable)),
+            40 => return Ok(Err(Refusal::ReadPending)),
             _ => return Err(Refusal::Invalid),
         }))
     }
 }
 
-fn append_result(output: &mut BytesMut, value: AppendResult) {
+pub(super) fn append_result(output: &mut BytesMut, value: AppendResult) {
     output.put_u64(value.position);
     output.put_u64(value.lsn);
     cut(output, value.cut);
@@ -387,7 +390,17 @@ fn append_result(output: &mut BytesMut, value: AppendResult) {
     output.put_u64(value.byte_end);
 }
 
-fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
+pub(super) fn record(output: &mut BytesMut, entry: &Record) {
+    append_result(output, entry.result);
+    grant(output, entry.grant);
+    output.put_i64(entry.timestamp);
+    request_id(output, entry.request);
+    output.put_slice(&entry.request_fingerprint);
+    output.put_u64(entry.payload.len() as u64);
+    output.put_slice(&entry.payload);
+}
+
+pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
     match value {
         Ok(Outcome::Enrolled(member)) => {
             output.put_u8(0);

@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use logkeeper::ordered::replication::transport::{Connector, RemoteVoter, serve_voter};
 use logkeeper::ordered::replication::{DurableVoter, Error, Group, Replica};
+use logkeeper::ordered::service::{Coordinator, Session, wire};
 use logkeeper::ordered::{
     BarrierClaim, Checkpoint, Command, Custody, Cut, Fingerprint, Limits, Outcome, Placement,
     Principal, Refusal, Request, RequestId, Window,
@@ -28,6 +29,21 @@ impl Connector for LocalPeer {
         tokio::spawn(async move { serve_voter(&voter, server, group, DEADLINE).await });
         Ok(client)
     }
+}
+
+async fn application<R: Replica>(
+    coordinator: &Coordinator<R>,
+    placement: Placement,
+    session: Session,
+    operation: wire::Operation,
+) -> wire::Reply {
+    let (client, server) = tokio::io::duplex(4096);
+    let (reply, served) = tokio::join!(
+        wire::exchange(client, placement, operation, 16_384, DEADLINE),
+        wire::serve(coordinator, server, session, 16_384, DEADLINE),
+    );
+    served.unwrap();
+    reply.unwrap()
 }
 
 #[tokio::test]
@@ -444,25 +460,73 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     );
     assert_eq!(funded.state().head(), published.cut);
     assert_eq!(funded.state().spent_bytes(), 0);
-    let appended = group
-        .choose(
-            &peers,
-            24,
-            request(
-                worker,
-                Command::Append {
-                    grant: second_grant,
-                    expected_next: published.cut.next_lsn,
-                    timestamp: 14,
-                    payload: Bytes::from_static(b"after funding"),
-                },
-            ),
-        )
-        .await
-        .unwrap();
+    let newest = request(
+        worker,
+        Command::Append {
+            grant: second_grant,
+            expected_next: published.cut.next_lsn,
+            timestamp: 14,
+            payload: Bytes::from_static(b"after funding"),
+        },
+    );
+    let appended = group.choose(&peers, 24, newest.clone()).await.unwrap();
     let Outcome::Appended(result) = appended.receipt().outcome.unwrap() else {
         panic!("the next funded allocation was refused");
     };
     assert_eq!(result.window, next_window);
     assert_eq!(result.byte_start, 0);
+
+    let coordinator = Coordinator::new(group, peers);
+    let session = Session::authenticated(placement, worker);
+    let route = application(&coordinator, placement, session, wire::Operation::Route).await;
+    let wire::Reply::Route(route) = route else {
+        panic!("the installed writer unrouteable");
+    };
+    assert_eq!(route.writer.grant, Some(second_grant));
+    assert_eq!(route.head, result.cut);
+    let reply = application(
+        &coordinator,
+        placement,
+        session,
+        wire::Operation::Reconcile {
+            grant: second_grant,
+            original: newest,
+        },
+    )
+    .await;
+    assert!(matches!(reply, wire::Reply::Reconciled(prior) if prior == result));
+
+    let forged = request(
+        Principal::Custodian,
+        Command::Publish {
+            grant: second_grant,
+            checkpoint: published,
+        },
+    );
+    let refusal = application(
+        &coordinator,
+        placement,
+        session,
+        wire::Operation::Execute(forged),
+    )
+    .await;
+    assert!(matches!(
+        refusal,
+        wire::Reply::Refused(Refusal::Unauthorized)
+    ));
+
+    let historic = application(
+        &coordinator,
+        placement,
+        session,
+        wire::Operation::Replay {
+            hold: proof.read(),
+            from: proof.read().checkpoint.cut,
+            maximum_bytes: 4096,
+        },
+    )
+    .await;
+    assert!(
+        matches!(historic, wire::Reply::Replay(page) if page.records.is_empty() && page.through == published.cut)
+    );
 }

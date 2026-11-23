@@ -1,0 +1,183 @@
+use super::{
+    Input, checkpoint, cut, grant, hold_row, placement, principal, request_id, snapshot, window,
+    writer_state,
+};
+use crate::ordered::{
+    BarrierClaim, Outcome, Placement, Principal, Receipt, Refusal, Request,
+    service::{
+        Decision, ReplayPage, Route,
+        wire::{Operation, Reply},
+    },
+};
+use bytes::{BufMut, Bytes, BytesMut};
+
+impl Operation {
+    pub(in crate::ordered) fn encode(&self, scope: Placement) -> Bytes {
+        let mut output = BytesMut::new();
+        placement(&mut output, scope);
+        match self {
+            Self::Route => output.put_u8(0),
+            Self::Execute(request) => {
+                output.put_u8(1);
+                output.put_slice(&request.encode());
+            }
+            Self::Reconcile {
+                grant: authority,
+                original,
+            } => {
+                output.put_u8(2);
+                grant(&mut output, *authority);
+                output.put_slice(&original.encode());
+            }
+            Self::Replay {
+                hold,
+                from,
+                maximum_bytes,
+            } => {
+                output.put_u8(3);
+                hold_row(&mut output, *hold);
+                cut(&mut output, *from);
+                output.put_u64(*maximum_bytes);
+            }
+        }
+        output.freeze()
+    }
+
+    pub(in crate::ordered) fn decode(body: Bytes) -> Result<(Placement, Self), Refusal> {
+        let mut input = Input(body);
+        let placement = input.placement()?;
+        let operation = match input.read_byte()? {
+            0 => Self::Route,
+            1 => Self::Execute(Request::decode(std::mem::take(&mut input.0))?),
+            2 => Self::Reconcile {
+                grant: input.grant()?,
+                original: Request::decode(std::mem::take(&mut input.0))?,
+            },
+            3 => Self::Replay {
+                hold: input.hold()?,
+                from: input.cut()?,
+                maximum_bytes: input.u64()?,
+            },
+            _ => return Err(Refusal::Invalid),
+        };
+        input.finish((placement, operation))
+    }
+}
+
+impl Reply {
+    pub(in crate::ordered) fn encode(&self) -> Bytes {
+        let mut output = BytesMut::new();
+        match self {
+            Self::Route(route) => {
+                output.put_u8(0);
+                placement(&mut output, route.placement);
+                writer_state(&mut output, route.writer);
+                output.put_u64(route.position);
+                output.put_slice(&route.history);
+                cut(&mut output, route.head);
+                cut(&mut output, route.floor);
+                checkpoint(&mut output, route.checkpoint);
+                window(&mut output, route.window);
+                output.put_u64(route.retry_positions);
+            }
+            Self::Decision(decision) => {
+                output.put_u8(1);
+                let receipt = decision.receipt;
+                placement(&mut output, receipt.placement);
+                principal(&mut output, receipt.principal);
+                request_id(&mut output, receipt.request);
+                output.put_u64(receipt.position);
+                snapshot::result(&mut output, receipt.outcome);
+                output.put_u8(u8::from(decision.barrier.is_some()));
+                if let Some(barrier) = decision.barrier {
+                    output.put_slice(&barrier.encode());
+                }
+            }
+            Self::Reconciled(append) => {
+                output.put_u8(2);
+                snapshot::append_result(&mut output, *append);
+            }
+            Self::Replay(page) => {
+                output.put_u8(3);
+                checkpoint(&mut output, page.checkpoint);
+                cut(&mut output, page.through);
+                output.put_u64(page.records.len() as u64);
+                for record in &page.records {
+                    snapshot::record(&mut output, record);
+                }
+            }
+            Self::Refused(refusal) => {
+                output.put_u8(4);
+                snapshot::result(&mut output, Err(*refusal));
+            }
+        }
+        output.freeze()
+    }
+
+    pub(in crate::ordered) fn decode(body: Bytes) -> Result<Self, Refusal> {
+        let mut input = Input(body);
+        let reply = match input.read_byte()? {
+            0 => Self::Route(Route {
+                placement: input.placement()?,
+                writer: input.writer_state()?,
+                position: input.u64()?,
+                history: input.take()?,
+                head: input.cut()?,
+                floor: input.cut()?,
+                checkpoint: input.checkpoint()?,
+                window: input.window()?,
+                retry_positions: input.u64()?,
+            }),
+            1 => Self::Decision(input.decision()?),
+            2 => Self::Reconciled(input.append_result()?),
+            3 => {
+                let checkpoint = input.checkpoint()?;
+                let through = input.cut()?;
+                let mut records = Vec::new();
+                for _ in 0..input.count(usize::MAX)? {
+                    records.push(input.record()?);
+                }
+                Self::Replay(ReplayPage {
+                    checkpoint,
+                    through,
+                    records,
+                })
+            }
+            4 => Self::Refused(input.result()?.err().ok_or(Refusal::Invalid)?),
+            _ => return Err(Refusal::Invalid),
+        };
+        input.finish(reply)
+    }
+}
+
+impl Input {
+    fn decision(&mut self) -> Result<Decision, Refusal> {
+        let receipt = Receipt {
+            placement: self.placement()?,
+            principal: self.principal()?,
+            request: self.request_id()?,
+            position: self.u64()?,
+            outcome: self.result()?,
+        };
+        let barrier = self.optional(|input| BarrierClaim::decode(std::mem::take(&mut input.0)))?;
+        if let Some(claim) = barrier
+            && (receipt.outcome
+                != Ok(Outcome::Barrier {
+                    grant: claim.grant(),
+                    nonce: claim.nonce(),
+                    read: claim.read(),
+                })
+                || receipt.placement != claim.placement()
+                || receipt.principal != Principal::Worker(claim.grant().enrollment)
+                || receipt.request != claim.read().id
+                || receipt.position != claim.read().admitted_at)
+        {
+            return Err(Refusal::Invalid);
+        }
+        Ok(Decision { receipt, barrier })
+    }
+
+    fn finish<T>(self, value: T) -> Result<T, Refusal> {
+        self.0.is_empty().then_some(value).ok_or(Refusal::Invalid)
+    }
+}

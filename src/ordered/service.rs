@@ -1,0 +1,226 @@
+//! The worker-facing authority of an installed journal group.
+//!
+//! Only the configured journal coordinators participate in voter exchanges.
+//! The accepting transport binds a worker or custodian identity before
+//! handing a request to this service.
+
+use super::{
+    AppendResult, BarrierClaim, Checkpoint, Cut, Fingerprint, Grant, Hold, Placement, Principal,
+    Receipt, Record, Refusal, Request, State, Window, WriterState,
+    replication::{self, Group, Replica},
+};
+use std::future::Future;
+use tokio::sync::Mutex;
+
+pub mod wire;
+
+const ROUND_ATTEMPTS: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Session {
+    placement: Placement,
+    principal: Principal,
+}
+
+impl Session {
+    /// Binds the result of authenticating this connection to one installed
+    /// group and enrollment. Never construct a session from command fields.
+    pub fn authenticated(placement: Placement, principal: Principal) -> Self {
+        Self {
+            placement,
+            principal,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Route {
+    pub placement: Placement,
+    pub writer: WriterState,
+    pub position: u64,
+    pub history: Fingerprint,
+    pub head: Cut,
+    pub floor: Cut,
+    pub checkpoint: Checkpoint,
+    pub window: Window,
+    pub retry_positions: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decision {
+    pub receipt: Receipt,
+    pub barrier: Option<BarrierClaim>,
+}
+
+pub struct ReplayPage {
+    pub checkpoint: Checkpoint,
+    pub through: Cut,
+    pub records: Vec<Record>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    Journal(#[from] replication::Error),
+    #[error("the journal request was refused: {0:?}")]
+    Refused(Refusal),
+}
+
+impl From<Refusal> for Error {
+    fn from(value: Refusal) -> Self {
+        Self::Refused(value)
+    }
+}
+
+/// A coordinator owns the local ballot sequence for the installed group.
+/// Another authenticated coordinator can recover and continue on the same
+/// voters after this coordinator or its worker disappears.
+pub struct Coordinator<R> {
+    group: Group,
+    peers: Vec<R>,
+    round: Mutex<u64>,
+}
+
+impl<R: Replica> Coordinator<R> {
+    pub fn new(group: Group, peers: Vec<R>) -> Self {
+        Self {
+            group,
+            peers,
+            round: Mutex::new(1),
+        }
+    }
+
+    /// Returns the current writer binding and exact recovery coordinates
+    /// from the installed group. Routing callers can treat discovery as a hint.
+    pub async fn route(&self, session: Session) -> Result<Route, Error> {
+        let state = self.recover(session).await?;
+        if let Principal::Worker(enrollment) = session.principal
+            && state.roster.get(&enrollment.worker) != Some(&enrollment)
+        {
+            return Err(Refusal::Unauthorized.into());
+        }
+        Ok(Route {
+            placement: state.placement(),
+            writer: state.writer_state(),
+            position: state.position(),
+            history: state.command_history(),
+            head: state.head(),
+            floor: state.floor(),
+            checkpoint: state.checkpoint(),
+            window: state.window(),
+            retry_positions: state.limits.retry_positions,
+        })
+    }
+
+    /// Binds the principal in the chosen frame to the authenticated session.
+    pub async fn execute(&self, session: Session, request: Request) -> Result<Decision, Error> {
+        self.admit(session)?;
+        if request.placement != session.placement || request.principal != session.principal {
+            return Err(Refusal::Unauthorized.into());
+        }
+        let chosen = self
+            .ordered(|round| self.group.choose(&self.peers, round, request.clone()))
+            .await?;
+        Ok(Decision {
+            receipt: chosen.receipt(),
+            barrier: chosen.barrier_claim(),
+        })
+    }
+
+    /// Lets the current writer reconcile an original retained request after
+    /// replacement. Authority to inspect the stream and identity of the old
+    /// append are established independently.
+    pub async fn reconcile(
+        &self,
+        session: Session,
+        grant: Grant,
+        original: &Request,
+    ) -> Result<AppendResult, Error> {
+        let state = self.recover(session).await?;
+        state.writer(session.principal, grant)?;
+        Ok(state.reconcile_append(original)?)
+    }
+
+    /// Reads a bounded continuation of the exact ordered hold. The caller
+    /// keeps the hold until it has finished using the provider checkpoint and
+    /// every page of the suffix.
+    pub async fn replay(
+        &self,
+        session: Session,
+        hold: Hold,
+        from: Cut,
+        maximum_bytes: usize,
+    ) -> Result<ReplayPage, Error> {
+        let state = self.recover(session).await?;
+        let replay = state.held_replay(session.principal, hold)?;
+        if from.next_lsn < replay.checkpoint().cut.next_lsn
+            || from.next_lsn > replay.through().next_lsn
+            || (from != replay.checkpoint().cut && state.cut(from.next_lsn) != Some(from))
+        {
+            return Err(Refusal::Invalid.into());
+        }
+        let checkpoint = replay.checkpoint();
+        let through = replay.through();
+        let skip = usize::try_from(from.next_lsn - checkpoint.cut.next_lsn)
+            .map_err(|_| Refusal::Invalid)?;
+        let mut remaining = maximum_bytes;
+        let mut records = Vec::new();
+        for record in replay.records().skip(skip) {
+            let size = usize::try_from(record.result.byte_end - record.result.byte_start)
+                .map_err(|_| Refusal::Capacity)?;
+            let Some(next) = remaining.checked_sub(size) else {
+                if records.is_empty() {
+                    return Err(Refusal::Capacity.into());
+                }
+                break;
+            };
+            remaining = next;
+            records.push(record.clone());
+        }
+        Ok(ReplayPage {
+            checkpoint,
+            through,
+            records,
+        })
+    }
+
+    fn admit(&self, session: Session) -> Result<(), Error> {
+        if session.placement != self.group.placement() {
+            return Err(Refusal::WrongPlacement.into());
+        }
+        Ok(())
+    }
+
+    async fn recover(&self, session: Session) -> Result<State, Error> {
+        self.admit(session)?;
+        self.ordered(|round| self.group.recover(&self.peers, round))
+            .await
+    }
+
+    async fn ordered<T, F>(&self, mut attempt: impl FnMut(u64) -> F) -> Result<T, Error>
+    where
+        F: Future<Output = Result<T, replication::Error>>,
+    {
+        let mut next = self.round.lock().await;
+        let mut newest = None;
+        for _ in 0..ROUND_ATTEMPTS {
+            let ballot = *next;
+            *next = ballot.checked_add(1).ok_or(replication::Error::Capacity)?;
+            match attempt(ballot).await {
+                Err(replication::Error::Deposed(promised)) => {
+                    *next = (*next).max(
+                        promised
+                            .round
+                            .checked_add(1)
+                            .ok_or(replication::Error::Capacity)?,
+                    );
+                    newest = Some(promised);
+                }
+                result => return result.map_err(Error::from),
+            }
+        }
+        Err(newest
+            .map_or(replication::Error::Quorum, replication::Error::Deposed)
+            .into())
+    }
+}

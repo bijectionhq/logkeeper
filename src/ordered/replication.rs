@@ -192,6 +192,9 @@ impl Group {
     pub fn identity(&self) -> Fingerprint {
         self.identity
     }
+    pub fn placement(&self) -> Placement {
+        self.initial.placement()
+    }
     pub fn quorum(&self) -> usize {
         self.voters.len() / 2 + 1
     }

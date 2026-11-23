@@ -6,6 +6,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::num::NonZeroU64;
 use uuid::Uuid;
 
+mod service;
 mod snapshot;
 
 const VERSION: u8 = 1;
