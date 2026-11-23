@@ -507,13 +507,8 @@ impl ControlManifest {
         let request = Request {
             placement: route.placement,
             principal: Principal::Administrator,
-            id: RequestId {
-                nonce: Uuid::new_v4(),
-                expires_at: route
-                    .position
-                    .checked_add(route.retry_positions)
-                    .ok_or_else(|| invalid("the control invocation horizon is exhausted"))?,
-            },
+            id: RequestId::fresh(route.position, route.retry_positions)
+                .map_err(|_| invalid("the control invocation horizon is exhausted"))?,
             command: action,
         };
         let Reply::Decision(decision) = client.call(Operation::Execute(request.clone())).await?

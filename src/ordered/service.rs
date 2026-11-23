@@ -116,17 +116,10 @@ impl<R: Replica> Coordinator<R> {
             .ordered(|round| self.group.recover(&self.peers, round))
             .await?;
         if state.successor.is_none() {
-            let expires_at = state
-                .position()
-                .checked_add(state.limits.retry_positions)
-                .ok_or(Refusal::Capacity)?;
             let request = Request {
                 placement: state.placement(),
                 principal: Principal::Administrator,
-                id: RequestId {
-                    nonce: uuid::Uuid::new_v4(),
-                    expires_at,
-                },
+                id: RequestId::fresh(state.position(), state.limits.retry_positions)?,
                 command: Command::SealCohort {
                     expected: self.group.identity(),
                     successor: destination.identity(),
@@ -235,13 +228,7 @@ impl<R: Replica> Coordinator<R> {
         let request = Request {
             placement: state.placement(),
             principal: session.principal,
-            id: RequestId {
-                nonce: uuid::Uuid::new_v4(),
-                expires_at: state
-                    .position()
-                    .checked_add(state.limits.retry_positions)
-                    .ok_or(Refusal::Capacity)?,
-            },
+            id: RequestId::fresh(state.position(), state.limits.retry_positions)?,
             command: Command::Release { hold },
         };
         match self.execute(session, request).await?.receipt.outcome {
