@@ -1,8 +1,6 @@
 //! Validation and selection of physical voter slots.
 
-use super::{Error, bounded_body_length, matches_fingerprint};
-
-pub(crate) const MAGIC: &[u8; 8] = b"LKORV005";
+use super::{Error, matches_fingerprint};
 
 #[cfg(verus_keep_ghost)]
 use super::slot_selection;
@@ -10,39 +8,10 @@ use super::slot_selection;
 use vstd::prelude::*;
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (if 2 <= length as int <= payload_limit as int {
-        Some(length as usize)
-    } else {
-        None
-    }),
-))]
-pub(crate) fn slot_body_length(length: u64, payload_limit: usize) -> Option<usize> {
-    bounded_body_length(length, 2, payload_limit)
-}
-
-#[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == (observed@ == stored@),
 ))]
 pub(crate) fn authenticates_body(observed: &[u8], stored: &[u8]) -> bool {
     matches_fingerprint(observed, stored)
-}
-
-#[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (magic@ == MAGIC@ && addressed@ == group@
-        && witness == voter && generation != 0),
-))]
-pub(crate) fn slot_header_matches(
-    magic: &[u8],
-    addressed: &[u8],
-    group: &[u8],
-    witness: u128,
-    voter: u128,
-    generation: u64,
-) -> bool {
-    matches_fingerprint(magic, MAGIC)
-        && matches_fingerprint(addressed, group)
-        && witness == voter
-        && generation != 0
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>

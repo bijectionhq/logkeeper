@@ -4,7 +4,9 @@ use super::{
     SlotPair, Vote,
 };
 use crate::ordered::admission::matches_fingerprint;
-use crate::ordered::codec::frame::bounded_body_length;
+use super::slot_header::{
+    DESCRIPTOR_BYTES, HEADER, decode_header, encode_descriptor, encode_header, matches_slot,
+};
 use crate::server::durability::sync_directory;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fs2::FileExt;
@@ -20,8 +22,8 @@ mod mirror;
 mod recover;
 mod selection;
 
-use recover::{HEADER, SlotHeader, recover_slot};
-use selection::{MAGIC, read_back_matches, select_slot};
+use recover::recover_slot;
+use selection::{read_back_matches, select_slot};
 
 const SLOTS: [&str; 2] = ["ordered.slot-a", "ordered.slot-b"];
 const LOCK: &str = "ordered.lock";
@@ -555,14 +557,10 @@ fn persist(
     if body.len() > size - HEADER {
         return Err(Error::Capacity);
     }
-    let mut header = BytesMut::with_capacity(HEADER);
-    header.put_slice(MAGIC);
-    header.put_slice(&group);
-    header.put_slice(voter.as_bytes());
-    header.put_u64(selected.generation);
-    header.put_u64(body.len() as u64);
-    let digest = slot_digest(&header, &body);
-    header.put_slice(&digest);
+    let descriptor =
+        encode_descriptor(&group, voter.as_bytes(), selected.generation, body.len() as u64);
+    let digest = slot_digest(&descriptor, &body);
+    let header = encode_header(&descriptor, &digest);
 
     // The header digest covers the whole body, so a crash between these
     // writes can only expose a complete image or leave the prior slot in use.
@@ -581,39 +579,20 @@ fn persist(
     Ok((body.len(), digest))
 }
 
-fn read_slot_header(file: &mut File) -> Result<SlotHeader, Error> {
+fn read_slot_header(file: &mut File) -> Result<[u8; HEADER], Error> {
     let mut header = [0; HEADER];
     file.read_exact(&mut header)?;
-    let split = HEADER - 32;
-    let mut descriptor = &header[..split];
-    let magic = descriptor[..8].try_into().map_err(|_| Error::Prefix)?;
-    descriptor.advance(8);
-    let addressed = descriptor[..32].try_into().map_err(|_| Error::Prefix)?;
-    descriptor.advance(32);
-    let witness = Uuid::from_slice(&descriptor[..16]).map_err(|_| Error::Prefix)?;
-    descriptor.advance(16);
-    let generation = descriptor.get_u64();
-    let length = descriptor.get_u64();
-    Ok(SlotHeader {
-        raw: header,
-        empty: header == [0; HEADER],
-        magic,
-        addressed,
-        witness: witness.as_u128(),
-        generation,
-        length,
-        digest: header[split..].try_into().map_err(|_| Error::Prefix)?,
-    })
+    Ok(header)
 }
 
 fn read_slot_body(
     file: &mut File,
-    header: &SlotHeader,
+    header: &[u8; HEADER],
     length: usize,
 ) -> Result<(Vec<u8>, Fingerprint), Error> {
     let mut body = vec![0; length];
     file.read_exact(&mut body)?;
-    let digest = slot_digest(&header.raw[..HEADER - 32], &body);
+    let digest = slot_digest(&header[..DESCRIPTOR_BYTES], &body);
     Ok((body, digest))
 }
 

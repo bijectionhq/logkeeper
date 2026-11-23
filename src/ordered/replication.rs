@@ -9,6 +9,7 @@ mod disk;
 mod evidence;
 mod rotation;
 mod rules;
+mod slot_header;
 #[cfg(feature = "simulation")]
 pub mod trace;
 pub mod transport;

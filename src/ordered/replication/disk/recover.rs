@@ -1,28 +1,15 @@
 //! Recovery eligibility checks, between the media reader and the selector.
 
-use super::selection::{authenticates_body, slot_body_length, slot_header_matches};
+use super::selection::authenticates_body;
 use super::{
-    Error, File, Fingerprint, Group, Selected, Uuid, load_state, read_slot_body, read_slot_header,
+    Error, File, Fingerprint, Group, HEADER, Selected, Uuid, decode_header, load_state,
+    matches_slot, read_slot_body, read_slot_header,
 };
 
 #[cfg(verus_keep_ghost)]
 use super::eligible_slot;
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
-
-pub(crate) const HEADER: usize = 8 + 32 + 16 + 8 + 8 + 32;
-
-#[derive(Clone, Copy)]
-pub(crate) struct SlotHeader {
-    pub raw: [u8; HEADER],
-    pub empty: bool,
-    pub magic: [u8; 8],
-    pub addressed: Fingerprint,
-    pub witness: u128,
-    pub generation: u64,
-    pub length: u64,
-    pub digest: Fingerprint,
-}
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     requires size >= HEADER,
@@ -37,26 +24,17 @@ pub(crate) fn recover_slot(
     voter: Uuid,
     size: usize,
 ) -> Result<(usize, Option<(Selected, Fingerprint)>), Error> {
-    let header = read_slot_header(file)?;
+    let raw = read_slot_header(file)?;
     let payload_limit = size - HEADER;
-    if header.empty {
-        return Ok((payload_limit, None));
-    }
-    let Some(length) = slot_body_length(header.length, payload_limit) else {
+    let Some(header) = decode_header(&raw, payload_limit) else {
         return Ok((payload_limit, None));
     };
-    let (body, observed) = read_slot_body(file, &header, length)?;
+    let length = header.length;
+    let (body, observed) = read_slot_body(file, &raw, length)?;
     if !authenticates_body(&observed, &header.digest) {
         return Ok((payload_limit, None));
     }
-    if !slot_header_matches(
-        &header.magic,
-        &header.addressed,
-        &group.identity,
-        header.witness,
-        voter.as_u128(),
-        header.generation,
-    ) {
+    if !matches_slot(&header, &group.identity, voter.as_bytes()) {
         return Err(Error::Group);
     }
     let state = load_state(group, body)?;
@@ -65,7 +43,7 @@ pub(crate) fn recover_slot(
         Some((
             Selected {
                 index,
-                generation: header.generation,
+                generation: header.descriptor.generation,
                 state,
             },
             header.digest,
