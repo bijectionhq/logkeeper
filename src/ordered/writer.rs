@@ -1,6 +1,6 @@
 //! Writer authorization and frontier decisions used by the ordered reducer.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use super::Refusal;
 
@@ -107,6 +107,10 @@ impl<G> Authority<G> {
     pub(super) fn vacate(&mut self) {
         self.grant = None;
     }
+}
+
+pub(super) fn insert_hold<K: Ord, H>(holds: &mut BTreeMap<K, H>, id: K, hold: H) {
+    holds.insert(id, hold);
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(

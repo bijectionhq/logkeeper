@@ -10,12 +10,14 @@ mod budget;
 mod codec;
 #[cfg(feature = "ordered-daemon")]
 pub mod daemon;
+mod lease;
 mod object_withdrawal;
 mod receipt;
 mod refusal;
 pub mod replication;
 mod replay_bounds;
 mod retention;
+mod rotation;
 pub mod service;
 mod writer;
 
@@ -23,7 +25,7 @@ use bytes::Bytes;
 use receipt::ReceiptBook;
 use receipt::RetainedOutcome;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use uuid::Uuid;
 
 pub type Fingerprint = [u8; 32];
@@ -78,6 +80,7 @@ pub struct WriterState {
     pub grant: Option<Grant>,
 }
 
+pub use lease::ApplyError;
 pub use writer::Cut;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -463,14 +466,6 @@ pub struct Limits {
     pub clock_drift: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ApplyError {
-    #[error("command position does not follow the applied journal prefix")]
-    Position,
-    #[error("decision time precedes the applied journal time")]
-    Time,
-}
-
 type RequestKey = (Principal, RequestId);
 
 #[derive(Clone, Copy)]
@@ -744,14 +739,7 @@ impl State {
         time: u64,
         request: Request,
     ) -> Result<Receipt, ApplyError> {
-        if self.position.checked_add(1) != Some(position) {
-            return Err(ApplyError::Position);
-        }
-        if time < self.time {
-            return Err(ApplyError::Time);
-        }
-        self.position = position;
-        self.time = time;
+        lease::advance_decision(&mut self.position, &mut self.time, position, time)?;
         let fingerprint = fingerprint(&request);
         self.command_history =
             extend_command_history(self.command_history, position, time, fingerprint);
@@ -818,13 +806,17 @@ impl State {
 
     fn writer(&self, principal: Principal, grant: Grant) -> Result<(), Refusal> {
         writer::authorize(
-            match principal {
-                Principal::Worker(enrollment) => Some(enrollment),
-                _ => None,
-            },
+            Self::worker_principal(principal),
             self.authority.grant.map(Grant::identity),
             grant.identity(),
         )
+    }
+
+    fn worker_principal(principal: Principal) -> Option<Enrollment> {
+        match principal {
+            Principal::Worker(enrollment) => Some(enrollment),
+            _ => None,
+        }
     }
 
     fn install_grant(
@@ -869,14 +861,16 @@ impl State {
         checkpoint: Checkpoint,
     ) -> Result<CheckpointPreparation, Refusal> {
         let pending = self.preparing.ok_or(Refusal::Unavailable)?;
-        if pending.checkpoint != checkpoint.cut
-            || pending.root != checkpoint.root
-            || pending.custody != checkpoint.custody
-            || checkpoint.manifest == [0; 32]
-            || self.cut(checkpoint.cut.next_lsn) != Some(checkpoint.cut)
-        {
-            return Err(Refusal::Conflict);
-        }
+        rotation::check_preparation(
+            pending.checkpoint,
+            pending.root,
+            pending.custody,
+            checkpoint.cut,
+            checkpoint.root,
+            checkpoint.custody,
+            checkpoint.manifest,
+            self.cut(checkpoint.cut.next_lsn),
+        )?;
         Ok(pending)
     }
 
@@ -892,13 +886,18 @@ impl State {
             );
         }
         if closes_history {
-            self.erasure_floor = checkpoint.cut.next_lsn;
             for entry in self.old_roots.values_mut() {
                 entry.closed = true;
             }
         }
-        self.preparing = None;
-        self.checkpoint = checkpoint;
+        rotation::publish_selection(
+            &mut self.checkpoint,
+            &mut self.preparing,
+            &mut self.erasure_floor,
+            checkpoint,
+            checkpoint.cut,
+            closes_history,
+        );
     }
 
     fn cut(&self, next_lsn: u64) -> Option<Cut> {
@@ -927,7 +926,7 @@ impl State {
         start: Cut,
         through: Cut,
     ) -> Result<Hold, Refusal> {
-        if start.next_lsn < self.erasure_floor
+        if !rotation::admits_history(self.erasure_floor, start.next_lsn)
             || through.next_lsn < start.next_lsn
             || self.cut(start.next_lsn) != Some(start)
             || self.cut(through.next_lsn) != Some(through)
@@ -1010,7 +1009,7 @@ impl State {
             start,
             through,
         };
-        self.holds.insert(id, HeldAdmission { hold, origin, kind });
+        writer::insert_hold(&mut self.holds, id, HeldAdmission { hold, origin, kind });
         Ok(hold)
     }
 
@@ -1086,21 +1085,24 @@ impl State {
                 self.install_grant(principal, id, candidate, self.authority.key_generation)
             }
             Command::PublishAndRotate { grant, checkpoint } => {
-                Self::custodian(principal)?;
-                if self.authority.grant != Some(grant)
-                    || self.head != checkpoint.cut
-                    || self.checkpoint == checkpoint
-                {
-                    return Err(Refusal::Stale);
-                }
+                rotation::check_rotation(
+                    principal == Principal::Custodian,
+                    self.authority.grant,
+                    grant,
+                    self.head,
+                    self.checkpoint,
+                    checkpoint,
+                    checkpoint.cut,
+                )?;
                 let pending = self.prepared_checkpoint(checkpoint)?;
-                if !pending.erasure || pending.source != grant || pending.base != self.checkpoint {
-                    return Err(Refusal::Stale);
-                }
-                let next = grant
-                    .key_generation
-                    .checked_add(1)
-                    .ok_or(Refusal::Capacity)?;
+                let next = rotation::successor_generation(
+                    pending.erasure,
+                    pending.source,
+                    grant,
+                    pending.base,
+                    self.checkpoint,
+                    grant.key_generation,
+                )?;
                 let outcome =
                     self.install_grant_at(principal, id, grant.enrollment, next, checkpoint)?;
                 self.publish_checkpoint(checkpoint, true);
@@ -1308,35 +1310,29 @@ impl State {
                 Ok(Outcome::WorkerDisposed(enrollment))
             }
             Command::DisposeExpired { enrollment } => {
-                if principal != Principal::Administrator && principal != Principal::Custodian {
-                    return Err(Refusal::Unauthorized);
-                }
-                if enrollment.serial == 0
-                    || enrollment.serial > self.enrollment_serial
-                    || self.roster.get(&enrollment.worker) == Some(&enrollment)
-                {
-                    return Err(Refusal::Stale);
-                }
-                let eligible_at = self
-                    .expiry_disposal_time(enrollment)
-                    .ok_or(Refusal::Capacity)?;
-                if self.time < eligible_at {
-                    return Err(Refusal::Unavailable);
-                }
+                lease::check_disposal(
+                    principal == Principal::Administrator || principal == Principal::Custodian,
+                    enrollment.serial,
+                    self.enrollment_serial,
+                    self.roster.get(&enrollment.worker) == Some(&enrollment),
+                    self.time,
+                    self.lease_end(enrollment),
+                    self.limits.clock_drift,
+                )?;
                 self.dispose(enrollment);
                 Ok(Outcome::WorkerDisposed(enrollment))
             }
             Command::Lease { grant } => {
-                self.writer(principal, grant)?;
-                if self.roster.get(&grant.enrollment.worker) != Some(&grant.enrollment) {
-                    return Err(Refusal::Stale);
-                }
-                let lease_end = self
-                    .time
-                    .checked_add(self.limits.serving_lease)
-                    .ok_or(Refusal::Capacity)?;
-                let last = self.leases.entry(grant.enrollment).or_default();
-                *last = (*last).max(lease_end);
+                let lease_end = lease::issue(
+                    &self.roster,
+                    &mut self.leases,
+                    &grant.enrollment.worker,
+                    Self::worker_principal(principal),
+                    self.authority.grant.map(Grant::identity),
+                    grant.identity(),
+                    self.time,
+                    self.limits.serving_lease,
+                )?;
                 Ok(Outcome::Leased {
                     grant,
                     issued_at: self.time,
@@ -1625,27 +1621,18 @@ impl State {
         after: Option<Enrollment>,
         limit: usize,
     ) -> impl Iterator<Item = Enrollment> {
-        let mut owners = BTreeSet::new();
-        for entry in self.holds.values() {
-            let owner = entry.hold.owner;
-            if after.is_some_and(|cursor| owner <= cursor)
-                || self.roster.get(&owner.worker) == Some(&owner)
-            {
-                continue;
-            }
-            owners.insert(owner);
-            if owners.len() > limit {
-                owners.pop_last();
-            }
-        }
-        owners.into_iter()
+        lease::withdrawn_page(
+            &self.holds,
+            &self.roster,
+            |entry| (entry.hold.owner, entry.hold.owner.worker),
+            after,
+            limit,
+        )
+        .into_iter()
     }
 
     fn expiry_disposal_time(&self, enrollment: Enrollment) -> Option<u64> {
-        match self.leases.get(&enrollment) {
-            Some(lease_end) => lease_end.checked_add(self.limits.clock_drift),
-            None => Some(0),
-        }
+        lease::disposal_time(self.lease_end(enrollment), self.limits.clock_drift)
     }
 
     /// Removes every hold the enrollment owns, with any receipt that was
@@ -1698,7 +1685,7 @@ impl State {
     }
 
     fn checkpoint_open(&self, checkpoint: Checkpoint) -> bool {
-        checkpoint.cut.next_lsn >= self.erasure_floor
+        rotation::admits_history(self.erasure_floor, checkpoint.cut.next_lsn)
             && self.checkpoint_retained(checkpoint)
             && !self
                 .old_roots
