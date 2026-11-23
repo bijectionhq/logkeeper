@@ -56,6 +56,51 @@ theorem funding_new_window {budget : Budget} {capacity reserve oldWindow newWind
     fundedBudget { budget with spent := 0 } newWindow capacity reserve := by
   exact ⟨Nat.zero_le _, by simpa [admitsDebit] using paid, funded.2.2⟩
 
+def trimBudget (budget : Budget) (credit : Logkeeper.Protocol.Credit) : Budget :=
+  { budget with
+    ordinary := budget.ordinary - credit.ordinary
+    maintenance := budget.maintenance - credit.maintenance }
+
+theorem trim_preserves_funding {budget : Budget} {window capacity reserve : Nat}
+    (funded : fundedBudget budget window capacity reserve) (credit : Logkeeper.Protocol.Credit) :
+    fundedBudget (trimBudget budget credit) window capacity reserve := by
+  simp only [fundedBudget, trimBudget] at *
+  omega
+
+structure State where
+  budget : Budget
+  window : Nat
+
+inductive Step (capacity reserve : Nat) : State → State → Prop where
+  | append (state : State) (lane : ChargeClass) (payload : Nat) (references : Option Nat)
+      (admitted : admitsAppend state.budget lane (recordCharge payload references)
+        state.window capacity reserve) :
+      Step capacity reserve state
+        { state with budget := appendBudget state.budget lane (recordCharge payload references) }
+  | fund (state : State) (window : Nat) (paid : admitsDebit state.budget.ordinary window capacity) :
+      Step capacity reserve state ⟨{ state.budget with spent := 0 }, window⟩
+  | trim (state : State) (credit : Logkeeper.Protocol.Credit)
+      (ordinary : credit.ordinary ≤ state.budget.ordinary)
+      (maintenance : credit.maintenance ≤ state.budget.maintenance) :
+      Step capacity reserve state { state with budget := trimBudget state.budget credit }
+
+inductive Trace (capacity reserve : Nat) : State → State → Prop where
+  | empty (state : State) : Trace capacity reserve state state
+  | next {start here finish : State} (earlier : Trace capacity reserve start here)
+      (step : Step capacity reserve here finish) : Trace capacity reserve start finish
+
+theorem trace_preserves_funding {start finish : State} {capacity reserve : Nat}
+    (funded : fundedBudget start.budget start.window capacity reserve)
+    (trace : Trace capacity reserve start finish) :
+    fundedBudget finish.budget finish.window capacity reserve := by
+  induction trace with
+  | empty => exact funded
+  | next _ step prior =>
+    cases step with
+    | append _ _ _ admitted => exact admitted_append_preserves_funding prior admitted
+    | fund _ paid => exact funding_new_window prior paid
+    | trim credit _ _ => exact trim_preserves_funding prior credit
+
 theorem independent_maintenance_at_full_window {budget : Budget} {window capacity reserve charge : Nat}
     (full : budget.spent = window) (positive : 0 < charge)
     (fits : admitsDebit budget.maintenance charge reserve) :
@@ -82,6 +127,8 @@ theorem ordinary_limit_cannot_fund_maintenance :
 
 #print axioms admitted_append_preserves_funding
 #print axioms funding_new_window
+#print axioms trim_preserves_funding
+#print axioms trace_preserves_funding
 #print axioms independent_maintenance_at_full_window
 #print axioms reachable_full_window
 #print axioms omitted_references_admit_an_unfunded_append

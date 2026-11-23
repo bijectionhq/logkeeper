@@ -12,6 +12,8 @@ structure State (Object Version : Type) where
   references : Object → Role → Nat → Prop
   fence : Object → Option Version
   hasOpaqueReferences : Prop
+  image : Nat
+  cohort : Nat
 
 def referenced (s : State Object Version) (name : Object) : Prop :=
   ∃ role owner, s.references name role owner
@@ -126,7 +128,7 @@ theorem fenced_refuses_reference {s : State Object Version} (closed : fenced s n
     (member : name ∈ names) : ¬ canAdmitReferences s (some names) :=
   fun allowed => allowed name member closed
 
-private def empty : State Nat Nat := ⟨fun _ _ _ => False, fun _ => none, False⟩
+private def empty : State Nat Nat := ⟨fun _ _ _ => False, fun _ => none, False, 0, 0⟩
 private def withdrawn : State Nat Nat :=
   { empty with fence := fun name => if name = 0 then some 7 else none }
 private def held : State Nat Nat :=
@@ -138,14 +140,19 @@ theorem reachable_fence : Step empty withdrawn :=
 theorem reachable_hold : Step withdrawn held :=
   Step.acquire withdrawn [1] .hold 4 (by simp [canAdmitReferences, fenced, withdrawn])
 
-private theorem carry_self (s : State Object Version) : Carries s s :=
-  ⟨fun _ _ _ => Iff.rfl, fun _ => rfl, Iff.rfl⟩
+private def compacted : State Nat Nat := { held with image := 1 }
+private def repaired : State Nat Nat := { compacted with cohort := 1 }
+
+private theorem held_reference : referenced held 1 :=
+  ⟨.hold, 4, Or.inl ⟨by simp, rfl, rfl⟩⟩
 
 theorem reachable_compacted_and_repaired :
-    Trace empty held ∧ held.fence 0 = some 7 ∧ referenced held 1 :=
+    Trace empty repaired ∧ repaired.image = 1 ∧ repaired.cohort = 1 ∧
+      repaired.fence 0 = some 7 ∧ referenced repaired 1 :=
   ⟨.next (.next (.next (.next (.empty _) reachable_fence) reachable_hold)
-      (.compact (carry_self _))) (.repair (carry_self _)),
-    rfl, .hold, 4, Or.inl ⟨by simp, rfl, rfl⟩⟩
+      (.compact ⟨fun _ _ _ => Iff.rfl, fun _ => rfl, Iff.rfl⟩))
+      (.repair ⟨fun _ _ _ => Iff.rfl, fun _ => rfl, Iff.rfl⟩),
+    rfl, rfl, rfl, held_reference⟩
 
 theorem unchecked_acquire_violates_separation :
     ¬ Safe { withdrawn with references := fun n r _ => n = 0 ∧ r = .suffix } := by
@@ -155,7 +162,7 @@ theorem unchecked_acquire_violates_separation :
 theorem unchecked_withdrawal_violates_separation :
     ¬ Safe { held with fence := fun n => if n = 1 then some 8 else held.fence n } := by
   intro safe
-  exact (safe 1 (by simp [fenced])).2 reachable_compacted_and_repaired.2.2
+  exact (safe 1 (by simp [fenced])).2 held_reference
 
 /-- A compactor that omits fences makes a delayed reference eligible again. -/
 theorem compaction_without_fences_reopens_name :
@@ -170,7 +177,7 @@ theorem repair_without_references_authorizes_withdrawal :
     canWithdraw { held with references := fun _ _ _ => False } 1 ∧
     ¬ Carries held { held with references := fun _ _ _ => False } := by
   refine ⟨⟨id, fun ⟨_, _, h⟩ => h⟩, fun carry => ?_⟩
-  obtain ⟨role, owner, h⟩ := reachable_compacted_and_repaired.2.2
+  obtain ⟨role, owner, h⟩ := held_reference
   exact (carry.references 1 role owner).mpr h
 
 #print axioms trace_preserves_separation
