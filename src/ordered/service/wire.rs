@@ -288,6 +288,16 @@ impl Reply {
                         (Command::Barrier { .. }, Ok(_)) | (_, Ok(Outcome::Barrier { .. })) => {
                             false
                         }
+                        (
+                            Command::WithdrawObject { object },
+                            Ok(Outcome::ObjectWithdrawn(fence)),
+                        ) => {
+                            *object == fence.object
+                                && fence.position > 0
+                                && fence.position <= decision.receipt.position
+                        }
+                        (Command::WithdrawObject { .. }, Ok(_))
+                        | (_, Ok(Outcome::ObjectWithdrawn(_))) => false,
                         _ => true,
                     }
             }
@@ -346,6 +356,7 @@ impl ReplayPage {
                         record.request,
                         record.timestamp,
                         &record.payload,
+                        record.references.as_deref(),
                     )
             {
                 return false;

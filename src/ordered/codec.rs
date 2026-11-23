@@ -1,7 +1,7 @@
 use super::{
     AppendClass, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut,
-    Enrollment, Fingerprint, Grant, Hold, Placement, Principal, Refusal, Request, RequestId,
-    Window, WriterState,
+    Enrollment, Fingerprint, Grant, Hold, MAX_OBJECT_REFERENCES, ObjectName, ObjectWithdrawal,
+    Placement, Principal, Refusal, Request, RequestId, Window, WriterState, valid_object_names,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use uuid::Uuid;
@@ -41,7 +41,10 @@ impl Request {
                 writer_state(&mut output, *expected);
                 enrollment(&mut output, *candidate);
             }
-            Command::RotateKey { grant: writer, checkpoint: root } => {
+            Command::RotateKey {
+                grant: writer,
+                checkpoint: root,
+            } => {
                 output.put_u8(22);
                 grant(&mut output, *writer);
                 checkpoint(&mut output, *root);
@@ -52,21 +55,35 @@ impl Request {
                 expected_next,
                 timestamp,
                 payload,
+                references,
             } => {
-                output.put_u8(3);
+                output.put_u8(if references.is_some() { 23 } else { 3 });
                 output.put_u8(class.tag());
                 grant(&mut output, *writer);
                 output.put_u64(*expected_next);
                 output.put_i64(*timestamp);
+                if let Some(names) = references {
+                    object_names(&mut output, names);
+                }
                 output.put_slice(payload);
             }
             Command::Barrier { grant: writer } => {
                 output.put_u8(4);
                 grant(&mut output, *writer);
             }
-            Command::PrepareCheckpoint { preparation } => {
-                output.put_u8(15);
+            Command::PrepareCheckpoint {
+                preparation,
+                references,
+            } => {
+                output.put_u8(if references.is_some() { 24 } else { 15 });
                 checkpoint_preparation(&mut output, *preparation);
+                if let Some(names) = references {
+                    object_names(&mut output, names);
+                }
+            }
+            Command::WithdrawObject { object } => {
+                output.put_u8(25);
+                withdrawal(&mut output, *object);
             }
             Command::CloseCheckpoint { checkpoint: root } => {
                 output.put_u8(16);
@@ -183,11 +200,12 @@ impl Request {
                 grant: input.grant()?,
                 checkpoint: input.checkpoint()?,
             },
-            3 => Command::Append {
+            tag @ (3 | 23) => Command::Append {
                 class: input.append_class()?,
                 grant: input.grant()?,
                 expected_next: input.u64()?,
                 timestamp: i64::from_be_bytes(input.take()?),
+                references: (tag == 23).then(|| input.object_names()).transpose()?,
                 payload: std::mem::take(&mut input.0),
             },
             4 => Command::Barrier {
@@ -234,8 +252,12 @@ impl Request {
                 expected: input.take()?,
                 successor: input.take()?,
             },
-            15 => Command::PrepareCheckpoint {
+            tag @ (15 | 24) => Command::PrepareCheckpoint {
                 preparation: input.checkpoint_preparation()?,
+                references: (tag == 24).then(|| input.object_names()).transpose()?,
+            },
+            25 => Command::WithdrawObject {
+                object: input.withdrawal()?,
             },
             16 => Command::CloseCheckpoint {
                 checkpoint: input.checkpoint()?,
@@ -567,4 +589,43 @@ fn window(output: &mut BytesMut, value: Window) {
     uuid(output, value.allocation);
     output.put_u64(value.serial);
     output.put_u64(value.bytes);
+}
+
+fn object_names(output: &mut BytesMut, names: &[ObjectName]) {
+    output.put_u32(names.len() as u32);
+    for name in names {
+        output.put_slice(name);
+    }
+}
+
+fn withdrawal(output: &mut BytesMut, item: ObjectWithdrawal) {
+    output.put_slice(&item.name);
+    output.put_slice(&item.version);
+}
+
+impl Input {
+    fn object_names(&mut self) -> Result<Vec<ObjectName>, Refusal> {
+        let count = u32::from_be_bytes(self.take()?) as usize;
+        if count > MAX_OBJECT_REFERENCES || count > self.0.len() / 32 {
+            return Err(Refusal::Invalid);
+        }
+        let names = (0..count)
+            .map(|_| self.take())
+            .collect::<Result<Vec<_>, _>>()?;
+        if !valid_object_names(&names) {
+            return Err(Refusal::Invalid);
+        }
+        Ok(names)
+    }
+
+    fn withdrawal(&mut self) -> Result<ObjectWithdrawal, Refusal> {
+        let item = ObjectWithdrawal {
+            name: self.take()?,
+            version: self.take()?,
+        };
+        if item.name == [0; 32] || item.version == [0; 32] {
+            return Err(Refusal::Invalid);
+        }
+        Ok(item)
+    }
 }

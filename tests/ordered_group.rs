@@ -4,8 +4,9 @@ use logkeeper::ordered::replication::transport::{Connector, RemoteVoter, serve_v
 use logkeeper::ordered::replication::{DurableVoter, Error, Group, Replica};
 use logkeeper::ordered::service::{Coordinator, Session, wire};
 use logkeeper::ordered::{
-    AppendClass, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut, Enrollment,
-    Fingerprint, Limits, Outcome, Placement, Principal, Refusal, Request, RequestId, Window,
+    AppendClass, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut,
+    Enrollment, Fingerprint, Limits, Outcome, Placement, Principal, Refusal, Request, RequestId,
+    Window,
 };
 use std::time::Duration;
 use uuid::Uuid;
@@ -325,6 +326,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let append = request(
         Principal::Worker(first_enrollment),
         Command::Append {
+            references: None,
             class: AppendClass::Data,
             grant: first_grant,
             expected_next: 0,
@@ -403,6 +405,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             request(
                 Principal::Worker(first_enrollment),
                 Command::Append {
+                    references: None,
                     class: AppendClass::Data,
                     grant: first_grant,
                     expected_next: 1,
@@ -449,6 +452,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             request(
                 Principal::Worker(second_enrollment),
                 Command::Append {
+                    references: None,
                     class: AppendClass::Data,
                     grant: second_grant,
                     expected_next: 1,
@@ -515,7 +519,10 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             13,
             request(
                 Principal::Custodian,
-                Command::PrepareCheckpoint { preparation },
+                Command::PrepareCheckpoint {
+                    preparation,
+                    references: None,
+                },
             ),
         )
         .await
@@ -685,6 +692,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let newest = request(
         worker,
         Command::Append {
+            references: None,
             class: AppendClass::Data,
             grant: second_grant,
             expected_next: published.cut.next_lsn,
@@ -796,6 +804,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let old_append = request(
         worker,
         Command::Append {
+            references: None,
             class: AppendClass::Data,
             grant: second_grant,
             expected_next: result.cut.next_lsn,

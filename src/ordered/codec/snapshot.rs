@@ -1,11 +1,12 @@
 use super::{
-    Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, principal,
-    request_id, window, writer_state,
+    Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, object_names,
+    principal, request_id, window, withdrawal, writer_state,
 };
 use crate::ordered::{
-    ACTIVATION_HOLD_SLOTS, APPEND_RECORD_CHARGE_BYTES, AppendClass, AppendResult, Command,
-    Grant, HeldAdmission, HoldKind, Outcome, Principal, Receipt, Record, Refusal, Request,
-    RetainedCheckpoint, RetainedOutcome, State, Window, admission, append_fingerprint, fingerprint,
+    ACTIVATION_HOLD_SLOTS, AppendClass, AppendResult, Command, Grant, HeldAdmission, HoldKind,
+    ObjectFence, Outcome, Principal, Receipt, Record, Refusal, Request, RetainedCheckpoint,
+    RetainedOutcome, State, WITHDRAWAL_BYTES, Window, admission, append_fingerprint, fingerprint,
+    record_charge,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::BTreeSet;
@@ -13,6 +14,7 @@ use std::collections::BTreeSet;
 use crate::ordered::TrimResult;
 
 const MAGIC: &[u8; 8] = b"LKBASE05";
+const REFERENCED_PAYLOAD: u64 = 1 << 63;
 
 impl super::super::Limits {
     pub(in crate::ordered) fn base_control_bytes(self) -> Option<usize> {
@@ -101,6 +103,17 @@ impl State {
         for (member, lease_end) in &self.leases {
             enrollment(&mut output, *member);
             output.put_u64(*lease_end);
+        }
+        if !self.root_references.is_empty() || !self.object_fences.is_empty() {
+            output.put_u64(self.root_references.len() as u64);
+            for (&revision, names) in &self.root_references {
+                output.put_u64(revision);
+                object_names(&mut output, names);
+            }
+            output.put_u64(self.object_fences.len() as u64);
+            for &fence in self.object_fences.values() {
+                encode_fence(&mut output, fence);
+            }
         }
         output.freeze()
     }
@@ -198,10 +211,78 @@ impl State {
         }
         state.read_outcomes(&mut input)?;
         state.read_leases(&mut input)?;
+        state.read_object_control(&mut input)?;
         if !input.0.is_empty() {
             return Err(Refusal::Invalid);
         }
         Ok(state)
+    }
+
+    fn read_object_control(&mut self, input: &mut Input) -> Result<(), Refusal> {
+        let legacy = input.0.is_empty();
+        let roots = if legacy {
+            0
+        } else {
+            input.count(self.limits.replay_holds.saturating_add(2))?
+        };
+        for _ in 0..roots {
+            let revision = input.u64()?;
+            if (revision != self.checkpoint.custody.revision
+                && self
+                    .preparing
+                    .is_none_or(|item| revision != item.custody.revision)
+                && !self.old_roots.contains_key(&revision))
+                || self
+                    .root_references
+                    .last_key_value()
+                    .is_some_and(|(old, _)| *old >= revision)
+            {
+                return Err(Refusal::Invalid);
+            }
+            self.root_references.insert(revision, input.object_names()?);
+        }
+        let fences = if legacy {
+            0
+        } else {
+            input.count(self.object_control_bytes / WITHDRAWAL_BYTES)?
+        };
+        for _ in 0..fences {
+            let fence = input.object_fence()?;
+            if fence.position == 0
+                || fence.position > self.position
+                || fence.time > self.time
+                || self
+                    .object_fences
+                    .last_key_value()
+                    .is_some_and(|(old, _)| *old >= fence.object.name)
+            {
+                return Err(Refusal::Invalid);
+            }
+            self.object_fences.insert(fence.object.name, fence);
+        }
+        self.charge_object_control(0)?;
+        if !self.object_fences.is_empty() {
+            if !self.has_complete_object_references() {
+                return Err(Refusal::Invalid);
+            }
+            for names in self.root_references.values().chain(
+                self.records
+                    .iter()
+                    .filter_map(|record| record.references.as_ref()),
+            ) {
+                self.admit_object_references(Some(names))?;
+            }
+        }
+        for retained in self.outcomes.values() {
+            if let Ok(Outcome::ObjectWithdrawn(fence)) = retained.receipt.outcome
+                && (retained.receipt.principal != Principal::Custodian
+                    || fence.position > retained.receipt.position
+                    || self.object_fences.get(&fence.object.name) != Some(&fence))
+            {
+                return Err(Refusal::Invalid);
+            }
+        }
+        Ok(())
     }
 
     fn read_leases(&mut self, input: &mut Input) -> Result<(), Refusal> {
@@ -284,6 +365,7 @@ impl State {
                 request,
                 request_fingerprint,
                 payload,
+                references,
             } = &entry;
             let original = Request {
                 placement: self.placement,
@@ -295,11 +377,10 @@ impl State {
                     expected_next: result.lsn,
                     timestamp: *timestamp,
                     payload: payload.clone(),
+                    references: references.clone(),
                 },
             };
-            let length = (payload.len() as u64)
-                .checked_add(APPEND_RECORD_CHARGE_BYTES)
-                .ok_or(Refusal::Invalid)?;
+            let length = record_charge(payload.len(), references.as_deref())?;
             if result.position <= previous_position
                 || result.position > self.position
                 || !self.valid_historical_grant(*grant)
@@ -318,6 +399,7 @@ impl State {
                         *request,
                         *timestamp,
                         payload,
+                        references.as_deref(),
                     )
                 || result.window.allocation.is_nil()
                 || result.window.serial == 0
@@ -520,11 +602,6 @@ impl Input {
         Ok(count)
     }
 
-    pub(super) fn payload(&mut self) -> Result<Bytes, Refusal> {
-        let length = self.count(usize::MAX)?;
-        Ok(self.0.split_to(length))
-    }
-
     pub(super) fn append_result(&mut self) -> Result<AppendResult, Refusal> {
         Ok(AppendResult {
             class: self.append_class()?,
@@ -538,13 +615,37 @@ impl Input {
     }
 
     pub(super) fn record(&mut self) -> Result<Record, Refusal> {
+        let result = self.append_result()?;
+        let grant = self.grant()?;
+        let timestamp = i64::from_be_bytes(self.take()?);
+        let request = self.request_id()?;
+        let request_fingerprint = self.take()?;
+        let encoded_length = self.u64()?;
+        let length =
+            usize::try_from(encoded_length & !REFERENCED_PAYLOAD).map_err(|_| Refusal::Invalid)?;
+        let references = (encoded_length & REFERENCED_PAYLOAD != 0)
+            .then(|| self.object_names())
+            .transpose()?;
+        if length > self.0.len() {
+            return Err(Refusal::Invalid);
+        }
+        let payload = self.0.split_to(length);
         Ok(Record {
-            result: self.append_result()?,
-            grant: self.grant()?,
-            timestamp: i64::from_be_bytes(self.take()?),
-            request: self.request_id()?,
-            request_fingerprint: self.take()?,
-            payload: self.payload()?,
+            result,
+            grant,
+            timestamp,
+            request,
+            request_fingerprint,
+            payload,
+            references,
+        })
+    }
+
+    fn object_fence(&mut self) -> Result<ObjectFence, Refusal> {
+        Ok(ObjectFence {
+            object: self.withdrawal()?,
+            position: self.u64()?,
+            time: self.u64()?,
         })
     }
 
@@ -582,6 +683,7 @@ impl Input {
                 issued_at: self.u64()?,
                 lease_end: self.u64()?,
             },
+            18 => Outcome::ObjectWithdrawn(self.object_fence()?),
             32 => return Ok(Err(Refusal::WrongPlacement)),
             33 => return Ok(Err(Refusal::Unauthorized)),
             34 => return Ok(Err(Refusal::Stale)),
@@ -612,8 +714,21 @@ pub(super) fn record(output: &mut BytesMut, entry: &Record) {
     output.put_i64(entry.timestamp);
     request_id(output, entry.request);
     output.put_slice(&entry.request_fingerprint);
-    output.put_u64(entry.payload.len() as u64);
+    let length = entry.payload.len() as u64;
+    match &entry.references {
+        Some(names) => {
+            output.put_u64(length | REFERENCED_PAYLOAD);
+            object_names(output, names);
+        }
+        None => output.put_u64(length),
+    }
     output.put_slice(&entry.payload);
+}
+
+fn encode_fence(output: &mut BytesMut, fence: ObjectFence) {
+    withdrawal(output, fence.object);
+    output.put_u64(fence.position);
+    output.put_u64(fence.time);
 }
 
 pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
@@ -693,6 +808,10 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
             grant(output, writer);
             output.put_u64(issued_at);
             output.put_u64(lease_end);
+        }
+        Ok(Outcome::ObjectWithdrawn(fence)) => {
+            output.put_u8(18);
+            encode_fence(output, fence);
         }
         Err(refusal) => output.put_u8(match refusal {
             Refusal::WrongPlacement => 32,

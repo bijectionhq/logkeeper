@@ -831,6 +831,7 @@ mod tests {
                         expected_next: 0,
                         timestamp: 1,
                         payload: Bytes::from_static(b"old"),
+                        references: None,
                     },
                 ),
             )
@@ -863,6 +864,7 @@ mod tests {
                             usable_bytes: 64,
                             descriptor: [5; 32],
                         },
+                        references: None,
                     },
                 ),
             )

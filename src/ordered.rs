@@ -191,6 +191,29 @@ impl RequestId {
     }
 }
 
+/// An opaque immutable object name. Callers must use the same name for all
+/// references to a physical object, including references derived during replay.
+pub type ObjectName = Fingerprint;
+
+pub const MAX_OBJECT_REFERENCES: usize = 16_384;
+const MAX_OBJECT_CONTROL_BYTES: usize = 2 << 20;
+const WITHDRAWAL_BYTES: usize = 80;
+
+/// The provider version is bound to the receipt. The name remains fenced even
+/// if a provider creates another version at the same key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectWithdrawal {
+    pub name: ObjectName,
+    pub version: Fingerprint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectFence {
+    pub object: ObjectWithdrawal,
+    pub position: u64,
+    pub time: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
     Enroll {
@@ -215,6 +238,8 @@ pub enum Command {
         expected_next: u64,
         timestamp: i64,
         payload: Bytes,
+        /// Complete, sorted and unique exact object names. None is a legacy opaque append.
+        references: Option<Vec<ObjectName>>,
     },
     /// A fresh read. Each admission protects its own basis at the current
     /// head; a retry is a new admission and never replays an earlier read.
@@ -223,6 +248,10 @@ pub enum Command {
     },
     PrepareCheckpoint {
         preparation: CheckpointPreparation,
+        references: Option<Vec<ObjectName>>,
+    },
+    WithdrawObject {
+        object: ObjectWithdrawal,
     },
     CloseCheckpoint {
         checkpoint: Checkpoint,
@@ -336,6 +365,7 @@ pub enum Outcome {
     },
     Published(Checkpoint),
     CheckpointPrepared(CheckpointPreparation),
+    ObjectWithdrawn(ObjectFence),
     CheckpointClosed(Checkpoint),
     CheckpointSettled(Checkpoint),
     WorkerDisposed(Enrollment),
@@ -403,6 +433,7 @@ pub struct Record {
     pub grant: Grant,
     pub timestamp: i64,
     pub payload: Bytes,
+    pub references: Option<Vec<ObjectName>>,
     request: RequestId,
     request_fingerprint: Fingerprint,
 }
@@ -516,6 +547,9 @@ pub struct State {
     preparing: Option<CheckpointPreparation>,
     old_roots: BTreeMap<u64, RetainedCheckpoint>,
     records: VecDeque<Record>,
+    object_control_bytes: usize,
+    root_references: BTreeMap<u64, Vec<ObjectName>>,
+    object_fences: BTreeMap<ObjectName, ObjectFence>,
     holds: BTreeMap<RequestId, HeldAdmission>,
     outcomes: BTreeMap<RequestKey, RetainedOutcome>,
     expiry: BTreeMap<(u64, RequestKey), ()>,
@@ -580,6 +614,9 @@ impl State {
             preparing: None,
             old_roots: BTreeMap::new(),
             records: VecDeque::new(),
+            object_control_bytes: MAX_OBJECT_CONTROL_BYTES,
+            root_references: BTreeMap::new(),
+            object_fences: BTreeMap::new(),
             holds: BTreeMap::new(),
             outcomes: BTreeMap::new(),
             expiry: BTreeMap::new(),
@@ -675,6 +712,7 @@ impl State {
             expected_next,
             timestamp,
             payload,
+            ..
         } = &request.command
         else {
             return Err(Refusal::Invalid);
@@ -827,7 +865,11 @@ impl State {
         key_generation: u64,
     ) -> Result<Outcome, Refusal> {
         let epoch = self.writer_epoch.checked_add(1).ok_or(Refusal::Capacity)?;
-        let grant = Grant { enrollment, epoch, key_generation };
+        let grant = Grant {
+            enrollment,
+            epoch,
+            key_generation,
+        };
         let recovery = self.admit_hold(
             principal,
             id,
@@ -999,7 +1041,10 @@ impl State {
                 if checkpoint.manifest == [0; 32] {
                     return Err(Refusal::Invalid);
                 }
-                let next = grant.key_generation.checked_add(1).ok_or(Refusal::Capacity)?;
+                let next = grant
+                    .key_generation
+                    .checked_add(1)
+                    .ok_or(Refusal::Capacity)?;
                 self.install_grant(principal, id, grant.enrollment, next)
             }
             Command::Append {
@@ -1008,17 +1053,15 @@ impl State {
                 expected_next,
                 timestamp,
                 payload,
+                references,
             } => {
                 self.writer(principal, grant)?;
                 if self.head.next_lsn != expected_next {
                     return Err(Refusal::Stale);
                 }
                 let next_lsn = expected_next.checked_add(1).ok_or(Refusal::Capacity)?;
-                let length = u64::try_from(payload.len()).map_err(|_| Refusal::Capacity)?;
-                // Charge the fixed record identity too, including an empty payload.
-                let bytes = length
-                    .checked_add(APPEND_RECORD_CHARGE_BYTES)
-                    .ok_or(Refusal::Capacity)?;
+                self.admit_object_references(references.as_deref())?;
+                let bytes = record_charge(payload.len(), references.as_deref())?;
                 let (byte_start, byte_end) = match class {
                     AppendClass::Data => (
                         self.spent,
@@ -1038,7 +1081,15 @@ impl State {
                     ),
                 }
                 .ok_or(Refusal::Capacity)?;
-                let history = append_fingerprint(self.head, class, grant, id, timestamp, &payload);
+                let history = append_fingerprint(
+                    self.head,
+                    class,
+                    grant,
+                    id,
+                    timestamp,
+                    &payload,
+                    references.as_deref(),
+                );
                 let cut = Cut { next_lsn, history };
                 let result = AppendResult {
                     class,
@@ -1054,6 +1105,7 @@ impl State {
                     grant,
                     timestamp,
                     payload,
+                    references,
                     request: id,
                     request_fingerprint,
                 });
@@ -1074,10 +1126,20 @@ impl State {
                 let read = self.protect(principal, id, grant.enrollment, self.head)?;
                 Ok(Outcome::Barrier { grant, read })
             }
-            Command::PrepareCheckpoint { preparation } => {
+            Command::WithdrawObject { object } => {
                 Self::custodian(principal)?;
+                self.withdraw_object(object).map(Outcome::ObjectWithdrawn)
+            }
+            Command::PrepareCheckpoint {
+                preparation,
+                references,
+            } => {
+                Self::custodian(principal)?;
+                let revision = preparation.custody.revision;
                 if let Some(pending) = self.preparing {
-                    return if pending == preparation {
+                    return if pending == preparation
+                        && self.root_references.get(&revision) == references.as_ref()
+                    {
                         Ok(Outcome::CheckpointPrepared(pending))
                     } else {
                         Err(Refusal::Conflict)
@@ -1098,6 +1160,11 @@ impl State {
                 // Preserve headroom to publish alongside previous pinned roots.
                 if self.old_roots.len() >= self.limits.replay_holds {
                     return Err(Refusal::Capacity);
+                }
+                self.admit_object_references(references.as_deref())?;
+                if let Some(references) = references {
+                    self.charge_object_control(12 + 32 * references.len())?;
+                    self.root_references.insert(revision, references);
                 }
                 self.preparing = Some(preparation);
                 Ok(Outcome::CheckpointPrepared(preparation))
@@ -1168,6 +1235,7 @@ impl State {
                     return Err(Refusal::Stale);
                 }
                 self.old_roots.remove(&checkpoint.custody.revision);
+                self.root_references.remove(&checkpoint.custody.revision);
                 Ok(Outcome::CheckpointSettled(checkpoint))
             }
             Command::DisposeWorker {
@@ -1396,6 +1464,95 @@ impl State {
         }
     }
 
+    fn admit_object_references(&self, references: Option<&[ObjectName]>) -> Result<(), Refusal> {
+        match references {
+            Some(names) if !valid_object_names(names) => Err(Refusal::Invalid),
+            Some(names)
+                if names
+                    .iter()
+                    .any(|name| self.object_fences.contains_key(name)) =>
+            {
+                Err(Refusal::Conflict)
+            }
+            None if !self.object_fences.is_empty() => Err(Refusal::Unavailable),
+            _ => Ok(()),
+        }
+    }
+
+    fn charge_object_control(&self, charge: usize) -> Result<(), Refusal> {
+        let used = self.object_fences.len() * WITHDRAWAL_BYTES
+            + self
+                .root_references
+                .values()
+                .map(|names| 12 + 32 * names.len())
+                .sum::<usize>();
+        if used.saturating_add(charge) > self.object_control_bytes {
+            return Err(Refusal::Capacity);
+        }
+        Ok(())
+    }
+
+    fn has_complete_object_references(&self) -> bool {
+        let known = |checkpoint: Checkpoint| {
+            (checkpoint.manifest == [0; 32] && checkpoint.root == [0; 32])
+                || self
+                    .root_references
+                    .contains_key(&checkpoint.custody.revision)
+        };
+        known(self.checkpoint)
+            && self
+                .holds
+                .values()
+                .all(|entry| known(entry.hold.checkpoint))
+            && self
+                .old_roots
+                .values()
+                .all(|entry| entry.closed || known(entry.checkpoint))
+            && self
+                .preparing
+                .is_none_or(|prep| self.root_references.contains_key(&prep.custody.revision))
+            && self
+                .records
+                .iter()
+                .all(|record| record.references.is_some())
+    }
+
+    fn withdraw_object(&mut self, object: ObjectWithdrawal) -> Result<ObjectFence, Refusal> {
+        if object.name == [0; 32] || object.version == [0; 32] {
+            return Err(Refusal::Invalid);
+        }
+        if let Some(fence) = self.object_fences.get(&object.name).copied() {
+            return if fence.object == object {
+                Ok(fence)
+            } else {
+                Err(Refusal::Conflict)
+            };
+        }
+        if !self.has_complete_object_references() {
+            return Err(Refusal::Unavailable);
+        }
+        if self
+            .root_references
+            .values()
+            .chain(
+                self.records
+                    .iter()
+                    .filter_map(|record| record.references.as_ref()),
+            )
+            .any(|names| names.binary_search(&object.name).is_ok())
+        {
+            return Err(Refusal::Conflict);
+        }
+        self.charge_object_control(WITHDRAWAL_BYTES)?;
+        let fence = ObjectFence {
+            object,
+            position: self.position,
+            time: self.time,
+        };
+        self.object_fences.insert(object.name, fence);
+        Ok(fence)
+    }
+
     fn withdrawn_hold_owners(
         &self,
         after: Option<Enrollment>,
@@ -1516,9 +1673,18 @@ fn append_fingerprint(
     request: RequestId,
     timestamp: i64,
     payload: &Bytes,
+    references: Option<&[ObjectName]>,
 ) -> Fingerprint {
     let mut hash = Sha256::new();
-    hash.update(b"logkeeper.applied-append.v3");
+    if let Some(names) = references {
+        hash.update(b"logkeeper.applied-append-with-references.v1");
+        hash.update((names.len() as u32).to_be_bytes());
+        for name in names {
+            hash.update(name);
+        }
+    } else {
+        hash.update(b"logkeeper.applied-append.v3");
+    }
     hash.update([class.tag()]);
     add_cut(&mut hash, previous);
     add_grant(&mut hash, grant);
@@ -1527,6 +1693,19 @@ fn append_fingerprint(
     hash.update(timestamp.to_be_bytes());
     hash.update(payload);
     hash.finalize().into()
+}
+
+fn valid_object_names(names: &[ObjectName]) -> bool {
+    names.len() <= MAX_OBJECT_REFERENCES
+        && names.first().is_none_or(|name| *name != [0; 32])
+        && names.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn record_charge(payload_len: usize, references: Option<&[ObjectName]>) -> Result<u64, Refusal> {
+    let overhead = references.map_or(0, |names| 4 + 32 * names.len() as u64);
+    (payload_len as u64)
+        .checked_add(APPEND_RECORD_CHARGE_BYTES + overhead)
+        .ok_or(Refusal::Capacity)
 }
 
 fn fingerprint(request: &Request) -> Fingerprint {

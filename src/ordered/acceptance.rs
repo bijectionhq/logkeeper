@@ -96,6 +96,7 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
         placement: state.placement,
         principal: Principal::Worker(first),
         command: Command::Append {
+            references: None,
             class: AppendClass::Data,
             grant: first_grant,
             expected_next: 0,
@@ -133,6 +134,7 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
             state,
             worker,
             Command::Append {
+                references: None,
                 class,
                 grant: successor,
                 expected_next,
@@ -180,7 +182,10 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
         apply(
             &mut state,
             Principal::Custodian,
-            Command::PrepareCheckpoint { preparation }
+            Command::PrepareCheckpoint {
+                preparation,
+                references: None
+            }
         )
         .outcome,
         Ok(Outcome::CheckpointPrepared(_))
@@ -255,6 +260,7 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
             &mut recovered,
             worker,
             Command::Append {
+                references: None,
                 class: AppendClass::Data,
                 grant: renewed,
                 expected_next: next,
@@ -321,6 +327,7 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
     let append = request(
         &state,
         Command::Append {
+            references: None,
             class: AppendClass::Data,
             grant: writer,
             expected_next: 0,
@@ -379,6 +386,7 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
     let more = request(
         &state,
         Command::Append {
+            references: None,
             class: AppendClass::Data,
             grant: writer,
             expected_next: 1,
@@ -486,6 +494,7 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
         &mut state,
         principal,
         Command::Append {
+            references: None,
             class: AppendClass::Data,
             grant: writer,
             expected_next: 0,
@@ -569,7 +578,10 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
         issue(
             &mut state,
             Principal::Custodian,
-            Command::PrepareCheckpoint { preparation }
+            Command::PrepareCheckpoint {
+                preparation,
+                references: None
+            }
         )
         .1,
         Ok(Outcome::CheckpointPrepared(_))
@@ -765,6 +777,7 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
         110,
         old,
         Command::Append {
+            references: None,
             class: AppendClass::Data,
             grant: old_grant,
             expected_next: 0,
@@ -848,7 +861,10 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
             &mut state,
             300,
             Principal::Custodian,
-            Command::PrepareCheckpoint { preparation }
+            Command::PrepareCheckpoint {
+                preparation,
+                references: None
+            }
         ),
         Ok(Outcome::CheckpointPrepared(_))
     ));
@@ -977,7 +993,10 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
             clock_drift: 100,
         },
         Checkpoint {
-            cut: Cut { next_lsn: 0, history: [1; 32] },
+            cut: Cut {
+                next_lsn: 0,
+                history: [1; 32],
+            },
             root: [0; 32],
             manifest: [0; 32],
             custody: Custody {
@@ -1001,16 +1020,24 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
 
     let append = |state: &mut State, grant| {
         let expected_next = state.head().next_lsn;
-        apply(state, worker, Command::Append {
-            class: AppendClass::Data,
-            grant,
-            expected_next,
-            timestamp: 1,
-            payload: Bytes::from_static(b"ciphertext"),
-        }).outcome
+        apply(
+            state,
+            worker,
+            Command::Append {
+                references: None,
+                class: AppendClass::Data,
+                grant,
+                expected_next,
+                timestamp: 1,
+                payload: Bytes::from_static(b"ciphertext"),
+            },
+        )
+        .outcome
     };
     assert!(matches!(append(&mut state, old), Ok(Outcome::Appended(_))));
-    let Ok(Outcome::Barrier { read, .. }) = apply(&mut state, worker, Command::Barrier { grant: old }).outcome else {
+    let Ok(Outcome::Barrier { read, .. }) =
+        apply(&mut state, worker, Command::Barrier { grant: old }).outcome
+    else {
         panic!("old view was refused");
     };
     let checkpoint = Checkpoint {
@@ -1023,8 +1050,14 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
             provider: [4; 32],
         },
     };
-    let rotate = Command::RotateKey { grant: old, checkpoint };
-    assert_eq!(apply(&mut state, worker, rotate.clone()).outcome, Err(Refusal::Stale));
+    let rotate = Command::RotateKey {
+        grant: old,
+        checkpoint,
+    };
+    assert_eq!(
+        apply(&mut state, worker, rotate.clone()).outcome,
+        Err(Refusal::Stale)
+    );
 
     let preparation = CheckpointPreparation {
         checkpoint: checkpoint.cut,
@@ -1037,7 +1070,15 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     };
     let custodian = Principal::Custodian;
     assert_eq!(
-        apply(&mut state, custodian, Command::PrepareCheckpoint { preparation }).outcome,
+        apply(
+            &mut state,
+            custodian,
+            Command::PrepareCheckpoint {
+                preparation,
+                references: None
+            }
+        )
+        .outcome,
         Ok(Outcome::CheckpointPrepared(preparation))
     );
     assert_eq!(
@@ -1049,8 +1090,14 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
         Err(Refusal::Unauthorized)
     );
     let mut advanced = state.clone();
-    assert!(matches!(append(&mut advanced, old), Ok(Outcome::Appended(_))));
-    assert_eq!(apply(&mut advanced, worker, rotate.clone()).outcome, Err(Refusal::Stale));
+    assert!(matches!(
+        append(&mut advanced, old),
+        Ok(Outcome::Appended(_))
+    ));
+    assert_eq!(
+        apply(&mut advanced, worker, rotate.clone()).outcome,
+        Err(Refusal::Stale)
+    );
 
     let request = Request {
         placement: state.placement(),
@@ -1060,7 +1107,10 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     };
     let frame = service::wire::Operation::Execute(request.clone()).encode(state.placement());
     let (_, service::wire::Operation::Execute(decoded)) =
-        service::wire::Operation::decode(frame).unwrap() else { panic!("not a rotation request"); };
+        service::wire::Operation::decode(frame).unwrap()
+    else {
+        panic!("not a rotation request");
+    };
     assert_eq!(decoded, request);
     let receipt = state
         .apply(state.position() + 1, state.time(), decoded)
@@ -1082,24 +1132,50 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     else {
         panic!("rotation was refused");
     };
-    assert_eq!(new, Grant { enrollment, epoch: old.epoch + 1, key_generation: 2 });
+    assert_eq!(
+        new,
+        Grant {
+            enrollment,
+            epoch: old.epoch + 1,
+            key_generation: 2
+        }
+    );
     assert_eq!(recovery.checkpoint, checkpoint);
-    assert_eq!((recovery.start, recovery.through), (checkpoint.cut, checkpoint.cut));
-    assert_eq!(state.apply(state.position() + 1, state.time(), request).unwrap(), receipt);
+    assert_eq!(
+        (recovery.start, recovery.through),
+        (checkpoint.cut, checkpoint.cut)
+    );
+    assert_eq!(
+        state
+            .apply(state.position() + 1, state.time(), request)
+            .unwrap(),
+        receipt
+    );
 
     assert_eq!(append(&mut state, old), Err(Refusal::Stale));
-    let forged = Grant { key_generation: old.key_generation, ..new };
+    let forged = Grant {
+        key_generation: old.key_generation,
+        ..new
+    };
     assert_eq!(append(&mut state, forged), Err(Refusal::Stale));
     assert!(matches!(append(&mut state, new), Ok(Outcome::Appended(_))));
 
     let image = state.encode_base();
     let mut obsolete = image.to_vec();
     obsolete[..8].copy_from_slice(b"LKBASE04");
-    assert!(matches!(State::decode_base(&initial, obsolete.into()), Err(Refusal::Invalid)));
+    assert!(matches!(
+        State::decode_base(&initial, obsolete.into()),
+        Err(Refusal::Invalid)
+    ));
     let mut recovered = State::decode_base(&initial, image.clone()).unwrap();
     assert_eq!(recovered.encode_base(), image);
     let held = recovered.held_replay(worker, read).unwrap();
-    assert_eq!(held.records().map(|record| record.grant).collect::<Vec<_>>(), [old]);
+    assert_eq!(
+        held.records()
+            .map(|record| record.grant)
+            .collect::<Vec<_>>(),
+        [old]
+    );
     let suffix = recovered.record(checkpoint.cut.next_lsn).unwrap().clone();
     let reply = service::wire::Reply::Replay(service::ReplayPage {
         checkpoint,
@@ -1107,7 +1183,9 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
         records: vec![suffix],
     });
     let service::wire::Reply::Replay(page) = service::wire::Reply::decode(reply.encode()).unwrap()
-        else { panic!("not a replay reply"); };
+    else {
+        panic!("not a replay reply");
+    };
     assert_eq!(page.records[0].grant, new);
 
     assert_eq!(
@@ -1121,4 +1199,305 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     assert_eq!(recovery.checkpoint, checkpoint);
     assert_eq!(recovery.start, checkpoint.cut);
     assert_eq!(recovery.through, recovered.head());
+}
+
+#[test]
+fn exact_withdrawal_orders_against_the_retained_tail_preparation_and_held_root() {
+    let mut initial = State::new(
+        Placement {
+            deployment: Uuid::new_v4(),
+            incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(),
+            generation: 1,
+        },
+        Limits {
+            enrolled_workers: 1,
+            replay_holds: 4,
+            retry_positions: 32,
+            retained_data_bytes: 1 << 16,
+            maintenance_bytes: 1 << 12,
+            serving_lease: 1000,
+            clock_drift: 100,
+        },
+        Checkpoint {
+            cut: Cut {
+                next_lsn: 0,
+                history: [1; 32],
+            },
+            root: [0; 32],
+            manifest: [0; 32],
+            custody: Custody {
+                allocation: Uuid::new_v4(),
+                revision: 1,
+                provider: [0; 32],
+            },
+        },
+        Window {
+            allocation: Uuid::new_v4(),
+            serial: 1,
+            bytes: 1 << 12,
+        },
+    )
+    .unwrap();
+    initial.object_control_bytes = WITHDRAWAL_BYTES + 64;
+    let mut state = initial.clone();
+    let enrollment = enroll(&mut state);
+    let worker = Principal::Worker(enrollment);
+    let (writer, startup) = grant(&mut state, enrollment);
+    let custodian = Principal::Custodian;
+    let object = ObjectWithdrawal {
+        name: [6; 32],
+        version: [7; 32],
+    };
+    let withdraw = Command::WithdrawObject { object };
+    let append = |state: &mut State, references| {
+        let expected_next = state.head().next_lsn;
+        apply(
+            state,
+            worker,
+            Command::Append {
+                class: AppendClass::Data,
+                grant: writer,
+                expected_next,
+                timestamp: 1,
+                payload: Bytes::from_static(b"opaque"),
+                references,
+            },
+        )
+        .outcome
+    };
+    let successor = |state: &State| Checkpoint {
+        cut: state.head(),
+        root: [2; 32],
+        manifest: [3; 32],
+        custody: Custody {
+            allocation: Uuid::new_v4(),
+            revision: state.checkpoint().custody.revision + 1,
+            provider: [4; 32],
+        },
+    };
+    let prepare = |state: &mut State, checkpoint: Checkpoint, names| {
+        let preparation = CheckpointPreparation {
+            checkpoint: checkpoint.cut,
+            root: checkpoint.root,
+            source: writer,
+            base: state.checkpoint(),
+            custody: checkpoint.custody,
+            usable_bytes: 4096,
+            descriptor: [5; 32],
+        };
+        apply(
+            state,
+            custodian,
+            Command::PrepareCheckpoint {
+                preparation,
+                references: Some(names),
+            },
+        )
+        .outcome
+    };
+    assert!(matches!(
+        append(&mut state, Some(vec![object.name])),
+        Ok(Outcome::Appended(_))
+    ));
+    assert_eq!(
+        apply(&mut state, custodian, withdraw.clone()).outcome,
+        Err(Refusal::Conflict)
+    );
+    assert_eq!(
+        apply(&mut state, worker, Command::Release { hold: startup }).outcome,
+        Ok(Outcome::Released)
+    );
+
+    let first = successor(&state);
+    let mut preparation_only = state.clone();
+    preparation_only.records.front_mut().unwrap().references = Some(vec![]);
+    assert!(matches!(
+        prepare(&mut preparation_only, first, vec![object.name]),
+        Ok(Outcome::CheckpointPrepared(_))
+    ));
+    assert_eq!(
+        apply(&mut preparation_only, custodian, withdraw.clone()).outcome,
+        Err(Refusal::Conflict)
+    );
+    assert!(matches!(
+        prepare(&mut state, first, vec![object.name]),
+        Ok(Outcome::CheckpointPrepared(_))
+    ));
+    assert_eq!(
+        apply(
+            &mut state,
+            custodian,
+            Command::Publish { checkpoint: first }
+        )
+        .outcome,
+        Ok(Outcome::Published(first))
+    );
+    assert!(matches!(
+        apply(
+            &mut state,
+            custodian,
+            Command::Trim {
+                selected: first,
+                through: first.cut
+            }
+        )
+        .outcome,
+        Ok(Outcome::Trimmed(_))
+    ));
+    assert_eq!(
+        apply(&mut state, custodian, withdraw.clone()).outcome,
+        Err(Refusal::Conflict)
+    );
+
+    let Ok(Outcome::Barrier { read, .. }) =
+        apply(&mut state, worker, Command::Barrier { grant: writer }).outcome
+    else {
+        panic!("read refused");
+    };
+    assert!(matches!(
+        append(&mut state, Some(vec![])),
+        Ok(Outcome::Appended(_))
+    ));
+    let second = successor(&state);
+    assert!(matches!(
+        prepare(&mut state, second, vec![]),
+        Ok(Outcome::CheckpointPrepared(_))
+    ));
+    assert_eq!(
+        apply(
+            &mut state,
+            custodian,
+            Command::Publish { checkpoint: second }
+        )
+        .outcome,
+        Ok(Outcome::Published(second))
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            custodian,
+            Command::CloseCheckpoint { checkpoint: first }
+        )
+        .outcome,
+        Err(Refusal::Unavailable)
+    );
+    assert_eq!(
+        apply(&mut state, custodian, withdraw.clone()).outcome,
+        Err(Refusal::Conflict)
+    );
+
+    assert_eq!(
+        apply(&mut state, worker, Command::Release { hold: read }).outcome,
+        Ok(Outcome::Released)
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            custodian,
+            Command::CloseCheckpoint { checkpoint: first }
+        )
+        .outcome,
+        Ok(Outcome::CheckpointClosed(first))
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            custodian,
+            Command::SettleCheckpoint {
+                checkpoint: first,
+                disposition: [9; 32]
+            }
+        )
+        .outcome,
+        Ok(Outcome::CheckpointSettled(first))
+    );
+    let request = Request {
+        placement: state.placement(),
+        principal: custodian,
+        id: RequestId::fresh(state.position(), state.limits.retry_positions).unwrap(),
+        command: withdraw.clone(),
+    };
+    let encoded = service::wire::Operation::Execute(request.clone()).encode(state.placement());
+    let (_, service::wire::Operation::Execute(decoded)) =
+        service::wire::Operation::decode(encoded).unwrap()
+    else {
+        panic!("expected withdrawal command");
+    };
+    let receipt = state
+        .apply(state.position() + 1, state.time(), decoded)
+        .unwrap();
+    let Ok(Outcome::ObjectWithdrawn(fence)) = receipt.outcome else {
+        panic!("withdrawal refused: {receipt:?}");
+    };
+    let reply = service::wire::Reply::Decision(service::wire::Decision {
+        receipt,
+        barrier: None,
+        rotation: None,
+    });
+    assert!(
+        matches!(service::wire::Reply::decode(reply.encode()).unwrap(), service::wire::Reply::Decision(decision) if decision.receipt == receipt)
+    );
+
+    let mut recovered = State::decode_base(&initial, state.encode_base()).unwrap();
+    assert_eq!(
+        recovered
+            .apply(recovered.position() + 1, recovered.time(), request)
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        append(&mut recovered, Some(vec![object.name])),
+        Err(Refusal::Conflict)
+    );
+    assert_eq!(append(&mut recovered, None), Err(Refusal::Unavailable));
+    assert!(matches!(
+        append(&mut recovered, Some(vec![])),
+        Ok(Outcome::Appended(_))
+    ));
+    let third = successor(&recovered);
+    assert_eq!(
+        prepare(&mut recovered, third, vec![object.name]),
+        Err(Refusal::Conflict)
+    );
+    assert_eq!(
+        apply(
+            &mut recovered,
+            custodian,
+            Command::WithdrawObject {
+                object: ObjectWithdrawal {
+                    version: [8; 32],
+                    ..object
+                },
+            }
+        )
+        .outcome,
+        Err(Refusal::Conflict)
+    );
+    assert_eq!(
+        apply(
+            &mut recovered,
+            custodian,
+            Command::WithdrawObject {
+                object: ObjectWithdrawal {
+                    name: [8; 32],
+                    ..object
+                },
+            }
+        )
+        .outcome,
+        Err(Refusal::Capacity)
+    );
+    for _ in 0..recovered.limits.retry_positions {
+        apply(
+            &mut recovered,
+            custodian,
+            Command::CloseCheckpoint { checkpoint: first },
+        );
+    }
+    let mut recovered = State::decode_base(&initial, recovered.encode_base()).unwrap();
+    assert_eq!(
+        apply(&mut recovered, custodian, withdraw).outcome,
+        Ok(Outcome::ObjectWithdrawn(fence))
+    );
 }

@@ -48,3 +48,26 @@ Its premises are the decoder projection, the digest-bound adopted roots, and the
 Logkeeper `main` carries the implementation at `895bc30`, and RTDB `main` pins it from `6475f29e27`.
 RTDB's crates `rtdb-replication` and `rtdb-multi` passed their full suites locally before the final rebase.
 At the push, RTDB `main` did not compile because of unrelated peer commits in `rtdb-tx`.
+
+## Exact-object withdrawal (W1)
+
+Ordered appends and checkpoint preparations may declare a complete, canonical list of immutable object names.
+The record debit includes its reference list.
+The preparation retains its references through publication and through settlement of any old root.
+A read hold retains its checkpoint and replay interval, so the same reference check covers reads.
+Opaque legacy dependencies block withdrawal until the corresponding roots, preparations, and records retire.
+After the first fence, an opaque append or preparation is refused.
+
+A custodian can fence an unreferenced name and bind the decision to an exact provider version.
+New references to the name are then refused, including references issued before the fence and delivered afterward.
+The same exact withdrawal returns the original fence and its decision coordinates after request expiry.
+Snapshot compaction and cohort repair carry the reference lists and fences.
+For voter groups, half of the prefix space above existing data and control reservations, capped at 2 MiB, funds the object control rows.
+A full reservation refuses further rows.
+Fences have stream lifetime.
+The physical custodian must independently establish that earlier I/O has drained and that the provider effect matches the version named by the receipt.
+
+`Logkeeper.ObjectWithdrawal` models one immutable object, two admission states and four reference roles.
+It proves separation after an arbitrary modeled step and constructs a reachable fence.
+The negative control permits a suffix acquisition after that fence and witnesses a violation.
+The model assumes exact references and recovery of the chosen state and does not verify the Rust codec, provider or RTDB projection.

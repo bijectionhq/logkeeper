@@ -317,6 +317,8 @@ impl Group {
             return Err(Refusal::Capacity);
         }
         let mut initial = State::new(placement, limits, checkpoint, window)?;
+        initial.object_control_bytes =
+            ((max_prefix_bytes - minimum) / 2).min(super::MAX_OBJECT_CONTROL_BYTES);
         let mut hash = Sha256::new();
         hash.update(b"logkeeper.ordered-group.v4");
         hash.update(placement.deployment.as_bytes());
