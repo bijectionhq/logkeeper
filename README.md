@@ -43,3 +43,16 @@ The `simulation` feature exposes state-machine hooks for tests, with compatibili
 The initial release extracts the journal from [RTDB Multi](https://github.com/bijectionhq/rtdb/tree/d445003c4f/rust/crates/logkeeper).
 It preserves the original on-disk records.
 RTDB's adapter continues to own its storage types, checkpoint policy, and directory membership.
+
+## Ordered journal implementation branch
+
+The `logkeeper::ordered` module implements fixed-cohort grant, append, barrier,
+checkpoint and trim decisions. Its voter transport takes an already authenticated
+channel and its replay API returns the exact journal interval of a live hold.
+Callers establish coordinator identity, worker enrollment and checkpoint custody
+at the integration boundary.
+
+The standalone daemon still serves the original protocol. The ordered
+implementation persists the accepted command prefix in full. Trim advances
+the logical replay floor. Physical reclamation, replenishment of paid append
+windows and cohort repair require their own installed-group protocols.

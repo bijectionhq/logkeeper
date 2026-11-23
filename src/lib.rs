@@ -13,6 +13,8 @@ mod protocol;
 mod local;
 mod server;
 
+pub mod ordered;
+
 pub use endpoint::{JournalEndpoint, valid_journal_identity};
 pub use error::{Error, ErrorKind, Result};
 pub use records::{AppendReceipt, LogMetadata, LogOffset, LogRecord, ReadReservation, ReplayHead};

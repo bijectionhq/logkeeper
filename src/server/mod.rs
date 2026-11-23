@@ -1,6 +1,6 @@
 //! The logkeeper server: many named streams on one data directory, served over one multiplexed protocol.
 
-mod durability;
+pub(crate) mod durability;
 mod journal;
 mod payload;
 pub(crate) mod state;
