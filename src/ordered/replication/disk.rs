@@ -496,8 +496,8 @@ fn persist(
     let digest = slot_digest(&header, &body);
     header.put_slice(&digest);
 
-    // Leave the current slot intact until both the inactive slot's body
-    // and its generation header have reached durable media.
+    // The header digest covers the whole body, so a crash between these
+    // writes can only expose a complete image or leave the prior slot in use.
     file.seek(SeekFrom::Start(HEADER as u64))?;
     file.write_all(&body)?;
     let mut old = previous.saturating_sub(body.len());
@@ -507,7 +507,6 @@ fn persist(
         file.write_all(&zeros[..count])?;
         old -= count;
     }
-    file.sync_all()?;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&header)?;
     file.sync_all()?;

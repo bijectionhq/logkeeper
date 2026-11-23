@@ -75,7 +75,8 @@ Retire old private keys once their cohort and repair signing are finished. Retai
 
 The ordered implementation can compact an accepted prefix into a bounded recovery base.
 Provisioning reserves two durable slots per voter and group.
-To select a new slot the voter syncs its exact body before the generation header, leaving the prior selected slot intact until both steps finish.
+To select a new slot the voter syncs its body and checksummed generation header together while the prior selected slot stays intact.
+Recovery verifies the combined digest before considering a slot, including when a crash partially persists an unsynced replacement.
 Before returning any promise or vote the voter installs the same promised ballot and accepted prefix in both slots, in succession.
 Either remaining valid slot therefore covers the acknowledged ballot and vote after a tear.
 A voter whose slots are both invalid cannot vote.
