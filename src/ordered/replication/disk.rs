@@ -1,5 +1,6 @@
 use super::{
-    Accepted, Ballot, Error, Fingerprint, Group, Prefix, Promise, RepairSeed, Replica, Vote,
+    Accepted, Ballot, Error, Fingerprint, Group, Prefix, Promise, RepairSeed, Replica, SlotImage,
+    SlotPair, Vote,
 };
 use crate::server::durability::sync_directory;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -160,8 +161,9 @@ impl DurableVoter {
         } else {
             recover_media(&mut slots, &mut used, &group, identity, size)?
         };
-        let selected = if let Some(known) = recovered {
-            if let Some(expected) = bootstrap
+        let installing = bootstrap.is_some();
+        let mut selected = if let Some(known) = recovered {
+            if let Some(expected) = &bootstrap
                 && (known.state.promised != expected.promised
                     || known.state.accepted.as_ref().map(|vote| &vote.prefix)
                         != expected.accepted.as_ref().map(|vote| &vote.prefix))
@@ -189,11 +191,26 @@ impl DurableVoter {
                 &selected,
                 used[0],
                 size,
-            )?;
+            )?
+            .0;
             selected
         } else {
             return Err(Error::Prefix);
         };
+        if installing {
+            let index = 1 - selected.index;
+            selected.index = index;
+            selected.generation = selected.generation.checked_add(1).ok_or(Error::Capacity)?;
+            used[index] = persist(
+                &mut slots[index],
+                group.identity,
+                identity,
+                &selected,
+                used[index],
+                size,
+            )?
+            .0;
+        }
         sync_directory(directory)?;
         if let Some((mut ticket, installed)) = ticket {
             if !installed {
@@ -355,15 +372,13 @@ impl Inner {
             return Err(Error::Deposed(promised));
         }
         let accepted = current.accepted.clone();
-        if current.promised != Some(ballot) {
-            self.install(
-                &mut media,
-                VoterState {
-                    promised: Some(ballot),
-                    accepted: accepted.clone(),
-                },
-            )?;
-        }
+        self.mirror(
+            &mut media,
+            VoterState {
+                promised: Some(ballot),
+                accepted: accepted.clone(),
+            },
+        )?;
         Ok(Promise {
             voter: self.identity,
             ballot,
@@ -377,11 +392,7 @@ impl Inner {
             return Err(Error::Prefix);
         }
         self.group.replay(&prefix)?;
-        let vote = Vote {
-            voter: self.identity,
-            ballot,
-            digest: prefix.identity(group),
-        };
+        let digest = prefix.identity(group);
         let mut media = self.media.lock();
         let current = &media.selected.as_ref().ok_or(Error::Stopped)?.state;
         match current.promised {
@@ -389,27 +400,45 @@ impl Inner {
             Some(promised) if promised == ballot => {}
             _ => return Err(Error::Group),
         }
-        if let Some(accepted) = current
+        if current
             .accepted
             .as_ref()
-            .filter(|accepted| accepted.ballot == ballot)
+            .is_some_and(|accepted| accepted.ballot == ballot && accepted.prefix != prefix)
         {
-            if accepted.prefix != prefix {
-                return Err(Error::Diverged);
-            }
-            return Ok(vote);
+            return Err(Error::Diverged);
         }
-        self.install(
+        let slots = self.mirror(
             &mut media,
             VoterState {
                 promised: Some(ballot),
                 accepted: Some(Accepted { ballot, prefix }),
             },
         )?;
-        Ok(vote)
+        Ok(Vote {
+            voter: self.identity,
+            ballot,
+            digest,
+            slots,
+        })
     }
 
-    fn install(&self, media: &mut Media, next: VoterState) -> Result<(), Error> {
+    fn mirror(&self, media: &mut Media, next: VoterState) -> Result<SlotPair, Error> {
+        // A torn slot must never roll back an acknowledged vote or the
+        // promise that prevented an older proposer from completing.
+        let (_, alternate) = self.install(media, next.clone())?;
+        let (selected, image) = self.install(media, next)?;
+        let images = if selected == 0 {
+            [image, alternate]
+        } else {
+            [alternate, image]
+        };
+        Ok(SlotPair {
+            selected: selected as u8,
+            images,
+        })
+    }
+
+    fn install(&self, media: &mut Media, next: VoterState) -> Result<(usize, SlotImage), Error> {
         let prior = media.selected.take().ok_or(Error::Stopped)?;
         let index = 1 - prior.index;
         let generation = prior.generation.checked_add(1).ok_or(Error::Capacity)?;
@@ -424,7 +453,7 @@ impl Inner {
             .checked_add(MAX_HEADER_BYTES)
             .ok_or(Error::Capacity)?;
         let previous = media.used[index];
-        media.used[index] = persist(
+        let (used, digest) = persist(
             &mut media.slots[index],
             self.group.identity,
             self.identity,
@@ -432,8 +461,9 @@ impl Inner {
             previous,
             size,
         )?;
+        media.used[index] = used;
         media.selected = Some(selected);
-        Ok(())
+        Ok((index, SlotImage { generation, digest }))
     }
 }
 
@@ -444,7 +474,7 @@ fn persist(
     selected: &Selected,
     previous: usize,
     size: usize,
-) -> Result<usize, Error> {
+) -> Result<(usize, Fingerprint), Error> {
     let mut body = BytesMut::new();
     put_ballot(&mut body, selected.state.promised);
     match &selected.state.accepted {
@@ -481,7 +511,7 @@ fn persist(
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&header)?;
     file.sync_all()?;
-    Ok(body.len())
+    Ok((body.len(), digest))
 }
 
 fn recover_slot(
@@ -696,5 +726,271 @@ mod tests {
             retried.state().command_history(),
             chosen.state().command_history()
         );
+    }
+
+    #[tokio::test]
+    async fn rotation_fences_both_slots_across_changed_majorities_and_repair() {
+        use crate::ordered::{AppendClass, CheckpointPreparation};
+
+        let voters = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let placement = Placement {
+            deployment: Uuid::new_v4(),
+            incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(),
+            generation: 1,
+        };
+        let base = Checkpoint {
+            cut: Cut {
+                next_lsn: 0,
+                history: [1; 32],
+            },
+            root: [0; 32],
+            manifest: [0; 32],
+            custody: Custody {
+                allocation: Uuid::new_v4(),
+                revision: 1,
+                provider: [0; 32],
+            },
+        };
+        let limits = Limits {
+            enrolled_workers: 1,
+            replay_holds: 2,
+            retry_positions: 16,
+            retained_data_bytes: 4096,
+            maintenance_bytes: 1024,
+            serving_lease: 30_000,
+            clock_drift: 1000,
+        };
+        let window = Window {
+            allocation: Uuid::new_v4(),
+            serial: 1,
+            bytes: 1024,
+        };
+        let group = Group::new(placement, limits, base, window, voters, 64 << 10).unwrap();
+        let volumes = voters.map(|_| tempfile::tempdir().unwrap());
+        let peers = voters
+            .iter()
+            .zip(&volumes)
+            .map(|(id, path)| DurableVoter::initialize(group.clone(), *id, path.path()).unwrap())
+            .collect::<Vec<_>>();
+        let first = [peers[0].clone(), peers[2].clone()];
+        let second = [peers[0].clone(), peers[1].clone()];
+        let third = [peers[1].clone(), peers[2].clone()];
+        let request = |round: u64, principal, command| Request {
+            placement,
+            principal,
+            id: RequestId::fresh(round - 1, 16).unwrap(),
+            command,
+        };
+        let enrollment = group
+            .choose(
+                &first,
+                1,
+                request(
+                    1,
+                    Principal::Administrator,
+                    Command::Enroll {
+                        worker: Uuid::new_v4(),
+                        expected: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let Ok(Outcome::Enrolled(enrolled)) = enrollment.receipt().outcome else {
+            panic!()
+        };
+        let worker = Principal::Worker(enrolled);
+        let grant = group
+            .choose(
+                &first,
+                2,
+                request(
+                    2,
+                    worker,
+                    Command::Grant {
+                        expected: enrollment.state().writer_state(),
+                        candidate: enrolled,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let Ok(Outcome::Granted { grant, .. }) = grant.receipt().outcome else {
+            panic!()
+        };
+        let append = group
+            .choose(
+                &first,
+                3,
+                request(
+                    3,
+                    worker,
+                    Command::Append {
+                        class: AppendClass::Data,
+                        grant,
+                        expected_next: 0,
+                        timestamp: 1,
+                        payload: Bytes::from_static(b"old"),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let checkpoint = Checkpoint {
+            cut: append.state().head(),
+            root: [2; 32],
+            manifest: [3; 32],
+            custody: Custody {
+                allocation: Uuid::new_v4(),
+                revision: 2,
+                provider: [4; 32],
+            },
+        };
+        let prepare = group
+            .choose(
+                &second,
+                4,
+                request(
+                    4,
+                    Principal::Custodian,
+                    Command::PrepareCheckpoint {
+                        preparation: CheckpointPreparation {
+                            checkpoint: checkpoint.cut,
+                            root: checkpoint.root,
+                            source: grant,
+                            base,
+                            custody: checkpoint.custody,
+                            usable_bytes: 64,
+                            descriptor: [5; 32],
+                        },
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            prepare.receipt().outcome,
+            Ok(Outcome::CheckpointPrepared(_))
+        ));
+        let publish = group
+            .choose(
+                &second,
+                5,
+                request(5, Principal::Custodian, Command::Publish { checkpoint }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            publish.receipt().outcome,
+            Ok(Outcome::Published(checkpoint))
+        );
+        let invocation = request(6, worker, Command::RotateKey { grant, checkpoint });
+        let rotation = group.choose(&third, 6, invocation.clone()).await.unwrap();
+        let evidence = rotation.rotation_slots(&invocation).unwrap();
+        let witness = evidence
+            .voters
+            .iter()
+            .find(|entry| entry.voter == voters[2])
+            .unwrap();
+        let selected = peers[2].inner.media.lock().selected.as_ref().unwrap().index;
+        assert_eq!(usize::from(witness.slots.selected), selected);
+        drop(first);
+        drop(second);
+        drop(third);
+        let [stale, other, torn]: [DurableVoter; 3] = peers.try_into().ok().unwrap();
+        drop(torn);
+        tear_slot(volumes[2].path(), selected);
+        let reopened = DurableVoter::recover(group.clone(), voters[2], volumes[2].path()).unwrap();
+        {
+            let media = reopened.inner.media.lock();
+            let recovered = media.selected.as_ref().unwrap();
+            assert_eq!(recovered.index, 1 - selected);
+            let accepted = recovered.state.accepted.as_ref().unwrap();
+            let state = group.replay(&accepted.prefix).unwrap();
+            assert_eq!(
+                state.checkpoint(),
+                checkpoint,
+                "alternate slot crossed the rotation fence backward"
+            );
+            assert_eq!(state.key_generation, 2);
+            assert_eq!(accepted.prefix.identity(group.identity()), evidence.prefix);
+            let image = witness.slots.images[recovered.index];
+            assert_eq!(recovered.generation, image.generation);
+            let mut file = File::open(volumes[2].path().join(SLOTS[recovered.index])).unwrap();
+            file.seek(SeekFrom::Start((HEADER - 32) as u64)).unwrap();
+            let mut digest = [0; 32];
+            file.read_exact(&mut digest).unwrap();
+            assert_eq!(digest, image.digest);
+        }
+
+        let changed = [stale, reopened];
+        assert_eq!(
+            group.recover(&changed, 7).await.unwrap().checkpoint(),
+            checkpoint
+        );
+        let successor_voters = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let successor = Group::new(placement, limits, base, window, successor_voters, 64 << 10)
+            .unwrap()
+            .successor(group.identity())
+            .unwrap();
+        let seal = request(
+            7,
+            Principal::Administrator,
+            Command::SealCohort {
+                expected: group.identity(),
+                successor: successor.identity(),
+            },
+        );
+        let sealed = group.choose(&changed, 8, seal).await.unwrap();
+        assert_eq!(
+            sealed.receipt().outcome,
+            Ok(Outcome::CohortSealed(successor.identity()))
+        );
+        let [_, reopened] = changed;
+        let selected = reopened.inner.media.lock().selected.as_ref().unwrap().index;
+        drop(reopened);
+        tear_slot(volumes[2].path(), selected);
+        let reopened = DurableVoter::recover(group.clone(), voters[2], volumes[2].path()).unwrap();
+        let seed = group
+            .repair_seed(&[other, reopened], 9, &successor)
+            .await
+            .unwrap();
+
+        let mut replacements = Vec::new();
+        let mut replacement_media = Vec::new();
+        for (offset, voter) in successor_voters[..2].iter().copied().enumerate() {
+            let directory = tempfile::tempdir().unwrap();
+            DurableVoter::reserve_repair(&successor, voter, directory.path()).unwrap();
+            let disk = DurableVoter::initialize_repaired(
+                successor.clone(),
+                voter,
+                directory.path(),
+                &seed,
+            )
+            .unwrap();
+            drop(disk);
+            tear_slot(directory.path(), offset);
+            replacements
+                .push(DurableVoter::recover(successor.clone(), voter, directory.path()).unwrap());
+            replacement_media.push(directory);
+        }
+        let retried = successor
+            .choose(&replacements, 2, invocation.clone())
+            .await
+            .unwrap();
+        assert_eq!(retried.receipt(), rotation.receipt());
+        let repaired_evidence = retried.rotation_slots(&invocation).unwrap();
+        assert_eq!(repaired_evidence.group, successor.identity());
+        assert_eq!(repaired_evidence.checkpoint, checkpoint);
+    }
+
+    fn tear_slot(directory: &Path, index: usize) {
+        let mut torn = OpenOptions::new()
+            .write(true)
+            .open(directory.join(SLOTS[index]))
+            .unwrap();
+        torn.write_all(&[0; HEADER]).unwrap();
+        torn.sync_all().unwrap();
     }
 }

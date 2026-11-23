@@ -1062,11 +1062,24 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     let (_, service::wire::Operation::Execute(decoded)) =
         service::wire::Operation::decode(frame).unwrap() else { panic!("not a rotation request"); };
     assert_eq!(decoded, request);
-    let receipt = state.apply(state.position() + 1, state.time(), decoded).unwrap();
-    let reply = service::wire::Reply::Decision(service::wire::Decision { receipt, barrier: None });
-    let service::wire::Reply::Decision(decision) = service::wire::Reply::decode(reply.encode()).unwrap()
-        else { panic!("not a decision reply"); };
-    let Ok(Outcome::Granted { grant: new, recovery }) = decision.receipt.outcome else {
+    let receipt = state
+        .apply(state.position() + 1, state.time(), decoded)
+        .unwrap();
+    let reply = service::wire::Reply::Decision(service::wire::Decision {
+        receipt,
+        barrier: None,
+        rotation: None,
+    });
+    let service::wire::Reply::Decision(decision) =
+        service::wire::Reply::decode(reply.encode()).unwrap()
+    else {
+        panic!("not a decision reply");
+    };
+    let Ok(Outcome::Granted {
+        grant: new,
+        recovery,
+    }) = decision.receipt.outcome
+    else {
         panic!("rotation was refused");
     };
     assert_eq!(new, Grant { enrollment, epoch: old.epoch + 1, key_generation: 2 });

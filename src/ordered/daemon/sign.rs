@@ -1,6 +1,6 @@
 use crate::ordered::{
-    BarrierClaim, Command, Fingerprint, Placement, Principal, Request,
-    service::wire::{Signature, SignedBarrier},
+    BarrierClaim, Command, Fingerprint, Placement, Principal, Receipt, Request,
+    service::wire::{Signature, SignedBarrier, SignedRotationSlots},
 };
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use sha2::{Digest, Sha256};
@@ -20,10 +20,6 @@ impl Issuer {
             .map_err(|_| super::invalid("invalid read receipt key"))?;
         let identity = Sha256::digest(key.public_key().as_ref()).into();
         Ok(Self { identity, key })
-    }
-
-    pub(super) fn sign(&self, claim: BarrierClaim) -> io::Result<Signature> {
-        self.sign_bytes(&claim.encode())
     }
 
     pub(super) fn public_key(&self) -> [u8; 32] {
@@ -97,12 +93,33 @@ impl BarrierVerifier {
                 "read receipt addresses a different invocation",
             ));
         }
+        self.verify_signature(proof.signature, &claim.encode())?;
+        Ok(claim)
+    }
+
+    pub(super) fn verify_rotation(
+        &self,
+        proof: &SignedRotationSlots,
+        group: Fingerprint,
+        receipt: Receipt,
+    ) -> io::Result<()> {
+        if receipt.placement != self.scope
+            || proof.evidence.group != group
+            || !proof.evidence.covers(receipt)
+        {
+            return Err(super::invalid(
+                "rotation slots address a different installed decision",
+            ));
+        }
+        self.verify_signature(proof.signature, &proof.evidence.signing_bytes(receipt))
+    }
+
+    fn verify_signature(&self, signature: Signature, body: &[u8]) -> io::Result<()> {
         let authority = self
             .keys
-            .get(&proof.signature.issuer)
-            .ok_or_else(|| super::invalid("unrecognized read receipt key"))?;
-        verify_bytes(authority, &claim.encode(), &proof.signature.proof)?;
-        Ok(claim)
+            .get(&signature.issuer)
+            .ok_or_else(|| super::invalid("unrecognized journal receipt key"))?;
+        verify_bytes(authority, body, &signature.proof)
     }
 }
 
@@ -114,6 +131,7 @@ mod tests {
     use crate::ordered::{
         Checkpoint, Custody, Cut, Enrollment, Grant, Hold, Limits, Outcome, Receipt, RequestId,
         Window,
+        replication::{Ballot, RotationSlots, SlotImage, SlotPair, VoterSlots},
     };
     use ring::rand::SystemRandom;
     use uuid::Uuid;
@@ -170,7 +188,7 @@ mod tests {
             };
             let signed = SignedBarrier {
                 claim,
-                signature: issuer.sign(claim).unwrap(),
+                signature: issuer.sign_bytes(&claim.encode()).unwrap(),
             };
             (request, signed)
         };
@@ -242,7 +260,14 @@ mod tests {
                 read: old.claim.read(),
             }),
         };
-        let encode = |receipt, barrier| Reply::Decision(Decision { receipt, barrier }).encode();
+        let encode = |receipt, barrier| {
+            Reply::Decision(Decision {
+                receipt,
+                barrier,
+                rotation: None,
+            })
+            .encode()
+        };
         let encoded = encode(receipt, Some(old));
         let Ok(Reply::Decision(decoded)) = Reply::decode(encoded.clone()) else {
             panic!("the genuine barrier did not round-trip");
@@ -275,6 +300,130 @@ mod tests {
         };
         assert!(Reply::decode(encode(refused, None)).is_ok());
         assert!(Reply::decode(encode(refused, Some(old))).is_err());
+    }
+
+    #[test]
+    fn a_rotation_signature_binds_both_images_of_each_voter_and_the_exact_decision() {
+        let issuer = issuer();
+        let placement = Placement {
+            deployment: Uuid::new_v4(),
+            incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(),
+            generation: 1,
+        };
+        let checkpoint = Checkpoint {
+            cut: Cut {
+                next_lsn: 5,
+                history: [1; 32],
+            },
+            root: [2; 32],
+            manifest: [3; 32],
+            custody: Custody {
+                allocation: Uuid::new_v4(),
+                revision: 1,
+                provider: [4; 32],
+            },
+        };
+        let grant = Grant {
+            enrollment: Enrollment {
+                worker: Uuid::new_v4(),
+                serial: 1,
+            },
+            epoch: 2,
+            key_generation: 2,
+        };
+        let request = RequestId::fresh(5, 16).unwrap();
+        let receipt = Receipt {
+            placement,
+            principal: Principal::Worker(grant.enrollment),
+            request,
+            position: 6,
+            outcome: Ok(Outcome::Granted {
+                grant,
+                recovery: Hold {
+                    id: request,
+                    owner: grant.enrollment,
+                    admitted_at: 6,
+                    checkpoint,
+                    start: checkpoint.cut,
+                    through: checkpoint.cut,
+                },
+            }),
+        };
+        let slots = SlotPair {
+            selected: 1,
+            images: [
+                SlotImage {
+                    generation: 7,
+                    digest: [5; 32],
+                },
+                SlotImage {
+                    generation: 8,
+                    digest: [6; 32],
+                },
+            ],
+        };
+        let evidence = RotationSlots {
+            group: [7; 32],
+            cohort_size: 3,
+            ballot: Ballot {
+                round: 8,
+                nonce: Uuid::new_v4(),
+            },
+            prefix: [8; 32],
+            position: 6,
+            checkpoint,
+            key_generation: 2,
+            voters: [1, 2]
+                .map(|id| VoterSlots {
+                    voter: Uuid::from_u128(id),
+                    slots,
+                })
+                .to_vec(),
+        };
+        let proof = SignedRotationSlots {
+            signature: issuer.sign_bytes(&evidence.signing_bytes(receipt)).unwrap(),
+            evidence,
+        };
+        let verifier = BarrierVerifier::new(placement, [issuer.public_key()]).unwrap();
+        let decision = Decision {
+            receipt,
+            barrier: None,
+            rotation: Some(proof.clone()),
+        };
+        let encoded = Reply::Decision(decision.clone()).encode();
+        let Ok(Reply::Decision(decoded)) = Reply::decode(encoded.clone()) else {
+            panic!("rotation proof did not round-trip");
+        };
+        assert_eq!(decoded, decision);
+        verifier
+            .verify_rotation(&proof, proof.evidence.group, receipt)
+            .unwrap();
+        assert!(verifier.verify_rotation(&proof, [9; 32], receipt).is_err());
+        let other_request = Receipt {
+            request: RequestId::fresh(5, 16).unwrap(),
+            ..receipt
+        };
+        assert!(
+            verifier
+                .verify_rotation(&proof, proof.evidence.group, other_request)
+                .is_err()
+        );
+        for voter in 0..2 {
+            for slot in 0..2 {
+                let mut changed = proof.clone();
+                changed.evidence.voters[voter].slots.images[slot].digest = [42; 32];
+                assert!(changed.evidence.covers(receipt));
+                assert!(
+                    verifier
+                        .verify_rotation(&changed, proof.evidence.group, receipt)
+                        .is_err()
+                );
+            }
+        }
+        let mut truncated = encoded.to_vec();
+        truncated.pop();
+        assert!(Reply::decode(truncated.into()).is_err());
     }
 
     fn issuer() -> Issuer {

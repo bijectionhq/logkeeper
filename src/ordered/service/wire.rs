@@ -2,9 +2,9 @@
 
 use super::{Coordinator, Error, ReplayHead, ReplayPage, Route, Session, WithdrawnWorker};
 use crate::ordered::{
-    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment, Fingerprint,
-    Grant, Hold, Outcome, Placement, Receipt, Refusal, Request, append_fingerprint,
-    replication::Replica,
+    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment,
+    Fingerprint, Grant, Hold, Outcome, Placement, Receipt, Refusal, Request, append_fingerprint,
+    replication::{Replica, RotationSlots},
 };
 use bytes::Bytes;
 use std::io;
@@ -12,7 +12,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-const MAGIC: &[u8; 8] = b"LKAPPC09";
+const MAGIC: &[u8; 8] = b"LKAPPC10";
 const REPLAY_OVERHEAD: usize = 1 + 160 + 40 + 8;
 const WITHDRAWN_WORKERS_OVERHEAD: usize = 1 + 1;
 const WITHDRAWN_WORKER_MAX_BYTES: usize = 16 + 8 + 1 + 8;
@@ -81,10 +81,17 @@ pub struct SignedBarrier {
     pub signature: Signature,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedRotationSlots {
+    pub evidence: RotationSlots,
+    pub signature: Signature,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub receipt: Receipt,
     pub barrier: Option<SignedBarrier>,
+    pub rotation: Option<SignedRotationSlots>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,7 +135,7 @@ pub async fn serve<R: Replica>(
     session: Session,
     maximum_frame: usize,
     deadline: Duration,
-    sign: impl FnOnce(BarrierClaim) -> io::Result<Signature>,
+    sign: impl Fn(&[u8]) -> io::Result<Signature>,
 ) -> Result<(), WireError> {
     timeout(deadline, async {
         let frame = read_frame(&mut channel, maximum_frame).await?;
@@ -146,13 +153,24 @@ pub async fn serve<R: Replica>(
                         .map(|claim| {
                             Ok::<_, io::Error>(SignedBarrier {
                                 claim,
-                                signature: sign(claim)?,
+                                signature: sign(&claim.encode())?,
+                            })
+                        })
+                        .transpose()?;
+                    let rotation = decision
+                        .rotation
+                        .map(|evidence| {
+                            let signature = sign(&evidence.signing_bytes(decision.receipt))?;
+                            Ok::<_, io::Error>(SignedRotationSlots {
+                                evidence,
+                                signature,
                             })
                         })
                         .transpose()?;
                     Ok(Reply::Decision(Decision {
                         receipt: decision.receipt,
                         barrier,
+                        rotation,
                     }))
                 }
                 Err(error) => Err(error),
@@ -257,6 +275,11 @@ impl Reply {
                 decision.receipt.placement == placement
                     && decision.receipt.principal == request.principal
                     && decision.receipt.request == request.id
+                    && decision.rotation.as_ref().is_none_or(|proof| {
+                        matches!(request.command, Command::RotateKey { grant, checkpoint }
+                            if checkpoint == proof.evidence.checkpoint
+                                && grant.key_generation.checked_add(1) == Some(proof.evidence.key_generation))
+                    })
                     && match (&request.command, decision.receipt.outcome) {
                         (
                             Command::Barrier { grant },

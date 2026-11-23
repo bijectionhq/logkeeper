@@ -1,13 +1,14 @@
 use super::{
-    Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, placement, principal,
-    request_id, snapshot, window, writer_state,
+    Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, placement,
+    principal, request_id, snapshot, uuid, window, writer_state,
 };
 use crate::ordered::RetainedCheckpoint;
 use crate::ordered::{
     BarrierClaim, Outcome, Placement, Principal, Receipt, Refusal, Request,
+    replication::{Ballot, RotationSlots, SlotImage, SlotPair, VoterSlots},
     service::{
         MAX_WITHDRAWN_WORKERS, ReplayHead, ReplayPage, Route, WithdrawnWorker,
-        wire::{Decision, Operation, Reply, Signature, SignedBarrier},
+        wire::{Decision, Operation, Reply, Signature, SignedBarrier, SignedRotationSlots},
     },
 };
 use bytes::{BufMut, Bytes, BytesMut};
@@ -174,18 +175,21 @@ impl Reply {
                 output.put_u64(route.clock_drift);
             }
             Self::Decision(decision) => {
-                output.put_u8(1);
-                let receipt = decision.receipt;
-                placement(&mut output, receipt.placement);
-                principal(&mut output, receipt.principal);
-                request_id(&mut output, receipt.request);
-                output.put_u64(receipt.position);
-                snapshot::result(&mut output, receipt.outcome);
-                output.put_u8(u8::from(decision.barrier.is_some()));
-                if let Some(barrier) = decision.barrier {
-                    output.put_slice(&barrier.signature.issuer);
-                    output.put_slice(&barrier.signature.proof);
-                    output.put_slice(&barrier.claim.encode());
+                if let Some(proof) = &decision.rotation {
+                    output.put_u8(9);
+                    receipt(&mut output, decision.receipt);
+                    output.put_slice(&proof.signature.issuer);
+                    output.put_slice(&proof.signature.proof);
+                    proof.evidence.encode(&mut output);
+                } else {
+                    output.put_u8(1);
+                    receipt(&mut output, decision.receipt);
+                    output.put_u8(u8::from(decision.barrier.is_some()));
+                    if let Some(barrier) = decision.barrier {
+                        output.put_slice(&barrier.signature.issuer);
+                        output.put_slice(&barrier.signature.proof);
+                        output.put_slice(&barrier.claim.encode());
+                    }
                 }
             }
             Self::Reconciled(append) => {
@@ -310,21 +314,64 @@ impl Reply {
                 }
                 Self::WithdrawnWorkers(workers)
             }
+            9 => Self::Decision(input.rotation_decision()?),
             _ => return Err(Refusal::Invalid),
         };
         input.finish(reply)
     }
 }
 
+fn receipt(output: &mut BytesMut, receipt: Receipt) {
+    placement(output, receipt.placement);
+    principal(output, receipt.principal);
+    request_id(output, receipt.request);
+    output.put_u64(receipt.position);
+    snapshot::result(output, receipt.outcome);
+}
+
+impl RotationSlots {
+    pub(in crate::ordered) fn signing_bytes(&self, decision: Receipt) -> Bytes {
+        let mut output = BytesMut::new();
+        output.put_slice(b"logkeeper.ordered-rotation-slots.v1");
+        receipt(&mut output, decision);
+        self.encode(&mut output);
+        output.freeze()
+    }
+
+    fn encode(&self, output: &mut BytesMut) {
+        output.put_slice(&self.group);
+        output.put_u64(self.cohort_size as u64);
+        output.put_u64(self.ballot.round);
+        uuid(output, self.ballot.nonce);
+        output.put_slice(&self.prefix);
+        output.put_u64(self.position);
+        checkpoint(output, self.checkpoint);
+        output.put_u64(self.key_generation);
+        output.put_u64(self.voters.len() as u64);
+        for voter in &self.voters {
+            uuid(output, voter.voter);
+            output.put_u8(voter.slots.selected);
+            for image in voter.slots.images {
+                output.put_u64(image.generation);
+                output.put_slice(&image.digest);
+            }
+        }
+    }
+}
+
 impl Input {
-    fn decision(&mut self) -> Result<Decision, Refusal> {
-        let receipt = Receipt {
+    fn receipt(&mut self) -> Result<Receipt, Refusal> {
+        Ok(Receipt {
             placement: self.placement()?,
             principal: self.principal()?,
             request: self.request_id()?,
             position: self.u64()?,
             outcome: self.result()?,
-        };
+        })
+    }
+
+    fn decision(&mut self) -> Result<Decision, Refusal> {
+        let receipt = self.receipt()?;
         let barrier = self.optional(|input| {
             let signature = Signature {
                 issuer: input.take()?,
@@ -344,7 +391,62 @@ impl Input {
             (Ok(Outcome::Barrier { .. }), _) | (_, Some(_)) => return Err(Refusal::Invalid),
             (_, None) => {}
         }
-        Ok(Decision { receipt, barrier })
+        Ok(Decision {
+            receipt,
+            barrier,
+            rotation: None,
+        })
+    }
+
+    fn rotation_decision(&mut self) -> Result<Decision, Refusal> {
+        let receipt = self.receipt()?;
+        let signature = Signature {
+            issuer: self.take()?,
+            proof: self.take()?,
+        };
+        let mut evidence = RotationSlots {
+            group: self.take()?,
+            cohort_size: usize::try_from(self.u64()?).map_err(|_| Refusal::Invalid)?,
+            ballot: Ballot {
+                round: self.u64()?,
+                nonce: self.uuid()?,
+            },
+            prefix: self.take()?,
+            position: self.u64()?,
+            checkpoint: self.checkpoint()?,
+            key_generation: self.u64()?,
+            voters: Vec::new(),
+        };
+        const VOTER_BYTES: usize = 16 + 1 + 2 * (8 + 32);
+        let count = self.count(self.0.len().saturating_sub(8) / VOTER_BYTES)?;
+        for _ in 0..count {
+            let voter = self.uuid()?;
+            let selected = self.read_byte()?;
+            let mut image = || -> Result<SlotImage, Refusal> {
+                Ok(SlotImage {
+                    generation: self.u64()?,
+                    digest: self.take()?,
+                })
+            };
+            evidence.voters.push(VoterSlots {
+                voter,
+                slots: SlotPair {
+                    selected,
+                    images: [image()?, image()?],
+                },
+            });
+        }
+        if !evidence.covers(receipt) {
+            return Err(Refusal::Invalid);
+        }
+        Ok(Decision {
+            receipt,
+            barrier: None,
+            rotation: Some(SignedRotationSlots {
+                evidence,
+                signature,
+            }),
+        })
     }
 
     fn finish<T>(self, value: T) -> Result<T, Refusal> {

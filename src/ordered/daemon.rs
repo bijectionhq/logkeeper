@@ -470,7 +470,7 @@ async fn dispatch(
                 session,
                 room.max_frame,
                 deadline,
-                |claim| issuer.sign(claim),
+                |body| issuer.sign_bytes(body),
             )
             .await?;
         }
@@ -632,9 +632,14 @@ impl Client {
                 .await?;
                 if let (Reply::Decision(decision), Operation::Execute(original)) =
                     (&reply, operation)
-                    && let Some(proof) = decision.barrier
                 {
-                    self.barriers.verify(proof, original)?;
+                    if let Some(proof) = decision.barrier {
+                        self.barriers.verify(proof, original)?;
+                    }
+                    if let Some(proof) = &decision.rotation {
+                        self.barriers
+                            .verify_rotation(proof, group, decision.receipt)?;
+                    }
                 }
                 Ok(reply)
             })

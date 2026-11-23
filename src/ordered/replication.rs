@@ -11,8 +11,8 @@ pub mod transport;
 pub use disk::DurableVoter;
 
 use super::{
-    BarrierClaim, Checkpoint, Fingerprint, Limits, Outcome, Placement, Receipt, Refusal, Request,
-    State, Window,
+    BarrierClaim, Checkpoint, Command, Fingerprint, Limits, Outcome, Placement, Receipt, Refusal,
+    Request, State, Window,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -95,17 +95,99 @@ pub struct Promise {
     pub accepted: Option<Accepted>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotImage {
+    pub generation: u64,
+    pub digest: Fingerprint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotPair {
+    /// Index of the selected image in the physical A/B order.
+    pub selected: u8,
+    pub images: [SlotImage; 2],
+}
+
+impl SlotPair {
+    pub fn is_mirrored(&self) -> bool {
+        let Some(selected) = self.images.get(usize::from(self.selected)) else {
+            return false;
+        };
+        let alternate = self.images[1 - usize::from(self.selected)];
+        alternate.generation != 0
+            && alternate.generation.checked_add(1) == Some(selected.generation)
+            && alternate.digest != [0; 32]
+            && selected.digest != [0; 32]
+            && alternate.digest != selected.digest
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Vote {
     pub voter: Uuid,
     pub ballot: Ballot,
     pub digest: Fingerprint,
+    pub slots: SlotPair,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoterSlots {
+    pub voter: Uuid,
+    pub slots: SlotPair,
+}
+
+/// Both images on each member of an accepting majority encode the named
+/// prefix. Every later eligible recovery inherits that prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RotationSlots {
+    pub group: Fingerprint,
+    pub cohort_size: usize,
+    pub ballot: Ballot,
+    pub prefix: Fingerprint,
+    pub position: u64,
+    pub checkpoint: Checkpoint,
+    pub key_generation: u64,
+    pub voters: Vec<VoterSlots>,
+}
+
+impl RotationSlots {
+    pub fn covers(&self, receipt: Receipt) -> bool {
+        let Ok(Outcome::Granted { grant, recovery }) = receipt.outcome else {
+            return false;
+        };
+        self.group != [0; 32]
+            && self.ballot.round != 0
+            && !self.ballot.nonce.is_nil()
+            && self.prefix != [0; 32]
+            && receipt.position != 0
+            && self.position >= receipt.position
+            && self.checkpoint == recovery.checkpoint
+            && recovery.admitted_at == receipt.position
+            && recovery.start == self.checkpoint.cut
+            && recovery.through == self.checkpoint.cut
+            && self.key_generation == grant.key_generation
+            && self.key_generation > 1
+            && self.cohort_size >= 3
+            && self.cohort_size % 2 == 1
+            && self.voters.len() == self.cohort_size / 2 + 1
+            && self
+                .voters
+                .iter()
+                .all(|v| !v.voter.is_nil() && v.slots.is_mirrored())
+            && self
+                .voters
+                .windows(2)
+                .all(|pair| pair[0].voter < pair[1].voter)
+    }
 }
 
 pub struct Chosen {
+    group: Fingerprint,
+    cohort_size: usize,
     ballot: Ballot,
     prefix: Fingerprint,
     voters: Vec<Uuid>,
+    images: Vec<VoterSlots>,
     receipt: Receipt,
     state: State,
 }
@@ -138,6 +220,37 @@ impl Chosen {
             grant,
             read,
         })
+    }
+
+    /// A retained rotation can be attested again while the recovered head
+    /// still serves from its exact clean checkpoint and generation.
+    pub(in crate::ordered) fn rotation_slots(&self, request: &Request) -> Option<RotationSlots> {
+        let Command::RotateKey { grant, checkpoint } = request.command else {
+            return None;
+        };
+        if request.placement != self.receipt.placement
+            || request.principal != self.receipt.principal
+            || request.id != self.receipt.request
+            || grant.key_generation.checked_add(1) != Some(self.state.key_generation)
+            || checkpoint != self.state.checkpoint()
+            || self.state.records.iter().any(|record| {
+                record.result.lsn >= checkpoint.cut.next_lsn
+                    && record.grant.key_generation != self.state.key_generation
+            })
+        {
+            return None;
+        }
+        let evidence = RotationSlots {
+            group: self.group,
+            cohort_size: self.cohort_size,
+            ballot: self.ballot,
+            prefix: self.prefix,
+            position: self.state.position(),
+            checkpoint,
+            key_generation: self.state.key_generation,
+            voters: self.images.clone(),
+        };
+        evidence.covers(self.receipt).then_some(evidence)
     }
 }
 
@@ -569,11 +682,14 @@ impl Group {
         };
         let ballot = prepared.ballot;
         let digest = prefix.identity(self.identity);
-        let voters = self.confirm(peers, prepared, &prefix, digest).await?;
+        let images = self.confirm(peers, prepared, &prefix, digest).await?;
         Ok(Chosen {
+            group: self.identity,
+            cohort_size: self.voters.len(),
             ballot,
             prefix: digest,
-            voters,
+            voters: images.iter().map(|evidence| evidence.voter).collect(),
+            images,
             receipt,
             state,
         })
@@ -648,7 +764,7 @@ impl Group {
         prepared: PreparedRound,
         prefix: &Prefix,
         digest: Fingerprint,
-    ) -> Result<Vec<Uuid>, Error> {
+    ) -> Result<Vec<VoterSlots>, Error> {
         let PreparedRound {
             ballot,
             voters: promised,
@@ -664,15 +780,22 @@ impl Group {
                 )
             })
             .collect();
-        let mut voters = BTreeSet::new();
+        let mut voters = Vec::with_capacity(self.quorum());
         while let Some((expected, reply)) = accepts.next().await {
             match reply {
                 Ok(vote)
-                    if vote.voter == expected && vote.ballot == ballot && vote.digest == digest =>
+                    if vote.voter == expected
+                        && vote.ballot == ballot
+                        && vote.digest == digest
+                        && vote.slots.is_mirrored() =>
                 {
-                    voters.insert(expected);
+                    voters.push(VoterSlots {
+                        voter: expected,
+                        slots: vote.slots,
+                    });
                     if voters.len() >= self.quorum() {
-                        return Ok(voters.into_iter().collect());
+                        voters.sort_unstable_by_key(|evidence| evidence.voter);
+                        return Ok(voters);
                     }
                 }
                 Err(Error::Deposed(newer)) => {

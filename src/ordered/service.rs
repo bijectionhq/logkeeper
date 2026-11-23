@@ -5,10 +5,10 @@
 //! handing a request to this service.
 
 use super::{
-    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment, Fingerprint,
-    Grant, Hold, Outcome, Placement, Principal, Receipt, Record, Refusal, Request, RequestId,
-    RetainedCheckpoint, State, Window, WriterState,
-    replication::{self, Group, Replica},
+    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment,
+    Fingerprint, Grant, Hold, Outcome, Placement, Principal, Receipt, Record, Refusal, Request,
+    RequestId, RetainedCheckpoint, State, Window, WriterState,
+    replication::{self, Group, Replica, RotationSlots},
 };
 use std::future::Future;
 use tokio::sync::Mutex;
@@ -61,10 +61,11 @@ pub struct Route {
     pub clock_drift: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     pub receipt: Receipt,
     pub barrier: Option<BarrierClaim>,
+    pub rotation: Option<RotationSlots>,
 }
 
 pub struct ReplayPage {
@@ -230,6 +231,7 @@ impl<R: Replica> Coordinator<R> {
         Ok(Decision {
             receipt: chosen.receipt(),
             barrier: chosen.barrier_claim(),
+            rotation: chosen.rotation_slots(&request),
         })
     }
 

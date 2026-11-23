@@ -5,7 +5,8 @@
 //! checked against that authorized scope.
 
 use super::{
-    Accepted, Ballot, DurableVoter, Error, Fingerprint, Group, Prefix, Promise, Replica, Vote,
+    Accepted, Ballot, DurableVoter, Error, Fingerprint, Group, Prefix, Promise, Replica, SlotImage,
+    SlotPair, Vote,
 };
 use bytes::{Bytes, BytesMut};
 use std::future::Future;
@@ -15,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-const MAGIC: &[u8; 8] = b"LKORPC02";
+const MAGIC: &[u8; 8] = b"LKORPC03";
 const PREPARE: u8 = 1;
 const ACCEPT: u8 = 2;
 const PROMISE: u8 = 3;
@@ -149,10 +150,22 @@ impl<C: Connector> Replica for RemoteVoter<C> {
             channel.flush().await?;
             self.response(&mut channel, VOTE, ballot).await?;
             let digest = read_array(&mut channel).await?;
+            let selected = channel.read_u8().await?;
+            let mut read_image = async || -> Result<SlotImage, Error> {
+                Ok(SlotImage {
+                    generation: channel.read_u64().await?,
+                    digest: read_array(&mut channel).await?,
+                })
+            };
+            let slots = SlotPair {
+                selected,
+                images: [read_image().await?, read_image().await?],
+            };
             Ok(Vote {
                 voter: self.voter,
                 ballot,
                 digest,
+                slots,
             })
         })
         .await
@@ -196,6 +209,11 @@ pub async fn serve_voter(
                     Ok(vote) => {
                         response_header(&mut channel, VOTE, vote.voter, ballot).await?;
                         channel.write_all(&vote.digest).await?;
+                        channel.write_u8(vote.slots.selected).await?;
+                        for image in vote.slots.images {
+                            channel.write_u64(image.generation).await?;
+                            channel.write_all(&image.digest).await?;
+                        }
                     }
                     Err(error) => refuse(&mut channel, voter.identity(), ballot, error).await?,
                 }

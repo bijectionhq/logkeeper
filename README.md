@@ -58,11 +58,13 @@ Initialize provisions a fresh voter directory once.
 Serve recovers only installed directories and accepts mutual TLS 1.3 using the endpoint certificate pins and roles in the installed manifest.
 Peer certificates used for voter traffic have no worker or custodian role in that group.
 Application clients retain the installed route and receipt verification keys independently of the serving daemon.
-Application wire version 9 (`LKAPPC09`) adds the custodian-only withdrawn hold owner query.
+Application wire version 10 (`LKAPPC10`) adds signed rotation slot evidence and retains the custodian-only withdrawn hold owner query.
 Each page contains at most 64 distinct enrollments in enrollment order and fits the configured application frame.
 Pass the last enrollment as a cursor to continue.
 Each page reflects its own selected state and gives the journal-time threshold for expiry disposal.
-The ordered command, voter wire and compact recovery image formats are unchanged.
+Voter wire version 3 (`LKORPC03`) carries both durable image identities in every accept reply.
+Update the voter cohort and application clients together before using rotation evidence.
+The ordered command and compact recovery image formats are unchanged.
 Keep every previously trusted barrier receipt public key for the lifetime of the logical placement, including its incarnation and generation.
 Rotate signers through a cohort successor and distribute the updated trusted `ApplicationRoute.verification_keys` to clients before using its new signers.
 Set `predecessor_keys` from the immediate predecessor's active voter roster and carry older public keys in `retained_barrier_keys`.
@@ -74,6 +76,9 @@ Retire old private keys once their cohort and repair signing are finished. Retai
 The ordered implementation can compact an accepted prefix into a bounded recovery base.
 Provisioning reserves two durable slots per voter and group.
 To select a new slot the voter syncs its exact body before the generation header, leaving the prior selected slot intact until both steps finish.
+Before returning any promise or vote the voter installs the same promised ballot and accepted prefix in both slots, in succession.
+Either remaining valid slot therefore covers the acknowledged ballot and vote after a tear.
+A voter whose slots are both invalid cannot vote.
 Recovery syncs the selected slot and its directory before admitting another rotation, including after a warm restart that observes a still-volatile header.
 Reusing a slot clears residual bytes from its previous body.
 An installed voter needs a filesystem that honours file preallocation and the configured durability barriers.
@@ -81,4 +86,13 @@ Ordered window renewal preserves historical window identities and installs a fre
 Each new voter preallocates both files before joining. The volume owner funds their physical footprint, metadata and all co-resident allocations. See the [installation premises](verification/evidence.md#c9-installed-boundaries).
 A repair reserves media with `reserve-repair`, orders the exact successor with `seal-repair` on an old coordinator, and consumes the signed package with `install-repair` on each prepared successor.
 The predecessor serves no fresh commands after choosing its seal.
-The successor preserves the original writer, retained receipts, checkpoint holds and paid append cursor.
+The successor installs the exact sealed state in both slots before voting and preserves the original writer, retained receipts, checkpoint holds and paid append cursor.
+
+A successful `RotateKey` can return signed evidence of a strict accepting majority at the exact clean checkpoint and successor suffix generation.
+Each named voter reports its selected and alternate physical slot, generation and digest for the same acknowledged prefix.
+The coordinator obtains those records over authenticated voter channels and signs the rotation receipt and slot evidence together.
+The installed client verifies the signature and the cohort it contacted.
+Other voters can still hold stale local images, and every eligible recovery majority intersects the acknowledging majority.
+The surviving slot of an intersecting voter carries its acknowledged vote or a later one, allowing ranked recovery to select the rotation or a continuation.
+The same rule protects the seal through cohort repair.
+An exact rotation retry can reissue the evidence while the selected root and suffix generation still match.
