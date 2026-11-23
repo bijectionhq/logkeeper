@@ -2,8 +2,9 @@ use super::{
     Accepted, Ballot, Error, Fingerprint, Group, Prefix, Promise, RepairSeed, Replica, SlotImage,
     SlotPair, Vote,
 };
-use crate::server::durability::sync_directory;
+use crate::ordered::admission::matches_fingerprint;
 use crate::ordered::codec::frame::bounded_body_length;
+use crate::server::durability::sync_directory;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -13,6 +14,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
+
+mod mirror;
+mod selection;
+
+use selection::{
+    authenticates_body, read_back_matches, select_slot, slot_body_length, slot_header_matches,
+};
 
 const MAGIC: &[u8; 8] = b"LKORV005";
 const SLOTS: [&str; 2] = ["ordered.slot-a", "ordered.slot-b"];
@@ -309,26 +317,16 @@ fn recover_media(
     identity: Uuid,
     size: usize,
 ) -> Result<Option<Selected>, Error> {
-    let mut recovered: Option<Selected> = None;
+    let mut candidates = [None, None];
     for (index, file) in slots.iter_mut().enumerate() {
         let (written, candidate) = recover_slot(file, index, group, identity, size)?;
         used[index] = written;
-        if let Some((candidate, _)) = candidate {
-            if recovered
-                .as_ref()
-                .is_some_and(|chosen| chosen.generation == candidate.generation)
-            {
-                return Err(Error::Diverged);
-            }
-            if recovered
-                .as_ref()
-                .is_none_or(|chosen| chosen.generation < candidate.generation)
-            {
-                recovered = Some(candidate);
-            }
-        }
+        candidates[index] = candidate.map(|(selected, _)| selected);
     }
-    Ok(recovered)
+    let [first, second] = candidates
+        .each_ref()
+        .map(|slot| slot.as_ref().map(|v| v.generation));
+    Ok(select_slot(first, second)?.and_then(|index| candidates[index].take()))
 }
 
 impl Replica for DurableVoter {
@@ -450,34 +448,21 @@ impl Inner {
             let (_, image) = recover_slot(file, index, &self.group, self.identity, size)?;
             let (image, observed) = image.ok_or(Error::Prefix)?;
             let accepted = image.state.accepted.ok_or(Error::Prefix)?;
-            if (SlotImage {
-                generation: image.generation,
-                digest: observed,
-            }) != slots.images[index]
-                || image.state.promised != Some(ballot)
-                || accepted.ballot != ballot
-                || accepted.prefix.identity(self.group.identity) != digest
-            {
+            let expected = slots.images[index];
+            if !read_back_matches(
+                image.generation,
+                expected.generation,
+                &observed,
+                &expected.digest,
+                image.state.promised == Some(ballot),
+                accepted.ballot == ballot,
+                &accepted.prefix.identity(self.group.identity),
+                &digest,
+            ) {
                 return Err(Error::Prefix);
             }
         }
         Ok(())
-    }
-
-    fn mirror(&self, media: &mut Media, next: VoterState) -> Result<SlotPair, Error> {
-        // A torn slot must never roll back an acknowledged vote or the
-        // promise that prevented an older proposer from completing.
-        let (_, alternate) = self.install(media, next.clone())?;
-        let (selected, image) = self.install(media, next)?;
-        let images = if selected == 0 {
-            [image, alternate]
-        } else {
-            [alternate, image]
-        };
-        Ok(SlotPair {
-            selected: selected as u8,
-            images,
-        })
     }
 
     fn install(&self, media: &mut Media, next: VoterState) -> Result<(usize, SlotImage), Error> {
@@ -576,19 +561,22 @@ fn recover_slot(
     let witness = Uuid::from_slice(&descriptor[..16]).map_err(|_| Error::Prefix)?;
     descriptor.advance(16);
     let generation = descriptor.get_u64();
-    let Some(length) = bounded_body_length(descriptor.get_u64(), 2, payload_limit) else {
+    let Some(length) = slot_body_length(descriptor.get_u64(), payload_limit) else {
         return Ok((payload_limit, None));
     };
     let mut body = vec![0; length];
     file.read_exact(&mut body)?;
-    if &slot_digest(&header[..split], &body)[..] != &header[split..] {
+    if !authenticates_body(&slot_digest(&header[..split], &body), &header[split..]) {
         return Ok((payload_limit, None));
     }
-    if magic != u64::from_be_bytes(*MAGIC)
-        || addressed != group.identity
-        || witness != voter
-        || generation == 0
-    {
+    if !slot_header_matches(
+        magic,
+        &addressed,
+        &group.identity,
+        witness.as_u128(),
+        voter.as_u128(),
+        generation,
+    ) {
         return Err(Error::Group);
     }
     let state = load_state(group, Bytes::from(body))?;

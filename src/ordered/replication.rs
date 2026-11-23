@@ -6,9 +6,12 @@
 //! durable journals in the installed cohort.
 
 mod disk;
+mod evidence;
 pub mod transport;
 
 pub use disk::DurableVoter;
+pub use evidence::{SlotImage, SlotPair, Vote, VoterSlots};
+use evidence::{record_vote, strict_majority, valid_voters};
 
 use super::{
     BarrierClaim, Checkpoint, Command, Fingerprint, Limits, Outcome, Placement, Receipt, Refusal,
@@ -95,48 +98,6 @@ pub struct Promise {
     pub accepted: Option<Accepted>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SlotImage {
-    pub generation: u64,
-    pub digest: Fingerprint,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SlotPair {
-    /// Index of the selected image in the physical A/B order.
-    pub selected: u8,
-    pub images: [SlotImage; 2],
-}
-
-impl SlotPair {
-    pub fn is_mirrored(&self) -> bool {
-        let Some(selected) = self.images.get(usize::from(self.selected)) else {
-            return false;
-        };
-        let alternate = self.images[1 - usize::from(self.selected)];
-        alternate.generation != 0
-            && alternate.generation.checked_add(1) == Some(selected.generation)
-            && alternate.digest != [0; 32]
-            && selected.digest != [0; 32]
-            && alternate.digest != selected.digest
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Vote {
-    pub voter: Uuid,
-    pub ballot: Ballot,
-    pub digest: Fingerprint,
-    pub slots: SlotPair,
-    pub read_back: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VoterSlots {
-    pub voter: Uuid,
-    pub slots: SlotPair,
-}
-
 /// Both images on each member of an accepting majority encode the named
 /// prefix. Every later eligible recovery inherits that prefix.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -170,15 +131,8 @@ impl RotationSlots {
             && self.key_generation > 1
             && self.cohort_size >= 3
             && self.cohort_size % 2 == 1
-            && self.voters.len() == self.cohort_size / 2 + 1
-            && self
-                .voters
-                .iter()
-                .all(|v| !v.voter.is_nil() && v.slots.is_mirrored())
-            && self
-                .voters
-                .windows(2)
-                .all(|pair| pair[0].voter < pair[1].voter)
+            && self.voters.len() == strict_majority(self.cohort_size)
+            && valid_voters(&self.voters)
     }
 }
 
@@ -432,7 +386,7 @@ impl Group {
         self.max_prefix_bytes
     }
     pub fn quorum(&self) -> usize {
-        self.voters.len() / 2 + 1
+        strict_majority(self.voters.len())
     }
 
     fn replay(&self, prefix: &Prefix) -> Result<State, Error> {
@@ -792,18 +746,10 @@ impl Group {
         let mut voters = Vec::with_capacity(self.quorum());
         while let Some((expected, reply)) = accepts.next().await {
             match reply {
-                Ok(vote)
-                    if vote.voter == expected
-                        && vote.ballot == ballot
-                        && vote.digest == digest
-                        && vote.slots.is_mirrored()
-                        && vote.read_back == read_back =>
-                {
-                    voters.push(VoterSlots {
-                        voter: expected,
-                        slots: vote.slots,
-                    });
-                    if voters.len() >= self.quorum() {
+                Ok(vote) => {
+                    if record_vote(&mut voters, expected, ballot, digest, read_back, vote)
+                        && voters.len() >= self.quorum()
+                    {
                         voters.sort_unstable_by_key(|evidence| evidence.voter);
                         return Ok(voters);
                     }

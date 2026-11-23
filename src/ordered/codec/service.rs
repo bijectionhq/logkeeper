@@ -14,6 +14,8 @@ use crate::ordered::{
 };
 use bytes::{BufMut, Bytes, BytesMut};
 
+mod rotation;
+
 impl Operation {
     pub(in crate::ordered) fn encode(&self, scope: Placement) -> Bytes {
         let mut output = BytesMut::new();
@@ -346,26 +348,6 @@ impl RotationSlots {
         receipt(&mut output, decision);
         self.encode(&mut output);
         output.freeze()
-    }
-
-    fn encode(&self, output: &mut BytesMut) {
-        output.put_slice(&self.group);
-        output.put_u64(self.cohort_size as u64);
-        output.put_u64(self.ballot.round);
-        uuid(output, self.ballot.nonce);
-        output.put_slice(&self.prefix);
-        output.put_u64(self.position);
-        checkpoint(output, self.checkpoint);
-        output.put_u64(self.key_generation);
-        output.put_u64(self.voters.len() as u64);
-        for voter in &self.voters {
-            uuid(output, voter.voter);
-            output.put_u8(voter.slots.selected);
-            for image in voter.slots.images {
-                output.put_u64(image.generation);
-                output.put_slice(&image.digest);
-            }
-        }
     }
 }
 
