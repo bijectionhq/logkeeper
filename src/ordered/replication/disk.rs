@@ -16,17 +16,16 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 mod mirror;
+mod recover;
 mod selection;
 
-use selection::{MAGIC, 
-    authenticates_body, read_back_matches, select_slot, slot_body_length, slot_header_matches,
-};
+use recover::{HEADER, SlotHeader, recover_slot};
+use selection::{MAGIC, read_back_matches, select_slot};
 
 const SLOTS: [&str; 2] = ["ordered.slot-a", "ordered.slot-b"];
 const LOCK: &str = "ordered.lock";
 const RESERVATION: &str = "ordered.reserve";
 const MAX_HEADER_BYTES: usize = 256;
-const HEADER: usize = 8 + 32 + 16 + 8 + 8 + 32;
 
 #[derive(Clone)]
 pub struct DurableVoter {
@@ -434,32 +433,31 @@ impl Inner {
         })
     }
 
-    fn read_back(
+    fn read_back_slot(
         &self,
         media: &mut Media,
+        index: usize,
+        size: usize,
         ballot: Ballot,
         digest: Fingerprint,
-        slots: SlotPair,
+        expected: SlotImage,
     ) -> Result<(), Error> {
-        let size = slot_size(&self.group)?;
-        for (index, file) in media.slots.iter_mut().enumerate() {
-            file.seek(SeekFrom::Start(0))?;
-            let (_, image) = recover_slot(file, index, &self.group, self.identity, size)?;
-            let (image, observed) = image.ok_or(Error::Prefix)?;
-            let accepted = image.state.accepted.ok_or(Error::Prefix)?;
-            let expected = slots.images[index];
-            if !read_back_matches(
-                image.generation,
-                expected.generation,
-                &observed,
-                &expected.digest,
-                image.state.promised == Some(ballot),
-                accepted.ballot == ballot,
-                &accepted.prefix.identity(self.group.identity),
-                &digest,
-            ) {
-                return Err(Error::Prefix);
-            }
+        let file = &mut media.slots[index];
+        file.seek(SeekFrom::Start(0))?;
+        let (_, image) = recover_slot(file, index, &self.group, self.identity, size)?;
+        let (image, observed) = image.ok_or(Error::Prefix)?;
+        let accepted = image.state.accepted.ok_or(Error::Prefix)?;
+        if !read_back_matches(
+            image.generation,
+            expected.generation,
+            &observed,
+            &expected.digest,
+            image.state.promised == Some(ballot),
+            accepted.ballot == ballot,
+            &accepted.prefix.identity(self.group.identity),
+            &digest,
+        ) {
+            return Err(Error::Prefix);
         }
         Ok(())
     }
@@ -539,58 +537,40 @@ fn persist(
     Ok((body.len(), digest))
 }
 
-fn recover_slot(
-    file: &mut File,
-    index: usize,
-    group: &Group,
-    voter: Uuid,
-    size: usize,
-) -> Result<(usize, Option<(Selected, Fingerprint)>), Error> {
+fn read_slot_header(file: &mut File) -> Result<SlotHeader, Error> {
     let mut header = [0; HEADER];
     file.read_exact(&mut header)?;
-    let payload_limit = size - HEADER;
-    if header == [0; HEADER] {
-        return Ok((payload_limit, None));
-    }
     let split = HEADER - 32;
     let mut descriptor = &header[..split];
-    let magic = &descriptor[..8];
+    let magic = descriptor[..8].try_into().map_err(|_| Error::Prefix)?;
     descriptor.advance(8);
-    let addressed: Fingerprint = descriptor[..32].try_into().map_err(|_| Error::Prefix)?;
+    let addressed = descriptor[..32].try_into().map_err(|_| Error::Prefix)?;
     descriptor.advance(32);
     let witness = Uuid::from_slice(&descriptor[..16]).map_err(|_| Error::Prefix)?;
     descriptor.advance(16);
     let generation = descriptor.get_u64();
-    let Some(length) = slot_body_length(descriptor.get_u64(), payload_limit) else {
-        return Ok((payload_limit, None));
-    };
+    let length = descriptor.get_u64();
+    Ok(SlotHeader {
+        raw: header,
+        empty: header == [0; HEADER],
+        magic,
+        addressed,
+        witness: witness.as_u128(),
+        generation,
+        length,
+        digest: header[split..].try_into().map_err(|_| Error::Prefix)?,
+    })
+}
+
+fn read_slot_body(
+    file: &mut File,
+    header: &SlotHeader,
+    length: usize,
+) -> Result<(Vec<u8>, Fingerprint), Error> {
     let mut body = vec![0; length];
     file.read_exact(&mut body)?;
-    if !authenticates_body(&slot_digest(&header[..split], &body), &header[split..]) {
-        return Ok((payload_limit, None));
-    }
-    if !slot_header_matches(
-        magic,
-        &addressed,
-        &group.identity,
-        witness.as_u128(),
-        voter.as_u128(),
-        generation,
-    ) {
-        return Err(Error::Group);
-    }
-    let state = load_state(group, Bytes::from(body))?;
-    Ok((
-        length,
-        Some((
-            Selected {
-                index,
-                generation,
-                state,
-            },
-            header[split..].try_into().map_err(|_| Error::Prefix)?,
-        )),
-    ))
+    let digest = slot_digest(&header.raw[..HEADER - 32], &body);
+    Ok((body, digest))
 }
 
 fn slot_digest(header: &[u8], body: &[u8]) -> Fingerprint {
@@ -600,7 +580,8 @@ fn slot_digest(header: &[u8], body: &[u8]) -> Fingerprint {
     hash.finalize().into()
 }
 
-fn load_state(group: &Group, mut input: Bytes) -> Result<VoterState, Error> {
+fn load_state(group: &Group, body: Vec<u8>) -> Result<VoterState, Error> {
+    let mut input = Bytes::from(body);
     let promised = read_ballot(&mut input)?;
     let accepted = if let Some(ballot) = read_ballot(&mut input)? {
         if promised.is_none_or(|promised| ballot > promised) {

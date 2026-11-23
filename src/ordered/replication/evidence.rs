@@ -18,6 +18,7 @@ pub struct SlotPair {
 
 impl SlotPair {
     pub fn is_mirrored(&self) -> bool {
+        let zero = [0; 32];
         if self.selected > 1 {
             return false;
         }
@@ -25,8 +26,8 @@ impl SlotPair {
         let alternate = self.images[1 - self.selected as usize];
         alternate.generation != 0
             && alternate.generation.checked_add(1) == Some(selected.generation)
-            && !matches_fingerprint(&alternate.digest, &[0; 32])
-            && !matches_fingerprint(&selected.digest, &[0; 32])
+            && !matches_fingerprint(&alternate.digest, &zero)
+            && !matches_fingerprint(&selected.digest, &zero)
             && !matches_fingerprint(&alternate.digest, &selected.digest)
     }
 }
@@ -108,10 +109,11 @@ impl RotationSlots {
         let Ok(Outcome::Granted { grant, recovery }) = receipt.outcome else {
             return false;
         };
-        self.group != [0; 32]
+        let zero = [0; 32];
+        !matches_fingerprint(&self.group, &zero)
             && self.ballot.round != 0
             && !self.ballot.nonce.is_nil()
-            && self.prefix != [0; 32]
+            && !matches_fingerprint(&self.prefix, &zero)
             && receipt.position != 0
             && self.position >= receipt.position
             && self.checkpoint == recovery.checkpoint
@@ -126,4 +128,3 @@ impl RotationSlots {
             && valid_voters(&self.voters)
     }
 }
-

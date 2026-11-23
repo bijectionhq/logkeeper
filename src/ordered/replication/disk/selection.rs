@@ -32,7 +32,7 @@ pub(super) fn select_slot(first: Option<u64>, second: Option<u64>) -> Result<Opt
         (Some(_), None) => Ok(Some(0)),
         (None, Some(_)) => Ok(Some(1)),
         (Some(a), Some(b)) if a == b => Err(Error::Diverged),
-        (Some(a), Some(b)) => Ok(Some(usize::from(b > a))),
+        (Some(a), Some(b)) => Ok(Some(if b > a { 1 } else { 0 })),
     }
 }
 

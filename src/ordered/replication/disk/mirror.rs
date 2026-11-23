@@ -1,4 +1,4 @@
-use super::{Error, Inner, Media, SlotPair, VoterState};
+use super::{Ballot, Error, Fingerprint, Inner, Media, SlotPair, VoterState, slot_size};
 
 impl Inner {
     pub(super) fn mirror(&self, media: &mut Media, next: VoterState) -> Result<SlotPair, Error> {
@@ -15,5 +15,17 @@ impl Inner {
             selected: selected as u8,
             images,
         })
+    }
+
+    pub(super) fn read_back(
+        &self,
+        media: &mut Media,
+        ballot: Ballot,
+        digest: Fingerprint,
+        slots: SlotPair,
+    ) -> Result<(), Error> {
+        let size = slot_size(&self.group)?;
+        self.read_back_slot(media, 0, size, ballot, digest, slots.images[0])?;
+        self.read_back_slot(media, 1, size, ballot, digest, slots.images[1])
     }
 }
