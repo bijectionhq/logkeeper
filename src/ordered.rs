@@ -9,8 +9,10 @@ mod admission;
 mod codec;
 #[cfg(feature = "ordered-daemon")]
 pub mod daemon;
+mod receipt;
 pub mod replication;
 pub mod service;
+mod writer;
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -379,18 +381,7 @@ pub enum Outcome {
     Trimmed(TrimResult),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Refusal {
-    WrongPlacement,
-    Unauthorized,
-    Stale,
-    Conflict,
-    Invalid,
-    Expired,
-    Capacity,
-    Unavailable,
-    CohortSealed,
-}
+pub use writer::Refusal;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Receipt {
@@ -748,9 +739,14 @@ impl State {
             return None;
         }
         let previous = self.outcomes.get(&(request.principal, request.id))?;
-        (request.placement == self.placement
-            && admission::matches_fingerprint(&previous.fingerprint, &fingerprint(request)))
-        .then_some(previous.receipt)
+        if request.placement != self.placement {
+            return None;
+        }
+        receipt::replay_mutation(
+            &previous.fingerprint,
+            &fingerprint(request),
+            previous.receipt,
+        )
     }
 
     /// Applies the decision chosen at `position`, stamped by its proposer
@@ -808,13 +804,13 @@ impl State {
             // A retained read receipt only proves its hold's provenance. Its
             // identity is spent: a read is never answered by replay, and the
             // original receipt is never overwritten.
-            return Ok(
-                if !reading && admission::matches_fingerprint(&previous.fingerprint, &fingerprint) {
-                    previous.receipt
-                } else {
-                    receipt(Err(Refusal::Conflict))
-                },
-            );
+            return Ok(receipt::replay(
+                reading,
+                &previous.fingerprint,
+                &fingerprint,
+                previous.receipt,
+            )
+            .unwrap_or_else(|| receipt(Err(Refusal::Conflict))));
         }
         if id.expires_at <= position {
             return Ok(receipt(Err(Refusal::Expired)));
@@ -826,7 +822,7 @@ impl State {
             return Ok(receipt(Err(Refusal::Invalid)));
         }
         let receipt = receipt(self.decide(principal, id, fingerprint, request.command));
-        if reading && receipt.outcome.is_err() {
+        if !receipt::record_after_apply(reading, &receipt.outcome) {
             // A refused read holds nothing and is never replayed, so it leaves
             // no state behind. Only an admitted read retains its receipt, as
             // the provenance of its hold.
@@ -844,13 +840,10 @@ impl State {
     }
 
     fn writer(&self, principal: Principal, grant: Grant) -> Result<(), Refusal> {
-        if principal != Principal::Worker(grant.enrollment) {
-            return Err(Refusal::Unauthorized);
-        }
-        if self.grant != Some(grant) {
-            return Err(Refusal::Stale);
-        }
-        Ok(())
+        writer::authorize(
+            principal == Principal::Worker(grant.enrollment),
+            self.grant == Some(grant),
+        )
     }
 
     fn install_grant(
@@ -871,7 +864,7 @@ impl State {
         key_generation: u64,
         checkpoint: Checkpoint,
     ) -> Result<Outcome, Refusal> {
-        let epoch = self.writer_epoch.checked_add(1).ok_or(Refusal::Capacity)?;
+        let epoch = writer::next_epoch(self.writer_epoch)?;
         let grant = Grant {
             enrollment,
             epoch,
@@ -1036,12 +1029,10 @@ impl State {
                 let enrollment = Enrollment { worker, serial };
                 self.enrollment_serial = serial;
                 self.roster.insert(worker, enrollment);
-                if self
+                let replaced_holder = self
                     .grant
-                    .is_some_and(|grant| grant.enrollment.worker == worker)
-                {
-                    self.grant = None;
-                }
+                    .is_some_and(|grant| grant.enrollment.worker == worker);
+                writer::withdraw(&mut self.grant, replaced_holder);
                 self.prune_leases();
                 Ok(Outcome::Enrolled(enrollment))
             }
@@ -1053,12 +1044,10 @@ impl State {
                     return Err(Refusal::Stale);
                 }
                 self.roster.remove(&enrollment.worker);
-                if self
+                let withdrew_holder = self
                     .grant
-                    .is_some_and(|grant| grant.enrollment == enrollment)
-                {
-                    self.grant = None;
-                }
+                    .is_some_and(|grant| grant.enrollment == enrollment);
+                writer::withdraw(&mut self.grant, withdrew_holder);
                 self.prune_leases();
                 Ok(Outcome::Withdrawn)
             }
@@ -1108,10 +1097,7 @@ impl State {
                 references,
             } => {
                 self.writer(principal, grant)?;
-                if self.head.next_lsn != expected_next {
-                    return Err(Refusal::Stale);
-                }
-                let next_lsn = expected_next.checked_add(1).ok_or(Refusal::Capacity)?;
+                let next_lsn = writer::append_next(self.head.next_lsn, expected_next)?;
                 self.admit_object_references(references.as_deref())?;
                 let bytes = record_charge(payload.len(), references.as_deref())?;
                 let (byte_start, byte_end) = match class {
