@@ -281,7 +281,6 @@ pub enum Command {
         through: Cut,
     },
     ProtectRange {
-        grant: Grant,
         from: u64,
         through: u64,
     },
@@ -1363,17 +1362,11 @@ impl State {
                 let hold = self.protect(principal, id, grant.enrollment, through)?;
                 Ok(Outcome::Protected(hold))
             }
-            Command::ProtectRange {
-                grant,
-                from,
-                through,
-            } => {
+            Command::ProtectRange { from, through } => {
                 let Principal::Worker(enrollment) = principal else {
                     return Err(Refusal::Unauthorized);
                 };
-                if self.roster.get(&enrollment.worker) != Some(&enrollment)
-                    || self.grant != Some(grant)
-                {
+                if self.roster.get(&enrollment.worker) != Some(&enrollment) {
                     return Err(Refusal::Stale);
                 }
                 let start = self.cut(from).ok_or(Refusal::Unavailable)?;

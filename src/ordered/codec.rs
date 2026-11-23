@@ -9,7 +9,7 @@ use uuid::Uuid;
 mod service;
 mod snapshot;
 
-const VERSION: u8 = 7;
+const VERSION: u8 = 8;
 const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR04";
 
 impl Request {
@@ -141,13 +141,8 @@ impl Request {
                 output.put_u8(21);
                 enrollment(&mut output, *worker);
             }
-            Command::ProtectRange {
-                grant: writer,
-                from,
-                through,
-            } => {
+            Command::ProtectRange { from, through } => {
                 output.put_u8(11);
-                grant(&mut output, *writer);
                 output.put_u64(*from);
                 output.put_u64(*through);
             }
@@ -233,7 +228,6 @@ impl Request {
                 window: input.window()?,
             },
             11 => Command::ProtectRange {
-                grant: input.grant()?,
                 from: input.u64()?,
                 through: input.u64()?,
             },
