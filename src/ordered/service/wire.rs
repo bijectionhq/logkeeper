@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-const MAGIC: &[u8; 8] = b"LKAPPC04";
+const MAGIC: &[u8; 8] = b"LKAPPC05";
 const REPLAY_OVERHEAD: usize = 1 + 160 + 40 + 8;
 
 #[derive(Clone)]
@@ -41,6 +41,12 @@ pub enum Operation {
         preparation: CheckpointPreparation,
         base: Checkpoint,
         from: Cut,
+        maximum_bytes: u64,
+    },
+    InspectCheckpoint {
+        base: Checkpoint,
+        from: Cut,
+        through: Cut,
         maximum_bytes: u64,
     },
 }
@@ -177,6 +183,21 @@ pub async fn serve<R: Replica>(
                     .await
                     .map(Reply::Replay)
             }
+            Operation::InspectCheckpoint {
+                base,
+                from,
+                through,
+                maximum_bytes,
+            } => {
+                let offered = usize::try_from(maximum_bytes).unwrap_or(usize::MAX);
+                let limit = maximum_frame
+                    .checked_sub(REPLAY_OVERHEAD)
+                    .ok_or(WireError::Frame)?;
+                coordinator
+                    .inspect_checkpoint(session, base, from, through, offered.min(limit))
+                    .await
+                    .map(Reply::Replay)
+            }
             Operation::ReplayHead { hold, from } => coordinator
                 .replay_head(session, hold, from)
                 .await
@@ -229,6 +250,15 @@ impl Reply {
                     ..
                 },
             ) => page.matches(*base, *from, preparation.checkpoint),
+            (
+                Self::Replay(page),
+                Operation::InspectCheckpoint {
+                    base,
+                    from,
+                    through,
+                    ..
+                },
+            ) => page.matches(*base, *from, *through),
             (Self::ReplayHead(head), Operation::ReplayHead { hold, from }) => match head {
                 Some(head) => {
                     from.next_lsn.checked_add(1) == Some(head.next.next_lsn)

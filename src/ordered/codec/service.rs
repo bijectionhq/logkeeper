@@ -52,6 +52,18 @@ impl Operation {
                 cut(&mut output, *from);
                 output.put_u64(*maximum_bytes);
             }
+            Self::InspectCheckpoint {
+                base,
+                from,
+                through,
+                maximum_bytes,
+            } => {
+                output.put_u8(8);
+                checkpoint(&mut output, *base);
+                cut(&mut output, *from);
+                cut(&mut output, *through);
+                output.put_u64(*maximum_bytes);
+            }
             Self::CheckpointCut { next } => {
                 output.put_u8(6);
                 output.put_u64(*next);
@@ -96,6 +108,12 @@ impl Operation {
                 preparation: input.checkpoint_preparation()?,
                 base: input.checkpoint()?,
                 from: input.cut()?,
+                maximum_bytes: input.u64()?,
+            },
+            8 => Self::InspectCheckpoint {
+                base: input.checkpoint()?,
+                from: input.cut()?,
+                through: input.cut()?,
                 maximum_bytes: input.u64()?,
             },
             _ => return Err(Refusal::Invalid),

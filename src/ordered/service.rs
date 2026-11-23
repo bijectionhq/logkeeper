@@ -297,23 +297,25 @@ impl<R: Replica> Coordinator<R> {
         if state.preparing != Some(preparation) || state.checkpoint() != base {
             return Err(Refusal::Stale.into());
         }
-        let through = preparation.checkpoint;
-        if from.next_lsn < base.cut.next_lsn
-            || from.next_lsn > through.next_lsn
-            || state.cut(from.next_lsn) != Some(from)
-        {
-            return Err(Refusal::Invalid.into());
+        checkpoint_records(&state, base, from, preparation.checkpoint, maximum_bytes)
+    }
+
+    /// Discovers an input before ordering its preparation. Every page
+    /// rechecks the base and terminal cut against the current retained history.
+    pub async fn inspect_checkpoint(
+        &self,
+        session: Session,
+        base: Checkpoint,
+        from: Cut,
+        through: Cut,
+        maximum_bytes: usize,
+    ) -> Result<ReplayPage, Error> {
+        State::custodian(session.principal)?;
+        let state = self.recover(session).await?;
+        if state.checkpoint() != base {
+            return Err(Refusal::Stale.into());
         }
-        let first = usize::try_from(from.next_lsn - state.floor().next_lsn)
-            .map_err(|_| Refusal::Invalid)?;
-        let count =
-            usize::try_from(through.next_lsn - from.next_lsn).map_err(|_| Refusal::Invalid)?;
-        replay_page(
-            base,
-            through,
-            state.records.iter().skip(first).take(count),
-            maximum_bytes,
-        )
+        checkpoint_records(&state, base, from, through, maximum_bytes)
     }
 
     pub async fn replay_head(
@@ -375,6 +377,31 @@ impl<R: Replica> Coordinator<R> {
             .map_or(replication::Error::Quorum, replication::Error::Deposed)
             .into())
     }
+}
+
+fn checkpoint_records(
+    state: &State,
+    base: Checkpoint,
+    from: Cut,
+    through: Cut,
+    maximum_bytes: usize,
+) -> Result<ReplayPage, Error> {
+    if from.next_lsn < base.cut.next_lsn
+        || from.next_lsn > through.next_lsn
+        || state.cut(from.next_lsn) != Some(from)
+        || state.cut(through.next_lsn) != Some(through)
+    {
+        return Err(Refusal::Invalid.into());
+    }
+    let first =
+        usize::try_from(from.next_lsn - state.floor().next_lsn).map_err(|_| Refusal::Invalid)?;
+    let count = usize::try_from(through.next_lsn - from.next_lsn).map_err(|_| Refusal::Invalid)?;
+    replay_page(
+        base,
+        through,
+        state.records.iter().skip(first).take(count),
+        maximum_bytes,
+    )
 }
 
 fn replay_page<'a>(
