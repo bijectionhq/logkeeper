@@ -1,0 +1,125 @@
+{
+  "summary": "The ordered trim guard and queue transition preserve all replay needs and refund charges per lane.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "admission",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 16,
+  "controls": {
+    "ignore_checkpoint": {
+      "defect": "The runtime guard and its contract accept a trim past the selected checkpoint.",
+      "mutate": [
+        {
+          "file": "src/ordered/retention.rs",
+          "find": "ensures out == (through <= checkpoint),",
+          "replace": "ensures out,"
+        },
+        {
+          "file": "src/ordered/retention.rs",
+          "find": "    through <= checkpoint\n",
+          "replace": "    true\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_trim/laws.rs",
+          "function": "trim_preserves_replay",
+          "category": "assertion failed"
+        },
+        {
+          "file": "src/ordered/retention.rs",
+          "function": "trim",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 14
+    },
+    "ignore_live_pin": {
+      "defect": "The suffix decision ignores live replay pins.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "    start < end && start < floor\n",
+          "replace": "    false\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/admission.rs",
+          "function": "pins_suffix",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "skip_maintenance_refund": {
+      "defect": "Trim removes maintenance records without returning their retained-byte credit.",
+      "mutate": [
+        {
+          "file": "src/ordered/retention.rs",
+          "find": "    *maintenance -= maintenance_bytes;\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/retention.rs",
+          "function": "trim_records",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/retention.rs",
+          "function": "trim_records",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "remove_extra_record": {
+      "defect": "Trim also removes a record from the end of the remaining suffix.",
+      "mutate": [
+        {
+          "file": "src/ordered/retention.rs",
+          "find": "    (ordinary_bytes, maintenance_bytes)\n}",
+          "replace": "    records.pop_back();\n    (ordinary_bytes, maintenance_bytes)\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/retention.rs",
+          "function": "trim_records",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/retention.rs",
+          "function": "trim_records",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "skip_hold_enumeration": {
+      "defect": "The hold scan overlooks every live hold when the requested cut is positive.",
+      "mutate": [
+        {
+          "file": "src/ordered/retention.rs",
+          "find": "    let mut entries = holds.values();",
+          "replace": "    if through > 0 { return false; }\n    let mut entries = holds.values();"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/retention.rs",
+          "function": "has_live_pin",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 15
+    }
+  }
+}

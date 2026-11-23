@@ -1,0 +1,177 @@
+{
+  "summary": "Fresh exact-object withdrawal refuses live references and permanently fences the withdrawn name against new admission.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 11,
+  "controls": {
+    "admit_fenced_name": {
+      "defect": "The runtime and its contract admit an exact list with a fenced name.",
+      "mutate": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "            while index < names.len() {",
+          "replace": "            while false && index < names.len() {"
+        },
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "        } else if no_fenced_names(names@, names@.len() as int, fences@) {\n            Ok(())\n        } else {\n            Err(Refusal::Conflict)\n        },",
+          "replace": "        } else {\n            Ok(())\n        },"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/object_withdrawal/laws.rs",
+          "function": "fenced_refuses_reference",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/object_withdrawal/laws.rs",
+          "function": "withdrawn_name_stays_fenced",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "admit_opaque_after_fence": {
+      "defect": "Opaque references can arrive after a fence exists.",
+      "mutate": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "        None if !fences.is_empty() => Err(Refusal::Unavailable),\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "function": "admit_object_references",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "withdraw_referenced_name": {
+      "defect": "A fresh withdrawal can proceed while the requested name is referenced.",
+      "mutate": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "    if referenced() {",
+          "replace": "    if false && referenced() {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "function": "withdraw_object",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "skip_fence_insert": {
+      "defect": "The reducer returns a withdrawal receipt without adding the fence.",
+      "mutate": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "    let _previous = fences.insert(name, fence);",
+          "replace": "    let _previous: Option<F> = None;"
+        },
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "    #[cfg(verus_keep_ghost)]\n    proof! {\n        lemma_btree_map_insert_ensures_if_obeys_cmp_concrete_eq(&before, fences, name, fence, _previous);\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "function": "install_fence",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "withdraw_with_opaque_references": {
+      "defect": "A fresh withdrawal proceeds despite incomplete references.",
+      "mutate": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "    if !complete() {",
+          "replace": "    if false && !complete() {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "function": "withdraw_object",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "function": "withdraw_object",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "retry_with_different_version": {
+      "defect": "A different provider version can retry an existing withdrawal.",
+      "mutate": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "        return if exact(fence) {",
+          "replace": "        return if true || exact(fence) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "function": "withdraw_object",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "ignore_referenced_root": {
+      "defect": "The enumeration overlooks objects referenced by roots or preparations.",
+      "mutate": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "    if root_match {",
+          "replace": "    if false && root_match {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "function": "has_live_reference",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    },
+    "ignore_referenced_record": {
+      "defect": "The enumeration overlooks objects referenced by retained replay records.",
+      "mutate": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "find": "    record_match\n}",
+          "replace": "    false\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/object_withdrawal.rs",
+          "function": "has_live_reference",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 10
+    }
+  }
+}

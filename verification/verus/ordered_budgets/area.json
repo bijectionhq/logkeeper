@@ -1,0 +1,79 @@
+{
+  "summary": "Ordered appends charge complete record bytes to the funded lane.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "admission",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 15,
+  "controls": {
+    "omit_reference_charge": {
+      "defect": "Appends no longer pay for a declared reference list.",
+      "mutate": [
+        {
+          "file": "src/ordered/budget.rs",
+          "find": "        Some(count) => 4 + 32 * count as u64,",
+          "replace": "        Some(_) => 0,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/budget.rs",
+          "function": "record_charge",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/budget.rs",
+          "function": "record_charge",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 14
+    },
+    "omit_window_limit": {
+      "defect": "An ordinary append can spend above its active funded window.",
+      "mutate": [
+        {
+          "file": "src/ordered/budget.rs",
+          "find": "let end = debit(spent, charge, window)?;",
+          "replace": "let end = debit(spent, charge, u64::MAX)?;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/budget.rs",
+          "function": "append_debit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 14
+    },
+    "spend_ordinary_capacity_for_maintenance": {
+      "defect": "Maintenance spends against the ordinary capacity instead of its own reserve.",
+      "mutate": [
+        {
+          "file": "src/ordered/budget.rs",
+          "find": "let retained = debit(maintenance, charge, reserve)?;",
+          "replace": "let retained = debit(maintenance, charge, ordinary_capacity)?;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/budget.rs",
+          "function": "append_debit",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/budget.rs",
+          "function": "append_debit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 14
+    }
+  }
+}
