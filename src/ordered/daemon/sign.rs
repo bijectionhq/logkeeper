@@ -77,7 +77,7 @@ impl BarrierVerifier {
     /// Authenticates the exact successful marker for the supplied invocation.
     /// The consumer still has to open and materialize the protected basis.
     pub fn verify(&self, proof: SignedBarrier, expected: &Request) -> io::Result<BarrierClaim> {
-        let Command::Barrier { grant } = &expected.command else {
+        let Command::Barrier = &expected.command else {
             return Err(super::invalid(
                 "a read receipt requires an original read invocation",
             ));
@@ -85,8 +85,7 @@ impl BarrierVerifier {
         let claim = proof.claim;
         if claim.placement() != self.scope
             || expected.placement != self.scope
-            || expected.principal != Principal::Worker(grant.enrollment)
-            || claim.grant() != *grant
+            || expected.principal != Principal::Worker(claim.read().owner)
             || claim.read().id != expected.id
         {
             return Err(super::invalid(
@@ -171,7 +170,7 @@ mod tests {
                 placement,
                 principal: Principal::Worker(grant.enrollment),
                 id: RequestId::fresh(0, 8).unwrap(),
-                command: Command::Barrier { grant },
+                command: Command::Barrier,
             };
             let read = Hold {
                 id: request.id,
@@ -183,7 +182,6 @@ mod tests {
             };
             let claim = BarrierClaim {
                 placement,
-                grant,
                 read,
             };
             let signed = SignedBarrier {
@@ -256,7 +254,6 @@ mod tests {
             request: original.id,
             position: old.claim.read().admitted_at,
             outcome: Ok(Outcome::Barrier {
-                grant,
                 read: old.claim.read(),
             }),
         };

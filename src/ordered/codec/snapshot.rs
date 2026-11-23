@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use crate::ordered::TrimResult;
 
-const MAGIC: &[u8; 8] = b"LKBASE06";
+const MAGIC: &[u8; 8] = b"LKBASE07";
 const REFERENCED_PAYLOAD: u64 = 1 << 63;
 
 impl super::super::Limits {
@@ -662,10 +662,7 @@ impl Input {
                 recovery: self.hold()?,
             },
             3 => Outcome::Appended(self.append_result()?),
-            4 => Outcome::Barrier {
-                grant: self.grant()?,
-                read: self.hold()?,
-            },
+            4 => Outcome::Barrier { read: self.hold()? },
             5 => Outcome::Published(self.checkpoint()?),
             6 => Outcome::Protected(self.hold()?),
             7 => Outcome::Released,
@@ -754,12 +751,8 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
             output.put_u8(3);
             append_result(output, append);
         }
-        Ok(Outcome::Barrier {
-            grant: writer,
-            read,
-        }) => {
+        Ok(Outcome::Barrier { read }) => {
             output.put_u8(4);
-            grant(output, writer);
             hold_row(output, read);
         }
         Ok(Outcome::Published(published)) => {

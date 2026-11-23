@@ -295,10 +295,10 @@ impl Reply {
                     }
                     && match (&request.command, decision.receipt.outcome) {
                         (
-                            Command::Barrier { grant },
-                            Ok(Outcome::Barrier { grant: issued, .. }),
-                        ) => *grant == issued,
-                        (Command::Barrier { .. }, Ok(_)) | (_, Ok(Outcome::Barrier { .. })) => {
+                            Command::Barrier,
+                            Ok(Outcome::Barrier { read }),
+                        ) => request.principal == Principal::Worker(read.owner),
+                        (Command::Barrier, Ok(_)) | (_, Ok(Outcome::Barrier { .. })) => {
                             false
                         }
                         (

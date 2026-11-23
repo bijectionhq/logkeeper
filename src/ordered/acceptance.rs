@@ -118,7 +118,7 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
     let read_receipt = apply(
         &mut state,
         original.principal,
-        Command::Barrier { grant: first_grant },
+        Command::Barrier,
     );
     let Ok(Outcome::Barrier { read, .. }) = read_receipt.outcome else {
         panic!("read not protected")
@@ -350,7 +350,7 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
     assert_eq!(state.head().next_lsn, 1);
 
     // Two identical read commands are two admissions with distinct holds.
-    let barrier = Command::Barrier { grant: writer };
+    let barrier = Command::Barrier;
     let first = state
         .apply(next(&state), state.time(), request(&state, barrier.clone()))
         .unwrap();
@@ -409,6 +409,16 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
         panic!("third read refused: {third:?}");
     };
     assert!(latest.through.next_lsn > late.through.next_lsn);
+
+    assert_eq!(
+        apply(&mut state, principal, Command::Vacate { grant: writer }).outcome,
+        Ok(Outcome::Vacated)
+    );
+    let Ok(Outcome::Barrier { read }) = apply(&mut state, principal, Command::Barrier).outcome else {
+        panic!("an enrolled reader could not protect the committed head during a vacancy");
+    };
+    assert_eq!(read.through, latest.through);
+    assert_eq!(read.owner, worker);
 
     // Every live read hold keeps its own receipt as provenance.
     let image = state.encode_base();
@@ -508,9 +518,9 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
     };
 
     // The reply to this read is lost: the reader keeps only its identity.
-    let (lost, _) = issue(&mut state, principal, Command::Barrier { grant: writer });
+    let (lost, _) = issue(&mut state, principal, Command::Barrier);
     assert_eq!(state.holds[&lost.id].hold.through, appended.cut);
-    let (_, kept) = issue(&mut state, principal, Command::Barrier { grant: writer });
+    let (_, kept) = issue(&mut state, principal, Command::Barrier);
     let Ok(Outcome::Barrier { read: kept, .. }) = kept else {
         panic!("second read refused");
     };
@@ -648,7 +658,7 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
     ));
 
     // Past its window the receipt leaves with the hold.
-    let (late, _) = issue(&mut state, principal, Command::Barrier { grant: writer });
+    let (late, _) = issue(&mut state, principal, Command::Barrier);
     while state.position() < late.id.expires_at {
         let _ = issue(
             &mut state,
@@ -790,7 +800,7 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
         panic!("append refused");
     };
     let Ok(Outcome::Barrier { read, .. }) =
-        at(&mut state, 120, old, Command::Barrier { grant: old_grant })
+        at(&mut state, 120, old, Command::Barrier)
     else {
         panic!("read refused");
     };
@@ -1039,7 +1049,7 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     };
     assert!(matches!(append(&mut state, old), Ok(Outcome::Appended(_))));
     let Ok(Outcome::Barrier { read, .. }) =
-        apply(&mut state, worker, Command::Barrier { grant: old }).outcome
+        apply(&mut state, worker, Command::Barrier).outcome
     else {
         panic!("old view was refused");
     };
@@ -1378,7 +1388,7 @@ fn exact_withdrawal_orders_against_the_retained_tail_preparation_and_held_root()
     );
 
     let Ok(Outcome::Barrier { read, .. }) =
-        apply(&mut state, worker, Command::Barrier { grant: writer }).outcome
+        apply(&mut state, worker, Command::Barrier).outcome
     else {
         panic!("read refused");
     };

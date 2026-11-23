@@ -212,13 +212,12 @@ impl Chosen {
 
     /// Supplies the exact successful application to a scoped receipt issuer.
     pub fn barrier_claim(&self) -> Option<BarrierClaim> {
-        let Outcome::Barrier { grant, read } = self.receipt.outcome.ok()? else {
+        let Outcome::Barrier { read } = self.receipt.outcome.ok()? else {
             return None;
         };
         self.state.held_replay(self.receipt.principal, read).ok()?;
         Some(BarrierClaim {
             placement: self.receipt.placement,
-            grant,
             read,
         })
     }

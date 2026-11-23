@@ -9,8 +9,8 @@ use uuid::Uuid;
 mod service;
 mod snapshot;
 
-const VERSION: u8 = 6;
-const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR03";
+const VERSION: u8 = 7;
+const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR04";
 
 impl Request {
     /// The exact bytes used by ordered replication and crash replay.
@@ -67,10 +67,7 @@ impl Request {
                 }
                 output.put_slice(payload);
             }
-            Command::Barrier { grant: writer } => {
-                output.put_u8(4);
-                grant(&mut output, *writer);
-            }
+            Command::Barrier => output.put_u8(4),
             Command::PrepareCheckpoint {
                 preparation,
                 references,
@@ -208,9 +205,7 @@ impl Request {
                 references: (tag == 23).then(|| input.object_names()).transpose()?,
                 payload: std::mem::take(&mut input.0),
             },
-            4 => Command::Barrier {
-                grant: input.grant()?,
-            },
+            4 => Command::Barrier,
             5 => Command::Publish {
                 checkpoint: input.checkpoint()?,
             },
@@ -313,7 +308,7 @@ impl BarrierClaim {
         let mut output = BytesMut::new();
         output.put_slice(BARRIER_DOMAIN);
         placement(&mut output, self.placement);
-        grant(&mut output, self.grant);
+        enrollment(&mut output, self.read.owner);
         request_id(&mut output, self.read.id);
         output.put_u64(self.read.admitted_at);
         checkpoint(&mut output, self.read.checkpoint);
@@ -329,7 +324,7 @@ impl BarrierClaim {
             return Err(Refusal::Invalid);
         }
         let placement = input.placement()?;
-        let grant = input.grant()?;
+        let owner = input.enrollment()?;
         let id = input.request_id()?;
         let admitted_at = input.u64()?;
         let checkpoint = input.checkpoint()?;
@@ -344,10 +339,9 @@ impl BarrierClaim {
         }
         Ok(Self {
             placement,
-            grant,
             read: Hold {
                 id,
-                owner: grant.enrollment,
+                owner,
                 admitted_at,
                 checkpoint,
                 start: checkpoint.cut,

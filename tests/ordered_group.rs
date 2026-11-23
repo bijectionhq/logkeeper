@@ -419,19 +419,17 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     assert_eq!(delayed.receipt().outcome, Err(Refusal::Stale));
     let mut barrier_request = request(
         Principal::Worker(second_enrollment),
-        Command::Barrier {
-            grant: second_grant,
-        },
+        Command::Barrier,
     );
     barrier_request.id.expires_at = 8;
     let barrier = group
         .choose(&peers, 8, barrier_request.clone())
         .await
         .unwrap();
-    let Outcome::Barrier { grant, read } = barrier.receipt().outcome.unwrap() else {
+    let Outcome::Barrier { read } = barrier.receipt().outcome.unwrap() else {
         panic!("fresh barrier was refused");
     };
-    assert_eq!(grant, second_grant);
+    assert_eq!(read.owner, second_enrollment);
     assert_eq!(read.through, original.cut);
     assert_eq!(read.checkpoint, seed);
     let claim = barrier.barrier_claim().unwrap();
@@ -473,14 +471,12 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     // at the same grant, observing at or after the original cut.
     let retry = request(
         Principal::Worker(second_enrollment),
-        Command::Barrier {
-            grant: second_grant,
-        },
+        Command::Barrier,
     );
     let retried = group.choose(&peers, 10, retry).await.unwrap();
     let retried_claim = retried.barrier_claim().unwrap();
     let retried = retried_claim.read();
-    assert_eq!(retried_claim.grant(), second_grant);
+    assert_eq!(retried.owner, second_enrollment);
     assert_ne!(retried.id, read.id);
     assert!(retried.admitted_at > read.admitted_at);
     assert!(retried.through.next_lsn >= read.through.next_lsn);
@@ -627,8 +623,8 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     // A refused read takes no state: there is nothing to abandon, and its
     // exact reissue is decided afresh at a later position.
     let deposed = request(
-        Principal::Worker(first_enrollment),
-        Command::Barrier { grant: first_grant },
+        Principal::Worker(Enrollment { worker: Uuid::new_v4(), serial: 1 }),
+        Command::Barrier,
     );
     let blocked = group.choose(&peers, 23, deposed.clone()).await.unwrap();
     assert_eq!(blocked.receipt().outcome, Err(Refusal::Stale));
@@ -641,9 +637,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             25,
             request(
                 reader,
-                Command::Barrier {
-                    grant: second_grant,
-                },
+                Command::Barrier,
             ),
         )
         .await
@@ -946,7 +940,7 @@ async fn exact_object_withdrawal_survives_compaction_and_cohort_repair() {
             .choose(
                 &voters,
                 round,
-                request(Principal::RouteReader, Command::Barrier { grant }),
+                request(Principal::RouteReader, Command::Barrier),
             )
             .await
             .unwrap();

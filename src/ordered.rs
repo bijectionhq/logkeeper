@@ -245,9 +245,7 @@ pub enum Command {
     },
     /// A fresh read. Each admission protects its own basis at the current
     /// head; a retry is a new admission and never replays an earlier read.
-    Barrier {
-        grant: Grant,
-    },
+    Barrier,
     PrepareCheckpoint {
         preparation: CheckpointPreparation,
         references: Option<Vec<ObjectName>>,
@@ -361,10 +359,7 @@ pub enum Outcome {
         recovery: Hold,
     },
     Appended(AppendResult),
-    Barrier {
-        grant: Grant,
-        read: Hold,
-    },
+    Barrier { read: Hold },
     Published(Checkpoint),
     CheckpointPrepared(CheckpointPreparation),
     ObjectWithdrawn(ObjectFence),
@@ -411,17 +406,12 @@ pub struct Receipt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BarrierClaim {
     placement: Placement,
-    grant: Grant,
     read: Hold,
 }
 
 impl BarrierClaim {
     pub fn placement(self) -> Placement {
         self.placement
-    }
-
-    pub fn grant(self) -> Grant {
-        self.grant
     }
 
     pub fn read(self) -> Hold {
@@ -755,7 +745,7 @@ impl State {
     fn retained_receipt(&self, request: &Request) -> Option<Receipt> {
         // Reads have no exact lost-reply recovery: a reissued read is applied
         // again and can never be answered with an earlier read's receipt.
-        if matches!(request.command, Command::Barrier { .. }) {
+        if matches!(request.command, Command::Barrier) {
             return None;
         }
         let previous = self.outcomes.get(&(request.principal, request.id))?;
@@ -814,7 +804,7 @@ impl State {
             return Ok(receipt(Err(Refusal::Invalid)));
         }
         let key = (principal, id);
-        let reading = matches!(&request.command, Command::Barrier { .. });
+        let reading = matches!(&request.command, Command::Barrier);
         if let Some(previous) = self.outcomes.get(&key) {
             // A retained read receipt only proves its hold's provenance. Its
             // identity is spent: a read is never answered by replay, and the
@@ -1182,12 +1172,15 @@ impl State {
                 };
                 Ok(Outcome::Appended(result))
             }
-            Command::Barrier { grant } => {
-                self.writer(principal, grant)?;
-                // The head never moves back under one grant, so a later read
-                // observes at or after every earlier read's cut.
-                let read = self.protect(principal, id, grant.enrollment, self.head)?;
-                Ok(Outcome::Barrier { grant, read })
+            Command::Barrier => {
+                let Principal::Worker(reader) = principal else {
+                    return Err(Refusal::Unauthorized);
+                };
+                if self.roster.get(&reader.worker) != Some(&reader) {
+                    return Err(Refusal::Stale);
+                }
+                let read = self.protect(principal, id, reader, self.head)?;
+                Ok(Outcome::Barrier { read })
             }
             Command::WithdrawObject { object } => {
                 Self::custodian(principal)?;

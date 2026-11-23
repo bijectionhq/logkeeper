@@ -385,11 +385,10 @@ impl Input {
             Ok(SignedBarrier { claim, signature })
         })?;
         match (receipt.outcome, barrier) {
-            (Ok(Outcome::Barrier { grant, read }), Some(SignedBarrier { claim, .. }))
-                if grant == claim.grant()
-                    && read == claim.read()
+            (Ok(Outcome::Barrier { read }), Some(SignedBarrier { claim, .. }))
+                if read == claim.read()
                     && receipt.placement == claim.placement()
-                    && receipt.principal == Principal::Worker(grant.enrollment)
+                    && receipt.principal == Principal::Worker(read.owner)
                     && receipt.request == read.id
                     && receipt.position == read.admitted_at => {}
             (Ok(Outcome::Barrier { .. }), _) | (_, Some(_)) => return Err(Refusal::Invalid),
