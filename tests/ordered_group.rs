@@ -3,8 +3,8 @@ use logkeeper::ordered::replication::transport::{Connector, RemoteVoter, serve_v
 use logkeeper::ordered::replication::{DurableVoter, Error, Group, Replica};
 use logkeeper::ordered::service::{Coordinator, Session, wire};
 use logkeeper::ordered::{
-    BarrierClaim, Checkpoint, Command, Custody, Cut, Fingerprint, Limits, Outcome, Placement,
-    Principal, Refusal, Request, RequestId, Window,
+    BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut, Fingerprint, Limits,
+    Outcome, Placement, Principal, Refusal, Request, RequestId, Window,
 };
 use std::num::NonZeroU64;
 use std::time::Duration;
@@ -300,10 +300,37 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         },
     };
     let worker = Principal::Worker(second_enrollment);
-    let publication = group
+    let preparation = CheckpointPreparation {
+        checkpoint: published.cut,
+        root: published.root,
+        source: second_grant,
+        base: seed,
+        custody: published.custody,
+        usable_bytes: 1 << 20,
+        descriptor: [6; 32],
+    };
+    let prepare = group
         .choose(
             &peers,
             11,
+            request(
+                Principal::Custodian,
+                Command::PrepareCheckpoint {
+                    grant: second_grant,
+                    preparation,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        prepare.receipt().outcome,
+        Ok(Outcome::CheckpointPrepared(preparation))
+    );
+    let publication = group
+        .choose(
+            &peers,
+            12,
             request(
                 Principal::Custodian,
                 Command::Publish {
@@ -327,7 +354,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             },
         )
     };
-    let blocked = group.choose(&peers, 12, trim()).await.unwrap();
+    let blocked = group.choose(&peers, 13, trim()).await.unwrap();
     assert_eq!(blocked.receipt().outcome, Err(Refusal::Unavailable));
     let medium = || {
         ["ordered.slot-a", "ordered.slot-b"]
@@ -339,12 +366,12 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             .any(|range| range == original_payload.as_ref())
     }));
 
-    for (round, hold) in [(13, first_recovery), (14, recovery), (15, read)] {
+    for (round, hold) in [(14, first_recovery), (15, recovery), (16, read)] {
         let release = request(Principal::Worker(hold.owner), Command::Release { hold });
         let released = group.choose(&peers, round, release).await.unwrap();
         assert_eq!(released.receipt().outcome, Ok(Outcome::Released));
     }
-    let trimmed = group.choose(&peers, 16, trim()).await.unwrap();
+    let trimmed = group.choose(&peers, 17, trim()).await.unwrap();
     assert_eq!(
         trimmed.receipt().outcome,
         Ok(Outcome::Trimmed(published.cut))
@@ -358,7 +385,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         Err(Refusal::Unavailable)
     ));
     assert_eq!(trimmed.state().spent_bytes(), next.byte_end);
-    group.compact(&peers, 17).await.unwrap();
+    group.compact(&peers, 18).await.unwrap();
     let reclaimed = medium();
     assert!(
         reclaimed
@@ -374,7 +401,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
 
     drop(peers);
     let peers = reopen([0, 1]);
-    let reopened = group.recover(&peers, 18).await.unwrap();
+    let reopened = group.recover(&peers, 19).await.unwrap();
     assert_eq!(reopened.position(), trimmed.state().position());
     assert_eq!(
         reopened.command_history(),
@@ -394,18 +421,18 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         )
     };
     let spent = group
-        .choose(&peers, 19, marker(NonZeroU64::MIN))
+        .choose(&peers, 20, marker(NonZeroU64::MIN))
         .await
         .unwrap();
     assert_eq!(spent.receipt().outcome, Err(Refusal::Stale));
 
     let pending = marker(NonZeroU64::new(3).unwrap());
-    let ahead = group.choose(&peers, 20, pending.clone()).await.unwrap();
+    let ahead = group.choose(&peers, 21, pending.clone()).await.unwrap();
     assert_eq!(ahead.receipt().outcome, Err(Refusal::ReadPending));
     let abandoned = group
         .choose(
             &peers,
-            21,
+            22,
             request(
                 reader,
                 Command::AbandonRead {
@@ -417,7 +444,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         .await
         .unwrap();
     assert_eq!(abandoned.receipt().outcome, Ok(Outcome::ReadAbandoned));
-    let admitted = group.choose(&peers, 22, pending).await.unwrap();
+    let admitted = group.choose(&peers, 23, pending).await.unwrap();
     let proof = admitted.barrier_claim().unwrap();
     assert_eq!(proof.nonce().get(), 3);
     assert_eq!(proof.read().through, published.cut);
@@ -425,7 +452,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let unsupported = group
         .choose(
             &peers,
-            23,
+            24,
             request(
                 worker,
                 Command::Publish {
@@ -446,7 +473,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let funded = group
         .choose(
             &peers,
-            24,
+            25,
             request(
                 Principal::Custodian,
                 Command::FundWindow {
@@ -472,7 +499,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             payload: Bytes::from_static(b"after funding"),
         },
     );
-    let appended = group.choose(&peers, 25, newest.clone()).await.unwrap();
+    let appended = group.choose(&peers, 26, newest.clone()).await.unwrap();
     let Outcome::Appended(result) = appended.receipt().outcome.unwrap() else {
         panic!("the next funded allocation was refused");
     };

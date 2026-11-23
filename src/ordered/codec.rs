@@ -1,6 +1,7 @@
 use super::{
-    BarrierClaim, Checkpoint, Command, Custody, Cut, Enrollment, Fingerprint, Grant, Hold,
-    Placement, Principal, Refusal, Request, RequestId, Window, WriterState,
+    BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut, Enrollment,
+    Fingerprint, Grant, Hold, Placement, Principal, Refusal, Request, RequestId, Window,
+    WriterState,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use std::num::NonZeroU64;
@@ -68,6 +69,34 @@ impl Request {
                 output.put_u8(9);
                 grant(&mut output, *writer);
                 output.put_u64(nonce.get());
+            }
+            Command::PrepareCheckpoint {
+                grant: writer,
+                preparation,
+            } => {
+                output.put_u8(15);
+                grant(&mut output, *writer);
+                checkpoint_preparation(&mut output, *preparation);
+            }
+            Command::CloseCheckpoint { checkpoint: root } => {
+                output.put_u8(16);
+                checkpoint(&mut output, *root);
+            }
+            Command::SettleCheckpoint {
+                checkpoint: root,
+                disposition,
+            } => {
+                output.put_u8(17);
+                checkpoint(&mut output, *root);
+                output.put_slice(disposition);
+            }
+            Command::DisposeWorker {
+                enrollment: worker,
+                disposition,
+            } => {
+                output.put_u8(18);
+                enrollment(&mut output, *worker);
+                output.put_slice(disposition);
             }
             Command::Publish {
                 grant: writer,
@@ -204,6 +233,21 @@ impl Request {
             14 => Command::SealCohort {
                 expected: input.take()?,
                 successor: input.take()?,
+            },
+            15 => Command::PrepareCheckpoint {
+                grant: input.grant()?,
+                preparation: input.checkpoint_preparation()?,
+            },
+            16 => Command::CloseCheckpoint {
+                checkpoint: input.checkpoint()?,
+            },
+            17 => Command::SettleCheckpoint {
+                checkpoint: input.checkpoint()?,
+                disposition: input.take()?,
+            },
+            18 => Command::DisposeWorker {
+                enrollment: input.enrollment()?,
+                disposition: input.take()?,
             },
             _ => return Err(Refusal::Invalid),
         };
@@ -364,6 +408,21 @@ impl Input {
         Ok(Cut { next_lsn, history })
     }
 
+    fn checkpoint_preparation(&mut self) -> Result<CheckpointPreparation, Refusal> {
+        Ok(CheckpointPreparation {
+            checkpoint: self.cut()?,
+            root: self.take()?,
+            source: self.grant()?,
+            base: self.checkpoint()?,
+            custody: Custody {
+                allocation: self.uuid()?,
+                revision: self.u64()?,
+            },
+            usable_bytes: self.u64()?,
+            descriptor: self.take()?,
+        })
+    }
+
     fn checkpoint(&mut self) -> Result<Checkpoint, Refusal> {
         Ok(Checkpoint {
             cut: self.cut()?,
@@ -454,6 +513,17 @@ fn hold_row(output: &mut BytesMut, value: Hold) {
 fn cut(output: &mut BytesMut, value: Cut) {
     output.put_u64(value.next_lsn);
     output.put_slice(&value.history);
+}
+
+fn checkpoint_preparation(output: &mut BytesMut, item: CheckpointPreparation) {
+    cut(output, item.checkpoint);
+    output.put_slice(&item.root);
+    grant(output, item.source);
+    checkpoint(output, item.base);
+    uuid(output, item.custody.allocation);
+    output.put_u64(item.custody.revision);
+    output.put_u64(item.usable_bytes);
+    output.put_slice(&item.descriptor);
 }
 
 fn checkpoint(output: &mut BytesMut, value: Checkpoint) {

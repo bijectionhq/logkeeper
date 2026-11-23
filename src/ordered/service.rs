@@ -5,8 +5,9 @@
 //! handing a request to this service.
 
 use super::{
-    AppendResult, BarrierClaim, Checkpoint, Command, Cut, Fingerprint, Grant, Hold, Outcome,
-    Placement, Principal, Receipt, Record, Refusal, Request, RequestId, State, Window, WriterState,
+    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Fingerprint,
+    Grant, Hold, Outcome, Placement, Principal, Receipt, Record, Refusal, Request, RequestId,
+    RetainedCheckpoint, State, Window, WriterState,
     replication::{self, Group, Replica},
 };
 use std::future::Future;
@@ -42,6 +43,8 @@ pub struct Route {
     pub head: Cut,
     pub floor: Cut,
     pub checkpoint: Checkpoint,
+    pub preparing: Option<CheckpointPreparation>,
+    pub retirement: Option<RetainedCheckpoint>,
     pub window: Window,
     pub window_spent: u64,
     pub reusable_bytes: u64,
@@ -159,6 +162,10 @@ impl<R: Replica> Coordinator<R> {
             head: state.head(),
             floor: state.floor(),
             checkpoint: state.checkpoint(),
+            preparing: state.preparing,
+            retirement: (session.principal == Principal::Custodian)
+                .then(|| state.next_checkpoint_retirement())
+                .flatten(),
             window: state.window(),
             window_spent: state.spent_bytes(),
             reusable_bytes: state.limits.retained_data_bytes - state.retained_bytes,

@@ -9,7 +9,8 @@ pub use sign::BarrierVerifier;
 pub use tls::{Credentials, Endpoint};
 
 use crate::ordered::{
-    Checkpoint, Enrollment, Fingerprint, Limits, Placement, Principal, Refusal, Window,
+    Checkpoint, Command, Enrollment, Fingerprint, Limits, Outcome, Placement, Principal, Refusal,
+    Request, RequestId, Window,
     replication::{
         DurableVoter, Group,
         transport::{RemoteVoter, serve_voter},
@@ -20,7 +21,7 @@ use crate::ordered::{
     },
 };
 use crate::server::durability::sync_directory;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
@@ -239,6 +240,35 @@ impl Manifest {
         Ok(serde_json::from_slice(&bytes)?)
     }
 
+    /// Emits public routing coordinates without exposing TLS or signing keys.
+    pub fn application_route(self, deployment: Uuid) -> Result<ApplicationRoute, Failure> {
+        let (manifest, groups) = self.resolve()?;
+        let mut selected = groups
+            .into_iter()
+            .filter(|(_, group)| group.group.placement().deployment == deployment);
+        let (group, config) = selected
+            .next()
+            .ok_or_else(|| invalid("the deployment has no installed group"))?;
+        if selected.next().is_some() {
+            return Err(
+                invalid("the installation contains several cohorts for the deployment").into(),
+            );
+        }
+        Ok(ApplicationRoute {
+            group,
+            placement: config.group.placement(),
+            endpoints: config.members.into_values().collect(),
+            maximum_frame: config.max_frame,
+            exchange_ms: manifest.exchange_ms,
+            verification_keys: config
+                .receipt_keys
+                .into_values()
+                .chain(config.predecessor_keys)
+                .collect(),
+            successors: Vec::new(),
+        })
+    }
+
     /// Explicit first provisioning on fresh media. Serving startup uses only
     /// recovery, so lost installed media cannot silently become an empty vote.
     pub fn initialize(self) -> Result<(), Failure> {
@@ -432,7 +462,7 @@ pub struct Client {
     barriers: BarrierVerifier,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplicationRoute {
     pub group: Fingerprint,
@@ -445,12 +475,61 @@ pub struct ApplicationRoute {
     pub successors: Vec<SuccessorRoute>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuccessorRoute {
     pub predecessor: Fingerprint,
     pub group: Fingerprint,
     pub endpoints: Vec<Endpoint>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlManifest {
+    credentials: Credentials,
+    route: ApplicationRoute,
+}
+
+impl ControlManifest {
+    pub async fn execute(path: &Path, action: Command) -> Result<Outcome, Failure> {
+        let mut bytes = Vec::new();
+        File::open(path)?
+            .take(MANIFEST_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MANIFEST_BYTES {
+            return Err(invalid("ordered control manifest too large").into());
+        }
+        let config: Self = serde_json::from_slice(&bytes)?;
+        let client = Client::new(config.route, &config.credentials)?;
+        let Reply::Route(route) = client.call(Operation::Route).await? else {
+            return Err(invalid("the journal did not return its installed route").into());
+        };
+        let request = Request {
+            placement: route.placement,
+            principal: Principal::Administrator,
+            id: RequestId {
+                nonce: Uuid::new_v4(),
+                expires_at: route
+                    .position
+                    .checked_add(route.retry_positions)
+                    .ok_or_else(|| invalid("the control invocation horizon is exhausted"))?,
+            },
+            command: action,
+        };
+        let Reply::Decision(decision) = client.call(Operation::Execute(request.clone())).await?
+        else {
+            return Err(invalid("the journal did not return the administrative decision").into());
+        };
+        if decision.receipt.request != request.id
+            || decision.receipt.principal != request.principal
+            || decision.receipt.placement != request.placement
+        {
+            return Err(invalid("the administrative receipt has a different scope").into());
+        }
+        decision.receipt.outcome.map_err(|reason| {
+            invalid(format_args!("ordered control was refused: {reason:?}")).into()
+        })
+    }
 }
 
 impl Client {
@@ -517,7 +596,7 @@ impl Client {
                 let reply = wire::exchange(
                     channel,
                     self.placement,
-                    operation.clone(),
+                    (*operation).clone(),
                     self.max_frame,
                     self.deadline,
                 )

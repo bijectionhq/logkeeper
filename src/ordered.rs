@@ -18,10 +18,9 @@ use uuid::Uuid;
 
 pub type Fingerprint = [u8; 32];
 
-// The stream's paid byte cursor includes a fixed charge for each record's
-// identity and framing. The physical store accounts for its own replicas,
-// staging, and metadata in addition to these stream charges.
-const APPEND_RECORD_CHARGE_BYTES: u64 = 208;
+/// Fixed stream charge for each record's identity and framing. Replica media
+/// also budget for staging and their own metadata.
+pub const APPEND_RECORD_CHARGE_BYTES: u64 = 208;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
@@ -102,6 +101,25 @@ pub struct Checkpoint {
     pub custody: Custody,
 }
 
+/// A custodian's durable authorization for one exact provider capture.
+/// The source descriptor belongs to the database adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointPreparation {
+    pub checkpoint: Cut,
+    pub root: Fingerprint,
+    pub source: Grant,
+    pub base: Checkpoint,
+    pub custody: Custody,
+    pub usable_bytes: u64,
+    pub descriptor: Fingerprint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedCheckpoint {
+    pub checkpoint: Checkpoint,
+    pub closed: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     feature = "ordered-daemon",
@@ -162,6 +180,23 @@ pub enum Command {
     AbandonRead {
         grant: Grant,
         nonce: NonZeroU64,
+    },
+    PrepareCheckpoint {
+        grant: Grant,
+        preparation: CheckpointPreparation,
+    },
+    CloseCheckpoint {
+        checkpoint: Checkpoint,
+    },
+    SettleCheckpoint {
+        checkpoint: Checkpoint,
+        disposition: Fingerprint,
+    },
+    /// The administrator attests that this withdrawn worker's original
+    /// running processes and delivery scope are permanently closed.
+    DisposeWorker {
+        enrollment: Enrollment,
+        disposition: Fingerprint,
     },
     /// The custodian attests the exact reconstructable root and manifest.
     Publish {
@@ -235,6 +270,10 @@ pub enum Outcome {
     },
     ReadAbandoned,
     Published(Checkpoint),
+    CheckpointPrepared(CheckpointPreparation),
+    CheckpointClosed(Checkpoint),
+    CheckpointSettled(Checkpoint),
+    WorkerDisposed(Enrollment),
     WindowFunded(Window),
     Protected(Hold),
     Released,
@@ -381,6 +420,8 @@ pub struct State {
     floor: Cut,
     head: Cut,
     checkpoint: Checkpoint,
+    preparing: Option<CheckpointPreparation>,
+    old_roots: BTreeMap<u64, RetainedCheckpoint>,
     records: VecDeque<Record>,
     holds: BTreeMap<RequestId, HeldAdmission>,
     outcomes: BTreeMap<RequestKey, RetainedOutcome>,
@@ -430,6 +471,8 @@ impl State {
             floor: checkpoint.cut,
             head: checkpoint.cut,
             checkpoint,
+            preparing: None,
+            old_roots: BTreeMap::new(),
             records: VecDeque::new(),
             holds: BTreeMap::new(),
             outcomes: BTreeMap::new(),
@@ -837,25 +880,129 @@ impl State {
                 self.read_floor = nonce.get();
                 Ok(Outcome::ReadAbandoned)
             }
-            Command::Publish { grant, checkpoint } => {
+            Command::PrepareCheckpoint { grant, preparation } => {
                 self.custodian(principal, grant)?;
-                if checkpoint.cut.next_lsn < self.checkpoint.cut.next_lsn
-                    || self.cut(checkpoint.cut.next_lsn) != Some(checkpoint.cut)
-                {
-                    return Err(Refusal::Stale);
+                if let Some(pending) = self.preparing {
+                    return if pending == preparation {
+                        Ok(Outcome::CheckpointPrepared(pending))
+                    } else {
+                        Err(Refusal::Conflict)
+                    };
                 }
-                if checkpoint.cut == self.checkpoint.cut && checkpoint != self.checkpoint {
-                    return Err(Refusal::Conflict);
-                }
-                if checkpoint != self.checkpoint
-                    && (checkpoint.custody.allocation.is_nil()
-                        || Some(checkpoint.custody.revision)
-                            != self.checkpoint.custody.revision.checked_add(1))
+                if preparation.checkpoint.next_lsn <= self.checkpoint.cut.next_lsn
+                    || self.cut(preparation.checkpoint.next_lsn) != Some(preparation.checkpoint)
+                    || preparation.source != grant
+                    || preparation.custody.allocation.is_nil()
+                    || Some(preparation.custody.revision)
+                        != self.checkpoint.custody.revision.checked_add(1)
+                    || preparation.usable_bytes == 0
+                    || preparation.root == [0; 32]
+                    || !self.checkpoint_open(preparation.base)
                 {
                     return Err(Refusal::Invalid);
                 }
+                // Preserve headroom to publish alongside previous pinned roots.
+                if self.old_roots.len() >= self.limits.replay_holds {
+                    return Err(Refusal::Capacity);
+                }
+                self.preparing = Some(preparation);
+                Ok(Outcome::CheckpointPrepared(preparation))
+            }
+            Command::Publish { grant, checkpoint } => {
+                self.custodian(principal, grant)?;
+                if checkpoint == self.checkpoint {
+                    return Ok(Outcome::Published(checkpoint));
+                }
+                let pending = self.preparing.ok_or(Refusal::Unavailable)?;
+                if pending.checkpoint != checkpoint.cut
+                    || pending.root != checkpoint.root
+                    || pending.custody != checkpoint.custody
+                    || checkpoint.manifest == [0; 32]
+                    || self.cut(checkpoint.cut.next_lsn) != Some(checkpoint.cut)
+                {
+                    return Err(Refusal::Conflict);
+                }
+                if self.checkpoint.manifest != [0; 32] {
+                    let old = self.checkpoint;
+                    self.old_roots.insert(
+                        old.custody.revision,
+                        RetainedCheckpoint {
+                            checkpoint: old,
+                            closed: false,
+                        },
+                    );
+                }
+                self.preparing = None;
                 self.checkpoint = checkpoint;
                 Ok(Outcome::Published(checkpoint))
+            }
+            Command::CloseCheckpoint { checkpoint } => {
+                if principal != Principal::Custodian {
+                    return Err(Refusal::Unauthorized);
+                }
+                let entry = self
+                    .old_roots
+                    .get_mut(&checkpoint.custody.revision)
+                    .filter(|entry| entry.checkpoint == checkpoint)
+                    .ok_or(Refusal::Stale)?;
+                if self
+                    .preparing
+                    .is_some_and(|pending| pending.base == checkpoint)
+                    || self
+                        .holds
+                        .values()
+                        .any(|entry| entry.hold.checkpoint == checkpoint)
+                {
+                    return Err(Refusal::Unavailable);
+                }
+                entry.closed = true;
+                Ok(Outcome::CheckpointClosed(checkpoint))
+            }
+            Command::SettleCheckpoint {
+                checkpoint,
+                disposition,
+            } => {
+                if principal != Principal::Custodian {
+                    return Err(Refusal::Unauthorized);
+                }
+                if disposition == [0; 32]
+                    || self
+                        .old_roots
+                        .get(&checkpoint.custody.revision)
+                        .is_none_or(|entry| entry.checkpoint != checkpoint || !entry.closed)
+                {
+                    return Err(Refusal::Stale);
+                }
+                self.old_roots.remove(&checkpoint.custody.revision);
+                Ok(Outcome::CheckpointSettled(checkpoint))
+            }
+            Command::DisposeWorker {
+                enrollment,
+                disposition,
+            } => {
+                if principal != Principal::Administrator {
+                    return Err(Refusal::Unauthorized);
+                }
+                if disposition == [0; 32]
+                    || enrollment.serial == 0
+                    || enrollment.serial > self.enrollment_serial
+                    || self.roster.get(&enrollment.worker) == Some(&enrollment)
+                {
+                    return Err(Refusal::Stale);
+                }
+                let retired = self
+                    .holds
+                    .values()
+                    .filter(|entry| entry.hold.owner == enrollment)
+                    .copied()
+                    .collect::<Vec<_>>();
+                for entry in retired {
+                    self.holds.remove(&entry.hold.id);
+                    if entry.hold.id.expires_at <= self.position {
+                        self.outcomes.remove(&(entry.origin, entry.hold.id));
+                    }
+                }
+                Ok(Outcome::WorkerDisposed(enrollment))
             }
             Command::FundWindow { grant, window } => {
                 self.custodian(principal, grant)?;
@@ -976,6 +1123,37 @@ impl State {
                 Ok(Outcome::Trimmed(through))
             }
         }
+    }
+
+    fn checkpoint_open(&self, checkpoint: Checkpoint) -> bool {
+        checkpoint == self.checkpoint
+            || self
+                .old_roots
+                .get(&checkpoint.custody.revision)
+                .is_some_and(|entry| !entry.closed && entry.checkpoint == checkpoint)
+            || (checkpoint.manifest == [0; 32]
+                && checkpoint.root == [0; 32]
+                && checkpoint.cut.next_lsn == 0
+                && checkpoint.custody.revision == 1
+                && self
+                    .holds
+                    .values()
+                    .any(|entry| entry.hold.checkpoint == checkpoint))
+    }
+
+    fn next_checkpoint_retirement(&self) -> Option<RetainedCheckpoint> {
+        self.old_roots
+            .values()
+            .find(|entry| {
+                let checkpoint = entry.checkpoint;
+                self.preparing
+                    .is_none_or(|pending| pending.base != checkpoint)
+                    && !self
+                        .holds
+                        .values()
+                        .any(|held| held.hold.checkpoint == checkpoint)
+            })
+            .copied()
     }
 
     fn custodian(&self, principal: Principal, grant: Grant) -> Result<(), Refusal> {

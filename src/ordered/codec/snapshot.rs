@@ -1,10 +1,11 @@
 use super::{
-    Input, checkpoint, cut, enrollment, grant, hold_row, principal, request_id, window,
-    writer_state,
+    Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, principal,
+    request_id, window, writer_state,
 };
 use crate::ordered::{
     APPEND_RECORD_CHARGE_BYTES, AppendResult, Command, HeldAdmission, Outcome, Principal, Receipt,
-    Record, Refusal, Request, RetainedOutcome, State, Window, append_fingerprint, fingerprint,
+    Record, Refusal, Request, RetainedCheckpoint, RetainedOutcome, State, Window,
+    append_fingerprint, fingerprint,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::BTreeSet;
@@ -20,9 +21,11 @@ impl super::super::Limits {
         let holds = self.replay_holds.checked_mul(289)?;
         let retries = usize::try_from(self.retry_positions).ok()?;
         let outcomes = retries.checked_add(self.replay_holds)?.checked_mul(394)?;
-        512usize
+        let checkpoint_retention = self.replay_holds.checked_mul(129)?;
+        1024usize
             .checked_add(roster)?
             .checked_add(holds)?
+            .checked_add(checkpoint_retention)?
             .checked_add(outcomes)
     }
 }
@@ -46,6 +49,15 @@ impl State {
         cut(&mut output, self.floor);
         cut(&mut output, self.head);
         checkpoint(&mut output, self.checkpoint);
+        output.put_u8(u8::from(self.preparing.is_some()));
+        if let Some(item) = self.preparing {
+            checkpoint_preparation(&mut output, item);
+        }
+        output.put_u64(self.old_roots.len() as u64);
+        for entry in self.old_roots.values() {
+            checkpoint(&mut output, entry.checkpoint);
+            output.put_u8(u8::from(entry.closed));
+        }
 
         output.put_u64(self.roster.len() as u64);
         for member in self.roster.values() {
@@ -91,6 +103,30 @@ impl State {
         state.floor = input.cut()?;
         state.head = input.cut()?;
         state.checkpoint = input.checkpoint()?;
+        state.preparing = input.optional(Input::checkpoint_preparation)?;
+        for _ in 0..input.count(state.limits.replay_holds)? {
+            let checkpoint = input.checkpoint()?;
+            let closed = match input.read_byte()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Refusal::Invalid),
+            };
+            if checkpoint.custody.revision == 0
+                || checkpoint.custody.revision >= state.checkpoint.custody.revision
+                || checkpoint.custody.allocation.is_nil()
+                || checkpoint.manifest == [0; 32]
+                || checkpoint.cut.next_lsn >= state.checkpoint.cut.next_lsn
+                || state
+                    .old_roots
+                    .insert(
+                        checkpoint.custody.revision,
+                        RetainedCheckpoint { checkpoint, closed },
+                    )
+                    .is_some()
+            {
+                return Err(Refusal::Invalid);
+            }
+        }
         if state.position == 0
             || state.voter_scope != initial.voter_scope
             || state
@@ -115,6 +151,23 @@ impl State {
         state.read_roster(&mut input)?;
         state.read_records(&mut input)?;
         state.read_holds(&mut input)?;
+        if state
+            .holds
+            .values()
+            .any(|entry| !state.checkpoint_open(entry.hold.checkpoint))
+            || state.preparing.is_some_and(|item| {
+                item.checkpoint.next_lsn <= state.checkpoint.cut.next_lsn
+                    || state.cut(item.checkpoint.next_lsn) != Some(item.checkpoint)
+                    || Some(item.custody.revision)
+                        != state.checkpoint.custody.revision.checked_add(1)
+                    || item.custody.allocation.is_nil()
+                    || item.root == [0; 32]
+                    || item.usable_bytes == 0
+                    || (item.base != initial.checkpoint && !state.checkpoint_open(item.base))
+            })
+        {
+            return Err(Refusal::Invalid);
+        }
         state.read_outcomes(&mut input)?;
         if !input.0.is_empty() {
             return Err(Refusal::Invalid);
@@ -381,6 +434,10 @@ impl Input {
             10 => Outcome::WindowFunded(self.window()?),
             11 => Outcome::Vacated,
             12 => Outcome::CohortSealed(self.take()?),
+            13 => Outcome::CheckpointPrepared(self.checkpoint_preparation()?),
+            14 => Outcome::CheckpointClosed(self.checkpoint()?),
+            15 => Outcome::CheckpointSettled(self.checkpoint()?),
+            16 => Outcome::WorkerDisposed(self.enrollment()?),
             32 => return Ok(Err(Refusal::WrongPlacement)),
             33 => return Ok(Err(Refusal::Unauthorized)),
             34 => return Ok(Err(Refusal::Stale)),
@@ -466,6 +523,22 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
         Ok(Outcome::CohortSealed(successor)) => {
             output.put_u8(12);
             output.put_slice(&successor);
+        }
+        Ok(Outcome::CheckpointPrepared(item)) => {
+            output.put_u8(13);
+            checkpoint_preparation(output, item);
+        }
+        Ok(Outcome::CheckpointClosed(root)) => {
+            output.put_u8(14);
+            checkpoint(output, root);
+        }
+        Ok(Outcome::CheckpointSettled(root)) => {
+            output.put_u8(15);
+            checkpoint(output, root);
+        }
+        Ok(Outcome::WorkerDisposed(worker)) => {
+            output.put_u8(16);
+            enrollment(output, worker);
         }
         Err(refusal) => output.put_u8(match refusal {
             Refusal::WrongPlacement => 32,

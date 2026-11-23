@@ -1,7 +1,8 @@
 use super::{
-    Input, checkpoint, cut, grant, hold_row, placement, principal, request_id, snapshot, window,
-    writer_state,
+    Input, checkpoint, checkpoint_preparation, cut, grant, hold_row, placement, principal,
+    request_id, snapshot, window, writer_state,
 };
+use crate::ordered::RetainedCheckpoint;
 use crate::ordered::{
     BarrierClaim, Outcome, Placement, Principal, Receipt, Refusal, Request,
     service::{
@@ -86,6 +87,15 @@ impl Reply {
                 cut(&mut output, route.head);
                 cut(&mut output, route.floor);
                 checkpoint(&mut output, route.checkpoint);
+                output.put_u8(u8::from(route.preparing.is_some()));
+                if let Some(item) = route.preparing {
+                    checkpoint_preparation(&mut output, item);
+                }
+                output.put_u8(u8::from(route.retirement.is_some()));
+                if let Some(item) = route.retirement {
+                    checkpoint(&mut output, item.checkpoint);
+                    output.put_u8(u8::from(item.closed));
+                }
                 window(&mut output, route.window);
                 output.put_u64(route.window_spent);
                 output.put_u64(route.reusable_bytes);
@@ -147,6 +157,16 @@ impl Reply {
                 head: input.cut()?,
                 floor: input.cut()?,
                 checkpoint: input.checkpoint()?,
+                preparing: input.optional(Input::checkpoint_preparation)?,
+                retirement: input.optional(|input| {
+                    let checkpoint = input.checkpoint()?;
+                    let closed = match input.read_byte()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(Refusal::Invalid),
+                    };
+                    Ok(RetainedCheckpoint { checkpoint, closed })
+                })?,
                 window: input.window()?,
                 window_spent: input.u64()?,
                 reusable_bytes: input.u64()?,

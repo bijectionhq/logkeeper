@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 const USAGE: &str = "Usage: logkeeper <listen-address> <journal-directory> <journal-id>";
 
 #[cfg(feature = "ordered-daemon")]
-const USAGE: &str = "Usage: logkeeper <listen-address> <journal-directory> <journal-id>\n       logkeeper ordered <initialize|serve> <installed-manifest.json>\n       logkeeper ordered reserve-repair <target-manifest> <deployment-id> <ticket>\n       logkeeper ordered seal-repair <source-manifest> <target-group.json> <package> <ticket>...\n       logkeeper ordered install-repair <target-manifest> <deployment-id> <package>";
+const USAGE: &str = "Usage: logkeeper <listen-address> <journal-directory> <journal-id>\n       logkeeper ordered <initialize|serve> <installed-manifest.json>\n       logkeeper ordered reserve-repair <target-manifest> <deployment-id> <ticket>\n       logkeeper ordered seal-repair <source-manifest> <target-group.json> <package> <ticket>...\n       logkeeper ordered install-repair <target-manifest> <deployment-id> <package>\n       logkeeper ordered route <installed-manifest> <deployment-id>\n       logkeeper ordered enroll <control-manifest> <worker-id> [prior-serial]\n       logkeeper ordered withdraw <control-manifest> <worker-id> <serial>\n       logkeeper ordered dispose-worker <control-manifest> <worker-id> <serial> <disposition-sha256>";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -33,16 +33,23 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
     if args.first().is_some_and(|argument| argument == "ordered") {
         return run_ordered(args).await;
     }
-    let [listen, data_dir, id] = args else { return Err(USAGE.into()); };
+    let [listen, data_dir, id] = args else {
+        return Err(USAGE.into());
+    };
     if !logkeeper::valid_journal_identity(id) {
         return Err("The journal ID must be a nonzero canonical UUID".into());
     }
     let address: SocketAddr = listen.parse()?;
     let listener = TcpListener::bind(address).await?;
     let (journal, installed) = PreparedJournal::open_for_member(
-        ServerOptions { data_dir: PathBuf::from(data_dir), fsync: true, cache_bytes: ServerOptions::DEFAULT_CACHE_BYTES },
+        ServerOptions {
+            data_dir: PathBuf::from(data_dir),
+            fsync: true,
+            cache_bytes: ServerOptions::DEFAULT_CACHE_BYTES,
+        },
         id.clone(),
-    ).await?;
+    )
+    .await?;
     if installed != *id {
         return Err("The journal directory already belongs to a different identity".into());
     }
@@ -62,19 +69,73 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
 
 #[cfg(feature = "ordered-daemon")]
 async fn run_ordered(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use logkeeper::ordered::daemon::Manifest;
+    use logkeeper::ordered::{
+        Command, Enrollment, Outcome,
+        daemon::{ControlManifest, Manifest},
+    };
     use std::path::Path;
 
-    let [_, mode, path, rest @ ..] = args else { return Err(USAGE.into()); };
-    let manifest = Manifest::read(Path::new(path))?;
+    let [_, mode, path, rest @ ..] = args else {
+        return Err(USAGE.into());
+    };
+    let path = Path::new(path);
+    let command = match (mode.as_str(), rest) {
+        ("enroll", [worker]) => Some(Command::Enroll {
+            worker: worker.parse()?,
+            expected: None,
+        }),
+        ("enroll", [worker, serial]) => {
+            let worker = worker.parse()?;
+            Some(Command::Enroll {
+                worker,
+                expected: Some(Enrollment {
+                    worker,
+                    serial: serial.parse()?,
+                }),
+            })
+        }
+        ("withdraw", [worker, serial]) => Some(Command::Withdraw {
+            enrollment: Enrollment {
+                worker: worker.parse()?,
+                serial: serial.parse()?,
+            },
+        }),
+        ("dispose-worker", [worker, serial, disposition]) => Some(Command::DisposeWorker {
+            enrollment: Enrollment {
+                worker: worker.parse()?,
+                serial: serial.parse()?,
+            },
+            disposition: decode_digest(disposition)?,
+        }),
+        _ => None,
+    };
+    if let Some(command) = command {
+        match ControlManifest::execute(path, command).await? {
+            Outcome::Enrolled(enrollment) | Outcome::WorkerDisposed(enrollment) => {
+                println!("{}", serde_json::to_string(&enrollment)?);
+            }
+            Outcome::Withdrawn => println!("withdrawn"),
+            _ => return Err("The journal returned a different administrative outcome".into()),
+        }
+        return Ok(());
+    }
+    let manifest = Manifest::read(path)?;
     match (mode.as_str(), rest) {
         ("initialize", []) => manifest.initialize()?,
+        ("route", [deployment]) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&manifest.application_route(deployment.parse()?)?)?
+            );
+        }
         ("reserve-repair", [deployment, output]) => {
             manifest.reserve_repair(deployment.parse()?, Path::new(output))?;
         }
         ("seal-repair", [destination, output, tickets @ ..]) => {
             let tickets = tickets.iter().map(Path::new).collect::<Vec<_>>();
-            manifest.seal_repair(Path::new(destination), &tickets, Path::new(output)).await?;
+            manifest
+                .seal_repair(Path::new(destination), &tickets, Path::new(output))
+                .await?;
         }
         ("install-repair", [deployment, package]) => {
             manifest.install_repair(deployment.parse()?, Path::new(package))?;
@@ -95,6 +156,19 @@ async fn run_ordered(args: &[String]) -> Result<(), Box<dyn std::error::Error + 
         _ => return Err(USAGE.into()),
     }
     Ok(())
+}
+
+#[cfg(feature = "ordered-daemon")]
+fn decode_digest(value: &str) -> Result<[u8; 32], &'static str> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("The disposition must be a SHA-256 hex digest");
+    }
+    let mut digest = [0; 32];
+    for (i, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[2 * i..2 * i + 2], 16)
+            .map_err(|_| "Invalid disposition digest")?;
+    }
+    Ok(digest)
 }
 
 #[cfg(unix)]

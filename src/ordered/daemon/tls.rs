@@ -34,7 +34,7 @@ pub struct Credentials {
     pub roots: PathBuf,
 }
 
-#[derive(Clone, serde::Deserialize)]
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
     pub address: SocketAddr,
