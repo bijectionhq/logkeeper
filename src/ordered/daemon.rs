@@ -1,6 +1,7 @@
 //! Installed-group daemon with separate mutually authenticated voter and
 //! application protocols.
 
+mod receipt_keys;
 mod repair;
 mod sign;
 mod tls;
@@ -21,6 +22,7 @@ use crate::ordered::{
     },
 };
 use crate::server::durability::sync_directory;
+use receipt_keys::ReceiptKeys;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -132,39 +134,7 @@ struct GroupConfig {
     voters: BTreeSet<Fingerprint>,
     clients: BTreeMap<Fingerprint, Principal>,
     max_frame: usize,
-    receipt_keys: BTreeMap<Uuid, [u8; 32]>,
-    predecessor_keys: Vec<[u8; 32]>,
-    retained_barrier_keys: Vec<[u8; 32]>,
-}
-
-impl GroupConfig {
-    fn barrier_keys(&self) -> BTreeSet<[u8; 32]> {
-        self.receipt_keys
-            .values()
-            .chain(&self.predecessor_keys)
-            .chain(&self.retained_barrier_keys)
-            .copied()
-            .collect()
-    }
-
-    fn validate_successor_keys(&self, source: &Self) -> io::Result<()> {
-        let active: BTreeSet<_> = source.receipt_keys.values().copied().collect();
-        if self
-            .predecessor_keys
-            .iter()
-            .any(|key| !active.contains(key))
-        {
-            return Err(invalid(
-                "a repair key is outside the active predecessor roster",
-            ));
-        }
-        if !source.barrier_keys().is_subset(&self.barrier_keys()) {
-            return Err(invalid(
-                "the successor dropped installed barrier verification keys",
-            ));
-        }
-        Ok(())
-    }
+    keys: ReceiptKeys,
 }
 
 struct Admission {
@@ -257,9 +227,11 @@ impl InstalledGroup {
             voters,
             clients,
             max_frame: self.maximum_application_frame,
-            receipt_keys,
-            predecessor_keys: self.predecessor_keys,
-            retained_barrier_keys: self.retained_barrier_keys,
+            keys: ReceiptKeys {
+                active: receipt_keys,
+                predecessor: self.predecessor_keys,
+                retained: self.retained_barrier_keys,
+            },
         })
     }
 }
@@ -290,7 +262,7 @@ impl Manifest {
                 invalid("the installation contains several cohorts for the deployment").into(),
             );
         }
-        let verification_keys = config.barrier_keys().into_iter().collect();
+        let verification_keys = config.keys.barrier_keys().into_iter().collect();
         Ok(ApplicationRoute {
             group,
             placement: config.group.placement(),
@@ -329,7 +301,7 @@ impl Manifest {
         let issuer = Arc::new(sign::Issuer::load(&manifest.barrier_key)?);
         if groups
             .values()
-            .any(|config| config.receipt_keys.get(&manifest.voter) != Some(&issuer.public_key()))
+            .any(|config| config.keys.active.get(&manifest.voter) != Some(&issuer.public_key()))
         {
             return Err(invalid("the configured receipt signer is not the installed voter").into());
         }

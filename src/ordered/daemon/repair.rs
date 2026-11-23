@@ -1,3 +1,5 @@
+mod authentication;
+
 use super::{
     Failure, GroupConfig, InstalledGroup, MANIFEST_BYTES, Manifest, TlsPeers, VOTER,
     group_directory, invalid, sign,
@@ -9,7 +11,6 @@ use crate::ordered::{
 };
 use crate::server::durability::sync_directory;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -28,7 +29,7 @@ impl Manifest {
         let (manifest, groups) = self.resolve()?;
         let group = successor(&groups, deployment)?;
         let issuer = sign::Issuer::load(&manifest.barrier_key)?;
-        if group.receipt_keys.get(&manifest.voter) != Some(&issuer.public_key()) {
+        if group.keys.active.get(&manifest.voter) != Some(&issuer.public_key()) {
             return Err(invalid(
                 "the successor reservation signer does not match its installed voter",
             )
@@ -72,10 +73,10 @@ impl Manifest {
         let source = groups
             .remove(&predecessor)
             .ok_or_else(|| invalid("the source manifest lacks the exact predecessor"))?;
-        destination.validate_successor_keys(&source)?;
+        destination.keys.validate_successor_keys(&source.keys)?;
         let issuer = sign::Issuer::load(&manifest.barrier_key)?;
-        if source.receipt_keys.get(&manifest.voter) != Some(&issuer.public_key())
-            || !destination.predecessor_keys.contains(&issuer.public_key())
+        if source.keys.active.get(&manifest.voter) != Some(&issuer.public_key())
+            || !destination.keys.predecessor.contains(&issuer.public_key())
         {
             return Err(
                 invalid("the predecessor signer is outside the repair authorization").into(),
@@ -116,15 +117,9 @@ impl Manifest {
         if packet.len() <= SIGNATURE_BYTES {
             return Err(invalid("the repair package has no certified image").into());
         }
-        let key = target
-            .predecessor_keys
-            .iter()
-            .find(|key| &Sha256::digest(key)[..] == &packet[..32])
-            .ok_or_else(|| {
-                invalid("the repair package signer is not in the installed predecessor")
-            })?;
-        sign::verify_bytes(
-            key,
+        authentication::verify_repair_signature(
+            &target.keys,
+            packet[..32].try_into()?,
             &packet[SIGNATURE_BYTES..],
             &packet[32..SIGNATURE_BYTES],
         )?;
@@ -165,7 +160,8 @@ fn validate_tickets(destination: &GroupConfig, tickets: &[&Path]) -> Result<(), 
         }
         let voter = Uuid::from_slice(&packet[40..56])?;
         let key = destination
-            .receipt_keys
+            .keys
+            .active
             .get(&voter)
             .ok_or_else(|| invalid("a repair reservation names an unknown voter"))?;
         sign::verify_bytes(key, &packet[..TICKET_BODY], &packet[TICKET_BODY..])?;

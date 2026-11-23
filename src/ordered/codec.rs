@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 pub(super) mod frame;
 mod service;
+mod signed;
 mod snapshot;
 mod snapshot_checks;
 
@@ -16,7 +17,7 @@ use frame::{
     object_name_count, read_decision_time,
 };
 
-const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR04";
+use signed::{BARRIER_DOMAIN, checkpoint, cut, enrollment, placement, request_id, uuid};
 
 impl Request {
     /// The exact bytes used by ordered replication and crash replay.
@@ -318,19 +319,6 @@ pub(in crate::ordered) fn decode_decision(frame: Bytes) -> Result<(u64, Request)
 }
 
 impl BarrierClaim {
-    /// Canonical bytes for the journal's scoped receipt issuer to authenticate.
-    pub fn encode(&self) -> Bytes {
-        let mut output = BytesMut::new();
-        output.put_slice(BARRIER_DOMAIN);
-        placement(&mut output, self.placement);
-        enrollment(&mut output, self.read.owner);
-        request_id(&mut output, self.read.id);
-        output.put_u64(self.read.admitted_at);
-        checkpoint(&mut output, self.read.checkpoint);
-        cut(&mut output, self.read.through);
-        output.freeze()
-    }
-
     /// Parses a claim. The receiver still authenticates the original bytes
     /// against the installed journal scope before relying on their contents.
     pub fn decode(frame: Bytes) -> Result<Self, Refusal> {
@@ -517,15 +505,6 @@ impl Input {
     }
 }
 
-fn uuid(output: &mut BytesMut, value: Uuid) {
-    output.put_slice(value.as_bytes());
-}
-
-fn request_id(output: &mut BytesMut, value: RequestId) {
-    uuid(output, value.nonce);
-    output.put_u64(value.expires_at);
-}
-
 fn principal(output: &mut BytesMut, value: Principal) {
     match value {
         Principal::Administrator => output.put_u8(0),
@@ -536,18 +515,6 @@ fn principal(output: &mut BytesMut, value: Principal) {
         Principal::Custodian => output.put_u8(2),
         Principal::RouteReader => output.put_u8(3),
     }
-}
-
-fn placement(output: &mut BytesMut, value: Placement) {
-    uuid(output, value.deployment);
-    uuid(output, value.incarnation);
-    uuid(output, value.group);
-    output.put_u64(value.generation);
-}
-
-fn enrollment(output: &mut BytesMut, value: Enrollment) {
-    uuid(output, value.worker);
-    output.put_u64(value.serial);
 }
 
 fn grant(output: &mut BytesMut, value: Grant) {
@@ -573,11 +540,6 @@ fn hold_row(output: &mut BytesMut, value: Hold) {
     cut(output, value.through);
 }
 
-fn cut(output: &mut BytesMut, value: Cut) {
-    output.put_u64(value.next_lsn);
-    output.put_slice(&value.history);
-}
-
 fn checkpoint_preparation(output: &mut BytesMut, item: CheckpointPreparation) {
     output.put_u8(u8::from(item.erasure));
     cut(output, item.checkpoint);
@@ -589,15 +551,6 @@ fn checkpoint_preparation(output: &mut BytesMut, item: CheckpointPreparation) {
     output.put_slice(&item.custody.provider);
     output.put_u64(item.usable_bytes);
     output.put_slice(&item.descriptor);
-}
-
-fn checkpoint(output: &mut BytesMut, value: Checkpoint) {
-    cut(output, value.cut);
-    output.put_slice(&value.root);
-    output.put_slice(&value.manifest);
-    uuid(output, value.custody.allocation);
-    output.put_u64(value.custody.revision);
-    output.put_slice(&value.custody.provider);
 }
 
 fn window(output: &mut BytesMut, value: Window) {

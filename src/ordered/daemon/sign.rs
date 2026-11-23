@@ -1,7 +1,9 @@
-use crate::ordered::{
-    BarrierClaim, Command, Fingerprint, Placement, Principal, Receipt, Request,
-    service::wire::{Signature, SignedBarrier, SignedRotationSlots},
-};
+mod verification;
+
+pub use verification::BarrierVerifier;
+
+use super::invalid;
+use crate::ordered::{Fingerprint, Placement, service::wire::Signature};
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -49,14 +51,6 @@ pub(super) fn verify_bytes(public: &[u8; 32], body: &[u8], signature: &[u8]) -> 
         .map_err(|_| super::invalid("invalid installed-journal signature"))
 }
 
-/// Verification material installed independently of the serving daemon.
-/// Carry all previously installed receipt public keys for the placement's
-/// lifetime. Verification does not extend the underlying read hold.
-pub struct BarrierVerifier {
-    scope: Placement,
-    keys: BTreeMap<Fingerprint, [u8; 32]>,
-}
-
 impl BarrierVerifier {
     pub fn new(
         scope: Placement,
@@ -73,63 +67,16 @@ impl BarrierVerifier {
         }
         Ok(Self { scope, keys })
     }
-
-    /// Authenticates the exact successful marker for the supplied invocation.
-    /// The consumer still has to open and materialize the protected basis.
-    pub fn verify(&self, proof: SignedBarrier, expected: &Request) -> io::Result<BarrierClaim> {
-        let Command::Barrier = &expected.command else {
-            return Err(super::invalid(
-                "a read receipt requires an original read invocation",
-            ));
-        };
-        let claim = proof.claim;
-        if claim.placement() != self.scope
-            || expected.placement != self.scope
-            || expected.principal != Principal::Worker(claim.read().owner)
-            || claim.read().id != expected.id
-        {
-            return Err(super::invalid(
-                "read receipt addresses a different invocation",
-            ));
-        }
-        self.verify_signature(proof.signature, &claim.encode())?;
-        Ok(claim)
-    }
-
-    pub(super) fn verify_rotation(
-        &self,
-        proof: &SignedRotationSlots,
-        group: Fingerprint,
-        receipt: Receipt,
-    ) -> io::Result<()> {
-        if receipt.placement != self.scope
-            || proof.evidence.group != group
-            || !proof.evidence.covers(receipt)
-        {
-            return Err(super::invalid(
-                "rotation slots address a different installed decision",
-            ));
-        }
-        self.verify_signature(proof.signature, &proof.evidence.signing_bytes(receipt))
-    }
-
-    fn verify_signature(&self, signature: Signature, body: &[u8]) -> io::Result<()> {
-        let authority = self
-            .keys
-            .get(&signature.issuer)
-            .ok_or_else(|| super::invalid("unrecognized journal receipt key"))?;
-        verify_bytes(authority, body, &signature.proof)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ordered::daemon::{GroupConfig, InstalledGroup, VoterRoute, tls::Endpoint};
-    use crate::ordered::service::wire::{Decision, Reply};
+    use crate::ordered::service::wire::{Decision, Reply, SignedBarrier, SignedRotationSlots};
     use crate::ordered::{
-        Checkpoint, Custody, Cut, Enrollment, Grant, Hold, Limits, Outcome, Receipt, RequestId,
-        Window,
+        BarrierClaim, Checkpoint, Command, Custody, Cut, Enrollment, Grant, Hold, Limits, Outcome,
+        Principal, Receipt, Request, RequestId, Window,
         replication::{Ballot, RotationSlots, SlotImage, SlotPair, VoterSlots},
     };
     use ring::rand::SystemRandom;
@@ -203,10 +150,10 @@ mod tests {
         );
         let last_without_history =
             cohort(placement, checkpoint, c.public_key(), Some(&middle), vec![]);
-        assert!(middle.validate_successor_keys(&initial).is_ok());
+        assert!(middle.keys.validate_successor_keys(&initial.keys).is_ok());
         assert!(
-            last_without_history
-                .validate_successor_keys(&middle)
+            last_without_history.keys
+                .validate_successor_keys(&middle.keys)
                 .is_err()
         );
 
@@ -215,15 +162,15 @@ mod tests {
             checkpoint,
             c.public_key(),
             Some(&middle),
-            initial.receipt_keys.values().copied().collect(),
+            initial.keys.active.values().copied().collect(),
         );
-        last.validate_successor_keys(&middle).unwrap();
-        last.predecessor_keys.push(a.public_key());
-        assert!(last.validate_successor_keys(&middle).is_err());
-        assert_eq!(last.predecessor_keys.pop(), Some(a.public_key()));
+        last.keys.validate_successor_keys(&middle.keys).unwrap();
+        last.keys.predecessor.push(a.public_key());
+        assert!(last.keys.validate_successor_keys(&middle.keys).is_err());
+        assert_eq!(last.keys.predecessor.pop(), Some(a.public_key()));
         let without_history =
-            BarrierVerifier::new(placement, last_without_history.barrier_keys()).unwrap();
-        let verifier = BarrierVerifier::new(placement, last.barrier_keys()).unwrap();
+            BarrierVerifier::new(placement, last_without_history.keys.barrier_keys()).unwrap();
+        let verifier = BarrierVerifier::new(placement, last.keys.barrier_keys()).unwrap();
         let (original, old) = emit(a);
         let (current, new) = emit(c);
         assert!(without_history.verify(old, &original).is_err());
@@ -235,7 +182,7 @@ mod tests {
             ..placement
         };
         assert!(
-            BarrierVerifier::new(foreign, last.barrier_keys())
+            BarrierVerifier::new(foreign, last.keys.barrier_keys())
                 .unwrap()
                 .verify(old, &original)
                 .is_err()
@@ -477,7 +424,7 @@ mod tests {
             }],
             predecessor: predecessor.map(|config| config.group.identity()),
             predecessor_keys: predecessor.map_or_else(Vec::new, |config| {
-                config.receipt_keys.values().copied().collect()
+                config.keys.active.values().copied().collect()
             }),
             retained_barrier_keys,
         }

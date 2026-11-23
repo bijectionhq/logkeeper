@@ -1,5 +1,10 @@
 //! Bounded application RPC on a channel authenticated for an installed group.
 
+mod receipt;
+
+pub(in crate::ordered) use receipt::barrier_receipt_matches;
+use receipt::receipt_scope_matches;
+
 use super::{Coordinator, Error, ReplayHead, ReplayPage, Route, Session, WithdrawnWorker};
 use crate::ordered::{
     AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment,
@@ -274,9 +279,7 @@ impl Reply {
             (Self::Released(released), Operation::Release { hold }) => released == hold,
             (Self::Route(route), Operation::Route) => route.placement == placement,
             (Self::Decision(decision), Operation::Execute(request)) => {
-                decision.receipt.placement == placement
-                    && decision.receipt.principal == request.principal
-                    && decision.receipt.request == request.id
+                receipt_scope_matches(decision.receipt, placement, request)
                     && match (
                         &request.command,
                         decision.receipt.outcome,

@@ -5,11 +5,11 @@ use super::{
 };
 use crate::ordered::RetainedCheckpoint;
 use crate::ordered::{
-    BarrierClaim, Outcome, Placement, Principal, Receipt, Refusal, Request,
+    BarrierClaim, Placement, Receipt, Refusal, Request,
     replication::{Ballot, RotationSlots, SlotImage, SlotPair, VoterSlots},
     service::{
         ErasureRetirement, MAX_WITHDRAWN_WORKERS, ReplayHead, ReplayPage, Route, WithdrawnWorker,
-        wire::{Decision, Operation, Reply, Signature, SignedBarrier, SignedRotationSlots},
+        wire::{Decision, Operation, Reply, Signature, SignedBarrier, SignedRotationSlots, barrier_receipt_matches},
     },
 };
 use bytes::{BufMut, Bytes, BytesMut};
@@ -333,22 +333,12 @@ impl Reply {
     }
 }
 
-fn receipt(output: &mut BytesMut, receipt: Receipt) {
+pub(super) fn receipt(output: &mut BytesMut, receipt: Receipt) {
     placement(output, receipt.placement);
     principal(output, receipt.principal);
     request_id(output, receipt.request);
     output.put_u64(receipt.position);
     snapshot::result(output, receipt.outcome);
-}
-
-impl RotationSlots {
-    pub(in crate::ordered) fn signing_bytes(&self, decision: Receipt) -> Bytes {
-        let mut output = BytesMut::new();
-        output.put_slice(b"logkeeper.ordered-rotation-slots.v1");
-        receipt(&mut output, decision);
-        self.encode(&mut output);
-        output.freeze()
-    }
 }
 
 impl Input {
@@ -372,15 +362,8 @@ impl Input {
             let claim = BarrierClaim::decode(std::mem::take(&mut input.0))?;
             Ok(SignedBarrier { claim, signature })
         })?;
-        match (receipt.outcome, barrier) {
-            (Ok(Outcome::Barrier { read }), Some(SignedBarrier { claim, .. }))
-                if read == claim.read()
-                    && receipt.placement == claim.placement()
-                    && receipt.principal == Principal::Worker(read.owner)
-                    && receipt.request == read.id
-                    && receipt.position == read.admitted_at => {}
-            (Ok(Outcome::Barrier { .. }), _) | (_, Some(_)) => return Err(Refusal::Invalid),
-            (_, None) => {}
+        if !barrier_receipt_matches(receipt, barrier) {
+            return Err(Refusal::Invalid);
         }
         Ok(Decision {
             receipt,
