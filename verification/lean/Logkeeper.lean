@@ -5,3 +5,5 @@ import Logkeeper.Premises
 import Logkeeper.SelectionFence
 import Logkeeper.ObjectWithdrawal
 import Logkeeper.OrderedAdmission
+import Logkeeper.OrderedWriter
+import Logkeeper.OrderedReceipt

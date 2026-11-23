@@ -1,0 +1,199 @@
+{
+  "summary": "Exact current grants, epoch and LSN progression, vacancy, and append-only logical history.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 18,
+  "controls": {
+    "ignore-grant-epoch": {
+      "defect": "The same enrolled holder can append under a grant from an earlier epoch.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "holder != candidate || epoch != candidate_epoch || key_generation != candidate_generation",
+          "replace": "holder != candidate || key_generation != candidate_generation"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "else if current != Some(presented) { Err(Refusal::Stale) }",
+          "replace": "else if !(current matches Some((holder, _, generation)) && holder == presented.0 && generation == presented.2) { Err(Refusal::Stale) }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "append_only_by_current_grant_at_next_lsn",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "skip-lsn": {
+      "defect": "Accept an append ahead of the current frontier.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "    if head != expected_next {",
+          "replace": "    if head > expected_next {"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "ensures out == if head != expected_next",
+          "replace": "ensures out == if head > expected_next"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "append_only_by_current_grant_at_next_lsn",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "applied_append_extends_history",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "reuse-epoch": {
+      "defect": "Install a grant using the previous writer epoch.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "    epoch.checked_add(1).ok_or(Refusal::Capacity)",
+          "replace": "    if epoch < u64::MAX { Ok(epoch) } else { Err(Refusal::Capacity) }"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "Ok((epoch as int + 1) as u64)",
+          "replace": "Ok(epoch)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "grant_installation_fences_older_epochs",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "keep-grant-on-withdrawal": {
+      "defect": "Withdrawing the holder leaves its grant active.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "        if holder_matches {\n            self.vacate();",
+          "replace": "        if !holder_matches {\n            self.vacate();"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "final(self).grant == if holder_matches { None } else { old(self).grant },",
+          "replace": "final(self).grant == if !holder_matches { None } else { old(self).grant },"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "withdrawal_clears_only_the_matching_grant",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "preserve-vacated-grant": {
+      "defect": "Vacating the current grant leaves it installed.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "        self.grant = None;",
+          "replace": "        let _ = &self.grant;"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "ensures final(self).grant == None,",
+          "replace": "ensures final(self).grant == old(self).grant,"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "ensures final(self).grant == if holder_matches { None } else { old(self).grant },",
+          "replace": "ensures final(self).grant == old(self).grant,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "withdrawal_clears_only_the_matching_grant",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "vacancy_clears_the_grant",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "prepend-record": {
+      "defect": "An append inserts before the existing records.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "    records.push_back(record);",
+          "replace": "    records.push_front(record);"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "final(records)@ == old(records)@.push(record)",
+          "replace": "final(records)@ == seq![record] + old(records)@"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "applied_append_extends_history",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    },
+    "trim-from-head": {
+      "defect": "Trim drops the newest records instead of the certified prefix.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "            .pop_front()",
+          "replace": "            .pop_back()"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "final(records)@ == old(records)@.skip(count as int)",
+          "replace": "final(records)@ == old(records)@.take(old(records)@.len() - count as int)"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "records@ == original.skip(removed as int),",
+          "replace": "records@ == original.take(original.len() - removed as int),"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "assert(records@ =~= original.skip(removed as int));",
+          "replace": "assert(records@ =~= original.take(original.len() - removed as int));"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "trim_keeps_the_logical_history",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 17
+    }
+  }
+}

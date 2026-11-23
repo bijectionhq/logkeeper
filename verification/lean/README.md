@@ -29,3 +29,13 @@ expiry and fingerprint decisions used by the
 [ordered admission production laws](../verus/ordered_admission/README.md).
 Run `python3 run_ordered_admission.py` from this directory to check its
 theorems, axiom lists and negative controls. The script also accepts `LAKE_BIN`.
+
+`Logkeeper.Kernel.Ordered` projects an installed reducer trace to writer
+authority and full logical history. The model uses an archived prefix to
+interpret a compacted image and the previous writer to interpret vacancy.
+`Logkeeper.Protocol.Ordered` projects the retained receipt book and relates
+exact mutation retry to `same_chosen_append`.
+
+Run `python3 run_ordered_reducer.py` for the ordered-model theorem and mutation
+checks. Run `python3 run_ordered_correspondence.py --verus /path/to/verus` to
+compare the Lean decisions with the Verus specs on the shared cases.

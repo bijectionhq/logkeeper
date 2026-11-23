@@ -1,0 +1,201 @@
+{
+  "summary": "Exact mutation retry, fresh barriers, and applied receipt insertion and horizon expiry.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "admission"
+  ],
+  "min_verified_functions": 17,
+  "controls": {
+    "replay-barrier": {
+      "defect": "Return the original receipt for a barrier with the same fingerprint.",
+      "mutate": [
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "    if reading {\n        return None;\n    }\n    replay_mutation",
+          "replace": "    let _ = reading;\n    replay_mutation"
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "if !reading && stored@ == presented@",
+          "replace": "if stored@ == presented@"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "barriers_never_replay",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "compare-fingerprint-length": {
+      "defect": "A same-length changed request reuses the old receipt.",
+      "mutate": [
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "admission::matches_fingerprint(stored, presented)",
+          "replace": "stored.len() == presented.len()"
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "if stored@ == presented@ { Some(original)",
+          "replace": "if stored@.len() == presented@.len() { Some(original)"
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "if !reading && stored@ == presented@",
+          "replace": "if !reading && stored@.len() == presented@.len()"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "mutation_retry_exact",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "expiry-requires-hold": {
+      "defect": "Evict an unheld receipt inside its retry window.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "    position < expires_at || owns_live_hold",
+          "replace": "    position < expires_at && owns_live_hold"
+        },
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "ensures out == (position < expires_at || owns_live_hold)",
+          "replace": "ensures out == (position < expires_at && owns_live_hold)"
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "final(outcomes)@ == if position < expires_at || owns_live_hold",
+          "replace": "final(outcomes)@ == if position < expires_at && owns_live_hold"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "mutation_receipt_within_horizon",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "expiry_preserves_recoverable_receipts",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "keep-expired-receipt": {
+      "defect": "Keep an unheld receipt at its expiry position.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "    position < expires_at || owns_live_hold",
+          "replace": "    position <= expires_at || owns_live_hold"
+        },
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "ensures out == (position < expires_at || owns_live_hold)",
+          "replace": "ensures out == (position <= expires_at || owns_live_hold)"
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "final(outcomes)@ == if position < expires_at || owns_live_hold",
+          "replace": "final(outcomes)@ == if position <= expires_at || owns_live_hold"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "expired_receipt_without_hold",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "expiry_preserves_recoverable_receipts",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "record-refused-barrier": {
+      "defect": "Insert a refused barrier into the receipt map.",
+      "mutate": [
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "    if reading && receipt.outcome.is_err() {\n        return false;\n    }",
+          "replace": "    let _ = reading;"
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "out == (!reading || receipt.outcome is Ok),",
+          "replace": "out,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "recording_uses_the_applied_outcome",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "omit-outcome-insertion": {
+      "defect": "Report that the receipt was recorded without inserting it.",
+      "mutate": [
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "    outcomes.insert(\n        (receipt.principal, receipt.request),\n        RetainedOutcome {\n            fingerprint,\n            receipt,\n        },\n    );",
+          "replace": "    let _ = (fingerprint, receipt);"
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "final(outcomes)@ == if out {\n            old(outcomes)@.insert((receipt.principal, receipt.request), RetainedOutcome { fingerprint, receipt })\n        } else {\n            old(outcomes)@\n        },",
+          "replace": "final(outcomes)@ == old(outcomes)@,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "recording_uses_the_applied_outcome",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "expire-live-hold": {
+      "defect": "Evict the receipt used as provenance by a still-live hold.",
+      "mutate": [
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "admission::retains_receipt(position, expires_at, owns_live_hold)",
+          "replace": "admission::retains_receipt(position, expires_at, false)"
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "final(outcomes)@ == if position < expires_at || owns_live_hold",
+          "replace": "final(outcomes)@ == if position < expires_at"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "expiry_preserves_recoverable_receipts",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    }
+  }
+}
