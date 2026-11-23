@@ -1,0 +1,234 @@
+{
+  "summary": "Exact erasure rotation, successor authority and the fresh-admission floor.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "writer",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "admission"
+  ],
+  "min_verified_functions": 27,
+  "controls": {
+    "ignore-incumbent": {
+      "defect": "Rotate using a grant other than the exact installed grant.",
+      "mutate": [
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "if current != Some(grant) || !same_cut(head, requested_cut)",
+          "replace": "if !same_cut(head, requested_cut)"
+        },
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "else if current != Some(grant) || !matches_cut(head, requested_cut)",
+          "replace": "else if !matches_cut(head, requested_cut)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "rotation_requires_exact_incumbent_and_head",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "ignore-head-digest": {
+      "defect": "Accept a different prefix digest at the same numeric journal head.",
+      "mutate": [
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "|| !same_cut(head, requested_cut) || published",
+          "replace": "|| head.next_lsn != requested_cut.next_lsn || published"
+        },
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "|| !matches_cut(head, requested_cut) || published",
+          "replace": "|| head.next_lsn != requested_cut.next_lsn || published"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "rotation_requires_exact_incumbent_and_head",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "ignore-prepared-root": {
+      "defect": "Publish a different root from the one named by the erasure preparation.",
+      "mutate": [
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "        || !matches_fingerprint(&prepared_root, &root)\n",
+          "replace": ""
+        },
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "        || prepared_root@ != root@ || prepared_custody != custody",
+          "replace": "        || prepared_custody != custody"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "rotation_requires_exact_preparation",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "ordinary-preparation-can-rotate": {
+      "defect": "Publish and rotate from a preparation for ordinary checkpoint publication.",
+      "mutate": [
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "if !erasure || source != grant || base != published {\n",
+          "replace": "if source != grant || base != published {\n"
+        },
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "if !erasure || source != grant || base != published { Err(Refusal::Stale) }",
+          "replace": "if source != grant || base != published { Err(Refusal::Stale) }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "rotation_installs_successor_generation",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "reuse-epoch": {
+      "defect": "Install the rotated grant at the outgoing writer epoch.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "    epoch.checked_add(1).ok_or(Refusal::Capacity)",
+          "replace": "    if epoch < u64::MAX { Ok(epoch) } else { Err(Refusal::Capacity) }"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "Ok((epoch as int + 1) as u64)",
+          "replace": "Ok(epoch)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "rotated_suffix_refuses_superseded_grant",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "reuse-generation": {
+      "defect": "Keep the outgoing key generation when installing the successor.",
+      "mutate": [
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "    generation.checked_add(1).ok_or(Refusal::Capacity)",
+          "replace": "    if generation < u64::MAX { Ok(generation) } else { Err(Refusal::Capacity) }"
+        },
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "else { Ok((generation as int + 1) as u64) },",
+          "replace": "else { Ok(generation) },"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "rotation_installs_successor_generation",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "rotated_suffix_refuses_superseded_grant",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 25
+    },
+    "reset-generation-on-vacancy": {
+      "defect": "Vacating a rotated grant restores the initial key generation.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "        self.grant = None;",
+          "replace": "        self.grant = None;\n        self.key_generation = 1;"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "ensures final(self).grant == None,\n            final(self).epoch == old(self).epoch,\n            final(self).key_generation == old(self).key_generation,",
+          "replace": "ensures final(self).grant == None,\n            final(self).epoch == old(self).epoch,\n            final(self).key_generation == 1,"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "ensures final(self).grant == if holder_matches { None } else { old(self).grant },\n            final(self).epoch == old(self).epoch,\n            final(self).key_generation == old(self).key_generation,",
+          "replace": "ensures final(self).grant == if holder_matches { None } else { old(self).grant },\n            final(self).epoch == old(self).epoch,\n            final(self).key_generation == if holder_matches { 1 } else { old(self).key_generation },"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "generation_survives_vacancy",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "append-under-superseded-grant": {
+      "defect": "The append writer check admits the old grant for the same enrollment.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "holder != candidate || epoch != candidate_epoch || key_generation != candidate_generation",
+          "replace": "holder != candidate"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "else if current != Some(presented) { Err(Refusal::Stale) }",
+          "replace": "else if !(current matches Some((holder, _, _)) && holder == presented.0) { Err(Refusal::Stale) }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "rotated_suffix_refuses_superseded_grant",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "publish-without-erasure-floor": {
+      "defect": "Publish the erasure checkpoint while leaving the fresh-admission floor at its old cut.",
+      "mutate": [
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "    if closes_history {\n        *erasure_floor = checkpoint_cut.next_lsn;\n    }\n",
+          "replace": ""
+        },
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "if closes_history { checkpoint_cut.next_lsn } else { *old(erasure_floor) }",
+          "replace": "*old(erasure_floor)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_rotation/laws.rs",
+          "function": "publication_closes_old_history",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 26
+    }
+  }
+}

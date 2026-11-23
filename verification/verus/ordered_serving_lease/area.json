@@ -1,0 +1,250 @@
+{
+  "summary": "Serving lease authorization, monotone journal time, disposal and exact withdrawn-owner pages.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "writer",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 28,
+  "controls": {
+    "rewind-journal-clock": {
+      "defect": "Apply an earlier decision time at the next position.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "            else if next_time < *old(time) { Err(ApplyError::Time) } else { Ok(()) },",
+          "replace": "            else { Ok(()) },"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "    if next_time < *time {\n        return Err(ApplyError::Time);\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "decision_time_is_monotone",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    },
+    "lease-without-enrollment": {
+      "defect": "Issue a lease to a current grant whose enrollment is no longer in the roster.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "else if current != Some(grant) || roster@.get(*worker) != Some(grant.0)",
+          "replace": "else if current != Some(grant)"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "    if roster.get(worker) != Some(&grant.0) {\n        return Err(Refusal::Stale);\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "lease_requires_current_enrolled_grant",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    },
+    "lease-under-superseded-grant": {
+      "defect": "Issue a lease without checking the current grant.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "else if current != Some(grant) || roster@.get(*worker) != Some(grant.0)",
+          "replace": "else if roster@.get(*worker) != Some(grant.0)"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "    writer::authorize(principal, current, grant)?;",
+          "replace": "    writer::authorize(principal, Some(grant), grant)?;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "lease_requires_current_enrolled_grant",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    },
+    "issue-zero-duration-lease": {
+      "defect": "Return the journal time itself as the lease end.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "            } else if now as int + duration > u64::MAX { Err(Refusal::Capacity) }\n            else { Ok((now as int + duration) as u64) },",
+          "replace": "            } else { Ok(now) },"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "    let end = now.checked_add(duration).ok_or(Refusal::Capacity)?;",
+          "replace": "    let end = now;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "lease_requires_current_enrolled_grant",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    },
+    "omit-disposal-drift": {
+      "defect": "Compute disposal eligibility at the lease end, omitting the drift margin.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "        Some(end) => end.checked_add(drift),",
+          "replace": "        Some(end) => Some(end),"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "        Some(time) if time as int + drift <= u64::MAX => Some((time as int + drift) as u64),\n        Some(_) => None,",
+          "replace": "        Some(time) => Some(time),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "disposal_requires_withdrawal_and_drift",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    },
+    "dispose-enrolled-worker": {
+      "defect": "Authorize time-based disposal while the exact enrollment remains enrolled.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "        else if serial == 0 || serial > last_serial || enrolled { Err(Refusal::Stale) }",
+          "replace": "        else if serial == 0 || serial > last_serial { Err(Refusal::Stale) }"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "\n    if serial == 0 || serial > last_serial || enrolled {",
+          "replace": "\n    if serial == 0 || serial > last_serial {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "disposal_requires_withdrawal_and_drift",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    },
+    "include-cursor": {
+      "defect": "Repeat the previous page's cursor in the next withdrawn-owner page.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "owner <= cursor)",
+          "replace": "owner < cursor)"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "Some(cursor) => owner_before(cursor, owner)",
+          "replace": "Some(cursor) => !owner_before(owner, cursor)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "withdrawn_owner_page_is_exact_and_bounded",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    },
+    "include-enrolled-owner": {
+      "defect": "Treat every held owner as withdrawn, regardless of its current roster slot.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "    &&& roster.get(worker) != Some(owner)\n",
+          "replace": ""
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "!(matches!(after, Some(cursor) if owner <= cursor) || roster.get(worker) == Some(&owner))",
+          "replace": "!matches!(after, Some(cursor) if owner <= cursor)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "withdrawn_owner_page_is_exact_and_bounded",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    },
+    "underfill-withdrawn-page": {
+      "defect": "Force the withdrawn-owner page to have no slots even with a positive requested limit.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "    ensures owner_page(out@, qualifying_owners(holds@.values(), roster@, projection, after), limit as nat),",
+          "replace": "    ensures owner_page(out@, qualifying_owners(holds@.values(), roster@, projection, after), 0nat),"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "    let mut page = Vec::new();",
+          "replace": "    let limit = 0usize;\n    let mut page = Vec::new();"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "            entries.obeys_prophetic_iter_laws(),",
+          "replace": "            limit == 0, entries.obeys_prophetic_iter_laws(),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "withdrawn_owner_page_is_exact_and_bounded",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    },
+    "drop-existing-holds": {
+      "defect": "Discard all admitted holds when adding the incoming writer's recovery hold.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "final(holds)@ == old(holds)@.insert(id, hold)",
+          "replace": "final(holds)@ == Map::empty().insert(id, hold)"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "    holds.insert(id, hold);",
+          "replace": "    holds.clear();\n    holds.insert(id, hold);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_serving_lease/laws.rs",
+          "function": "grant_change_preserves_holds",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 27
+    }
+  }
+}

@@ -5,9 +5,13 @@ use std::collections::{BTreeMap, VecDeque};
 use super::Refusal;
 
 #[cfg(verus_keep_ghost)]
+use vstd::laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq};
+#[cfg(verus_keep_ghost)]
 use vstd::laws_eq::obeys_concrete_eq;
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
+#[cfg(verus_keep_ghost)]
+use vstd::std_specs::btree::btree_map_inv;
 
 /// An exclusive data frontier and the identity of the prefix before it.
 #[derive(Clone, Copy)]
@@ -109,6 +113,10 @@ impl<G> Authority<G> {
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(
+    requires obeys_cmp::<K>(), obeys_cmp_concrete_eq::<K>(), btree_map_inv(old(holds)),
+    ensures btree_map_inv(final(holds)), final(holds)@ == old(holds)@.insert(id, hold),
+))]
 pub(super) fn insert_hold<K: Ord, H>(holds: &mut BTreeMap<K, H>, id: K, hold: H) {
     holds.insert(id, hold);
 }

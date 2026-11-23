@@ -10,3 +10,5 @@ import Logkeeper.OrderedReceipt
 import Logkeeper.Codec
 import Logkeeper.CompactImage
 import Logkeeper.OrderedBudgets
+import Logkeeper.DisposalLease
+import Logkeeper.ErasureCommit

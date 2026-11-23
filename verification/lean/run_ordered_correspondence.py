@@ -17,7 +17,7 @@ RECEIPT = "Logkeeper.Protocol.Ordered"
 MAX = 2**64 - 1
 
 CASES = {
-    "ordered_writer": (WRITER, [
+    "ordered_writer": ("OrderedWriter", WRITER, [
         ("append_next_lsn 0 0 7", "append_next_lsn(0, 0, 7)"),
         ("append_next_lsn 3 4 7", "append_next_lsn(3, 4, 7)"),
         ("append_next_lsn 3 2 7", "append_next_lsn(3, 2, 7)"),
@@ -37,7 +37,7 @@ CASES = {
         ("withdraw_grant (some 5) true", "withdraw_grant(Some(5u64), true)"),
         ("withdraw_grant (some 5) false", "withdraw_grant(Some(5u64), false)"),
     ]),
-    "ordered_receipt": (RECEIPT, [
+    "ordered_receipt": ("OrderedReceipt", RECEIPT, [
         ("retains_receipt 7 8 false", "retains_receipt(7, 8, false)"),
         ("retains_receipt 8 8 false", "retains_receipt(8, 8, false)"),
         ("retains_receipt 9 8 true", "retains_receipt(9, 8, true)"),
@@ -52,6 +52,44 @@ CASES = {
         ("record_after_apply false (.error (3 : Nat) : Except Nat Nat)",
          "record_after_apply(false, Result::<u64, u64>::Err(3))"),
     ]),
+    "ordered_serving_lease": ("DisposalLease", "DisposalLease", [
+        ("decision_time 10 9", "decision_time(10, 9)"),
+        ("decision_time 10 10", "decision_time(10, 10)"),
+        ("decision_time 10 11", "decision_time(10, 11)"),
+        (f"lease_end (some 2) (some (2, 3, 4)) (2, 3, 4) (some 2) 10 5 {MAX}",
+         "lease_end(Some(2u64), Some((2, 3, 4)), (2, 3, 4), Some(2), 10, 5)"),
+        (f"lease_end (some 2) (some (2, 3, 4)) (2, 2, 4) (some 2) 10 5 {MAX}",
+         "lease_end(Some(2u64), Some((2, 3, 4)), (2, 2, 4), Some(2), 10, 5)"),
+        (f"lease_end (some 2) (some (2, 3, 4)) (2, 3, 4) (some 1) 10 5 {MAX}",
+         "lease_end(Some(2u64), Some((2, 3, 4)), (2, 3, 4), Some(1), 10, 5)"),
+        (f"lease_end (some 2) (some (2, 3, 4)) (2, 3, 4) (some 2) {MAX} 1 {MAX}",
+         f"lease_end(Some(2u64), Some((2, 3, 4)), (2, 3, 4), Some(2), {MAX}, 1)"),
+        ("withdrawn 2 2 false", "withdrawn(2, 2, false)"),
+        ("withdrawn 2 2 true", "withdrawn(2, 2, true)"),
+        ("withdrawn 0 2 false", "withdrawn(0, 2, false)"),
+        ("withdrawn 3 2 false", "withdrawn(3, 2, false)"),
+    ]),
+    "ordered_rotation": ("ErasureCommit", "ErasureCommit", [
+        ("rotation_head true (some 3) 3 (8, 1) (8, 1) 10 11",
+         "rotation_head(true, Some(3u64), 3, head, head, 10u64, 11)"),
+        ("rotation_head true (some 3) 3 (8, 1) (8, 2) 10 11",
+         "rotation_head(true, Some(3u64), 3, head, other, 10u64, 11)"),
+        ("rotation_head true (some 3) 2 (8, 1) (8, 1) 10 11",
+         "rotation_head(true, Some(3u64), 2, head, head, 10u64, 11)"),
+        ("rotation_head true (some 3) 3 (8, 1) (8, 1) 10 10",
+         "rotation_head(true, Some(3u64), 3, head, head, 10u64, 10)"),
+        (f"successor_generation true 3 3 10 10 7 {MAX}",
+         "successor_generation(true, 3u64, 3, 10u64, 10, 7)"),
+        (f"successor_generation true 2 3 10 10 7 {MAX}",
+         "successor_generation(true, 2u64, 3, 10u64, 10, 7)"),
+        (f"successor_generation false 3 3 10 10 7 {MAX}",
+         "successor_generation(false, 3u64, 3, 10u64, 10, 7)"),
+        (f"successor_generation true 3 3 10 10 {MAX} {MAX}",
+         f"successor_generation(true, 3u64, 3, 10u64, 10, {MAX})"),
+        ("admits_history (erasure_floor 2 8 true) 7", "admits_history(laws::erasure_floor(2, 8, true), 7)"),
+        ("admits_history (erasure_floor 2 8 true) 8", "admits_history(laws::erasure_floor(2, 8, true), 8)"),
+        ("admits_history (erasure_floor 2 8 false) 7", "admits_history(laws::erasure_floor(2, 8, false), 7)"),
+    ]),
 }
 
 
@@ -65,9 +103,8 @@ def verus_literal(value):
     raise ValueError(f"Unexpected Lean result {value!r}")
 
 
-def check_area(lake, verus, scratch, area, namespace, cases):
+def check_area(lake, verus, scratch, area, module_name, namespace, cases):
     lean = scratch / "Correspondence.lean"
-    module_name = "OrderedWriter" if area == "ordered_writer" else "OrderedReceipt"
     lean.write_text(
         f"import Logkeeper.{module_name}\nopen {namespace}\n"
         + "".join(f"#eval ({expression})\n" for expression, _ in cases),
@@ -91,6 +128,15 @@ def check_area(lake, verus, scratch, area, namespace, cases):
             "        let stored = seq![0u8, 1];\n"
             "        let shortened = seq![0u8];\n"
             "        assert(stored.len() == 2 && shortened.len() == 1);\n"
+            + assertions
+        )
+    if area == "ordered_rotation":
+        head_digest = ", ".join(["1u8"] * 32)
+        other_digest = ", ".join(["2u8"] * 32)
+        assertions = (
+            f"        let head = crate::writer::Cut {{ next_lsn: 8, history: [{head_digest}] }};\n"
+            f"        let other = crate::writer::Cut {{ next_lsn: 8, history: [{other_digest}] }};\n"
+            "        assert(head.history@[0] != other.history@[0]);\n"
             + assertions
         )
     with harness.open("a", encoding="utf-8") as file:
@@ -131,10 +177,11 @@ def main():
         scratch = Path(scratch_path)
         sources = scratch / "src/ordered"
         sources.mkdir(parents=True)
-        for name in ("admission.rs", "budget.rs", "receipt.rs", "refusal.rs", "retention.rs", "writer.rs"):
+        for name in ("admission.rs", "budget.rs", "lease.rs", "receipt.rs", "refusal.rs",
+                     "retention.rs", "rotation.rs", "writer.rs"):
             shutil.copyfile(REPO / "src/ordered" / name, sources / name)
-        for area, (namespace, cases) in CASES.items():
-            check_area(lake, verus, scratch, area, namespace, cases)
+        for area, (module_name, namespace, cases) in CASES.items():
+            check_area(lake, verus, scratch, area, module_name, namespace, cases)
 
 
 if __name__ == "__main__":
