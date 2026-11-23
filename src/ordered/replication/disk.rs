@@ -3,6 +3,7 @@ use super::{
     SlotPair, Vote,
 };
 use crate::server::durability::sync_directory;
+use crate::ordered::codec::frame::bounded_body_length;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -575,8 +576,7 @@ fn recover_slot(
     let witness = Uuid::from_slice(&descriptor[..16]).map_err(|_| Error::Prefix)?;
     descriptor.advance(16);
     let generation = descriptor.get_u64();
-    let length = usize::try_from(descriptor.get_u64()).ok();
-    let Some(length) = length.filter(|length| (2..=payload_limit).contains(length)) else {
+    let Some(length) = bounded_body_length(descriptor.get_u64(), 2, payload_limit) else {
         return Ok((payload_limit, None));
     };
     let mut body = vec![0; length];

@@ -1,3 +1,4 @@
+use super::frame::{decode_flag, encode_flag};
 use super::{
     Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, placement,
     principal, request_id, snapshot, uuid, window, writer_state,
@@ -67,7 +68,7 @@ impl Operation {
             }
             Self::WithdrawnWorkers { after } => {
                 output.put_u8(9);
-                output.put_u8(u8::from(after.is_some()));
+                output.put_u8(encode_flag(after.is_some()));
                 if let Some(after) = after {
                     enrollment(&mut output, *after);
                 }
@@ -144,25 +145,25 @@ impl Reply {
                 output.put_u64(route.position);
                 output.put_slice(&route.history);
                 cut(&mut output, route.head);
-                output.put_u8(u8::from(route.last_data.is_some()));
+                output.put_u8(encode_flag(route.last_data.is_some()));
                 if let Some(chosen) = route.last_data {
                     cut(&mut output, chosen);
                 }
-                output.put_u8(u8::from(route.last_maintenance.is_some()));
+                output.put_u8(encode_flag(route.last_maintenance.is_some()));
                 if let Some(chosen) = route.last_maintenance {
                     cut(&mut output, chosen);
                 }
                 cut(&mut output, route.floor);
                 output.put_u64(route.erasure_floor);
                 checkpoint(&mut output, route.checkpoint);
-                output.put_u8(u8::from(route.preparing.is_some()));
+                output.put_u8(encode_flag(route.preparing.is_some()));
                 if let Some(item) = route.preparing {
                     checkpoint_preparation(&mut output, item);
                 }
-                output.put_u8(u8::from(route.retirement.is_some()));
+                output.put_u8(encode_flag(route.retirement.is_some()));
                 if let Some(item) = route.retirement {
                     checkpoint(&mut output, item.checkpoint);
-                    output.put_u8(u8::from(item.closed));
+                    output.put_u8(encode_flag(item.closed));
                 }
                 window(&mut output, route.window);
                 output.put_u64(route.window_spent);
@@ -185,7 +186,7 @@ impl Reply {
                 } else {
                     output.put_u8(1);
                     receipt(&mut output, decision.receipt);
-                    output.put_u8(u8::from(decision.barrier.is_some()));
+                    output.put_u8(encode_flag(decision.barrier.is_some()));
                     if let Some(barrier) = decision.barrier {
                         output.put_slice(&barrier.signature.issuer);
                         output.put_slice(&barrier.signature.proof);
@@ -219,7 +220,7 @@ impl Reply {
                 output.put_u8(workers.len() as u8);
                 for worker in workers {
                     enrollment(&mut output, worker.enrollment);
-                    output.put_u8(u8::from(worker.eligible_at.is_some()));
+                    output.put_u8(encode_flag(worker.eligible_at.is_some()));
                     if let Some(time) = worker.eligible_at {
                         output.put_u64(time);
                     }
@@ -231,7 +232,7 @@ impl Reply {
             }
             Self::ReplayHead(head) => {
                 output.put_u8(5);
-                output.put_u8(u8::from(head.is_some()));
+                output.put_u8(encode_flag(head.is_some()));
                 if let Some(head) = head {
                     cut(&mut output, head.next);
                     output.put_i64(head.timestamp);
@@ -260,11 +261,7 @@ impl Reply {
                 preparing: input.optional(Input::checkpoint_preparation)?,
                 retirement: input.optional(|input| {
                     let checkpoint = input.checkpoint()?;
-                    let closed = match input.read_byte()? {
-                        0 => false,
-                        1 => true,
-                        _ => return Err(Refusal::Invalid),
-                    };
+                    let closed = decode_flag(input.read_byte()?).ok_or(Refusal::Invalid)?;
                     Ok(RetainedCheckpoint { checkpoint, closed })
                 })?,
                 window: input.window()?,

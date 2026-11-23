@@ -2,6 +2,10 @@ use super::{
     Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, object_names,
     principal, request_id, window, withdrawal, writer_state,
 };
+use super::frame::{decode_flag, encode_flag};
+use super::snapshot_checks::{
+    fence_row_valid, generation_in_range, hold_receipt_matches, lease_row_valid,
+};
 use crate::ordered::{
     ACTIVATION_HOLD_SLOTS, AppendClass, AppendResult, Command, Grant, HeldAdmission, HoldKind,
     ObjectFence, Outcome, Principal, Receipt, Record, Refusal, Request, RetainedCheckpoint,
@@ -48,7 +52,7 @@ impl State {
         output.put_u64(self.time);
         output.put_slice(&self.command_history);
         output.put_slice(&self.voter_scope);
-        output.put_u8(u8::from(self.successor.is_some()));
+        output.put_u8(encode_flag(self.successor.is_some()));
         if let Some(successor) = self.successor {
             output.put_slice(&successor);
         }
@@ -61,14 +65,14 @@ impl State {
         output.put_u64(self.erasure_floor);
         cut(&mut output, self.head);
         checkpoint(&mut output, self.checkpoint);
-        output.put_u8(u8::from(self.preparing.is_some()));
+        output.put_u8(encode_flag(self.preparing.is_some()));
         if let Some(item) = self.preparing {
             checkpoint_preparation(&mut output, item);
         }
         output.put_u64(self.old_roots.len() as u64);
         for entry in self.old_roots.values() {
             checkpoint(&mut output, entry.checkpoint);
-            output.put_u8(u8::from(entry.closed));
+            output.put_u8(encode_flag(entry.closed));
         }
 
         output.put_u64(self.roster.len() as u64);
@@ -144,11 +148,7 @@ impl State {
         state.preparing = input.optional(Input::checkpoint_preparation)?;
         for _ in 0..input.count(state.limits.replay_holds)? {
             let checkpoint = input.checkpoint()?;
-            let closed = match input.read_byte()? {
-                0 => false,
-                1 => true,
-                _ => return Err(Refusal::Invalid),
-            };
+            let closed = decode_flag(input.read_byte()?).ok_or(Refusal::Invalid)?;
             if checkpoint.custody.revision == 0
                 || checkpoint.custody.revision >= state.checkpoint.custody.revision
                 || checkpoint.custody.allocation.is_nil()
@@ -187,7 +187,7 @@ impl State {
             || (state.checkpoint.custody.revision == 1 && state.checkpoint != initial.checkpoint)
             || state.head.next_lsn > state.position
             || state.authority.epoch > state.position
-            || !(1..=state.authority.epoch.max(1)).contains(&state.authority.key_generation)
+            || !generation_in_range(state.authority.epoch, state.authority.key_generation)
             || state.enrollment_serial > state.position
         {
             return Err(Refusal::Invalid);
@@ -252,14 +252,15 @@ impl State {
         };
         for _ in 0..fences {
             let fence = input.object_fence()?;
-            if fence.position == 0
-                || fence.position > self.position
-                || fence.time > self.time
-                || self
-                    .object_fences
+            if !fence_row_valid(
+                fence.position,
+                self.position,
+                fence.time,
+                self.time,
+                self.object_fences
                     .last_key_value()
-                    .is_some_and(|(old, _)| *old >= fence.object.name)
-            {
+                    .is_none_or(|(old, _)| *old < fence.object.name),
+            ) {
                 return Err(Refusal::Invalid);
             }
             self.object_fences.insert(fence.object.name, fence);
@@ -296,16 +297,17 @@ impl State {
             let lease_end = input.u64()?;
             let retained = self.roster.get(&member.worker) == Some(&member)
                 || self.holds.values().any(|entry| entry.hold.owner == member);
-            if member.serial == 0
-                || member.serial > self.enrollment_serial
-                || !retained
-                || lease_end < self.limits.serving_lease
-                || lease_end > self.time.saturating_add(self.limits.serving_lease)
-                || self
-                    .leases
+            if !lease_row_valid(
+                member.serial,
+                self.enrollment_serial,
+                retained,
+                lease_end,
+                self.limits.serving_lease,
+                self.time,
+                self.leases
                     .last_key_value()
-                    .is_some_and(|(old, _)| *old >= member)
-            {
+                    .is_none_or(|(old, _)| *old < member),
+            ) {
                 return Err(Refusal::Invalid);
             }
             self.leases.insert(member, lease_end);
@@ -575,21 +577,23 @@ impl State {
         }
         for entry in self.holds.values() {
             let hold = entry.hold;
-            let receipt = self
+            let receipt_position = self
                 .outcomes
                 .get(&(entry.origin, hold.id))
-                .ok_or(Refusal::Invalid)?
-                .receipt;
-            let admitted = match (entry.kind, receipt.outcome) {
-                (HoldKind::Recovery, Ok(Outcome::Granted { recovery, .. })) => recovery,
-                (
-                    HoldKind::Ordinary,
-                    Ok(Outcome::Barrier { read, .. } | Outcome::Protected(read)),
-                ) => read,
-                (HoldKind::Root(_), Ok(Outcome::Protected(read))) => read,
-                _ => return Err(Refusal::Invalid),
-            };
-            if admitted != hold || receipt.position != hold.admitted_at {
+                .and_then(|retained| {
+                    let receipt = retained.receipt;
+                    let admitted = match (entry.kind, receipt.outcome) {
+                        (HoldKind::Recovery, Ok(Outcome::Granted { recovery, .. })) => recovery,
+                        (
+                            HoldKind::Ordinary,
+                            Ok(Outcome::Barrier { read, .. } | Outcome::Protected(read)),
+                        ) => read,
+                        (HoldKind::Root(_), Ok(Outcome::Protected(read))) => read,
+                        _ => return None,
+                    };
+                    (admitted == hold).then_some(receipt.position)
+                });
+            if !hold_receipt_matches(hold.admitted_at, receipt_position) {
                 return Err(Refusal::Invalid);
             }
         }

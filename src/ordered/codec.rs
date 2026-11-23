@@ -6,17 +6,23 @@ use super::{
 use bytes::{BufMut, Bytes, BytesMut};
 use uuid::Uuid;
 
+pub(super) mod frame;
 mod service;
 mod snapshot;
+mod snapshot_checks;
 
-const VERSION: u8 = 8;
+use frame::{
+    COMMAND_VERSION, decision_header, decode_flag, encode_flag, has_command_version,
+    read_decision_time,
+};
+
 const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR04";
 
 impl Request {
     /// The exact bytes used by ordered replication and crash replay.
     pub fn encode(&self) -> Bytes {
         let mut output = BytesMut::new();
-        output.put_u8(VERSION);
+        output.put_u8(COMMAND_VERSION);
         placement(&mut output, self.placement);
         principal(&mut output, self.principal);
         request_id(&mut output, self.id);
@@ -24,7 +30,7 @@ impl Request {
             Command::Enroll { worker, expected } => {
                 output.put_u8(0);
                 uuid(&mut output, *worker);
-                output.put_u8(u8::from(expected.is_some()));
+                output.put_u8(encode_flag(expected.is_some()));
                 if let Some(expected) = expected {
                     enrollment(&mut output, *expected);
                 }
@@ -170,7 +176,7 @@ impl Request {
     /// placement before choosing the frame.
     pub fn decode(frame: Bytes) -> Result<Self, Refusal> {
         let mut input = Input(frame);
-        if input.read_byte()? != VERSION {
+        if !has_command_version(input.read_byte()?) {
             return Err(Refusal::Invalid);
         }
         let placement = input.placement()?;
@@ -279,17 +285,13 @@ impl Request {
 pub(in crate::ordered) fn encode_decision(time: u64, request: &Request) -> Bytes {
     let body = request.encode();
     let mut output = BytesMut::with_capacity(body.len() + 8);
-    output.put_slice(&body[..1]);
-    output.put_u64(time);
+    output.put_slice(&decision_header(time.to_be_bytes()));
     output.put_slice(&body[1..]);
     output.freeze()
 }
 
 pub(in crate::ordered) fn decode_decision(frame: Bytes) -> Result<(u64, Request), Refusal> {
-    if frame.len() < 9 || frame[0] != VERSION {
-        return Err(Refusal::Invalid);
-    }
-    let time = u64::from_be_bytes(frame[1..9].try_into().map_err(|_| Refusal::Invalid)?);
+    let time = u64::from_be_bytes(read_decision_time(&frame).ok_or(Refusal::Invalid)?);
     let mut body = BytesMut::with_capacity(frame.len() - 8);
     body.put_slice(&frame[..1]);
     body.put_slice(&frame[9..]);
@@ -488,10 +490,10 @@ impl Input {
         &mut self,
         read: impl FnOnce(&mut Self) -> Result<T, Refusal>,
     ) -> Result<Option<T>, Refusal> {
-        match self.read_byte()? {
-            0 => Ok(None),
-            1 => Ok(Some(read(self)?)),
-            _ => Err(Refusal::Invalid),
+        match decode_flag(self.read_byte()?) {
+            Some(false) => Ok(None),
+            Some(true) => Ok(Some(read(self)?)),
+            None => Err(Refusal::Invalid),
         }
     }
 }
@@ -537,7 +539,7 @@ fn grant(output: &mut BytesMut, value: Grant) {
 
 fn writer_state(output: &mut BytesMut, value: WriterState) {
     output.put_u64(value.epoch);
-    output.put_u8(u8::from(value.grant.is_some()));
+    output.put_u8(encode_flag(value.grant.is_some()));
     if let Some(authority) = value.grant {
         grant(output, authority);
     }

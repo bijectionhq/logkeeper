@@ -8,6 +8,7 @@ use super::{
     Accepted, Ballot, DurableVoter, Error, Fingerprint, Group, Prefix, Promise, Replica, SlotImage,
     SlotPair, Vote,
 };
+use crate::ordered::codec::frame::{bounded_body_length, decode_flag, encode_flag};
 use bytes::{Bytes, BytesMut};
 use std::future::Future;
 use std::io;
@@ -117,13 +118,13 @@ impl<C: Connector> Replica for RemoteVoter<C> {
             let mut channel = self.open(group, PREPARE, ballot).await?;
             channel.flush().await?;
             self.response(&mut channel, PROMISE, ballot).await?;
-            let accepted = match channel.read_u8().await? {
-                0 => None,
-                1 => Some(Accepted {
+            let accepted = match decode_flag(channel.read_u8().await?) {
+                Some(false) => None,
+                Some(true) => Some(Accepted {
                     ballot: read_ballot(&mut channel).await?,
                     prefix: read_prefix(&mut channel, self.max_prefix_bytes).await?,
                 }),
-                _ => return Err(Error::Prefix),
+                None => return Err(Error::Prefix),
             };
             Ok(Promise {
                 voter: self.voter,
@@ -201,7 +202,7 @@ pub async fn serve_voter(
                 Ok(promise) => {
                     response_header(&mut channel, PROMISE, promise.voter, ballot).await?;
                     channel
-                        .write_u8(u8::from(promise.accepted.is_some()))
+                        .write_u8(encode_flag(promise.accepted.is_some()))
                         .await?;
                     if let Some(accepted) = promise.accepted {
                         write_ballot(&mut channel, accepted.ballot).await?;
@@ -281,10 +282,8 @@ async fn read_prefix(
     channel: &mut (impl AsyncRead + Unpin),
     limit: usize,
 ) -> Result<Prefix, Error> {
-    let length = usize::try_from(channel.read_u64().await?).map_err(|_| Error::Capacity)?;
-    if length == 0 || length > limit {
-        return Err(Error::Capacity);
-    }
+    let length =
+        bounded_body_length(channel.read_u64().await?, 1, limit).ok_or(Error::Capacity)?;
     let mut body = vec![0; length];
     channel.read_exact(&mut body).await?;
     Prefix::decode(Bytes::from(body), limit)

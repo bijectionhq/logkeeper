@@ -5,6 +5,7 @@ use crate::ordered::{
     AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment,
     Fingerprint, Grant, Hold, Outcome, Placement, Principal, Receipt, Refusal, Request,
     append_fingerprint,
+    codec::frame::bounded_body_length,
     replication::{Replica, RotationSlots},
 };
 use bytes::Bytes;
@@ -409,10 +410,8 @@ async fn read_frame(
     if &magic != MAGIC {
         return Err(WireError::Frame);
     }
-    let length = channel.read_u32().await? as usize;
-    if length == 0 || length > limit {
-        return Err(WireError::Frame);
-    }
+    let length = bounded_body_length(u64::from(channel.read_u32().await?), 1, limit)
+        .ok_or(WireError::Frame)?;
     let mut body = vec![0; length];
     channel.read_exact(&mut body).await?;
     Ok(Bytes::from(body))
@@ -424,9 +423,7 @@ async fn write_frame(
     limit: usize,
 ) -> Result<(), WireError> {
     let size = u32::try_from(bytes.len()).map_err(|_| WireError::Frame)?;
-    if bytes.is_empty() || bytes.len() > limit {
-        return Err(WireError::Frame);
-    }
+    bounded_body_length(u64::from(size), 1, limit).ok_or(WireError::Frame)?;
     channel.write_all(MAGIC).await?;
     channel.write_u32(size).await?;
     channel.write_all(&bytes).await?;
