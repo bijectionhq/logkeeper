@@ -368,6 +368,7 @@ impl Input {
             8 => Outcome::Trimmed(self.cut()?),
             9 => Outcome::ReadAbandoned,
             10 => Outcome::WindowFunded(self.window()?),
+            11 => Outcome::Vacated,
             32 => return Ok(Err(Refusal::WrongPlacement)),
             33 => return Ok(Err(Refusal::Unauthorized)),
             34 => return Ok(Err(Refusal::Stale)),
@@ -448,6 +449,7 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
             output.put_u8(10);
             window(output, allocation);
         }
+        Ok(Outcome::Vacated) => output.put_u8(11),
         Err(refusal) => output.put_u8(match refusal {
             Refusal::WrongPlacement => 32,
             Refusal::Unauthorized => 33,

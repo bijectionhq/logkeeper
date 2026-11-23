@@ -115,6 +115,14 @@ impl Request {
                 output.put_u64(*from);
                 output.put_u64(*through);
             }
+            Command::ProtectRoot { source } => {
+                output.put_u8(12);
+                hold_row(&mut output, *source);
+            }
+            Command::Vacate { grant: writer } => {
+                output.put_u8(13);
+                grant(&mut output, *writer);
+            }
         }
         output.freeze()
     }
@@ -178,6 +186,12 @@ impl Request {
                 grant: input.grant()?,
                 from: input.u64()?,
                 through: input.u64()?,
+            },
+            12 => Command::ProtectRoot {
+                source: input.hold()?,
+            },
+            13 => Command::Vacate {
+                grant: input.grant()?,
             },
             _ => return Err(Refusal::Invalid),
         };

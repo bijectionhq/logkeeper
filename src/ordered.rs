@@ -182,6 +182,12 @@ pub enum Command {
         from: u64,
         through: u64,
     },
+    ProtectRoot {
+        source: Hold,
+    },
+    Vacate {
+        grant: Grant,
+    },
     Release {
         hold: Hold,
     },
@@ -228,6 +234,7 @@ pub enum Outcome {
     WindowFunded(Window),
     Protected(Hold),
     Released,
+    Vacated,
     Trimmed(Cut),
 }
 
@@ -651,6 +658,18 @@ impl State {
         {
             return Err(Refusal::Unavailable);
         }
+        self.admit_hold(origin, id, owner, self.checkpoint, start, through)
+    }
+
+    fn admit_hold(
+        &mut self,
+        origin: Principal,
+        id: RequestId,
+        owner: Enrollment,
+        checkpoint: Checkpoint,
+        start: Cut,
+        through: Cut,
+    ) -> Result<Hold, Refusal> {
         if self.holds.contains_key(&id) {
             return Err(Refusal::Conflict);
         }
@@ -661,7 +680,7 @@ impl State {
             id,
             owner,
             admitted_at: self.position,
-            checkpoint: self.checkpoint,
+            checkpoint,
             start,
             through,
         };
@@ -866,6 +885,33 @@ impl State {
                 let through = self.cut(through).ok_or(Refusal::Unavailable)?;
                 let hold = self.protect_range(principal, id, enrollment, start, through)?;
                 Ok(Outcome::Protected(hold))
+            }
+            Command::ProtectRoot { source } => {
+                if principal != Principal::Worker(source.owner) {
+                    return Err(Refusal::Unauthorized);
+                }
+                if self
+                    .holds
+                    .get(&source.id)
+                    .is_none_or(|entry| entry.hold != source)
+                {
+                    return Err(Refusal::Unavailable);
+                }
+                let checkpoint = source.checkpoint;
+                let hold = self.admit_hold(
+                    principal,
+                    id,
+                    source.owner,
+                    checkpoint,
+                    checkpoint.cut,
+                    checkpoint.cut,
+                )?;
+                Ok(Outcome::Protected(hold))
+            }
+            Command::Vacate { grant } => {
+                self.writer(principal, grant)?;
+                self.grant = None;
+                Ok(Outcome::Vacated)
             }
             Command::Release { hold } => {
                 if principal != Principal::Worker(hold.owner) {
