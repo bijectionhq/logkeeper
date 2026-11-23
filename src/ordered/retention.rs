@@ -1,7 +1,9 @@
 //! Selection and accounting for a removed replay prefix.
 
 use super::{AppendClass, Refusal, writer};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+
+use super::admission::pins_suffix;
 
 pub(super) struct TrimSelection {
     pub floor: u64,
@@ -59,4 +61,21 @@ pub(super) fn trim_records<R, P: Fn(&R) -> (AppendClass, u64, u64)>(
     *ordinary -= ordinary_bytes;
     *maintenance -= maintenance_bytes;
     (ordinary_bytes, maintenance_bytes)
+}
+
+pub(super) fn has_live_pin<K, H>(
+    holds: &BTreeMap<K, H>,
+    through: u64,
+    interval: impl Fn(&H) -> (u64, u64),
+) -> bool {
+    let mut entries = holds.values();
+    loop {
+        let Some(hold) = entries.next() else {
+            return false;
+        };
+        let (start, end) = interval(hold);
+        if pins_suffix(start, end, through) {
+            return true;
+        }
+    }
 }

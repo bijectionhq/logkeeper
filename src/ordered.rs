@@ -1439,12 +1439,8 @@ impl State {
                 let (ordinary_bytes, maintenance_bytes) = retention::trim(
                     selection,
                     || {
-                        holds.values().any(|entry| {
-                            admission::pins_suffix(
-                                entry.hold.start.next_lsn,
-                                entry.hold.through.next_lsn,
-                                through.next_lsn,
-                            )
+                        retention::has_live_pin(holds, through.next_lsn, |entry| {
+                            (entry.hold.start.next_lsn, entry.hold.through.next_lsn)
                         })
                     },
                     &mut self.records,
