@@ -87,7 +87,9 @@ impl DurableVoter {
         let size = slot_size(group)?;
         if directory.join(RESERVATION).try_exists()? {
             let _slots = slots(directory, size, false)?;
-            let _ticket = read_reservation(directory, group, identity, size)?;
+            let (ticket, _) = read_reservation(directory, group, identity, size)?;
+            ticket.sync_all()?;
+            sync_directory(directory)?;
             return Self::reserved_bytes(group);
         }
         let _slots = slots(directory, size, true)?;
@@ -166,6 +168,10 @@ impl DurableVoter {
             {
                 return Err(Error::Group);
             }
+            // A warm restart can read a header that the prior process did
+            // not finish syncing. Make its slot durable before a later
+            // install can overwrite the other slot.
+            slots[known.index].sync_all()?;
             known
         } else if let Some(state) = bootstrap {
             if ticket.as_ref().is_some_and(|(_, installed)| *installed) {
@@ -184,16 +190,16 @@ impl DurableVoter {
                 used[0],
                 size,
             )?;
-            if create {
-                sync_directory(directory)?;
-            }
             selected
         } else {
             return Err(Error::Prefix);
         };
-        if let Some((mut ticket, false)) = ticket {
-            ticket.seek(SeekFrom::Start(32))?;
-            ticket.write_all(&[1])?;
+        sync_directory(directory)?;
+        if let Some((mut ticket, installed)) = ticket {
+            if !installed {
+                ticket.seek(SeekFrom::Start(32))?;
+                ticket.write_all(&[1])?;
+            }
             ticket.sync_all()?;
         }
         Ok(Self {
@@ -586,7 +592,15 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn a_torn_inactive_slot_preserves_the_acknowledged_prefix() {
+    async fn surviving_voters_recover_the_exact_receipt_after_slot_tears() {
+        for failed_zone in 0..3 {
+            for tear_at in [0, HEADER as u64] {
+                assert_receipt_recovers(failed_zone, tear_at).await;
+            }
+        }
+    }
+
+    async fn assert_receipt_recovers(failed_zone: usize, tear_at: u64) {
         let voters = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         let placement = Placement {
             deployment: Uuid::new_v4(),
@@ -644,29 +658,33 @@ mod tests {
                 expected: None,
             },
         };
-        let chosen = group.choose(&peers, 1, invocation.clone()).await.unwrap();
+        let chosen = group
+            .choose(&peers[..2], 1, invocation.clone())
+            .await
+            .unwrap();
         assert!(matches!(chosen.receipt().outcome, Ok(Outcome::Enrolled(_))));
-        let used = chosen
-            .voters()
+        assert_eq!(chosen.voters().len(), 2);
+        let surviving = peers
             .iter()
-            .map(|id| {
-                let at = voters.iter().position(|&voter| voter == *id).unwrap();
-                let disk = peers[at].inner.media.lock();
+            .enumerate()
+            .filter(|(at, _)| *at != failed_zone)
+            .map(|(at, peer)| {
+                let disk = peer.inner.media.lock();
                 let committed = disk.selected.as_ref().unwrap().index;
                 (at, 1 - committed)
             })
             .collect::<Vec<_>>();
         drop(peers);
-        for &(at, inactive) in &used {
-            // Reproduce a body torn before publishing the new generation
-            // header. The previously selected vote must remain recoverable.
+        for &(at, inactive) in &surviving {
+            // Reproduce a torn body or generation header on every voter
+            // outside the failed zone before restarting any of them.
             let path = volumes[at].path().join(SLOTS[inactive]);
             let mut file = OpenOptions::new().write(true).open(path).unwrap();
-            file.seek(SeekFrom::Start(HEADER as u64)).unwrap();
+            file.seek(SeekFrom::Start(tear_at)).unwrap();
             file.write_all(&[0xff; 61]).unwrap();
             file.sync_all().unwrap();
         }
-        let reopened = used
+        let reopened = surviving
             .iter()
             .map(|&(at, _)| {
                 DurableVoter::recover(group.clone(), voters[at], volumes[at].path()).unwrap()
