@@ -1300,3 +1300,14 @@ RTDB `rtdb_replication::replay_closure` (branch `codesign/typed-closure`)
 | A467 | Table blocks name active search runs that serving and later checkpoints read. Study 110's base closure omitted them. | Include each table block's active search runs in the base closure. RTDB's typed model and production enumeration now do. |
 | A468 | A promoting leader's recovery confirmation reads files of historical catalogs below the base, outside every base and suffix closure. | Remove the confirmation path in installed journals (A459). Until then, exclude leader promotion from the recovery closure premise. |
 | A469 | Production table slugs can carry collision suffixes, so log records map to object keys only through catalogs. | Derive every key from the base or an adopted catalog's entries, and refuse a table with no slug. |
+
+## Installed term derivation · 2026-11-23
+
+RTDB replication driver at `8de6d7d9bf`
+
+| ID | Finding | Design amendment |
+| --- | --- | --- |
+| A470 | Under ordinary capacity pressure the driver demotes and claims again (`replication/src/driver.rs:572-579`), so it appends a maintenance claim without any crash. That reaches the A459 exhaustion under load alone. | Remove the per-term claim in installed journals as A459 requires. A demotion for capacity reuses the grant and promotes without a record. |
+| A471 | Promoting without a claim right after a demotion can reuse a term whose earlier records are not yet read back. Followers then discard the new term's sequence-zero record. | In journal-fenced mode, promote only after an empty replica poll, take the term as the highest admitted term plus one, and start the term's sequence at zero. |
+| A472 | The first record of a claimless term can be an idle heartbeat `NoOp` at sequence zero, which RTDB classifies as maintenance. | In journal-fenced mode, classify a sequence-zero `NoOp` as ordinary data. Only boundaries and uploads use the maintenance lane. |
+| A473 | Recovery confirmations are written only when replay does not observe the recovered root's upload. Installed custodians publish only roots whose upload is chosen after their boundary, and trim keeps every record after the boundary. | Treat a confirmation write in installed mode as an invariant breach rather than a maintenance cost. |
