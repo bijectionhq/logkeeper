@@ -24,7 +24,10 @@ pub type Fingerprint = [u8; 32];
 const APPEND_RECORD_CHARGE_BYTES: u64 = 208;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
+#[cfg_attr(
+    feature = "ordered-daemon",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 pub struct Placement {
     pub deployment: Uuid,
     pub incarnation: Uuid,
@@ -33,13 +36,20 @@ pub struct Placement {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
+#[cfg_attr(
+    feature = "ordered-daemon",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 pub struct Enrollment {
     pub worker: Uuid,
     pub serial: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "ordered-daemon",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 pub struct Grant {
     pub enrollment: Enrollment,
     pub epoch: u64,
@@ -53,7 +63,10 @@ pub struct WriterState {
 
 /// An exclusive data frontier and the identity of the prefix before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
+#[cfg_attr(
+    feature = "ordered-daemon",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 pub struct Cut {
     pub next_lsn: u64,
     pub history: Fingerprint,
@@ -68,14 +81,20 @@ pub struct Window {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
+#[cfg_attr(
+    feature = "ordered-daemon",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 pub struct Custody {
     pub allocation: Uuid,
     pub revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "ordered-daemon", derive(serde::Deserialize))]
+#[cfg_attr(
+    feature = "ordered-daemon",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 pub struct Checkpoint {
     pub cut: Cut,
     pub root: Fingerprint,
@@ -84,6 +103,10 @@ pub struct Checkpoint {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "ordered-daemon",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 pub struct Hold {
     pub id: RequestId,
     pub owner: Enrollment,
@@ -104,6 +127,10 @@ pub enum Principal {
 
 /// An invocation identifier with an immutable retry limit in journal order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(
+    feature = "ordered-daemon",
+    derive(serde::Deserialize, serde::Serialize)
+)]
 pub struct RequestId {
     pub nonce: Uuid,
     pub expires_at: u64,
