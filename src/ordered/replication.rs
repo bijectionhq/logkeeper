@@ -205,7 +205,7 @@ impl Group {
         }
         let mut initial = State::new(placement, limits, checkpoint, window)?;
         let mut hash = Sha256::new();
-        hash.update(b"logkeeper.ordered-group.v3");
+        hash.update(b"logkeeper.ordered-group.v4");
         hash.update(placement.deployment.as_bytes());
         hash.update(placement.incarnation.as_bytes());
         hash.update(placement.group.as_bytes());
