@@ -1,12 +1,12 @@
 use super::{
-    Input, checkpoint, checkpoint_preparation, cut, grant, hold_row, placement, principal,
+    Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, placement, principal,
     request_id, snapshot, window, writer_state,
 };
 use crate::ordered::RetainedCheckpoint;
 use crate::ordered::{
     BarrierClaim, Outcome, Placement, Principal, Receipt, Refusal, Request,
     service::{
-        ReplayHead, ReplayPage, Route,
+        MAX_WITHDRAWN_WORKERS, ReplayHead, ReplayPage, Route, WithdrawnWorker,
         wire::{Decision, Operation, Reply, Signature, SignedBarrier},
     },
 };
@@ -64,6 +64,13 @@ impl Operation {
                 cut(&mut output, *through);
                 output.put_u64(*maximum_bytes);
             }
+            Self::WithdrawnWorkers { after } => {
+                output.put_u8(9);
+                output.put_u8(u8::from(after.is_some()));
+                if let Some(after) = after {
+                    enrollment(&mut output, *after);
+                }
+            }
             Self::CheckpointCut { next } => {
                 output.put_u8(6);
                 output.put_u64(*next);
@@ -115,6 +122,9 @@ impl Operation {
                 from: input.cut()?,
                 through: input.cut()?,
                 maximum_bytes: input.u64()?,
+            },
+            9 => Self::WithdrawnWorkers {
+                after: input.optional(Input::enrollment)?,
             },
             _ => return Err(Refusal::Invalid),
         };
@@ -199,6 +209,17 @@ impl Reply {
                 output.put_u8(7);
                 cut(&mut output, *selected);
             }
+            Self::WithdrawnWorkers(workers) => {
+                output.put_u8(8);
+                output.put_u8(workers.len() as u8);
+                for worker in workers {
+                    enrollment(&mut output, worker.enrollment);
+                    output.put_u8(u8::from(worker.eligible_at.is_some()));
+                    if let Some(time) = worker.eligible_at {
+                        output.put_u64(time);
+                    }
+                }
+            }
             Self::Released(hold) => {
                 output.put_u8(6);
                 hold_row(&mut output, *hold);
@@ -275,6 +296,20 @@ impl Reply {
             })?),
             6 => Self::Released(input.hold()?),
             7 => Self::CheckpointCut(input.cut()?),
+            8 => {
+                let count = usize::from(input.read_byte()?);
+                if count > MAX_WITHDRAWN_WORKERS {
+                    return Err(Refusal::Invalid);
+                }
+                let mut workers = Vec::with_capacity(count);
+                for _ in 0..count {
+                    workers.push(WithdrawnWorker {
+                        enrollment: input.enrollment()?,
+                        eligible_at: input.optional(Input::u64)?,
+                    });
+                }
+                Self::WithdrawnWorkers(workers)
+            }
             _ => return Err(Refusal::Invalid),
         };
         input.finish(reply)

@@ -4,7 +4,7 @@ use logkeeper::ordered::replication::transport::{Connector, RemoteVoter, serve_v
 use logkeeper::ordered::replication::{DurableVoter, Error, Group, Replica};
 use logkeeper::ordered::service::{Coordinator, Session, wire};
 use logkeeper::ordered::{
-    AppendClass, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut,
+    AppendClass, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut, Enrollment,
     Fingerprint, Limits, Outcome, Placement, Principal, Refusal, Request, RequestId, Window,
 };
 use std::time::Duration;
@@ -37,15 +37,189 @@ async fn application<R: Replica>(
     session: Session,
     operation: wire::Operation,
 ) -> wire::Reply {
+    application_with_frame(coordinator, placement, session, operation, 16_384).await
+}
+
+async fn application_with_frame<R: Replica>(
+    coordinator: &Coordinator<R>,
+    placement: Placement,
+    session: Session,
+    operation: wire::Operation,
+    frame: usize,
+) -> wire::Reply {
     let (client, server) = tokio::io::duplex(4096);
     let (reply, served) = tokio::join!(
-        wire::exchange(client, placement, operation, 16_384, DEADLINE),
-        wire::serve(coordinator, server, session, 16_384, DEADLINE, |_| panic!(
+        wire::exchange(client, placement, operation, frame, DEADLINE),
+        wire::serve(coordinator, server, session, frame, DEADLINE, |_| panic!(
             "unexpected barrier in test exchange"
         )),
     );
     served.unwrap();
     reply.unwrap()
+}
+
+#[tokio::test]
+async fn only_the_custodian_can_page_withdrawn_hold_owners_over_the_application_wire() {
+    use logkeeper::ordered::service::WithdrawnWorker;
+
+    let placement = Placement {
+        deployment: Uuid::new_v4(),
+        incarnation: Uuid::new_v4(),
+        group: Uuid::new_v4(),
+        generation: 1,
+    };
+    let limits = Limits {
+        enrolled_workers: 1,
+        replay_holds: 8,
+        retry_positions: 64,
+        retained_data_bytes: 8192,
+        maintenance_bytes: 1024,
+        serving_lease: 100,
+        clock_drift: 20,
+    };
+    let voter_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    let group = Group::new(
+        placement,
+        limits,
+        Checkpoint {
+            cut: Cut {
+                next_lsn: 0,
+                history: [1; 32],
+            },
+            root: [0; 32],
+            manifest: [0; 32],
+            custody: Custody {
+                allocation: Uuid::new_v4(),
+                revision: 1,
+                provider: [0; 32],
+            },
+        },
+        Window {
+            allocation: Uuid::new_v4(),
+            serial: 1,
+            bytes: 4096,
+        },
+        voter_ids,
+        1 << 20,
+    )
+    .unwrap();
+    let media = voter_ids.map(|_| tempfile::tempdir().unwrap());
+    let peers: Vec<_> = voter_ids
+        .into_iter()
+        .zip(&media)
+        .map(|(id, dir)| DurableVoter::initialize(group.clone(), id, dir.path()).unwrap())
+        .collect();
+    let choose = async |round, principal, command| {
+        group
+            .choose_at(
+                &peers,
+                round,
+                1_000,
+                Request {
+                    placement,
+                    principal,
+                    id: RequestId {
+                        nonce: Uuid::new_v4(),
+                        expires_at: 64,
+                    },
+                    command,
+                },
+            )
+            .await
+            .unwrap()
+    };
+    let worker = Uuid::new_v4();
+    let mut expected = Vec::new();
+    let mut round = 1;
+    for serial in 1..=4 {
+        let enrollment = Enrollment { worker, serial };
+        let admin = Principal::Administrator;
+        let enrolled = choose(
+            round,
+            admin,
+            Command::Enroll {
+                worker,
+                expected: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            enrolled.receipt().outcome,
+            Ok(Outcome::Enrolled(enrollment))
+        );
+        let principal = Principal::Worker(enrollment);
+        let claimed = choose(
+            round + 1,
+            principal,
+            Command::Grant {
+                expected: enrolled.state().writer_state(),
+                candidate: enrollment,
+            },
+        )
+        .await;
+        let Ok(Outcome::Granted { grant, .. }) = claimed.receipt().outcome else {
+            panic!("recovery hold was not admitted");
+        };
+        if serial == 4 {
+            break;
+        }
+        let eligible_at = if serial == 1 {
+            let leased = choose(round + 2, principal, Command::Lease { grant }).await;
+            assert_eq!(
+                leased.receipt().outcome,
+                Ok(Outcome::Leased {
+                    grant,
+                    issued_at: 1_000,
+                    lease_end: 1_100,
+                })
+            );
+            1_120
+        } else {
+            0
+        };
+        let withdrawn = choose(round + 3, admin, Command::Withdraw { enrollment }).await;
+        assert_eq!(withdrawn.receipt().outcome, Ok(Outcome::Withdrawn));
+        expected.push(WithdrawnWorker {
+            enrollment,
+            eligible_at: Some(eligible_at),
+        });
+        round += 4;
+    }
+    let coordinator = Coordinator::new(group, peers);
+    let query = async |principal, after| {
+        application_with_frame(
+            &coordinator,
+            placement,
+            Session::authenticated(placement, principal),
+            wire::Operation::WithdrawnWorkers { after },
+            82,
+        )
+        .await
+    };
+    for principal in [
+        Principal::Administrator,
+        Principal::RouteReader,
+        Principal::Worker(Enrollment { worker, serial: 4 }),
+    ] {
+        assert!(matches!(
+            query(principal, None).await,
+            wire::Reply::Refused(Refusal::Unauthorized)
+        ));
+    }
+    let custody = Principal::Custodian;
+    let wire::Reply::WithdrawnWorkers(first) = query(custody, None).await else {
+        panic!("withdrawn workers were not returned");
+    };
+    assert_eq!(first, expected[..2]);
+    let wire::Reply::WithdrawnWorkers(second) = query(custody, Some(first[1].enrollment)).await
+    else {
+        panic!("next withdrawn workers were not returned");
+    };
+    assert_eq!(second, expected[2..]);
+    assert!(matches!(
+        query(custody, Some(second[0].enrollment)).await,
+        wire::Reply::WithdrawnWorkers(last) if last.is_empty()
+    ));
 }
 
 #[tokio::test]

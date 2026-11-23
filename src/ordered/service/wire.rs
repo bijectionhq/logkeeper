@@ -1,8 +1,8 @@
 //! Bounded application RPC on a channel authenticated for an installed group.
 
-use super::{Coordinator, Error, ReplayHead, ReplayPage, Route, Session};
+use super::{Coordinator, Error, ReplayHead, ReplayPage, Route, Session, WithdrawnWorker};
 use crate::ordered::{
-    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Fingerprint,
+    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment, Fingerprint,
     Grant, Hold, Outcome, Placement, Receipt, Refusal, Request, append_fingerprint,
     replication::Replica,
 };
@@ -12,8 +12,10 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-const MAGIC: &[u8; 8] = b"LKAPPC08";
+const MAGIC: &[u8; 8] = b"LKAPPC09";
 const REPLAY_OVERHEAD: usize = 1 + 160 + 40 + 8;
+const WITHDRAWN_WORKERS_OVERHEAD: usize = 1 + 1;
+const WITHDRAWN_WORKER_MAX_BYTES: usize = 16 + 8 + 1 + 8;
 
 #[derive(Clone)]
 pub enum Operation {
@@ -50,6 +52,9 @@ pub enum Operation {
         through: Cut,
         maximum_bytes: u64,
     },
+    WithdrawnWorkers {
+        after: Option<Enrollment>,
+    },
 }
 
 pub enum Reply {
@@ -60,6 +65,7 @@ pub enum Reply {
     ReplayHead(Option<ReplayHead>),
     Released(Hold),
     CheckpointCut(Cut),
+    WithdrawnWorkers(Vec<WithdrawnWorker>),
     Refused(Refusal),
 }
 
@@ -207,6 +213,14 @@ pub async fn serve<R: Replica>(
                 .checkpoint_cut(session, next)
                 .await
                 .map(Reply::CheckpointCut),
+            Operation::WithdrawnWorkers { after } => {
+                let limit = maximum_frame.saturating_sub(WITHDRAWN_WORKERS_OVERHEAD)
+                    / WITHDRAWN_WORKER_MAX_BYTES;
+                coordinator
+                    .withdrawn_workers(session, after, limit)
+                    .await
+                    .map(Reply::WithdrawnWorkers)
+            }
             Operation::Release { hold } => coordinator
                 .release(session, hold)
                 .await
@@ -226,6 +240,14 @@ pub async fn serve<R: Replica>(
 impl Reply {
     fn matches(&self, placement: Placement, operation: &Operation) -> bool {
         match (self, operation) {
+            (Self::WithdrawnWorkers(workers), Operation::WithdrawnWorkers { after }) => {
+                workers
+                    .first()
+                    .is_none_or(|first| after.is_none_or(|cursor| first.enrollment > cursor))
+                    && workers
+                        .windows(2)
+                        .all(|pair| pair[0].enrollment < pair[1].enrollment)
+            }
             (Self::CheckpointCut(cut), Operation::CheckpointCut { next, .. }) => {
                 cut.next_lsn == *next
             }
@@ -348,6 +370,49 @@ async fn write_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn withdrawn_worker_codec_rejects_oversized_pages_and_repeated_or_old_rows() {
+        let enrollment = Enrollment {
+            worker: uuid::Uuid::new_v4(),
+            serial: 1,
+        };
+        let worker = WithdrawnWorker {
+            enrollment,
+            eligible_at: None,
+        };
+        let body = Reply::WithdrawnWorkers(vec![worker]).encode();
+        assert!(matches!(
+            Reply::decode(body),
+            Ok(Reply::WithdrawnWorkers(rows)) if rows == [worker]
+        ));
+        let large = Reply::WithdrawnWorkers(vec![worker; super::super::MAX_WITHDRAWN_WORKERS + 1]);
+        assert!(matches!(
+            Reply::decode(large.encode()),
+            Err(Refusal::Invalid)
+        ));
+        let repeated = Reply::WithdrawnWorkers(vec![worker, worker]);
+        assert!(!repeated.matches(
+            test_placement(),
+            &Operation::WithdrawnWorkers { after: None }
+        ));
+        let old = Reply::WithdrawnWorkers(vec![worker]);
+        assert!(!old.matches(
+            test_placement(),
+            &Operation::WithdrawnWorkers {
+                after: Some(enrollment),
+            }
+        ));
+    }
+
+    fn test_placement() -> Placement {
+        Placement {
+            deployment: uuid::Uuid::new_v4(),
+            incarnation: uuid::Uuid::new_v4(),
+            group: uuid::Uuid::new_v4(),
+            generation: 1,
+        }
+    }
 
     #[tokio::test]
     async fn application_framing_requires_the_protocol_magic_and_bounded_length() {

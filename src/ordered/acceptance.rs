@@ -817,6 +817,7 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
         })
     ));
     let dispose = Command::DisposeExpired { enrollment: first };
+    assert!(state.withdrawn_hold_owners(None, 64).next().is_none());
     assert_eq!(
         at(&mut state, 300, Principal::Administrator, dispose.clone()),
         Err(Refusal::Stale)
@@ -890,6 +891,14 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
     );
     assert_eq!(state.lease_end(first), Some(1_100));
     round_trips(&state);
+    let recovered = State::decode_base(&initial, state.encode_base()).unwrap();
+    assert_eq!(
+        recovered
+            .withdrawn_hold_owners(None, 64)
+            .collect::<Vec<_>>(),
+        [first]
+    );
+    assert_eq!(recovered.expiry_disposal_time(first), Some(1_200));
     assert_eq!(
         at(&mut state, 1_199, Principal::Custodian, dispose.clone()),
         Err(Refusal::Unavailable)
@@ -907,6 +916,7 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
         Ok(Outcome::WorkerDisposed(first))
     );
     assert!(state.holds.values().all(|entry| entry.hold.owner != first));
+    assert!(state.withdrawn_hold_owners(None, 64).next().is_none());
     assert_eq!(state.lease_end(first), None);
     round_trips(&state);
     assert!(matches!(
@@ -917,6 +927,7 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
     // A worker that was never leased never served: it is disposable once
     // withdrawn.
     let unleased = enroll_at(&mut state, 1_300);
+    grant_at(&mut state, 1_300, unleased);
     assert_eq!(
         at(
             &mut state,
@@ -928,6 +939,11 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
         ),
         Ok(Outcome::Withdrawn)
     );
+    assert_eq!(
+        state.withdrawn_hold_owners(None, 64).collect::<Vec<_>>(),
+        [unleased]
+    );
+    assert_eq!(state.expiry_disposal_time(unleased), Some(0));
     assert_eq!(
         at(
             &mut state,

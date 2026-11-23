@@ -5,7 +5,7 @@
 //! handing a request to this service.
 
 use super::{
-    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Fingerprint,
+    AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment, Fingerprint,
     Grant, Hold, Outcome, Placement, Principal, Receipt, Record, Refusal, Request, RequestId,
     RetainedCheckpoint, State, Window, WriterState,
     replication::{self, Group, Replica},
@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 pub mod wire;
 
 const ROUND_ATTEMPTS: usize = 4;
+pub(super) const MAX_WITHDRAWN_WORKERS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Session {
@@ -77,6 +78,14 @@ pub struct ReplayHead {
     pub next: Cut,
     pub timestamp: i64,
     pub payload_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WithdrawnWorker {
+    pub enrollment: Enrollment,
+    /// Earliest eligible journal time in milliseconds. Zero means eligible on
+    /// withdrawal. None means the lease and drift exceed the journal clock range.
+    pub eligible_at: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -247,6 +256,25 @@ impl<R: Replica> Coordinator<R> {
             return Err(Refusal::Stale.into());
         }
         state.cut(next).ok_or_else(|| Refusal::Unavailable.into())
+    }
+
+    /// Returns distinct withdrawn hold owners in enrollment order, strictly
+    /// after the cursor, from a recovered journal state.
+    pub async fn withdrawn_workers(
+        &self,
+        session: Session,
+        after: Option<Enrollment>,
+        limit: usize,
+    ) -> Result<Vec<WithdrawnWorker>, Error> {
+        State::custodian(session.principal)?;
+        let state = self.recover(session).await?;
+        Ok(state
+            .withdrawn_hold_owners(after, limit.min(MAX_WITHDRAWN_WORKERS))
+            .map(|enrollment| WithdrawnWorker {
+                enrollment,
+                eligible_at: state.expiry_disposal_time(enrollment),
+            })
+            .collect())
     }
 
     /// A withdrawn enrollment can release its old exact hold without

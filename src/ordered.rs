@@ -14,7 +14,7 @@ pub mod service;
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use uuid::Uuid;
 
 pub type Fingerprint = [u8; 32];
@@ -1197,15 +1197,11 @@ impl State {
                 {
                     return Err(Refusal::Stale);
                 }
-                // A worker that was never leased never served, so it is
-                // disposable as soon as it is withdrawn.
-                if let Some(lease_end) = self.leases.get(&enrollment) {
-                    let disposable = lease_end
-                        .checked_add(self.limits.clock_drift)
-                        .ok_or(Refusal::Capacity)?;
-                    if self.time < disposable {
-                        return Err(Refusal::Unavailable);
-                    }
+                let eligible_at = self
+                    .expiry_disposal_time(enrollment)
+                    .ok_or(Refusal::Capacity)?;
+                if self.time < eligible_at {
+                    return Err(Refusal::Unavailable);
                 }
                 self.dispose(enrollment);
                 Ok(Outcome::WorkerDisposed(enrollment))
@@ -1397,6 +1393,34 @@ impl State {
                 self.floor = through;
                 Ok(Outcome::Trimmed(result))
             }
+        }
+    }
+
+    fn withdrawn_hold_owners(
+        &self,
+        after: Option<Enrollment>,
+        limit: usize,
+    ) -> impl Iterator<Item = Enrollment> {
+        let mut owners = BTreeSet::new();
+        for entry in self.holds.values() {
+            let owner = entry.hold.owner;
+            if after.is_some_and(|cursor| owner <= cursor)
+                || self.roster.get(&owner.worker) == Some(&owner)
+            {
+                continue;
+            }
+            owners.insert(owner);
+            if owners.len() > limit {
+                owners.pop_last();
+            }
+        }
+        owners.into_iter()
+    }
+
+    fn expiry_disposal_time(&self, enrollment: Enrollment) -> Option<u64> {
+        match self.leases.get(&enrollment) {
+            Some(lease_end) => lease_end.checked_add(self.limits.clock_drift),
+            None => Some(0),
         }
     }
 

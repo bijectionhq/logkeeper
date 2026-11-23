@@ -58,6 +58,11 @@ Initialize provisions a fresh voter directory once.
 Serve recovers only installed directories and accepts mutual TLS 1.3 using the endpoint certificate pins and roles in the installed manifest.
 Peer certificates used for voter traffic have no worker or custodian role in that group.
 Application clients retain the installed route and receipt verification keys independently of the serving daemon.
+Application wire version 9 (`LKAPPC09`) adds the custodian-only withdrawn hold owner query.
+Each page contains at most 64 distinct enrollments in enrollment order and fits the configured application frame.
+Pass the last enrollment as a cursor to continue.
+Each page reflects its own selected state and gives the journal-time threshold for expiry disposal.
+The ordered command, voter wire and compact recovery image formats are unchanged.
 Keep every previously trusted barrier receipt public key for the lifetime of the logical placement, including its incarnation and generation.
 Rotate signers through a cohort successor and distribute the updated trusted `ApplicationRoute.verification_keys` to clients before using its new signers.
 Set `predecessor_keys` from the immediate predecessor's active voter roster and carry older public keys in `retained_barrier_keys`.
