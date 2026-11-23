@@ -261,6 +261,13 @@ pub enum Command {
     Release {
         hold: Hold,
     },
+    /// Releases a read hold by the identity of the barrier that admitted it,
+    /// for a reader that lost the barrier's reply. Only the admitting
+    /// principal can release it. An unknown or already released read is
+    /// already released.
+    ReleaseRead {
+        read: RequestId,
+    },
     Trim {
         selected: Checkpoint,
         through: Cut,
@@ -1193,6 +1200,38 @@ impl State {
                     self.outcomes.remove(&(entry.origin, hold.id));
                 }
                 self.holds.remove(&hold.id);
+                Ok(Outcome::Released)
+            }
+            Command::ReleaseRead { read } => {
+                if !matches!(principal, Principal::Worker(_)) {
+                    return Err(Refusal::Unauthorized);
+                }
+                let key = (principal, read);
+                let admitted_read = self.outcomes.get(&key).map(|retained| {
+                    matches!(retained.receipt.outcome, Ok(Outcome::Barrier { .. }))
+                });
+                let Some(entry) = self.holds.get(&read).copied() else {
+                    // Nothing is held under this identity. It may still name
+                    // this principal's mutation, which is never a read.
+                    return match admitted_read {
+                        Some(false) => Err(Refusal::Conflict),
+                        _ => Ok(Outcome::Released),
+                    };
+                };
+                if entry.origin != principal {
+                    return Err(Refusal::Unauthorized);
+                }
+                if entry.kind != HoldKind::Ordinary || admitted_read != Some(true) {
+                    return Err(Refusal::Conflict);
+                }
+                // As with Release, a receipt still inside its retry window stays
+                // on the expiry schedule. It keeps a delayed copy of the
+                // original barrier from admitting a second hold under the same
+                // identity; past its window it leaves with the hold.
+                if read.expires_at <= self.position {
+                    self.outcomes.remove(&key);
+                }
+                self.holds.remove(&read);
                 Ok(Outcome::Released)
             }
             Command::Trim { selected, through } => {

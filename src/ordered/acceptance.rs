@@ -386,3 +386,248 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
     let recovered = State::decode_base(&initial, image.clone()).unwrap();
     assert_eq!(recovered.encode_base(), image);
 }
+
+#[test]
+fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
+    let initial = State::new(
+        Placement {
+            deployment: Uuid::new_v4(),
+            incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(),
+            generation: 1,
+        },
+        Limits {
+            enrolled_workers: 2,
+            replay_holds: 4,
+            retry_positions: 64,
+            retained_data_bytes: 1 << 16,
+            maintenance_bytes: 1 << 12,
+        },
+        Checkpoint {
+            cut: Cut {
+                next_lsn: 0,
+                history: [1; 32],
+            },
+            root: [0; 32],
+            manifest: [0; 32],
+            custody: Custody {
+                allocation: Uuid::new_v4(),
+                revision: 1,
+                provider: [0; 32],
+            },
+        },
+        Window {
+            allocation: Uuid::new_v4(),
+            serial: 1,
+            bytes: 1 << 12,
+        },
+    )
+    .unwrap();
+    let mut state = initial.clone();
+    let reader = enroll(&mut state);
+    let other = Principal::Worker(enroll(&mut state));
+    let principal = Principal::Worker(reader);
+    let expected = state.writer_state();
+    let grant_request = Request {
+        id: RequestId::fresh(state.position(), state.limits.retry_positions).unwrap(),
+        placement: state.placement,
+        principal,
+        command: Command::Grant {
+            expected,
+            candidate: reader,
+        },
+    };
+    let granted = state.apply(state.position() + 1, grant_request.clone());
+    let Ok(Outcome::Granted {
+        grant: writer,
+        recovery,
+    }) = granted.unwrap().outcome
+    else {
+        panic!("the reader was not granted");
+    };
+    let issue = |state: &mut State, principal, command| {
+        let request = Request {
+            id: RequestId::fresh(state.position(), state.limits.retry_positions).unwrap(),
+            placement: state.placement,
+            principal,
+            command,
+        };
+        let receipt = state.apply(state.position() + 1, request.clone()).unwrap();
+        (request, receipt.outcome)
+    };
+    let release_read = |state: &mut State, principal, read| {
+        issue(state, principal, Command::ReleaseRead { read }).1
+    };
+    let (append, appended) = issue(
+        &mut state,
+        principal,
+        Command::Append {
+            class: AppendClass::Data,
+            grant: writer,
+            expected_next: 0,
+            timestamp: 1,
+            payload: Bytes::from_static(b"a"),
+        },
+    );
+    let Ok(Outcome::Appended(appended)) = appended else {
+        panic!("append refused");
+    };
+
+    // The reply to this read is lost: the reader keeps only its identity.
+    let (lost, _) = issue(&mut state, principal, Command::Barrier { grant: writer });
+    assert_eq!(state.holds[&lost.id].hold.through, appended.cut);
+    let (_, kept) = issue(&mut state, principal, Command::Barrier { grant: writer });
+    let Ok(Outcome::Barrier { read: kept, .. }) = kept else {
+        panic!("second read refused");
+    };
+    let (_, protected) = issue(
+        &mut state,
+        principal,
+        Command::Protect {
+            grant: writer,
+            through: appended.cut,
+        },
+    );
+    let Ok(Outcome::Protected(protected)) = protected else {
+        panic!("protection refused");
+    };
+
+    // Only the admitting principal can release, and only a read.
+    assert_eq!(
+        release_read(&mut state, other, lost.id),
+        Err(Refusal::Unauthorized)
+    );
+    assert_eq!(
+        release_read(&mut state, Principal::Custodian, lost.id),
+        Err(Refusal::Unauthorized)
+    );
+    assert_eq!(
+        release_read(&mut state, principal, append.id),
+        Err(Refusal::Conflict)
+    );
+    assert_eq!(
+        release_read(&mut state, principal, grant_request.id),
+        Err(Refusal::Conflict)
+    );
+    assert_eq!(
+        release_read(&mut state, principal, protected.id),
+        Err(Refusal::Conflict)
+    );
+    assert_eq!(state.holds.len(), 4);
+    let image = state.encode_base();
+    assert_eq!(
+        State::decode_base(&initial, image.clone())
+            .unwrap()
+            .encode_base(),
+        image
+    );
+
+    let checkpoint = Checkpoint {
+        cut: appended.cut,
+        root: [2; 32],
+        manifest: [3; 32],
+        custody: Custody {
+            allocation: Uuid::new_v4(),
+            revision: 2,
+            provider: [4; 32],
+        },
+    };
+    let preparation = CheckpointPreparation {
+        checkpoint: checkpoint.cut,
+        root: checkpoint.root,
+        source: writer,
+        base: initial.checkpoint,
+        custody: checkpoint.custody,
+        usable_bytes: 64,
+        descriptor: [5; 32],
+    };
+    assert!(matches!(
+        issue(
+            &mut state,
+            Principal::Custodian,
+            Command::PrepareCheckpoint { preparation }
+        )
+        .1,
+        Ok(Outcome::CheckpointPrepared(_))
+    ));
+    assert_eq!(
+        issue(
+            &mut state,
+            Principal::Custodian,
+            Command::Publish { checkpoint }
+        )
+        .1,
+        Ok(Outcome::Published(checkpoint))
+    );
+    for hold in [recovery, kept, protected] {
+        assert_eq!(
+            issue(&mut state, principal, Command::Release { hold }).1,
+            Ok(Outcome::Released)
+        );
+    }
+    let trim = Command::Trim {
+        selected: checkpoint,
+        through: checkpoint.cut,
+    };
+    // The orphaned read alone still pins the suffix.
+    assert_eq!(
+        issue(&mut state, Principal::Custodian, trim.clone()).1,
+        Err(Refusal::Unavailable)
+    );
+
+    assert_eq!(
+        release_read(&mut state, principal, lost.id),
+        Ok(Outcome::Released)
+    );
+    assert!(state.holds.is_empty());
+    // The released read's identity stays spent until its window closes.
+    let resent = state.apply(state.position() + 1, lost.clone()).unwrap();
+    assert_eq!(resent.outcome, Err(Refusal::Conflict));
+    assert!(state.holds.is_empty());
+    // Releasing again, or an unknown read, is already done.
+    assert_eq!(
+        release_read(&mut state, principal, lost.id),
+        Ok(Outcome::Released)
+    );
+    let unknown = RequestId::fresh(state.position(), 8).unwrap();
+    assert_eq!(
+        release_read(&mut state, principal, unknown),
+        Ok(Outcome::Released)
+    );
+    let image = state.encode_base();
+    assert_eq!(
+        State::decode_base(&initial, image.clone())
+            .unwrap()
+            .encode_base(),
+        image
+    );
+
+    assert!(matches!(
+        issue(&mut state, Principal::Custodian, trim).1,
+        Ok(Outcome::Trimmed(_))
+    ));
+
+    // Past its window the receipt leaves with the hold.
+    let (late, _) = issue(&mut state, principal, Command::Barrier { grant: writer });
+    while state.position() < late.id.expires_at {
+        let _ = issue(
+            &mut state,
+            Principal::Custodian,
+            Command::Publish { checkpoint },
+        );
+    }
+    assert!(state.outcomes.contains_key(&(principal, late.id)));
+    assert_eq!(
+        release_read(&mut state, principal, late.id),
+        Ok(Outcome::Released)
+    );
+    assert!(!state.outcomes.contains_key(&(principal, late.id)));
+    assert!(state.holds.is_empty());
+    let image = state.encode_base();
+    assert_eq!(
+        State::decode_base(&initial, image.clone())
+            .unwrap()
+            .encode_base(),
+        image
+    );
+}

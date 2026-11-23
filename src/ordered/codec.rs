@@ -110,6 +110,10 @@ impl Request {
                 output.put_u8(7);
                 hold_row(&mut output, *hold);
             }
+            Command::ReleaseRead { read } => {
+                output.put_u8(19);
+                request_id(&mut output, *read);
+            }
             Command::ProtectRange {
                 grant: writer,
                 from,
@@ -181,6 +185,9 @@ impl Request {
             },
             7 => Command::Release {
                 hold: input.hold()?,
+            },
+            19 => Command::ReleaseRead {
+                read: input.request_id()?,
             },
             8 => Command::Trim {
                 selected: input.checkpoint()?,
