@@ -144,3 +144,11 @@ python3 verification/architecture-reopening/run.py
 
 Set `LOGKEEPER_TLC_SCRATCH` to an existing directory on a volume with more free space if TLC needs it.
 The runner gives each case its own Java temporary directory and state queue, then removes both and keeps the command, configuration, and log in the study’s ignored .results directory.
+
+## Production Rust proofs
+
+The [Verus runner](verus/README.md) verifies shipped Rust functions against
+reference laws and checks that each declared production mutation fails at
+its expected function. The [ordered admission area](verus/ordered_admission/README.md)
+covers checked debits, trim pinning, receipt expiry and exact fingerprint
+comparison.

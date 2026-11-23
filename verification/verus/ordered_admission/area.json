@@ -1,0 +1,182 @@
+{
+  "summary": "Exact admission debits, separation of maintenance from an exhausted ordinary window, trim pinning, receipt expiry and exact bytewise fingerprints.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 10,
+  "controls": {
+    "reject-exact-reserve": {
+      "defect": "Refuse a debit that exactly fills the funded ceiling.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "charge > ceiling - used",
+          "replace": "charge >= ceiling - used"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/admission.rs",
+          "function": "debit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "reject-exact-reserve-with-weakened-contract": {
+      "defect": "Refuse a debit that exactly fills the funded ceiling. Weaken the shipped contract to permit the same behavior.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "charge > ceiling - used",
+          "replace": "charge >= ceiling - used"
+        },
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "(out is Some) == (used as int + charge as int <= ceiling as int)",
+          "replace": "(out is Some) == ((used as int + charge as int) < ceiling as int)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_admission/laws.rs",
+          "function": "debit_matches_reference",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "verification/verus/ordered_admission/laws.rs",
+          "function": "maintenance_at_data_ceiling",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 8
+    },
+    "pin-at-floor": {
+      "defect": "Refuse a trim that stops at the first LSN of a nonempty hold.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "    start < end && start < floor\n",
+          "replace": "    start < end && start <= floor\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/admission.rs",
+          "function": "pins_suffix",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "pin-at-floor-with-weakened-contract": {
+      "defect": "Refuse a trim that stops at the first LSN of a nonempty hold. Weaken the shipped contract to permit the same behavior.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "    start < end && start < floor\n",
+          "replace": "    start < end && start <= floor\n"
+        },
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "ensures out == (start < end && start < floor)",
+          "replace": "ensures out == (start < end && start <= floor)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_admission/laws.rs",
+          "function": "pins_suffix_matches_reference",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "keep-at-expiry": {
+      "defect": "Retain the receipt at its expiry even when there is no live hold.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "    position < expires_at || owns_live_hold\n",
+          "replace": "    position <= expires_at || owns_live_hold\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/admission.rs",
+          "function": "retains_receipt",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "keep-at-expiry-with-weakened-contract": {
+      "defect": "Retain the receipt at its expiry even when there is no live hold. Weaken the shipped contract to permit the same behavior.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "    position < expires_at || owns_live_hold\n",
+          "replace": "    position <= expires_at || owns_live_hold\n"
+        },
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "ensures out == (position < expires_at || owns_live_hold)",
+          "replace": "ensures out == (position <= expires_at || owns_live_hold)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_admission/laws.rs",
+          "function": "retains_receipt_matches_reference",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "compare-only-lengths": {
+      "defect": "Accept different fingerprints of the same length.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "            return false;\n        }\n        #[cfg(verus_keep_ghost)]",
+          "replace": "            return true;\n        }\n        #[cfg(verus_keep_ghost)]"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/admission.rs",
+          "function": "matches_fingerprint",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    },
+    "compare-only-lengths-with-weakened-contract": {
+      "defect": "Accept different fingerprints of the same length. Weaken the shipped contract to permit the same behavior.",
+      "mutate": [
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "            return false;\n        }\n        #[cfg(verus_keep_ghost)]",
+          "replace": "            return true;\n        }\n        #[cfg(verus_keep_ghost)]"
+        },
+        {
+          "file": "src/ordered/admission.rs",
+          "find": "ensures out == (stored@ == presented@)",
+          "replace": "ensures out == (stored@.len() == presented@.len())"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_admission/laws.rs",
+          "function": "fingerprint_equality_matches_reference",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 9
+    }
+  }
+}

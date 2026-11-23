@@ -23,3 +23,9 @@ signatures and encoding to their inspected implementations.
 
 Run `python3 run_selection_fence.py` from this directory to build the package
 and check the one-slot control. Set `LAKE_BIN` if Lake is outside the path.
+
+`Logkeeper.OrderedAdmission` defines the local debit, suffix pin, receipt
+expiry and fingerprint decisions used by the
+[ordered admission production laws](../verus/ordered_admission/README.md).
+Run `python3 run_ordered_admission.py` from this directory to check its
+theorems, axiom lists and negative controls. The script also accepts `LAKE_BIN`.
