@@ -109,3 +109,7 @@ pub(crate) fn bounded_body_length(
     }
     Some(declared as usize)
 }
+
+pub(super) fn object_name_count(declared: u32, maximum: usize, remaining: usize) -> Option<usize> {
+    bounded_body_length(u64::from(declared), 0, maximum.min(remaining / 32))
+}

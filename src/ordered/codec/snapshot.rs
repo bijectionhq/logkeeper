@@ -5,6 +5,7 @@ use super::{
 use super::frame::{decode_flag, encode_flag};
 use super::snapshot_checks::{
     fence_row_valid, generation_in_range, hold_receipt_matches, lease_row_valid,
+    root_reference_row_valid,
 };
 use crate::ordered::{
     ACTIVATION_HOLD_SLOTS, AppendClass, AppendResult, Command, Grant, HeldAdmission, HoldKind,
@@ -231,16 +232,13 @@ impl State {
         };
         for _ in 0..roots {
             let revision = input.u64()?;
-            if (revision != self.checkpoint.custody.revision
-                && self
-                    .preparing
-                    .is_none_or(|item| revision != item.custody.revision)
-                && !self.old_roots.contains_key(&revision))
+            let known = revision == self.checkpoint.custody.revision
                 || self
-                    .root_references
-                    .last_key_value()
-                    .is_some_and(|(old, _)| *old >= revision)
-            {
+                    .preparing
+                    .is_some_and(|item| revision == item.custody.revision)
+                || self.old_roots.contains_key(&revision);
+            let previous = self.root_references.last_key_value().map(|(&old, _)| old);
+            if !root_reference_row_valid(revision, previous, known) {
                 return Err(Refusal::Invalid);
             }
             self.root_references.insert(revision, input.object_names()?);

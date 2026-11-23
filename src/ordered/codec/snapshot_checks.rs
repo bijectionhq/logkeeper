@@ -90,3 +90,14 @@ pub(super) fn hold_receipt_matches(admitted_at: u64, receipt_position: Option<u6
         None => false,
     }
 }
+
+pub(super) fn root_reference_row_valid(
+    revision: u64,
+    previous: Option<u64>,
+    known: bool,
+) -> bool {
+    known && match previous {
+        Some(previous) => previous < revision,
+        None => true,
+    }
+}

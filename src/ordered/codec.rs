@@ -13,7 +13,7 @@ mod snapshot_checks;
 
 use frame::{
     COMMAND_VERSION, decision_header, decode_flag, encode_flag, has_command_version,
-    read_decision_time,
+    object_name_count, read_decision_time,
 };
 
 const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR04";
@@ -601,10 +601,9 @@ fn withdrawal(output: &mut BytesMut, item: ObjectWithdrawal) {
 
 impl Input {
     fn object_names(&mut self) -> Result<Vec<ObjectName>, Refusal> {
-        let count = u32::from_be_bytes(self.take()?) as usize;
-        if count > MAX_OBJECT_REFERENCES || count > self.0.len() / 32 {
-            return Err(Refusal::Invalid);
-        }
+        let declared = u32::from_be_bytes(self.take()?);
+        let count = object_name_count(declared, MAX_OBJECT_REFERENCES, self.0.len())
+            .ok_or(Refusal::Invalid)?;
         let names = (0..count)
             .map(|_| self.take())
             .collect::<Result<Vec<_>, _>>()?;
