@@ -1,1 +1,2 @@
 import Logkeeper.Protocol
+import Logkeeper.RecoveryCertificate
