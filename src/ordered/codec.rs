@@ -4,14 +4,13 @@ use super::{
     Window, WriterState,
 };
 use bytes::{BufMut, Bytes, BytesMut};
-use std::num::NonZeroU64;
 use uuid::Uuid;
 
 mod service;
 mod snapshot;
 
-const VERSION: u8 = 3;
-const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR01";
+const VERSION: u8 = 4;
+const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR02";
 
 impl Request {
     /// The exact bytes used by ordered replication and crash replay.
@@ -56,21 +55,9 @@ impl Request {
                 output.put_i64(*timestamp);
                 output.put_slice(payload);
             }
-            Command::Barrier {
-                grant: writer,
-                nonce,
-            } => {
+            Command::Barrier { grant: writer } => {
                 output.put_u8(4);
                 grant(&mut output, *writer);
-                output.put_u64(nonce.get());
-            }
-            Command::AbandonRead {
-                grant: writer,
-                nonce,
-            } => {
-                output.put_u8(9);
-                grant(&mut output, *writer);
-                output.put_u64(nonce.get());
             }
             Command::PrepareCheckpoint { preparation } => {
                 output.put_u8(15);
@@ -184,7 +171,6 @@ impl Request {
             },
             4 => Command::Barrier {
                 grant: input.grant()?,
-                nonce: input.nonce()?,
             },
             5 => Command::Publish {
                 checkpoint: input.checkpoint()?,
@@ -199,10 +185,6 @@ impl Request {
             8 => Command::Trim {
                 selected: input.checkpoint()?,
                 through: input.cut()?,
-            },
-            9 => Command::AbandonRead {
-                grant: input.grant()?,
-                nonce: input.nonce()?,
             },
             10 => Command::FundWindow {
                 window: input.window()?,
@@ -257,7 +239,6 @@ impl BarrierClaim {
         output.put_slice(BARRIER_DOMAIN);
         placement(&mut output, self.placement);
         grant(&mut output, self.grant);
-        output.put_u64(self.nonce.get());
         request_id(&mut output, self.read.id);
         output.put_u64(self.read.admitted_at);
         checkpoint(&mut output, self.read.checkpoint);
@@ -274,7 +255,6 @@ impl BarrierClaim {
         }
         let placement = input.placement()?;
         let grant = input.grant()?;
-        let nonce = input.nonce()?;
         let id = input.request_id()?;
         let admitted_at = input.u64()?;
         let checkpoint = input.checkpoint()?;
@@ -290,7 +270,6 @@ impl BarrierClaim {
         Ok(Self {
             placement,
             grant,
-            nonce,
             read: Hold {
                 id,
                 owner: grant.enrollment,
@@ -333,10 +312,6 @@ impl Input {
     }
     fn u64(&mut self) -> Result<u64, Refusal> {
         Ok(u64::from_be_bytes(self.take()?))
-    }
-
-    fn nonce(&mut self) -> Result<NonZeroU64, Refusal> {
-        NonZeroU64::new(self.u64()?).ok_or(Refusal::Invalid)
     }
 
     fn request_id(&mut self) -> Result<RequestId, Refusal> {

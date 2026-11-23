@@ -114,10 +114,7 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
     let read_receipt = apply(
         &mut state,
         original.principal,
-        Command::Barrier {
-            grant: first_grant,
-            nonce: NonZeroU64::MIN,
-        },
+        Command::Barrier { grant: first_grant },
     );
     let Ok(Outcome::Barrier { read, .. }) = read_receipt.outcome else {
         panic!("read not protected")
@@ -265,4 +262,127 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
         .outcome,
         Ok(Outcome::Appended(_))
     ));
+}
+
+#[test]
+fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
+    let initial = State::new(
+        Placement {
+            deployment: Uuid::new_v4(),
+            incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(),
+            generation: 1,
+        },
+        Limits {
+            enrolled_workers: 1,
+            replay_holds: 4,
+            retry_positions: 64,
+            retained_data_bytes: 1 << 16,
+            maintenance_bytes: 1 << 12,
+        },
+        Checkpoint {
+            cut: Cut {
+                next_lsn: 0,
+                history: [1; 32],
+            },
+            root: [0; 32],
+            manifest: [0; 32],
+            custody: Custody {
+                allocation: Uuid::new_v4(),
+                revision: 1,
+                provider: [0; 32],
+            },
+        },
+        Window {
+            allocation: Uuid::new_v4(),
+            serial: 1,
+            bytes: 1 << 12,
+        },
+    )
+    .unwrap();
+    let mut state = initial.clone();
+    let worker = enroll(&mut state);
+    let (writer, _) = grant(&mut state, worker);
+    let principal = Principal::Worker(worker);
+    let request = |state: &State, command| Request {
+        id: RequestId::fresh(state.position(), state.limits.retry_positions).unwrap(),
+        placement: state.placement,
+        principal,
+        command,
+    };
+    let next = |state: &State| state.position() + 1;
+
+    // Two identical append requests resolve to one receipt and one record.
+    let append = request(
+        &state,
+        Command::Append {
+            class: AppendClass::Data,
+            grant: writer,
+            expected_next: 0,
+            timestamp: 1,
+            payload: Bytes::from_static(b"a"),
+        },
+    );
+    let appended = state.apply(next(&state), append.clone()).unwrap();
+    assert!(matches!(appended.outcome, Ok(Outcome::Appended(_))));
+    assert_eq!(state.apply(next(&state), append.clone()).unwrap(), appended);
+    assert_eq!(state.retained_receipt(&append), Some(appended));
+    assert_eq!(state.head().next_lsn, 1);
+
+    // Two identical read commands are two admissions with distinct holds.
+    let barrier = Command::Barrier { grant: writer };
+    let first = state
+        .apply(next(&state), request(&state, barrier.clone()))
+        .unwrap();
+    let Ok(Outcome::Barrier { read: early, .. }) = first.outcome else {
+        panic!("first read refused: {first:?}");
+    };
+    let second = state
+        .apply(next(&state), request(&state, barrier.clone()))
+        .unwrap();
+    let Ok(Outcome::Barrier { read: late, .. }) = second.outcome else {
+        panic!("second read refused: {second:?}");
+    };
+    assert_ne!(first, second);
+    assert_ne!(early.id, late.id);
+    assert_eq!(early.through, late.through);
+    assert_eq!(state.holds.len(), 3);
+
+    // The exact reissue of an admitted read never replays its receipt and
+    // never takes a second hold, and its original receipt stays retained.
+    let reissue = Request {
+        id: early.id,
+        placement: state.placement,
+        principal,
+        command: barrier.clone(),
+    };
+    assert_eq!(state.retained_receipt(&reissue), None);
+    let refused = state.apply(next(&state), reissue).unwrap();
+    assert_eq!(refused.outcome, Err(Refusal::Conflict));
+    assert_eq!(refused.position, state.position());
+    assert_eq!(state.holds.len(), 3);
+    assert_eq!(state.outcomes[&(principal, early.id)].receipt, first);
+
+    // A later read observes at or after every earlier read's cut.
+    let more = request(
+        &state,
+        Command::Append {
+            class: AppendClass::Data,
+            grant: writer,
+            expected_next: 1,
+            timestamp: 2,
+            payload: Bytes::from_static(b"b"),
+        },
+    );
+    assert!(state.apply(next(&state), more).unwrap().outcome.is_ok());
+    let third = state.apply(next(&state), request(&state, barrier)).unwrap();
+    let Ok(Outcome::Barrier { read: latest, .. }) = third.outcome else {
+        panic!("third read refused: {third:?}");
+    };
+    assert!(latest.through.next_lsn > late.through.next_lsn);
+
+    // Every live read hold keeps its own receipt as provenance.
+    let image = state.encode_base();
+    let recovered = State::decode_base(&initial, image.clone()).unwrap();
+    assert_eq!(recovered.encode_base(), image);
 }

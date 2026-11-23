@@ -296,7 +296,6 @@ impl Input {
             && (receipt.outcome
                 != Ok(Outcome::Barrier {
                     grant: claim.grant(),
-                    nonce: claim.nonce(),
                     read: claim.read(),
                 })
                 || receipt.placement != claim.placement()

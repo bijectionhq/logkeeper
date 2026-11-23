@@ -14,9 +14,7 @@ pub mod service;
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
-use std::num::NonZeroU64;
 use uuid::Uuid;
 
 pub type Fingerprint = [u8; 32];
@@ -212,13 +210,10 @@ pub enum Command {
         timestamp: i64,
         payload: Bytes,
     },
+    /// A fresh read. Each admission protects its own basis at the current
+    /// head; a retry is a new admission and never replays an earlier read.
     Barrier {
         grant: Grant,
-        nonce: NonZeroU64,
-    },
-    AbandonRead {
-        grant: Grant,
-        nonce: NonZeroU64,
     },
     PrepareCheckpoint {
         preparation: CheckpointPreparation,
@@ -305,17 +300,9 @@ pub struct TrimResult {
 pub enum Outcome {
     Enrolled(Enrollment),
     Withdrawn,
-    Granted {
-        grant: Grant,
-        recovery: Hold,
-    },
+    Granted { grant: Grant, recovery: Hold },
     Appended(AppendResult),
-    Barrier {
-        grant: Grant,
-        nonce: NonZeroU64,
-        read: Hold,
-    },
-    ReadAbandoned,
+    Barrier { grant: Grant, read: Hold },
     Published(Checkpoint),
     CheckpointPrepared(CheckpointPreparation),
     CheckpointClosed(Checkpoint),
@@ -339,7 +326,6 @@ pub enum Refusal {
     Expired,
     Capacity,
     Unavailable,
-    ReadPending,
     CohortSealed,
 }
 
@@ -357,7 +343,6 @@ pub struct Receipt {
 pub struct BarrierClaim {
     placement: Placement,
     grant: Grant,
-    nonce: NonZeroU64,
     read: Hold,
 }
 
@@ -372,10 +357,6 @@ impl BarrierClaim {
 
     pub fn read(self) -> Hold {
         self.read
-    }
-
-    pub fn nonce(self) -> NonZeroU64 {
-        self.nonce
     }
 }
 
@@ -471,7 +452,6 @@ pub struct State {
     enrollment_serial: u64,
     roster: BTreeMap<Uuid, Enrollment>,
     grant: Option<Grant>,
-    read_floor: u64,
     window: Window,
     spent: u64,
     retained_bytes: u64,
@@ -532,7 +512,6 @@ impl State {
             enrollment_serial: 0,
             roster: BTreeMap::new(),
             grant: None,
-            read_floor: 0,
             window,
             spent: 0,
             retained_bytes: 0,
@@ -663,6 +642,11 @@ impl State {
     }
 
     fn retained_receipt(&self, request: &Request) -> Option<Receipt> {
+        // Reads have no exact lost-reply recovery: a reissued read is applied
+        // again and can never be answered with an earlier read's receipt.
+        if matches!(request.command, Command::Barrier { .. }) {
+            return None;
+        }
         let previous = self.outcomes.get(&(request.principal, request.id))?;
         (request.placement == self.placement
             && admission::matches_fingerprint(&previous.fingerprint, &fingerprint(request)))
@@ -706,9 +690,13 @@ impl State {
             return Ok(receipt(Err(Refusal::Invalid)));
         }
         let key = (principal, id);
+        let reading = matches!(&request.command, Command::Barrier { .. });
         if let Some(previous) = self.outcomes.get(&key) {
+            // A retained read receipt only proves its hold's provenance. Its
+            // identity is spent: a read is never answered by replay, and the
+            // original receipt is never overwritten.
             return Ok(
-                if admission::matches_fingerprint(&previous.fingerprint, &fingerprint) {
+                if !reading && admission::matches_fingerprint(&previous.fingerprint, &fingerprint) {
                     previous.receipt
                 } else {
                     receipt(Err(Refusal::Conflict))
@@ -724,13 +712,11 @@ impl State {
         if id.expires_at - position > self.limits.retry_positions {
             return Ok(receipt(Err(Refusal::Invalid)));
         }
-        let reading = matches!(&request.command, Command::Barrier { .. });
         let receipt = receipt(self.decide(principal, id, fingerprint, request.command));
-        if receipt.outcome == Err(Refusal::ReadPending)
-            || (reading && receipt.outcome == Err(Refusal::Capacity))
-        {
-            // A blocked admission has taken neither the nonce nor a hold.
-            // The same request can still acquire them once the condition clears.
+        if reading && receipt.outcome.is_err() {
+            // A refused read holds nothing and is never replayed, so it leaves
+            // no state behind. Only an admitted read retains its receipt, as
+            // the provenance of its hold.
             return Ok(receipt);
         }
         self.outcomes.insert(
@@ -752,21 +738,6 @@ impl State {
             return Err(Refusal::Stale);
         }
         Ok(())
-    }
-
-    fn next_read(
-        &self,
-        principal: Principal,
-        grant: Grant,
-        nonce: NonZeroU64,
-    ) -> Result<(), Refusal> {
-        self.writer(principal, grant)?;
-        let expected = self.read_floor.checked_add(1).ok_or(Refusal::Stale)?;
-        match nonce.get().cmp(&expected) {
-            Ordering::Equal => Ok(()),
-            Ordering::Less => Err(Refusal::Stale),
-            Ordering::Greater => Err(Refusal::ReadPending),
-        }
     }
 
     fn cut(&self, next_lsn: u64) -> Option<Cut> {
@@ -929,7 +900,6 @@ impl State {
                 )?;
                 self.writer_epoch = epoch;
                 self.grant = Some(grant);
-                self.read_floor = 0;
                 Ok(Outcome::Granted { grant, recovery })
             }
             Command::Append {
@@ -997,16 +967,12 @@ impl State {
                 };
                 Ok(Outcome::Appended(result))
             }
-            Command::Barrier { grant, nonce } => {
-                self.next_read(principal, grant, nonce)?;
+            Command::Barrier { grant } => {
+                self.writer(principal, grant)?;
+                // The head never moves back under one grant, so a later read
+                // observes at or after every earlier read's cut.
                 let read = self.protect(principal, id, grant.enrollment, self.head)?;
-                self.read_floor = nonce.get();
-                Ok(Outcome::Barrier { grant, nonce, read })
-            }
-            Command::AbandonRead { grant, nonce } => {
-                self.next_read(principal, grant, nonce)?;
-                self.read_floor = nonce.get();
-                Ok(Outcome::ReadAbandoned)
+                Ok(Outcome::Barrier { grant, read })
             }
             Command::PrepareCheckpoint { preparation } => {
                 Self::custodian(principal)?;

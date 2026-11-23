@@ -7,7 +7,6 @@ use logkeeper::ordered::{
     AppendClass, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Custody, Cut,
     Fingerprint, Limits, Outcome, Placement, Principal, Refusal, Request, RequestId, Window,
 };
-use std::num::NonZeroU64;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -243,7 +242,6 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         Principal::Worker(second_enrollment),
         Command::Barrier {
             grant: second_grant,
-            nonce: NonZeroU64::MIN,
         },
     );
     barrier_request.id.expires_at = 8;
@@ -251,11 +249,10 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         .choose(&peers, 8, barrier_request.clone())
         .await
         .unwrap();
-    let Outcome::Barrier { grant, nonce, read } = barrier.receipt().outcome.unwrap() else {
+    let Outcome::Barrier { grant, read } = barrier.receipt().outcome.unwrap() else {
         panic!("fresh barrier was refused");
     };
     assert_eq!(grant, second_grant);
-    assert_eq!(nonce, NonZeroU64::MIN);
     assert_eq!(read.through, original.cut);
     assert_eq!(read.checkpoint, seed);
     let claim = barrier.barrier_claim().unwrap();
@@ -292,9 +289,29 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     assert_eq!(next.lsn, 1);
     assert_eq!(next.window, original.window);
     assert_eq!(next.byte_start, original.byte_end);
-    let reissued = group.choose(&peers, 10, barrier_request).await.unwrap();
-    assert_eq!(reissued.receipt(), barrier.receipt());
-    assert_eq!(reissued.barrier_claim(), Some(claim));
+    // A read has no exact lost-reply recovery. Its retry is a new admission
+    // at the same grant, observing at or after the original cut.
+    let retry = request(
+        Principal::Worker(second_enrollment),
+        Command::Barrier {
+            grant: second_grant,
+        },
+    );
+    let retried = group.choose(&peers, 10, retry).await.unwrap();
+    let retried_claim = retried.barrier_claim().unwrap();
+    let retried = retried_claim.read();
+    assert_eq!(retried_claim.grant(), second_grant);
+    assert_ne!(retried.id, read.id);
+    assert!(retried.admitted_at > read.admitted_at);
+    assert!(retried.through.next_lsn >= read.through.next_lsn);
+    assert_eq!(retried.through, next.cut);
+    // The original identity is spent: the exact reissue is never answered
+    // with the original receipt and never admits a second hold.
+    let reissued = group.choose(&peers, 11, barrier_request).await.unwrap();
+    assert_eq!(reissued.receipt().outcome, Err(Refusal::Conflict));
+    assert_eq!(reissued.barrier_claim(), None);
+    let still = reissued.state().held_replay(reader, read).unwrap();
+    assert_eq!(still.through(), original.cut);
 
     let published = Checkpoint {
         cut: next.cut,
@@ -319,7 +336,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let prepare = group
         .choose(
             &peers,
-            11,
+            13,
             request(
                 Principal::Custodian,
                 Command::PrepareCheckpoint { preparation },
@@ -334,7 +351,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let publication = group
         .choose(
             &peers,
-            12,
+            14,
             request(
                 Principal::Custodian,
                 Command::Publish {
@@ -357,7 +374,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             },
         )
     };
-    let blocked = group.choose(&peers, 13, trim()).await.unwrap();
+    let blocked = group.choose(&peers, 15, trim()).await.unwrap();
     assert_eq!(blocked.receipt().outcome, Err(Refusal::Unavailable));
     let medium = || {
         ["ordered.slot-a", "ordered.slot-b"]
@@ -369,12 +386,17 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             .any(|range| range == original_payload.as_ref())
     }));
 
-    for (round, hold) in [(14, first_recovery), (15, recovery), (16, read)] {
+    for (round, hold) in [
+        (16, first_recovery),
+        (17, recovery),
+        (18, read),
+        (19, retried),
+    ] {
         let release = request(Principal::Worker(hold.owner), Command::Release { hold });
         let released = group.choose(&peers, round, release).await.unwrap();
         assert_eq!(released.receipt().outcome, Ok(Outcome::Released));
     }
-    let trimmed = group.choose(&peers, 17, trim()).await.unwrap();
+    let trimmed = group.choose(&peers, 20, trim()).await.unwrap();
     assert_eq!(
         trimmed.receipt().outcome,
         Ok(Outcome::Trimmed(TrimResult {
@@ -391,7 +413,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         Err(Refusal::Unavailable)
     ));
     assert_eq!(trimmed.state().spent_bytes(), next.byte_end);
-    group.compact(&peers, 18).await.unwrap();
+    group.compact(&peers, 21).await.unwrap();
     let reclaimed = medium();
     assert!(
         reclaimed
@@ -407,7 +429,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
 
     drop(peers);
     let peers = reopen([0, 1]);
-    let reopened = group.recover(&peers, 19).await.unwrap();
+    let reopened = group.recover(&peers, 22).await.unwrap();
     assert_eq!(reopened.position(), trimmed.state().position());
     assert_eq!(
         reopened.command_history(),
@@ -418,48 +440,37 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     assert_eq!(reopened.window(), window);
     assert_eq!(reopened.reconcile_append(&append), Ok(original));
 
-    let marker = |nonce| {
-        request(
-            reader,
-            Command::Barrier {
-                grant: second_grant,
-                nonce,
-            },
-        )
-    };
-    let spent = group
-        .choose(&peers, 20, marker(NonZeroU64::MIN))
-        .await
-        .unwrap();
-    assert_eq!(spent.receipt().outcome, Err(Refusal::Stale));
-
-    let pending = marker(NonZeroU64::new(3).unwrap());
-    let ahead = group.choose(&peers, 21, pending.clone()).await.unwrap();
-    assert_eq!(ahead.receipt().outcome, Err(Refusal::ReadPending));
-    let abandoned = group
+    // A refused read takes no state: there is nothing to abandon, and its
+    // exact reissue is decided afresh at a later position.
+    let deposed = request(
+        Principal::Worker(first_enrollment),
+        Command::Barrier { grant: first_grant },
+    );
+    let blocked = group.choose(&peers, 23, deposed.clone()).await.unwrap();
+    assert_eq!(blocked.receipt().outcome, Err(Refusal::Stale));
+    let again = group.choose(&peers, 24, deposed).await.unwrap();
+    assert_eq!(again.receipt().outcome, Err(Refusal::Stale));
+    assert!(again.receipt().position > blocked.receipt().position);
+    let admitted = group
         .choose(
             &peers,
-            22,
+            25,
             request(
                 reader,
-                Command::AbandonRead {
+                Command::Barrier {
                     grant: second_grant,
-                    nonce: NonZeroU64::new(2).unwrap(),
                 },
             ),
         )
         .await
         .unwrap();
-    assert_eq!(abandoned.receipt().outcome, Ok(Outcome::ReadAbandoned));
-    let admitted = group.choose(&peers, 23, pending).await.unwrap();
     let proof = admitted.barrier_claim().unwrap();
-    assert_eq!(proof.nonce().get(), 3);
     assert_eq!(proof.read().through, published.cut);
 
     let unsupported = group
         .choose(
             &peers,
-            24,
+            26,
             request(
                 worker,
                 Command::Publish {
@@ -479,7 +490,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     let funded = group
         .choose(
             &peers,
-            25,
+            27,
             request(
                 Principal::Custodian,
                 Command::FundWindow {
@@ -505,7 +516,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             payload: Bytes::from_static(b"after funding"),
         },
     );
-    let appended = group.choose(&peers, 26, newest.clone()).await.unwrap();
+    let appended = group.choose(&peers, 28, newest.clone()).await.unwrap();
     let Outcome::Appended(result) = appended.receipt().outcome.unwrap() else {
         panic!("the next funded allocation was refused");
     };

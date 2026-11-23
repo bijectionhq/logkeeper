@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
-const MAGIC: &[u8; 8] = b"LKAPPC06";
+const MAGIC: &[u8; 8] = b"LKAPPC07";
 const REPLAY_OVERHEAD: usize = 1 + 160 + 40 + 8;
 
 #[derive(Clone)]

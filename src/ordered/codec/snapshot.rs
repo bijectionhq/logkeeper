@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use crate::ordered::TrimResult;
 
-const MAGIC: &[u8; 8] = b"LKBASE03";
+const MAGIC: &[u8; 8] = b"LKBASE04";
 
 impl super::super::Limits {
     pub(in crate::ordered) fn base_control_bytes(self) -> Option<usize> {
@@ -46,7 +46,6 @@ impl State {
         }
         writer_state(&mut output, self.writer_state());
         output.put_u64(self.enrollment_serial);
-        output.put_u64(self.read_floor);
         window(&mut output, self.window);
         output.put_u64(self.spent);
         cut(&mut output, self.floor);
@@ -108,7 +107,6 @@ impl State {
         state.writer_epoch = writer.epoch;
         state.grant = writer.grant;
         state.enrollment_serial = input.u64()?;
-        state.read_floor = input.u64()?;
         state.window = input.window()?;
         state.spent = input.u64()?;
         state.floor = input.cut()?;
@@ -400,7 +398,6 @@ impl State {
                 || position > self.position
                 || position >= id.expires_at
                 || id.expires_at - position > self.limits.retry_positions
-                || outcome == Err(Refusal::ReadPending)
                 || self
                     .outcomes
                     .last_key_value()
@@ -505,7 +502,6 @@ impl Input {
             3 => Outcome::Appended(self.append_result()?),
             4 => Outcome::Barrier {
                 grant: self.grant()?,
-                nonce: self.nonce()?,
                 read: self.hold()?,
             },
             5 => Outcome::Published(self.checkpoint()?),
@@ -517,7 +513,6 @@ impl Input {
                 ordinary_bytes: self.u64()?,
                 maintenance_bytes: self.u64()?,
             }),
-            9 => Outcome::ReadAbandoned,
             10 => Outcome::WindowFunded(self.window()?),
             11 => Outcome::Vacated,
             12 => Outcome::CohortSealed(self.take()?),
@@ -533,7 +528,6 @@ impl Input {
             37 => return Ok(Err(Refusal::Expired)),
             38 => return Ok(Err(Refusal::Capacity)),
             39 => return Ok(Err(Refusal::Unavailable)),
-            40 => return Ok(Err(Refusal::ReadPending)),
             41 => return Ok(Err(Refusal::CohortSealed)),
             _ => return Err(Refusal::Invalid),
         }))
@@ -581,12 +575,10 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
         }
         Ok(Outcome::Barrier {
             grant: writer,
-            nonce,
             read,
         }) => {
             output.put_u8(4);
             grant(output, writer);
-            output.put_u64(nonce.get());
             hold_row(output, read);
         }
         Ok(Outcome::Published(published)) => {
@@ -605,7 +597,6 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
             output.put_u64(result.ordinary_bytes);
             output.put_u64(result.maintenance_bytes);
         }
-        Ok(Outcome::ReadAbandoned) => output.put_u8(9),
         Ok(Outcome::WindowFunded(allocation)) => {
             output.put_u8(10);
             window(output, allocation);
@@ -640,7 +631,6 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
             Refusal::Expired => 37,
             Refusal::Capacity => 38,
             Refusal::Unavailable => 39,
-            Refusal::ReadPending => 40,
             Refusal::CohortSealed => 41,
         }),
     }
