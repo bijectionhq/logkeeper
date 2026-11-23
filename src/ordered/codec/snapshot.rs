@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use crate::ordered::TrimResult;
 
-const MAGIC: &[u8; 8] = b"LKBASE05";
+const MAGIC: &[u8; 8] = b"LKBASE06";
 const REFERENCED_PAYLOAD: u64 = 1 << 63;
 
 impl super::super::Limits {
@@ -58,6 +58,7 @@ impl State {
         window(&mut output, self.window);
         output.put_u64(self.spent);
         cut(&mut output, self.floor);
+        output.put_u64(self.erasure_floor);
         cut(&mut output, self.head);
         checkpoint(&mut output, self.checkpoint);
         output.put_u8(u8::from(self.preparing.is_some()));
@@ -137,6 +138,7 @@ impl State {
         state.window = input.window()?;
         state.spent = input.u64()?;
         state.floor = input.cut()?;
+        state.erasure_floor = input.u64()?;
         state.head = input.cut()?;
         state.checkpoint = input.checkpoint()?;
         state.preparing = input.optional(Input::checkpoint_preparation)?;
@@ -153,6 +155,7 @@ impl State {
                 || checkpoint.custody.provider == [0; 32]
                 || checkpoint.manifest == [0; 32]
                 || checkpoint.cut.next_lsn >= state.checkpoint.cut.next_lsn
+                || (!closed && checkpoint.cut.next_lsn < state.erasure_floor)
                 || state
                     .old_roots
                     .insert(
@@ -175,6 +178,7 @@ impl State {
             || (state.window.serial == 1 && state.window != initial.window)
             || state.spent > state.window.bytes
             || state.floor.next_lsn > state.checkpoint.cut.next_lsn
+            || state.erasure_floor > state.checkpoint.cut.next_lsn
             || state.checkpoint.cut.next_lsn > state.head.next_lsn
             || state.checkpoint.custody.allocation.is_nil()
             || state.checkpoint.custody.revision == 0
@@ -194,7 +198,7 @@ impl State {
         if state
             .holds
             .values()
-            .any(|entry| !state.checkpoint_open(entry.hold.checkpoint))
+            .any(|entry| !state.checkpoint_retained(entry.hold.checkpoint))
             || state.preparing.is_some_and(|item| {
                 item.checkpoint.next_lsn <= state.checkpoint.cut.next_lsn
                     || state.cut(item.checkpoint.next_lsn) != Some(item.checkpoint)

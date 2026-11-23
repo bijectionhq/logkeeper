@@ -170,6 +170,7 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
         },
     };
     let preparation = CheckpointPreparation {
+        erasure: false,
         checkpoint: checkpoint.cut,
         root: checkpoint.root,
         source: successor,
@@ -566,6 +567,7 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
         },
     };
     let preparation = CheckpointPreparation {
+        erasure: false,
         checkpoint: checkpoint.cut,
         root: checkpoint.root,
         source: writer,
@@ -848,6 +850,7 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
         },
     };
     let preparation = CheckpointPreparation {
+        erasure: false,
         checkpoint: checkpoint.cut,
         root: checkpoint.root,
         source: new_grant,
@@ -1050,16 +1053,17 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
             provider: [4; 32],
         },
     };
-    let rotate = Command::RotateKey {
+    let rotate = Command::PublishAndRotate {
         grant: old,
         checkpoint,
     };
     assert_eq!(
         apply(&mut state, worker, rotate.clone()).outcome,
-        Err(Refusal::Stale)
+        Err(Refusal::Unauthorized)
     );
 
     let preparation = CheckpointPreparation {
+        erasure: true,
         checkpoint: checkpoint.cut,
         root: checkpoint.root,
         source: old,
@@ -1069,6 +1073,10 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
         descriptor: [5; 32],
     };
     let custodian = Principal::Custodian;
+    assert_eq!(
+        apply(&mut state, custodian, rotate.clone()).outcome,
+        Err(Refusal::Unavailable)
+    );
     assert_eq!(
         apply(
             &mut state,
@@ -1083,7 +1091,7 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     );
     assert_eq!(
         apply(&mut state, custodian, Command::Publish { checkpoint }).outcome,
-        Ok(Outcome::Published(checkpoint))
+        Err(Refusal::Conflict)
     );
     assert_eq!(
         apply(&mut state, Principal::RouteReader, rotate.clone()).outcome,
@@ -1095,13 +1103,15 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
         Ok(Outcome::Appended(_))
     ));
     assert_eq!(
-        apply(&mut advanced, worker, rotate.clone()).outcome,
+        apply(&mut advanced, custodian, rotate.clone()).outcome,
         Err(Refusal::Stale)
     );
 
+    assert_eq!(advanced.checkpoint(), initial.checkpoint());
+
     let request = Request {
         placement: state.placement(),
-        principal: worker,
+        principal: custodian,
         id: RequestId::fresh(state.position(), state.limits.retry_positions).unwrap(),
         command: rotate,
     };
@@ -1140,6 +1150,21 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
             key_generation: 2
         }
     );
+    assert_eq!(state.checkpoint(), checkpoint);
+    assert_eq!(state.erasure_floor(), checkpoint.cut.next_lsn);
+    assert_eq!(
+        apply(
+            &mut state,
+            worker,
+            Command::ProtectRange {
+                grant: new,
+                from: 0,
+                through: checkpoint.cut.next_lsn,
+            }
+        )
+        .outcome,
+        Err(Refusal::Unavailable)
+    );
     assert_eq!(recovery.checkpoint, checkpoint);
     assert_eq!(
         (recovery.start, recovery.through),
@@ -1169,6 +1194,7 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     ));
     let mut recovered = State::decode_base(&initial, image.clone()).unwrap();
     assert_eq!(recovered.encode_base(), image);
+    assert_eq!(recovered.erasure_floor(), checkpoint.cut.next_lsn);
     let held = recovered.held_replay(worker, read).unwrap();
     assert_eq!(
         held.records()
@@ -1278,6 +1304,7 @@ fn exact_withdrawal_orders_against_the_retained_tail_preparation_and_held_root()
     };
     let prepare = |state: &mut State, checkpoint: Checkpoint, names| {
         let preparation = CheckpointPreparation {
+            erasure: false,
             checkpoint: checkpoint.cut,
             root: checkpoint.root,
             source: writer,

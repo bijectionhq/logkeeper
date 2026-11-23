@@ -505,6 +505,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     };
     let worker = Principal::Worker(second_enrollment);
     let preparation = CheckpointPreparation {
+        erasure: false,
         checkpoint: published.cut,
         root: published.root,
         source: second_grant,

@@ -124,6 +124,7 @@ pub struct Checkpoint {
 /// The source descriptor belongs to the database adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointPreparation {
+    pub erasure: bool,
     pub checkpoint: Cut,
     pub root: Fingerprint,
     pub source: Grant,
@@ -227,8 +228,9 @@ pub enum Command {
         expected: WriterState,
         candidate: Enrollment,
     },
-    /// Advance the payload key generation at the selected checkpoint's exact cut.
-    RotateKey {
+    /// Select the prepared clean checkpoint, fence old admissions, and install
+    /// its successor key generation in one custody decision.
+    PublishAndRotate {
         grant: Grant,
         checkpoint: Checkpoint,
     },
@@ -542,6 +544,7 @@ pub struct State {
     retained_bytes: u64,
     maintenance_retained: u64,
     floor: Cut,
+    erasure_floor: u64,
     head: Cut,
     checkpoint: Checkpoint,
     preparing: Option<CheckpointPreparation>,
@@ -609,6 +612,7 @@ impl State {
             retained_bytes: 0,
             maintenance_retained: 0,
             floor: checkpoint.cut,
+            erasure_floor: checkpoint.cut.next_lsn,
             head: checkpoint.cut,
             checkpoint,
             preparing: None,
@@ -651,6 +655,9 @@ impl State {
     }
     pub fn floor(&self) -> Cut {
         self.floor
+    }
+    pub fn erasure_floor(&self) -> u64 {
+        self.erasure_floor
     }
     pub fn checkpoint(&self) -> Checkpoint {
         self.checkpoint
@@ -864,6 +871,17 @@ impl State {
         enrollment: Enrollment,
         key_generation: u64,
     ) -> Result<Outcome, Refusal> {
+        self.install_grant_at(principal, id, enrollment, key_generation, self.checkpoint)
+    }
+
+    fn install_grant_at(
+        &mut self,
+        principal: Principal,
+        id: RequestId,
+        enrollment: Enrollment,
+        key_generation: u64,
+        checkpoint: Checkpoint,
+    ) -> Result<Outcome, Refusal> {
         let epoch = self.writer_epoch.checked_add(1).ok_or(Refusal::Capacity)?;
         let grant = Grant {
             enrollment,
@@ -874,8 +892,8 @@ impl State {
             principal,
             id,
             enrollment,
-            self.checkpoint,
-            self.checkpoint.cut,
+            checkpoint,
+            checkpoint.cut,
             self.head,
             HoldKind::Recovery,
         )?;
@@ -883,6 +901,43 @@ impl State {
         self.key_generation = key_generation;
         self.grant = Some(grant);
         Ok(Outcome::Granted { grant, recovery })
+    }
+
+    fn prepared_checkpoint(
+        &self,
+        checkpoint: Checkpoint,
+    ) -> Result<CheckpointPreparation, Refusal> {
+        let pending = self.preparing.ok_or(Refusal::Unavailable)?;
+        if pending.checkpoint != checkpoint.cut
+            || pending.root != checkpoint.root
+            || pending.custody != checkpoint.custody
+            || checkpoint.manifest == [0; 32]
+            || self.cut(checkpoint.cut.next_lsn) != Some(checkpoint.cut)
+        {
+            return Err(Refusal::Conflict);
+        }
+        Ok(pending)
+    }
+
+    fn publish_checkpoint(&mut self, checkpoint: Checkpoint, closes_history: bool) {
+        if self.checkpoint.manifest != [0; 32] {
+            let old = self.checkpoint;
+            self.old_roots.insert(
+                old.custody.revision,
+                RetainedCheckpoint {
+                    checkpoint: old,
+                    closed: closes_history,
+                },
+            );
+        }
+        if closes_history {
+            self.erasure_floor = checkpoint.cut.next_lsn;
+            for entry in self.old_roots.values_mut() {
+                entry.closed = true;
+            }
+        }
+        self.preparing = None;
+        self.checkpoint = checkpoint;
     }
 
     fn cut(&self, next_lsn: u64) -> Option<Cut> {
@@ -911,7 +966,8 @@ impl State {
         start: Cut,
         through: Cut,
     ) -> Result<Hold, Refusal> {
-        if through.next_lsn < start.next_lsn
+        if start.next_lsn < self.erasure_floor
+            || through.next_lsn < start.next_lsn
             || self.cut(start.next_lsn) != Some(start)
             || self.cut(through.next_lsn) != Some(through)
         {
@@ -1033,19 +1089,26 @@ impl State {
                 }
                 self.install_grant(principal, id, candidate, self.key_generation)
             }
-            Command::RotateKey { grant, checkpoint } => {
-                self.writer(principal, grant)?;
-                if self.checkpoint != checkpoint || self.head != checkpoint.cut {
+            Command::PublishAndRotate { grant, checkpoint } => {
+                Self::custodian(principal)?;
+                if self.grant != Some(grant)
+                    || self.head != checkpoint.cut
+                    || self.checkpoint == checkpoint
+                {
                     return Err(Refusal::Stale);
                 }
-                if checkpoint.manifest == [0; 32] {
-                    return Err(Refusal::Invalid);
+                let pending = self.prepared_checkpoint(checkpoint)?;
+                if !pending.erasure || pending.source != grant || pending.base != self.checkpoint {
+                    return Err(Refusal::Stale);
                 }
                 let next = grant
                     .key_generation
                     .checked_add(1)
                     .ok_or(Refusal::Capacity)?;
-                self.install_grant(principal, id, grant.enrollment, next)
+                let outcome =
+                    self.install_grant_at(principal, id, grant.enrollment, next, checkpoint)?;
+                self.publish_checkpoint(checkpoint, true);
+                Ok(outcome)
             }
             Command::Append {
                 class,
@@ -1154,6 +1217,10 @@ impl State {
                     || preparation.usable_bytes == 0
                     || preparation.root == [0; 32]
                     || !self.checkpoint_open(preparation.base)
+                    || (preparation.erasure
+                        && (self.grant != Some(preparation.source)
+                            || preparation.base != self.checkpoint
+                            || preparation.checkpoint != self.head))
                 {
                     return Err(Refusal::Invalid);
                 }
@@ -1174,27 +1241,10 @@ impl State {
                 if checkpoint == self.checkpoint {
                     return Ok(Outcome::Published(checkpoint));
                 }
-                let pending = self.preparing.ok_or(Refusal::Unavailable)?;
-                if pending.checkpoint != checkpoint.cut
-                    || pending.root != checkpoint.root
-                    || pending.custody != checkpoint.custody
-                    || checkpoint.manifest == [0; 32]
-                    || self.cut(checkpoint.cut.next_lsn) != Some(checkpoint.cut)
-                {
+                if self.prepared_checkpoint(checkpoint)?.erasure {
                     return Err(Refusal::Conflict);
                 }
-                if self.checkpoint.manifest != [0; 32] {
-                    let old = self.checkpoint;
-                    self.old_roots.insert(
-                        old.custody.revision,
-                        RetainedCheckpoint {
-                            checkpoint: old,
-                            closed: false,
-                        },
-                    );
-                }
-                self.preparing = None;
-                self.checkpoint = checkpoint;
+                self.publish_checkpoint(checkpoint, false);
                 Ok(Outcome::Published(checkpoint))
             }
             Command::CloseCheckpoint { checkpoint } => {
@@ -1233,6 +1283,16 @@ impl State {
                         .is_none_or(|entry| entry.checkpoint != checkpoint || !entry.closed)
                 {
                     return Err(Refusal::Stale);
+                }
+                if self
+                    .preparing
+                    .is_some_and(|pending| pending.base == checkpoint)
+                    || self
+                        .holds
+                        .values()
+                        .any(|entry| entry.hold.checkpoint == checkpoint)
+                {
+                    return Err(Refusal::Unavailable);
                 }
                 self.old_roots.remove(&checkpoint.custody.revision);
                 self.root_references.remove(&checkpoint.custody.revision);
@@ -1337,6 +1397,9 @@ impl State {
                     .get(&source.id)
                     .is_none_or(|entry| entry.hold != source || entry.kind != HoldKind::Recovery)
                 {
+                    return Err(Refusal::Unavailable);
+                }
+                if !self.checkpoint_open(source.checkpoint) {
                     return Err(Refusal::Unavailable);
                 }
                 let kind = HoldKind::Root(source.id);
@@ -1609,12 +1672,12 @@ impl State {
         });
     }
 
-    fn checkpoint_open(&self, checkpoint: Checkpoint) -> bool {
+    fn checkpoint_retained(&self, checkpoint: Checkpoint) -> bool {
         checkpoint == self.checkpoint
             || self
                 .old_roots
                 .get(&checkpoint.custody.revision)
-                .is_some_and(|entry| !entry.closed && entry.checkpoint == checkpoint)
+                .is_some_and(|entry| entry.checkpoint == checkpoint)
             || (checkpoint.manifest == [0; 32]
                 && checkpoint.root == [0; 32]
                 && checkpoint.cut.next_lsn == 0
@@ -1624,6 +1687,15 @@ impl State {
                     .holds
                     .values()
                     .any(|entry| entry.hold.checkpoint == checkpoint))
+    }
+
+    fn checkpoint_open(&self, checkpoint: Checkpoint) -> bool {
+        checkpoint.cut.next_lsn >= self.erasure_floor
+            && self.checkpoint_retained(checkpoint)
+            && !self
+                .old_roots
+                .get(&checkpoint.custody.revision)
+                .is_some_and(|entry| entry.closed)
     }
 
     fn next_checkpoint_retirement(&self) -> Option<RetainedCheckpoint> {

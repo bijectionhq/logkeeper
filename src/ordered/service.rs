@@ -45,6 +45,7 @@ pub struct Route {
     pub last_data: Option<Cut>,
     pub last_maintenance: Option<Cut>,
     pub floor: Cut,
+    pub erasure_floor: u64,
     pub checkpoint: Checkpoint,
     pub preparing: Option<CheckpointPreparation>,
     pub retirement: Option<RetainedCheckpoint>,
@@ -186,6 +187,7 @@ impl<R: Replica> Coordinator<R> {
                 .find(|record| record.result.class == super::AppendClass::Maintenance)
                 .map(|record| record.result.cut),
             floor: state.floor(),
+            erasure_floor: state.erasure_floor(),
             checkpoint: state.checkpoint(),
             preparing: state.preparing,
             retirement: (session.principal == Principal::Custodian)
@@ -229,10 +231,18 @@ impl<R: Replica> Coordinator<R> {
         {
             return Err(Refusal::CohortSealed.into());
         }
+        let receipt = chosen.receipt();
+        let rotation = chosen.rotation_slots(&request);
+        if matches!(request.command, Command::PublishAndRotate { .. })
+            && receipt.outcome.is_ok()
+            && rotation.is_none()
+        {
+            return Err(Refusal::Unavailable.into());
+        }
         Ok(Decision {
-            receipt: chosen.receipt(),
+            receipt,
             barrier: chosen.barrier_claim(),
-            rotation: chosen.rotation_slots(&request),
+            rotation,
         })
     }
 

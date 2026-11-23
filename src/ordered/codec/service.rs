@@ -153,6 +153,7 @@ impl Reply {
                     cut(&mut output, chosen);
                 }
                 cut(&mut output, route.floor);
+                output.put_u64(route.erasure_floor);
                 checkpoint(&mut output, route.checkpoint);
                 output.put_u8(u8::from(route.preparing.is_some()));
                 if let Some(item) = route.preparing {
@@ -254,6 +255,7 @@ impl Reply {
                 last_data: input.optional(Input::cut)?,
                 last_maintenance: input.optional(Input::cut)?,
                 floor: input.cut()?,
+                erasure_floor: input.u64()?,
                 checkpoint: input.checkpoint()?,
                 preparing: input.optional(Input::checkpoint_preparation)?,
                 retirement: input.optional(|input| {

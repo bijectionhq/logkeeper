@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use uuid::Uuid;
 
-const MAGIC: &[u8; 8] = b"LKORPC03";
+const MAGIC: &[u8; 8] = b"LKORPC04";
 const PREPARE: u8 = 1;
 const ACCEPT: u8 = 2;
 const PROMISE: u8 = 3;
@@ -140,16 +140,22 @@ impl<C: Connector> Replica for RemoteVoter<C> {
         group: Fingerprint,
         ballot: Ballot,
         prefix: &Prefix,
+        read_back: bool,
     ) -> Result<Vote, Error> {
         if prefix.bytes > self.max_prefix_bytes {
             return Err(Error::Capacity);
         }
         timeout(self.deadline, async {
             let mut channel = self.open(group, ACCEPT, ballot).await?;
+            channel.write_u8(u8::from(read_back)).await?;
             write_prefix(&mut channel, prefix).await?;
             channel.flush().await?;
             self.response(&mut channel, VOTE, ballot).await?;
             let digest = read_array(&mut channel).await?;
+            let witnessed = channel.read_u8().await?;
+            if witnessed != u8::from(read_back) {
+                return Err(Error::Prefix);
+            }
             let selected = channel.read_u8().await?;
             let mut read_image = async || -> Result<SlotImage, Error> {
                 Ok(SlotImage {
@@ -166,6 +172,7 @@ impl<C: Connector> Replica for RemoteVoter<C> {
                 ballot,
                 digest,
                 slots,
+                read_back,
             })
         })
         .await
@@ -204,11 +211,17 @@ pub async fn serve_voter(
                 Err(error) => refuse(&mut channel, voter.identity(), ballot, error).await?,
             },
             ACCEPT => {
+                let read_back = match channel.read_u8().await? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::Prefix),
+                };
                 let prefix = read_prefix(&mut channel, voter.max_prefix_bytes()).await?;
-                match voter.accept(group, ballot, &prefix).await {
+                match voter.accept(group, ballot, &prefix, read_back).await {
                     Ok(vote) => {
                         response_header(&mut channel, VOTE, vote.voter, ballot).await?;
                         channel.write_all(&vote.digest).await?;
+                        channel.write_u8(u8::from(vote.read_back)).await?;
                         channel.write_u8(vote.slots.selected).await?;
                         for image in vote.slots.images {
                             channel.write_u64(image.generation).await?;

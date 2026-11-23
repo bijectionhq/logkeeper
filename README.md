@@ -58,13 +58,13 @@ Initialize provisions a fresh voter directory once.
 Serve recovers only installed directories and accepts mutual TLS 1.3 using the endpoint certificate pins and roles in the installed manifest.
 Peer certificates used for voter traffic have no worker or custodian role in that group.
 Application clients retain the installed route and receipt verification keys independently of the serving daemon.
-Application wire version 10 (`LKAPPC10`) adds signed rotation slot evidence and retains the custodian-only withdrawn hold owner query.
+Application wire version 12 (`LKAPPC12`) carries the erasure replay floor and requires signed slot evidence on a successful erasure switch. The withdrawn hold owner query remains restricted to the custodian.
 Each page contains at most 64 distinct enrollments in enrollment order and fits the configured application frame.
 Pass the last enrollment as a cursor to continue.
 Each page reflects its own selected state and gives the journal-time threshold for expiry disposal.
-Voter wire version 3 (`LKORPC03`) carries both durable image identities in every accept reply.
+Voter wire version 4 (`LKORPC04`) carries both durable image identities and confirms explicit readback on an erasure accept.
 Update the voter cohort and application clients together before using rotation evidence.
-The ordered command and compact recovery image formats are unchanged.
+Provision fresh voter media and compact recovery images with this protocol.
 Keep every previously trusted barrier receipt public key for the lifetime of the logical placement, including its incarnation and generation.
 Rotate signers through a cohort successor and distribute the updated trusted `ApplicationRoute.verification_keys` to clients before using its new signers.
 Set `predecessor_keys` from the immediate predecessor's active voter roster and carry older public keys in `retained_barrier_keys`.
@@ -89,8 +89,9 @@ A repair reserves media with `reserve-repair`, orders the exact successor with `
 The predecessor serves no fresh commands after choosing its seal.
 The successor installs the exact sealed state in both slots before voting and preserves the original writer, retained receipts, checkpoint holds and paid append cursor.
 
-A successful `RotateKey` can return signed evidence of a strict accepting majority at the exact clean checkpoint and successor suffix generation.
-Each named voter reports its selected and alternate physical slot, generation and digest for the same acknowledged prefix.
+A custodian orders `PublishAndRotate` against the exact incumbent, head and erasure preparation. One decision selects the clean checkpoint, commits the successor payload key generation and closes new holds on the preceding roots and replay range. Existing hold owners retain access until their holds end.
+The command returns signed evidence of a strict accepting majority at the clean checkpoint and successor suffix generation.
+Each named voter reads both durable slots after the mirrored write and checks the accepted ballot, prefix and image identities before acknowledgement.
 The coordinator obtains those records over authenticated voter channels and signs the rotation receipt and slot evidence together.
 The installed client verifies the signature and the cohort it contacted.
 Other voters can still hold stale local images, and every eligible recovery majority intersects the acknowledging majority.

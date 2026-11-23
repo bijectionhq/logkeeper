@@ -128,6 +128,7 @@ pub struct Vote {
     pub ballot: Ballot,
     pub digest: Fingerprint,
     pub slots: SlotPair,
+    pub read_back: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -225,7 +226,7 @@ impl Chosen {
     /// A retained rotation can be attested again while the recovered head
     /// still serves from its exact clean checkpoint and generation.
     pub(in crate::ordered) fn rotation_slots(&self, request: &Request) -> Option<RotationSlots> {
-        let Command::RotateKey { grant, checkpoint } = request.command else {
+        let Command::PublishAndRotate { grant, checkpoint } = request.command else {
             return None;
         };
         if request.placement != self.receipt.placement
@@ -320,7 +321,7 @@ impl Group {
         initial.object_control_bytes =
             ((max_prefix_bytes - minimum) / 2).min(super::MAX_OBJECT_CONTROL_BYTES);
         let mut hash = Sha256::new();
-        hash.update(b"logkeeper.ordered-group.v4");
+        hash.update(b"logkeeper.ordered-group.v5");
         hash.update(placement.deployment.as_bytes());
         hash.update(placement.incarnation.as_bytes());
         hash.update(placement.group.as_bytes());
@@ -572,6 +573,7 @@ pub trait Replica: Sync {
         group: Fingerprint,
         ballot: Ballot,
         prefix: &Prefix,
+        read_back: bool,
     ) -> impl Future<Output = Result<Vote, Error>> + Send;
 }
 
@@ -590,7 +592,8 @@ impl Group {
         let state = self.replay(&prefix)?;
         if !prefix.is_empty() {
             let digest = prefix.identity(self.identity);
-            self.confirm(peers, prepared, &prefix, digest).await?;
+            self.confirm(peers, prepared, &prefix, digest, false)
+                .await?;
         }
         Ok(state)
     }
@@ -607,7 +610,8 @@ impl Group {
                 prefix = base;
             }
             let digest = prefix.identity(self.identity);
-            self.confirm(peers, prepared, &prefix, digest).await?;
+            self.confirm(peers, prepared, &prefix, digest, false)
+                .await?;
         }
         Ok(())
     }
@@ -647,6 +651,7 @@ impl Group {
         time: Option<u64>,
         request: Request,
     ) -> Result<Chosen, Error> {
+        let read_back = matches!(request.command, Command::PublishAndRotate { .. });
         if request.placement != self.initial.placement() {
             return Err(Error::Group);
         }
@@ -684,7 +689,9 @@ impl Group {
         };
         let ballot = prepared.ballot;
         let digest = prefix.identity(self.identity);
-        let images = self.confirm(peers, prepared, &prefix, digest).await?;
+        let images = self
+            .confirm(peers, prepared, &prefix, digest, read_back)
+            .await?;
         Ok(Chosen {
             group: self.identity,
             cohort_size: self.voters.len(),
@@ -766,6 +773,7 @@ impl Group {
         prepared: PreparedRound,
         prefix: &Prefix,
         digest: Fingerprint,
+        read_back: bool,
     ) -> Result<Vec<VoterSlots>, Error> {
         let PreparedRound {
             ballot,
@@ -778,7 +786,7 @@ impl Group {
             .map(|peer| async move {
                 (
                     peer.identity(),
-                    peer.accept(self.identity, ballot, prefix).await,
+                    peer.accept(self.identity, ballot, prefix, read_back).await,
                 )
             })
             .collect();
@@ -789,7 +797,8 @@ impl Group {
                     if vote.voter == expected
                         && vote.ballot == ballot
                         && vote.digest == digest
-                        && vote.slots.is_mirrored() =>
+                        && vote.slots.is_mirrored()
+                        && vote.read_back == read_back =>
                 {
                     voters.push(VoterSlots {
                         voter: expected,

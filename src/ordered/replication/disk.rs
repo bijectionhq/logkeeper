@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
-const MAGIC: &[u8; 8] = b"LKORV004";
+const MAGIC: &[u8; 8] = b"LKORV005";
 const SLOTS: [&str; 2] = ["ordered.slot-a", "ordered.slot-b"];
 const LOCK: &str = "ordered.lock";
 const RESERVATION: &str = "ordered.reserve";
@@ -312,7 +312,7 @@ fn recover_media(
     for (index, file) in slots.iter_mut().enumerate() {
         let (written, candidate) = recover_slot(file, index, group, identity, size)?;
         used[index] = written;
-        if let Some(candidate) = candidate {
+        if let Some((candidate, _)) = candidate {
             if recovered
                 .as_ref()
                 .is_some_and(|chosen| chosen.generation == candidate.generation)
@@ -347,10 +347,11 @@ impl Replica for DurableVoter {
         group: Fingerprint,
         ballot: Ballot,
         prefix: &Prefix,
+        read_back: bool,
     ) -> Result<Vote, Error> {
         let inner = Arc::clone(&self.inner);
         let prefix = prefix.clone();
-        tokio::task::spawn_blocking(move || inner.accept(group, ballot, prefix))
+        tokio::task::spawn_blocking(move || inner.accept(group, ballot, prefix, read_back))
             .await
             .map_err(|_| Error::Stopped)?
     }
@@ -386,7 +387,13 @@ impl Inner {
         })
     }
 
-    fn accept(&self, group: Fingerprint, ballot: Ballot, prefix: Prefix) -> Result<Vote, Error> {
+    fn accept(
+        &self,
+        group: Fingerprint,
+        ballot: Ballot,
+        prefix: Prefix,
+        read_back: bool,
+    ) -> Result<Vote, Error> {
         self.check(group, ballot)?;
         if prefix.is_empty() {
             return Err(Error::Prefix);
@@ -414,12 +421,46 @@ impl Inner {
                 accepted: Some(Accepted { ballot, prefix }),
             },
         )?;
+        if read_back {
+            if let Err(error) = self.read_back(&mut media, ballot, digest, slots) {
+                media.selected = None;
+                return Err(error);
+            }
+        }
         Ok(Vote {
             voter: self.identity,
             ballot,
             digest,
             slots,
+            read_back,
         })
+    }
+
+    fn read_back(
+        &self,
+        media: &mut Media,
+        ballot: Ballot,
+        digest: Fingerprint,
+        slots: SlotPair,
+    ) -> Result<(), Error> {
+        let size = slot_size(&self.group)?;
+        for (index, file) in media.slots.iter_mut().enumerate() {
+            file.seek(SeekFrom::Start(0))?;
+            let (_, image) = recover_slot(file, index, &self.group, self.identity, size)?;
+            let (image, observed) = image.ok_or(Error::Prefix)?;
+            let accepted = image.state.accepted.ok_or(Error::Prefix)?;
+            if (SlotImage {
+                generation: image.generation,
+                digest: observed,
+            }) != slots.images[index]
+                || image.state.promised != Some(ballot)
+                || accepted.ballot != ballot
+                || accepted.prefix.identity(self.group.identity) != digest
+            {
+                return Err(Error::Prefix);
+            }
+        }
+        Ok(())
     }
 
     fn mirror(&self, media: &mut Media, next: VoterState) -> Result<SlotPair, Error> {
@@ -519,7 +560,7 @@ fn recover_slot(
     group: &Group,
     voter: Uuid,
     size: usize,
-) -> Result<(usize, Option<Selected>), Error> {
+) -> Result<(usize, Option<(Selected, Fingerprint)>), Error> {
     let mut header = [0; HEADER];
     file.read_exact(&mut header)?;
     let payload_limit = size - HEADER;
@@ -553,11 +594,14 @@ fn recover_slot(
     let state = load_state(group, Bytes::from(body))?;
     Ok((
         length,
-        Some(Selected {
-            index,
-            generation,
-            state,
-        }),
+        Some((
+            Selected {
+                index,
+                generation,
+                state,
+            },
+            header[split..].try_into().map_err(|_| Error::Prefix)?,
+        )),
     ))
 }
 
@@ -856,6 +900,7 @@ mod tests {
                     Principal::Custodian,
                     Command::PrepareCheckpoint {
                         preparation: CheckpointPreparation {
+                            erasure: true,
                             checkpoint: checkpoint.cut,
                             root: checkpoint.root,
                             source: grant,
@@ -874,19 +919,11 @@ mod tests {
             prepare.receipt().outcome,
             Ok(Outcome::CheckpointPrepared(_))
         ));
-        let publish = group
-            .choose(
-                &second,
-                5,
-                request(5, Principal::Custodian, Command::Publish { checkpoint }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            publish.receipt().outcome,
-            Ok(Outcome::Published(checkpoint))
+        let invocation = request(
+            6,
+            Principal::Custodian,
+            Command::PublishAndRotate { grant, checkpoint },
         );
-        let invocation = request(6, worker, Command::RotateKey { grant, checkpoint });
         let rotation = group.choose(&third, 6, invocation.clone()).await.unwrap();
         let evidence = rotation.rotation_slots(&invocation).unwrap();
         let witness = evidence

@@ -9,7 +9,7 @@ use uuid::Uuid;
 mod service;
 mod snapshot;
 
-const VERSION: u8 = 5;
+const VERSION: u8 = 6;
 const BARRIER_DOMAIN: &[u8; 8] = b"LKBRAR03";
 
 impl Request {
@@ -41,7 +41,7 @@ impl Request {
                 writer_state(&mut output, *expected);
                 enrollment(&mut output, *candidate);
             }
-            Command::RotateKey {
+            Command::PublishAndRotate {
                 grant: writer,
                 checkpoint: root,
             } => {
@@ -196,7 +196,7 @@ impl Request {
                 expected: input.writer_state()?,
                 candidate: input.enrollment()?,
             },
-            22 => Command::RotateKey {
+            22 => Command::PublishAndRotate {
                 grant: input.grant()?,
                 checkpoint: input.checkpoint()?,
             },
@@ -456,6 +456,11 @@ impl Input {
 
     fn checkpoint_preparation(&mut self) -> Result<CheckpointPreparation, Refusal> {
         Ok(CheckpointPreparation {
+            erasure: match self.read_byte()? {
+                0 => false,
+                1 => true,
+                _ => return Err(Refusal::Invalid),
+            },
             checkpoint: self.cut()?,
             root: self.take()?,
             source: self.grant()?,
@@ -565,6 +570,7 @@ fn cut(output: &mut BytesMut, value: Cut) {
 }
 
 fn checkpoint_preparation(output: &mut BytesMut, item: CheckpointPreparation) {
+    output.put_u8(u8::from(item.erasure));
     cut(output, item.checkpoint);
     output.put_slice(&item.root);
     grant(output, item.source);
