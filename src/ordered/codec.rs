@@ -114,6 +114,14 @@ impl Request {
                 output.put_u8(19);
                 request_id(&mut output, *read);
             }
+            Command::Lease { grant: writer } => {
+                output.put_u8(20);
+                grant(&mut output, *writer);
+            }
+            Command::DisposeExpired { enrollment: worker } => {
+                output.put_u8(21);
+                enrollment(&mut output, *worker);
+            }
             Command::ProtectRange {
                 grant: writer,
                 from,
@@ -189,6 +197,12 @@ impl Request {
             19 => Command::ReleaseRead {
                 read: input.request_id()?,
             },
+            20 => Command::Lease {
+                grant: input.grant()?,
+            },
+            21 => Command::DisposeExpired {
+                enrollment: input.enrollment()?,
+            },
             8 => Command::Trim {
                 selected: input.checkpoint()?,
                 through: input.cut()?,
@@ -237,6 +251,29 @@ impl Request {
             command,
         })
     }
+}
+
+/// The bytes of one chosen decision: the request stamped with the journal
+/// time its proposer assigned. The time is outside the request fingerprint,
+/// so an exact retry still matches its original receipt.
+pub(in crate::ordered) fn encode_decision(time: u64, request: &Request) -> Bytes {
+    let body = request.encode();
+    let mut output = BytesMut::with_capacity(body.len() + 8);
+    output.put_slice(&body[..1]);
+    output.put_u64(time);
+    output.put_slice(&body[1..]);
+    output.freeze()
+}
+
+pub(in crate::ordered) fn decode_decision(frame: Bytes) -> Result<(u64, Request), Refusal> {
+    if frame.len() < 9 || frame[0] != VERSION {
+        return Err(Refusal::Invalid);
+    }
+    let time = u64::from_be_bytes(frame[1..9].try_into().map_err(|_| Refusal::Invalid)?);
+    let mut body = BytesMut::with_capacity(frame.len() - 8);
+    body.put_slice(&frame[..1]);
+    body.put_slice(&frame[9..]);
+    Ok((time, Request::decode(body.freeze())?))
 }
 
 impl BarrierClaim {

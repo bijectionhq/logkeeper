@@ -25,8 +25,13 @@ impl super::super::Limits {
         let retries = usize::try_from(self.retry_positions).ok()?;
         let outcomes = retries.checked_add(hold_slots)?.checked_mul(448)?;
         let checkpoint_retention = self.replay_holds.checked_mul(161)?;
+        let leases = self
+            .enrolled_workers
+            .checked_add(hold_slots)?
+            .checked_mul(32)?;
         1024usize
             .checked_add(roster)?
+            .checked_add(leases)?
             .checked_add(holds)?
             .checked_add(checkpoint_retention)?
             .checked_add(outcomes)
@@ -38,6 +43,7 @@ impl State {
         let mut output = BytesMut::new();
         output.put_slice(MAGIC);
         output.put_u64(self.position);
+        output.put_u64(self.time);
         output.put_slice(&self.command_history);
         output.put_slice(&self.voter_scope);
         output.put_u8(u8::from(self.successor.is_some()));
@@ -90,6 +96,11 @@ impl State {
             output.put_u64(retained.receipt.position);
             result(&mut output, retained.receipt.outcome);
         }
+        output.put_u64(self.leases.len() as u64);
+        for (member, lease_end) in &self.leases {
+            enrollment(&mut output, *member);
+            output.put_u64(*lease_end);
+        }
         output.freeze()
     }
 
@@ -100,6 +111,7 @@ impl State {
         }
         let mut state = initial.clone();
         state.position = input.u64()?;
+        state.time = input.u64()?;
         state.command_history = input.take()?;
         state.voter_scope = input.take()?;
         state.successor = input.optional(|input| input.take())?;
@@ -182,10 +194,35 @@ impl State {
             return Err(Refusal::Invalid);
         }
         state.read_outcomes(&mut input)?;
+        state.read_leases(&mut input)?;
         if !input.0.is_empty() {
             return Err(Refusal::Invalid);
         }
         Ok(state)
+    }
+
+    fn read_leases(&mut self, input: &mut Input) -> Result<(), Refusal> {
+        let bound = self.limits.enrolled_workers + self.limits.replay_holds + ACTIVATION_HOLD_SLOTS;
+        for _ in 0..input.count(bound)? {
+            let member = input.enrollment()?;
+            let lease_end = input.u64()?;
+            let retained = self.roster.get(&member.worker) == Some(&member)
+                || self.holds.values().any(|entry| entry.hold.owner == member);
+            if member.serial == 0
+                || member.serial > self.enrollment_serial
+                || !retained
+                || lease_end < self.limits.serving_lease
+                || lease_end > self.time.saturating_add(self.limits.serving_lease)
+                || self
+                    .leases
+                    .last_key_value()
+                    .is_some_and(|(old, _)| *old >= member)
+            {
+                return Err(Refusal::Invalid);
+            }
+            self.leases.insert(member, lease_end);
+        }
+        Ok(())
     }
 
     fn read_roster(&mut self, input: &mut Input) -> Result<(), Refusal> {
@@ -520,6 +557,11 @@ impl Input {
             14 => Outcome::CheckpointClosed(self.checkpoint()?),
             15 => Outcome::CheckpointSettled(self.checkpoint()?),
             16 => Outcome::WorkerDisposed(self.enrollment()?),
+            17 => Outcome::Leased {
+                grant: self.grant()?,
+                issued_at: self.u64()?,
+                lease_end: self.u64()?,
+            },
             32 => return Ok(Err(Refusal::WrongPlacement)),
             33 => return Ok(Err(Refusal::Unauthorized)),
             34 => return Ok(Err(Refusal::Stale)),
@@ -621,6 +663,16 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
         Ok(Outcome::WorkerDisposed(worker)) => {
             output.put_u8(16);
             enrollment(output, worker);
+        }
+        Ok(Outcome::Leased {
+            grant: writer,
+            issued_at,
+            lease_end,
+        }) => {
+            output.put_u8(17);
+            grant(output, writer);
+            output.put_u64(issued_at);
+            output.put_u64(lease_end);
         }
         Err(refusal) => output.put_u8(match refusal {
             Refusal::WrongPlacement => 32,

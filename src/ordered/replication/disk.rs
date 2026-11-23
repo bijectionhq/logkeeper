@@ -602,6 +602,8 @@ mod tests {
                 retry_positions: 16,
                 retained_data_bytes: 4096,
                 maintenance_bytes: 1024,
+                serving_lease: 30_000,
+                clock_drift: 1_000,
             },
             Checkpoint {
                 cut: Cut {

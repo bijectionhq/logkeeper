@@ -159,6 +159,8 @@ pub enum Error {
     Stopped,
     #[error("the installed voter configuration was sealed for repair")]
     Sealed,
+    #[error("the proposed journal time precedes the chosen journal time")]
+    Time,
     #[error("ordered journal I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -232,6 +234,8 @@ impl Group {
         hash.update(limits.retry_positions.to_be_bytes());
         hash.update(limits.retained_data_bytes.to_be_bytes());
         hash.update(limits.maintenance_bytes.to_be_bytes());
+        hash.update(limits.serving_lease.to_be_bytes());
+        hash.update(limits.clock_drift.to_be_bytes());
         for voter in &roster {
             hash.update(voter.as_bytes());
         }
@@ -328,12 +332,15 @@ impl Group {
             None => return Err(Error::Prefix),
         };
         for frame in &prefix.frames {
-            let request = Request::decode(frame.clone()).map_err(|_| Error::Prefix)?;
+            let (time, request) =
+                super::codec::decode_decision(frame.clone()).map_err(|_| Error::Prefix)?;
             if request.placement != state.placement() {
                 return Err(Error::Group);
             }
             let position = state.position().checked_add(1).ok_or(Error::Capacity)?;
-            state.apply(position, request).map_err(|_| Error::Prefix)?;
+            state
+                .apply(position, time, request)
+                .map_err(|_| Error::Prefix)?;
         }
         Ok(state)
     }
@@ -493,10 +500,36 @@ impl Group {
     /// Orders one command or returns an uncertain outcome. An identical retry
     /// uses the original request identity and deadline. The caller increments
     /// its proposed round after receiving a newer durable promise.
+    ///
+    /// The decision is stamped with this proposer's wall clock in milliseconds
+    /// since the Unix epoch, raised to the chosen journal time if the clock is
+    /// behind it. See [`Limits::clock_drift`] for the clock premise.
     pub async fn choose<R: Replica>(
         &self,
         peers: &[R],
         round: u64,
+        request: Request,
+    ) -> Result<Chosen, Error> {
+        self.choose_stamped(peers, round, None, request).await
+    }
+
+    /// Orders one command at an explicit journal time. A time below the
+    /// chosen journal time is refused with [`Error::Time`].
+    pub async fn choose_at<R: Replica>(
+        &self,
+        peers: &[R],
+        round: u64,
+        time: u64,
+        request: Request,
+    ) -> Result<Chosen, Error> {
+        self.choose_stamped(peers, round, Some(time), request).await
+    }
+
+    async fn choose_stamped<R: Replica>(
+        &self,
+        peers: &[R],
+        round: u64,
+        time: Option<u64>,
         request: Request,
     ) -> Result<Chosen, Error> {
         if request.placement != self.initial.placement() {
@@ -512,9 +545,16 @@ impl Group {
             if state.successor.is_some() {
                 return Err(Error::Sealed);
             }
-            let frame = request.encode();
+            let time = match time {
+                Some(time) if time < state.time() => return Err(Error::Time),
+                Some(time) => time,
+                None => journal_clock().max(state.time()),
+            };
+            let frame = super::codec::encode_decision(time, &request);
             let position = state.position().checked_add(1).ok_or(Error::Capacity)?;
-            let receipt = state.apply(position, request).map_err(|_| Error::Prefix)?;
+            let receipt = state
+                .apply(position, time, request)
+                .map_err(|_| Error::Prefix)?;
             let appended = prefix.append(frame, self.max_prefix_bytes);
             if appended.is_err() || matches!(receipt.outcome, Ok(Outcome::Trimmed(_))) {
                 let compact = Prefix::from_base(state.encode_base(), self.max_prefix_bytes);
@@ -659,4 +699,13 @@ fn choose_base(winner: &mut Option<Accepted>, candidate: Accepted) -> Result<(),
     }
     *winner = Some(candidate);
     Ok(())
+}
+
+/// The proposer's wall clock in milliseconds since the Unix epoch.
+fn journal_clock() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }

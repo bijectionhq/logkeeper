@@ -5,6 +5,7 @@ fn apply(state: &mut State, principal: Principal, command: Command) -> Receipt {
     state
         .apply(
             state.position() + 1,
+            state.time(),
             Request {
                 id,
                 principal,
@@ -63,6 +64,8 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
             retry_positions: 64,
             retained_data_bytes: 5 * charge,
             maintenance_bytes: 4 * charge,
+            serving_lease: 30_000,
+            clock_drift: 1_000,
         },
         Checkpoint {
             cut: Cut {
@@ -101,7 +104,7 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
         },
     };
     let Some(original_receipt) = state
-        .apply(state.position() + 1, original.clone())
+        .apply(state.position() + 1, state.time(), original.clone())
         .unwrap()
         .outcome
         .ok()
@@ -279,6 +282,8 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
             retry_positions: 64,
             retained_data_bytes: 1 << 16,
             maintenance_bytes: 1 << 12,
+            serving_lease: 30_000,
+            clock_drift: 1_000,
         },
         Checkpoint {
             cut: Cut {
@@ -323,22 +328,29 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
             payload: Bytes::from_static(b"a"),
         },
     );
-    let appended = state.apply(next(&state), append.clone()).unwrap();
+    let appended = state
+        .apply(next(&state), state.time(), append.clone())
+        .unwrap();
     assert!(matches!(appended.outcome, Ok(Outcome::Appended(_))));
-    assert_eq!(state.apply(next(&state), append.clone()).unwrap(), appended);
+    assert_eq!(
+        state
+            .apply(next(&state), state.time(), append.clone())
+            .unwrap(),
+        appended
+    );
     assert_eq!(state.retained_receipt(&append), Some(appended));
     assert_eq!(state.head().next_lsn, 1);
 
     // Two identical read commands are two admissions with distinct holds.
     let barrier = Command::Barrier { grant: writer };
     let first = state
-        .apply(next(&state), request(&state, barrier.clone()))
+        .apply(next(&state), state.time(), request(&state, barrier.clone()))
         .unwrap();
     let Ok(Outcome::Barrier { read: early, .. }) = first.outcome else {
         panic!("first read refused: {first:?}");
     };
     let second = state
-        .apply(next(&state), request(&state, barrier.clone()))
+        .apply(next(&state), state.time(), request(&state, barrier.clone()))
         .unwrap();
     let Ok(Outcome::Barrier { read: late, .. }) = second.outcome else {
         panic!("second read refused: {second:?}");
@@ -357,7 +369,7 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
         command: barrier.clone(),
     };
     assert_eq!(state.retained_receipt(&reissue), None);
-    let refused = state.apply(next(&state), reissue).unwrap();
+    let refused = state.apply(next(&state), state.time(), reissue).unwrap();
     assert_eq!(refused.outcome, Err(Refusal::Conflict));
     assert_eq!(refused.position, state.position());
     assert_eq!(state.holds.len(), 3);
@@ -374,8 +386,16 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
             payload: Bytes::from_static(b"b"),
         },
     );
-    assert!(state.apply(next(&state), more).unwrap().outcome.is_ok());
-    let third = state.apply(next(&state), request(&state, barrier)).unwrap();
+    assert!(
+        state
+            .apply(next(&state), state.time(), more)
+            .unwrap()
+            .outcome
+            .is_ok()
+    );
+    let third = state
+        .apply(next(&state), state.time(), request(&state, barrier))
+        .unwrap();
     let Ok(Outcome::Barrier { read: latest, .. }) = third.outcome else {
         panic!("third read refused: {third:?}");
     };
@@ -402,6 +422,8 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
             retry_positions: 64,
             retained_data_bytes: 1 << 16,
             maintenance_bytes: 1 << 12,
+            serving_lease: 30_000,
+            clock_drift: 1_000,
         },
         Checkpoint {
             cut: Cut {
@@ -437,7 +459,7 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
             candidate: reader,
         },
     };
-    let granted = state.apply(state.position() + 1, grant_request.clone());
+    let granted = state.apply(state.position() + 1, state.time(), grant_request.clone());
     let Ok(Outcome::Granted {
         grant: writer,
         recovery,
@@ -452,7 +474,9 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
             principal,
             command,
         };
-        let receipt = state.apply(state.position() + 1, request.clone()).unwrap();
+        let receipt = state
+            .apply(state.position() + 1, state.time(), request.clone())
+            .unwrap();
         (request, receipt.outcome)
     };
     let release_read = |state: &mut State, principal, read| {
@@ -581,7 +605,9 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
     );
     assert!(state.holds.is_empty());
     // The released read's identity stays spent until its window closes.
-    let resent = state.apply(state.position() + 1, lost.clone()).unwrap();
+    let resent = state
+        .apply(state.position() + 1, state.time(), lost.clone())
+        .unwrap();
     assert_eq!(resent.outcome, Err(Refusal::Conflict));
     assert!(state.holds.is_empty());
     // Releasing again, or an unknown read, is already done.
@@ -630,4 +656,288 @@ fn a_reader_that_lost_the_reply_releases_its_read_by_identity() {
             .encode_base(),
         image
     );
+}
+
+#[test]
+fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
+    let initial = State::new(
+        Placement {
+            deployment: Uuid::new_v4(),
+            incarnation: Uuid::new_v4(),
+            group: Uuid::new_v4(),
+            generation: 1,
+        },
+        Limits {
+            enrolled_workers: 2,
+            replay_holds: 4,
+            retry_positions: 64,
+            retained_data_bytes: 1 << 16,
+            maintenance_bytes: 1 << 12,
+            serving_lease: 1_000,
+            clock_drift: 100,
+        },
+        Checkpoint {
+            cut: Cut {
+                next_lsn: 0,
+                history: [1; 32],
+            },
+            root: [0; 32],
+            manifest: [0; 32],
+            custody: Custody {
+                allocation: Uuid::new_v4(),
+                revision: 1,
+                provider: [0; 32],
+            },
+        },
+        Window {
+            allocation: Uuid::new_v4(),
+            serial: 1,
+            bytes: 1 << 12,
+        },
+    )
+    .unwrap();
+    let mut state = initial.clone();
+    let at = |state: &mut State, time: u64, principal, command| {
+        let request = Request {
+            id: RequestId::fresh(state.position(), state.limits.retry_positions).unwrap(),
+            placement: state.placement,
+            principal,
+            command,
+        };
+        state
+            .apply(state.position() + 1, time, request)
+            .unwrap()
+            .outcome
+    };
+    let round_trips = |state: &State| {
+        let image = state.encode_base();
+        let recovered = State::decode_base(&initial, image.clone()).unwrap();
+        assert_eq!(recovered.encode_base(), image);
+        assert_eq!(recovered.time(), state.time());
+        assert_eq!(recovered.leases, state.leases);
+    };
+    let enroll_at = |state: &mut State, time| {
+        let Ok(Outcome::Enrolled(enrollment)) = at(
+            state,
+            time,
+            Principal::Administrator,
+            Command::Enroll {
+                worker: Uuid::new_v4(),
+                expected: None,
+            },
+        ) else {
+            panic!("enrollment refused");
+        };
+        enrollment
+    };
+    let grant_at = |state: &mut State, time, candidate: Enrollment| {
+        let expected = state.writer_state();
+        let Ok(Outcome::Granted { grant, recovery }) = at(
+            state,
+            time,
+            Principal::Worker(candidate),
+            Command::Grant {
+                expected,
+                candidate,
+            },
+        ) else {
+            panic!("grant refused");
+        };
+        (grant, recovery)
+    };
+    let first = enroll_at(&mut state, 0);
+    let second = enroll_at(&mut state, 0);
+    let old = Principal::Worker(first);
+    let (old_grant, old_recovery) = grant_at(&mut state, 10, first);
+
+    // The current writer obtains a lease measured in journal time.
+    assert_eq!(
+        at(&mut state, 100, old, Command::Lease { grant: old_grant }),
+        Ok(Outcome::Leased {
+            grant: old_grant,
+            issued_at: 100,
+            lease_end: 1_100,
+        })
+    );
+    assert_eq!(state.lease_end(first), Some(1_100));
+    let Ok(Outcome::Appended(appended)) = at(
+        &mut state,
+        110,
+        old,
+        Command::Append {
+            class: AppendClass::Data,
+            grant: old_grant,
+            expected_next: 0,
+            timestamp: 1,
+            payload: Bytes::from_static(b"a"),
+        },
+    ) else {
+        panic!("append refused");
+    };
+    let Ok(Outcome::Barrier { read, .. }) =
+        at(&mut state, 120, old, Command::Barrier { grant: old_grant })
+    else {
+        panic!("read refused");
+    };
+
+    // Journal time never moves back in decision order.
+    let position = state.position();
+    let backwards = Request {
+        id: RequestId::fresh(position, state.limits.retry_positions).unwrap(),
+        placement: state.placement,
+        principal: old,
+        command: Command::Lease { grant: old_grant },
+    };
+    assert_eq!(
+        state.apply(position + 1, 119, backwards),
+        Err(ApplyError::Time)
+    );
+    assert_eq!(state.position(), position);
+    assert_eq!(state.time(), 120);
+
+    // A grant change alone keeps the old writer's holds and lease.
+    let (new_grant, new_recovery) = grant_at(&mut state, 200, second);
+    assert_eq!(state.holds[&read.id].hold, read);
+    assert_eq!(state.holds[&old_recovery.id].hold, old_recovery);
+    assert_eq!(state.lease_end(first), Some(1_100));
+    assert_eq!(
+        at(&mut state, 210, old, Command::Lease { grant: old_grant }),
+        Err(Refusal::Stale)
+    );
+    assert!(matches!(
+        at(
+            &mut state,
+            210,
+            Principal::Worker(second),
+            Command::Lease { grant: new_grant }
+        ),
+        Ok(Outcome::Leased {
+            lease_end: 1_210,
+            ..
+        })
+    ));
+    let dispose = Command::DisposeExpired { enrollment: first };
+    assert_eq!(
+        at(&mut state, 300, Principal::Administrator, dispose.clone()),
+        Err(Refusal::Stale)
+    );
+    round_trips(&state);
+
+    let checkpoint = Checkpoint {
+        cut: appended.cut,
+        root: [2; 32],
+        manifest: [3; 32],
+        custody: Custody {
+            allocation: Uuid::new_v4(),
+            revision: 2,
+            provider: [4; 32],
+        },
+    };
+    let preparation = CheckpointPreparation {
+        checkpoint: checkpoint.cut,
+        root: checkpoint.root,
+        source: new_grant,
+        base: initial.checkpoint,
+        custody: checkpoint.custody,
+        usable_bytes: 64,
+        descriptor: [5; 32],
+    };
+    assert!(matches!(
+        at(
+            &mut state,
+            300,
+            Principal::Custodian,
+            Command::PrepareCheckpoint { preparation }
+        ),
+        Ok(Outcome::CheckpointPrepared(_))
+    ));
+    assert_eq!(
+        at(
+            &mut state,
+            300,
+            Principal::Custodian,
+            Command::Publish { checkpoint }
+        ),
+        Ok(Outcome::Published(checkpoint))
+    );
+    assert_eq!(
+        at(
+            &mut state,
+            300,
+            Principal::Worker(second),
+            Command::Release { hold: new_recovery }
+        ),
+        Ok(Outcome::Released)
+    );
+    let trim = Command::Trim {
+        selected: checkpoint,
+        through: checkpoint.cut,
+    };
+    assert_eq!(
+        at(&mut state, 300, Principal::Custodian, trim.clone()),
+        Err(Refusal::Unavailable)
+    );
+
+    // Withdrawal alone does not dispose: the lease plus drift must pass.
+    assert_eq!(
+        at(
+            &mut state,
+            300,
+            Principal::Administrator,
+            Command::Withdraw { enrollment: first }
+        ),
+        Ok(Outcome::Withdrawn)
+    );
+    assert_eq!(state.lease_end(first), Some(1_100));
+    round_trips(&state);
+    assert_eq!(
+        at(&mut state, 1_199, Principal::Custodian, dispose.clone()),
+        Err(Refusal::Unavailable)
+    );
+    assert_eq!(
+        at(&mut state, 1_199, old, dispose.clone()),
+        Err(Refusal::Unauthorized)
+    );
+    assert_eq!(
+        at(&mut state, 1_199, Principal::Custodian, trim.clone()),
+        Err(Refusal::Unavailable)
+    );
+    assert_eq!(
+        at(&mut state, 1_200, Principal::Custodian, dispose.clone()),
+        Ok(Outcome::WorkerDisposed(first))
+    );
+    assert!(state.holds.values().all(|entry| entry.hold.owner != first));
+    assert_eq!(state.lease_end(first), None);
+    round_trips(&state);
+    assert!(matches!(
+        at(&mut state, 1_200, Principal::Custodian, trim),
+        Ok(Outcome::Trimmed(_))
+    ));
+
+    // A worker that was never leased never served: it is disposable once
+    // withdrawn.
+    let unleased = enroll_at(&mut state, 1_300);
+    assert_eq!(
+        at(
+            &mut state,
+            1_300,
+            Principal::Administrator,
+            Command::Withdraw {
+                enrollment: unleased
+            }
+        ),
+        Ok(Outcome::Withdrawn)
+    );
+    assert_eq!(
+        at(
+            &mut state,
+            1_300,
+            Principal::Administrator,
+            Command::DisposeExpired {
+                enrollment: unleased
+            }
+        ),
+        Ok(Outcome::WorkerDisposed(unleased))
+    );
+    round_trips(&state);
 }

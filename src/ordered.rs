@@ -268,6 +268,16 @@ pub enum Command {
     ReleaseRead {
         read: RequestId,
     },
+    /// Obtains or renews the current writer's serving lease. The worker
+    /// serves reads only before the lease end it receives.
+    Lease {
+        grant: Grant,
+    },
+    /// Disposes a withdrawn worker's holds without operator evidence once
+    /// journal time has passed its last lease end plus the clock drift bound.
+    DisposeExpired {
+        enrollment: Enrollment,
+    },
     Trim {
         selected: Checkpoint,
         through: Cut,
@@ -307,14 +317,26 @@ pub struct TrimResult {
 pub enum Outcome {
     Enrolled(Enrollment),
     Withdrawn,
-    Granted { grant: Grant, recovery: Hold },
+    Granted {
+        grant: Grant,
+        recovery: Hold,
+    },
     Appended(AppendResult),
-    Barrier { grant: Grant, read: Hold },
+    Barrier {
+        grant: Grant,
+        read: Hold,
+    },
     Published(Checkpoint),
     CheckpointPrepared(CheckpointPreparation),
     CheckpointClosed(Checkpoint),
     CheckpointSettled(Checkpoint),
     WorkerDisposed(Enrollment),
+    /// `lease_end` is `issued_at + serving_lease` in journal time.
+    Leased {
+        grant: Grant,
+        issued_at: u64,
+        lease_end: u64,
+    },
     WindowFunded(Window),
     Protected(Hold),
     Released,
@@ -413,12 +435,24 @@ pub struct Limits {
     pub retained_data_bytes: u64,
     /// A standing part of the physical capacity that ordinary appends cannot spend.
     pub maintenance_bytes: u64,
+    /// Journal-time milliseconds a renewed serving lease lasts. Must be nonzero.
+    pub serving_lease: u64,
+    /// Journal-time milliseconds that bound clock error over one lease interval.
+    ///
+    /// Premise: between any two ordered decisions, elapsed journal time exceeds
+    /// elapsed real time by at most `clock_drift`, and a worker's monotonic
+    /// clock runs slow by at most the same bound over a lease interval. A
+    /// withdrawn worker's holds become disposable without evidence once journal
+    /// time reaches its last lease end plus this bound.
+    pub clock_drift: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ApplyError {
     #[error("command position does not follow the applied journal prefix")]
     Position,
+    #[error("decision time precedes the applied journal time")]
+    Time,
 }
 
 type RequestKey = (Principal, RequestId);
@@ -452,6 +486,7 @@ pub struct State {
     placement: Placement,
     limits: Limits,
     position: u64,
+    time: u64,
     command_history: Fingerprint,
     voter_scope: Fingerprint,
     successor: Option<Fingerprint>,
@@ -459,6 +494,9 @@ pub struct State {
     enrollment_serial: u64,
     roster: BTreeMap<Uuid, Enrollment>,
     grant: Option<Grant>,
+    /// The last lease end issued to each enrollment that is enrolled or
+    /// still owns a hold.
+    leases: BTreeMap<Enrollment, u64>,
     window: Window,
     spent: u64,
     retained_bytes: u64,
@@ -505,6 +543,7 @@ impl State {
             || limits.enrolled_workers == 0
             || limits.replay_holds == 0
             || limits.retry_positions == 0
+            || limits.serving_lease == 0
         {
             return Err(Refusal::Invalid);
         }
@@ -512,6 +551,7 @@ impl State {
             placement,
             limits,
             position: 0,
+            time: 0,
             command_history: [0; 32],
             voter_scope: [0; 32],
             successor: None,
@@ -519,6 +559,7 @@ impl State {
             enrollment_serial: 0,
             roster: BTreeMap::new(),
             grant: None,
+            leases: BTreeMap::new(),
             window,
             spent: 0,
             retained_bytes: 0,
@@ -540,6 +581,14 @@ impl State {
     }
     pub fn position(&self) -> u64 {
         self.position
+    }
+    /// The journal time of the last applied decision.
+    pub fn time(&self) -> u64 {
+        self.time
+    }
+    /// The last lease end issued to this enrollment, if it is retained.
+    pub fn lease_end(&self, enrollment: Enrollment) -> Option<u64> {
+        self.leases.get(&enrollment).copied()
     }
     pub fn command_history(&self) -> Fingerprint {
         self.command_history
@@ -660,13 +709,26 @@ impl State {
         .then_some(previous.receipt)
     }
 
-    pub fn apply(&mut self, position: u64, request: Request) -> Result<Receipt, ApplyError> {
+    /// Applies the decision chosen at `position`, stamped by its proposer
+    /// with journal time `time` in milliseconds. Journal time never decreases
+    /// in decision order.
+    pub fn apply(
+        &mut self,
+        position: u64,
+        time: u64,
+        request: Request,
+    ) -> Result<Receipt, ApplyError> {
         if self.position.checked_add(1) != Some(position) {
             return Err(ApplyError::Position);
         }
+        if time < self.time {
+            return Err(ApplyError::Time);
+        }
         self.position = position;
+        self.time = time;
         let fingerprint = fingerprint(&request);
-        self.command_history = extend_command_history(self.command_history, position, fingerprint);
+        self.command_history =
+            extend_command_history(self.command_history, position, time, fingerprint);
         while let Some((&(until, key), _)) = self.expiry.first_key_value() {
             if until > position {
                 break;
@@ -859,6 +921,7 @@ impl State {
                 {
                     self.grant = None;
                 }
+                self.prune_leases();
                 Ok(Outcome::Enrolled(enrollment))
             }
             Command::Withdraw { enrollment } => {
@@ -875,6 +938,7 @@ impl State {
                 {
                     self.grant = None;
                 }
+                self.prune_leases();
                 Ok(Outcome::Withdrawn)
             }
             Command::Grant {
@@ -1091,19 +1155,48 @@ impl State {
                 {
                     return Err(Refusal::Stale);
                 }
-                let retired = self
-                    .holds
-                    .values()
-                    .filter(|entry| entry.hold.owner == enrollment)
-                    .copied()
-                    .collect::<Vec<_>>();
-                for entry in retired {
-                    self.holds.remove(&entry.hold.id);
-                    if entry.hold.id.expires_at <= self.position {
-                        self.outcomes.remove(&(entry.origin, entry.hold.id));
+                self.dispose(enrollment);
+                Ok(Outcome::WorkerDisposed(enrollment))
+            }
+            Command::DisposeExpired { enrollment } => {
+                if principal != Principal::Administrator && principal != Principal::Custodian {
+                    return Err(Refusal::Unauthorized);
+                }
+                if enrollment.serial == 0
+                    || enrollment.serial > self.enrollment_serial
+                    || self.roster.get(&enrollment.worker) == Some(&enrollment)
+                {
+                    return Err(Refusal::Stale);
+                }
+                // A worker that was never leased never served, so it is
+                // disposable as soon as it is withdrawn.
+                if let Some(lease_end) = self.leases.get(&enrollment) {
+                    let disposable = lease_end
+                        .checked_add(self.limits.clock_drift)
+                        .ok_or(Refusal::Capacity)?;
+                    if self.time < disposable {
+                        return Err(Refusal::Unavailable);
                     }
                 }
+                self.dispose(enrollment);
                 Ok(Outcome::WorkerDisposed(enrollment))
+            }
+            Command::Lease { grant } => {
+                self.writer(principal, grant)?;
+                if self.roster.get(&grant.enrollment.worker) != Some(&grant.enrollment) {
+                    return Err(Refusal::Stale);
+                }
+                let lease_end = self
+                    .time
+                    .checked_add(self.limits.serving_lease)
+                    .ok_or(Refusal::Capacity)?;
+                let last = self.leases.entry(grant.enrollment).or_default();
+                *last = (*last).max(lease_end);
+                Ok(Outcome::Leased {
+                    grant,
+                    issued_at: self.time,
+                    lease_end,
+                })
             }
             Command::FundWindow { window } => {
                 Self::custodian(principal)?;
@@ -1200,6 +1293,7 @@ impl State {
                     self.outcomes.remove(&(entry.origin, hold.id));
                 }
                 self.holds.remove(&hold.id);
+                self.prune_leases();
                 Ok(Outcome::Released)
             }
             Command::ReleaseRead { read } => {
@@ -1232,6 +1326,7 @@ impl State {
                     self.outcomes.remove(&key);
                 }
                 self.holds.remove(&read);
+                self.prune_leases();
                 Ok(Outcome::Released)
             }
             Command::Trim { selected, through } => {
@@ -1274,6 +1369,34 @@ impl State {
                 Ok(Outcome::Trimmed(result))
             }
         }
+    }
+
+    /// Removes every hold the enrollment owns, with any receipt that was
+    /// retained only as that hold's provenance.
+    fn dispose(&mut self, enrollment: Enrollment) {
+        let retired = self
+            .holds
+            .values()
+            .filter(|entry| entry.hold.owner == enrollment)
+            .copied()
+            .collect::<Vec<_>>();
+        for entry in retired {
+            self.holds.remove(&entry.hold.id);
+            if entry.hold.id.expires_at <= self.position {
+                self.outcomes.remove(&(entry.origin, entry.hold.id));
+            }
+        }
+        self.prune_leases();
+    }
+
+    /// Keeps a lease end only while its enrollment is enrolled or owns a hold.
+    fn prune_leases(&mut self) {
+        let roster = &self.roster;
+        let holds = &self.holds;
+        self.leases.retain(|enrollment, _| {
+            roster.get(&enrollment.worker) == Some(enrollment)
+                || holds.values().any(|entry| entry.hold.owner == *enrollment)
+        });
     }
 
     fn checkpoint_open(&self, checkpoint: Checkpoint) -> bool {
@@ -1362,12 +1485,14 @@ fn fingerprint(request: &Request) -> Fingerprint {
 fn extend_command_history(
     previous: Fingerprint,
     position: u64,
+    time: u64,
     request: Fingerprint,
 ) -> Fingerprint {
     let mut hash = Sha256::new();
-    hash.update(b"logkeeper.ordered-history.v1");
+    hash.update(b"logkeeper.ordered-history.v2");
     hash.update(previous);
     hash.update(position.to_be_bytes());
+    hash.update(time.to_be_bytes());
     hash.update(request);
     hash.finalize().into()
 }

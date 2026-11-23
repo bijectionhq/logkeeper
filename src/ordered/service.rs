@@ -54,6 +54,10 @@ pub struct Route {
     pub maintenance_limit: u64,
     pub maintenance_retained: u64,
     pub retry_positions: u64,
+    /// Journal time of the last chosen decision, in milliseconds.
+    pub time: u64,
+    pub serving_lease: u64,
+    pub clock_drift: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +187,9 @@ impl<R: Replica> Coordinator<R> {
             maintenance_limit: state.limits.maintenance_bytes,
             maintenance_retained: state.maintenance_retained,
             retry_positions: state.limits.retry_positions,
+            time: state.time(),
+            serving_lease: state.limits.serving_lease,
+            clock_drift: state.limits.clock_drift,
         })
     }
 

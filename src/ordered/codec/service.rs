@@ -159,6 +159,9 @@ impl Reply {
                 output.put_u64(route.maintenance_limit);
                 output.put_u64(route.maintenance_retained);
                 output.put_u64(route.retry_positions);
+                output.put_u64(route.time);
+                output.put_u64(route.serving_lease);
+                output.put_u64(route.clock_drift);
             }
             Self::Decision(decision) => {
                 output.put_u8(1);
@@ -243,6 +246,9 @@ impl Reply {
                 maintenance_limit: input.u64()?,
                 maintenance_retained: input.u64()?,
                 retry_positions: input.u64()?,
+                time: input.u64()?,
+                serving_lease: input.u64()?,
+                clock_drift: input.u64()?,
             }),
             1 => Self::Decision(input.decision()?),
             2 => Self::Reconciled(input.append_result()?),

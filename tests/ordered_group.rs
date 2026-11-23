@@ -81,6 +81,8 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         retry_positions: 64,
         retained_data_bytes: 8192,
         maintenance_bytes: 1024,
+        serving_lease: 30_000,
+        clock_drift: 1_000,
     };
     let group = Group::new(placement, limits, seed, window, voter_ids, 1 << 20).unwrap();
     let directories = std::array::from_fn::<_, 3, _>(|_| tempfile::tempdir().unwrap());
@@ -607,7 +609,12 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
             successor: repaired.identity(),
         },
     );
-    let chosen = group.choose(&old_peers, 100, seal).await.unwrap();
+    // A proposer cannot stamp a decision below the chosen journal time.
+    assert!(matches!(
+        group.choose_at(&old_peers, 100, 0, seal.clone()).await,
+        Err(Error::Time)
+    ));
+    let chosen = group.choose(&old_peers, 101, seal).await.unwrap();
     assert_eq!(
         chosen.receipt().outcome,
         Ok(Outcome::CohortSealed(repaired.identity()))
@@ -623,11 +630,11 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         },
     );
     assert!(matches!(
-        group.choose(&old_peers, 101, old_append).await,
+        group.choose(&old_peers, 102, old_append).await,
         Err(Error::Sealed)
     ));
 
-    let inherited = group.repair_seed(&old_peers, 102, &repaired).await.unwrap();
+    let inherited = group.repair_seed(&old_peers, 103, &repaired).await.unwrap();
     let new_peers: Vec<_> = new_media
         .iter()
         .zip(surviving_ids)
