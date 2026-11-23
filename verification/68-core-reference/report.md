@@ -24,20 +24,21 @@ Its prefix also constructs the exact live-held state used by the countermodel.
 
 ## Mechanism checks
 
-[Weakening.lean](Weakening.lean) checks five constructive countermodels in the same logical state space.
+[Weakening.lean](Weakening.lean) checks six constructive countermodels in the same logical state space.
 Each variant retains every original kernel transition and adds the indicated operation with only one guard removed.
 The starting states come from the checked ordered programs, with enough capacity for their first append.
 The original models refuse the operation at the same state.
 
 | Mechanism and removed guard | Checked violation |
 | --- | --- |
+| M01, exact next LSN | An authorized writer resubmits changed data at LSN 0, and the mutant appends it at LSN 1 despite the stale position. S03 fails. |
 | M02, exact installed writer | The old writer appends at the correct head with both budgets available after the higher epoch. S03 fails. |
 | M05, published checkpoint floor | Trim advances past the certified recovery basis without any live hold blocking it. The logical trim invariant for S06 fails. |
 | M05, active replay floor | Trim crosses a live admitted read even with a correct published checkpoint. S06 and the logical part of S11 fail. |
 | M08, recovery bound | With one record of recovery debt, the next append exceeds that bound while retained debt still fits. The recovery component of B01 fails. |
 | M08, retained bound | The converse configuration exceeds retained debt while recovery debt still fits. The retention component of B01 fails. |
 
-Lean reports fifteen theorems and only standard axioms across the three files.
+Lean reports sixteen theorems and only standard axioms across the three files.
 The countermodels substantiate guard dependence within the logical kernel.
 Changing all layers that enforce an end-to-end mechanism still requires a separate independence argument.
 

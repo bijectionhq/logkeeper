@@ -10,7 +10,7 @@ Chosen(event) == InPrefix(event, Len(history))
 At(cut) ==
   [oldRoot |-> ~InPrefix("release-root", cut),
    read |-> ~InPrefix("finish-read", cut),
-   delivery |-> ~InPrefix("finish-delivery", cut),
+   delivery |-> Scenario # "ordinary-read" /\ ~InPrefix("finish-delivery", cut),
    a |-> IF InPrefix("settle-A", cut) THEN "gone"
          ELSE IF InPrefix("reserve-A", cut) THEN "withdrawing" ELSE "open",
    c |-> IF InPrefix("reserve-C", cut) THEN "withdrawing" ELSE "open"]
@@ -52,7 +52,7 @@ ReserveA ==
   /\ applied.a = "open"
   /\ ~Chosen("reserve-A")
   /\ ~applied.oldRoot \/ Policy = "visible-only"
-  /\ ~applied.read
+  /\ ~applied.read \/ Policy = "drop-read"
   /\ ~applied.delivery \/ Policy = "drop-delivery"
   /\ applied.c = "open"
   /\ history' = Append(history, "reserve-A")
@@ -156,4 +156,5 @@ SurvivesB == copies \ {lost} # {}
 EventuallySettled == <>Chosen("settle-A")
 NeverSettlesFromNewerSelector == ~(crashed /\ stable > 0 /\ Chosen("settle-A"))
 NeverSettlesFromOlderSelector == ~(crashed /\ stable = 0 /\ Chosen("settle-A"))
+NeverDeletesAfterFinishingRead == ~(Chosen("finish-read") /\ "A" \notin copies)
 ======================================================================================

@@ -54,6 +54,7 @@ Selectable(cut) == cut = stable \/ (pending /\ cut = 1)
 HasReceipt(cut) == IF cut = 0 THEN physical ELSE book
 AcceptsKey(key) ==
     key = Exact
+    \/ (Variant = "ignore_lineage" /\ key[2] = Exact[2] /\ key[3] = Exact[3] /\ key[4] = Exact[4])
     \/ (Variant = "lsn_only" /\ key[3] = Exact[3])
     \/ (Variant = "payload_only" /\ key[3] = Exact[3] /\ key[4] = Exact[4])
 Reconcile(cut, key) ==

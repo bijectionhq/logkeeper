@@ -28,10 +28,12 @@ The proof control omits the receipt's exact physical version comparison and fail
 ## Bounded comparison
 
 TLC 2.19 checks two custody checkpoint choices, three AZs, one acknowledged input, separate root, read and delivery holds, and at most one custodian crash.
+The ordinary-read scenario starts with one old root hold and one live physical read. It has no exact delivery hold.
 
 | Weakened design | Counterexample |
 | --- | --- |
 | Consider only the visible checkpoint | Erase A while the older selectable root still needs it in six transitions. |
+| Ignore only an ordinary physical read | Release the old root and erase A while the physical read still has a hold. `ExactHolds` fails in five transitions. |
 | Treat the delivery as released once the ordinary read closes | Erase A despite the outstanding delivery in six transitions. |
 | Dispatch from staging | A provider deletes A in four transitions without a chosen withdrawal. |
 | Reopen the earlier image without its chosen suffix | The recovered authority has the wrong phase in seven transitions. |
@@ -46,6 +48,7 @@ TLC 2.19 checks two custody checkpoint choices, three AZs, one acknowledged inpu
 | Keep a paid delivery when the other holds release | Withdrawal stays unavailable in five states. |
 | Normal verified terminal settlement | Eventual settlement under weak fairness in 82 states. |
 | Competing staging before authority is chosen | The safety invariants hold in 92 states. |
+| Ordinary physical read stays protected | The invariants hold in 15 states. A six-transition witness finishes the read and deletes the old copy. |
 
 The older and newer crash selectors each reach deletion during the outage and settlement after recovery.
 Their shortest witnesses take ten and eleven transitions respectively.

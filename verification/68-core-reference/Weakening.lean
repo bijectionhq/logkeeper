@@ -8,6 +8,7 @@ open CoreReference (stream)
 open CorePrograms (first successor committed fenced held)
 
 inductive Removed where
+  | nextLsn
   | writer
   | checkpoint
   | replayHold
@@ -21,6 +22,11 @@ def append (state : Stream) (writer : Kernel.Writer) (payload : Nat) : Stream :=
 
 inductive Step (removed : Removed) (limits : Kernel.Limits) : Stream → Stream → Prop
   | original {state next} (step : Kernel.Step limits state next) : Step removed limits state next
+  | withoutNextLsn {state} (omitted : removed = .nextLsn) (writer : Kernel.Writer) (lsn payload : Nat)
+      (authorized : state.authority = .active writer)
+      (recover : state.history.length + 1 - state.checkpointEnd ≤ limits.recovery)
+      (retain : state.history.length + 1 - state.firstRetained ≤ limits.retained) :
+      Step removed limits state (append state writer payload)
   | withoutWriter {state} (omitted : removed = .writer) (writer : Kernel.Writer) (lsn payload : Nat)
       (head : lsn = state.history.length)
       (recover : state.history.length + 1 - state.checkpointEnd ≤ limits.recovery)
@@ -42,6 +48,25 @@ inductive Step (removed : Removed) (limits : Kernel.Limits) : Stream → Stream 
       (authorized : state.authority = .active writer) (head : lsn = state.history.length)
       (recover : state.history.length + 1 - state.checkpointEnd ≤ limits.recovery) :
       Step removed limits state (append state writer payload)
+
+theorem removing_the_next_lsn_check_accepts_a_request_at_an_occupied_position :
+    let before := stream committed
+    let budget : Kernel.Limits := ⟨2, 2⟩
+    let after := append before first 43
+    Step .nextLsn budget before after ∧
+      (OrderedApplication.decideCommand budget before (.append first 0 43)).2 = .refused ∧
+      after.history[0]? = some CorePrograms.entry ∧
+      after.history[1]? = some ⟨first.epoch, 43⟩ ∧
+      ¬ Kernel.MatchesReceipt after 0 ⟨first.epoch, 43⟩ := by
+  refine ⟨.withoutNextLsn rfl first 0 43 rfl (by decide) (by decide), ?_, rfl, rfl, ?_⟩
+  · simp only [OrderedApplication.decideCommand]
+    split
+    · rename_i admitted
+      exact False.elim (Nat.noConfusion admitted.2.1)
+    · rfl
+  · intro matched
+    have bytes := congrArg Kernel.Entry.bytes (Option.some.inj matched.2)
+    exact (by decide : (42 : Nat) ≠ 43) bytes
 
 theorem removing_the_writer_check_admits_the_stale_append_at_the_valid_head :
     let before := stream fenced
@@ -110,6 +135,7 @@ theorem removing_retained_room_exceeds_only_the_retained_limit :
   intro permitted
   exact (by decide : ¬ 2 ≤ 1) permitted.retainedRoom
 
+#print axioms removing_the_next_lsn_check_accepts_a_request_at_an_occupied_position
 #print axioms removing_the_writer_check_admits_the_stale_append_at_the_valid_head
 #print axioms removing_the_checkpoint_guard_admits_trim_without_a_certified_replacement
 #print axioms removing_the_replay_guard_invalidates_a_live_hold

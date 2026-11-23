@@ -25,6 +25,8 @@ def verify_tla():
             law="ExactHolds", expected="ExactHolds")
     compare("closed-read-does-not-finish-delivery", "pinned-delivery", policy="drop-delivery",
             law="ExactHolds", expected="ExactHolds")
+    compare("physical-read-prevents-withdrawal", "ordinary-read", policy="drop-read",
+            law="ExactHolds", expected="ExactHolds")
     compare("staging-must-not-mint-a-delete", "staging", policy="send-staged",
             law="AuthorizedEffect", expected="AuthorizedEffect")
     compare("crash-chooses-then-forgets-the-old-suffix", "recovery-race", policy="base-only",
@@ -41,6 +43,9 @@ def verify_tla():
     compare("held-delivery-prevents-withdrawal", "pinned-delivery")
     compare("verified-terminal-settlement", "settlement", progress=True)
     compare("staging-is-invisible-for-effects", "staging")
+    compare("ordinary-read-custody", "ordinary-read")
+    compare("deletes-after-finishing-read-witness", "ordinary-read", law="NeverDeletesAfterFinishingRead",
+            expected="NeverDeletesAfterFinishingRead")
     compare("settles-from-newer-selector-witness", "offline-effect", law="NeverSettlesFromNewerSelector",
             expected="NeverSettlesFromNewerSelector")
     compare("settles-from-older-selector-witness", "offline-effect", law="NeverSettlesFromOlderSelector",

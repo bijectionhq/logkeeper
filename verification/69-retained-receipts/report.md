@@ -21,6 +21,7 @@ The witness for both selectors, followed by successful lookup at the new base af
 | --- | --- |
 | Publish the new checkpoint without exact receipt identity | Choose the record and publish a second selectable basis. The new basis has no retained receipt in two transitions. |
 | Match by LSN alone | Choose, seal, activate, and reconcile a different request at the occupied LSN. Four transitions. |
+| Omit only the lineage comparison | A different lineage obtains the original result with the original grant, position and payload unchanged. Four transitions. |
 | Match by LSN and payload alone | A different grant or lineage at the same payload can use the prior result. Four transitions. |
 | Reappend on reconciliation | Choose, seal, activate, and retry the exact request. History grows on lookup in four transitions. |
 | Answer with the old result after trim | Choose and move, select a retained checkpoint, trim the original range, and serve the old receipt. Seven transitions. |
@@ -36,10 +37,12 @@ The lookup requires authorization, exact lineage and binding, and a position wit
 For an authenticated lookup below that range, the result is the retention floor even when a stale physical row survives.
 The Lean negative control reduces identity to LSN alone and fails the exact-binding proof.
 
-[MoveProgram.lean](MoveProgram.lean) checks three constructive theorems with standard axioms only.
+[MoveProgram.lean](MoveProgram.lean) checks five constructive theorems with standard axioms only.
 The funded append program from Study 68 creates the exact receipt row.
 From a sealed source image carrying the retained row, applying an authenticated funded activation installs the new writer and window at the exact original cut.
 The successor reports that cut and the original receipt and refuses changed bytes, with the original history unchanged.
+The C12 controls bypass lookup authorization with a complete exact key and record a chosen stale append before successful application.
+The actual result fold refuses to create the stale row and the committed position remains empty.
 
 ## Amendments
 

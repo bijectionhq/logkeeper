@@ -26,6 +26,7 @@ TLC 2.19 checked the following configurations.
 
 | Policy and history | Evidence |
 | --- | --- |
+| Skip only the new input's coverage check at acknowledgement | With the reference loss cases and withdrawal guards unchanged, acknowledge B-only work in two transitions and violate `PromisesIntact`. |
 | Treat timeout of A as proof of AZ loss | Promise violation in two transitions. Observe B and C, open the cut and acknowledge the new B-only input. |
 | Same policy with an actual first loss injected | Lost acknowledged input in three transitions. Open, acknowledge on B, then lose B. |
 | Withdraw A's retained old copy just because the serving cut excludes A | Lost previous acknowledgment in three transitions. Open, withdraw A, then lose B. |
@@ -41,6 +42,7 @@ TLC 2.19 checked the following configurations.
 Weak fairness applies to cut opening, replication when configured, and acknowledgment when continuously eligible in the temporal comparisons.
 The injected-loss and renewal cases are finite safety checks.
 Separate bounded acceptance traces reach loss of B after safely replacing A's copy, and loss of B after verified renewal with new acknowledged work.
+Under the same configuration as the new-input control, the reference acknowledges after independent replication in three transitions.
 
 ## Amendments and developer cost
 

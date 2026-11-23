@@ -45,7 +45,7 @@ Ack ==
   /\ opened
   /\ ServingQuorum
   /\ "new" \notin owed
-  /\ Covers(copies, {"new"}, DecisionLosses)
+  /\ Covers(copies, {"new"}, DecisionLosses) \/ Policy = "skip-ack-coverage"
   /\ owed' = owed \cup {"new"}
   /\ UNCHANGED <<copies, physicalLoss, opened, renewed>>
 
@@ -93,6 +93,7 @@ SurvivesActualLoss == \A input \in owed : Residual(copies, input, physicalLoss) 
 RenewalHasFullCoverage == renewed => Covers(copies, owed, AZs)
 EventuallyOpen == <>opened
 EventuallyAck == <>("new" \in owed)
+NeverAcksWithIndependentCopy == ~("new" \in owed /\ "C" \in copies["new"])
 PriorCopyNeverReplacedBeforeLoss ==
   ~(copies["old"] = {"B", "C"} /\ physicalLoss = {"B"})
 NeverLoseAgainAfterQualifiedRenewal ==

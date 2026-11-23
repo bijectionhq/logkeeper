@@ -29,6 +29,8 @@ def compare(name, world, *, policy="preserve", replicate=True, loss=False, input
 
 
 def main():
+    compare("ack-without-new-input-coverage", "slow", policy="skip-ack-coverage",
+            loss=True, expected="PromisesIntact")
     compare("timeout-narrows-the-promise", "slow", policy="timeout-is-failure",
             replicate=False, expected="PromisesIntact")
     compare("timeout-ack-physically-loses-write", "slow", policy="timeout-is-failure",
@@ -51,6 +53,8 @@ def main():
     compare("refuse-missing-inputs", "slow", inputs=False)
 
     # Negated reachability properties give minimal acceptance traces.
+    compare("ack-after-independent-replication-witness", "slow", loss=True,
+            laws=("NeverAcksWithIndependentCopy",), expected="NeverAcksWithIndependentCopy")
     compare("replace-then-lose-an-az-witness", "slow", loss=True,
             laws=("PriorCopyNeverReplacedBeforeLoss",), expected="PriorCopyNeverReplacedBeforeLoss")
     compare("renew-then-lose-an-az-witness", "diagnosed", loss=True, requalify=True,

@@ -28,6 +28,39 @@ theorem the_common_append_program_populates_its_exact_receipt_row
   simp [CorePrograms.bootReplies, CorePrograms.append, frame,
     ReceiptReplay.retain, ReceiptReplay.record, stream, committed, SnapshotAdmission.setSlot]
 
+theorem skipping_lookup_authorization_exposes_the_exact_retained_receipt :
+    let view : ReceiptReplay.View 1 Nat := ⟨committed, retainedRows⟩
+    ReceiptReplay.lookup lineage False view original = .refused ∧
+      ReceiptReplay.lookup lineage True view original = .committed receipt := by
+  constructor
+  · simp [ReceiptReplay.lookup]
+  · apply ReceiptReplay.the_exact_retained_receipt_is_available_without_appending
+    · exact ⟨trivial, rfl⟩
+    · decide
+    · decide
+    · rfl
+    · rfl
+
+private def recordAtChoice (rows : ReceiptReplay.Rows Nat) (chosen : Frame 1 Nat Unit) :
+    ReceiptReplay.Rows Nat :=
+  match chosen.command with
+  | .append request =>
+    ReceiptReplay.record rows
+      ⟨chosen, .stream (.appended request.lsn ⟨request.writer.epoch, request.payload⟩)⟩
+  | _ => rows
+
+theorem accepting_choice_instead_of_success_records_a_refused_append (rules : Rules 1 Nat Unit) :
+    let before := CorePrograms.fenced
+    let chosen := frame 5 (CorePrograms.append first 1 1 43)
+    let result := ChosenReplay.decide rules lineage before chosen
+    ReceiptReplay.record retainedRows ⟨chosen, result.2⟩ 1 = none ∧
+      recordAtChoice retainedRows chosen 1 =
+        some ⟨⟨lineage, first, 1, 43⟩, 5, 2⟩ ∧
+      (stream result.1).history[1]? = none := by
+  dsimp only
+  rw [CorePrograms.a_delayed_writer_is_refused_in_the_funded_window rules]
+  exact ⟨rfl, rfl, rfl⟩
+
 def target : Kernel.Placement := ⟨2, 2⟩
 def nextWriter : Kernel.Writer := {first with placement := target}
 def slot : SourceOutcomes.Key 1 := ⟨0, 1⟩
@@ -126,6 +159,8 @@ theorem a_successor_recovers_the_original_reply_and_its_cut_without_another_appe
     simp [ReceiptReplay.lookup, permitted, permittedRange, committedRange, stored, ReceiptReplay.Matches, distinct]
 
 #print axioms the_common_append_program_populates_its_exact_receipt_row
+#print axioms skipping_lookup_authorization_exposes_the_exact_retained_receipt
+#print axioms accepting_choice_instead_of_success_records_a_refused_append
 #print axioms the_funded_activation_moves_writer_and_window_with_the_same_exact_history
 #print axioms a_successor_recovers_the_original_reply_and_its_cut_without_another_append
 

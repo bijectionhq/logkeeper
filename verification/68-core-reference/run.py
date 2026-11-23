@@ -51,7 +51,7 @@ def main():
     compile_lean_modules(ROOT, ("68-core-reference/CoreReference.lean",))
     check_lean_theorems(ROOT, command, ROOT / "CorePrograms.lean", count=6)
     compile_lean_modules(ROOT, ("68-core-reference/CorePrograms.lean",))
-    check_lean_theorems(ROOT, command, ROOT / "Weakening.lean", count=5)
+    check_lean_theorems(ROOT, command, ROOT / "Weakening.lean", count=6)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ def check(name, laws, *, variant="reference", expected=None):
 def verify_tla():
     for variant, law in (
         ("drop_identity", "RetainedCoverage"),
+        ("ignore_lineage", "ExactReturnedReceipt"),
         ("lsn_only", "ExactReturnedReceipt"),
         ("payload_only", "ExactReturnedReceipt"),
         ("append_on_reconcile", "ReconcileNeverAppends"),
@@ -74,7 +75,7 @@ def verify_lean():
         "exact exactBinding")
     check_lean_theorems(ROOT, command, source, count=8)
     compile_lean_modules(ROOT, ("69-retained-receipts/ReceiptReplay.lean",))
-    check_lean_theorems(ROOT, command, ROOT / "MoveProgram.lean", count=3)
+    check_lean_theorems(ROOT, command, ROOT / "MoveProgram.lean", count=5)
 
 
 if __name__ == "__main__":
