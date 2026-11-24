@@ -5,15 +5,15 @@ mod admission;
 use admission::matches_fingerprint;
 #[path = "../../../src/ordered/codec/frame.rs"]
 mod frame;
-use frame::bounded_body_length;
 #[path = "../../../src/ordered/replication/disk/selection.rs"]
 pub mod selection;
 #[path = "../../../src/ordered/replication/disk/mirror.rs"]
 mod mirror;
 #[path = "../../../src/ordered/replication/disk/recover.rs"]
 pub mod recover;
-use recover::{HEADER, SlotHeader};
-use selection::MAGIC;
+#[path = "../../../src/ordered/replication/slot_header.rs"]
+mod slot_header;
+use slot_header::{decode_header, decodeBE, matches_slot, voterSlotMagic, HEADER};
 
 pub type Fingerprint = [u8; 32];
 #[derive(Clone, Copy)]
@@ -23,11 +23,11 @@ pub struct Ballot {
 }
 
 #[derive(Clone, Copy)]
-pub struct Uuid(pub u128);
+pub struct Uuid(pub [u8; 16]);
 
 impl Uuid {
     #[verus_spec(out => ensures out == self.0)]
-    pub fn as_u128(&self) -> u128 { self.0 }
+    pub fn as_bytes(&self) -> &[u8; 16] { &self.0 }
 }
 
 pub struct Group { pub identity: Fingerprint }
@@ -39,7 +39,7 @@ pub struct Selected {
 }
 
 pub struct File {
-    pub header: Option<SlotHeader>,
+    pub header: Option<[u8; HEADER]>,
     pub body: Ghost<Seq<u8>>,
 }
 
@@ -81,26 +81,26 @@ pub struct Inner { pub group: Group }
 verus! {
 
 impl File {
-    pub open spec fn snapshot(&self) -> (Option<SlotHeader>, Seq<u8>) {
+    pub open spec fn snapshot(&self) -> (Option<[u8; HEADER]>, Seq<u8>) {
         (self.header, self.body@)
     }
 }
 
-pub uninterp spec fn slot_digest(header: SlotHeader, body: Seq<u8>) -> Seq<u8>;
+pub uninterp spec fn slot_digest(descriptor: Seq<u8>, body: Seq<u8>) -> Seq<u8>;
 pub uninterp spec fn decoded_state(group: &Group, body: Seq<u8>) -> Option<VoterState>;
 
 #[verifier::external_body]
-pub fn read_slot_header(file: &mut File) -> (out: Result<SlotHeader, Error>)
+pub fn read_slot_header(file: &mut File) -> (out: Result<[u8; HEADER], Error>)
     ensures old(file).snapshot() == final(file).snapshot(),
         out matches Ok(header) ==> old(file).header == Some(header),
 { unimplemented!() }
 
 #[verifier::external_body]
-pub fn read_slot_body(file: &mut File, header: &SlotHeader, length: usize)
+pub fn read_slot_body(file: &mut File, header: &[u8; HEADER], length: usize)
     -> (out: Result<(Vec<u8>, Fingerprint), Error>)
     ensures old(file).snapshot() == final(file).snapshot(),
         out matches Ok((body, digest)) ==> length <= old(file).body@.len()
-            && body@ == old(file).body@.take(length as int) && digest@ == slot_digest(*header, body@),
+            && body@ == old(file).body@.take(length as int) && digest@ == slot_digest(header@.take(72), body@),
 { unimplemented!() }
 
 #[verifier::external_body]
@@ -112,13 +112,16 @@ pub(crate) open spec fn eligible_slot(
     file: &File, group: &Group, voter: Uuid, size: usize, index: usize,
     used: usize, selected: Selected, digest: Fingerprint,
 ) -> bool {
-    file.header matches Some(header) && !header.empty
-    && header.magic@ == MAGIC@ && header.addressed@ == group.identity@
-    && header.witness == voter.0 && header.generation != 0
+    file.header matches Some(header)
+    && header@.subrange(0, 8) == voterSlotMagic()
+    && header@.subrange(8, 40) == group.identity@
+    && header@.subrange(40, 56) == voter.0@
+    && decodeBE(header@.subrange(56, 64)) != 0
     && 2 <= used as int <= size as int - HEADER as int
-    && used == header.length && used <= file.body@.len()
-    && digest@ == header.digest@ && digest@ == slot_digest(header, file.body@.take(used as int))
-    && selected.index == index && selected.generation == header.generation
+    && used == decodeBE(header@.subrange(64, 72)) && used <= file.body@.len()
+    && digest@ == header@.subrange(72, 104)
+    && digest@ == slot_digest(header@.take(72), file.body@.take(used as int))
+    && selected.index == index && selected.generation == decodeBE(header@.subrange(56, 64))
     && decoded_state(group, file.body@.take(used as int)) == Some(selected.state)
 }
 

@@ -13,8 +13,9 @@ The ghost contracts erase from normal builds.
 | `one_tear_leaves_the_mirrored_image`, `any_surviving_slot_keeps_the_acknowledged_rank` | `recover_slot` checks body bounds, the header/body digest, slot identity and a decoded state before yielding a candidate. Under the tear premise, the surviving image after a single tear of either slot is the acknowledged image. After intervening steps satisfying `Keeps`, every returned image dominates the acknowledged rank. |
 | `AtFence`, `MirrorsFence` | The shared L13 readback check requires the physical descriptor, exact promised ballot, exact accepted ballot and exact prefix digest. The shipped `Inner::read_back` visits A and B and propagates a failed visit. |
 
-The file adapter supplies the parsed fixed-size header and the declared body
-bytes, with SHA-256 over the header descriptor and that body. A detectable
+The file adapter supplies the raw fixed-size header and the declared body
+bytes, with SHA-256 over the header descriptor and that body. Recovery uses
+the shipped [slot header decoder and scope check](../voter_slot_header/README.md). A detectable
 partial write invalidates one slot. A tear may also preserve a complete image
 when the resulting descriptor and body are unchanged. The model assumes the
 digest binds that pair and that successful filesystem syncs persist it without

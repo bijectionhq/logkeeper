@@ -54,15 +54,20 @@
       "defect": "The header can name more body bytes than fit in the slot.",
       "mutate": [
         {
-          "file": "src/ordered/replication/disk/selection.rs",
-          "find": "    bounded_body_length(length, 2, payload_limit)",
-          "replace": "    bounded_body_length(length, 2, usize::MAX)"
+          "file": "src/ordered/replication/slot_header.rs",
+          "find": "if length < 2 || length > payload_limit as u64 {",
+          "replace": "if length < 2 {"
         }
       ],
       "expect": [
         {
-          "file": "src/ordered/replication/disk/selection.rs",
-          "function": "slot_body_length",
+          "file": "src/ordered/replication/slot_header.rs",
+          "function": "decode_header",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "function": "decode_header",
           "category": "postcondition not satisfied"
         }
       ],
@@ -90,15 +95,15 @@
       "defect": "An authenticated image from another group can participate in recovery.",
       "mutate": [
         {
-          "file": "src/ordered/replication/disk/selection.rs",
-          "find": "        && matches_fingerprint(addressed, group)\n",
+          "file": "src/ordered/replication/slot_header.rs",
+          "find": "        && bytes_equal(&descriptor.group, group)\n",
           "replace": ""
         }
       ],
       "expect": [
         {
-          "file": "src/ordered/replication/disk/selection.rs",
-          "function": "slot_header_matches",
+          "file": "src/ordered/replication/slot_header.rs",
+          "function": "matches_slot",
           "category": "postcondition not satisfied"
         }
       ],

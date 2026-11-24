@@ -1,13 +1,60 @@
 //! Fixed-width descriptor and checksum of an LKORV005 slot.
 
-const MAGIC: [u8; 8] = *b"LKORV005";
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
+
+#[cfg(verus_keep_ghost)]
+verus! {
+
+pub(super) open spec fn voterSlotMagic() -> Seq<u8> {
+    seq![76u8, 75, 79, 82, 86, 48, 48, 53]
+}
+
+pub(super) open spec fn decodeBE(bytes: Seq<u8>) -> u64 {
+    ((bytes[0] as u64) << 56)
+        | ((bytes[1] as u64) << 48)
+        | ((bytes[2] as u64) << 40)
+        | ((bytes[3] as u64) << 32)
+        | ((bytes[4] as u64) << 24)
+        | ((bytes[5] as u64) << 16)
+        | ((bytes[6] as u64) << 8)
+        | bytes[7] as u64
+}
+
+pub(super) open spec fn encodeBE(value: u64) -> Seq<u8> {
+    seq![
+        (value >> 56) as u8, (value >> 48) as u8, (value >> 40) as u8, (value >> 32) as u8,
+        (value >> 24) as u8, (value >> 16) as u8, (value >> 8) as u8, value as u8,
+    ]
+}
+
+pub(super) open spec fn slotDescriptor(group: Seq<u8>, voter: Seq<u8>, generation: u64, length: u64)
+    -> Seq<u8>
+{
+    voterSlotMagic() + group + voter + encodeBE(generation) + encodeBE(length)
+}
+
+pub(super) open spec fn slotHeaderLengthValid(bytes: Seq<u8>, payload_limit: usize) -> bool {
+    bytes.len() == 104 && 2 <= decodeBE(bytes.subrange(64, 72)) <= payload_limit
+}
+
+pub(super) open spec fn slotHeaderMatches(header: SlotHeader, group: Seq<u8>, voter: Seq<u8>) -> bool {
+    header.descriptor.magic@ == voterSlotMagic()
+        && header.descriptor.group@ == group
+        && header.descriptor.voter@ == voter
+        && header.descriptor.generation != 0
+}
+
+}
+
+const MAGIC: [u8; 8] = [b'L', b'K', b'O', b'R', b'V', b'0', b'0', b'5'];
 pub(super) const DESCRIPTOR_BYTES: usize = 72;
 pub(super) const HEADER: usize = DESCRIPTOR_BYTES + 32;
 
 pub(super) struct SlotDescriptor {
-    magic: [u8; 8],
-    group: [u8; 32],
-    voter: [u8; 16],
+    pub(super) magic: [u8; 8],
+    pub(super) group: [u8; 32],
+    pub(super) voter: [u8; 16],
     pub(super) generation: u64,
 }
 
@@ -17,12 +64,17 @@ pub(super) struct SlotHeader {
     pub(super) digest: [u8; 32],
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires offset as int + N as int <= bytes@.len(), offset as int + N as int <= usize::MAX,
+    ensures out@ == bytes@.subrange(offset as int, offset as int + N as int),
+))]
 fn read_field<const N: usize>(bytes: &[u8], offset: usize) -> [u8; N] {
     let mut field = [0; N];
     field.copy_from_slice(&bytes[offset..offset + N]);
     field
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == decodeBE(bytes@),))]
 fn read_be(bytes: [u8; 8]) -> u64 {
     ((bytes[0] as u64) << 56)
         | ((bytes[1] as u64) << 48)
@@ -34,6 +86,7 @@ fn read_be(bytes: [u8; 8]) -> u64 {
         | bytes[7] as u64
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out@ =~= encodeBE(value),))]
 fn write_be(value: u64) -> [u8; 8] {
     [
         (value >> 56) as u8,
@@ -47,6 +100,7 @@ fn write_be(value: u64) -> [u8; 8] {
     ]
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out@ =~= slotDescriptor(group@, voter@, generation, length),))]
 pub(super) fn encode_descriptor(
     group: &[u8; 32],
     voter: &[u8; 16],
@@ -59,9 +113,15 @@ pub(super) fn encode_descriptor(
     bytes[40..56].copy_from_slice(voter);
     bytes[56..64].copy_from_slice(&write_be(generation));
     bytes[64..72].copy_from_slice(&write_be(length));
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(MAGIC@ =~= voterSlotMagic());
+        assert(bytes@ =~= slotDescriptor(group@, voter@, generation, length));
+    }
     bytes
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out@ =~= descriptor@ + digest@,))]
 pub(super) fn encode_header(
     descriptor: &[u8; DESCRIPTOR_BYTES],
     digest: &[u8; 32],
@@ -72,6 +132,18 @@ pub(super) fn encode_header(
     bytes
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out.is_some() == slotHeaderLengthValid(bytes@, payload_limit),
+        out matches Some(header) ==> {
+            &&& header.descriptor.magic@ == bytes@.subrange(0, 8)
+            &&& header.descriptor.group@ == bytes@.subrange(8, 40)
+            &&& header.descriptor.voter@ == bytes@.subrange(40, 56)
+            &&& header.descriptor.generation == decodeBE(bytes@.subrange(56, 64))
+            &&& header.length as u64 == decodeBE(bytes@.subrange(64, 72))
+            &&& header.digest@ == bytes@.subrange(72, 104)
+        },
+))]
 pub(super) fn decode_header(bytes: &[u8], payload_limit: usize) -> Option<SlotHeader> {
     if bytes.len() != HEADER {
         return None;
@@ -93,19 +165,35 @@ pub(super) fn decode_header(bytes: &[u8], payload_limit: usize) -> Option<SlotHe
     })
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (left@ == right@),))]
 fn bytes_equal<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
     let mut i = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            i <= N,
+            forall|j: int| 0 <= j < i ==> left@[j] == right@[j],
+        decreases N - i,
+    ))]
     while i < N {
         if left[i] != right[i] {
             return false;
         }
         i += 1;
     }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(left@ =~= right@);
+    }
     true
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == slotHeaderMatches(*header, group@, voter@),))]
 pub(super) fn matches_slot(header: &SlotHeader, group: &[u8; 32], voter: &[u8; 16]) -> bool {
     let descriptor = &header.descriptor;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(MAGIC@ =~= voterSlotMagic());
+    }
     bytes_equal(&descriptor.magic, &MAGIC)
         && bytes_equal(&descriptor.group, group)
         && bytes_equal(&descriptor.voter, voter)

@@ -1,0 +1,95 @@
+{
+  "summary": "Exact LKORV005 slot descriptor and digest fields, bounded payload extent, and installed voter scope.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 17,
+  "controls": {
+    "swap-generation-and-length": {
+      "defect": "The slot writer puts the generation at the payload-length offset.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "find": "    bytes[56..64].copy_from_slice(&write_be(generation));",
+          "replace": "    bytes[56..64].copy_from_slice(&write_be(length));"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "function": "encode_descriptor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "ignore-capacity": {
+      "defect": "The slot header parser accepts a declared payload above the slot capacity.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "find": "if length < 2 || length > payload_limit as u64 {",
+          "replace": "if length < 2 {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "function": "decode_header",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "function": "decode_header",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "read-digest-from-descriptor": {
+      "defect": "The parser treats bytes in the descriptor as the stored digest.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "find": "digest: read_field(bytes, DESCRIPTOR_BYTES),",
+          "replace": "digest: read_field(bytes, 40),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "function": "decode_header",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "forget-voter": {
+      "defect": "The runtime and its predicate allow a slot for a different voter.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "find": "        && header.descriptor.voter@ == voter\n",
+          "replace": ""
+        },
+        {
+          "file": "src/ordered/replication/slot_header.rs",
+          "find": "        && bytes_equal(&descriptor.voter, voter)\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/voter_slot_header/laws.rs",
+          "function": "voter_slot_scope_is_exact",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    }
+  }
+}

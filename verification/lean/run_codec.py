@@ -17,8 +17,15 @@ def main():
     command = [lake, "env", "lean"]
     codec = ROOT / "Logkeeper" / "Codec.lean"
     image = ROOT / "Logkeeper" / "CompactImage.lean"
+    slot = ROOT / "Logkeeper" / "VoterSlotHeader.lean"
     check_lean_theorems(ROOT, command, codec, count=7, case="codec")
     check_lean_theorems(ROOT, command, image, count=8, case="compact-image")
+    check_lean_theorems(ROOT, command, slot, count=4, case="voter-slot-header")
+    check_lean_mutation(
+        ROOT, command, slot, "voter-slot-header-ignore-voter",
+        [("header.voter = voter ∧", "True ∧")],
+        "  rfl\n\nprivate theorem take_field",
+    )
     check_lean_mutation(
         ROOT, command, codec, "codec-ignore-maximum",
         [("minimum ≤ declared ∧ declared ≤ maximum", "minimum ≤ declared ∧ True")],
