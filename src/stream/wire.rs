@@ -23,13 +23,22 @@ pub struct EpochRun {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Create { stream: StreamId, ensemble: [KeeperId; 3] },
-    Seal { stream: StreamId, epoch: Epoch, holder: Holder },
-    Sync { stream: StreamId, epoch: Epoch, from: Lsn, records: Vec<Bytes>, complete: bool },
-    Append { stream: StreamId, epoch: Epoch, at: Lsn, records: Vec<Bytes>, commit: Lsn },
-    Trim { stream: StreamId, epoch: Epoch, through: Lsn },
+    /// Promise only within the caller's ensemble. Stale routes are fenced after replacement.
+    Seal { stream: StreamId, ensemble: [KeeperId; 3], epoch: Epoch, holder: Holder },
+    /// Install a range from the chosen history. `runs` covers exactly `records`;
+    /// `floor` and `commit` describe the prefix installed by the end of this chunk.
+    Sync { stream: StreamId, epoch: Epoch, holder: Holder, floor: Lsn, from: Lsn, records: Vec<Bytes>, runs: Vec<EpochRun>, commit: Lsn, complete: bool },
+    Append { stream: StreamId, epoch: Epoch, holder: Holder, at: Lsn, records: Vec<Bytes>, commit: Lsn },
+    Trim { stream: StreamId, epoch: Epoch, holder: Holder, through: Lsn },
     Check { stream: StreamId, epoch: Epoch },
+    /// Fetch accepted history under the current promise, including above `commit`.
+    Recover { stream: StreamId, epoch: Epoch, holder: Holder, from: Lsn, max: u32 },
+    /// Fetch committed history. A page can stop early at the wire byte limit.
     Read { stream: StreamId, from: Lsn, max: u32, wait_ms: u32 },
-    Delete { stream: StreamId },
+    Delete { stream: StreamId, ensemble: [KeeperId; 3] },
+    /// Install a one-keeper replacement at a synced epoch. The proposer must
+    /// obtain durable replies from both survivors before installing the learner.
+    Replace { stream: StreamId, epoch: Epoch, holder: Holder, from: [KeeperId; 3], to: [KeeperId; 3] },
 }
 
 /// A keeper's durable view of one stream.
@@ -41,6 +50,9 @@ pub struct StreamView {
     pub commit: Lsn,
     pub floor: Lsn,
     pub runs: Vec<EpochRun>,
+    pub ensemble: [KeeperId; 3],
+    /// A replacement cannot vote until it is synced and installed in the ensemble.
+    pub learner: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +65,7 @@ pub enum Reply {
     Checked(StreamView),
     Records { floor: Lsn, records: Vec<(Lsn, Bytes)>, commit: Lsn },
     Deleted,
+    Replaced,
     Refused(Refusal),
 }
 
@@ -69,6 +82,7 @@ pub enum Refusal {
     NotFound,
     Deleted,
     Unauthorized,
+    WrongEnsemble { ensemble: [KeeperId; 3] },
 }
 
 /// A transport failure. The request may or may not have taken effect.
