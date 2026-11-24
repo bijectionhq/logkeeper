@@ -413,9 +413,11 @@ impl TcpTransport {
             .routes
             .get(&keeper)
             .ok_or(TransportError::Unreachable)?;
-        // Waiting reads would hold the shared connection's in-order replies.
-        let exclusive = matches!(request, Request::Read { wait_ms: 1.., .. })
-            || matches!(request, Request::Batch(_))
+        // Waiting reads and Delete compaction would hold the shared connection's replies.
+        let exclusive = matches!(
+            request,
+            Request::Read { wait_ms: 1.., .. } | Request::Delete { .. } | Request::Batch(_)
+        )
             || codec::batched_request_len(&request) >= SHARED_REQUEST_BYTES;
         if !exclusive {
             return route.shared.call(request).await;

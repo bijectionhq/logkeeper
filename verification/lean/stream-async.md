@@ -30,8 +30,8 @@ only by a new argument about mixtures that the Paxos core cannot express. Cleari
 a stale keeper). The simpler result is the one view change Viewstamped Replication already
 makes atomic: the keeper stages an incomplete Sync's records and floor, and its view,
 including every Seal and Check reply, changes only when a complete Sync installs them. A
-new promise discards the staging. Staged records live in the WAL and in `.staged`
-checkpoint extents, so a long transfer survives rotation and reopen. Study 119's model
+new promise discards the staging. Staged records live in the WAL and in the retained and staged ranges of the
+shared checkpoint index, so a long transfer survives rotation and reopen. Study 119's model
 was already staged, so it is unchanged. `incomplete_sync_with_changed_tail_has_no_reference_step`
 is now the negative control, and the replay rejects the former effect.
 [Keeper state](../../src/stream/keeper/state.rs) · [WAL](../../src/stream/keeper/wal.rs)
@@ -150,7 +150,7 @@ The model still assumes these facts; no proof ties them to the code.
   [Sweeper](../../src/stream/keeper/sweep.rs)
 - **WAL and transport.** Reopen rows show the reopened image equals the durable image for
   every crash in the corpus, and Study 117's bridge covers reply survival. Torn frames,
-  background checkpoints of staged and retained records, and the authenticated byte
+  shared-pack checkpoints of staged and retained records, and the authenticated byte
   exchange are not modeled in Lean. A `Batch` envelope is transport framing that the
   keeper splits into single requests before deciding; the simulator and the replay use
   single requests.
@@ -176,3 +176,14 @@ to represent. Wrapper futures share the action of the delegated future.
 | Reads | [Try one keeper](../../src/stream/writer/read.rs#L23), [sample the first chunk](../../src/stream/writer/read.rs#L69) and [fetch subsequent chunks](../../src/stream/writer/read.rs#L97). The keeper [enqueues the request](../../src/stream/keeper/mod.rs#L115), [waits for the WAL worker's result](../../src/stream/keeper/mod.rs#L117) and [wakes or times out a long poll](../../src/stream/keeper/mod.rs#L121). |
 | Replacement coordination | [Complete a sweep plan](../../src/stream/keeper/sweep.rs#L38), [seal both survivors](../../src/stream/keeper/sweep.rs#L59), [copy to the other survivor](../../src/stream/keeper/sweep.rs#L87), [complete Sync on the source](../../src/stream/keeper/sweep.rs#L99), [publish on both survivors](../../src/stream/keeper/sweep.rs#L103), [create the learner](../../src/stream/keeper/sweep.rs#L116), [seal the learner](../../src/stream/keeper/sweep.rs#L117), [copy to the learner](../../src/stream/keeper/sweep.rs#L130), [install both survivors](../../src/stream/keeper/sweep.rs#L131) and [promote the learner](../../src/stream/keeper/sweep.rs#L135). |
 | Replacement RPCs | [Recover a chunk](../../src/stream/keeper/sweep.rs#L163), [install it](../../src/stream/keeper/sweep.rs#L207) or [complete an empty copy](../../src/stream/keeper/sweep.rs#L223). [Seal the old roster](../../src/stream/keeper/sweep.rs#L237) and [retry the new roster](../../src/stream/keeper/sweep.rs#L240) on a split installation. [Await Replace](../../src/stream/keeper/sweep.rs#L271), [await Sync](../../src/stream/keeper/sweep.rs#L301), [await publication](../../src/stream/keeper/sweep.rs#L322), [check the expected reply](../../src/stream/keeper/sweep.rs#L332) and [receive the transport reply](../../src/stream/keeper/sweep.rs#L348). |
+
+
+The storage change preserves the automaton's durable image. Physical WAL
+rollover can split an entry across segments, and the shared checkpoint worker
+publishes the complete boundary before removing covered files. Rust
+regressions exercise cross-segment recovery and the pre-publication and
+post-publication crash states. The trace checker still projects each keeper
+effect and reopen to the same state. An isolated append continues to require
+quorum acceptance before publication. The first-accept control reaches a
+single local acceptance and checks that a read cannot expose it before a
+takeover that adopts an empty history.

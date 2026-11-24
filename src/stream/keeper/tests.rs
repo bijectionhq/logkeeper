@@ -145,11 +145,18 @@ impl Harness {
     }
 
     fn batch(&mut self, requests: impl IntoIterator<Item = Request>) -> Vec<Reply> {
+        let mut deletes = false;
         let (pending, results): (VecDeque<_>, Vec<_>) = requests
             .into_iter()
-            .map(|request| work(&CLIENT, request))
+            .map(|request| {
+                deletes |= matches!(request, Request::Delete { .. });
+                work(&CLIENT, request)
+            })
             .unzip();
         self.engine.process(pending).unwrap();
+        if deletes {
+            self.engine.drain_checkpoints().unwrap();
+        }
         results
             .into_iter()
             .map(|mut result| result.try_recv().unwrap().0.unwrap())
@@ -169,12 +176,7 @@ impl Harness {
     }
 
     fn segment(&self) -> PathBuf {
-        let entries: Vec<_> = fs::read_dir(self.dir.path().join("segments"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(entries.len(), 1);
-        entries[0].clone()
+        self.engine.wal.segment()
     }
 }
 
@@ -303,7 +305,11 @@ fn incomplete_sync_is_invisible_until_complete() {
         test.send(sync(A, 2, 2, &[b"staged"], 1, false)),
         Reply::Synced { tail: Lsn(2) }
     );
-    assert_eq!(test.send(check(A)), voted, "an incomplete Sync keeps the voted view");
+    assert_eq!(
+        test.send(check(A)),
+        voted,
+        "an incomplete Sync keeps the voted view"
+    );
     assert_eq!(
         test.send(recover(A, 2, 1)),
         page(1, 1, &[(1, b"committed"), (2, b"divergent")])
@@ -312,7 +318,7 @@ fn incomplete_sync_is_invisible_until_complete() {
     let reopen = |test: Harness, rotate: bool| {
         let Harness { mut engine, dir } = test;
         if rotate {
-            engine.wal.rotate(&mut engine.streams).unwrap();
+            engine.wal.rotate(&engine.streams).unwrap();
         }
         drop(engine);
         let engine =
@@ -320,13 +326,21 @@ fn incomplete_sync_is_invisible_until_complete() {
         Harness { engine, dir }
     };
     let mut test = reopen(test, false);
-    assert_eq!(test.send(check(A)), voted, "WAL replay restores the staged Sync");
+    assert_eq!(
+        test.send(check(A)),
+        voted,
+        "WAL replay restores the staged Sync"
+    );
     assert_eq!(
         test.send(sync(A, 2, 3, &[b"more"], 1, false)),
         Reply::Synced { tail: Lsn(2) }
     );
     let mut test = reopen(test, true);
-    assert_eq!(test.send(check(A)), voted, "a checkpoint keeps the staged Sync");
+    assert_eq!(
+        test.send(check(A)),
+        voted,
+        "a checkpoint keeps the staged Sync"
+    );
     assert_eq!(
         test.send(sync(A, 2, 4, &[], 1, true)),
         Reply::Synced { tail: Lsn(3) }
@@ -367,29 +381,26 @@ fn background_checkpoint_follows_staged_records_into_the_completed_history() {
     test.send(append(A, 1, 1, &[b"committed", b"divergent"], 1));
     test.send(seal(A, 2));
     test.send(sync(A, 2, 2, &[b"staged"], 1, false));
-    let gate = Arc::new(std::sync::Barrier::new(2));
-    test.engine.wal.rotation_gate = Some(gate.clone());
+    let (gate, wait) = std::sync::mpsc::channel();
+    test.engine.wal.rotation_gate = Some(wait);
     test.engine
         .wal
-        .start_rotation(&test.engine.streams)
+        .start_rotation(&test.engine.streams, false)
         .unwrap();
     // The Sync completes while the checkpoint of its staged record is being written.
     assert_eq!(
         test.send(sync(A, 2, 3, &[], 1, true)),
         Reply::Synced { tail: Lsn(2) }
     );
-    gate.wait();
-    test.engine
-        .wal
-        .finish_rotation(&mut test.engine.streams)
-        .unwrap();
+    drop(gate);
+    test.engine.wal.finish_rotation().unwrap();
     let pending = test.engine.streams[&A]
         .records
         .iter()
-        .map(|record| matches!(record.payload, state::Payload::Pending(_)))
+        .map(|record| matches!(*record.payload.read(), state::Payload::Pending(_)))
         .collect::<Vec<_>>();
     assert_eq!(pending, [false, false], "the staged copy now backs LSN 2");
-    test.engine.wal.rotate(&mut test.engine.streams).unwrap();
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
     let Harness { engine, dir } = test;
     drop(engine);
     let engine = Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
@@ -637,32 +648,18 @@ fn delete_rotates_and_removes_only_its_payloads() {
         append(A, 1, 1, &[b"keep"], 1),
         append(B, 1, 1, &[b"remove"], 1),
     ]);
-    test.engine.wal.rotate(&mut test.engine.streams).unwrap();
-    let a = test
-        .dir
-        .path()
-        .join("streams")
-        .join(format!("{:032x}", A.0));
-    let b = test
-        .dir
-        .path()
-        .join("streams")
-        .join(format!("{:032x}", B.0));
-    let checkpoint = fs::read(a.join("state")).unwrap();
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
     let segment = test.segment();
+    let pack = pack_files(test.dir.path()).pop().unwrap();
+    let before = fs::read(&pack).unwrap();
+    assert!(before.windows(6).any(|bytes| bytes == b"remove"));
     assert_eq!(test.send(delete(B)), Reply::Deleted);
     assert_ne!(test.segment(), segment, "delete must rotate");
     assert!(!segment.exists(), "old shared segment still exists");
-    assert_eq!(
-        fs::read(a.join("state")).unwrap(),
-        checkpoint,
-        "untouched stream was checkpointed"
-    );
-    assert_eq!(
-        fs::read_dir(b).unwrap().count(),
-        1,
-        "deleted stream kept an extent"
-    );
+    assert!(!pack.exists(), "deleted stream kept a shared pack");
+    let packs = pack_files(test.dir.path());
+    assert_eq!(packs.len(), 1);
+    assert_eq!(fs::read(&packs[0]).unwrap(), b"keep");
     assert_eq!(test.send(create(B)), Reply::Refused(Refusal::Deleted));
     assert_eq!(test.send(delete(B)), Reply::Deleted);
     let Harness { engine, dir } = test;
@@ -819,6 +816,7 @@ fn recovery_cuts_interleaved_torn_tail_and_keeps_the_other_stream() {
         page(1, 2, &[(1, b"b1"), (2, b"b2")]),
         "other stream lost a whole record"
     );
+    reopened.engine.drain_checkpoints().unwrap();
     assert!(!segment.exists());
 }
 
@@ -1112,7 +1110,7 @@ async fn sweeper_restores_an_absent_survivor_from_one_durable_copy() {
 }
 
 #[test]
-fn recovery_resumes_rotation_after_only_one_stream_checkpointed() {
+fn checkpoint_boundary_controls_wal_replay() {
     let mut test = Harness::new(Limits::default());
     test.writer(A);
     test.writer(B);
@@ -1120,48 +1118,29 @@ fn recovery_resumes_rotation_after_only_one_stream_checkpointed() {
         append(A, 1, 1, &[b"a1"], 1),
         append(B, 1, 1, &[b"b1"], 1),
         trim(A, 1, 1),
-        append(A, 1, 2, &[b"a2"], 2),
     ]);
-    let segment = test.segment();
-    test.engine
-        .wal
-        .checkpoint_stream(A, test.engine.streams.get_mut(&A).unwrap())
-        .unwrap();
-    let a = test
-        .dir
-        .path()
-        .join("streams")
-        .join(format!("{:032x}", A.0));
-    let path = a.join("state");
-    let checkpoint = fs::read(&path).unwrap();
-    let file = OpenOptions::new().write(true).open(&path).unwrap();
-    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(100))
-        .unwrap();
-    let modified = file.metadata().unwrap().modified().unwrap();
-    drop(file);
+    let old = test.segment();
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+    // Crash after publishing the index and before unlinking the covered segment.
+    fs::write(&old, b"damaged redundant data").unwrap();
+    test.send(append(A, 1, 2, &[b"a2"], 2));
+
     let Harness { engine, dir } = test;
     drop(engine);
     let mut reopened = Harness {
-        engine: Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap(),
+        engine: Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow))
+            .expect("covered WAL was applied again"),
         dir,
     };
-    assert_eq!(
-        reopened.send(read(A, 2)),
-        page(2, 2, &[(2, b"a2")]),
-        "checkpointed stream was replayed twice"
+    let view = reopened.send(check(A));
+    assert!(
+        matches!(view, Reply::Checked(view) if view.floor == Lsn(2) && view.tail == Lsn(2)),
+        "replay lost the indexed floor or the WAL suffix"
     );
-    assert_eq!(
-        reopened.send(read(B, 1)),
-        page(1, 1, &[(1, b"b1")]),
-        "uncheckpointed stream was skipped"
-    );
-    assert_eq!(fs::read(&path).unwrap(), checkpoint);
-    assert_eq!(
-        fs::metadata(path).unwrap().modified().unwrap(),
-        modified,
-        "checkpointed stream was rewritten"
-    );
-    assert!(!segment.exists());
+    assert_eq!(reopened.send(read(A, 2)), page(2, 2, &[(2, b"a2")]));
+    assert_eq!(reopened.send(read(B, 1)), page(1, 1, &[(1, b"b1")]));
+    reopened.engine.drain_checkpoints().unwrap();
+    assert!(!old.exists());
 }
 
 #[test]
@@ -1170,17 +1149,8 @@ fn corrupt_extent_cannot_supply_a_read() {
     let mut test = Harness::new(Limits::default());
     test.writer(A);
     test.send(append(A, 1, 1, &[b"valid"], 1));
-    test.engine.wal.rotate(&mut test.engine.streams).unwrap();
-    let dir = test
-        .dir
-        .path()
-        .join("streams")
-        .join(format!("{:032x}", A.0));
-    let path = fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "extent"))
-        .unwrap();
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+    let path = pack_files(test.dir.path()).pop().unwrap();
     let mut file = OpenOptions::new().write(true).open(path).unwrap();
     file.seek(SeekFrom::End(-1)).unwrap();
     file.write_all(b"!").unwrap();
@@ -1462,13 +1432,12 @@ fn background_rotation_keeps_deciding_rounds_until_its_checkpoints_are_durable()
         append(A, 1, 1, &[b"a1", b"a2"], 2),
         append(B, 1, 1, &[b"b1", b"b2"], 2),
     ]);
-    let state = |stream: StreamId| test_state_path(test.dir.path(), stream);
-    let (a_state, b_state) = (state(A), state(B));
-    let gate = Arc::new(std::sync::Barrier::new(2));
-    test.engine.wal.rotation_gate = Some(gate.clone());
+    let index = test.dir.path().join("INDEX");
+    let (gate, wait) = std::sync::mpsc::channel();
+    test.engine.wal.rotation_gate = Some(wait);
     test.engine
         .wal
-        .start_rotation(&test.engine.streams)
+        .start_rotation(&test.engine.streams, false)
         .unwrap();
 
     // The checkpoint worker is held, yet rounds are decided and synced in the new segment.
@@ -1481,25 +1450,22 @@ fn background_rotation_keeps_deciding_rounds_until_its_checkpoints_are_durable()
         ]
     );
     assert_eq!(test.engine.wal.rounds.len(), rounds + 1);
-    assert!(!a_state.exists() && !b_state.exists());
+    assert!(!index.exists());
     assert_eq!(
         segment_count(test.dir.path()),
         2,
         "old segment retired early"
     );
 
-    gate.wait();
-    test.engine
-        .wal
-        .finish_rotation(&mut test.engine.streams)
-        .unwrap();
-    assert!(a_state.exists() && b_state.exists());
+    drop(gate);
+    test.engine.wal.finish_rotation().unwrap();
+    assert!(index.exists());
     assert_eq!(segment_count(test.dir.path()), 1);
     let kinds = |stream: StreamId, engine: &Engine| {
         engine.streams[&stream]
             .records
             .iter()
-            .map(|record| matches!(record.payload, state::Payload::Pending(_)))
+            .map(|record| matches!(*record.payload.read(), state::Payload::Pending(_)))
             .collect::<Vec<_>>()
     };
     assert_eq!(
@@ -1528,24 +1494,296 @@ fn background_rotation_keeps_deciding_rounds_until_its_checkpoints_are_durable()
         page(1, 3, &[(1, b"a1"), (2, b"a2"), (3, b"a3")])
     );
     assert_eq!(reopened.send(read(B, 2)), page(2, 2, &[(2, b"b2")]));
+}
 
-    // Negative control: a synchronous rotation does all checkpoint IO before returning,
-    // so the round loop cannot run until every dirty stream is durable.
-    reopened.send(append(A, 1, 4, &[b"a4"], 4));
-    let before = fs::read(test_state_path(reopened.dir.path(), A)).unwrap();
-    reopened
-        .engine
-        .wal
-        .rotate(&mut reopened.engine.streams)
-        .unwrap();
-    assert_ne!(
-        fs::read(test_state_path(reopened.dir.path(), A)).unwrap(),
-        before
+fn pack_files(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|file| file.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
+        .collect()
+}
+
+#[test]
+fn rotation_sync_count_is_independent_of_dirty_streams() {
+    let rotate = |count| {
+        let mut test = Harness::new(Limits::default());
+        for id in 1..=count {
+            test.writer(StreamId(id));
+            test.send(append(StreamId(id), 1, 1, &[b"record"], 1));
+        }
+        let before = durability::syncs();
+        test.engine.wal.rotate(&test.engine.streams).unwrap();
+        assert_eq!(pack_files(test.dir.path()).len(), 1);
+        durability::syncs() - before + test.engine.wal.rotation_syncs()
+    };
+    let one = rotate(1);
+    let many = rotate(10_000);
+    assert_eq!(
+        one, many,
+        "rotation sync count depends on dirty stream count"
+    );
+    assert_eq!(many, 7);
+}
+
+#[test]
+fn delete_joins_its_compaction_without_blocking_other_rounds() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.writer(B);
+    test.send(append(B, 1, 1, &[b"secret"], 1));
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+    let old_pack = pack_files(test.dir.path()).pop().unwrap();
+    let (gate, wait) = std::sync::mpsc::channel();
+    test.engine.wal.rotation_gate = Some(wait);
+
+    let (delete_work, mut deleted) = work(&CLIENT, delete(B));
+    test.engine.process(VecDeque::from([delete_work])).unwrap();
+    let (retry_work, mut retried) = work(&CLIENT, delete(B));
+    test.engine.process(VecDeque::from([retry_work])).unwrap();
+
+    assert!(old_pack.exists());
+    assert!(
+        matches!(deleted.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "delete replied before the tombstone and erasure checkpoint"
+    );
+    assert!(
+        matches!(retried.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "delete retry replied before erasure"
+    );
+    assert_eq!(test.send(read(B, 1)), Reply::Refused(Refusal::Deleted));
+    assert_eq!(
+        test.send(append(A, 1, 1, &[b"other stream"], 1)),
+        Reply::Appended { tail: Lsn(1) }
+    );
+
+    drop(gate);
+    test.engine.drain_checkpoints().unwrap();
+    assert_eq!(deleted.try_recv().unwrap().0, Ok(Reply::Deleted));
+    assert_eq!(retried.try_recv().unwrap().0, Ok(Reply::Deleted));
+    assert!(!old_pack.exists());
+}
+
+#[test]
+fn replay_and_new_rounds_do_not_wait_for_startup_compaction() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"one"], 1));
+    let old = test.segment();
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let mut engine =
+        Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
+    let (gate, wait) = std::sync::mpsc::channel();
+    engine.wal.rotation_gate = Some(wait);
+    let mut test = Harness { engine, dir };
+    assert!(old.exists(), "startup checkpoint ran synchronously");
+    assert_eq!(test.send(read(A, 1)), page(1, 1, &[(1, b"one")]));
+    assert_eq!(
+        test.send(append(A, 1, 2, &[b"two"], 2)),
+        Reply::Appended { tail: Lsn(2) }
+    );
+    assert!(old.exists(), "startup ran compaction on the round thread");
+    drop(gate);
+    test.engine.drain_checkpoints().unwrap();
+    assert!(!old.exists());
+    assert_eq!(
+        test.send(read(A, 1)),
+        page(1, 2, &[(1, b"one"), (2, b"two")])
     );
 }
 
-fn test_state_path(dir: &Path, stream: StreamId) -> PathBuf {
-    dir.join("streams")
-        .join(format!("{:032x}", stream.0))
-        .join("state")
+#[test]
+fn segment_rollover_caps_files_and_keeps_interleaved_fragments() {
+    let mut test = Harness::new(Limits {
+        round_bytes_per_stream: 85,
+        ..Limits::default()
+    });
+    test.engine.wal.segment_bytes = 256;
+    test.writer(A);
+    test.writer(B);
+    let mut large = append(A, 1, 1, &[], 1);
+    let data = Bytes::from(vec![7; 720]);
+    let Request::Append { records, .. } = &mut large else {
+        unreachable!()
+    };
+    records.push(data.clone());
+    assert_eq!(
+        test.batch([large, append(B, 1, 1, &[b"small"], 1)]),
+        [
+            Reply::Appended { tail: Lsn(1) },
+            Reply::Appended { tail: Lsn(1) }
+        ]
+    );
+    for path in fs::read_dir(test.dir.path().join("segments")).unwrap() {
+        assert!(
+            path.unwrap().metadata().unwrap().len() <= 256,
+            "segment exceeded its byte cap"
+        );
+    }
+    assert!(
+        segment_count(test.dir.path()) > 2,
+        "fixture must roll across multiple segments"
+    );
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let mut test = Harness {
+        engine: Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow))
+            .expect("cross-segment fragment was lost"),
+        dir,
+    };
+    assert_eq!(
+        test.send(read(A, 1)),
+        Reply::Records {
+            floor: Lsn(1),
+            head: Lsn(1),
+            records: vec![(Lsn(1), data)]
+        }
+    );
+    assert_eq!(test.send(read(B, 1)), page(1, 1, &[(1, b"small")]));
+}
+
+#[test]
+fn startup_reuses_a_checkpoint_boundary_with_an_unpublished_pack() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"live"], 1));
+    let next = test.segment().with_file_name("00000000000000000001.seg");
+    let orphan = test.dir.path().join("00000000000000000001.pack");
+    // Crash after syncing the new pack but before publishing INDEX.
+    fs::File::create(&next).unwrap();
+    fs::write(&orphan, b"unpublished").unwrap();
+    let covered = fs::metadata(test.segment()).unwrap().len();
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let engine = Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
+    let mut test = Harness { engine, dir };
+    assert_eq!(
+        test.engine.wal.uncheckpointed, covered,
+        "reopen lost the WAL suffix charge"
+    );
+    assert_eq!(test.send(read(A, 1)), page(1, 1, &[(1, b"live")]));
+    test.engine
+        .drain_checkpoints()
+        .expect("orphan pack blocked recovery");
+    assert_eq!(test.segment(), next);
+    assert_eq!(fs::read(orphan).unwrap(), b"live");
+    assert_eq!(test.engine.wal.uncheckpointed, 0);
+}
+
+#[test]
+fn recovered_delete_retry_waits_for_obsolete_pack_cleanup() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"ciphertext"], 1));
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+    let orphan = pack_files(test.dir.path()).pop().unwrap();
+    let data = fs::read(&orphan).unwrap();
+    assert_eq!(test.send(delete(A)), Reply::Deleted);
+    // Crash after publishing the tombstone index but before unlinking its old pack.
+    fs::write(&orphan, data).unwrap();
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let mut engine =
+        Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
+    let (gate, wait) = std::sync::mpsc::channel();
+    engine.wal.rotation_gate = Some(wait);
+    let (retry, mut result) = work(&CLIENT, delete(A));
+    engine.process(VecDeque::from([retry])).unwrap();
+    assert!(
+        matches!(result.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "recovered delete replied before durable cleanup"
+    );
+    drop(gate);
+    engine.drain_checkpoints().unwrap();
+    assert_eq!(result.try_recv().unwrap().0, Ok(Reply::Deleted));
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn wal_backlog_keeps_observations_running_without_growing_replay() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    let (gate, wait) = std::sync::mpsc::channel();
+    test.engine.wal.rotation_gate = Some(wait);
+    test.engine.wal.uncheckpointed = wal::MAX_WAL_SUFFIX_BYTES;
+    let (job, mut result) = work(&CLIENT, append(A, 1, 1, &[b"later"], 1));
+    test.engine.process(VecDeque::from([job])).unwrap();
+    assert_eq!(
+        result.try_recv().unwrap().0,
+        Err(TransportError::TimedOut),
+        "the keeper admitted a new mutation above the recovery bound"
+    );
+    assert_eq!(test.send(read(A, 1)), page(1, 0, &[]));
+    drop(gate);
+    test.engine.drain_checkpoints().unwrap();
+    assert_eq!(
+        test.send(append(A, 1, 1, &[b"later"], 1)),
+        Reply::Appended { tail: Lsn(1) }
+    );
+}
+
+#[test]
+fn legacy_checkpoint_migrates_with_an_uncaptured_wal_suffix() {
+    use bytes::BufMut;
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"legacy"], 1));
+    let dir = test
+        .dir
+        .path()
+        .join("streams")
+        .join(format!("{:032x}", A.0));
+    fs::create_dir_all(&dir).unwrap();
+    let mut extent = BytesMut::new();
+    extent.put_u64(1);
+    extent.put_u64(1);
+    extent.put_u32(6);
+    extent.put_u32(crc32fast::hash(b"legacy"));
+    extent.put_slice(b"legacy");
+    let path = dir.join("00000000000000000000.extent");
+    fs::write(&path, extent).unwrap();
+    let mut body = BytesMut::new();
+    body.put_u64(0);
+    body.put_u8(0);
+    wal::put_bytes(
+        &mut body,
+        &codec::encode_checkpoint_view(&test.engine.streams[&A].view).unwrap(),
+    )
+    .unwrap();
+    body.put_u32(1);
+    body.put_u64(0);
+    body.put_u8(0);
+    body.put_u64(1);
+    body.put_u64(1);
+    body.put_u8(0);
+    let mut frame = BytesMut::new();
+    frame.put_u32(body.len() as u32);
+    frame.put_u32(crc32fast::hash(&body));
+    frame.put_slice(&body);
+    fs::write(dir.join("state"), frame).unwrap();
+
+    let covered = test.segment();
+    test.engine.wal.roll_segment().unwrap();
+    fs::remove_file(covered).unwrap();
+    test.send(append(A, 1, 2, &[b"suffix"], 2));
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let engine = Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow))
+        .expect("legacy keeper lost its checkpoint format");
+    let mut test = Harness { engine, dir };
+    assert_eq!(
+        test.send(read(A, 1)),
+        page(1, 2, &[(1, b"legacy"), (2, b"suffix")])
+    );
+    test.engine.drain_checkpoints().unwrap();
+    assert!(!path.exists());
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let engine = Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
+    let mut test = Harness { engine, dir };
+    assert_eq!(
+        test.send(read(A, 1)),
+        page(1, 2, &[(1, b"legacy"), (2, b"suffix")])
+    );
 }

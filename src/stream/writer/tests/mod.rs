@@ -79,6 +79,45 @@ async fn different_payload_after_uncertain_append_has_no_decided_conflict() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn publishing_on_first_accept_would_expose_a_history_takeover_can_discard() {
+    let (network, old) = started().await;
+    let [only, left, right] = KEEPERS[..3].try_into().unwrap();
+    network.down(left, true);
+    network.down(right, true);
+    assert_eq!(
+        old.append(STREAM, E1, Lsn(1), record("unselected")).await,
+        Err(JournalError::Unavailable)
+    );
+    network
+        .until(|| network.view(only, STREAM).unwrap().tail == Lsn(1))
+        .await;
+    let reader = writer(&network, 9);
+    let observed = reader
+        .read(STREAM, Lsn(1), 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(
+        observed.records.is_empty(),
+        "single-keeper read exposed an unchosen record"
+    );
+
+    network.down(only, true);
+    network.down(left, false);
+    network.down(right, false);
+    let successor = writer(&network, 2);
+    assert_eq!(successor.seal(STREAM, E2).await, Ok(Lsn(0)));
+    assert_eq!(
+        successor.append(STREAM, E2, Lsn(1), record("chosen")).await,
+        Ok(Lsn(1))
+    );
+    let observed = reader
+        .read(STREAM, Lsn(1), 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(observed.records, [(Lsn(1), record("chosen"))]);
+}
+
+#[tokio::test(start_paused = true)]
 async fn stale_trim_checks_the_fence_before_reporting_a_local_head_conflict() {
     let (network, stale) = started().await;
     let successor = writer(&network, 2);

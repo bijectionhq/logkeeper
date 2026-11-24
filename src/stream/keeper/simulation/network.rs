@@ -304,6 +304,9 @@ impl Network {
                 Err(TransportError::Unreachable)
             }
             Ok(()) => {
+                if matches!(request, Request::Delete { .. }) {
+                    engine.drain_checkpoints().expect("finish delete compaction");
+                }
                 let reply = result.try_recv().expect("keeper must finish work").0;
                 record(Some(&reply), engine);
                 if matches!(request, Request::Append { head, .. } if head.0 != 0)

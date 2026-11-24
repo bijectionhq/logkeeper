@@ -11,7 +11,6 @@ use crate::stream::{
 
 pub(super) struct Extent {
     pub sequence: u64,
-    pub staged: bool,
     pub path: PathBuf,
 }
 
@@ -83,9 +82,29 @@ impl Payload {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Record {
     pub epoch: Epoch,
-    pub payload: Payload,
+    // A checkpoint can move the same record even if a later Sync installed it
+    // in a different position in the keeper's state.
+    pub payload: Arc<parking_lot::RwLock<Payload>>,
+}
+
+impl Record {
+    pub fn new(epoch: Epoch, payload: Payload) -> Self {
+        Self {
+            epoch,
+            payload: Arc::new(parking_lot::RwLock::new(payload)),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.payload.read().len()
+    }
+
+    pub fn read(&self, reader: &mut ExtentReader) -> io::Result<Bytes> {
+        self.payload.read().read(reader)
+    }
 }
 
 /// The records of an incomplete Sync. The keeper's view changes only when the Sync completes.
@@ -180,11 +199,11 @@ impl Stream {
                 .range(offset..offset + count as usize)
                 .enumerate()
             {
-                bytes += 20 + record.payload.len();
+                bytes += 20 + record.len();
                 if bytes > PAGE_BYTES {
                     break;
                 }
-                records.push((Lsn(from.0 + index as u64), record.payload.read(reader)?));
+                records.push((Lsn(from.0 + index as u64), record.read(reader)?));
             }
         }
         Ok(Reply::Records {
@@ -252,8 +271,8 @@ impl Stream {
                 Some(epoch)
             };
             if expected != Some(stored.epoch)
-                || payload.len() != stored.payload.len()
-                || *payload != stored.payload.read(reader)?
+                || payload.len() != stored.len()
+                || *payload != stored.read(reader)?
             {
                 return Ok((false, bytes));
             }
@@ -278,7 +297,7 @@ impl Stream {
             + staging
                 .records
                 .range(index(first).min(end_index)..end_index)
-                .map(|record| record.payload.len().max(1) as u64)
+                .map(|record| record.len().max(1) as u64)
                 .sum::<u64>()
     }
 
@@ -291,7 +310,7 @@ impl Stream {
         let tail = offset(tail);
         self.records
             .range(offset(first).min(tail)..tail)
-            .map(|record| record.payload.len().max(1) as u64)
+            .map(|record| record.len().max(1) as u64)
             .sum()
     }
 
@@ -301,7 +320,7 @@ impl Stream {
         }
         let count = (floor.0 - self.view.floor.0).min(self.records.len() as u64) as usize;
         for record in self.records.drain(..count) {
-            self.bytes -= record.payload.len().max(1) as u64;
+            self.bytes -= record.len().max(1) as u64;
         }
         let count = self.view.runs.partition_point(|run| run.last < floor);
         self.view.runs.drain(..count);
@@ -314,7 +333,7 @@ impl Stream {
     fn truncate(&mut self, from: Lsn) {
         let keep = (from.0 - self.view.floor.0).min(self.records.len() as u64) as usize;
         for record in self.records.drain(keep..) {
-            self.bytes -= record.payload.len().max(1) as u64;
+            self.bytes -= record.len().max(1) as u64;
         }
         let keep = self.view.runs.partition_point(|run| run.first < from);
         self.view.runs.truncate(keep);
@@ -334,7 +353,7 @@ impl Stream {
                 last: lsn,
             }),
         }
-        self.bytes += record.payload.len().max(1) as u64;
+        self.bytes += record.len().max(1) as u64;
         self.records.push_back(record);
         self.view.tail = lsn;
     }
@@ -402,7 +421,9 @@ impl Stream {
                     Some(mut staging)
                         if staging.from <= start && start.0 <= staging.tail().0 + 1 =>
                     {
-                        staging.records.truncate((start.0 - staging.from.0) as usize);
+                        staging
+                            .records
+                            .truncate((start.0 - staging.from.0) as usize);
                         staging
                     }
                     _ => Staging {
@@ -417,10 +438,9 @@ impl Stream {
                     .into_iter()
                     .flat_map(|run| (run.first.0..=run.last.0).map(move |_| run.epoch));
                 for (payload, epoch) in records.into_iter().zip(epochs).skip(skip) {
-                    staging.records.push_back(Record {
-                        epoch,
-                        payload: Payload::Pending(payload),
-                    });
+                    staging
+                        .records
+                        .push_back(Record::new(epoch, Payload::Pending(payload)));
                 }
                 if complete {
                     self.install(staging, head);
@@ -441,10 +461,7 @@ impl Stream {
             } => {
                 if at > self.view.tail {
                     for payload in records {
-                        self.push(Record {
-                            epoch,
-                            payload: Payload::Pending(payload),
-                        });
+                        self.push(Record::new(epoch, Payload::Pending(payload)));
                     }
                 }
                 self.view.head = self.view.head.max(head);

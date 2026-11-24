@@ -129,3 +129,21 @@ jar. Use `--lean-only` or `--scenario protocol` for a subset. Pass
 checkout. The runner writes logs, generated TLC configurations and mutation
 sources to the ignored `.results/` directory. A control must fail at its
 designated theorem or invariant.
+
+
+## Shared checkpoint boundary and append latency
+
+The keeper's shared index changes the file-level representation of the
+durable WAL prefix. The model's durable image and the WAL bridge's
+per-stream projection still describe the same keeper effects. Study 119's
+WAL actions model record and reply durability. The pack sync, index rename,
+directory sync and covered-file unlink boundaries are exercised in the Rust
+keeper regressions. Read and recovery bounds after replacement are unchanged.
+
+An isolated append still accepts before publishing. In the bounded schedule
+of three original keepers, two epochs and one position, epoch 1 delivers
+the append to one keeper. A read from that keeper cannot return the record.
+The other two keepers seal epoch 2 with an empty history and choose another
+payload at the same position. The Rust witness reaches each step. Its
+negative control publishes the append's tail on the first accept and the
+read-visibility check rejects it.

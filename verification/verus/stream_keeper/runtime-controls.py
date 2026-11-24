@@ -89,8 +89,11 @@ CONTROLS = [
         KEEPER_TEST + "recovery_refuses_damage_before_the_last_segment", "middle segment damage was accepted",
     ),
     (
-        "replay-checkpointed-stream", "keeper/wal.rs", "sequence <= last", "sequence < last",
-        KEEPER_TEST + "recovery_resumes_rotation_after_only_one_stream_checkpointed", "checkpointed stream was rewritten",
+        "replay-covered-wal", "keeper/wal.rs",
+        "for (expected, (&seq, segment)) in (first..).zip(paths.range(first..)) {",
+        "let first = *paths.first_key_value().unwrap().0;\n"
+        "        for (expected, (&seq, segment)) in (first..).zip(paths.range(first..)) {",
+        KEEPER_TEST + "checkpoint_boundary_controls_wal_replay", "covered WAL was applied again",
     ),
     (
         "ignore-extent-crc", "keeper/state.rs",
@@ -98,10 +101,82 @@ CONTROLS = [
         KEEPER_TEST + "corrupt_extent_cannot_supply_a_read", "called `Result::unwrap_err()` on an `Ok` value",
     ),
     (
-        "delete-without-rotation", "keeper/mod.rs",
-        "if !deletions.is_empty() || self.wal.bytes >= wal::SEGMENT_BYTES {",
-        "if self.wal.bytes >= wal::SEGMENT_BYTES {",
-        KEEPER_TEST + "delete_rotates_and_removes_only_its_payloads", "delete must rotate",
+        "per-stream-checkpoint-sync", "keeper/checkpoint.rs",
+        "                file.write_all(&stream.body)?;",
+        "                file.write_all(&stream.body)?;\n                sync_file(file.get_ref())?;",
+        KEEPER_TEST + "rotation_sync_count_is_independent_of_dirty_streams",
+        "rotation sync count depends on dirty stream count",
+    ),
+    (
+        "delete-without-compaction", "keeper/wal.rs",
+        "            || delete\n            || index.compaction_due()\n            || dirty.iter().any(|id| states[id].deleted);",
+        "            || index.compaction_due();\n        let _ = delete;",
+        KEEPER_TEST + "delete_rotates_and_removes_only_its_payloads", "deleted stream kept a shared pack",
+    ),
+    (
+        "early-delete-ack", "keeper/mod.rs",
+        "            if reply == Reply::Deleted {\n                self.deletions.entry(id).or_default().push(work.done);",
+        "            if reply == Reply::Deleted {\n                replies.push((work.done, (Ok(Reply::Deleted), None)));",
+        KEEPER_TEST + "delete_joins_its_compaction_without_blocking_other_rounds",
+        "delete replied before the tombstone and erasure checkpoint",
+    ),
+    (
+        "inline-startup-compaction", "keeper/wal.rs",
+        "        Ok((wal, states))",
+        "        #[cfg(test)]\n        if wal.bootstrap { wal.rotate(&states)?; }\n        Ok((wal, states))",
+        KEEPER_TEST + "replay_and_new_rounds_do_not_wait_for_startup_compaction",
+        "startup checkpoint ran synchronously",
+    ),
+    (
+        "uncapped-segment", "keeper/wal.rs",
+        "let limit = self.segment_bytes;",
+        "let limit = self.segment_bytes + SEGMENT_BYTES;",
+        KEEPER_TEST + "segment_rollover_caps_files_and_keeps_interleaved_fragments",
+        "segment exceeded its byte cap",
+    ),
+    (
+        "discard-continuation", "keeper/wal.rs",
+        "if flags == CONTINUED && id == StreamId(0) && frame.0 == &[0][..] {\n                continue;",
+        "if flags == CONTINUED && id == StreamId(0) && frame.0 == &[0][..] {\n                fragments.clear();\n                continue;",
+        KEEPER_TEST + "segment_rollover_caps_files_and_keeps_interleaved_fragments",
+        "cross-segment fragment was lost",
+    ),
+    (
+        "ignore-unpublished-pack", "keeper/checkpoint.rs",
+        "        if !self.references(next) {", "        if false && !self.references(next) {",
+        KEEPER_TEST + "startup_reuses_a_checkpoint_boundary_with_an_unpublished_pack",
+        "orphan pack blocked recovery",
+    ),
+    (
+        "reset-replay-charge", "keeper/wal.rs",
+        "            uncheckpointed,", "            uncheckpointed: 0,",
+        KEEPER_TEST + "startup_reuses_a_checkpoint_boundary_with_an_unpublished_pack",
+        "reopen lost the WAL suffix charge",
+    ),
+    (
+        "early-recovered-delete-ack", "keeper/mod.rs",
+        "self.recovering || self.rotating_deletions.contains_key(&id)",
+        "self.rotating_deletions.contains_key(&id)",
+        KEEPER_TEST + "recovered_delete_retry_waits_for_obsolete_pack_cleanup",
+        "recovered delete replied before durable cleanup",
+    ),
+    (
+        "admit-mutations-during-wal-backlog", "keeper/mod.rs",
+        "Decision::Persist if backlogged =>", "Decision::Persist if backlogged && false =>",
+        KEEPER_TEST + "wal_backlog_keeps_observations_running_without_growing_replay",
+        "the keeper admitted a new mutation above the recovery bound",
+    ),
+    (
+        "skip-legacy-checkpoint", "keeper/wal.rs",
+        "None if streams.exists() =>", "None if false && streams.exists() =>",
+        KEEPER_TEST + "legacy_checkpoint_migrates_with_an_uncaptured_wal_suffix",
+        "legacy keeper lost its checkpoint format",
+    ),
+    (
+        "publish-before-choice", "writer/append.rs",
+        "head: self.head.min(last),", "head: last,",
+        "stream::writer::tests::publishing_on_first_accept_would_expose_a_history_takeover_can_discard",
+        "single-keeper read exposed an unchosen record",
     ),
     (
         "reopen-as-another-keeper", "keeper/wal.rs",
@@ -114,14 +189,17 @@ CONTROLS = [
     ),
     (
         "single-survivor", "keeper/sweep.rs",
-        "let (left, right) = tokio::try_join!(\n"
+        "let (left, right) = tokio::join!(\n"
         "            self.seal(transport, first, next),\n"
         "            self.seal(transport, second, next)\n"
-        "        )?;",
-        "let left = self.seal(transport, first, next).await?;\n"
-        "        let (second, right) = match self.seal(transport, second, next).await {\n"
-        "            Ok(view) => (second, view),\n"
-        "            Err(_) => (first, left.clone()),\n"
+        "        );",
+        "let (left, right) = tokio::join!(\n"
+        "            self.seal(transport, first, next),\n"
+        "            self.seal(transport, second, next)\n"
+        "        );\n"
+        "        let (second, right) = match (&left, right) {\n"
+        "            (Ok(left), Err(_)) => (first, Ok(left.clone())),\n"
+        "            (_, right) => (second, right),\n"
         "        };",
         KEEPER_TEST + "sweeper_uses_two_survivors_and_activates_the_trimmed_learner",
         "matches!(outcome, Err(SweepError::Transport",
@@ -144,7 +222,7 @@ CONTROLS = [
         KEEPER_TEST + "replacement_fences_stale_routes_and_resumes_a_split_install", "stale route gained a tombstone",
     ),
     (
-        "writes-by-reader", "transport.rs", "_ => can_write,", "_ => can_write || can_read,",
+        "writes-by-reader", "transport.rs", "_ => self.can_write,", "_ => self.can_write || self.can_read,",
         TLS_TEST, "reader reached a writer verb",
     ),
     (

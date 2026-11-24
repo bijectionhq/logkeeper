@@ -1,5 +1,7 @@
 //! A durable keeper for many streams. The keeper serializes decisions and WAL rounds.
+mod checkpoint;
 mod durability;
+mod legacy;
 #[cfg(test)]
 pub(super) mod memory;
 mod rules;
@@ -69,20 +71,13 @@ impl Keeper {
         limits: Limits,
         policy: Arc<dyn SealPolicy>,
     ) -> io::Result<Self> {
-        let mut engine = Engine::open(path, keeper, limits, policy)?;
-        let (work, mut incoming) = mpsc::channel::<Vec<Work>>(limits.round_requests);
+        let engine = Engine::open(path, keeper, limits, policy)?;
+        let (work, incoming) = mpsc::channel::<Vec<Work>>(limits.round_requests);
         std::thread::Builder::new()
             .name("stream-keeper-wal".into())
             .spawn(move || {
-                while let Some(first) = incoming.blocking_recv() {
-                    if first.iter().any(Work::is_mutation) {
-                        std::thread::sleep(Duration::from_micros(200));
-                    }
-                    let pending = admit(first, &mut incoming, limits.round_requests);
-                    if let Err(error) = engine.process(pending) {
-                        eprintln!("stream keeper WAL stopped: {error}");
-                        return;
-                    }
+                if let Err(error) = engine.run(incoming) {
+                    eprintln!("stream keeper WAL stopped: {error}");
                 }
             })?;
         Ok(Self { work })
@@ -218,6 +213,9 @@ struct Engine {
     policy: Arc<dyn SealPolicy>,
     wal: Wal,
     streams: HashMap<StreamId, Stream>,
+    deletions: HashMap<StreamId, Vec<Done>>,
+    rotating_deletions: HashMap<StreamId, Vec<Done>>,
+    recovering: bool,
 }
 
 impl Engine {
@@ -244,29 +242,93 @@ impl Engine {
             policy,
             wal,
             streams,
+            deletions: HashMap::new(),
+            rotating_deletions: HashMap::new(),
+            recovering: false,
         })
     }
 
-    fn process(&mut self, mut pending: VecDeque<Work>) -> io::Result<()> {
-        let mut deletions = Vec::new();
-        while !pending.is_empty() {
-            self.round(&mut pending, &mut deletions)?;
+    fn run(mut self, mut incoming: mpsc::Receiver<Vec<Work>>) -> io::Result<()> {
+        self.maintain()?;
+        loop {
+            let event = futures::executor::block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = self.wal.rotation_ready() => Some(None),
+                    first = incoming.recv() => first.map(Some),
+                }
+            });
+            match event {
+                Some(Some(first)) => {
+                    if first.iter().any(Work::is_mutation) {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                    self.process(admit(first, &mut incoming, self.limits.round_requests))?;
+                }
+                Some(None) => {
+                    self.complete_rotation()?;
+                    self.maintain()?;
+                }
+                None => return Ok(()),
+            }
         }
-        self.wal.poll_rotation(&mut self.streams)?;
-        if !deletions.is_empty() {
-            self.wal.rotate(&mut self.streams)?;
-        } else if self.wal.bytes >= wal::SEGMENT_BYTES {
-            self.wal.start_rotation(&self.streams)?;
-        }
-        for done in deletions {
+    }
+
+    fn complete_rotation(&mut self) -> io::Result<()> {
+        self.wal.finish_rotation()?;
+        self.recovering = false;
+        for done in std::mem::take(&mut self.rotating_deletions)
+            .into_values()
+            .flatten()
+        {
             let _ = done.send((Ok(Reply::Deleted), None));
         }
         Ok(())
     }
 
+    #[cfg(test)]
+    fn drain_checkpoints(&mut self) -> io::Result<()> {
+        while self.wal.rotating() {
+            self.complete_rotation()?;
+            self.maintain()?;
+        }
+        Ok(())
+    }
+
+    fn maintain(&mut self) -> io::Result<()> {
+        if self.wal.rotation_finished() {
+            self.complete_rotation()?;
+        }
+        if !self.wal.rotating()
+            && (self.wal.bootstrap
+                || !self.deletions.is_empty()
+                || self.wal.uncheckpointed >= wal::SEGMENT_BYTES - FRAME_OVERHEAD as u64)
+        {
+            self.recovering = self.wal.bootstrap;
+            self.wal
+                .start_rotation(&self.streams, !self.deletions.is_empty())?;
+            self.rotating_deletions = std::mem::take(&mut self.deletions);
+        }
+        Ok(())
+    }
+
+    fn process(&mut self, mut pending: VecDeque<Work>) -> io::Result<()> {
+        self.maintain()?;
+        // Bound the WAL suffix even if compaction runs slowly. Finish the admitted
+        // work, then ask new mutations to retry while observations keep advancing.
+        let backlogged = self.wal.uncheckpointed >= wal::MAX_WAL_SUFFIX_BYTES;
+        while !pending.is_empty() {
+            if self.wal.remaining() <= FRAME_OVERHEAD {
+                self.wal.roll_segment()?;
+            }
+            self.round(&mut pending, backlogged)?;
+        }
+        self.maintain()
+    }
+
     /// Decide and buffer in arrival order per stream. Other streams can advance while a
     /// large mutation is fragmented. A round publishes all its results after one sync.
-    fn round(&mut self, pending: &mut VecDeque<Work>, deletions: &mut Vec<Done>) -> io::Result<()> {
+    fn round(&mut self, pending: &mut VecDeque<Work>, backlogged: bool) -> io::Result<()> {
         let mut buffer = BytesMut::new();
         let mut charged = HashMap::<StreamId, usize>::new();
         let mut blocked = HashSet::new();
@@ -293,10 +355,17 @@ impl Engine {
                     &self.limits,
                     &mut self.wal.reader,
                 )? {
-                    Decision::Reply(Reply::Deleted)
-                        if changed.contains(&id) || !deletions.is_empty() =>
-                    {
-                        deletions.push(work.done);
+                    Decision::Reply(Reply::Deleted) => {
+                        if let Some(waiting) = self.deletions.get_mut(&id) {
+                            waiting.push(work.done);
+                        } else if self.recovering || self.rotating_deletions.contains_key(&id) {
+                            self.rotating_deletions
+                                .entry(id)
+                                .or_default()
+                                .push(work.done);
+                        } else {
+                            replies.push((work.done, (Ok(Reply::Deleted), None)));
+                        }
                         continue;
                     }
                     Decision::Reply(reply) => {
@@ -318,12 +387,17 @@ impl Engine {
                         replies.push((work.done, (Ok(reply), changed)));
                         continue;
                     }
+                    Decision::Persist if backlogged => {
+                        replies.push((work.done, (Err(TransportError::TimedOut), None)));
+                        continue;
+                    }
                     Decision::Persist => {}
                 }
             }
 
             let charge = charged.entry(id).or_default();
-            let budget = self.limits.round_bytes_per_stream - *charge;
+            let budget = (self.limits.round_bytes_per_stream - *charge)
+                .min(self.wal.remaining() - buffer.len());
             if budget <= FRAME_OVERHEAD {
                 blocked.insert(id);
                 pending.push_back(work);
@@ -363,7 +437,7 @@ impl Engine {
             self.wal.dirty.insert(id);
             changed.insert(id);
             if reply == Reply::Deleted {
-                deletions.push(work.done);
+                self.deletions.entry(id).or_default().push(work.done);
             } else {
                 replies.push((work.done, (Ok(reply), None)));
             }

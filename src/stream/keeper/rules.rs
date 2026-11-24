@@ -70,7 +70,7 @@ pub(crate) fn may_replace(current: bool, synced: bool, member: bool, changed: us
 pub use implementation::Limits;
 #[cfg(not(verus_keep_ghost))]
 pub(super) use implementation::{
-    Decision, StreamView, charge, decide, installs_floor, promised, sync_start, valid_limits,
+    Decision, StreamView, decide, installs_floor, promised, sync_start, valid_limits,
 };
 
 #[cfg(not(verus_keep_ghost))]

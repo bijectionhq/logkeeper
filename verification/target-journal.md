@@ -99,7 +99,7 @@ requests require writer authorization.
 | `Check { stream: StreamId, epoch: Epoch }` | Return the durable view. The caller uses the requested epoch to identify eligible replies. |
 | `Recover { stream: StreamId, epoch: Epoch, from: Lsn, max: u32 }` | Require the promise. Read retained accepted records, including records above the local head, with no wait. |
 | `Read { stream: StreamId, from: Lsn, max: u32, wait_ms: u32 }` | Read retained committed records up to the local head. A page can stop early at the wire byte limit. When the start is past the head and `max` is positive, wait up to `wait_ms`. |
-| `Delete { stream: StreamId, ensemble: [KeeperId; 3] }` | Require the current ensemble and membership. Install a permanent tombstone and rotate the WAL before replying. |
+| `Delete { stream: StreamId, ensemble: [KeeperId; 3] }` | Require the current ensemble and membership. Install a permanent tombstone. Reply after a background rotation has durably retired the files containing its ciphertext. |
 | `Replace { stream: StreamId, epoch: Epoch, from: [KeeperId; 3], to: [KeeperId; 3] }` | Require the promise and a completed Sync. Install a valid ensemble differing in one slot, with the keeper a member of the new ensemble. The proposer installs both survivors before installing the learner. |
 | `Batch(Vec<Request>)` | A node-level envelope of independent single-stream requests from one client process. Authorize each request separately. Admit every authorized request to the same round, decide them in arrival order and reply after that round's single sync. Each request keeps its own rule, refusal and fence. Refuse an empty or nested batch. |
 
@@ -151,7 +151,14 @@ requests require writer authorization.
   keeper's tail up to the highest position the writer has assigned. Two
   durable acceptances at the writer's epoch choose the record. Publish the
   head to a quorum before acknowledging the append, using the head on
-  subsequent or empty appends.
+  subsequent or empty appends. An isolated append takes an accept round
+  followed by a publication round. If the first accept could advance the
+  head, one keeper could serve the record while the other two fence that
+  writer and adopt a history without it. If the writer instead acknowledged
+  on acceptance alone, a fresh read index could sample the acknowledged
+  tail while every eligible head remained behind it. With no subsequent
+  write and the writer gone, nothing would publish that head. A fence or
+  any other publication failure after choice returns `Unavailable`.
 - **Head.** Open a fresh `Check` round after the invocation and batch callers
   waiting when it opens. A writer can use append replies from requests sent
   after the round opened. It covers the sampled tails with a chosen head and
@@ -182,24 +189,50 @@ requests require writer authorization.
   streams. Requests queued while a frame is written are coalesced into one
   `Batch`, up to 4 MiB, and frames are pipelined. The keeper decides a
   connection's frames concurrently and answers them in frame order. Waiting
-  reads and requests of 1 MiB or more use separate pooled connections, so
-  they never delay the shared connection's replies.
+  reads, deletes and requests of 1 MiB or more use separate pooled
+  connections, so they never delay the shared connection's replies.
 
 ### Keeper storage
 
 One append-only segmented WAL per keeper carries all streams. A frame records
 length, CRC, stream and fragment boundaries. A round admits whole
-queued envelopes until it holds at least `round_requests` requests, so a
-batch is never split across rounds. It uses at most `round_bytes_per_stream`
-WAL bytes per stream. Both limits are configured. Large entries span rounds.
-One write and sync cover the round's mutations. Recovery cuts a torn final
-frame, discards incomplete entries and demultiplexes by stream. Segment
-rotation copies changed retained records to per-stream extents, persists
-checkpoints and retires old segments. A full segment rotates in the
-background: rounds continue in the next segment while a worker writes each
-dirty stream's checkpoint as of the boundary, and the old segments are
-retired only after every checkpoint is durable. Delete forces a synchronous
-rotation. Each stream
+queued envelopes until it holds at least `round_requests` requests. A round
+uses at most `round_bytes_per_stream` WAL bytes per stream and fits in the
+current 64 MiB segment. Large entries can span rounds and segments. One write
+and sync cover a round's mutations. Recovery cuts a torn final frame and
+discards incomplete entries. A continuation marker carries unfinished
+fragments across a physical rollover. A fresh segment opened after recovery
+starts without those fragments.
+
+At a boundary between admissions, a background worker copies pending
+retained and staged records into a shared extent pack. It publishes a single
+keeper-wide index with the stream views, extent references, and first WAL
+segment to replay. The segment name is durable before checkpointing starts.
+The worker makes the new pack and its name durable before atomically replacing
+and syncing the index. It unlinks the covered segments and obsolete packs
+only after the index is durable. A crash before publication leaves the old
+index and WAL authoritative. A crash after publication uses the new index
+and can finish removing obsolete files. Each rotation uses a constant number
+of file and directory syncs.
+
+A delete first syncs its tombstone in the WAL. Its checkpoint copies only
+live records into a new pack and retires all old packs and the covered WAL
+before replying. The worker also reclaims unreferenced packs during regular
+rotation and compacts mixed packs when their physical bytes exceed twice
+their live bytes plus one segment. Rounds continue during the copy and an
+idempotent delete waits if its cleanup is outstanding. Reads after a keeper
+installs the tombstone are refused immediately. Removal is from the keeper's
+durable file namespace. RTDB completes cryptographic erasure as described in
+section 4.
+
+Startup loads the index and replays its suffix before serving. Index loading
+reads record metadata without scanning packed ciphertext. Startup schedules
+any resulting checkpoint work in the background. When the uncheckpointed WAL
+reaches four segments' worth of bytes, keepers finish the admitted batch and
+ask new mutations to retry until checkpoint progress frees space.
+Observations keep running. The replay bound is 256 MiB plus one admission of
+whole, wire-bounded envelopes and their WAL framing. The suffix charge is
+restored on restart, so repeated crashes cannot reset this limit. Each stream
 has a static quota. Trim can advance the floor without available quota.
 
 ## 4. What the consumer (RTDB) owns, for reference
