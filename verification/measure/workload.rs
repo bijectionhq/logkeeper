@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use journal_contract::{BoxFuture, Epoch, Identity, Journal, JournalError, Lsn, StreamId};
 use logkeeper::stream::{
-    keeper::{Sweep, sweep_idle},
+    keeper::{Sweep, SweepError, sweep_idle},
     transport::{Credentials, TcpTransport},
     wire::{KeeperId, Reply, Request, Transport, TransportError},
     writer::Writer,
@@ -251,8 +251,10 @@ pub async fn commit(
     streams: u64,
     width: u64,
     batches: u64,
+    in_flight: usize,
 ) -> Result<()> {
-    assert!(streams > 0 && width > 0 && batches > 0);
+    assert!(streams > 0 && width > 0 && batches > 0 && in_flight > 0);
+    let in_flight = in_flight.min(streams as usize);
     let cluster = Cluster::start(binary, [rtt; 3], CAP).await?;
     let io = Measured::connect(&cluster, &cluster.writer)?;
     let writer = io.writer()?;
@@ -261,27 +263,35 @@ pub async fn commit(
     let connections: Vec<_> = cluster.links.iter().map(Link::connections).collect();
     let mut tasks = JoinSet::new();
     let gate = Arc::new(tokio::sync::Barrier::new(streams as usize + 1));
+    let admission = Arc::new(tokio::sync::Semaphore::new(in_flight));
     for id in 1..=streams {
         let writer = writer.clone();
         let gate = gate.clone();
+        let admission = admission.clone();
         tasks.spawn(async move {
             gate.wait().await;
+            let mut queue_times = Vec::new();
             let mut batch_times = Vec::new();
             let mut append_times = Vec::new();
             for index in 0..batches {
+                let queued = Instant::now();
+                let _permit = admission.acquire().await.unwrap();
+                queue_times.push(queued.elapsed());
                 let (elapsed, records) = batch(&writer, id, index * width + 1, width).await?;
                 batch_times.push(elapsed);
                 append_times.extend(records);
             }
-            Ok::<_, BenchError>((batch_times, append_times))
+            Ok::<_, BenchError>((queue_times, batch_times, append_times))
         });
     }
     let start = Instant::now();
     gate.wait().await;
+    let mut queue_times = Vec::new();
     let mut batch_times = Vec::new();
     let mut append_times = Vec::new();
     while let Some(task) = tasks.join_next().await {
-        let (batch, append) = task??;
+        let (queue, batch, append) = task??;
+        queue_times.extend(queue);
         batch_times.extend(batch);
         append_times.extend(append);
     }
@@ -289,49 +299,50 @@ pub async fn commit(
     println!(
         "{}",
         json!({"case":"commit", "rtt_us":rtt.as_micros(), "streams":streams, "batch":width,
-        "batches_per_stream":batches, "seconds":elapsed.as_secs_f64(),
+        "in_flight_streams":in_flight, "batches_per_stream":batches, "seconds":elapsed.as_secs_f64(),
         "records_per_sec":append_times.len() as f64 / elapsed.as_secs_f64(), "record":stats(append_times),
-        "batch_ack":stats(batch_times), "rpc":io.rates(before, elapsed), "new_connections":
+        "producer_queue":stats(queue_times), "batch_ack":stats(batch_times), "rpc":io.rates(before, elapsed), "new_connections":
         cluster.links.iter().zip(connections).map(|(link, before)| link.connections()-before).collect::<Vec<_>>() })
     );
     Ok(())
 }
 
-async fn background(
+fn background(
     writer: Writer,
     ids: impl IntoIterator<Item = u64>,
     payload: Bytes,
+    first: u64,
     stop: &CancellationToken,
     period: Duration,
-) -> JoinSet<Result<u64>> {
+) -> JoinSet<Result<(u64, Lsn)>> {
     let mut tasks = JoinSet::new();
     for id in ids {
         let writer = writer.clone();
         let payload = payload.clone();
         let stop = stop.clone();
         tasks.spawn(async move {
-            let mut done = 0;
+            let mut head = first - 1;
             while !stop.is_cancelled() {
                 let start = Instant::now();
-                append(&writer, id, CURRENT, done + 1, payload.clone()).await?;
-                done += 1;
+                append(&writer, id, CURRENT, head + 1, payload.clone()).await?;
+                head += 1;
                 let slept = period.saturating_sub(start.elapsed());
                 if !slept.is_zero() {
                     tokio::select! { _ = stop.cancelled() => {}, _ = tokio::time::sleep(slept) => {} }
                 }
             }
-            Ok(done)
+            Ok((id, Lsn(head)))
         });
     }
     tasks
 }
 
-async fn collect_background(mut tasks: JoinSet<Result<u64>>) -> Result<u64> {
-    let mut count = 0;
+async fn collect_background(mut tasks: JoinSet<Result<(u64, Lsn)>>) -> Result<Vec<(u64, Lsn)>> {
+    let mut heads = Vec::new();
     while let Some(task) = tasks.join_next().await {
-        count += task??;
+        heads.push(task??);
     }
-    Ok(count)
+    Ok(heads)
 }
 
 pub async fn head(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
@@ -345,7 +356,14 @@ pub async fn head(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
         prepare(&writer, streams).await?;
         let stop = CancellationToken::new();
         let appends = if loaded {
-            background(writer.clone(), 1..=streams, record(), &stop, Duration::ZERO).await
+            background(
+                writer.clone(),
+                1..=streams,
+                record(),
+                1,
+                &stop,
+                Duration::ZERO,
+            )
         } else {
             JoinSet::new()
         };
@@ -508,10 +526,12 @@ pub async fn replace(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
     assert!(streams >= 100 && streams % 100 == 0);
     let mut cluster = Cluster::start(binary, [rtt; 3], CAP).await?;
     let writer = Measured::connect(&cluster, &cluster.writer)?.writer()?;
+    eprintln!("Preparing {streams} replacement streams");
     prepare(&writer, streams).await?;
     seed(&writer, 1..=streams).await?;
     cluster.keepers[0].kill()?;
     cluster.add(binary, LEARNER, rtt, CAP).await?;
+    eprintln!("Installing a learner for {streams} streams");
     let transport = Measured::connect(&cluster, &cluster.successor)?;
     let plan = |id: u64| Sweep {
         stream: StreamId(id.into()),
@@ -525,26 +545,43 @@ pub async fn replace(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
     let sweep = |id| {
         let transport = &transport;
         async move {
-            let (_, result) = sweep_idle(transport.as_ref(), [plan(id)])
-                .await
-                .pop()
-                .unwrap();
-            result?;
-            Ok::<_, BenchError>(start.elapsed())
+            let started = Instant::now();
+            loop {
+                match sweep_idle(transport.as_ref(), [plan(id)])
+                    .await
+                    .pop()
+                    .unwrap()
+                    .1
+                {
+                    Err(SweepError::Transport { .. }) if started.elapsed() < RETRY_LIMIT => {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    result => {
+                        result?;
+                        return Ok::<_, BenchError>(start.elapsed());
+                    }
+                }
+            }
         }
     };
-    // Park 99%. The active 1% each submit an append while idle streams move,
-    // then drain before their own per-stream replacement is scheduled.
-    let (mut completion, _) = tokio::try_join!(
-        stream::iter(count + 1..=streams)
-            .map(sweep)
-            .buffer_unordered(PARALLEL)
-            .try_collect::<Vec<_>>(),
-        stream::iter(1..=count)
-            .map(|id| append(&writer, id, CURRENT, 2, record()))
-            .buffer_unordered(PARALLEL)
-            .try_collect::<Vec<_>>(),
-    )?;
+    // Park 99%. The rest stay active until their writer drains for replacement.
+    let stop = CancellationToken::new();
+    let appends = background(
+        writer,
+        1..=count,
+        record(),
+        2,
+        &stop,
+        Duration::from_secs(1),
+    );
+    let mut completion = stream::iter(count + 1..=streams)
+        .map(sweep)
+        .buffer_unordered(PARALLEL)
+        .try_collect::<Vec<_>>()
+        .await?;
+    stop.cancel();
+    let heads: std::collections::HashMap<_, _> =
+        collect_background(appends).await?.into_iter().collect();
     completion.extend(
         stream::iter(1..=count)
             .map(sweep)
@@ -553,22 +590,29 @@ pub async fn replace(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
             .await?,
     );
     let elapsed = start.elapsed();
+    eprintln!("Verifying {streams} learner copies");
     // Check the learner has the copied data and is a voting member on every stream.
     // This observation is outside the measured installation interval.
     stream::iter(1..=streams).map(|id| {
         let transport = &transport;
+        let expected = heads.get(&id).copied().unwrap_or(Lsn(1));
         async move {
             let stream = StreamId(id.into());
-            let expected = if id <= count { Lsn(2) } else { Lsn(1) };
             let reply = transport.call(LEARNER, Request::Check { stream, epoch:NEXT }).await;
             assert!(matches!(reply, Ok(Reply::Checked(view)) if !view.learner && view.head == expected
                 && view.ensemble == [LEARNER, ENSEMBLE[1], ENSEMBLE[2]]), "unrestored learner on {stream:?}");
+            let data = transport.call(LEARNER, Request::Read {
+                stream, from: expected, max: 1, wait_ms: 0,
+            }).await;
+            assert!(matches!(data, Ok(Reply::Records { records, .. }) if records == [(expected, record())]),
+                "unreadable learner copy on {stream:?}");
             Ok::<_, BenchError>(())
         }
     }).buffer_unordered(PARALLEL).try_collect::<Vec<_>>().await?;
     println!(
         "{}",
         json!({"case":"replace", "rtt_us":rtt.as_micros(), "streams":streams, "active":count,
+        "active_appends":heads.values().map(|head| head.0 - 1).sum::<u64>(),
         "seconds":elapsed.as_secs_f64(), "streams_per_sec":streams as f64 / elapsed.as_secs_f64(),
         "completion":stats(completion)})
     );
@@ -585,7 +629,7 @@ pub async fn hot(binary: &Path, rtt: Duration, neighbours: u64, cap: usize) -> R
     let stop = CancellationToken::new();
     let period = Duration::from_secs_f64(hot_bytes as f64 / 200_000_000.0);
     let start = Instant::now();
-    let task = background(writer.clone(), [1], payload, &stop, period).await;
+    let task = background(writer.clone(), [1], payload, 1, &stop, period);
     let samples = stream::iter(2..=neighbours + 1)
         .map(|id| {
             let writer = &writer;
@@ -604,7 +648,9 @@ pub async fn hot(binary: &Path, rtt: Duration, neighbours: u64, cap: usize) -> R
         .try_collect::<Vec<_>>()
         .await;
     stop.cancel();
-    let records = collect_background(task).await?;
+    let [(_, Lsn(records))] = collect_background(task).await?[..] else {
+        unreachable!()
+    };
     let elapsed = start.elapsed();
     println!(
         "{}",
