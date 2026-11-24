@@ -190,6 +190,10 @@ impl State {
         self.serial
     }
 
+    pub(in crate::stream) fn retry_lanes(&mut self) {
+        self.revision += 1;
+    }
+
     pub(in crate::stream) fn mark_sent(&mut self) -> u64 {
         self.serial += 1;
         self.serial

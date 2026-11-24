@@ -146,6 +146,7 @@ impl Writer {
                 });
             }
             if active.epoch == epoch {
+                active.retry_lanes();
                 return head::check(&self.io, stream, Some(active)).await;
             }
         }

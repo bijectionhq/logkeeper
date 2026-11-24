@@ -819,6 +819,41 @@ async fn head_and_trim_wait_for_a_sampled_append_to_be_visible() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn same_epoch_seal_resumes_after_lost_publication_replies() {
+    let (network, writer) = started().await;
+    network.down(KEEPERS[2], true);
+    for &keeper in &KEEPERS[..2] {
+        network.fault(keeper, Kind::Publish, Fault::LoseReply);
+    }
+    let (first, second) = tokio::join!(
+        writer.append(STREAM, E1, Lsn(1), record("first")),
+        writer.append(STREAM, E1, Lsn(2), record("second")),
+    );
+    assert_eq!(first, Err(JournalError::Unavailable));
+    assert_eq!(second, Err(JournalError::Unavailable));
+
+    let observer = self::writer(&network, 2);
+    assert_eq!(observer.head(STREAM).await, Ok(Lsn(2)));
+    assert_eq!(writer.seal(STREAM, E1).await, Ok(Lsn(2)));
+    assert_eq!(
+        writer.append(STREAM, E1, Lsn(3), record("third")).await,
+        Ok(Lsn(3))
+    );
+    assert_eq!(
+        observer
+            .read(STREAM, Lsn(1), 3, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        [
+            (Lsn(1), record("first")),
+            (Lsn(2), record("second")),
+            (Lsn(3), record("third"))
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_fenced_publication_leaves_a_chosen_append_outcome_unknown() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);

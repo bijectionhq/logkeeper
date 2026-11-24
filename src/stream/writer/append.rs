@@ -194,6 +194,11 @@ impl Active {
         self.state.lock().proposer.open()
     }
 
+    pub(super) fn retry_lanes(&self) {
+        self.state.lock().proposer.retry_lanes();
+        self.wake();
+    }
+
     pub(super) fn observation(&self, lane: usize, after: u64) -> Option<Observation> {
         self.state.lock().observations[lane]
             .as_ref()
