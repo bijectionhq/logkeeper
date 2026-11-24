@@ -91,6 +91,7 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
     let first = enroll(&mut state);
     let second = enroll(&mut state);
     let (first_grant, first_start) = grant(&mut state, first);
+    let data = Bytes::from_static(b"d");
     let original = Request {
         id: RequestId::fresh(state.position(), state.limits.retry_positions).unwrap(),
         placement: state.placement,
@@ -101,9 +102,16 @@ fn full_data_and_read_capacity_let_a_replacement_publish_trim_and_reopen() {
             grant: first_grant,
             expected_next: 0,
             timestamp: 1,
-            payload: Bytes::from_static(b"d"),
+            payload: data.clone(),
         },
     };
+    let execute = service::wire::Operation::Execute(original.clone());
+    let frame = execute.encode_parts(state.placement);
+    assert!(
+        frame
+            .parts()
+            .any(|part| part.as_ptr() == data.as_ptr() && part == data.as_ref())
+    );
     let Some(original_receipt) = state
         .apply(state.position() + 1, state.time(), original.clone())
         .unwrap()

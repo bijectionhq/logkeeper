@@ -122,7 +122,12 @@ pub async fn exchange(
     deadline: Duration,
 ) -> Result<Reply, WireError> {
     timeout(deadline, async {
-        write_frame(&mut channel, operation.encode(placement), maximum_frame).await?;
+        write_frame_parts(
+            &mut channel,
+            operation.encode_parts(placement).parts(),
+            maximum_frame,
+        )
+        .await?;
         let frame = read_frame(&mut channel, maximum_frame).await?;
         let reply = Reply::decode(frame).map_err(|_| WireError::Frame)?;
         if !reply.matches(placement, &operation) {
@@ -420,6 +425,7 @@ async fn read_frame(
     Ok(Bytes::from(body))
 }
 
+#[cfg(test)]
 async fn write_frame(
     channel: &mut (impl AsyncWrite + Unpin),
     bytes: Bytes,
