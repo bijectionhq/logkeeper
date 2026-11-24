@@ -2,7 +2,7 @@
 //! A checkpoint is published after its extent and before the segment can be removed.
 //! Replay skips each stream's checkpointed prefix independently.
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -15,7 +15,7 @@ use fs2::FileExt;
 use super::{
     durability::{sync_directory, sync_file},
     rules::charge,
-    state::{Extent, ExtentReader, Payload, Record, Stream},
+    state::{Extent, ExtentReader, Payload, Record, Staging, Stream},
 };
 use crate::stream::{
     codec::{self, MAX_FRAME_BYTES, invalid},
@@ -149,8 +149,9 @@ fn segment_path(dir: &Path, sequence: u64) -> PathBuf {
     dir.join(format!("{sequence:020}.seg"))
 }
 
-fn extent_path(dir: &Path, sequence: u64) -> PathBuf {
-    dir.join(format!("{sequence:020}.extent"))
+fn extent_path(dir: &Path, sequence: u64, staged: bool) -> PathBuf {
+    let kind = if staged { "staged" } else { "extent" };
+    dir.join(format!("{sequence:020}.{kind}"))
 }
 
 fn sequence(path: &Path) -> io::Result<u64> {
@@ -415,104 +416,155 @@ struct Rotation {
     worker: std::thread::JoinHandle<io::Result<Vec<Written>>>,
 }
 
-/// One stream's durable state at a segment boundary: the extent spans of its retained
-/// prefix and the pending suffix that the checkpoint copies to a new extent.
+/// One stream's durable state at a segment boundary: its retained records and, for an
+/// incomplete Sync, its staged records. Each part has extent spans and a pending suffix
+/// that the checkpoint copies to a new extent.
 struct Snapshot {
     dir: PathBuf,
     stream: StreamId,
     deleted: bool,
     view: StreamView,
+    records: Part,
+    /// The staged start and floor, and the staged records.
+    staged: Option<(Lsn, Lsn, Part)>,
+}
+
+struct Part {
+    first: Lsn,
     spans: Vec<Span>,
     pending: Vec<(Epoch, Bytes)>,
     /// A retained extent record follows a pending one.
     unordered: bool,
 }
 
-/// The pending payloads a checkpoint copied into its new extent.
+/// The pending payloads a checkpoint copied into its new extents.
 struct Written {
     stream: StreamId,
     sequence: u64,
-    first: Lsn,
-    extent: Option<Arc<Extent>>,
-    copied: Vec<(Bytes, u64, u32, u32)>,
+    records: Copied,
+    staged: Copied,
 }
 
-impl Snapshot {
-    fn of(dir: PathBuf, stream: StreamId, state: &Stream) -> Self {
+struct Copied {
+    first: Lsn,
+    extent: Option<Arc<Extent>>,
+    payloads: Vec<(Bytes, u64, u32, u32)>,
+}
+
+impl Part {
+    fn of(first: Lsn, records: &VecDeque<Record>) -> Self {
         let mut spans: Vec<Span> = Vec::new();
         let mut pending = Vec::new();
         let mut unordered = false;
-        for (index, record) in state.records.iter().enumerate() {
+        for (index, record) in records.iter().enumerate() {
             match &record.payload {
                 Payload::Pending(payload) => pending.push((record.epoch, payload.clone())),
                 Payload::Extent { .. } if !pending.is_empty() => unordered = true,
                 Payload::Extent { extent, .. } => {
-                    extend(
-                        &mut spans,
-                        extent.sequence,
-                        Lsn(state.view.floor.0 + index as u64),
-                    );
+                    extend(&mut spans, extent, Lsn(first.0 + index as u64));
                 }
             }
         }
         Self {
-            dir,
-            stream,
-            deleted: state.deleted,
-            view: state.view.clone(),
+            first,
             spans,
             pending,
             unordered,
         }
     }
 
-    /// Copy pending records to a new extent, then publish the stream checkpoint.
-    fn write(mut self, sequence: u64) -> io::Result<Written> {
+    /// Copy the pending suffix to a new extent of the given kind.
+    fn write(&mut self, dir: &Path, sequence: u64, staged: bool) -> io::Result<Copied> {
         if self.unordered {
             return Err(invalid("pending records are not a suffix"));
         }
-        directories(&self.dir)?;
         let retained: u64 = self
             .spans
             .iter()
             .map(|span| span.last.0 - span.first.0 + 1)
             .sum();
-        let first = Lsn(self.view.floor.0 + retained);
-        let mut copied = Vec::new();
-        let mut extent = None;
-        if !self.pending.is_empty() {
-            let path = extent_path(&self.dir, sequence);
-            atomic_file(&path, |file| {
-                let mut offset = 0;
-                for (index, (epoch, payload)) in self.pending.iter().enumerate() {
-                    let lsn = first.0 + index as u64;
-                    let len = payload.len() as u32;
-                    let crc = crc32fast::hash(payload);
-                    file.write_all(&lsn.to_be_bytes())?;
-                    file.write_all(&epoch.0.to_be_bytes())?;
-                    file.write_all(&len.to_be_bytes())?;
-                    file.write_all(&crc.to_be_bytes())?;
-                    file.write_all(payload)?;
-                    copied.push((payload.clone(), offset + 24, len, crc));
-                    offset += 24 + u64::from(len);
-                }
-                Ok(())
-            })?;
-            extent = Some(Arc::new(Extent { sequence, path }));
-            for index in 0..self.pending.len() {
-                extend(&mut self.spans, sequence, Lsn(first.0 + index as u64));
-            }
+        let first = Lsn(self.first.0 + retained);
+        let mut copied = Copied::empty(first);
+        if self.pending.is_empty() {
+            return Ok(copied);
         }
-        let spans = self.spans;
+        let path = extent_path(dir, sequence, staged);
+        atomic_file(&path, |file| {
+            let mut offset = 0;
+            for (index, (epoch, payload)) in self.pending.iter().enumerate() {
+                let lsn = first.0 + index as u64;
+                let len = payload.len() as u32;
+                let crc = crc32fast::hash(payload);
+                file.write_all(&lsn.to_be_bytes())?;
+                file.write_all(&epoch.0.to_be_bytes())?;
+                file.write_all(&len.to_be_bytes())?;
+                file.write_all(&crc.to_be_bytes())?;
+                file.write_all(payload)?;
+                copied.payloads.push((payload.clone(), offset + 24, len, crc));
+                offset += 24 + u64::from(len);
+            }
+            Ok(())
+        })?;
+        let extent = Arc::new(Extent {
+            sequence,
+            staged,
+            path,
+        });
+        for index in 0..self.pending.len() {
+            extend(&mut self.spans, &extent, Lsn(first.0 + index as u64));
+        }
+        copied.extent = Some(extent);
+        Ok(copied)
+    }
+}
+
+fn put_spans(body: &mut BytesMut, spans: &[Span]) -> io::Result<()> {
+    put_count(body, spans.len())?;
+    for span in spans {
+        body.put_u64(span.sequence);
+        body.put_u8(u8::from(span.staged));
+        body.put_u64(span.first.0);
+        body.put_u64(span.last.0);
+    }
+    Ok(())
+}
+
+impl Snapshot {
+    fn of(dir: PathBuf, stream: StreamId, state: &Stream) -> Self {
+        Self {
+            dir,
+            stream,
+            deleted: state.deleted,
+            view: state.view.clone(),
+            records: Part::of(state.view.floor, &state.records),
+            staged: state.staging.as_ref().map(|staging| {
+                (
+                    staging.from,
+                    staging.floor,
+                    Part::of(staging.from, &staging.records),
+                )
+            }),
+        }
+    }
+
+    /// Copy pending records to new extents, then publish the stream checkpoint.
+    fn write(mut self, sequence: u64) -> io::Result<Written> {
+        directories(&self.dir)?;
+        let records = self.records.write(&self.dir, sequence, false)?;
         let mut body = BytesMut::new();
         body.put_u64(sequence);
         body.put_u8(u8::from(self.deleted));
         put_bytes(&mut body, &codec::encode_checkpoint_view(&self.view)?)?;
-        put_count(&mut body, spans.len())?;
-        for span in &spans {
-            body.put_u64(span.sequence);
-            body.put_u64(span.first.0);
-            body.put_u64(span.last.0);
+        put_spans(&mut body, &self.records.spans)?;
+        let mut live = self.records.spans;
+        body.put_u8(u8::from(self.staged.is_some()));
+        let mut staged = Copied::empty(Lsn(0));
+        if let Some((from, floor, part)) = &mut self.staged {
+            staged = part.write(&self.dir, sequence, true)?;
+            body.put_u64(from.0);
+            body.put_u64(floor.0);
+            put_spans(&mut body, &part.spans)?;
+            live.extend_from_slice(&part.spans);
         }
         atomic_file(&self.dir.join("state"), |file| {
             let length: u32 = body
@@ -523,42 +575,86 @@ impl Snapshot {
             file.write_all(&crc32fast::hash(&body).to_be_bytes())?;
             file.write_all(&body)
         })?;
-        clean_extents(&self.dir, &spans)?;
+        clean_extents(&self.dir, &live)?;
         Ok(Written {
             stream: self.stream,
             sequence,
-            first,
-            extent,
-            copied,
+            records,
+            staged,
         })
     }
 }
 
-fn extend(spans: &mut Vec<Span>, sequence: u64, lsn: Lsn) {
+fn extend(spans: &mut Vec<Span>, extent: &Extent, lsn: Lsn) {
     match spans.last_mut() {
-        Some(span) if span.sequence == sequence => span.last = lsn,
+        Some(span) if span.sequence == extent.sequence && span.staged == extent.staged => {
+            span.last = lsn
+        }
         _ => spans.push(Span {
-            sequence,
+            sequence: extent.sequence,
+            staged: extent.staged,
             first: lsn,
             last: lsn,
         }),
     }
 }
 
-impl Written {
-    /// Point the copied records at the extent. A record trimmed since the snapshot is
-    /// skipped. The first record that a later Sync or Delete replaced ends the run, so
-    /// the remaining pending records stay a suffix for the next checkpoint.
-    fn install(self, state: &mut Stream) {
-        state.checkpoint = Some(self.sequence);
-        let Some(extent) = self.extent else { return };
-        for (index, (payload, offset, len, crc)) in self.copied.into_iter().enumerate() {
-            let lsn = self.first.0 + index as u64;
-            let Some(position) = lsn.checked_sub(state.view.floor.0) else {
-                continue;
-            };
-            let Some(record) = state.records.get_mut(position as usize) else {
-                return;
+/// Where a copied record is now.
+enum Slot<'a> {
+    Trimmed,
+    Gone,
+    Record(&'a mut Record),
+}
+
+/// A retained record at `lsn`, or, for a staged copy, the staged record while the Sync
+/// is incomplete and the installed record after it completes. A staged copy moved into
+/// the retained records is installed only after a record that is no longer pending, so
+/// pending records stay a suffix.
+fn slot(state: &mut Stream, lsn: u64, staged: bool) -> Slot<'_> {
+    if let Some(staging) = state.staging.as_mut().filter(|staging| staged && lsn >= staging.from.0) {
+        return staging
+            .records
+            .get_mut((lsn - staging.from.0) as usize)
+            .map_or(Slot::Gone, Slot::Record);
+    }
+    let Some(position) = lsn.checked_sub(state.view.floor.0) else {
+        return Slot::Trimmed;
+    };
+    let position = position as usize;
+    if staged
+        && position > 0
+        && state
+            .records
+            .get(position - 1)
+            .is_some_and(|before| matches!(before.payload, Payload::Pending(_)))
+    {
+        return Slot::Gone;
+    }
+    state
+        .records
+        .get_mut(position)
+        .map_or(Slot::Gone, Slot::Record)
+}
+
+impl Copied {
+    fn empty(first: Lsn) -> Self {
+        Self {
+            first,
+            extent: None,
+            payloads: Vec::new(),
+        }
+    }
+
+    /// Point copied records at the extent while they are still the same payloads.
+    fn install(self, state: &mut Stream, staged: bool) {
+        let Some(extent) = self.extent else {
+            return;
+        };
+        for (index, (payload, offset, len, crc)) in self.payloads.into_iter().enumerate() {
+            let record = match slot(state, self.first.0 + index as u64, staged) {
+                Slot::Trimmed => continue,
+                Slot::Gone => return,
+                Slot::Record(record) => record,
             };
             match &record.payload {
                 Payload::Pending(current)
@@ -574,6 +670,18 @@ impl Written {
                 _ => return,
             }
         }
+    }
+}
+
+impl Written {
+    /// Point the copied records at their extents. A record trimmed since the snapshot is
+    /// skipped. The first record that a later Sync or Delete replaced ends a run, so the
+    /// remaining pending records stay a suffix for the next checkpoint. Staged copies are
+    /// installed wherever a completed Sync moved them.
+    fn install(self, state: &mut Stream) {
+        state.checkpoint = Some(self.sequence);
+        self.records.install(state, false);
+        self.staged.install(state, true);
     }
 }
 
@@ -663,19 +771,24 @@ fn replay(
 #[derive(Clone, Copy)]
 struct Span {
     sequence: u64,
+    staged: bool,
     first: Lsn,
     last: Lsn,
 }
 
 fn clean_extents(dir: &Path, live: &[Span]) -> io::Result<()> {
-    let live: HashSet<_> = live.iter().map(|span| span.sequence).collect();
+    let live: HashSet<_> = live.iter().map(|span| (span.sequence, span.staged)).collect();
     let mut removed = false;
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().is_some_and(|ext| ext == "tmp")
-            || (path.extension().is_some_and(|ext| ext == "extent")
-                && !live.contains(&sequence(&path)?))
-        {
+        let stale = match path.extension().and_then(|ext| ext.to_str()) {
+            Some("tmp") => true,
+            Some(kind @ ("extent" | "staged")) => {
+                !live.contains(&(sequence(&path)?, kind == "staged"))
+            }
+            _ => false,
+        };
+        if stale {
             fs::remove_file(path)?;
             removed = true;
         }
@@ -719,26 +832,33 @@ fn load_streams(root: &Path) -> io::Result<HashMap<StreamId, Stream>> {
             view,
             ..Stream::default()
         };
-        let spans = (0..input.count(24)?)
-            .map(|_| {
-                Ok(Span {
-                    sequence: input.u64()?,
-                    first: Lsn(input.u64()?),
-                    last: Lsn(input.u64()?),
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+        let mut spans = input.spans()?;
+        let staged = if input.boolean()? {
+            Some((Lsn(input.u64()?), Lsn(input.u64()?), input.spans()?))
+        } else {
+            None
+        };
         input.finish()?;
-        let mut next = state.view.floor.0;
-        for span in &spans {
-            if span.first.0 != next || span.last < span.first || span.last > state.view.tail {
-                return Err(invalid("noncontiguous stream checkpoint extents"));
-            }
-            read_extent(&dir, *span, &mut state)?;
-            next = span.last.0 + 1;
-        }
-        if next != state.view.tail.0 + 1 {
+        if read_extents(&dir, state.view.floor, &spans, &mut state.records)? != state.view.tail {
             return Err(invalid("stream checkpoint is missing records"));
+        }
+        state.bytes = state
+            .records
+            .iter()
+            .map(|record| charge_len(record.payload.len() as u32))
+            .sum();
+        if let Some((from, floor, staged)) = staged {
+            if from.0 == 0 {
+                return Err(invalid("invalid staged stream history"));
+            }
+            let mut staging = Staging {
+                from,
+                floor,
+                records: VecDeque::new(),
+            };
+            read_extents(&dir, from, &staged, &mut staging.records)?;
+            state.staging = Some(staging);
+            spans.extend(staged);
         }
         clean_extents(&dir, &spans)?;
         states.insert(StreamId(id), state);
@@ -746,11 +866,30 @@ fn load_streams(root: &Path) -> io::Result<HashMap<StreamId, Stream>> {
     Ok(states)
 }
 
-fn read_extent(dir: &Path, span: Span, state: &mut Stream) -> io::Result<()> {
-    let path = extent_path(dir, span.sequence);
+/// Read contiguous spans from `first` and return the last position read.
+fn read_extents(
+    dir: &Path,
+    first: Lsn,
+    spans: &[Span],
+    records: &mut VecDeque<Record>,
+) -> io::Result<Lsn> {
+    let mut next = first.0;
+    for span in spans {
+        if span.first.0 != next || span.last < span.first {
+            return Err(invalid("noncontiguous stream checkpoint extents"));
+        }
+        read_extent(dir, *span, records)?;
+        next = span.last.0 + 1;
+    }
+    Ok(Lsn(next - 1))
+}
+
+fn read_extent(dir: &Path, span: Span, records: &mut VecDeque<Record>) -> io::Result<()> {
+    let path = extent_path(dir, span.sequence, span.staged);
     let file = File::open(&path)?;
     let extent = Arc::new(Extent {
         sequence: span.sequence,
+        staged: span.staged,
         path,
     });
     let length = file.metadata()?.len();
@@ -773,7 +912,7 @@ fn read_extent(dir: &Path, span: Span, state: &mut Stream) -> io::Result<()> {
             if lsn != next {
                 return Err(invalid("out of order stream extent"));
             }
-            state.records.push_back(Record {
+            records.push_back(Record {
                 epoch,
                 payload: Payload::Extent {
                     extent: Arc::clone(&extent),
@@ -782,7 +921,6 @@ fn read_extent(dir: &Path, span: Span, state: &mut Stream) -> io::Result<()> {
                     crc,
                 },
             });
-            state.bytes += charge_len(len);
             next += 1;
             if lsn == span.last.0 {
                 return Ok(());
@@ -826,6 +964,19 @@ impl Decoder {
 
     fn u128(&mut self) -> io::Result<u128> {
         Ok(self.take(16)?.get_u128())
+    }
+
+    fn spans(&mut self) -> io::Result<Vec<Span>> {
+        (0..self.count(25)?)
+            .map(|_| {
+                Ok(Span {
+                    sequence: self.u64()?,
+                    staged: self.boolean()?,
+                    first: Lsn(self.u64()?),
+                    last: Lsn(self.u64()?),
+                })
+            })
+            .collect()
     }
 
     fn boolean(&mut self) -> io::Result<bool> {

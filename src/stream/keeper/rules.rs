@@ -117,6 +117,8 @@ mod implementation {
         pub keeper: KeeperId,
         pub durable: Option<&'a wire::StreamView>,
         pub deleted: bool,
+        /// The floor and tail of an incomplete Sync's history.
+        pub staged: Option<(Lsn, Lsn)>,
         pub identity: &'a Identity,
         pub seal_allowed: bool,
         pub identical: bool,
@@ -296,13 +298,16 @@ mod implementation {
                 let Some(tail) = last(*from, records.len()) else {
                     return refuse(Refusal::Gap { head: state.head });
                 };
-                if floor.0 == 0 || *floor > *from || *from < state.floor {
+                let (floor, image_tail) = view
+                    .staged
+                    .map_or((*floor, state.tail), |(staged, tail)| (staged.max(*floor), tail));
+                if floor.0 == 0 || floor > *from || *from < state.floor {
                     return refuse(Refusal::BelowFloor { floor: state.floor });
                 }
                 if !sync_head_valid(state.head.0, head.0, tail.0, floor.0) {
                     return refuse(Refusal::AboveHead { head: state.head });
                 }
-                if *from > Lsn(state.tail.0 + 1) && from != floor {
+                if *from > Lsn(image_tail.0 + 1) && *from != floor {
                     return refuse(Refusal::Gap { head: state.head });
                 }
                 if !valid_runs(*epoch, *from, tail, runs)
@@ -315,14 +320,14 @@ mod implementation {
                         && view.identical
                         && tail <= state.tail
                         && *head == state.head
-                        && *floor <= state.floor
+                        && floor <= state.floor
                     {
                         Decision::Reply(Reply::Synced { tail: state.tail })
                     } else {
                         refuse(Refusal::Conflict { head: state.head })
                     };
                 }
-                let skip = (sync_start(state, *from, *floor).0 - from.0).min(records.len() as u64);
+                let skip = (sync_start(state, *from, floor).0 - from.0).min(records.len() as u64);
                 capacity(
                     &records[skip as usize..],
                     view.retained_bytes,

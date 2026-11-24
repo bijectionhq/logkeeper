@@ -293,6 +293,149 @@ fn sync_preserves_head_and_completes_explicitly() {
 }
 
 #[test]
+fn incomplete_sync_is_invisible_until_complete() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"committed", b"divergent"], 1));
+    test.send(seal(A, 2));
+    let voted = test.send(check(A));
+    assert_eq!(
+        test.send(sync(A, 2, 2, &[b"staged"], 1, false)),
+        Reply::Synced { tail: Lsn(2) }
+    );
+    assert_eq!(test.send(check(A)), voted, "an incomplete Sync keeps the voted view");
+    assert_eq!(
+        test.send(recover(A, 2, 1)),
+        page(1, 1, &[(1, b"committed"), (2, b"divergent")])
+    );
+
+    let reopen = |test: Harness, rotate: bool| {
+        let Harness { mut engine, dir } = test;
+        if rotate {
+            engine.wal.rotate(&mut engine.streams).unwrap();
+        }
+        drop(engine);
+        let engine =
+            Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
+        Harness { engine, dir }
+    };
+    let mut test = reopen(test, false);
+    assert_eq!(test.send(check(A)), voted, "WAL replay restores the staged Sync");
+    assert_eq!(
+        test.send(sync(A, 2, 3, &[b"more"], 1, false)),
+        Reply::Synced { tail: Lsn(2) }
+    );
+    let mut test = reopen(test, true);
+    assert_eq!(test.send(check(A)), voted, "a checkpoint keeps the staged Sync");
+    assert_eq!(
+        test.send(sync(A, 2, 4, &[], 1, true)),
+        Reply::Synced { tail: Lsn(3) }
+    );
+    assert_eq!(
+        test.send(recover(A, 2, 1)),
+        page(1, 1, &[(1, b"committed"), (2, b"staged"), (3, b"more")])
+    );
+    let mut test = reopen(test, true);
+    assert_eq!(
+        test.send(recover(A, 2, 1)),
+        page(1, 1, &[(1, b"committed"), (2, b"staged"), (3, b"more")])
+    );
+
+    test.send(seal(A, 3));
+    let voted = test.send(check(A));
+    test.send(sync(A, 3, 2, &[b"abandoned"], 1, false));
+    test.send(seal(A, 4));
+    assert_eq!(
+        test.send(sync(A, 4, 4, &[], 1, true)),
+        Reply::Synced { tail: Lsn(3) },
+        "a new promise discards the staged Sync"
+    );
+    assert_eq!(
+        test.send(recover(A, 4, 1)),
+        page(1, 1, &[(1, b"committed"), (2, b"staged"), (3, b"more")])
+    );
+    let Reply::Checked(view) = voted else {
+        panic!("missing stream")
+    };
+    assert_eq!(view.tail, Lsn(3));
+}
+
+#[test]
+fn background_checkpoint_follows_staged_records_into_the_completed_history() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"committed", b"divergent"], 1));
+    test.send(seal(A, 2));
+    test.send(sync(A, 2, 2, &[b"staged"], 1, false));
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    test.engine.wal.rotation_gate = Some(gate.clone());
+    test.engine
+        .wal
+        .start_rotation(&test.engine.streams)
+        .unwrap();
+    // The Sync completes while the checkpoint of its staged record is being written.
+    assert_eq!(
+        test.send(sync(A, 2, 3, &[], 1, true)),
+        Reply::Synced { tail: Lsn(2) }
+    );
+    gate.wait();
+    test.engine
+        .wal
+        .finish_rotation(&mut test.engine.streams)
+        .unwrap();
+    let pending = test.engine.streams[&A]
+        .records
+        .iter()
+        .map(|record| matches!(record.payload, state::Payload::Pending(_)))
+        .collect::<Vec<_>>();
+    assert_eq!(pending, [false, false], "the staged copy now backs LSN 2");
+    test.engine.wal.rotate(&mut test.engine.streams).unwrap();
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let engine = Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
+    let mut test = Harness { engine, dir };
+    assert_eq!(
+        test.send(recover(A, 2, 1)),
+        page(1, 1, &[(1, b"committed"), (2, b"staged")])
+    );
+}
+
+#[test]
+fn staged_floor_skips_the_retained_history_on_completion() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"old"], 1));
+    test.send(seal(A, 2));
+    let voted = test.send(check(A));
+    let skip = |from: u64, records: Vec<Bytes>, runs, complete| Request::Sync {
+        stream: A,
+        epoch: Epoch(2),
+        floor: Lsn(5),
+        from: Lsn(from),
+        records,
+        runs,
+        head: Lsn(4),
+        complete,
+    };
+    let run = EpochRun {
+        epoch: Epoch(1),
+        first: Lsn(5),
+        last: Lsn(5),
+    };
+    assert_eq!(
+        test.send(skip(5, vec![Bytes::from_static(b"kept")], vec![run], false)),
+        Reply::Synced { tail: Lsn(1) }
+    );
+    assert_eq!(test.send(check(A)), voted);
+    assert_eq!(
+        test.send(sync(A, 2, 6, &[], 4, true)),
+        Reply::Synced { tail: Lsn(5) },
+        "a later chunk keeps the staged floor"
+    );
+    assert_eq!(test.send(recover(A, 2, 5)), page(5, 4, &[(5, b"kept")]));
+}
+
+#[test]
 fn append_requires_current_sync_next_position_or_an_identical_retry() {
     let mut test = Harness::new(Limits {
         stream_quota_bytes: 4,

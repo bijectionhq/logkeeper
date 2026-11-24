@@ -3,7 +3,7 @@ use std::{collections::VecDeque, fs::File, io, path::PathBuf, sync::Arc};
 use bytes::Bytes;
 use tokio::sync::watch;
 
-use super::rules::{self, Decision, Limits, charge};
+use super::rules::{self, Decision, Limits};
 use crate::stream::{
     codec::{PAGE_BYTES, invalid},
     wire::{self, *},
@@ -11,6 +11,7 @@ use crate::stream::{
 
 pub(super) struct Extent {
     pub sequence: u64,
+    pub staged: bool,
     pub path: PathBuf,
 }
 
@@ -87,10 +88,24 @@ pub(super) struct Record {
     pub payload: Payload,
 }
 
+/// The records of an incomplete Sync. The keeper's view changes only when the Sync completes.
+pub(super) struct Staging {
+    pub from: Lsn,
+    pub floor: Lsn,
+    pub records: VecDeque<Record>,
+}
+
+impl Staging {
+    pub fn tail(&self) -> Lsn {
+        Lsn(self.from.0 - 1 + self.records.len() as u64)
+    }
+}
+
 pub(super) struct Stream {
     pub view: wire::StreamView,
     pub deleted: bool,
     pub records: VecDeque<Record>,
+    pub staging: Option<Staging>,
     pub bytes: u64,
     pub checkpoint: Option<u64>,
     pub changed: watch::Sender<()>,
@@ -113,6 +128,9 @@ pub(super) fn decide(
         keeper,
         durable: state.map(|state| &state.view),
         deleted: state.is_some_and(|state| state.deleted),
+        staged: state
+            .and_then(|state| state.staging.as_ref())
+            .map(|staging| (staging.floor, staging.tail())),
         identity,
         seal_allowed,
         identical,
@@ -136,6 +154,7 @@ impl Default for Stream {
             },
             deleted: false,
             records: VecDeque::new(),
+            staging: None,
             bytes: 0,
             checkpoint: None,
             changed: watch::channel(()).0,
@@ -199,9 +218,9 @@ impl Stream {
                 } else {
                     self.view.head
                 };
-                let start = rules::sync_start(&self.view, *from, *floor);
-                let first = self.view.floor.max(*floor);
-                let bytes = self.bytes_between(first, start);
+                let floor = self.staged_floor(*floor);
+                let start = rules::sync_start(&self.view, *from, floor);
+                let bytes = self.image_bytes(self.view.floor.max(floor), start);
                 (*from, records, Some(runs), *epoch, through, bytes)
             }
             _ => return Ok((true, self.bytes)),
@@ -240,6 +259,27 @@ impl Stream {
             }
         }
         Ok((true, bytes))
+    }
+
+    fn staged_floor(&self, floor: Lsn) -> Lsn {
+        self.staging
+            .as_ref()
+            .map_or(floor, |staging| staging.floor.max(floor))
+    }
+
+    /// The charge of the positions in `[first, end)` of the history an incomplete Sync builds.
+    fn image_bytes(&self, first: Lsn, end: Lsn) -> u64 {
+        let Some(staging) = &self.staging else {
+            return self.bytes_between(first, end);
+        };
+        let index = |lsn: Lsn| lsn.0.saturating_sub(staging.from.0) as usize;
+        let end_index = index(end).min(staging.records.len());
+        self.bytes_between(first, end.min(staging.from))
+            + staging
+                .records
+                .range(index(first).min(end_index)..end_index)
+                .map(|record| record.payload.len().max(1) as u64)
+                .sum::<u64>()
     }
 
     fn bytes_between(&self, first: Lsn, tail: Lsn) -> u64 {
@@ -284,22 +324,35 @@ impl Stream {
         self.view.tail = Lsn(from.0 - 1);
     }
 
-    fn push(&mut self, epoch: Epoch, payload: Bytes) {
+    fn push(&mut self, record: Record) {
         let lsn = Lsn(self.view.tail.0 + 1);
         match self.view.runs.last_mut() {
-            Some(run) if run.epoch == epoch => run.last = lsn,
+            Some(run) if run.epoch == record.epoch => run.last = lsn,
             _ => self.view.runs.push(EpochRun {
-                epoch,
+                epoch: record.epoch,
                 first: lsn,
                 last: lsn,
             }),
         }
-        self.bytes += charge(&payload);
-        self.records.push_back(Record {
-            epoch,
-            payload: Payload::Pending(payload),
-        });
+        self.bytes += record.payload.len().max(1) as u64;
+        self.records.push_back(record);
         self.view.tail = lsn;
+    }
+
+    /// Replace the history from the staged position. A staged floor can skip the whole history.
+    fn install(&mut self, staging: Staging, head: Lsn) {
+        if staging.from.0 > self.view.tail.0 + 1 {
+            self.discard_before(Lsn(self.view.tail.0 + 1));
+            self.view.floor = staging.from;
+            self.view.tail = Lsn(staging.from.0 - 1);
+        } else {
+            self.truncate(staging.from);
+        }
+        for record in staging.records {
+            self.push(record);
+        }
+        self.discard_before(staging.floor);
+        self.view.head = head;
     }
 
     /// Apply an admitted WAL entry. Replay uses the identical transition.
@@ -326,6 +379,7 @@ impl Stream {
                 Ok(Reply::Created)
             }
             Request::Seal { epoch, .. } => {
+                self.staging = None;
                 self.view.promised = Some((
                     epoch,
                     identity.ok_or_else(|| invalid("missing seal identity"))?,
@@ -342,19 +396,37 @@ impl Stream {
                 complete,
                 ..
             } => {
+                let floor = self.staged_floor(floor);
                 let start = rules::sync_start(&self.view, from, floor);
-                self.discard_before(floor);
-                self.truncate(start);
+                let mut staging = match self.staging.take() {
+                    Some(mut staging)
+                        if staging.from <= start && start.0 <= staging.tail().0 + 1 =>
+                    {
+                        staging.records.truncate((start.0 - staging.from.0) as usize);
+                        staging
+                    }
+                    _ => Staging {
+                        from: start,
+                        floor,
+                        records: VecDeque::new(),
+                    },
+                };
+                staging.floor = floor;
                 let skip = (start.0 - from.0).min(records.len() as u64) as usize;
                 let epochs = runs
                     .into_iter()
                     .flat_map(|run| (run.first.0..=run.last.0).map(move |_| run.epoch));
                 for (payload, epoch) in records.into_iter().zip(epochs).skip(skip) {
-                    self.push(epoch, payload);
+                    staging.records.push_back(Record {
+                        epoch,
+                        payload: Payload::Pending(payload),
+                    });
                 }
-                self.view.head = head;
                 if complete {
+                    self.install(staging, head);
                     self.view.synced = Some(epoch);
+                } else {
+                    self.staging = Some(staging);
                 }
                 Ok(Reply::Synced {
                     tail: self.view.tail,
@@ -369,7 +441,10 @@ impl Stream {
             } => {
                 if at > self.view.tail {
                     for payload in records {
-                        self.push(epoch, payload);
+                        self.push(Record {
+                            epoch,
+                            payload: Payload::Pending(payload),
+                        });
                     }
                 }
                 self.view.head = self.view.head.max(head);
