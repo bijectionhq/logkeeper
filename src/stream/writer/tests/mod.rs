@@ -560,6 +560,40 @@ async fn an_append_reply_waits_for_quorum_commit_visibility() {
 }
 
 #[tokio::test]
+async fn a_fenced_publication_leaves_a_chosen_append_outcome_unknown() {
+    let (network, writer) = started().await;
+    network.down(KEEPERS[2], true);
+    let gates = [Gate::new(), Gate::new()];
+    for (&keeper, gate) in KEEPERS.iter().zip(&gates) {
+        network.fault(keeper, Kind::Append, Fault::HoldReply(gate.clone()));
+    }
+    let append = writer.append(STREAM, E1, Lsn(1), record("chosen before fence"));
+    tokio::pin!(append);
+    assert!(poll!(&mut append).is_pending());
+    for gate in &gates {
+        gate.reached().await;
+    }
+    let successor = self::writer(&network, 2);
+    assert_eq!(successor.seal(STREAM, E2).await, Ok(Lsn(1)));
+    for gate in &gates {
+        gate.release();
+    }
+    assert_eq!(
+        append.await,
+        Err(JournalError::Unavailable),
+        "a publication fence does not rule out the already chosen append"
+    );
+    assert_eq!(
+        successor
+            .read(STREAM, Lsn(1), 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        [(Lsn(1), record("chosen before fence"))]
+    );
+}
+
+#[tokio::test]
 async fn create_uses_url_order_or_explicit_ensemble_and_delete_is_terminal() {
     let network = Arc::new(Network::default());
     let order = [KEEPERS[3], KEEPERS[1], KEEPERS[2], KEEPERS[0]];

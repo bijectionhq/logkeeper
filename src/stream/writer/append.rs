@@ -232,7 +232,9 @@ impl Active {
             Some(wait) => {
                 let at = wait.await.unwrap_or(Err(JournalError::Unavailable))?;
                 // An observer can read the choice immediately after we acknowledge it.
-                self.published(at).await?;
+                self.published(at)
+                    .await
+                    .map_err(|_| JournalError::Unavailable)?;
                 Ok(at)
             }
             None => self.retry_committed(at, payload).await,
