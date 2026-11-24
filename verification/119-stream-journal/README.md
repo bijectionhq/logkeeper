@@ -21,12 +21,19 @@ ledger follows [PrefixAgreement](../lean/Logkeeper/PrefixAgreement.lean) and
 | RankLE | Lexicographic order on the history's synced epoch and tail. Original entry epochs are ghost metadata. |
 | Chosen | An exact history prefix covered by two durable votes at one epoch. |
 
-Create, Seal, incomplete and complete Sync, Append, identical retry, Trim,
-Check, Read and Delete each have a keeper transition. An incomplete Sync
-stages durable data. Complete Sync publishes the history. A delayed
-same-epoch complete Sync preserves the published history. Trim advances the
-floor and removes records from the retained view. The proof keeps trimmed
-records as ghost data for comparing histories across cuts.
+Create, Seal, incomplete and complete Sync, synced floor installation,
+Append of one or more records, publication, Trim, Check, Read and Delete
+each have a keeper transition, matching the shipped keeper rules. An
+incomplete Sync stages durable data and a floor; the keeper's view does not
+change. Complete Sync publishes the history, its floor and a certified head.
+A staged floor can skip positions the writer already trimmed; their ghost
+records come from the seed. A delayed same-epoch complete Sync preserves the
+published history. Publication raises the head to a certified cut within
+the tail, with or without a retained record of the current epoch. Floor
+installation advances a synced keeper over a trimmed prefix it never
+received. Trim advances the floor and removes records from the retained
+view. Delete can tombstone a stream the keeper never created. The proof
+keeps trimmed records as ghost data for comparing histories across cuts.
 
 1. A chosen cut extends the previous chosen prefix as the head
    advances. Taking the retained slice preserves contiguity and agreement

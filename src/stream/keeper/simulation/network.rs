@@ -64,7 +64,16 @@ struct State {
     sent: u64,
     newest: u64,
     coverage: Coverage,
-    trace: Option<Vec<String>>,
+    trace: Option<Trace>,
+}
+
+/// Every keeper effect with its durable images, for Lean's reference replay.
+#[derive(Default)]
+struct Trace {
+    rows: Vec<String>,
+    identities: Vec<Identity>,
+    /// The durable images of a crashed keeper, compared with its reopened images.
+    durable: [Option<BTreeMap<StreamId, String>>; 4],
 }
 
 struct Client {
@@ -130,6 +139,9 @@ impl Network {
             "one disk loss per run"
         );
         state.nodes[slot(keeper)] = None;
+        if let Some(trace) = &mut state.trace {
+            trace.durable[slot(keeper)] = None;
+        }
         fs::remove_dir_all(self.root.path().join(keeper.0.to_string())).unwrap();
         state.nodes[slot(LEARNER)] = Some(self.open(LEARNER));
         state.hit("disk loss");
@@ -141,8 +153,25 @@ impl Network {
             if state.lost == Some(keeper) {
                 continue;
             }
-            state.nodes[slot(keeper)] = None;
-            state.nodes[slot(keeper)] = Some(self.open(keeper));
+            let state = &mut *state;
+            let running = state.nodes[slot(keeper)].take();
+            let before = state.trace.as_mut().map(|trace| match &running {
+                Some(running) => trace.images(running),
+                None => trace.durable[slot(keeper)].take().unwrap_or_default(),
+            });
+            drop(running);
+            let engine = self.open(keeper);
+            if let (Some(trace), Some(before)) = (&mut state.trace, before) {
+                let after = trace.images(&engine);
+                for stream in before.keys().chain(after.keys()).collect::<std::collections::BTreeSet<_>>() {
+                    let image = |images: &BTreeMap<StreamId, String>| {
+                        images.get(stream).cloned().unwrap_or_else(|| trace_image(None, &mut Vec::new()))
+                    };
+                    let row = format!("reopen 0 {} 0 {} {}", keeper.0, image(&before), image(&after));
+                    trace.rows.push(row);
+                }
+            }
+            state.nodes[slot(keeper)] = Some(engine);
             state.hit("reopened WAL");
         }
     }
@@ -156,12 +185,12 @@ impl Network {
     }
 
     pub(super) fn record_trace(&self) {
-        self.state.lock().trace = Some(Vec::new());
+        self.state.lock().trace = Some(Trace::default());
     }
 
     pub(super) fn write_trace(&self, seed: u64, out: &mut impl Write) -> io::Result<()> {
         writeln!(out, "seed {seed}")?;
-        for row in self.state.lock().trace.take().unwrap() {
+        for row in self.state.lock().trace.take().unwrap().rows {
             writeln!(out, "{row}")?;
         }
         Ok(())
@@ -220,20 +249,24 @@ impl Network {
         if state.isolated == Some(*keeper) || state.lost == Some(*keeper) {
             return Err(TransportError::Unreachable);
         }
-        let tracing = state.trace.is_some() && traceable(request);
+        let state = &mut *state;
         let node = &mut state.nodes[slot(*keeper)];
         if matches!(fault, Some(Fault::CrashBefore)) {
+            if let (Some(trace), Some(engine)) = (&mut state.trace, node.as_ref()) {
+                trace.durable[slot(*keeper)] = Some(trace.images(engine));
+            }
             *node = None;
-            state.hit("crashed");
+            *state.coverage.entry("crashed").or_default() += 1;
             return Err(TransportError::Unreachable);
         }
         let Some(engine) = node else {
             return Err(TransportError::Unreachable);
         };
         let stream = crate::stream::codec::stream(request);
-        let before = tracing
-            .then(|| engine.streams.get(&stream).map(|stream| stream.view.clone()))
-            .flatten();
+        let before = state.trace.as_mut().map(|trace| {
+            let caller = trace.identity(identity);
+            (caller, trace.images(engine))
+        });
         engine.wal.retain_unsynced = match fault {
             Some(Fault::LoseUnsynced) => Some(0),
             Some(Fault::Tear) => Some(packet.cut),
@@ -247,21 +280,32 @@ impl Network {
             pending: None,
         };
         let rounds = engine.wal.rounds.len();
-        match engine.process(VecDeque::from([work])) {
+        let outcome = engine.process(VecDeque::from([work]));
+        let mut record = |reply: Option<&CallResult>, engine: &Engine| {
+            if let (Some(trace), Some((caller, before))) = (&mut state.trace, &before) {
+                let after = trace.images(engine);
+                let image = |images: &BTreeMap<StreamId, String>| {
+                    images.get(&stream).cloned().unwrap_or_else(|| trace_image(None, &mut Vec::new()))
+                };
+                let (before, after) = (image(before), image(&after));
+                let row = trace_row(packet, *caller, &before, &after, request, reply, &mut trace.identities);
+                trace.rows.push(row);
+            }
+        };
+        match outcome {
             Ok(()) if matches!(fault, Some(Fault::CrashAfterSync)) => {
                 assert!(engine.wal.rounds.len() > rounds, "crash missed WAL sync");
-                *node = None;
-                state.hit("crashed");
+                record(None, engine);
+                if let Some(trace) = &mut state.trace {
+                    trace.durable[slot(*keeper)] = Some(trace.images(engine));
+                }
+                state.nodes[slot(*keeper)] = None;
+                *state.coverage.entry("crashed").or_default() += 1;
                 Err(TransportError::Unreachable)
             }
             Ok(()) => {
                 let reply = result.try_recv().expect("keeper must finish work").0;
-                if let Some(before) = before {
-                    let after = &engine.streams[&stream].view;
-                    if let Some(row) = trace_effect(packet, &reply, &before, after) {
-                        state.trace.as_mut().unwrap().push(row);
-                    }
-                }
+                record(Some(&reply), engine);
                 if matches!(request, Request::Append { head, .. } if head.0 != 0)
                     && matches!(reply, Ok(Reply::Appended { .. }))
                 {
@@ -274,7 +318,10 @@ impl Network {
                     result.try_recv().is_err(),
                     "durability: a success reply escaped a failed WAL sync"
                 );
-                *node = None;
+                if let (Some(trace), Some((_, before))) = (&mut state.trace, before) {
+                    trace.durable[slot(*keeper)] = Some(before);
+                }
+                state.nodes[slot(*keeper)] = None;
                 state.hit("crashed");
                 Err(TransportError::Unreachable)
             }
@@ -302,56 +349,163 @@ struct Packet {
     cut: usize,
 }
 
-fn traceable(request: &Request) -> bool {
-    matches!(request, Request::Append { records, .. } if records.is_empty())
-        || matches!(request, Request::Sync { complete: false, .. })
-}
-
-fn trace_effect(
-    packet: &Packet,
-    reply: &CallResult,
-    before: &StreamView,
-    after: &StreamView,
-) -> Option<String> {
-    use std::fmt::Write;
-
-    let (verb, epoch) = match (&packet.request, reply) {
-        (Request::Append { epoch, .. }, Ok(Reply::Appended { .. })) => ("publish", epoch),
-        (Request::Sync { epoch, .. }, Ok(Reply::Synced { .. })) => ("sync-part", epoch),
-        _ => return None,
-    };
-    let (promised, owner) = before.promised.as_ref().unwrap();
-    let synced = |view: &StreamView| view.synced.map_or(0, |epoch| u128::from(epoch.0) + 1);
-    let mut row = format!(
-        "{verb} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
-        packet.serial,
-        packet.keeper.0,
-        epoch.0,
-        promised.0,
-        u8::from(owner == &packet.identity),
-        u8::from(before.learner),
-        synced(before),
-        before.floor.0,
-        before.tail.0,
-        before.head.0,
-        synced(after),
-        after.floor.0,
-        after.tail.0,
-        after.head.0,
-    );
-    match &packet.request {
-        Request::Append { at, head, .. } => {
-            write!(row, " {} {}", at.0, head.0).unwrap();
-            for run in &before.runs {
-                write!(row, " {} {} {}", run.epoch.0, run.first.0, run.last.0).unwrap();
+impl Trace {
+    fn identity(&mut self, identity: &Identity) -> usize {
+        match self.identities.iter().position(|known| known == identity) {
+            Some(index) => index + 1,
+            None => {
+                self.identities.push(identity.clone());
+                self.identities.len()
             }
         }
-        Request::Sync { from, floor, head, records, .. } => {
-            write!(row, " {} {} {} {}", from.0, floor.0, head.0, records.len()).unwrap();
-        }
-        _ => unreachable!(),
     }
-    Some(row)
+
+    fn images(&mut self, engine: &Engine) -> BTreeMap<StreamId, String> {
+        engine
+            .streams
+            .iter()
+            .map(|(id, stream)| (*id, trace_image(Some(stream), &mut self.identities)))
+            .collect()
+    }
+}
+
+fn trace_runs(row: &mut String, runs: &[EpochRun]) {
+    use std::fmt::Write;
+    write!(row, " {}", runs.len()).unwrap();
+    for run in runs {
+        write!(row, " {} {} {}", run.epoch.0, run.first.0, run.last.0).unwrap();
+    }
+}
+
+fn trace_view(row: &mut String, view: &StreamView, identities: &mut Vec<Identity>) {
+    use std::fmt::Write;
+    let (promised, owner) = view.promised.as_ref().map_or((0, 0), |(epoch, owner)| {
+        let index = match identities.iter().position(|known| known == owner) {
+            Some(index) => index + 1,
+            None => {
+                identities.push(owner.clone());
+                identities.len()
+            }
+        };
+        (u128::from(epoch.0) + 1, index)
+    });
+    write!(
+        row,
+        " {promised} {owner} {} {} {} {} {} {} {} {}",
+        view.synced.map_or(0, |epoch| u128::from(epoch.0) + 1),
+        view.floor.0,
+        view.tail.0,
+        view.head.0,
+        u8::from(view.learner),
+        view.ensemble[0].0,
+        view.ensemble[1].0,
+        view.ensemble[2].0,
+    )
+    .unwrap();
+    trace_runs(row, &view.runs);
+}
+
+/// `exists deleted` then the view, then `0` or `1 floor from tail runs` for a staged Sync.
+fn trace_image(stream: Option<&super::super::state::Stream>, identities: &mut Vec<Identity>) -> String {
+    use std::fmt::Write;
+    let Some(stream) = stream else {
+        return "0 0 0 0 0 1 0 0 1 0 0 0 0 0".into();
+    };
+    let mut row = format!("1 {}", u8::from(stream.deleted));
+    trace_view(&mut row, &stream.view, identities);
+    match &stream.staging {
+        None => row.push_str(" 0"),
+        Some(staging) => {
+            write!(row, " 1 {} {} {}", staging.floor.0, staging.from.0, staging.tail().0).unwrap();
+            let mut runs: Vec<EpochRun> = Vec::new();
+            for (index, record) in staging.records.iter().enumerate() {
+                let lsn = Lsn(staging.from.0 + index as u64);
+                match runs.last_mut() {
+                    Some(run) if run.epoch == record.epoch => run.last = lsn,
+                    _ => runs.push(EpochRun {
+                        epoch: record.epoch,
+                        first: lsn,
+                        last: lsn,
+                    }),
+                }
+            }
+            trace_runs(&mut row, &runs);
+        }
+    }
+    row
+}
+
+/// `verb serial keeper caller before after request-fields reply-tag reply-fields`.
+fn trace_row(
+    packet: &Packet,
+    caller: usize,
+    before: &str,
+    after: &str,
+    request: &Request,
+    reply: Option<&CallResult>,
+    identities: &mut Vec<Identity>,
+) -> String {
+    use std::fmt::Write;
+    let ensemble = |e: &[KeeperId; 3]| format!("{} {} {}", e[0].0, e[1].0, e[2].0);
+    let (verb, fields) = match request {
+        Request::Create { ensemble: e, .. } => ("create", ensemble(e)),
+        Request::Seal { epoch, ensemble: e, .. } => ("seal", format!("{} {}", epoch.0, ensemble(e))),
+        Request::Sync { epoch, floor, from, records, runs, head, complete, .. } => {
+            let mut fields = format!(
+                "{} {} {} {} {} {}",
+                epoch.0, floor.0, from.0, records.len(), head.0, u8::from(*complete)
+            );
+            trace_runs(&mut fields, runs);
+            ("sync", fields)
+        }
+        Request::Append { epoch, at, records, head, .. } => (
+            "append",
+            format!("{} {} {} {}", epoch.0, at.0, records.len(), head.0),
+        ),
+        Request::Trim { epoch, through, .. } => ("trim", format!("{} {}", epoch.0, through.0)),
+        Request::Check { epoch, .. } => ("check", format!("{}", epoch.0)),
+        Request::Recover { epoch, from, max, .. } => {
+            ("recover", format!("{} {} {}", epoch.0, from.0, max))
+        }
+        Request::Read { from, max, .. } => ("read", format!("{} {}", from.0, max)),
+        Request::Delete { ensemble: e, .. } => ("delete", ensemble(e)),
+        Request::Replace { epoch, from, to, .. } => (
+            "replace",
+            format!("{} {} {}", epoch.0, ensemble(from), ensemble(to)),
+        ),
+    };
+    let mut row = format!(
+        "{verb} {} {} {caller} {before} {after} {fields}",
+        packet.serial, packet.keeper.0
+    );
+    match reply {
+        None => row.push_str(" 10"),
+        Some(Err(_)) => row.push_str(" 11"),
+        Some(Ok(reply)) => match reply {
+            Reply::Refused(_) => row.push_str(" 0"),
+            Reply::Created => row.push_str(" 1"),
+            Reply::Sealed(view) => {
+                row.push_str(" 2");
+                trace_view(&mut row, view, identities);
+            }
+            Reply::Synced { tail } => write!(row, " 3 {}", tail.0).unwrap(),
+            Reply::Appended { tail } => write!(row, " 4 {}", tail.0).unwrap(),
+            Reply::Trimmed { floor } => write!(row, " 5 {}", floor.0).unwrap(),
+            Reply::Checked(view) => {
+                row.push_str(" 6");
+                trace_view(&mut row, view, identities);
+            }
+            Reply::Records { floor, records, head } => {
+                write!(row, " 7 {} {} {}", floor.0, head.0, records.len()).unwrap();
+                for (lsn, _) in records {
+                    write!(row, " {}", lsn.0).unwrap();
+                }
+            }
+            Reply::Deleted => row.push_str(" 8"),
+            Reply::Replaced => row.push_str(" 9"),
+        },
+    }
+    row
 }
 
 impl Transport for Client {

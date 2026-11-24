@@ -93,7 +93,7 @@ requests require writer authorization.
 | --- | --- |
 | `Create { stream: StreamId, ensemble: [KeeperId; 3] }` | Create if absent and the ensemble contains three distinct nonzero IDs. A keeper outside the ensemble starts as a learner. |
 | `Seal { stream: StreamId, ensemble: [KeeperId; 3], epoch: Epoch }` | Require the current ensemble, policy approval and a higher epoch or the same epoch and authenticated identity. Reply with the keeper view. |
-| `Sync { stream: StreamId, epoch: Epoch, floor: Lsn, from: Lsn, records: Vec<Bytes>, runs: Vec<EpochRun>, head: Lsn, complete: bool }` | Require the promise. Install the selected history with its exact epoch runs and preserve the prefix through the keeper's head. A complete install sets `synced`. An empty, incomplete Sync can advance a synced keeper's floor over a discarded prefix. |
+| `Sync { stream: StreamId, epoch: Epoch, floor: Lsn, from: Lsn, records: Vec<Bytes>, runs: Vec<EpochRun>, head: Lsn, complete: bool }` | Require the promise. Stage the selected history with its exact epoch runs and preserve the prefix through the keeper's head. A staged floor at `from` can skip a trimmed prefix. The view, and so every Seal and Check reply, changes only when a complete Sync installs the staged history and sets `synced`. A new promise discards staged records. An empty, incomplete Sync can advance a synced keeper's floor over a discarded prefix. |
 | `Append { stream: StreamId, epoch: Epoch, at: Lsn, records: Vec<Bytes>, head: Lsn }` | Require the promise and a synced voting member. Extend at `tail + 1` or verify the entire retry range. An empty append can publish the head without adding a record. The published head must fit the resulting tail. |
 | `Trim { stream: StreamId, epoch: Epoch, through: Lsn }` | Require the promise and a synced voting member. Discard through the requested position at or below the local head. |
 | `Check { stream: StreamId, epoch: Epoch }` | Return the durable view. The caller uses the requested epoch to identify eligible replies. |
@@ -109,7 +109,7 @@ requests require writer authorization.
 | --- | --- |
 | `Created` | The stream exists. |
 | `Sealed(StreamView)` | The authenticated promise is durable and the view describes the keeper's history. |
-| `Synced { tail: Lsn }` | The keeper has durably installed the requested range. |
+| `Synced { tail: Lsn }` | The keeper has durably staged or installed the requested range. `tail` is the view's tail. |
 | `Appended { tail: Lsn }` | The keeper has durably accepted the append or already held the same range. |
 | `Trimmed { floor: Lsn }` | The keeper has durably advanced its floor through the requested position. |
 | `Checked(StreamView)` | The keeper's durable view. |

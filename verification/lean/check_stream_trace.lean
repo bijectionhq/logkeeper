@@ -2,13 +2,12 @@ import Logkeeper.StreamTrace
 
 open Logkeeper.StreamTrace
 
-def checkTrace (path : System.FilePath) (requireReference : Bool) : IO UInt32 := do
+def checkTrace (path : System.FilePath) : IO UInt32 := do
   let file ← IO.FS.Handle.mk path .read
   let mut seed := none
   let mut seeds := 0
   let mut events := 0
-  let mut publications := 0
-  let mut incompleteSyncs := 0
+  let mut counts : List (Projection × Nat) := Projection.all.map (·, 0)
   let mut line := 0
   repeat
     let row ← file.getLine
@@ -22,35 +21,20 @@ def checkTrace (path : System.FilePath) (requireReference : Bool) : IO UInt32 :=
       seed := some index
       seeds := seeds + 1
     else
-      let some current := seed | throw (IO.userError s!"line {line}: missing seed")
-      match parse row with
+      if seed.isNone then throw (IO.userError s!"line {line}: missing seed")
+      match parse row >>= step with
       | .error message =>
           IO.eprintln s!"line {line}: {message}"
           return 1
-      | .ok (serial, keeper, projection) =>
+      | .ok projection =>
           events := events + 1
-          match projection with
-          | .checked => pure ()
-          | .inheritedPublication =>
-              if requireReference then
-                IO.eprintln s!"line {line}: Study 119 inherited publication"
-                return 1
-              if publications == 0 then
-                IO.println s!"inherited publication witness: seed {current}, RPC {serial}, keeper {keeper}, line {line}"
-              publications := publications + 1
-          | .incompleteSync =>
-              if requireReference then
-                IO.eprintln s!"line {line}: Study 119 incomplete Sync tail"
-                return 1
-              if incompleteSyncs == 0 then
-                IO.println s!"incomplete Sync witness: seed {current}, RPC {serial}, keeper {keeper}, line {line}"
-              incompleteSyncs := incompleteSyncs + 1
-  IO.println s!"{seeds} seeds, {events} effects, {publications} inherited publications, {incompleteSyncs} changed incomplete Sync tails"
+          counts := counts.map fun (kind, count) => (kind, if kind == projection then count + 1 else count)
+  let summary := ", ".intercalate (counts.map fun (kind, count) => s!"{count} {kind.name}")
+  IO.println s!"{seeds} seeds, {events} effects: {summary}"
   return 0
 
 def main : List String → IO UInt32
-  | [path] => checkTrace path false
-  | ["--require-reference", path] => checkTrace path true
+  | [path] => checkTrace path
   | _ => do
-      IO.eprintln "usage: check_stream_trace.lean [--require-reference] STREAM_TRACE"
+      IO.eprintln "usage: check_stream_trace.lean STREAM_TRACE"
       return 2

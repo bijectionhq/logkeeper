@@ -219,11 +219,11 @@ theorem keeper_step_refines_durable_acceptor {w : Writer Payload} {k next : Keep
       · intro equal
         simp [history, same (ballot.symm.trans equal)]
   | installFloor _ admitted _ _ _ issued _ _ =>
-      refine accept_extension_is_durable_step admitted.1 admitted.2 ?_
+      refine accept_extension_is_durable_step admitted.1 (append_requires_sync admitted) ?_
       simp only [List.length_take]
       exact Nat.le_min_of_le_of_le (Nat.le_max_left _ _) issued.length_le
   | append _ admitted _ _ _ _ _ _ =>
-      exact accept_extension_is_durable_step admitted.1 admitted.2 (by simp)
+      exact accept_extension_is_durable_step admitted.1 (append_requires_sync admitted) (by simp)
   | _ => exact .restart
 
 theorem reachable_keeper_refines_durable_acceptor {w : Writer Payload} {k : Keeper Payload}
