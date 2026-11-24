@@ -187,34 +187,29 @@ impl Writer {
         }
         // Trim replies establish the current fence and cover the requested
         // head even if the local snapshot is behind.
-        let floor = quorum(FuturesUnordered::from_iter(stream.ensemble.map(
-            |keeper| async move {
-                match self
-                    .io
-                    .call(
-                        keeper,
-                        Request::Trim {
-                            stream: stream.id,
-                            epoch,
-                            through,
-                        },
-                    )
-                    .await?
-                {
-                    Reply::Trimmed { floor } if floor > through => Ok(floor),
-                    _ => Err(JournalError::Unavailable),
-                }
-            },
-        )))
+        let floors = quorum(stream.ensemble.map(|keeper| async move {
+            match self
+                .io
+                .call(
+                    keeper,
+                    Request::Trim {
+                        stream: stream.id,
+                        epoch,
+                        through,
+                    },
+                )
+                .await?
+            {
+                Reply::Trimmed { floor } if floor > through => Ok(floor),
+                _ => Err(JournalError::Unavailable),
+            }
+        }))
         .await
         .map_err(|error| match error {
             JournalError::Conflict { .. } if through > head => JournalError::Conflict { head },
             error => error,
-        })?
-        .into_iter()
-        .max()
-        .unwrap();
-        active.trim(floor);
+        })?;
+        active.trim(floors[0].max(floors[1]));
         Ok(())
     }
 
@@ -389,20 +384,19 @@ impl Io {
         expected: Reply,
     ) -> Result<()> {
         // Finish sending to the third keeper after the caller has its quorum.
-        let calls = FuturesUnordered::new();
-        for keeper in stream.ensemble {
+        let calls = stream.ensemble.map(|keeper| {
             let (io, request, expected) = (self.clone(), request.clone(), expected.clone());
-            calls.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 if io.call(keeper, request).await? == expected {
                     Ok(())
                 } else {
                     Err(JournalError::Unavailable)
                 }
-            }));
-        }
-        quorum(FuturesUnordered::from_iter(calls.into_iter().map(
-            |call| async move { call.await.unwrap_or(Err(JournalError::Unavailable)) },
-        )))
+            })
+        });
+        quorum(
+            calls.map(|call| async move { call.await.unwrap_or(Err(JournalError::Unavailable)) }),
+        )
         .await
         .map(|_| ())
     }
@@ -433,19 +427,21 @@ impl Io {
     }
 }
 
-async fn quorum<T, F>(mut calls: FuturesUnordered<F>) -> Result<Vec<T>>
+/// Each slot owns one call on the stream's distinct, fixed ensemble.
+async fn quorum<T, F>(calls: [F; 3]) -> Result<[T; QUORUM]>
 where
     F: Future<Output = Result<T>>,
 {
-    let mut successes = Vec::with_capacity(QUORUM);
+    let mut calls = FuturesUnordered::from_iter(calls);
+    let mut first = None;
     let mut errors = Vec::new();
     while let Some(reply) = calls.next().await {
         match reply {
             Ok(value) => {
-                successes.push(value);
-                if successes.len() == QUORUM {
-                    return Ok(successes);
+                if let Some(previous) = first.take() {
+                    return Ok([previous, value]);
                 }
+                first = Some(value);
             }
             Err(error) => errors.push(error),
         }

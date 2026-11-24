@@ -263,19 +263,18 @@ impl Active {
                     .then_some(self.ensemble[index])
             })
         };
-        quorum(FuturesUnordered::from_iter(
-            accepted.into_iter().flatten().map(|keeper| {
-                let payload = &payload;
-                async move {
-                    let retained =
-                        recovery::fetch(&self.io, keeper, self.stream, self.epoch, at).await?;
-                    if retained != *payload {
-                        return Err(JournalError::Conflict { head: self.head() });
-                    }
-                    self.io.publish(keeper, self.stream, self.epoch, at).await
+        quorum(accepted.map(|keeper| {
+            let payload = &payload;
+            async move {
+                let keeper = keeper.ok_or(JournalError::Unavailable)?;
+                let retained =
+                    recovery::fetch(&self.io, keeper, self.stream, self.epoch, at).await?;
+                if retained != *payload {
+                    return Err(JournalError::Conflict { head: self.head() });
                 }
-            }),
-        ))
+                self.io.publish(keeper, self.stream, self.epoch, at).await
+            }
+        }))
         .await
         .map(|_| at)
         .map_err(|error| match error {

@@ -29,16 +29,13 @@ pub(super) struct Recovery {
 
 impl Recovery {
     pub(super) async fn choose(io: &Io, stream: &Stream, epoch: Epoch) -> Result<Self> {
-        let replies = quorum(FuturesUnordered::from_iter(stream.ensemble.map(
-            |keeper| async move {
-                Ok((
-                    keeper,
-                    seal(io, keeper, stream.id, stream.ensemble, epoch).await?,
-                ))
-            },
-        )))
+        let [(first, a), (second, b)] = quorum(stream.ensemble.map(|keeper| async move {
+            Ok((
+                keeper,
+                seal(io, keeper, stream.id, stream.ensemble, epoch).await?,
+            ))
+        }))
         .await?;
-        let [(first, a), (second, b)] = replies.try_into().unwrap();
         let floor = a.floor.max(b.floor);
         let head = a.head.max(b.head);
         let (source, history) = if outranks(

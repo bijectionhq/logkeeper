@@ -69,13 +69,30 @@ def controls():
     )
     yield (
         "send-unassigned-retry",
-        [edit(WRITER + "append.rs", "                    let retained =\n",
-              "                    if keeper.0 != 0 {\n"
-              "                        return self.send_append(keeper, at, vec![payload.clone()], at).await;\n"
-              "                    }\n"
-              "                    let retained =\n")],
+        [edit(WRITER + "append.rs", "                let retained =\n",
+              "                if keeper.0 != 0 {\n"
+              "                    return self.send_append(keeper, at, vec![payload.clone()], at).await;\n"
+              "                }\n"
+              "                let retained =\n")],
         "stream::writer::tests::committed_retry_does_not_send_unassigned_bytes",
         "committed retry sent unassigned bytes", 0,
+    )
+    yield (
+        "poll-past-read-deadline",
+        [edit(WRITER + "read.rs", "timeout_at(deadline, request(from, max, wait_ms))",
+              "timeout_at(deadline + super::RPC_TIMEOUT, request(from, max, wait_ms))")],
+        "stream::writer::tests::a_delayed_poll_reply_cannot_extend_the_read_wait",
+        "the first poll exhausted the wait budget", 0,
+    )
+    yield (
+        "return-abandoned-read-page",
+        [edit(WRITER + "read.rs", "        } = request(at, left as usize, 0).await?;",
+              "        } = match request(at, left as usize, 0).await {\n"
+              "            Ok(chunk) => chunk,\n"
+              "            Err(_) => return Ok(page),\n"
+              "        };")],
+        "stream::writer::tests::a_lost_read_chunk_discards_the_partial_page_before_fallback",
+        "fallback must use its own first reply", 0,
     )
     yield (
         "ignore-seal-proposal",

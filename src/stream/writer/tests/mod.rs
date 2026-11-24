@@ -1078,6 +1078,86 @@ async fn read_assembles_a_page_across_keeper_frames() {
     assert_eq!(page.records, [(Lsn(1), payload.clone()), (Lsn(2), payload)]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_lost_read_chunk_discards_the_partial_page_before_fallback() {
+    let size = 32 * 1024 * 1024;
+    let network = Arc::new(Network::new(3, size, 3 * u64::from(size)));
+    let writer = writer(&network, 1);
+    writer.create(STREAM).await.unwrap();
+    writer.seal(STREAM, E1).await.unwrap();
+    let payload = Bytes::from(vec![7; size as usize]);
+    for lsn in [Lsn(1), Lsn(2)] {
+        writer
+            .append(STREAM, E1, lsn, payload.clone())
+            .await
+            .unwrap();
+    }
+    network
+        .until(|| {
+            KEEPERS[..3].iter().all(|&keeper| {
+                network
+                    .view(keeper, STREAM)
+                    .is_some_and(|view| view.head == Lsn(2))
+            })
+        })
+        .await;
+
+    let first = KEEPERS[0];
+    let gate = Gate::new();
+    network.fault(first, Kind::Read, Fault::HoldReply(gate.clone()));
+    let read = writer.read(STREAM, Lsn(1), 3, Duration::ZERO);
+    tokio::pin!(read);
+    tokio::select! {
+        _ = gate.reached() => {}
+        _ = &mut read => panic!("the first chunk must be held"),
+    }
+    network.fault(first, Kind::Read, Fault::LoseReply);
+    writer
+        .append(STREAM, E1, Lsn(3), record("last"))
+        .await
+        .unwrap();
+    network
+        .until(|| {
+            KEEPERS[..3].iter().all(|&keeper| {
+                network
+                    .view(keeper, STREAM)
+                    .is_some_and(|view| view.head == Lsn(3))
+            })
+        })
+        .await;
+    gate.release();
+
+    let page = read.await.unwrap();
+    assert_eq!(page.head, Lsn(3), "fallback must use its own first reply");
+    assert_eq!(
+        page.records,
+        [
+            (Lsn(1), payload.clone()),
+            (Lsn(2), payload),
+            (Lsn(3), record("last"))
+        ]
+    );
+    let calls = network.calls(Kind::Read);
+    assert_eq!(&calls[..3], &[first, first, KEEPERS[1]]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_delayed_poll_reply_cannot_extend_the_read_wait() {
+    let (network, writer) = started().await;
+    let first = KEEPERS[0];
+    network.fault(first, Kind::Poll, Fault::HoldReply(Gate::new()));
+    let start = tokio::time::Instant::now();
+    let page = writer.read(STREAM, Lsn(1), 1, WAIT).await.unwrap();
+    assert!(
+        start.elapsed() <= WAIT,
+        "the first poll exhausted the wait budget"
+    );
+    assert_eq!(page.head, Lsn(0));
+    assert!(page.records.is_empty());
+    assert_eq!(network.calls(Kind::Poll), [first]);
+    assert_eq!(network.calls(Kind::Read), KEEPERS[..3]);
+}
+
 /// Seal a fresh stream with a writer whose lanes send at most `records` per append.
 async fn started_with_append_records(records: usize) -> (Arc<Network>, Writer) {
     let network = Arc::new(Network::default());
