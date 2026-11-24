@@ -10,6 +10,11 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::wire::*;
 
+#[cfg(feature = "stream")]
+mod reply_write;
+#[cfg(feature = "stream")]
+pub(super) use reply_write::PreparedReply;
+
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const PAGE_BYTES: usize = MAX_FRAME_BYTES - 64;
 
@@ -103,12 +108,17 @@ pub fn decode_request(body: Bytes) -> io::Result<Request> {
 }
 
 pub fn encode_reply(reply: &Reply) -> io::Result<Bytes> {
-    if let Reply::Batch(replies) = reply
-        && (replies.is_empty() || replies.iter().any(|reply| matches!(reply, Reply::Batch(_))))
-    {
-        return Err(invalid("empty or nested keeper batch"));
+    if let Reply::Batch(replies) = reply {
+        validate_reply_batch(replies)?;
     }
     encode(&ReplyFrame::from(reply), MAX_FRAME_BYTES)
+}
+
+fn validate_reply_batch(replies: &[Reply]) -> io::Result<()> {
+    if replies.is_empty() || replies.iter().any(|reply| matches!(reply, Reply::Batch(_))) {
+        return Err(invalid("empty or nested keeper batch"));
+    }
+    Ok(())
 }
 
 pub fn decode_reply(body: Bytes) -> io::Result<Reply> {

@@ -38,7 +38,7 @@ use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 use super::{
     codec::{
-        self, decode_reply, decode_request, encode_reply, encode_request, invalid, read_frame,
+        self, PreparedReply, decode_reply, decode_request, encode_request, invalid, read_frame,
         write_frame,
     },
     keeper::{Keeper, Limits, SealPolicy},
@@ -192,7 +192,9 @@ async fn serve_connection(
                     None => open = false,
                 },
                 Some(reply) = running.next(), if !running.is_empty() => {
-                    timeout(FRAME_TIMEOUT, write_frame(&mut write, &encode_reply(&reply?)?)).await??;
+                    let reply = reply?;
+                    let frame = PreparedReply::new(&reply)?;
+                    timeout(FRAME_TIMEOUT, frame.write(&mut write)).await??;
                 }
                 else => return Ok::<_, io::Error>(()),
             }
