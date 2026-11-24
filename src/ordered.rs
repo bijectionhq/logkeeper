@@ -19,6 +19,7 @@ mod object_withdrawal;
 mod receipt;
 mod reducer;
 mod reducer_request;
+mod reducer_retention;
 mod refusal;
 pub mod replication;
 mod replay_bounds;
@@ -1562,14 +1563,17 @@ impl State {
         )
     }
 
-    fn charge_object_control(&self, charge: usize) -> Result<(), Refusal> {
-        let used = self.object_fences.len() * WITHDRAWAL_BYTES
+    fn object_control_used(&self) -> usize {
+        self.object_fences.len() * WITHDRAWAL_BYTES
             + self
                 .root_references
                 .values()
                 .map(|names| 12 + 32 * names.len())
-                .sum::<usize>();
-        if used.saturating_add(charge) > self.object_control_bytes {
+                .sum::<usize>()
+    }
+
+    fn charge_object_control(&self, charge: usize) -> Result<(), Refusal> {
+        if self.object_control_used().saturating_add(charge) > self.object_control_bytes {
             return Err(Refusal::Capacity);
         }
         Ok(())
@@ -1623,13 +1627,20 @@ impl State {
         )? {
             return Ok(fence);
         }
-        self.charge_object_control(WITHDRAWAL_BYTES)?;
         let fence = ObjectFence {
             object,
             position: self.position,
             time: self.time,
         };
-        object_withdrawal::install_fence(&mut self.object_fences, object.name, fence);
+        let used = self.object_control_used();
+        reducer_retention::commit_withdrawal(
+            &mut self.object_fences,
+            object.name,
+            fence,
+            used,
+            WITHDRAWAL_BYTES,
+            self.object_control_bytes,
+        )?;
         Ok(fence)
     }
 
