@@ -1145,6 +1145,83 @@ async fn sweeper_restores_an_absent_survivor_from_one_durable_copy() {
     }
 }
 
+#[tokio::test]
+async fn sweeper_transfers_multiple_pages_across_successive_replacements() {
+    use crate::stream::writer::Writer;
+    use journal_contract::{Journal, JournalError};
+
+    let [source, lagging, lost] = MEMBERS;
+    let learner = KeeperId(4);
+    let successor = KeeperId(5);
+    let directories: Vec<_> = (0..5).map(|_| tempdir().unwrap()).collect();
+    let mut transport = Local(
+        MEMBERS
+            .into_iter()
+            .chain([learner, successor])
+            .zip(&directories)
+            .map(|(id, dir)| (id, Keeper::open(dir.path(), id, Limits::default()).unwrap()))
+            .collect(),
+    );
+    let records = vec![b"before".as_slice(); 8193];
+    let end = Lsn(records.len() as u64);
+    for keeper in MEMBERS {
+        for request in [create(A), seal(A, 1), sync(A, 1, 1, &[], 0, true)] {
+            transport.call(keeper, request).await.unwrap();
+        }
+    }
+    for keeper in [source, lost] {
+        assert_eq!(
+            transport
+                .call(keeper, append(A, 1, 1, &records, end.0))
+                .await
+                .unwrap(),
+            Reply::Appended { tail: end }
+        );
+    }
+    transport.0.remove(&lost).unwrap();
+    let transport = Arc::new(transport);
+    let stale = Writer::new(transport.clone(), MEMBERS).unwrap();
+    let first = Sweep::new(A, MEMBERS, [source, lagging], learner, Epoch(2));
+    let [(_, outcome)] = sweep_idle(&*transport, [first]).await.try_into().unwrap();
+    assert!(
+        outcome.is_ok(),
+        "sweep rejected its incomplete Sync reply: {outcome:?}"
+    );
+    let middle = [source, lagging, learner];
+    let writer = Writer::new(transport.clone(), middle).unwrap();
+    assert_eq!(writer.head(A).await, Ok(end));
+    assert_eq!(
+        stale.head(A).await,
+        Err(JournalError::Unavailable),
+        "stale roster supplied a fresh head"
+    );
+
+    let epoch = Epoch(3);
+    let last = Lsn(end.0 + 1);
+    assert_eq!(writer.seal(A, epoch).await, Ok(end));
+    assert_eq!(
+        writer
+            .append(A, epoch, last, Bytes::from_static(b"after"))
+            .await,
+        Ok(last)
+    );
+    let mut transport = Local(transport.0.clone());
+    transport.0.remove(&source).unwrap();
+    let transport = Arc::new(transport);
+    let second = Sweep::new(A, middle, [lagging, learner], successor, Epoch(4));
+    let [(_, outcome)] = sweep_idle(&*transport, [second]).await.try_into().unwrap();
+    assert!(
+        outcome.is_ok(),
+        "second replacement lost the recovered prefix: {outcome:?}"
+    );
+    let observer = Writer::new(transport.clone(), [successor, lagging, learner]).unwrap();
+    assert_eq!(observer.head(A).await, Ok(last));
+    assert_eq!(
+        transport.call(successor, read(A, end.0)).await.unwrap(),
+        page(1, last.0, &[(end.0, b"before"), (last.0, b"after")])
+    );
+}
+
 #[test]
 fn checkpoint_boundary_controls_wal_replay() {
     let mut test = Harness::new(Limits::default());

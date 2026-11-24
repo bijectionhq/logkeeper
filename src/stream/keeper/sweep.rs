@@ -128,6 +128,7 @@ impl Sweep {
                 Vec::new(),
                 known_commit,
                 true,
+                history.tail,
             )
             .await?;
         }
@@ -240,6 +241,7 @@ impl Sweep {
                 runs,
                 head.min(last),
                 last == history.tail,
+                target.tail,
             )
             .await?;
             if last == history.tail {
@@ -256,6 +258,7 @@ impl Sweep {
             Vec::new(),
             head,
             true,
+            target.tail,
         )
         .await
     }
@@ -324,8 +327,14 @@ impl Sweep {
         runs: Vec<EpochRun>,
         head: Lsn,
         complete: bool,
+        visible_tail: Lsn,
     ) -> Result<(), SweepError> {
-        let tail = Lsn(from.0 - 1 + records.len() as u64);
+        // Incomplete Sync acknowledges a staged chunk without changing the view.
+        let tail = if complete {
+            Lsn(from.0 - 1 + records.len() as u64)
+        } else {
+            visible_tail
+        };
         self.expect(
             transport,
             keeper,
