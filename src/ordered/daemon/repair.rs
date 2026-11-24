@@ -172,7 +172,7 @@ fn validate_tickets(destination: &GroupConfig, tickets: &[&Path]) -> Result<(), 
             return Err(invalid("a repair reservation has the wrong scope or was repeated").into());
         }
     }
-    if paid.len() < destination.group.quorum() {
+    if !super::super::cohort::has_paid_repair_quorum(paid.len(), destination.group.quorum()) {
         return Err(invalid("no prepaid successor quorum is available").into());
     }
     Ok(())

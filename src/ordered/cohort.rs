@@ -16,3 +16,8 @@ pub(super) fn matches_chosen_seal(successor: Option<&[u8; 32]>, destination: &[u
         None => false,
     }
 }
+
+#[cfg(feature = "ordered-daemon")]
+pub(super) fn has_paid_repair_quorum(paid: usize, quorum: usize) -> bool {
+    paid >= quorum
+}
