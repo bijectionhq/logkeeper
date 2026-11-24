@@ -69,6 +69,7 @@ def main():
         ("reused-address", "joint", "reuse_address", "SurvivingCopy"),
         ("early-discard", "joint", "early_discard", "SurvivingCopy"),
         ("new-only-joint", "joint", "joint_old_optional", "QuorumCanRecover"),
+        ("new-below-quorum", "sealed", "new_below_quorum", "SurvivingCopy"),
     ):
         check(f"control-{name}", (law,), design=design, mutation=mutation, expected=law)
     for design in ("joint", "sealed"):

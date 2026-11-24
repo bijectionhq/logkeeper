@@ -33,6 +33,7 @@ Delivering a previous decision and making a new old-only decision are different 
 | A35 | Old persistence counts for a new durable identity at the same address. | Commit → enter joint → adopt using the old disk's proof for its replacement → lose the remaining eligible copy. Four transitions. |
 | A36 | Release old storage while joint. | Enter joint → commit → lose an AZ → reclaim the last copy in the still-protecting old membership. Four transitions. |
 | A37 | Accept a new-only vote in the joint phase. | Enter joint → commit with a new-only majority. An old-side recovery majority has no exact copy. Two transitions. |
+| Successor quorum | Accept one voter in the installed successor. | Seal → adopt → commit on one successor voter → lose its AZ. No surviving copy. Four transitions. |
 
 ## General proofs and acceptance program
 
