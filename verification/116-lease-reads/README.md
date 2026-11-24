@@ -1,0 +1,58 @@
+# Study 116 · Serving leases and per-read barriers
+
+The lease proposal as stated breaks latest-read linearizability and admitted-view retention. A guarded local path can remove the voter round from a latest read. It needs an apply interlock, standing protection for exact dependencies, and an admission fence before replacement or erasure rotation. A hybrid keeps ordered admission for a named basis outside local coverage. Keep the barrier as the default until implementation evidence justifies the failover, retention, and erasure tradeoffs. D01 and D02 stay in effect.
+
+## Prior work
+
+- Study 29 removed the marker with a **fresh quorum round**. Its `known_cut_only` control let a valid replica miss a command chosen before invocation. That rejection still applies when a leaseholder serves its applied cut while a prior choice is unapplied. Study 30 also ruled out old read quorums after reconfiguration and required the inherited reservation to survive. [Study 29](../29-read-index/report.md) · [Study 30](../30-reconfigured-reads/report.md) · [A102–A109](../amendments.md#study-29--2026-11-22)
+- Study 31 shared durable custody across local admissions, while keeping fresh quorum evidence for each invocation. It rejected a local gate whose reservation omitted the replay suffix or vanished on restart. Study 92 distinguished latest observation, a named basis, and original-result recovery. D01 subsequently removed original-result recovery from the baseline. [Study 31](../31-standing-custody/report.md) · [Study 92](../92-read-contracts/report.md) · [D01](../requirements.md#owner-decisions--2026-11-23)
+- Study 113 used a serving lease to bound admission by a withdrawn worker before disposing of its **journal holds**. It rejected an asynchronous self-fence and unbounded drift. Those reasons still hold. Its admission model made each read atomic. A500 later identified that already admitted provider I/O can continue after lease expiry and must drain behind the provider fence. Study 112 required old held views to work until the erasure deadline and refuse after it. [Study 113](../113-worker-disposal/report.md) · [A464–A466](../amendments.md#study-113--2026-11-23) · [A500](../amendments.md#co-design-wave-3--2026-11-23) · [Study 112](../112-erasure-rotation/report.md)
+- The search covered Studies 01–113 and the amendment log for lease and local reads, reader epochs, and epoch reclamation. The studies above cover the separate authority and custody mechanisms. None of the matches compared exclusive serving authority and periodic reader-floor reports as a replacement for the barrier and its hold.
+
+## Protocols and results
+
+**A. Ordered barrier.** The voter decision selects the exact current logical head and attaches a hold. The admitted operation can materialize that basis after the writer changes. Trim and collection consult held bases. RTDB records a request identity before sending the barrier. It releases a known hold with `Release` and settles an uncertain barrier by identity with `ReleaseRead`. The reducer spends the request identity and uses a retained receipt only as hold provenance. The model charges one ordered release for either cleanup path and models orphan expiry as an abstract effective stop after its horizon. It abstracts the reducer's journal-position retry window and RTDB's repeated cleanup attempts. [Logkeeper Barrier](../../src/ordered.rs#L1171) · [Read identity](../../src/ordered.rs#L772) · [ReleaseRead](../../src/ordered.rs#L1472) · [Trim](../../src/ordered.rs#L1510) · [RTDB source inventory](../codesign.md)
+
+The RTDB implementation inspected was `58f6a6e976`, `rust/crates/multi/src/journal/log.rs`, lines 100–123 and 300–362 for release, admission, and lost-reply settlement. In the C2 revision `76f4ad2189`, lines 473–506 cover replay under the held interval.
+
+**B. Guarded lease.** The installed writer is the only source of data proposals. Before proposing, it closes latest admission across any unresolved outcome and waits until it applies the exact chosen head. It checks `workerClock + drift < leaseEnd` at the same local transition that captures the applied cut and registers the exact borrow. The writer's applied cut can lag a choice even within a valid lease. The lagging-apply variant preserves a committed-prefix guarantee only. Its returned cut may predate the entire invocation, and the model gives no freshness bound in versions.
+
+Renewal takes the lower of the oldest active basis and the earliest basis available to future local admissions. In the main model, the latter is the applied cut when proposing a raised floor. The renewed gate admits only at or above the published floor. A real publication must raise the local admission bound before the custodian can act on the report, keep the prior protection until the update is known, and bind the report to its exact epoch and generation. A report of active readers alone misses later admissions below its value. The `periodic-only` control loses the first reply at cut 0, advances the floor to 1, admits a named retry at the still-resident cut 0, then trims it. With unrestricted **latest** admissions at a monotone applied cut within the same epoch, using that cut when no readers are active already gives a conservative bound for future latest admissions. That fact gives no protection for older named reads or for discarding a departed writer's reported floor.
+
+The custodian uses the minimum across still-protected epochs. Writer-lease expiry closes new admission. The old epoch's floor stays until every admitted operation completes or is effectively stopped. The checked lease variant waits for the predecessor's deadline before installing a replacement or committing rotation. A bounded wait can be replaced by a proven effective admission fence, which is an open refinement. An unreachable predecessor can retain its floor beyond expiry if drain cannot be proved.
+
+**Physical dependencies.** The main model uses one exact basis per cut. The auxiliary model separates a logical read cut 2 from its root at 0 and replay input at 1. Reporting cut 2 as the reclamation floor allows both journal trim and provider deletion while the read is live. An implementation needs a floor over the oldest needed dependencies, or exact registered reachability covering every live root, replay interval and immutable object. A cut number alone cannot certify that set. [ExactBasis.tla](ExactBasis.tla) · [Study 31 custody rules](../31-standing-custody/report.md)
+
+**D01.** A lost reply spends its admission. A named retry uses a distinct admission and the same logical basis while it is retained and authorized. An unpinned latest request with no known basis opens a fresh latest observation. A and guarded B have witnesses that retries the original basis across replacement after the head advances. A raised floor can also exclude an older named basis while the bytes remain resident and the generation still authorizes it. A local-only interface therefore loses immediate admission for some retained bases that the ordered path can admit. The hybrid takes an ordered hold when local coverage is unavailable and passes `RetainedNamedAdmission`; this invariant checks enabledness at the current state. Keep D01 by retaining this named path, or by supplying a still-valid independent hold that covers the requested basis. Resampling a known basis to latest would require an explicit D01 change.
+
+**D02.** Rotation is one epoch change with clean successor state and an armed deadline. A previously admitted old-generation view remains protected and can be used before the deadline. At and after the deadline its use returns `rtdb/erased-under-view`, even while its ciphertext is held. Fresh ordered or local selections after rotation use the clean generation. The model assumes that the clean checkpoint covers every selectable recovery image and that the key fence also controls already cached plaintext and delayed provider work at the point of use. The timed lease adds a possible admission-fence wait before rotation commits. [D02](../requirements.md#owner-decisions--2026-11-23) · [Study 112](../112-erasure-rotation/report.md) · [A506](../amendments.md#co-design-wave-3--2026-11-23)
+
+## Work per read
+
+One successful chosen command counts as one modeled consensus round trip and one journal entry. The model stores both counts per admission and for shared renewals.
+
+| Path | Critical-path rounds / entries | Cleanup rounds / entries | Shared work |
+| --- | ---: | ---: | --- |
+| A · Barrier and ordered release | 1 / 1 | 1 / 1 | Existing grant and maintenance traffic |
+| B · Covered local admission and release | 0 / 0 | 0 / 0 | 1 / 1 per modeled renewal for the active epoch |
+| B · Ordered fallback for a named basis | 1 / 1 | 1 / 1 | Same lease maintenance when the local path is enabled |
+
+For `N` covered reads with explicit release and `R` renewals, the model counts `2N` dedicated commands for A and `R` shared commands for B, plus any dedicated lease acquisition beyond the initial installed grant. An expiry can replace an explicit cleanup in the abstraction. A normal read saves one round on the response path. The batch witness has two completed local reads and one renewal. The counts exclude retries, route lookup, provider I/O, startup, and actual replication traffic. Operational latency may depend on catch-up, unavailable quorum during renewal, and local borrow acquisition. D06 requires measurement for the reported budgets.
+
+## Evidence and limits
+
+TLC uses one tenant, an abstract totally ordered voter decision, one append with separate proposal/choice/application, one successor installation (replacement **or** rotation), at most two attempts, and at most one renewal. Reconfiguration safety runs use one attempt and six ticks. Two-attempt safety runs fix the epoch and use three ticks. Cross-epoch two-attempt witnesses use six ticks. The lease term is three ticks, allowed clock offset is one tick, and the orphan horizon and post-commit erasure grace are two ticks each. The clock advances monotonically and may lead or lag within the bound. The exact-basis model uses one reader, two old dependencies, one new root publication, no clock, and three positions. The final table gives the passing state counts and named failure depths. [Expected results](expected-results.md)
+
+Lean checks arithmetic for cutover, protection of a sampled active borrow, and protection of a later admission above the published floor. The three mutants fail at their respective proof obligations. These lemmas do not establish the clock premise or implement the reporting protocol. [Lean proofs](LeaseBounds.lean)
+
+The models check bounded safety and reachability. They abstract crash recovery, real consensus, authentication, persistent sessions, the provider fence and the clean root proof. They establish fresh latest results under the modeled gate and preserve held views through the checked replacement and rotation schedules. Full two-attempt reconfiguration was split into focused safety runs and cross-epoch witnesses after the combined state space exceeded the shared runner's timeout. A lease-epoch fast path still needs refinement for partitions, restart and stale reports, multi-step erasure staging, and measured failover and reclamation limits before it can replace the barrier.
+
+## Reproduction
+
+```sh
+JAVA_BIN=/Users/sachaichbiah/cycle3/jdk/Contents/Home/bin/java \
+TLA_JAR=/Users/sachaichbiah/cycle3/tools/formal/tla-1.7.4/tla2tools.jar \
+  python3 verification/116-lease-reads/run.py
+```
+
+The runner checks the pinned jar and Lean 4.35.0. It accepts `tla` or `lean` to select a checker. Logs, configurations, and counterexamples go under the ignored `.results/` directory.
