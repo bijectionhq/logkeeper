@@ -254,7 +254,7 @@ mod implementation {
 
         match request {
             Request::Seal {
-                epoch, ensemble, ..
+                epoch, ensemble, proposal, ..
             } => {
                 if !view.seal_allowed {
                     return refuse(Refusal::Unauthorized);
@@ -263,7 +263,7 @@ mod implementation {
                     return wrong_ensemble(state);
                 }
                 let current = state.promised.as_ref().map_or(0, |(current, _)| current.0);
-                let identical = promised(*epoch);
+                let identical = promised(*epoch) && state.proposal == *proposal;
                 if !may_seal(state.promised.is_some(), current, epoch.0, identical) {
                     return fenced(state);
                 }

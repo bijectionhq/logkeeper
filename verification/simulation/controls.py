@@ -49,6 +49,12 @@ def controls():
         yield name, [keeper[name]["mutate"][0]], WIRE, check, 0
 
     yield (
+        "reuse-seal-proposal",
+        [edit(WRITER + "mod.rs", "proposal: uuid::Uuid::new_v4().as_u128(),", "proposal: 1,")],
+        "stream::writer::tests::a_new_writer_with_the_same_identity_cannot_reseal",
+        "independent writer re-elected an existing epoch", 0,
+    )
+    yield (
         "one-keeper", writer["one-keeper"]["mutate"],
         SIM + "guards::one_acceptance_cannot_publish_a_head",
         "writer published a head without two acceptances", 0,

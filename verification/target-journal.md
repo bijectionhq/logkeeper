@@ -27,7 +27,7 @@ LSN 1. The **head** is the last committed LSN, or 0 for an empty stream. A
 | Call | Result | Semantics |
 | --- | --- | --- |
 | `create(stream: StreamId)` | `()` | Create an empty stream with head 0, floor 1 and no epoch. Idempotent. A deleted ID cannot be reused. |
-| `seal(stream: StreamId, epoch: Epoch)` | `Lsn` | Fence lower epochs and return the head, which covers every earlier acknowledged append. An equal-epoch retry from the same identity is idempotent. A different identity at the same epoch is fenced. |
+| `seal(stream: StreamId, epoch: Epoch)` | `Lsn` | Fence lower epochs and return the head, which covers every earlier acknowledged append. An equal-epoch retry by the existing proposer is idempotent. A new proposer at the same epoch is fenced, including a restarted writer using the same identity. |
 | `append(stream: StreamId, epoch: Epoch, at: Lsn, payload: Bytes)` | `Lsn` | Commit at `at == head + 1` under the sealed epoch and identity. An identical retained retry returns `at`. A different payload at a committed position returns `Conflict`. |
 | `read(stream: StreamId, from: Lsn, max: usize, wait: Duration)` | `Page` | Read the contiguous committed slice in `[from, from + max)` through the serving keeper's head. Wait up to `wait` for records when `from` exceeds the observed head. Try another keeper if the first cannot supply the requested records. Return `Trimmed` only if the requested start is unavailable and is below an observed floor. A page can lag `head()`, include records another keeper trimmed, or include retained records until the serving keeper observes a deletion. |
 | `head(stream: StreamId)` | `Lsn` | Return a head that existed during the call and covers every LSN acknowledged before the call began. |
@@ -70,13 +70,14 @@ normally one per zone. The writer drives the protocol and the keepers never
 coordinate with each other on the hot path. The authenticated transport
 supplies the caller `Identity`. Mutating messages carry no claimed identity.
 One proposer drives a given epoch. The proposer uses its certificate
-identity and shares one writer state among its handles. A takeover elects a
-fresh epoch. A reconnect at the same epoch retries the existing election.
+identity and shares one writer state among its handles. A writer instance generates a proposal ID and shares it across its handles.
+A takeover elects a fresh epoch. A reconnect at the same epoch retries the
+existing proposal. The keeper stores and echoes the proposal ID with the promise.
 
 A keeper's **tail** is the last durable LSN, which can include accepted,
 uncommitted records. The keeper's **head** is the last LSN it knows to be
 committed. `StreamView` contains `promised: Option<(Epoch, Identity)>`,
-`synced: Option<Epoch>`, `tail: Lsn`, `head: Lsn`, `floor: Lsn`,
+`proposal: Option<u128>`, `synced: Option<Epoch>`, `tail: Lsn`, `head: Lsn`, `floor: Lsn`,
 `runs: Vec<EpochRun>`, `ensemble: [KeeperId; 3]` and `learner: bool`.
 Each `EpochRun { epoch: Epoch, first: Lsn, last: Lsn }` covers an inclusive
 range of records from one epoch. The keeper also persists its deletion
@@ -92,7 +93,7 @@ requests require writer authorization.
 | Request | Keeper rule |
 | --- | --- |
 | `Create { stream: StreamId, ensemble: [KeeperId; 3] }` | Create if absent and the ensemble contains three distinct nonzero IDs. A keeper outside the ensemble starts as a learner. |
-| `Seal { stream: StreamId, ensemble: [KeeperId; 3], epoch: Epoch, proposal: Option<u128> }` | Require the current ensemble, policy approval and a higher epoch or the same epoch and authenticated identity. Reply with the keeper view. |
+| `Seal { stream: StreamId, ensemble: [KeeperId; 3], epoch: Epoch, proposal: Option<u128> }` | Require the current ensemble, policy approval and a higher epoch or the same epoch, authenticated identity and proposal ID. An absent proposal denotes a legacy promise and cannot retry a promise with a proposal ID. Reply with the keeper view. |
 | `Sync { stream: StreamId, epoch: Epoch, floor: Lsn, from: Lsn, records: Vec<Bytes>, runs: Vec<EpochRun>, head: Lsn, complete: bool }` | Require the promise. Stage the selected history with its exact epoch runs and preserve the prefix through the keeper's head. A staged floor at `from` can skip a trimmed prefix. The view, and so every Seal and Check reply, changes only when a complete Sync installs the staged history and sets `synced`. A new promise discards staged records. An empty, incomplete Sync can advance a synced keeper's floor over a discarded prefix. |
 | `Append { stream: StreamId, epoch: Epoch, at: Lsn, records: Vec<Bytes>, head: Lsn }` | Require the promise and a synced voting member. Extend at `tail + 1` or verify the entire retry range. An empty append can publish the head without adding a record. The published head must fit the resulting tail. |
 | `Trim { stream: StreamId, epoch: Epoch, through: Lsn }` | Require the promise and a synced voting member. Discard through the requested position at or below the local head. |

@@ -191,6 +191,25 @@ async fn two_identities_at_the_same_epoch_cannot_both_seal() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_new_writer_with_the_same_identity_cannot_reseal() {
+    let (network, original) = started().await;
+    assert_eq!(original.clone().seal(STREAM, E1).await, Ok(Lsn(0)));
+    drop(original);
+
+    let restarted = writer(&network, 1);
+    assert_eq!(
+        restarted.seal(STREAM, E1).await,
+        Err(JournalError::Fenced { current: E1 }),
+        "independent writer re-elected an existing epoch"
+    );
+    assert_eq!(restarted.seal(STREAM, E2).await, Ok(Lsn(0)));
+    assert_eq!(
+        restarted.append(STREAM, E2, Lsn(1), record("new epoch")).await,
+        Ok(Lsn(1))
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn head_and_reseal_accept_the_winning_identity_amid_a_split_promise() {
     use crate::stream::wire::{Reply, Request, Transport};
 

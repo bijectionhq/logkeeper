@@ -37,6 +37,7 @@ pub struct Writer {
 
 struct Io {
     transport: Arc<dyn Transport>,
+    proposal: u128,
     /// Most pending records one lane sends in a single keeper append.
     append_records: usize,
 }
@@ -70,6 +71,7 @@ impl Writer {
         Ok(Self {
             io: Arc::new(Io {
                 transport,
+                proposal: uuid::Uuid::new_v4().as_u128(),
                 append_records: append::APPEND_RECORDS,
             }),
             keepers,
@@ -83,6 +85,7 @@ impl Writer {
     fn with_append_records(mut self, records: usize) -> Self {
         self.io = Arc::new(Io {
             transport: self.io.transport.clone(),
+            proposal: self.io.proposal,
             append_records: records,
         });
         self
