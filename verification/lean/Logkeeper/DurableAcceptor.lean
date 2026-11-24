@@ -28,6 +28,32 @@ def promise (state : State Command) (ballot : Nat) : State Command :=
       promised := ballot
       replies := fun time => if time = ballot then some state.latest else state.replies time }
 
+/-- A retry at the existing floor acknowledges the same promise. -/
+def PrepareAdmitted (floor ballot : Nat) : Prop := floor ≤ ballot
+
+/-- The native protocol requires its own prepare before accepting. -/
+def AcceptAtPromise (floor ballot : Nat) : Prop := floor ≠ 0 ∧ floor = ballot
+
+theorem promise_only_advances_above_floor {floor ballot : Nat}
+    (admitted : PrepareAdmitted floor ballot) (changed : floor ≠ ballot) :
+    floor < ballot :=
+  Nat.lt_of_le_of_ne admitted changed
+
+theorem accept_at_or_above_promise {floor ballot : Nat}
+    (admitted : AcceptAtPromise floor ballot) : floor ≤ ballot :=
+  Nat.le_of_eq admitted.2
+
+instance (floor ballot : Nat) : Decidable (PrepareAdmitted floor ballot) :=
+  inferInstanceAs (Decidable (floor ≤ ballot))
+
+instance (floor ballot : Nat) : Decidable (AcceptAtPromise floor ballot) :=
+  inferInstanceAs (Decidable (floor ≠ 0 ∧ floor = ballot))
+
+#guard !(decide (PrepareAdmitted 3 2))
+#guard !(decide (AcceptAtPromise 3 2))
+#guard !(decide (AcceptAtPromise 3 4))
+#guard decide (PrepareAdmitted 3 3)
+
 inductive Step : State Command → State Command → Prop
   | accept {state} (vote : Vote Command) (abovePromise : state.promised ≤ vote.ballot)
       (keepsRank : ∀ old, state.latest = some old → RankLE old vote) :
@@ -35,6 +61,27 @@ inductive Step : State Command → State Command → Prop
   | prepare {state} (ballot : Nat) (newer : state.promised < ballot) :
       Step state (promise state ballot)
   | restart {state} : Step state state
+
+def prepareOrRetry (state : State Command) (ballot : Nat) : State Command :=
+  if state.promised = ballot then state else promise state ballot
+
+theorem prepare_or_retry_is_step {state : State Command} {ballot : Nat}
+    (admitted : PrepareAdmitted state.promised ballot) :
+    Step state (prepareOrRetry state ballot) := by
+  by_cases same : state.promised = ballot
+  · simpa [prepareOrRetry, same] using (Step.restart (state := state))
+  · simpa [prepareOrRetry, same] using
+      (Step.prepare (state := state) ballot (promise_only_advances_above_floor admitted same))
+
+theorem accept_at_promise_is_step {state : State Command} (vote : Vote Command)
+    (admitted : AcceptAtPromise state.promised vote.ballot)
+    (keepsRank : ∀ old, state.latest = some old → RankLE old vote) :
+    Step state (acceptVote state vote) :=
+  .accept vote (accept_at_or_above_promise admitted) keepsRank
+
+#print axioms promise_only_advances_above_floor
+#print axioms accept_at_promise_is_step
+#print axioms prepare_or_retry_is_step
 
 inductive Reachable : State Command → Prop
   | initial : Reachable initial

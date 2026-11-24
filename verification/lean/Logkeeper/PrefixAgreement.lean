@@ -14,6 +14,20 @@ def RankLE (earlier later : Vote Command) : Prop :=
   earlier.ballot ≤ later.ballot ∧
   (earlier.ballot = later.ballot → earlier.history.length ≤ later.history.length)
 
+/-- One native ballot consists of a round followed by a big-endian UUID. -/
+def ballotRank (round nonce : Nat) : Nat := round * 2^128 + nonce
+
+theorem ballot_rank_order {a b x y : Nat} (xFits : x < 2^128) (yFits : y < 2^128) :
+    ballotRank a x < ballotRank b y ↔ a < b ∨ a = b ∧ x < y := by
+  simp only [ballotRank]
+  omega
+
+instance (earlier later : Vote Command) : Decidable (RankLE earlier later) :=
+  inferInstanceAs (Decidable (earlier.ballot ≤ later.ballot ∧
+    (earlier.ballot = later.ballot → earlier.history.length ≤ later.history.length)))
+
+#guard ballotRank 1 (2^128 - 1) < ballotRank 2 0
+
 theorem rank_refl (vote : Vote Command) : RankLE vote vote :=
   ⟨Nat.le_refl _, fun _ => Nat.le_refl _⟩
 
@@ -60,6 +74,11 @@ structure BallotRules (ledger : Ledger Voter Command) : Prop where
 
 structure Rules (ledger : Ledger Voter Command) : Prop extends BallotRules ledger where
   replyCoverage : ReplyCoverage ledger
+
+instance (observed winner : Vote Command) : Decidable (WinnerDominates observed winner) :=
+  inferInstanceAs (Decidable (RankLE observed winner))
+
+#guard !(decide (WinnerDominates (⟨2, [1]⟩ : Vote Nat) ⟨1, [1, 2]⟩))
 
 def Chosen (ledger : Ledger Voter Command) (ballot : Nat) (history : List Command) : Prop :=
   ∃ voters, JournalRefinement.Majority ledger.members voters ∧
@@ -160,6 +179,7 @@ theorem delivery_extends_the_learned_prefix {ledger : Ledger Voter Command} (rul
     · rw [learn, ite_eq_right tied]
       exact ⟨List.prefix_rfl, longer⟩
 
+#print axioms ballot_rank_order
 #print axioms rank_refl
 #print axioms rank_trans
 #print axioms chosen_is_prefix_of_issued

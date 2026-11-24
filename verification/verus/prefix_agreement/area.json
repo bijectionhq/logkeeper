@@ -1,0 +1,237 @@
+{
+  "summary": "Local durable ballot, certificate, ranked recovery and sealed image decisions.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "rotation_support::evidence",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 25,
+  "controls": {
+    "stale_prepare": {
+      "defect": "A request below the current promise can be acknowledged.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "    ensures out == match floor {\n        Some(floor) => ballot_lt(ballot, floor),\n        None => false,\n    },",
+          "replace": "    ensures !out,"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "Some(floor) => lower_ballot(ballot, floor),",
+          "replace": "Some(_) => false,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/prefix_agreement/laws.rs",
+          "function": "promise_only_advances_above_floor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "stale_accept": {
+      "defect": "An accept may replace a vote at a lower ballot than the promise.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "Some(floor) => (out is Deposed) == ballot_lt(ballot, floor)\n            && (out is Promised) == (floor == ballot),",
+          "replace": "Some(floor) => !(out is Deposed)\n            && (out is Promised) == (floor == ballot || ballot_lt(ballot, floor)),"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "Some(floor) if lower_ballot(ballot, floor) => AcceptBallot::Deposed,",
+          "replace": "Some(floor) if lower_ballot(ballot, floor) => AcceptBallot::Promised,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/prefix_agreement/laws.rs",
+          "function": "accept_at_or_above_promise",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "mixed_ballots": {
+      "defect": "A coordinator may count a reply from a different ballot.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "ensures out == record_matches(vote, expected, ballot, digest, read_back),",
+          "replace": "ensures out == record_matches(vote, expected, vote.ballot, digest, read_back),"
+        },
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "        || vote.ballot.round != ballot.round\n        || vote.ballot.nonce.as_u128() != ballot.nonce.as_u128()\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/prefix_agreement/laws.rs",
+          "function": "chosen_votes_bind_ballot_voter_and_image",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "half_quorum": {
+      "defect": "The final certificate gate also admits half of the roster, rounded down.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "    if !strict_majority(configured.len(), votes.len()) {",
+          "replace": "    if votes.len() < configured.len() / 2 {"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "out ==> 2 * votes@.len() > configured@.len(),",
+          "replace": "out ==> 2 * votes@.len() + 1 >= configured@.len(),"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "            2 * votes@.len() > configured@.len(),",
+          "replace": "            2 * votes@.len() + 1 >= configured@.len(),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/prefix_agreement/laws.rs",
+          "function": "majority_is_strict",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "repeat_voter": {
+      "defect": "A repeated voter may fill a second certificate slot.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "votes[index - 1] >= votes[index]",
+          "replace": "votes[index - 1] > votes[index]"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "out ==> forall|i: int| 0 < i < votes@.len() ==> #[trigger] votes@[i - 1] < #[trigger] votes@[i],",
+          "replace": "out ==> forall|i: int| 0 < i < votes@.len() ==> #[trigger] votes@[i - 1] <= #[trigger] votes@[i],"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "forall|i: int| 0 < i < index ==> #[trigger] votes@[i - 1] < #[trigger] votes@[i],",
+          "replace": "forall|i: int| 0 < i < index ==> #[trigger] votes@[i - 1] <= #[trigger] votes@[i],"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/prefix_agreement/laws.rs",
+          "function": "majority_counts_each_voter_once",
+          "category": "precondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "foreign_voter": {
+      "defect": "An unconfigured voter may count toward a certificate.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "if !contains_voter(configured, votes[index])\n            || (index > 0 && votes[index - 1] >= votes[index])",
+          "replace": "if index > 0 && votes[index - 1] >= votes[index]"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "        out ==> forall|i: int| 0 <= i < votes@.len() ==> configured@.contains(#[trigger] votes@[i]),\n",
+          "replace": ""
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "            forall|i: int| 0 <= i < index ==> configured@.contains(#[trigger] votes@[i]),\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/prefix_agreement/laws.rs",
+          "function": "majority_counts_only_configured_voters",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "prefer_older_image": {
+      "defect": "The recovery fold replaces its winner with an older report.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "if lower_ballot(observed, current) {\n        RecoveryChoice::Keep",
+          "replace": "if lower_ballot(observed, current) {\n        RecoveryChoice::Replace"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "(out is Keep) == ballot_lt(observed, current),",
+          "replace": "!(out is Keep),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/prefix_agreement/laws.rs",
+          "function": "winner_dominates_observed",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "install_wrong_predecessor": {
+      "defect": "Installation accepts an image from another predecessor.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "    ensures out == if (predecessor matches Some(old) && old@ == source@)\n        && destination@ == target@ { Some(image) } else { None },",
+          "replace": "    ensures out == if destination@ == target@ { Some(image) } else { None },"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "if sealed_for(predecessor, source) && same_image(destination, target) {",
+          "replace": "if same_image(destination, target) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/prefix_agreement/laws.rs",
+          "function": "installation_carries_exact_predecessor_image",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 24
+    },
+    "seal_wrong_destination": {
+      "defect": "Sealing releases the selected image for a destination absent from the predecessor seal.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "    ensures out == if selected_seal matches Some(target) && target@ == destination@\n        { Some(selected) } else { None },",
+          "replace": "    ensures out == Some(selected),"
+        },
+        {
+          "file": "src/ordered/replication/rules.rs",
+          "find": "    if sealed_for(selected_seal, destination) {\n        Some(selected)\n    } else {\n        None\n    }",
+          "replace": "    Some(selected)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/prefix_agreement/laws.rs",
+          "function": "sealing_carries_exact_predecessor_image",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 24
+    }
+  }
+}

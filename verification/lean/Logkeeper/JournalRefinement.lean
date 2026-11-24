@@ -11,6 +11,35 @@ open Kernel
 def Majority (members : List Replica) (votes : Replica → Bool) : Prop :=
   members.length < 2 * members.countP votes
 
+instance (members : List Replica) (votes : Replica → Bool) :
+    Decidable (Majority members votes) :=
+  inferInstanceAs (Decidable (members.length < 2 * members.countP votes))
+
+theorem distinct_configured_votes_are_majority {members voters : List Nat}
+    (distinctMembers : members.Nodup) (distinctVotes : voters.Nodup)
+    (configured : voters ⊆ members) :
+    Majority members voters.contains ↔ members.length < 2 * voters.length := by
+  have filteredDistinct := (List.filter_sublist (p := voters.contains) (l := members)).nodup distinctMembers
+  have exactVotes : List.Perm (members.filter voters.contains) voters :=
+    (List.perm_ext_iff_of_nodup filteredDistinct distinctVotes).mpr (fun voter => by
+      simp only [List.mem_filter, List.contains_iff_mem]
+      exact ⟨And.right, fun present => ⟨configured present, present⟩⟩)
+  rw [Majority, List.countP_eq_length_filter, exactVotes.length_eq]
+
+def ExactImage {Image : Type} (selected installed : Image) : Prop := installed = selected
+
+instance [DecidableEq Image] (selected installed : Image) :
+    Decidable (ExactImage selected installed) :=
+  inferInstanceAs (Decidable (installed = selected))
+
+theorem exact_image_preserves_projection {Image Projection : Type} (project : Image → Projection)
+    {selected installed : Image} (exactImage : ExactImage selected installed) :
+    project installed = project selected :=
+  congrArg project exactImage
+
+#guard !(decide (ExactImage (1 : Nat) 2))
+#guard !(decide (Majority [1, 2, 3, 4] (fun voter => voter < 3)))
+
 private theorem disjoint_counts_fit (members : List Replica) (a b : Replica → Bool)
     (disjoint : ∀ replica ∈ members, a replica = true → b replica = false) :
     members.countP a + members.countP b ≤ members.length := by
@@ -190,6 +219,8 @@ theorem verified_membership_change_program {limits : Limits} (journal : Journal 
       after.members = newMembers ∧ CompleteCut after :=
   ⟨_, .finalizeMembership newMembers certified, rfl, rfl, certified⟩
 
+#print axioms distinct_configured_votes_are_majority
+#print axioms exact_image_preserves_projection
 #print axioms majorities_overlap
 #print axioms durable_fence_excludes_stale_majority
 #print axioms overlapping_configurations_can_have_disjoint_majorities
