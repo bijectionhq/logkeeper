@@ -5,6 +5,8 @@ import argparse
 import json
 from pathlib import Path
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 
@@ -48,6 +50,11 @@ def controls():
 
     yield (
         "one-keeper", writer["one-keeper"]["mutate"],
+        SIM + "guards::one_acceptance_cannot_publish_a_head",
+        "writer published a head without two acceptances", 0,
+    )
+    yield (
+        "ignore-tail", writer["ignore-tail"]["mutate"],
         SIM + "guards::one_acceptance_cannot_publish_a_head",
         "writer published a head without two acceptances", 0,
     )
@@ -122,9 +129,8 @@ def controls():
         SEEDED, "durability: successful append must cover two disks", 0,
     )
     yield (
-        "seal-short", [edit(WRITER + "mod.rs", "        Ok(head)\n    }\n\n    fn active(",
-                            "        Ok(Lsn(0))\n    }\n\n    fn active(")],
-        SEEDED, "seal head missed an acknowledged append", 0,
+        "seal-short", [edit(WRITER + "mod.rs", "        Ok(head)\n", "        Ok(Lsn(0))\n")],
+        SEEDED, "journal contract violated in seed 0", 0,
     )
     yield (
         "observer-no-head-quorum",
@@ -162,31 +168,93 @@ def controls():
     yield (
         "retry-fills-gaps", [edit(str(append.relative_to(ROOT)), line[start:end],
                                  "        let accepted = self.ensemble.map(Some);\n")],
-        SEEDED, "journal contract violated in seed 70", 70,
+        SIM + "guards::conflicting_retry_cannot_publish_on_a_lagging_keeper",
+        "journal contract violated in seed 0", 0,
     )
 
 
-def run(case, evidence):
-    name, edits, test, check, seed = case
-    originals = {}
-    try:
-        for change in edits:
-            path = ROOT / change["file"]
-            source = path.read_bytes()
-            originals.setdefault(path, source)
-            old = change["find"].encode()
-            new = change["replace"].encode()
+# The control sites are in rustfmt-formatted named functions. Their closing
+# braces share the declaration's indentation.
+FUNCTION = re.compile(r"^([ ]*)(?:pub(?:\([^)]*\))? )?(?:async )?fn \w+\(", re.M)
+CONTROL_ENV = "LOGKEEPER_SIM_CONTROL"
+
+
+def instrument(source, edits):
+    """Give each affected body one isolated alternative per control."""
+    bodies = {}
+    functions = list(FUNCTION.finditer(source))
+    for name, changes in edits.items():
+        for change in changes:
+            old, new = change["find"], change["replace"]
             if not old or old == new or source.count(old) != 1:
                 raise ValueError(f"{name}: ambiguous mutation in {change['file']}")
-            path.write_bytes(source.replace(old, new, 1))
-        command = [str(GUARD), "logkeeper", "test", "--locked", "--all-features", "--lib",
-                   test, "--", "--exact", "--nocapture"]
-        env = dict(os.environ, LOGKEEPER_SIM_FIRST_SEED=str(seed), LOGKEEPER_SIM_SEEDS="1")
-        result = subprocess.run(command, cwd=ROOT, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, check=False)
-    finally:
-        for path, source in originals.items():
-            path.write_bytes(source)
+            position = source.index(old)
+            function = next((f for f in reversed(functions) if f.end() < position), None)
+            if function is None:
+                raise ValueError(f"{name}: mutation has no containing function")
+            start = source.index("{", function.end()) + 1
+            closing = re.compile(r"^" + function[1] + r"\}", re.M).search(source, start)
+            if closing is None or not start <= position < position + len(old) <= closing.end():
+                raise ValueError(f"{name}: mutation crosses a function boundary")
+            bodies.setdefault((start, closing.end()), {}).setdefault(name, []).append((old, new))
+    for (start, stop), variants in sorted(bodies.items(), reverse=True):
+        original = source[start:stop]
+        alternatives = []
+        for name, changes in variants.items():
+            altered = original
+            for old, new in changes:
+                altered = altered.replace(old, new, 1)
+            if not altered.endswith("}"):
+                raise ValueError(f"{name}: mutation removes the function's closing brace")
+            altered = altered[:-1]
+            alternatives.append(
+                f'\n    #[cfg(test)]\n    if std::env::var_os("{CONTROL_ENV}").as_deref()'
+                f' == Some(std::ffi::OsStr::new("{name}")) {{\n'
+                f'        return {{{altered}}};\n    }}\n'
+            )
+        source = source[:start] + "".join(alternatives) + source[start:]
+    return source
+
+
+def build(cases, evidence, workspace):
+    shutil.copytree(ROOT / "src", workspace / "src")
+    shutil.copytree(ROOT / "contract", workspace / "contract")
+    manifest = (ROOT / "Cargo.toml").read_text()
+    package = "logkeeper-simulation-controls"
+    (workspace / "Cargo.toml").write_text(manifest.replace('name = "logkeeper"', f'name = "{package}"', 1))
+    shutil.copyfile(ROOT / "Cargo.lock", workspace / "Cargo.lock")
+    by_file = {}
+    for name, edits, *_ in cases:
+        for change in edits:
+            by_file.setdefault(change["file"], {}).setdefault(name, []).append(change)
+    for file, edits in by_file.items():
+        path = workspace / file
+        path.write_text(instrument(path.read_text(), edits))
+    command = [str(GUARD), "logkeeper", "test", "--offline", "--all-features",
+               "--package", package, "--lib", "--no-run", "--message-format=json",
+               "--manifest-path", str(workspace / "Cargo.toml")]
+    result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, check=False)
+    (evidence / "build.log").write_text(result.stdout)
+    if result.returncode != 0:
+        raise ValueError(f"control build failed, see {evidence / 'build.log'}")
+    executables = []
+    for line in result.stdout.splitlines():
+        if line.startswith("{"):
+            message = json.loads(line)
+            if message.get("reason") == "compiler-artifact" and message.get("executable"):
+                executables.append(message["executable"])
+    if len(executables) != 1:
+        raise ValueError(f"expected one test executable, found {executables}")
+    return executables[0]
+
+
+def run(case, executable, evidence):
+    name, _, test, check, seed = case
+    env = dict(os.environ, LOGKEEPER_SIM_FIRST_SEED=str(seed), LOGKEEPER_SIM_SEEDS="1")
+    env[CONTROL_ENV] = name
+    result = subprocess.run([executable, test, "--exact", "--nocapture"], cwd=ROOT, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
     (evidence / f"{name}.log").write_text(result.stdout)
     if result.returncode == 0 or f"test {test} ... FAILED" not in result.stdout or check not in result.stdout:
         raise ValueError(f"{name}: expected {check!r} from {test}, see {evidence}")
@@ -200,21 +268,20 @@ def main():
     cases = {case[0]: case for case in controls()}
     if unknown := set(args.names) - cases.keys():
         parser.error(f"unknown controls: {', '.join(sorted(unknown))}")
-    if subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "src/stream"],
-                      cwd=ROOT).returncode:
-        parser.error("commit stream sources before running these worktree-local mutations")
     results = HERE / ".results"
     results.mkdir(exist_ok=True)
     evidence = Path(tempfile.mkdtemp(prefix="controls-", dir=results))
     print(f"Evidence: {evidence}", flush=True)
-    selected = args.names or cases.keys()
+    selected = [cases[name] for name in dict.fromkeys(args.names or cases)]
     failures = []
-    for name in selected:
-        try:
-            run(cases[name], evidence)
-        except ValueError as error:
-            failures.append(str(error))
-            print(error, flush=True)
+    with tempfile.TemporaryDirectory(prefix="sources-", dir=evidence) as directory:
+        executable = build(selected, evidence, Path(directory))
+        for case in selected:
+            try:
+                run(case, executable, evidence)
+            except ValueError as error:
+                failures.append(str(error))
+                print(error, flush=True)
     print(f"{len(selected) - len(failures)} of {len(selected)} controls rejected at their named checks",
           flush=True)
     if failures:

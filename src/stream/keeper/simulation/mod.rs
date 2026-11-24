@@ -30,7 +30,7 @@ const FAULTS: [Fault; 9] = [
     Fault::RequestLoss,
     Fault::ReplyLoss,
     Fault::Duplicate,
-    Fault::Delay,
+    Fault::Delay(35),
     Fault::Partition,
     Fault::CrashBefore,
     Fault::LoseUnsynced,

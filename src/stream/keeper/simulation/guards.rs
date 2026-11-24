@@ -458,3 +458,36 @@ async fn failed_sync_never_replies() {
     );
     history.check(0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn conflicting_retry_cannot_publish_on_a_lagging_keeper() {
+    let network = Network::new(0, Limits::default());
+    let old = writer(&network, &OLD, ENSEMBLE);
+    let reader = writer(&network, &READER, ENSEMBLE);
+    let history = History::new(&network);
+    history.call(&old, &OLD, Op::Create).await.unwrap();
+    sleep(20).await;
+    history.call(&old, &OLD, Op::Seal(E1)).await.unwrap();
+    sleep(45).await;
+
+    let at = Lsn(1);
+    let chosen = Bytes::from_static(b"chosen");
+    let lagging = ENSEMBLE[0];
+    network.arm(lagging, Fault::Delay(100));
+    history
+        .call(&old, &OLD, Op::Append(E1, at, chosen.clone()))
+        .await
+        .unwrap();
+    assert_eq!(network.copies(&[lagging], STREAM, at, &chosen, false), 0);
+    assert_eq!(
+        history
+            .call(&old, &OLD, Op::Append(E1, at, Bytes::from_static(b"other")))
+            .await,
+        Err(JournalError::Conflict { head: at }),
+    );
+    history
+        .call(&reader, &READER, Op::Read(at, 1))
+        .await
+        .unwrap();
+    history.check(0);
+}

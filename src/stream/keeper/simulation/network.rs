@@ -22,7 +22,7 @@ pub(super) enum Fault {
     RequestLoss,
     ReplyLoss,
     Duplicate,
-    Delay,
+    Delay(u64),
     Partition,
     CrashBefore,
     LoseUnsynced,
@@ -36,7 +36,7 @@ impl Fault {
             Self::RequestLoss => "request loss",
             Self::ReplyLoss => "reply loss",
             Self::Duplicate => "duplication",
-            Self::Delay => "delay",
+            Self::Delay(_) => "delay",
             Self::Partition => "partition",
             Self::CrashBefore => "crash before WAL write",
             Self::LoseUnsynced => "lost unsynced write",
@@ -313,7 +313,10 @@ impl Transport for Client {
             let (done, reply) = tokio::sync::oneshot::channel();
             // A caller that drops its future cannot recall a transmitted packet.
             tokio::spawn(async move {
-                let extra = u64::from(matches!(packet.fault, Some(Fault::Delay))) * 35;
+                let extra = match packet.fault {
+                    Some(Fault::Delay(milliseconds)) => milliseconds,
+                    _ => 0,
+                };
                 sleep(delivery + extra).await;
                 if matches!(packet.fault, Some(Fault::RequestLoss)) {
                     let _ = done.send(Err(TransportError::TimedOut));

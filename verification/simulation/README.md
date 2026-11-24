@@ -32,7 +32,8 @@ number of physical copies of acknowledged bytes, including coverage of the
 published head at the reply. Async socket handling, file metadata crash
 points, and arbitrary combinations of faults are outside this bounded run.
 
-Run the controls from a worktree with committed stream sources.
+Run the controls in the worktree. The runner builds an isolated test executable
+and enables one mutation per invocation of the named test.
 
 ```sh
 python3 verification/simulation/controls.py
