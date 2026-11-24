@@ -277,3 +277,250 @@ async fn ordered_restart_recovers_the_highest_accept_and_trace_rejects_a_stale_v
     ));
     trace.finish_with_forbidden_accept(cohort.ids[0]);
 }
+
+#[cfg(feature = "simulation")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generated_ordered_fault_schedules() {
+    use logkeeper::ordered::Fingerprint;
+    use logkeeper::ordered::replication::{
+        Ballot, DurableVoter, Error, Prefix, Promise, Replica, Vote,
+    };
+    use prefix_trace::{Fixture, ordered::Cohort};
+    use tokio::sync::Notify;
+    use uuid::Uuid;
+
+    enum Fault<'a> {
+        None,
+        LosePrepare,
+        LoseAccept,
+        LoseReply,
+        Duplicate,
+        Delay(Duration),
+        Cancel(&'a Notify),
+        Late(&'a Notify, &'a Notify),
+    }
+
+    struct Peer<'a> {
+        voter: &'a DurableVoter,
+        fault: Fault<'a>,
+    }
+
+    impl Replica for Peer<'_> {
+        fn identity(&self) -> Uuid {
+            self.voter.identity()
+        }
+
+        async fn prepare(&self, group: Fingerprint, ballot: Ballot) -> Result<Promise, Error> {
+            match self.fault {
+                Fault::LosePrepare => return Err(Error::Stopped),
+                Fault::Duplicate => {
+                    self.voter.prepare(group, ballot).await?;
+                }
+                Fault::Delay(duration) => tokio::time::sleep(duration).await,
+                _ => {}
+            }
+            self.voter.prepare(group, ballot).await
+        }
+
+        async fn accept(
+            &self,
+            group: Fingerprint,
+            ballot: Ballot,
+            prefix: &Prefix,
+            read_back: bool,
+        ) -> Result<Vote, Error> {
+            match self.fault {
+                Fault::LoseAccept => return Err(Error::Stopped),
+                Fault::Duplicate => {
+                    self.voter.accept(group, ballot, prefix, read_back).await?;
+                }
+                Fault::Delay(duration) => tokio::time::sleep(duration).await,
+                Fault::Late(waiting, deliver) => {
+                    waiting.notify_one();
+                    deliver.notified().await;
+                }
+                _ => {}
+            }
+            let reply = self.voter.accept(group, ballot, prefix, read_back).await?;
+            match self.fault {
+                Fault::LoseReply => Err(Error::Stopped),
+                Fault::Cancel(saved) => {
+                    saved.notify_one();
+                    std::future::pending().await
+                }
+                _ => Ok(reply),
+            }
+        }
+    }
+
+    let Some(path) = std::env::var_os("LOGKEEPER_PREFIX_SCHEDULES") else {
+        return;
+    };
+    for line in std::fs::read_to_string(path).unwrap().lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let [name, fault, a, b, c, delay, restart] = fields.as_slice() else {
+            panic!("invalid schedule {line:?}");
+        };
+        let [a, b, c] = [a, b, c].map(|index| index.parse::<usize>().unwrap());
+        let delay = Duration::from_millis(delay.parse().unwrap());
+        let trace = Fixture::new(name);
+        let cohort = Cohort::new(&trace);
+        let mut voters = cohort.provision();
+        let first = cohort.enroll();
+        let prior = cohort
+            .group
+            .choose_at(
+                &[voters[a].clone(), voters[b].clone()],
+                1,
+                100,
+                first.clone(),
+            )
+            .await
+            .unwrap();
+        let retry = cohort.enroll();
+
+        match *fault {
+            "late" => {
+                let waiting = Notify::new();
+                let deliver = Notify::new();
+                let peers = [
+                    Peer {
+                        voter: &voters[a],
+                        fault: Fault::Late(&waiting, &deliver),
+                    },
+                    Peer {
+                        voter: &voters[b],
+                        fault: Fault::LoseAccept,
+                    },
+                ];
+                let old = cohort.group.choose_at(&peers, 2, 101, retry.clone());
+                tokio::pin!(old);
+                tokio::select! {
+                    _ = waiting.notified() => {}
+                    result = &mut old => panic!("{name}: old round finished before delay: {:?}", result.err()),
+                }
+                let newer = cohort
+                    .group
+                    .choose_at(
+                        &[voters[a].clone(), voters[c].clone()],
+                        3,
+                        102,
+                        retry.clone(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(newer.state().position(), 2, "{name}");
+                deliver.notify_one();
+                assert!(matches!(old.await, Err(Error::Deposed(_))), "{name}");
+            }
+            "cancel" => {
+                let saved = Notify::new();
+                let peers = [
+                    Peer {
+                        voter: &voters[a],
+                        fault: Fault::Cancel(&saved),
+                    },
+                    Peer {
+                        voter: &voters[b],
+                        fault: Fault::LoseAccept,
+                    },
+                ];
+                tokio::select! {
+                    _ = saved.notified() => {}
+                    result = cohort.group.choose_at(&peers, 2, 101, retry.clone()) => {
+                        panic!("{name}: round finished before cancellation: {:?}", result.err())
+                    }
+                }
+            }
+            "prepare-loss" | "duplicate" => {
+                let admission = if *fault == "prepare-loss" {
+                    Fault::LosePrepare
+                } else {
+                    Fault::Duplicate
+                };
+                let peers = [
+                    Peer {
+                        voter: &voters[a],
+                        fault: admission,
+                    },
+                    Peer {
+                        voter: &voters[b],
+                        fault: Fault::None,
+                    },
+                    Peer {
+                        voter: &voters[c],
+                        fault: Fault::Delay(delay),
+                    },
+                ];
+                let peers = if *fault == "duplicate" {
+                    &peers[..2]
+                } else {
+                    &peers
+                };
+                let chosen = cohort
+                    .group
+                    .choose_at(peers, 2, 101, retry.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(chosen.state().position(), 2, "{name}");
+            }
+            "accept-loss" | "reply-loss" => {
+                let fault = if *fault == "accept-loss" {
+                    Fault::LoseAccept
+                } else {
+                    Fault::LoseReply
+                };
+                let peers = [
+                    Peer {
+                        voter: &voters[a],
+                        fault: Fault::Delay(delay),
+                    },
+                    Peer {
+                        voter: &voters[b],
+                        fault,
+                    },
+                ];
+                assert!(
+                    matches!(
+                        cohort.group.choose_at(&peers, 2, 101, retry.clone()).await,
+                        Err(Error::Quorum)
+                    ),
+                    "{name}"
+                );
+            }
+            _ => panic!("unknown fault {fault:?}"),
+        }
+
+        if *restart == "1" {
+            let [first, second, third] = voters;
+            let mut media = [Some(first), Some(second), Some(third)];
+            drop(media[a].take());
+            media[a] = Some(
+                DurableVoter::recover(cohort.group.clone(), cohort.ids[a], cohort.media[a].path())
+                    .unwrap(),
+            );
+            voters = media.map(Option::unwrap);
+        }
+        let surviving = [voters[a].clone(), voters[c].clone()];
+        let recovered = cohort
+            .group
+            .choose_at(&surviving, 4, 103, retry)
+            .await
+            .unwrap();
+        assert_eq!(recovered.state().position(), 2, "{name}");
+        let time = if *fault == "late" { 102 } else { 101 };
+        assert_eq!(recovered.state().time(), time, "{name}");
+        let original = cohort
+            .group
+            .choose_at(&surviving, 5, 104, first)
+            .await
+            .unwrap();
+        assert_eq!(original.receipt(), prior.receipt(), "{name}");
+        assert_eq!(
+            original.state().command_history(),
+            recovered.state().command_history(),
+            "{name}"
+        );
+        trace.finish();
+    }
+}
