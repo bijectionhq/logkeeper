@@ -198,3 +198,120 @@ At the saturated 10,000-stream, batch-32 operating point, the additional hop is 
 Addendum (node-level batching): that operating point now runs with zero transport errors at 457,401 records/s and 7.09 ms record p99 with 64 producers, and 874,353 records/s and 17.87 ms p99 with 256. The per-stream logical consensus is unchanged: batching happens at the node connection and in the keeper round. The collapse was caused by per-call connections and per-record keeper rounds, not by per-stream quorums.
 
 The comparison uses the decision criteria stated in the N7 brief. The granularity deep dive's numerical thresholds were absent from the supplied Wave N report directory. The loopback setup measures one disk and one network stack across all processes, and the experiment models the remote leader's additional RTT. It supplies no cell-leader measurements or independent-AZ hardware results.
+
+## F6 shared checkpoint rotation
+
+The baseline was `8d88239`. Both release builds ran the complete `run.sh`
+on the same loopback host at the 1 ms and 2 ms settings, including the
+100,000-stream replacement and the scale guard. The calibrated echo
+latencies were:
+
+| RTT setting | Before echo (ms) | F6 echo (ms) |
+| --- | --- | --- |
+| 0 ms | 0.02 / 0.11 / 0.13 | 0.02 / 0.15 / 0.25 |
+| 1 ms | 1.62 / 1.66 / 1.73 | 1.63 / 1.72 / 1.80 |
+| 2 ms | 3.17 / 6.09 / 9.73 | 3.11 / 3.26 / 3.78 |
+
+All latency triples are p50 / p99 / p99.9. The 64-channel pool check
+reopened zero connections in both builds at both RTTs.
+
+F4 measured about 3.8 s for a rotation over 10,000 dirty streams, with about
+five syncs per new stream. The F6 regression counts seven syncs total for a
+rotation with either one or 10,000 dirty streams, including the successor
+segment and the retirement sync. The pack writer and index publication run
+off the round thread. Physical WAL segments stop at 64 MiB, including while
+the previous checkpoint is in progress. The gate tests stop the checkpoint
+worker while an unrelated append completes for both startup and delete.
+
+### Commit
+
+The first three commit probes per RTT belong to the scale guard. The table
+below reports the full commit matrix. The 10,000-stream batch-32 row admits
+64 producers.
+
+| RTT | Streams | Batch | Before record ack (ms) | F6 record ack (ms) | Before records/s | F6 records/s |
+| --- | ---: | ---: | --- | --- | ---: | ---: |
+| 1 ms | 1 | 1 | 3.75 / 4.08 / 4.16 | 4.09 / 4.55 / 5.14 | 268 | 247 |
+| 1 ms | 1 | 32 | 5.96 / 6.60 / 6.61 | 6.12 / 6.73 / 6.79 | 5,228 | 5,051 |
+| 1 ms | 100 | 1 | 3.90 / 5.27 / 5.38 | 4.15 / 7.27 / 7.54 | 23,888 | 22,129 |
+| 1 ms | 100 | 32 | 6.38 / 8.40 / 8.63 | 10.38 / 14.46 / 14.58 | 439,800 | 240,962 |
+| 1 ms | 1,000 | 1 | 4.06 / 6.19 / 6.30 | 4.17 / 12.38 / 12.68 | 58,220 | 47,741 |
+| 1 ms | 1,000 | 32 | 7.55 / 14.89 / 15.77 | 7.85 / 13.31 / 14.57 | 959,620 | 934,582 |
+| 1 ms | 10,000 | 1 | 3.99 / 5.85 / 6.94 | 4.43 / 5.72 / 7.14 | 62,658 | 57,023 |
+| 1 ms | 10,000 | 32 | 4.40 / 12.19 / 16.11 | 4.85 / 7.79 / 10.38 | 419,414 | 401,319 |
+| 2 ms | 1 | 1 | 6.40 / 34.06 / 139.95 | 6.98 / 7.57 / 9.30 | 97 | 145 |
+| 2 ms | 1 | 32 | 6.62 / 12.72 / 12.73 | 7.06 / 10.73 / 11.06 | 3,939 | 3,708 |
+| 2 ms | 100 | 1 | 5.76 / 7.74 / 7.89 | 5.64 / 8.13 / 8.88 | 15,887 | 16,297 |
+| 2 ms | 100 | 32 | 7.24 / 9.74 / 9.91 | 6.63 / 8.81 / 9.82 | 333,178 | 336,968 |
+| 2 ms | 1,000 | 1 | 5.91 / 8.22 / 9.80 | 6.18 / 8.06 / 9.35 | 39,940 | 39,157 |
+| 2 ms | 1,000 | 32 | 9.82 / 15.88 / 16.98 | 15.85 / 27.98 / 29.37 | 751,051 | 465,622 |
+| 2 ms | 10,000 | 1 | 5.86 / 8.38 / 11.94 | 6.02 / 14.52 / 16.50 | 42,784 | 38,738 |
+| 2 ms | 10,000 | 32 | 6.44 / 12.14 / 14.11 | 6.35 / 9.87 / 11.43 | 298,535 | 304,043 |
+
+The measured single-record median still includes two keeper round trips.
+Publishing in the first request would allow one keeper to show an unchosen
+record that a takeover can discard. Acknowledging before publication would
+let a fresh read index observe the chosen tail without quorum head coverage.
+The writer keeps the existing publication rule and preserves
+`Unavailable` after uncertain publication.
+
+### Head and scale guard
+
+The full head case and the head phase of `scale-check` each ran 4,096
+calls per RTT and build. They recorded zero `Unavailable`, zero
+`Unreachable` and zero `TimedOut` in both observer and writer RPC counters.
+The table shows the full head case.
+
+| RTT | Load | Caller | Before head (ms) | F6 head (ms) |
+| --- | --- | --- | --- | --- |
+| 1 ms | Idle | Writer | 1.77 / 2.10 / 2.11 | 1.73 / 1.89 / 1.90 |
+| 1 ms | Idle | Observer | 1.33 / 3.89 / 3.89 | 1.75 / 3.86 / 3.87 |
+| 1 ms | Write | Writer | 3.47 / 6.29 / 6.64 | 4.01 / 4.71 / 4.81 |
+| 1 ms | Write | Observer | 4.14 / 5.67 / 5.73 | 4.19 / 5.72 / 5.77 |
+| 2 ms | Idle | Writer | 3.10 / 3.66 / 3.68 | 3.33 / 3.61 / 3.64 |
+| 2 ms | Idle | Observer | 3.22 / 6.91 / 6.92 | 3.32 / 7.01 / 7.03 |
+| 2 ms | Write | Writer | 5.76 / 6.61 / 6.72 | 5.98 / 7.56 / 7.63 |
+| 2 ms | Write | Observer | 6.63 / 7.94 / 8.11 | 6.40 / 8.23 / 8.68 |
+
+The standalone F6 scale guard also passed at both settings. Its 256-producer
+batch-32 case and the corresponding in-harness cases had zero transport
+errors and reconnects. Each standalone head phase had zero `Unavailable`,
+`Unreachable` or `TimedOut`.
+
+| RTT | Before records/s | F6 records/s | F6 standalone records/s | F6 standalone batch-32 ratio |
+| --- | --- | --- | --- | --- |
+| 1 ms | 868,973 | 825,253 | 667,937 | 23.2× |
+| 2 ms | 558,874 | 790,638 | 699,994 | 21.7× |
+
+### Loss, replacement and noisy neighbour
+
+The replacement verifier checked all 100,000 learner copies after timing
+at each setting. The partition case still waits about two seconds for the
+blackholed route.
+
+| RTT | Case | Before elapsed (s) | F6 elapsed (s) | Before stream p99 (ms) | F6 stream p99 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 1 ms | kill | 0.012 | 0.013 | 11.78 | 12.41 |
+| 1 ms | partition | 2.039 | 2.035 | 2038.05 | 2034.71 |
+| 1 ms | replace | 44.906 | 38.104 | 44529.53 | 37771.18 |
+| 2 ms | kill | 0.019 | 0.017 | 18.88 | 16.57 |
+| 2 ms | partition | 2.040 | 2.037 | 2039.56 | 2036.97 |
+| 2 ms | replace | 66.398 | 64.362 | 65766.52 | 63845.37 |
+
+| RTT | Round cap | Before hot MB/s | F6 hot MB/s | Before neighbour p99 (ms) | F6 neighbour p99 (ms) |
+| --- | --- | --- | --- | --- | --- |
+| 1 ms | 4 MiB | 22.6 | 192.4 | 70.50 | 35.06 |
+| 1 ms | 64 MiB | 110.5 | 83.6 | 419.06 | 60.96 |
+| 2 ms | 4 MiB | 163.3 | 192.2 | 79.40 | 48.40 |
+| 2 ms | 64 MiB | 48.2 | 61.0 | 48.78 | 689.57 |
+
+The 2 ms noisy-neighbour repeat moved in both directions:
+
+| Round cap | Before hot MB/s | F6 hot MB/s | Before neighbour p99 (ms) | F6 neighbour p99 (ms) |
+| --- | --- | --- | --- | --- |
+| 4 MiB | 138.7 | 58.9 | 47.17 | 95.97 |
+| 64 MiB | 177.7 | 186.3 | 92.97 | 52.46 |
+
+The first pass's 689.57 ms p99 at the 64 MiB cap did not recur. These
+loopback runs share a disk and network stack. The run-to-run differences
+do not isolate filesystem contention from host scheduling.
