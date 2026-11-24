@@ -492,7 +492,8 @@ fn append_requires_current_sync_next_position_or_an_identical_retry() {
     test.engine.process(VecDeque::from([job])).unwrap();
     assert_eq!(
         result.try_recv().unwrap().0.unwrap(),
-        Reply::Refused(Refusal::Fenced { promised: Epoch(1) })
+        Reply::Refused(Refusal::Fenced { promised: Epoch(1) }),
+        "keeper admitted an append from a different identity"
     );
     assert_eq!(
         test.send(append(A, 1, 2, &[b"a"], 0)),

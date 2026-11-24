@@ -59,10 +59,10 @@ CONTROLS = [
     ),
     (
         "ignore-authenticated-identity", "keeper/rules.rs",
-        ".is_some_and(|(current, owner)| *current == epoch && owner == identity)",
-        ".is_some_and(|(current, _)| *current == epoch)",
-        "stream::transport::tests::writer_round_trips_through_three_tls_keepers",
-        "a different certificate identity must be fenced at the same epoch",
+        ".is_some_and(|(current, owner, _)| *current == epoch && owner == identity)",
+        ".is_some_and(|(current, ..)| *current == epoch)",
+        KEEPER_TEST + "append_requires_current_sync_next_position_or_an_identical_retry",
+        "keeper admitted an append from a different identity",
     ),
     (
         "drop-wal-identity", "keeper/wal.rs",
@@ -109,8 +109,9 @@ CONTROLS = [
     ),
     (
         "delete-without-compaction", "keeper/wal.rs",
-        "            || delete\n            || index.compaction_due()\n            || dirty.iter().any(|id| states[id].deleted);",
-        "            || index.compaction_due();\n        let _ = delete;",
+        "        let rewrite = delete\n            || index.compaction_due()\n"
+        "            || dirty.iter().any(|id| states[id].deleted);",
+        "        let _ = delete;\n        let rewrite = index.compaction_due();",
         KEEPER_TEST + "delete_rotates_and_removes_only_its_payloads", "deleted stream kept a shared pack",
     ),
     (
@@ -192,7 +193,7 @@ CONTROLS = [
     ),
     (
         "publish-before-choice", "writer/append.rs",
-        "head: self.head.min(last),", "head: last,",
+        "head: Lsn(append_head(self.head.0, last.0)),", "head: last,",
         "stream::writer::tests::publishing_on_first_accept_would_expose_a_history_takeover_can_discard",
         "single-keeper read exposed an unchosen record",
     ),
