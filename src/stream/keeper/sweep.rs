@@ -56,10 +56,23 @@ impl Sweep {
                 self.learner
             }
         });
-        let (left, right) = tokio::try_join!(
+        let (left, right) = tokio::join!(
             self.seal(transport, first, next),
             self.seal(transport, second, next)
-        )?;
+        );
+        // A create quorum may have included the lost keeper. Rebuild an absent
+        // survivor only after the other survivor confirms the stream exists.
+        let (left, right) = match (left, right) {
+            (Ok(left), Err(error)) if !left.learner && error.not_found() => {
+                self.create(transport, second).await?;
+                (left, self.seal(transport, second, next).await?)
+            }
+            (Err(error), Ok(right)) if !right.learner && error.not_found() => {
+                self.create(transport, first).await?;
+                (self.seal(transport, first, next).await?, right)
+            }
+            (left, right) => (left?, right?),
+        };
         if left.learner || right.learner {
             return Err(SweepError::History);
         }
@@ -104,16 +117,7 @@ impl Sweep {
             self.head(transport, first, history.tail),
             self.head(transport, second, history.tail),
         )?;
-        self.expect(
-            transport,
-            self.learner,
-            Request::Create {
-                stream: self.stream,
-                ensemble: self.ensemble,
-            },
-            Reply::Created,
-        )
-        .await?;
+        self.create(transport, self.learner).await?;
         let learner = self.seal(transport, self.learner, next).await?;
         if !learner.learner && learner.ensemble != next {
             return Err(SweepError::History);
@@ -133,6 +137,19 @@ impl Sweep {
             self.replace(transport, second, next)
         )?;
         self.replace(transport, self.learner, next).await
+    }
+
+    async fn create(&self, transport: &dyn Transport, keeper: KeeperId) -> Result<(), SweepError> {
+        self.expect(
+            transport,
+            keeper,
+            Request::Create {
+                stream: self.stream,
+                ensemble: self.ensemble,
+            },
+            Reply::Created,
+        )
+        .await
     }
 
     async fn copy(
@@ -347,5 +364,17 @@ impl Sweep {
             .call(keeper, request)
             .await
             .map_err(|error| SweepError::Transport { keeper, error })
+    }
+}
+
+impl SweepError {
+    fn not_found(&self) -> bool {
+        matches!(
+            self,
+            Self::Reply {
+                reply: Reply::Refused(Refusal::NotFound),
+                ..
+            }
+        )
     }
 }

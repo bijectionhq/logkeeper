@@ -870,6 +870,75 @@ async fn sweeper_uses_two_survivors_and_activates_the_trimmed_learner() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn sweeper_restores_an_absent_survivor_from_one_durable_copy() {
+    let learner = KeeperId(4);
+    let [source, absent, lost] = MEMBERS;
+    let next = [source, absent, learner];
+    let directories: Vec<_> = (0..4).map(|_| tempdir().unwrap()).collect();
+    let mut transport = Local(
+        MEMBERS
+            .into_iter()
+            .chain([learner])
+            .zip(&directories)
+            .map(|(id, dir)| (id, Keeper::open(dir.path(), id, Limits::default()).unwrap()))
+            .collect(),
+    );
+    for keeper in [source, lost] {
+        for request in [create(A), seal(A, 1), sync(A, 1, 1, &[], 0, true)] {
+            transport.call(keeper, request).await.unwrap();
+        }
+        assert_eq!(
+            transport
+                .call(keeper, append(A, 1, 1, &[b"chosen"], 1))
+                .await
+                .unwrap(),
+            Reply::Appended { tail: Lsn(1) }
+        );
+    }
+    drop(transport.0.remove(&lost).unwrap());
+    assert_eq!(
+        transport.call(absent, check(A)).await.unwrap(),
+        Reply::Refused(Refusal::NotFound)
+    );
+    let plan = Sweep {
+        stream: A,
+        ensemble: MEMBERS,
+        survivors: [source, absent],
+        learner,
+        epoch: Epoch(2),
+    };
+    let [(_, outcome)] = sweep_idle(&transport, [plan]).await.try_into().unwrap();
+    assert!(
+        outcome.is_ok(),
+        "replacement must restore the absent survivor: {outcome:?}"
+    );
+    for keeper in next {
+        assert_eq!(
+            transport.call(keeper, read(A, 1)).await.unwrap(),
+            page(1, 1, &[(1, b"chosen")])
+        );
+    }
+    let unknown = Sweep { stream: B, ..plan };
+    let [(_, outcome)] = sweep_idle(&transport, [unknown]).await.try_into().unwrap();
+    assert!(
+        matches!(
+            outcome,
+            Err(SweepError::Reply {
+                reply: Reply::Refused(Refusal::NotFound),
+                ..
+            })
+        ),
+        "replacement requires an existing survivor"
+    );
+    for keeper in next {
+        assert_eq!(
+            transport.call(keeper, check(B)).await.unwrap(),
+            Reply::Refused(Refusal::NotFound)
+        );
+    }
+}
+
 #[test]
 fn recovery_resumes_rotation_after_only_one_stream_checkpointed() {
     let mut test = Harness::new(Limits::default());
