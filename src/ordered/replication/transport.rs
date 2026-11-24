@@ -8,6 +8,11 @@ use super::{
     Accepted, Ballot, DurableVoter, Error, Fingerprint, Group, Prefix, Promise, Replica, SlotImage,
     SlotPair, Vote,
 };
+use super::transport_fields::{
+    ACCEPT, DEPOSED, PREPARE, PROMISE, REJECTED, ResponseKind, TRANSPORT_MAGIC, VOTE,
+    decode_ballot, decode_vote_slots, encode_ballot, response_kind, transport_group_matches,
+    transport_magic_matches, transport_voter_matches, vote_read_back_matches,
+};
 use crate::ordered::codec::frame::{bounded_body_length, decode_flag, encode_flag};
 use bytes::{Bytes, BytesMut};
 use std::future::Future;
@@ -16,14 +21,6 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use uuid::Uuid;
-
-const MAGIC: &[u8; 8] = b"LKORPC04";
-const PREPARE: u8 = 1;
-const ACCEPT: u8 = 2;
-const PROMISE: u8 = 3;
-const VOTE: u8 = 4;
-const DEPOSED: u8 = 5;
-const REJECTED: u8 = 6;
 
 /// Opens an authenticated channel to the exact voter for the installed group.
 pub trait Connector: Sync {
@@ -73,7 +70,7 @@ impl<C: Connector> RemoteVoter<C> {
             return Err(Error::Group);
         }
         let mut channel = self.connector.connect(group, self.voter).await?;
-        channel.write_all(MAGIC).await?;
+        channel.write_all(&TRANSPORT_MAGIC).await?;
         channel.write_u8(operation).await?;
         channel.write_all(&group).await?;
         write_ballot(&mut channel, ballot).await?;
@@ -88,22 +85,22 @@ impl<C: Connector> RemoteVoter<C> {
     ) -> Result<(), Error> {
         check_magic(channel).await?;
         let kind = channel.read_u8().await?;
-        if Uuid::from_bytes(read_array(channel).await?) != self.voter
+        if !transport_voter_matches(&read_array(channel).await?, self.voter.as_bytes())
             || read_ballot(channel).await? != ballot
         {
             return Err(Error::Group);
         }
-        match kind {
-            kind if kind == expected => Ok(()),
-            DEPOSED => {
+        match response_kind(kind, expected) {
+            ResponseKind::Expected => Ok(()),
+            ResponseKind::Deposed => {
                 let newer = read_ballot(channel).await?;
                 if newer <= ballot {
                     return Err(Error::Prefix);
                 }
                 Err(Error::Deposed(newer))
             }
-            REJECTED => Err(Error::Stopped),
-            _ => Err(Error::Prefix),
+            ResponseKind::Rejected => Err(Error::Stopped),
+            ResponseKind::Invalid => Err(Error::Prefix),
         }
     }
 }
@@ -154,19 +151,17 @@ impl<C: Connector> Replica for RemoteVoter<C> {
             self.response(&mut channel, VOTE, ballot).await?;
             let digest = read_array(&mut channel).await?;
             let witnessed = channel.read_u8().await?;
-            if witnessed != u8::from(read_back) {
+            if !vote_read_back_matches(witnessed, read_back) {
                 return Err(Error::Prefix);
             }
-            let selected = channel.read_u8().await?;
-            let mut read_image = async || -> Result<SlotImage, Error> {
-                Ok(SlotImage {
-                    generation: channel.read_u64().await?,
-                    digest: read_array(&mut channel).await?,
-                })
-            };
+            let slots = decode_vote_slots(&read_array::<81>(&mut channel).await?)
+                .ok_or(Error::Prefix)?;
             let slots = SlotPair {
-                selected,
-                images: [read_image().await?, read_image().await?],
+                selected: slots.selected,
+                images: slots.images.map(|image| SlotImage {
+                    generation: image.generation,
+                    digest: image.digest,
+                }),
             };
             Ok(Vote {
                 voter: self.voter,
@@ -193,7 +188,7 @@ pub async fn serve_voter(
         check_magic(&mut channel).await?;
         let operation = channel.read_u8().await?;
         let group = read_array::<32>(&mut channel).await?;
-        if group != authorized_group || group != voter.group() {
+        if !transport_group_matches(&group, &authorized_group, &voter.group()) {
             return Err(Error::Group);
         }
         let ballot = read_ballot(&mut channel).await?;
@@ -212,11 +207,7 @@ pub async fn serve_voter(
                 Err(error) => refuse(&mut channel, voter.identity(), ballot, error).await?,
             },
             ACCEPT => {
-                let read_back = match channel.read_u8().await? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(Error::Prefix),
-                };
+                let read_back = decode_flag(channel.read_u8().await?).ok_or(Error::Prefix)?;
                 let prefix = read_prefix(&mut channel, voter.max_prefix_bytes()).await?;
                 match voter.accept(group, ballot, &prefix, read_back).await {
                     Ok(vote) => {
@@ -261,7 +252,7 @@ async fn response_header(
     voter: Uuid,
     ballot: Ballot,
 ) -> Result<(), Error> {
-    channel.write_all(MAGIC).await?;
+    channel.write_all(&TRANSPORT_MAGIC).await?;
     channel.write_u8(kind).await?;
     channel.write_all(voter.as_bytes()).await?;
     write_ballot(channel, ballot).await
@@ -293,22 +284,22 @@ async fn write_ballot(
     channel: &mut (impl AsyncWrite + Unpin),
     ballot: Ballot,
 ) -> Result<(), Error> {
-    channel.write_u64(ballot.round).await?;
-    channel.write_all(ballot.nonce.as_bytes()).await?;
+    channel
+        .write_all(&encode_ballot(ballot.round, ballot.nonce.as_bytes()))
+        .await?;
     Ok(())
 }
 
 async fn read_ballot(channel: &mut (impl AsyncRead + Unpin)) -> Result<Ballot, Error> {
-    let round = channel.read_u64().await?;
-    let nonce = Uuid::from_bytes(read_array(channel).await?);
-    if round == 0 || nonce.is_nil() {
-        return Err(Error::Prefix);
-    }
-    Ok(Ballot { round, nonce })
+    let ballot = decode_ballot(&read_array::<24>(channel).await?).ok_or(Error::Prefix)?;
+    Ok(Ballot {
+        round: ballot.round,
+        nonce: Uuid::from_bytes(ballot.nonce),
+    })
 }
 
 async fn check_magic(channel: &mut (impl AsyncRead + Unpin)) -> Result<(), Error> {
-    if &read_array::<8>(channel).await? != MAGIC {
+    if !transport_magic_matches(&read_array::<8>(channel).await?) {
         return Err(Error::Prefix);
     }
     Ok(())

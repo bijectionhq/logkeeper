@@ -68,14 +68,14 @@ pub(super) struct SlotHeader {
     requires offset as int + N as int <= bytes@.len(), offset as int + N as int <= usize::MAX,
     ensures out@ == bytes@.subrange(offset as int, offset as int + N as int),
 ))]
-fn read_field<const N: usize>(bytes: &[u8], offset: usize) -> [u8; N] {
+pub(super) fn read_field<const N: usize>(bytes: &[u8], offset: usize) -> [u8; N] {
     let mut field = [0; N];
     field.copy_from_slice(&bytes[offset..offset + N]);
     field
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == decodeBE(bytes@),))]
-fn read_be(bytes: [u8; 8]) -> u64 {
+pub(super) fn read_be(bytes: [u8; 8]) -> u64 {
     ((bytes[0] as u64) << 56)
         | ((bytes[1] as u64) << 48)
         | ((bytes[2] as u64) << 40)
@@ -87,7 +87,7 @@ fn read_be(bytes: [u8; 8]) -> u64 {
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out@ =~= encodeBE(value),))]
-fn write_be(value: u64) -> [u8; 8] {
+pub(super) fn write_be(value: u64) -> [u8; 8] {
     [
         (value >> 56) as u8,
         (value >> 48) as u8,
@@ -166,7 +166,7 @@ pub(super) fn decode_header(bytes: &[u8], payload_limit: usize) -> Option<SlotHe
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (left@ == right@),))]
-fn bytes_equal<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
+pub(super) fn bytes_equal<const N: usize>(left: &[u8; N], right: &[u8; N]) -> bool {
     let mut i = 0;
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant

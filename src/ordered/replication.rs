@@ -13,6 +13,7 @@ mod slot_header;
 #[cfg(feature = "simulation")]
 pub mod trace;
 pub mod transport;
+mod transport_fields;
 
 pub use disk::DurableVoter;
 pub use evidence::{RotationSlots, SlotImage, SlotPair, Vote, VoterSlots};
