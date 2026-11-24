@@ -24,7 +24,7 @@ impl Operation {
             Self::Route => output.put_u8(0),
             Self::Execute(request) => {
                 output.put_u8(1);
-                output.put_slice(&request.encode());
+                request.encode_into(&mut output, None);
             }
             Self::Reconcile {
                 grant: authority,
@@ -32,7 +32,7 @@ impl Operation {
             } => {
                 output.put_u8(2);
                 grant(&mut output, *authority);
-                output.put_slice(&original.encode());
+                original.encode_into(&mut output, None);
             }
             Self::Replay {
                 hold,

@@ -4,6 +4,7 @@ use super::{
     Refusal, Request, RequestId, Window, WriterState, valid_object_names,
 };
 use bytes::{BufMut, Bytes, BytesMut};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub(super) mod frame;
@@ -23,38 +24,54 @@ impl Request {
     /// The exact bytes used by ordered replication and crash replay.
     pub fn encode(&self) -> Bytes {
         let mut output = BytesMut::new();
-        output.put_u8(COMMAND_VERSION);
-        placement(&mut output, self.placement);
-        principal(&mut output, self.principal);
-        request_id(&mut output, self.id);
+        self.encode_into(&mut output, None);
+        output.freeze()
+    }
+
+    fn encode_into(&self, output: &mut BytesMut, journal_time: Option<u64>) {
+        let payload = self.encode_prefix(output, journal_time);
+        output.put_slice(payload);
+    }
+
+    // Writes every field except the opaque append tail, which can also be
+    // hashed directly from the request.
+    fn encode_prefix(&self, output: &mut BytesMut, journal_time: Option<u64>) -> &[u8] {
+        if let Some(time) = journal_time {
+            output.put_slice(&decision_header(time.to_be_bytes()));
+        } else {
+            output.put_u8(COMMAND_VERSION);
+        }
+        placement(output, self.placement);
+        principal(output, self.principal);
+        request_id(output, self.id);
         match &self.command {
             Command::Enroll { worker, expected } => {
                 output.put_u8(0);
-                uuid(&mut output, *worker);
+                uuid(output, *worker);
                 output.put_u8(encode_flag(expected.is_some()));
                 if let Some(expected) = expected {
-                    enrollment(&mut output, *expected);
+                    enrollment(output, *expected);
                 }
             }
             Command::Withdraw { enrollment: worker } => {
                 output.put_u8(1);
-                enrollment(&mut output, *worker);
+                enrollment(output, *worker);
             }
             Command::Grant {
                 expected,
                 candidate,
             } => {
                 output.put_u8(2);
-                writer_state(&mut output, *expected);
-                enrollment(&mut output, *candidate);
+                writer_state(output, *expected);
+                enrollment(output, *candidate);
             }
             Command::PublishAndRotate {
                 grant: writer,
                 checkpoint: root,
             } => {
                 output.put_u8(22);
-                grant(&mut output, *writer);
-                checkpoint(&mut output, *root);
+                grant(output, *writer);
+                checkpoint(output, *root);
             }
             Command::Append {
                 class,
@@ -66,13 +83,13 @@ impl Request {
             } => {
                 output.put_u8(if references.is_some() { 23 } else { 3 });
                 output.put_u8(class.tag());
-                grant(&mut output, *writer);
+                grant(output, *writer);
                 output.put_u64(*expected_next);
                 output.put_i64(*timestamp);
                 if let Some(names) = references {
-                    object_names(&mut output, names);
+                    object_names(output, names);
                 }
-                output.put_slice(payload);
+                return payload;
             }
             Command::Barrier => output.put_u8(4),
             Command::PrepareCheckpoint {
@@ -80,18 +97,18 @@ impl Request {
                 references,
             } => {
                 output.put_u8(if references.is_some() { 24 } else { 15 });
-                checkpoint_preparation(&mut output, *preparation);
+                checkpoint_preparation(output, *preparation);
                 if let Some(names) = references {
-                    object_names(&mut output, names);
+                    object_names(output, names);
                 }
             }
             Command::WithdrawObject { object } => {
                 output.put_u8(25);
-                withdrawal(&mut output, *object);
+                withdrawal(output, *object);
             }
             Command::CloseCheckpoint { checkpoint: root } => {
                 output.put_u8(16);
-                checkpoint(&mut output, *root);
+                checkpoint(output, *root);
             }
             Command::SettleCheckpoint {
                 checkpoint: root,
@@ -99,7 +116,7 @@ impl Request {
                 erasure_floor,
             } => {
                 output.put_u8(17);
-                checkpoint(&mut output, *root);
+                checkpoint(output, *root);
                 output.put_slice(disposition);
                 output.put_u64(*erasure_floor);
             }
@@ -108,51 +125,51 @@ impl Request {
                 disposition,
             } => {
                 output.put_u8(18);
-                enrollment(&mut output, *worker);
+                enrollment(output, *worker);
                 output.put_slice(disposition);
             }
             Command::Publish {
                 checkpoint: offered,
             } => {
                 output.put_u8(5);
-                checkpoint(&mut output, *offered);
+                checkpoint(output, *offered);
             }
             Command::FundWindow { window: allocation } => {
                 output.put_u8(10);
-                window(&mut output, *allocation);
+                window(output, *allocation);
             }
             Command::Protect {
                 grant: writer,
                 through,
             } => {
                 output.put_u8(6);
-                grant(&mut output, *writer);
-                cut(&mut output, *through);
+                grant(output, *writer);
+                cut(output, *through);
             }
             Command::Trim { selected, through } => {
                 output.put_u8(8);
-                checkpoint(&mut output, *selected);
-                cut(&mut output, *through);
+                checkpoint(output, *selected);
+                cut(output, *through);
             }
             Command::Release { hold } => {
                 output.put_u8(7);
-                hold_row(&mut output, *hold);
+                hold_row(output, *hold);
             }
             Command::ReleaseRead { read } => {
                 output.put_u8(19);
-                request_id(&mut output, *read);
+                request_id(output, *read);
             }
             Command::Lease { grant: writer } => {
                 output.put_u8(20);
-                grant(&mut output, *writer);
+                grant(output, *writer);
             }
             Command::LeaseRead { hold } => {
                 output.put_u8(26);
-                hold_row(&mut output, *hold);
+                hold_row(output, *hold);
             }
             Command::DisposeExpired { enrollment: worker } => {
                 output.put_u8(21);
-                enrollment(&mut output, *worker);
+                enrollment(output, *worker);
             }
             Command::ProtectRange { from, through } => {
                 output.put_u8(11);
@@ -167,11 +184,11 @@ impl Request {
             }
             Command::ProtectRoot { source } => {
                 output.put_u8(12);
-                hold_row(&mut output, *source);
+                hold_row(output, *source);
             }
             Command::Vacate { grant: writer } => {
                 output.put_u8(13);
-                grant(&mut output, *writer);
+                grant(output, *writer);
             }
             Command::SealCohort {
                 expected,
@@ -182,7 +199,7 @@ impl Request {
                 output.put_slice(successor);
             }
         }
-        output.freeze()
+        &[]
     }
 
     /// Decodes a single frame. A transport authenticates the principal and
@@ -299,14 +316,22 @@ impl Request {
     }
 }
 
+pub(super) fn fingerprint(request: &Request) -> Fingerprint {
+    let mut prefix = BytesMut::new();
+    let payload = request.encode_prefix(&mut prefix, None);
+    let mut hash = Sha256::new();
+    hash.update(b"logkeeper.ordered-request.v1");
+    hash.update(&prefix[..]);
+    hash.update(payload);
+    hash.finalize().into()
+}
+
 /// The bytes of one chosen decision: the request stamped with the journal
 /// time its proposer assigned. The time is outside the request fingerprint,
 /// so an exact retry still matches its original receipt.
 pub(in crate::ordered) fn encode_decision(time: u64, request: &Request) -> Bytes {
-    let body = request.encode();
-    let mut output = BytesMut::with_capacity(body.len() + 8);
-    output.put_slice(&decision_header(time.to_be_bytes()));
-    output.put_slice(&body[1..]);
+    let mut output = BytesMut::new();
+    request.encode_into(&mut output, Some(time));
     output.freeze()
 }
 
@@ -638,6 +663,108 @@ mod tests {
         };
         names.reverse();
         assert_eq!(Request::decode(command.encode()), Ok(command));
+    }
+
+    #[test]
+    fn append_envelopes_keep_the_v9_request_bytes() {
+        use crate::ordered::service::wire::Operation;
+
+        let worker = Enrollment {
+            worker: Uuid::from_u128(5),
+            serial: 6,
+        };
+        let writer = Grant {
+            enrollment: worker,
+            epoch: 7,
+            key_generation: 8,
+        };
+        let authority = Grant { epoch: 9, ..writer };
+        let payload = b"\x00opaque\xff";
+        let time = 0x0123_4567_89ab_cdef_u64;
+
+        let mut placement_bytes = Vec::new();
+        for id in 1..=3 {
+            placement_bytes.put_u128(id);
+        }
+        let mut scope_bytes = placement_bytes.clone();
+        scope_bytes.put_u64(2);
+        placement_bytes.put_u64(1);
+
+        let mut reconcile_prefix = scope_bytes.clone();
+        reconcile_prefix.put_u8(2);
+        reconcile_prefix.put_u128(5);
+        reconcile_prefix.put_u64(6);
+        reconcile_prefix.put_u64(9);
+        reconcile_prefix.put_u64(8);
+        let mut execute_prefix = scope_bytes;
+        execute_prefix.put_u8(1);
+
+        let names = [[0x81; 32], [0x93; 32]];
+        for (tag, references) in [(3, None), (23, Some(names.as_slice()))] {
+            let mut original = request(Command::Append {
+                class: AppendClass::Maintenance,
+                grant: writer,
+                expected_next: 11,
+                timestamp: -12,
+                payload: Bytes::from_static(payload),
+                references: references.map(<[ObjectName]>::to_vec),
+            });
+            original.principal = Principal::Worker(worker);
+            let scope = Placement {
+                generation: 2,
+                ..original.placement
+            };
+
+            let mut expected = vec![9];
+            expected.put_slice(&placement_bytes);
+            expected.put_u8(1);
+            expected.put_u128(5);
+            expected.put_u64(6);
+            expected.put_u128(4);
+            expected.put_u64(10);
+            expected.put_slice(&[tag, 1]);
+            expected.put_u128(5);
+            expected.put_u64(6);
+            expected.put_u64(7);
+            expected.put_u64(8);
+            expected.put_u64(11);
+            expected.put_i64(-12);
+            if let Some(names) = references {
+                expected.put_u32(2);
+                for name in names {
+                    expected.put_slice(name);
+                }
+            }
+            expected.put_slice(payload);
+
+            let execute = Operation::Execute(original.clone()).encode(scope);
+            let reconcile = Operation::Reconcile {
+                grant: authority,
+                original: original.clone(),
+            }
+            .encode(scope);
+            let decision = encode_decision(time, &original);
+
+            assert_eq!(original.encode().as_ref(), expected.as_slice());
+            assert_eq!(
+                execute.as_ref(),
+                [execute_prefix.as_slice(), &expected].concat().as_slice()
+            );
+            assert_eq!(
+                reconcile.as_ref(),
+                [reconcile_prefix.as_slice(), &expected].concat().as_slice()
+            );
+            assert_eq!(
+                decision.as_ref(),
+                [&[9][..], &time.to_be_bytes(), &expected[1..]].concat().as_slice()
+            );
+
+            let mut hash = Sha256::new();
+            hash.update(b"logkeeper.ordered-request.v1");
+            hash.update(&expected);
+            let expected_fingerprint: Fingerprint = hash.finalize().into();
+            assert_eq!(fingerprint(&original), expected_fingerprint);
+        }
     }
 
     #[test]

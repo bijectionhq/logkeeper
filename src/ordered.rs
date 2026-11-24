@@ -29,6 +29,7 @@ pub mod service;
 mod writer;
 
 use bytes::Bytes;
+use codec::fingerprint;
 use object_names::valid_object_names;
 use receipt::ReceiptBook;
 use sha2::{Digest, Sha256};
@@ -1836,13 +1837,6 @@ fn append_fingerprint(
 
 fn record_charge(payload_len: usize, references: Option<&[ObjectName]>) -> Result<u64, Refusal> {
     budget::record_charge(payload_len, references.map(<[ObjectName]>::len)).ok_or(Refusal::Capacity)
-}
-
-fn fingerprint(request: &Request) -> Fingerprint {
-    let mut hash = Sha256::new();
-    hash.update(b"logkeeper.ordered-request.v1");
-    hash.update(request.encode());
-    hash.finalize().into()
 }
 
 fn extend_command_history(
