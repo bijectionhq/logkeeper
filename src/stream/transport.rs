@@ -38,8 +38,8 @@ use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 use super::{
     codec::{
-        self, decode_reply, decode_request, encode_reply, encode_request, invalid, read_frame,
-        write_frame,
+        self, PreparedReply, decode_reply, decode_request, invalid, read_frame,
+        request_write::RequestWrite,
     },
     keeper::{Keeper, Limits, SealPolicy},
     wire::*,
@@ -192,7 +192,9 @@ async fn serve_connection(
                     None => open = false,
                 },
                 Some(reply) = running.next(), if !running.is_empty() => {
-                    timeout(FRAME_TIMEOUT, write_frame(&mut write, &encode_reply(&reply?)?)).await??;
+                    let reply = reply?;
+                    let frame = PreparedReply::new(&reply)?;
+                    timeout(FRAME_TIMEOUT, frame.write(&mut write)).await??;
                 }
                 else => return Ok::<_, io::Error>(()),
             }
@@ -430,7 +432,7 @@ impl TcpTransport {
             _ => None,
         };
         let _connection = route.connections.acquire().await.expect("open route");
-        let body = encode_request(&request).map_err(protocol)?;
+        let request = RequestWrite::preflight(request).map_err(protocol)?;
         let idle = route.idle.lock().channels.pop().map(|(_, channel)| channel);
         let mut channel = match idle {
             Some(channel) => channel,
@@ -446,7 +448,7 @@ impl TcpTransport {
                 channel
             }
         };
-        write_frame(&mut channel, &body)
+        request.write(&mut channel)
             .await
             .map_err(connection_error)?;
         let reply = decode_reply(read_frame(&mut channel).await.map_err(connection_error)?)

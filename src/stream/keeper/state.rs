@@ -6,6 +6,7 @@ use tokio::sync::watch;
 use super::{
     checkpoint_bytes::check_extent,
     rules::{self, Decision, Limits},
+    wal_layout::checksum_matches,
 };
 use crate::stream::{
     codec::{PAGE_BYTES, invalid},
@@ -16,6 +17,8 @@ pub(super) struct Extent {
     pub sequence: u64,
     pub path: PathBuf,
 }
+
+pub(super) const EXTENT_COPY_BYTES: usize = 64 * 1024;
 
 /// Keep one file open across sequential record reads, independent of stream count.
 #[derive(Default)]
@@ -31,6 +34,34 @@ impl ExtentReader {
             self.0 = Some((Arc::clone(extent), File::open(&extent.path)?));
         }
         Ok(&mut self.0.as_mut().expect("extent is open").1)
+    }
+
+    pub fn copy_checked(
+        &mut self,
+        extent: &Arc<Extent>,
+        mut offset: u64,
+        len: u32,
+        expected_crc: u32,
+        buffer: &mut [u8; EXTENT_COPY_BYTES],
+        output: &mut impl io::Write,
+    ) -> io::Result<()> {
+        let end = offset
+            .checked_add(u64::from(len))
+            .ok_or_else(|| invalid("invalid stream extent range"))?;
+        let file = self.file(extent)?;
+        let mut crc = crc32fast::Hasher::new();
+        while offset < end {
+            let chunk_len = (end - offset).min(buffer.len() as u64) as usize;
+            let chunk = &mut buffer[..chunk_len];
+            read_at(file, chunk, offset)?;
+            crc.update(chunk);
+            output.write_all(chunk)?;
+            offset += chunk_len as u64;
+        }
+        if !checksum_matches(expected_crc, crc.finalize()) {
+            return Err(invalid("stream extent checksum mismatch"));
+        }
+        Ok(())
     }
 }
 

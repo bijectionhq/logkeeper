@@ -5,10 +5,13 @@ use bytes::{Bytes, BytesMut};
 use prost::Message;
 #[cfg(any(test, feature = "stream"))]
 use tokio::io::{AsyncRead, AsyncReadExt};
-#[cfg(feature = "stream")]
-use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::wire::*;
+
+#[cfg(feature = "stream")]
+mod reply_write;
+#[cfg(feature = "stream")]
+pub(super) use reply_write::PreparedReply;
 
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub(super) const PAGE_BYTES: usize = MAX_FRAME_BYTES - 64;
@@ -26,19 +29,6 @@ pub(super) async fn read_frame(channel: &mut (impl AsyncRead + Unpin)) -> io::Re
     let mut body = vec![0; length];
     channel.read_exact(&mut body).await?;
     Ok(Bytes::from(body))
-}
-
-#[cfg(feature = "stream")]
-pub(super) async fn write_frame(
-    channel: &mut (impl AsyncWrite + Unpin),
-    body: &[u8],
-) -> io::Result<()> {
-    if body.is_empty() || body.len() > MAX_FRAME_BYTES {
-        return Err(invalid("invalid keeper frame length"));
-    }
-    channel.write_u32(body.len() as u32).await?;
-    channel.write_all(body).await?;
-    channel.flush().await
 }
 
 pub(super) fn stream(request: &Request) -> StreamId {
@@ -66,6 +56,13 @@ pub(super) fn encode_request_after(
     request: &Request,
     prefix: impl FnOnce(usize) -> io::Result<Vec<u8>>,
 ) -> io::Result<Bytes> {
+    let (message, len) = checked_request_frame(request)?;
+    let mut body = prefix(len)?;
+    message.encode(&mut body).map_err(io::Error::other)?;
+    Ok(Bytes::from(body))
+}
+
+fn checked_request_frame(request: &Request) -> io::Result<(RequestFrame, usize)> {
     if !well_formed_batch(request) {
         return Err(invalid("empty or nested keeper batch"));
     }
@@ -74,9 +71,7 @@ pub(super) fn encode_request_after(
     if len > MAX_FRAME_BYTES {
         return Err(invalid("keeper message too large"));
     }
-    let mut body = prefix(len)?;
-    message.encode(&mut body).map_err(io::Error::other)?;
-    Ok(Bytes::from(body))
+    Ok((message, len))
 }
 
 /// A batch carries at least one request and never another batch.
@@ -103,12 +98,17 @@ pub fn decode_request(body: Bytes) -> io::Result<Request> {
 }
 
 pub fn encode_reply(reply: &Reply) -> io::Result<Bytes> {
-    if let Reply::Batch(replies) = reply
-        && (replies.is_empty() || replies.iter().any(|reply| matches!(reply, Reply::Batch(_))))
-    {
-        return Err(invalid("empty or nested keeper batch"));
+    if let Reply::Batch(replies) = reply {
+        validate_reply_batch(replies)?;
     }
     encode(&ReplyFrame::from(reply), MAX_FRAME_BYTES)
+}
+
+fn validate_reply_batch(replies: &[Reply]) -> io::Result<()> {
+    if replies.is_empty() || replies.iter().any(|reply| matches!(reply, Reply::Batch(_))) {
+        return Err(invalid("empty or nested keeper batch"));
+    }
+    Ok(())
 }
 
 pub fn decode_reply(body: Bytes) -> io::Result<Reply> {
@@ -290,6 +290,9 @@ struct RequestFrame {
     #[prost(message, repeated, tag = "12")]
     batch: Vec<RequestFrame>,
 }
+
+#[cfg(feature = "stream")]
+pub(super) mod request_write;
 
 // Each request schema declares its protobuf fields and their domain conversion together.
 macro_rules! request_messages {
