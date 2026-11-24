@@ -149,7 +149,7 @@ pub async fn serve<R: Replica>(
         let (placement, operation) = Operation::decode(frame).map_err(|_| WireError::Frame)?;
         if placement != session.placement {
             let reply = Reply::Refused(Refusal::WrongPlacement);
-            return write_frame(&mut channel, reply.encode(), maximum_frame).await;
+            return write_frame_parts(&mut channel, reply.into_frame().parts(), maximum_frame).await;
         }
         let outcome = match operation {
             Operation::Route => coordinator.route(session).await.map(Reply::Route),
@@ -256,7 +256,7 @@ pub async fn serve<R: Replica>(
             Err(Error::Refused(refusal)) => Reply::Refused(refusal),
             Err(error) => return Err(error.into()),
         };
-        write_frame(&mut channel, reply.encode(), maximum_frame).await
+        write_frame_parts(&mut channel, reply.into_frame().parts(), maximum_frame).await
     })
     .await
     .map_err(|_| WireError::Timeout)?
@@ -425,11 +425,25 @@ async fn write_frame(
     bytes: Bytes,
     limit: usize,
 ) -> Result<(), WireError> {
-    let size = u32::try_from(bytes.len()).map_err(|_| WireError::Frame)?;
+    write_frame_parts(channel, std::iter::once(bytes.as_ref()), limit).await
+}
+
+async fn write_frame_parts<'a>(
+    channel: &mut (impl AsyncWrite + Unpin),
+    parts: impl Iterator<Item = &'a [u8]> + Clone,
+    limit: usize,
+) -> Result<(), WireError> {
+    let length = parts
+        .clone()
+        .try_fold(0usize, |total, part| total.checked_add(part.len()))
+        .ok_or(WireError::Frame)?;
+    let size = u32::try_from(length).map_err(|_| WireError::Frame)?;
     bounded_body_length(u64::from(size), 1, limit).ok_or(WireError::Frame)?;
     channel.write_all(MAGIC).await?;
     channel.write_u32(size).await?;
-    channel.write_all(&bytes).await?;
+    for part in parts {
+        channel.write_all(part).await?;
+    }
     channel.flush().await?;
     Ok(())
 }
@@ -507,5 +521,24 @@ mod tests {
             read_frame(&mut packet.as_slice(), body.len()).await,
             Err(WireError::Frame)
         ));
+    }
+
+    #[tokio::test]
+    async fn multipart_frame_admits_the_total_before_writing() {
+        let parts = [b"header".as_slice(), b"payload".as_slice(), b"tail".as_slice()];
+        let length: usize = parts.iter().map(|part| part.len()).sum();
+        let mut packet = Vec::new();
+        assert!(matches!(
+            write_frame_parts(&mut packet, parts.into_iter(), length - 1).await,
+            Err(WireError::Frame)
+        ));
+        assert!(packet.is_empty());
+        write_frame_parts(&mut packet, parts.into_iter(), length)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_frame(&mut packet.as_slice(), length).await.unwrap().as_ref(),
+            b"headerpayloadtail"
+        );
     }
 }
