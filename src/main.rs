@@ -17,6 +17,8 @@ async fn main() -> ExitCode {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.as_slice() == ["--help"] {
         println!("{USAGE}");
+        #[cfg(feature = "stream")]
+        println!("       logkeeper keeper --config FILE");
         return ExitCode::SUCCESS;
     }
     match run(&args).await {
@@ -29,6 +31,29 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "stream")]
+    if args.first().is_some_and(|arg| arg == "keeper") {
+        let [_, flag, file] = args else {
+            return Err("Usage: logkeeper keeper --config FILE".into());
+        };
+        if flag != "--config" {
+            return Err("Usage: logkeeper keeper --config FILE".into());
+        }
+        let config = logkeeper::stream::transport::Config::read(std::path::Path::new(file))?;
+        let listener = TcpListener::bind(config.listen).await?;
+        let cancellation = CancellationToken::new();
+        let serving = config.serve(listener, cancellation.clone());
+        tokio::pin!(serving);
+        tokio::select! {
+            result = &mut serving => result?,
+            signal = shutdown_signal() => {
+                cancellation.cancel();
+                serving.await?;
+                signal?;
+            }
+        }
+        return Ok(());
+    }
     #[cfg(feature = "ordered-daemon")]
     if args.first().is_some_and(|argument| argument == "ordered") {
         return run_ordered(args).await;
