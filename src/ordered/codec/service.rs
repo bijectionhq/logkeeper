@@ -16,15 +16,27 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 mod rotation;
 
+pub(in crate::ordered) struct EncodedOperation<'a> {
+    header: Bytes,
+    payload: &'a [u8],
+}
+
+impl EncodedOperation<'_> {
+    pub(in crate::ordered) fn parts(&self) -> impl Iterator<Item = &[u8]> + Clone {
+        [self.header.as_ref(), self.payload].into_iter()
+    }
+}
+
 impl Operation {
-    pub(in crate::ordered) fn encode(&self, scope: Placement) -> Bytes {
+    pub(in crate::ordered) fn encode_parts(&self, scope: Placement) -> EncodedOperation<'_> {
         let mut output = BytesMut::new();
+        let mut payload = &[][..];
         placement(&mut output, scope);
         match self {
             Self::Route => output.put_u8(0),
             Self::Execute(request) => {
                 output.put_u8(1);
-                request.encode_into(&mut output, None);
+                payload = request.encode_prefix(&mut output, None);
             }
             Self::Reconcile {
                 grant: authority,
@@ -32,7 +44,7 @@ impl Operation {
             } => {
                 output.put_u8(2);
                 grant(&mut output, *authority);
-                original.encode_into(&mut output, None);
+                payload = original.encode_prefix(&mut output, None);
             }
             Self::Replay {
                 hold,
@@ -88,6 +100,19 @@ impl Operation {
                 hold_row(&mut output, *hold);
                 cut(&mut output, *from);
             }
+        }
+        EncodedOperation {
+            header: output.freeze(),
+            payload,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::ordered) fn encode(&self, scope: Placement) -> Bytes {
+        let frame = self.encode_parts(scope);
+        let mut output = BytesMut::new();
+        for part in frame.parts() {
+            output.put_slice(part);
         }
         output.freeze()
     }
