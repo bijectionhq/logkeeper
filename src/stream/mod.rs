@@ -3,6 +3,7 @@
 
 pub mod codec;
 pub mod keeper;
+mod proposer;
 #[cfg(feature = "stream")]
 pub mod transport;
 pub mod wire;

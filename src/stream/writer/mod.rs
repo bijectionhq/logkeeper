@@ -1,7 +1,7 @@
 //! Writer-driven stream journal over an authenticated keeper transport.
 
 mod append;
-mod decision;
+pub(super) mod decision;
 mod head;
 mod read;
 mod recovery;
@@ -17,9 +17,14 @@ use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use self::{append::Active, decision::QUORUM, recovery::Recovery};
-use super::wire::{KeeperId, Refusal, Reply, Request, Transport};
-
-const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+use super::{
+    proposer::{
+        driver, map_refusal,
+        mutation::{Kind, Mutation},
+        refusal,
+    },
+    wire::{KeeperId, Reply, Request, Transport},
+};
 
 /// Optional admission policy for seal. By default any authenticated identity can seal.
 pub trait SealPolicy: Send + Sync {
@@ -150,7 +155,7 @@ impl Writer {
             });
         }
         if recovery.as_ref().is_none_or(|r| r.epoch != epoch) {
-            *recovery = Some(Recovery::choose(&self.io, stream, epoch).await?);
+            *recovery = Some(recovery::choose(&self.io, stream, epoch).await?);
         }
         // Keep the selected history across lost replies or cancellation at this epoch.
         let selected = recovery.as_ref().unwrap();
@@ -187,29 +192,17 @@ impl Writer {
         }
         // Trim replies establish the current fence and cover the requested
         // head even if the local snapshot is behind.
-        let floors = quorum(stream.ensemble.map(|keeper| async move {
-            match self
-                .io
-                .call(
-                    keeper,
-                    Request::Trim {
-                        stream: stream.id,
-                        epoch,
-                        through,
-                    },
-                )
-                .await?
-            {
-                Reply::Trimmed { floor } if floor > through => Ok(floor),
-                _ => Err(JournalError::Unavailable),
-            }
-        }))
+        let floor = driver::run(
+            &*self.io.transport,
+            Mutation::new(Kind::Trim { epoch, through }, stream.id, stream.ensemble),
+            Some(driver::RPC_TIMEOUT),
+        )
         .await
         .map_err(|error| match error {
             JournalError::Conflict { .. } if through > head => JournalError::Conflict { head },
             error => error,
         })?;
-        active.trim(floors[0].max(floors[1]));
+        active.trim(floor);
         Ok(())
     }
 
@@ -285,16 +278,12 @@ impl Journal for Writer {
         Box::pin(async move {
             let stream = self.stream(stream);
             let _mutation = stream.mutation.lock().await;
-            self.io
-                .broadcast(
-                    &stream,
-                    Request::Create {
-                        stream: stream.id,
-                        ensemble: stream.ensemble,
-                    },
-                    Reply::Created,
-                )
-                .await
+            driver::run_detached(
+                self.io.transport.clone(),
+                Mutation::new(Kind::Create, stream.id, stream.ensemble),
+            )
+            .await
+            .map(|_| ())
         })
     }
 
@@ -345,16 +334,11 @@ impl Journal for Writer {
         Box::pin(async move {
             let stream = self.stream(stream);
             let mut recovery = stream.mutation.lock().await;
-            self.io
-                .broadcast(
-                    &stream,
-                    Request::Delete {
-                        stream: stream.id,
-                        ensemble: stream.ensemble,
-                    },
-                    Reply::Deleted,
-                )
-                .await?;
+            driver::run_detached(
+                self.io.transport.clone(),
+                Mutation::new(Kind::Delete, stream.id, stream.ensemble),
+            )
+            .await?;
             if let Some(active) = stream.active.lock().take() {
                 active.close(JournalError::Deleted);
             }
@@ -370,35 +354,16 @@ impl Io {
             Request::Read { wait_ms, .. } => Duration::from_millis((*wait_ms).into()),
             _ => Duration::ZERO,
         };
-        match tokio::time::timeout(wait + RPC_TIMEOUT, self.transport.call(keeper, request)).await {
+        match tokio::time::timeout(
+            wait + driver::RPC_TIMEOUT,
+            self.transport.call(keeper, request),
+        )
+        .await
+        {
             Ok(Ok(Reply::Refused(refusal))) => Err(map_refusal(refusal)),
             Ok(Ok(reply)) => Ok(reply),
             _ => Err(JournalError::Unavailable),
         }
-    }
-
-    async fn broadcast(
-        self: &Arc<Self>,
-        stream: &Stream,
-        request: Request,
-        expected: Reply,
-    ) -> Result<()> {
-        // Finish sending to the third keeper after the caller has its quorum.
-        let calls = stream.ensemble.map(|keeper| {
-            let (io, request, expected) = (self.clone(), request.clone(), expected.clone());
-            tokio::spawn(async move {
-                if io.call(keeper, request).await? == expected {
-                    Ok(())
-                } else {
-                    Err(JournalError::Unavailable)
-                }
-            })
-        });
-        quorum(
-            calls.map(|call| async move { call.await.unwrap_or(Err(JournalError::Unavailable)) }),
-        )
-        .await
-        .map(|_| ())
     }
 
     async fn publish(
@@ -447,53 +412,6 @@ where
         }
     }
     Err(refusal(&errors))
-}
-
-fn map_refusal(refusal: Refusal) -> JournalError {
-    match refusal {
-        Refusal::Fenced { promised } => JournalError::Fenced { current: promised },
-        Refusal::Gap { head } | Refusal::Conflict { head } | Refusal::AboveHead { head } => {
-            JournalError::Conflict { head }
-        }
-        Refusal::BelowFloor { floor } => JournalError::Trimmed { floor },
-        Refusal::Full { floor } => JournalError::Full { floor },
-        Refusal::TooLarge { max } => JournalError::TooLarge { max: max as usize },
-        Refusal::Deleted => JournalError::Deleted,
-        Refusal::NotFound => JournalError::NotFound,
-        Refusal::NotSynced | Refusal::Unauthorized | Refusal::WrongEnsemble { .. } => {
-            JournalError::Unavailable
-        }
-    }
-}
-
-fn refusal(errors: &[JournalError]) -> JournalError {
-    for error in [JournalError::Deleted, JournalError::NotFound] {
-        if errors.iter().filter(|seen| **seen == error).count() >= QUORUM {
-            return error;
-        }
-    }
-    if let Some(error) = errors.iter().find(|first| {
-        !matches!(
-            first,
-            JournalError::Unavailable | JournalError::Fenced { .. }
-        ) && errors
-            .iter()
-            .filter(|second| std::mem::discriminant(*second) == std::mem::discriminant(*first))
-            .count()
-            >= QUORUM
-    }) {
-        return error.clone();
-    }
-    errors
-        .iter()
-        .filter_map(|error| match error {
-            JournalError::Fenced { current } => Some(*current),
-            _ => None,
-        })
-        .max()
-        .map_or(JournalError::Unavailable, |current| JournalError::Fenced {
-            current,
-        })
 }
 
 #[cfg(test)]

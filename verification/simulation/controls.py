@@ -19,6 +19,7 @@ SEEDED = SIM + "seeded_stream_journal"
 RULES = "src/stream/keeper/rules.rs"
 STATE = "src/stream/keeper/state.rs"
 WRITER = "src/stream/writer/"
+PROPOSER = "src/stream/proposer/"
 ENGINE = "src/stream/keeper/mod.rs"
 
 
@@ -56,14 +57,14 @@ def controls():
     )
     yield (
         "expect-staged-tail-in-sweep",
-        [edit("src/stream/keeper/sweep.rs", "        let tail = if complete {",
-              "        let tail = if complete || !complete {")],
+        [edit(PROPOSER + "sweep.rs", "let visible_tail = if complete {",
+              "let visible_tail = if complete || !complete {")],
         "stream::keeper::tests::sweeper_transfers_multiple_pages_across_successive_replacements",
         "sweep rejected its incomplete Sync reply", 0,
     )
     yield (
         "count-stale-roster-head",
-        [edit(WRITER + "head.rs", "                && view.ensemble == stream.ensemble\n", "")],
+        [edit(PROPOSER + "head.rs", "                && view.ensemble == ensemble\n", "")],
         "stream::keeper::tests::sweeper_transfers_multiple_pages_across_successive_replacements",
         "stale roster supplied a fresh head", 0,
     )
@@ -79,38 +80,33 @@ def controls():
     )
     yield (
         "count-one-keeper-twice-for-trim",
-        [edit(WRITER + "mod.rs", "let floors = quorum(stream.ensemble.map(|keeper| async move {",
-              "let floors = quorum(stream.ensemble.map(|_| async move {\n"
-              "            let keeper = stream.ensemble[0];")],
+        [edit(PROPOSER + "mutation.rs", "Send::new(slot, ensemble[slot as usize], request)",
+              "Send::new(slot, if matches!(request, Request::Trim { .. }) { ensemble[0] } else { ensemble[slot as usize] }, request)")],
         "stream::writer::tests::trim_and_delete_wait_for_a_distinct_durable_reply",
         "Trim returned without the second keeper reply", 0,
     )
     yield (
         "count-one-keeper-twice-for-delete",
-        [edit(WRITER + "mod.rs", "        let calls = stream.ensemble.map(|keeper| {\n",
-              "        let calls = stream.ensemble.map(|keeper| {\n"
-              "            let keeper = if matches!(request, Request::Delete { .. }) {\n"
-              "                stream.ensemble[0]\n"
-              "            } else {\n"
-              "                keeper\n"
-              "            };\n")],
+        [edit(PROPOSER + "mutation.rs", "Send::new(slot, ensemble[slot as usize], request)",
+              "Send::new(slot, if matches!(request, Request::Delete { .. }) { ensemble[0] } else { ensemble[slot as usize] }, request)")],
         "stream::writer::tests::trim_and_delete_wait_for_a_distinct_durable_reply",
         "Delete returned without the second keeper reply", 0,
     )
     yield (
         "poll-past-read-deadline",
-        [edit(WRITER + "read.rs", "timeout_at(deadline, request(from, max, wait_ms))",
-              "timeout_at(deadline + super::RPC_TIMEOUT, request(from, max, wait_ms))")],
+        [edit(PROPOSER + "driver.rs", "timeout_at(started + deadline, call)",
+              "timeout_at(started + deadline + RPC_TIMEOUT, call)")],
         "stream::writer::tests::a_delayed_poll_reply_cannot_extend_the_read_wait",
         "the first poll exhausted the wait budget", 0,
     )
     yield (
         "return-abandoned-read-page",
-        [edit(WRITER + "read.rs", "        } = request(at, left as usize, 0).await?;",
-              "        } = match request(at, left as usize, 0).await {\n"
-              "            Ok(chunk) => chunk,\n"
-              "            Err(_) => return Ok(page),\n"
-              "        };")],
+        [edit(PROPOSER + "read.rs", "let result = chunk(response, at).and_then(|next| {",
+              """let response = match response {
+                    Ok(Reply::Records { .. }) => response,
+                    _ => return Effects::Complete(Ok(page)),
+                };
+                let result = chunk(response, at).and_then(|next| {""")],
         "stream::writer::tests::a_lost_read_chunk_discards_the_partial_page_before_fallback",
         "fallback must use its own first reply", 0,
     )
@@ -123,7 +119,7 @@ def controls():
     )
     yield (
         "discard-uncertain-append",
-        [edit(WRITER + "append.rs", "if failed_at_first && first > self.uncertain_through {",
+        [edit(PROPOSER + "append.rs", "if failed_at_first && first > self.uncertain_through {",
               "if failed_at_first {")],
         "stream::writer::tests::capacity_refusals_do_not_release_a_timed_out_append",
         "capacity refusals released a position with an unanswered append", 0,
@@ -169,8 +165,7 @@ def controls():
     )
     yield (
         "sync-past-seed",
-        [edit(WRITER + "recovery.rs", "floor.min(Lsn(self.tail().0 + 1)).max(target.floor)",
-              "floor.max(target.floor)")],
+        [edit(PROPOSER + "recovery.rs", "            .min(Lsn(self.recovery.tail().0 + 1))\n", "")],
         "stream::writer::tests::unsynced_keeper_installs_the_seed_before_advancing_past_it",
         "lagging keeper must join after the floor passes the seed", 0,
     )
@@ -254,10 +249,8 @@ def controls():
     )
     yield (
         "append-reply-before-publication",
-        [edit(WRITER + "append.rs", """                self.published(at)
-                    .await
-                    .map_err(|_| JournalError::Unavailable)?;
-""", "")],
+        [edit(PROPOSER + "append.rs", "let Some(result) = self.publication(at) else {",
+              "let Some(result) = Some(Ok(())) else {")],
         SEEDED, "durability: successful append must cover two disks", 0,
     )
     yield (
@@ -266,7 +259,7 @@ def controls():
     )
     yield (
         "observer-no-head-quorum",
-        [edit(WRITER + "head.rs", """        head_quorum(
+        [edit(PROPOSER + "head.rs", """        head_quorum(
             eligible(views, candidate)
                 .filter(|view| view.head >= index)
                 .count(),
@@ -288,12 +281,10 @@ def controls():
               "if *ensemble != state.ensemble && false {\n                    return wrong_ensemble(state);\n                }\n                let current")],
         SEEDED, "replacement: split install admitted a stale seal", 9,
     )
-    sweep = ROOT / "src/stream/keeper/sweep.rs"
-    line = sweep.read_text()
-    start = line.index("        self.copy(")
-    end = line.index("        if history.synced", start)
     yield (
-        "skip-survivor-repair", [edit(str(sweep.relative_to(ROOT)), line[start:end], "")],
+        "skip-survivor-repair",
+        [edit(PROPOSER + "sweep.rs", "        self.copy(other, target, head)",
+              "        self.copied(other)")],
         SEEDED, "replacement did not repair both survivors", 9,
     )
     yield (
@@ -301,18 +292,18 @@ def controls():
         [edit(WRITER + "append.rs", """        let accepted = {
             let state = self.state.lock();
             std::array::from_fn::<_, 3, _>(|index| {
-                state.lanes[index]
-                    .accepted
-                    .is_some_and(|tail| tail >= at)
+                state
+                    .proposer
+                    .accepted(index, at)
                     .then_some(self.ensemble[index])
             })
         };""", "        let accepted = self.ensemble.map(Some);"),
-         edit(WRITER + "append.rs", """                    let retained =
-                        recovery::fetch(&self.io, keeper, self.stream, self.epoch, at).await?;
-                    if retained != *payload {
-                        return Err(JournalError::Conflict { head: self.head() });
-                    }
-                    self.io.publish(keeper, self.stream, self.epoch, at).await""",
+         edit(WRITER + "append.rs", """                let retained =
+                    recovery::fetch(&self.io, keeper, self.stream, self.epoch, at).await?;
+                if retained != *payload {
+                    return Err(JournalError::Conflict { head: self.head() });
+                }
+                self.io.publish(keeper, self.stream, self.epoch, at).await""",
               "                    self.send_append(keeper, at, vec![payload.clone()], at).await")],
         SIM + "guards::conflicting_retry_cannot_publish_on_a_lagging_keeper",
         "conflicting retry installed bytes on a lagging keeper", 0,

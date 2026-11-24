@@ -1,23 +1,19 @@
 //! A fresh quorum round for the callers queued when the round opens.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use futures::{StreamExt, stream::FuturesUnordered};
 use journal_contract::{Epoch, JournalError, Lsn, Result};
 use tokio::sync::oneshot;
 
-use super::{
-    Io, KeeperId, Reply, Request, Stream,
-    append::Active,
-    decision::{eligible_sample, head_quorum, sample_index},
-    refusal,
+use super::{Io, KeeperId, Request, Stream, append::Active};
+use crate::stream::{
+    proposer::{
+        driver,
+        head::{Observer, Samples, checked_view, writer_tail},
+    },
+    wire::StreamView,
 };
-use crate::stream::wire::StreamView;
-
-const RETRY: Duration = Duration::from_millis(1);
-const MAX_RETRY: Duration = Duration::from_millis(32);
-/// How long an observer waits for its read index to be covered by published heads.
-const SETTLE: Duration = Duration::from_secs(2);
 
 pub(super) async fn head(io: Arc<Io>, stream: Arc<Stream>) -> Result<Lsn> {
     let (send, receive) = oneshot::channel();
@@ -71,43 +67,18 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
                 }
             }
             let view = check_keeper(io, stream, keeper, active.epoch).await?;
-            match view.promised {
-                Some((current, identity, proposal))
-                    if current > active.epoch
-                        || (current == active.epoch
-                            && (&identity != io.transport.identity()
-                                || proposal != io.proposal)) =>
-                {
-                    Err(JournalError::Fenced { current })
-                }
-                Some((epoch, ..)) if epoch == active.epoch && view.synced == Some(epoch) => {
-                    Ok(view.tail)
-                }
-                _ => Err(JournalError::Unavailable),
-            }
+            writer_tail(view, active.epoch, io.transport.identity(), io.proposal)
         },
     ));
-    let mut count = 0;
-    let mut sample = Lsn(0);
-    let mut errors = Vec::new();
+    let mut samples = Samples::new(active.epoch);
     while let Some(reply) = calls.next().await {
-        match reply {
-            Ok(tail) => {
-                count += 1;
-                sample = Lsn(sample_index(sample.0, tail.0));
-                if head_quorum(count) {
-                    let head = active.cover(sample).await?;
-                    active.published(head).await?;
-                    return Ok(head);
-                }
-            }
-            Err(error @ JournalError::Fenced { current }) if current > active.epoch => {
-                return Err(error);
-            }
-            Err(error) => errors.push(error),
+        if let Some(sample) = samples.receive(reply) {
+            let head = active.cover(sample?).await?;
+            active.published(head).await?;
+            return Ok(head);
         }
     }
-    Err(refusal(&errors))
+    Err(samples.error())
 }
 
 /// How an observer chooses the position that later rounds must cover.
@@ -135,94 +106,9 @@ async fn observer(io: &Io, stream: &Stream) -> Result<Lsn> {
     observe(io, stream, Index::Pinned).await
 }
 
-/// The read index is the maximum tail of an eligible quorum in the first complete round.
-/// It covers every chosen record, hence every acknowledged append, at the invocation.
-/// Any committed position at or above it is a linearizable head. Appends that keep
-/// arriving advance tails but never move the index, so they cannot starve the call.
 pub(super) async fn observe(io: &Io, stream: &Stream, index: Index) -> Result<Lsn> {
-    let deadline = tokio::time::Instant::now() + SETTLE;
-    let mut target = None;
-    let mut pause = RETRY;
-    loop {
-        let result = observer_round(io, stream, &mut target).await;
-        if result != Err(JournalError::Unavailable) || tokio::time::Instant::now() >= deadline {
-            return result;
-        }
-        if index.resamples() {
-            target = None;
-        }
-        tokio::time::sleep(pause).await;
-        pause = (pause * 2).min(MAX_RETRY);
-    }
-}
-
-async fn observer_round(io: &Io, stream: &Stream, target: &mut Option<Lsn>) -> Result<Lsn> {
-    let mut calls = FuturesUnordered::from_iter(
-        stream
-            .ensemble
-            .map(|keeper| check_keeper(io, stream, keeper, Epoch(0))),
-    );
-    let mut views = Vec::<StreamView>::new();
-    let mut errors = Vec::new();
-    while let Some(reply) = calls.next().await {
-        match reply {
-            Ok(view) => views.push(view),
-            Err(error) => errors.push(error),
-        }
-        if let Some(head) = observed_head(&views, *target) {
-            return Ok(head);
-        }
-    }
-    if target.is_none() {
-        *target = read_index(&views);
-    }
-    Err(refusal(&errors))
-}
-
-/// Views at the highest promised epoch, from a keeper synced at that epoch and with
-/// the same promise as `candidate`.
-fn eligible<'a>(
-    views: &'a [StreamView],
-    candidate: &'a StreamView,
-) -> impl Iterator<Item = &'a StreamView> + 'a {
-    let epoch = views
-        .iter()
-        .filter_map(|view| view.promised.as_ref().map(|p| p.0))
-        .max();
-    views.iter().filter(move |view| {
-        eligible_sample(
-            view.promised.as_ref().map(|p| (p.0).0),
-            view.synced.map(|epoch| epoch.0),
-            epoch.map(|epoch| epoch.0),
-            view.promised == candidate.promised,
-        )
-    })
-}
-
-/// The maximum tail of an eligible quorum, if the views contain one.
-fn read_index(views: &[StreamView]) -> Option<Lsn> {
-    views.iter().find_map(|candidate| {
-        head_quorum(eligible(views, candidate).count())
-            .then(|| eligible(views, candidate).map(|view| view.tail).max())
-            .flatten()
-    })
-}
-
-/// Without a target, the eligible maximum tail must already be covered by a quorum of
-/// published heads. With a pinned target, a quorum of eligible heads must reach it.
-pub(super) fn observed_head(views: &[StreamView], target: Option<Lsn>) -> Option<Lsn> {
-    views.iter().find_map(|candidate| {
-        let index = match target {
-            Some(target) => target,
-            None => eligible(views, candidate).map(|view| view.tail).max()?,
-        };
-        head_quorum(
-            eligible(views, candidate)
-                .filter(|view| view.head >= index)
-                .count(),
-        )
-        .then_some(index)
-    })
+    let operation = Observer::new(stream.id, stream.ensemble, index.resamples());
+    driver::run(&*io.transport, operation, Some(driver::RPC_TIMEOUT)).await
 }
 
 pub(super) async fn check_keeper(
@@ -231,25 +117,15 @@ pub(super) async fn check_keeper(
     keeper: KeeperId,
     epoch: Epoch,
 ) -> Result<StreamView> {
-    match io
-        .call(
+    checked_view(
+        io.call(
             keeper,
             Request::Check {
                 stream: stream.id,
                 epoch,
             },
         )
-        .await?
-    {
-        Reply::Checked(view)
-            if view.head <= view.tail
-                && view.floor.0 > 0
-                && view.floor.0 - 1 <= view.head.0
-                && view.ensemble == stream.ensemble
-                && !view.learner =>
-        {
-            Ok(view)
-        }
-        _ => Err(JournalError::Unavailable),
-    }
+        .await?,
+        stream.ensemble,
+    )
 }
