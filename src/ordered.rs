@@ -298,6 +298,10 @@ pub enum Command {
     Lease {
         grant: Grant,
     },
+    /// Renews serving authority for an enrolled reader's exact protected basis.
+    LeaseRead {
+        hold: Hold,
+    },
     /// Disposes a withdrawn worker's holds without operator evidence once
     /// journal time has passed its last lease end plus the clock drift bound.
     DisposeExpired {
@@ -357,6 +361,11 @@ pub enum Outcome {
     /// `lease_end` is `issued_at + serving_lease` in journal time.
     Leased {
         grant: Grant,
+        issued_at: u64,
+        lease_end: u64,
+    },
+    ReadLeased {
+        hold: Hold,
         issued_at: u64,
         lease_end: u64,
     },
@@ -1287,6 +1296,16 @@ impl State {
                     issued_at: self.time,
                     lease_end,
                 })
+            }
+            Command::LeaseRead { hold } => {
+                if self.roster.get(&hold.owner.worker) != Some(&hold.owner) {
+                    return Err(Refusal::Stale);
+                }
+                self.held_replay(principal, hold)?;
+                let lease_end = self.time.checked_add(self.limits.serving_lease).ok_or(Refusal::Capacity)?;
+                let last = self.leases.entry(hold.owner).or_default();
+                *last = (*last).max(lease_end);
+                Ok(Outcome::ReadLeased { hold, issued_at: self.time, lease_end })
             }
             Command::FundWindow { window } => {
                 Self::custodian(principal)?;

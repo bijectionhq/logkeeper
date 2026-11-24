@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 
 use crate::ordered::TrimResult;
 
-const MAGIC: &[u8; 8] = b"LKBASE07";
+const MAGIC: &[u8; 8] = b"LKBASE08";
 const REFERENCED_PAYLOAD: u64 = 1 << 63;
 
 impl super::super::Limits {
@@ -686,6 +686,11 @@ impl Input {
                 issued_at: self.u64()?,
                 lease_end: self.u64()?,
             },
+            19 => Outcome::ReadLeased {
+                hold: self.hold()?,
+                issued_at: self.u64()?,
+                lease_end: self.u64()?,
+            },
             18 => Outcome::ObjectWithdrawn(self.object_fence()?),
             32 => return Ok(Err(Refusal::WrongPlacement)),
             33 => return Ok(Err(Refusal::Unauthorized)),
@@ -805,6 +810,12 @@ pub(super) fn result(output: &mut BytesMut, value: Result<Outcome, Refusal>) {
         }) => {
             output.put_u8(17);
             grant(output, writer);
+            output.put_u64(issued_at);
+            output.put_u64(lease_end);
+        }
+        Ok(Outcome::ReadLeased { hold, issued_at, lease_end }) => {
+            output.put_u8(19);
+            hold_row(output, hold);
             output.put_u64(issued_at);
             output.put_u64(lease_end);
         }

@@ -143,6 +143,10 @@ impl Request {
                 output.put_u8(20);
                 grant(&mut output, *writer);
             }
+            Command::LeaseRead { hold } => {
+                output.put_u8(26);
+                hold_row(&mut output, *hold);
+            }
             Command::DisposeExpired { enrollment: worker } => {
                 output.put_u8(21);
                 enrollment(&mut output, *worker);
@@ -223,6 +227,7 @@ impl Request {
             20 => Command::Lease {
                 grant: input.grant()?,
             },
+            26 => Command::LeaseRead { hold: input.hold()? },
             21 => Command::DisposeExpired {
                 enrollment: input.enrollment()?,
             },

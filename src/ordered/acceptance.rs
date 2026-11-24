@@ -420,6 +420,14 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
     assert_eq!(read.through, latest.through);
     assert_eq!(read.owner, worker);
 
+    let lease = apply(&mut state, principal, Command::LeaseRead { hold: read });
+    assert!(matches!(lease.outcome, Ok(Outcome::ReadLeased { hold, issued_at, lease_end })
+        if hold == read && lease_end > issued_at));
+    assert_eq!(
+        apply(&mut state, Principal::RouteReader, Command::LeaseRead { hold: read }).outcome,
+        Err(Refusal::Unauthorized),
+    );
+
     // Every live read hold keeps its own receipt as provenance.
     let image = state.encode_base();
     let recovered = State::decode_base(&initial, image.clone()).unwrap();

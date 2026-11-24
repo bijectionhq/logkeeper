@@ -32,7 +32,7 @@ pub(crate) open spec fn objectNameCountFits(declared: int, maximum: int, remaini
 
 }
 
-pub(super) const COMMAND_VERSION: u8 = 8;
+pub(super) const COMMAND_VERSION: u8 = 9;
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == (version == commandVersion()),
