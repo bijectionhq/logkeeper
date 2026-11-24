@@ -1,0 +1,289 @@
+{
+  "summary": "Verify keeper admission, commit bounds, and reply projections over the primitive shipped rules.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 24,
+  "controls": {
+    "reuse-deleted-stream": {
+      "defect": "Create passes a tombstone.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    !deleted\n",
+          "replace": "    let _ = deleted;\n    true\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "ensures out == !deleted",
+          "replace": "ensures out"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "create_cannot_reuse_a_stream_id",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "seal-equal-other-holder": {
+      "defect": "An equal epoch may switch holders.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    !has_promise || current < epoch || (current == epoch && same_holder)\n",
+          "replace": "    let _ = same_holder;\n    !has_promise || current <= epoch\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "out == (!has_promise || current < epoch || (current == epoch && same_holder))",
+          "replace": "out == (!has_promise || current <= epoch)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "seal_requires_a_higher_epoch_or_same_holder",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "sync-overwrite-commit": {
+      "defect": "Sync can replace an unequal committed record.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    from > commit || identical\n",
+          "replace": "    let _ = (from, commit, identical);\n    true\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "ensures out == (from > commit || identical)",
+          "replace": "ensures out"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "sync_cannot_replace_committed_records",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "sync-regress-commit": {
+      "defect": "Sync can move the local commit backwards.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    current <= next && next <= end && floor > 0 && floor - 1 <= next\n",
+          "replace": "    let _ = current;\n    next <= end && floor > 0 && floor - 1 <= next\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "out == (current <= next && next <= end && 0 < floor && floor as int <= next as int + 1)",
+          "replace": "out == (next <= end && 0 < floor && floor as int <= next as int + 1)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "sync_commit_is_monotone_and_bounded",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "append-before-sync": {
+      "defect": "A promise alone can authorize an append.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    promised && synced\n",
+          "replace": "    let _ = synced;\n    promised\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "out == (promised && synced)",
+          "replace": "out == promised"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "append_requires_both_current_promise_and_sync",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "append-conflicting-retry": {
+      "defect": "A different payload can count as a retry.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    nonempty && last <= end && identical\n",
+          "replace": "    let _ = identical;\n    nonempty && last <= end\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "out == (nonempty && last <= end && identical)",
+          "replace": "out == (nonempty && last <= end)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "append_retry_must_match_the_whole_existing_range",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "trim-uncommitted": {
+      "defect": "Trim can discard uncommitted records.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    through <= commit\n",
+          "replace": "    let _ = (through, commit);\n    true\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "ensures out == (through <= commit)",
+          "replace": "ensures out"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "trim_cannot_cross_the_commit",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "check-invent-end": {
+      "defect": "Check returns a request field as the durable end.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    current\n",
+          "replace": "    let _ = current;\n    _request_epoch\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "out == current))]",
+          "replace": "out == _request_epoch))]"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "check_reports_the_existing_end",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "read-accepted-tail": {
+      "defect": "Read exposes the accepted tail.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    commit\n",
+          "replace": "    let _ = commit;\n    _accepted\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "out == commit))]",
+          "replace": "out == _accepted))]"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "read_cannot_expose_the_accepted_tail",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "read-below-floor": {
+      "defect": "Read accepts a position below the retained floor.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    floor <= from\n",
+          "replace": "    let _ = (floor, from);\n    true\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "ensures out == (floor <= from)",
+          "replace": "ensures out"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "read_cannot_cross_the_floor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "delete-clears-tombstone": {
+      "defect": "A later operation can clear the tombstone.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    deleted || deleting\n",
+          "replace": "    let _ = deleted;\n    deleting\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "out == (deleted || deleting)",
+          "replace": "out == deleting"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "delete_is_terminal",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "replace-without-sync": {
+      "defect": "A keeper can enter a new ensemble before completing the chosen history.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    current && synced && member && changed == 1\n",
+          "replace": "    let _ = synced;\n    current && member && changed == 1\n"
+        },
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "out == (current && synced && member && changed == 1)",
+          "replace": "out == (current && member && changed == 1)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/stream_keeper/laws.rs",
+          "function": "replace_requires_a_synced_current_ensemble_with_one_new_member",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    }
+  }
+}
