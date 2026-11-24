@@ -1,0 +1,149 @@
+physical-A-write-unbounded: 266 distinct states
+physical-A-write-unbounded-witness: reached SawWriteClosure in 5 transitions
+physical-A-write-unbounded-no-fence: reached StableAbsence in 5 transitions
+physical-B-write: 107 distinct states
+physical-B-write-witness: reached SawWriteClosure in 9 transitions
+physical-B-write-g1-d2-e0-StableAbsence: reached StableAbsence in 6 transitions
+physical-B-write-g3-d2-e1-StableAbsence: reached StableAbsence in 6 transitions
+physical-B-write-g4-d2-e1-StableAbsence: reached StableAbsence in 7 transitions
+physical-B-write-unbounded-StableAbsence: reached StableAbsence in 8 transitions
+physical-pin-write-g4-d2-e1-StableAbsence: reached StableAbsence in 7 transitions
+physical-A-borrow: 144 distinct states
+physical-A-borrow-witness: reached SawDetachedDrain in 7 transitions
+physical-A-worker: 142 distinct states
+physical-A-worker-witness: reached SawWorkerReclaimed in 12 transitions
+physical-B-borrow: 108 distinct states
+physical-B-borrow-witness: reached SawDetachedDrain in 10 transitions
+physical-B-worker: 109 distinct states
+physical-B-worker-witness: reached SawWorkerReclaimed in 11 transitions
+physical-pin-borrow: 108 distinct states
+physical-pin-borrow-witness: reached SawDetachedDrain in 10 transitions
+physical-pin-worker: 109 distinct states
+physical-pin-worker-witness: reached SawWorkerReclaimed in 11 transitions
+physical-A-borrow-drop-borrow: reached BorrowBacked in 5 transitions
+physical-B-borrow-g4-d2-e1-BorrowBacked: reached BorrowBacked in 7 transitions
+physical-pin-borrow-g1-d2-e0: 47 distinct states
+physical-pin-borrow-g1-d2-e0-witness: reached SawDetachedDrain in 8 transitions
+physical-A-worker-early-dispose: reached DisposalAfterAdmission in 7 transitions
+physical-A-worker-no-dispose: found temporal counterexample
+physical-A-worker-race: 958 distinct states
+physical-A-worker-race-witness: reached SawLeasedBorrow in 10 transitions
+physical-A-worker-race-early-dispose: reached BorrowBacked in 7 transitions
+physical-B-worker-race-g7-d2-e1: 583 distinct states
+physical-B-worker-race-g7-d2-e1-witness: reached SawLeasedBorrow in 11 transitions
+physical-B-worker-race-g6-d2-e1-BorrowBacked: reached BorrowBacked in 8 transitions
+physical-B-worker-race-BorrowBacked: reached BorrowBacked in 7 transitions
+physical-A-fork: 826 distinct states
+physical-A-fork-witness: reached SawRootRelease in 5 transitions
+physical-A-fork-ignore-root: reached LiveRootsBacked in 3 transitions
+physical-A-selector: 826 distinct states
+physical-A-selector-witness: reached SawRootRelease in 5 transitions
+physical-A-selector-ignore-root: reached LiveRootsBacked in 3 transitions
+physical-A-preparation: 826 distinct states
+physical-A-preparation-witness: reached SawRootRelease in 5 transitions
+physical-A-preparation-ignore-root: reached LiveRootsBacked in 3 transitions
+physical-A-suffix: 826 distinct states
+physical-A-suffix-witness: reached SawRootRelease in 5 transitions
+physical-A-suffix-ignore-root: reached LiveRootsBacked in 3 transitions
+physical-A-register: 958 distinct states
+physical-A-register-witness: reached SawRegistrationWin in 2 transitions
+physical-A-register-stale-mark: reached LiveRootsBacked in 4 transitions
+physical-A-replace: 399 distinct states
+physical-A-replace-witness: reached SawReplacementSurvive in 6 transitions
+physical-A-replace-delete-latest: reached LiveRootsBacked in 4 transitions
+physical-A-replace-marker: reached ExactSettlement in 4 transitions
+physical-B-fork: 487 distinct states
+physical-B-fork-witness: reached SawRootRelease in 8 transitions
+physical-B-fork-ignore-root: reached LiveRootsBacked in 6 transitions
+physical-B-selector: 487 distinct states
+physical-B-selector-witness: reached SawRootRelease in 8 transitions
+physical-B-selector-ignore-root: reached LiveRootsBacked in 6 transitions
+physical-B-preparation: 487 distinct states
+physical-B-preparation-witness: reached SawRootRelease in 8 transitions
+physical-B-preparation-ignore-root: reached LiveRootsBacked in 6 transitions
+physical-B-suffix: 487 distinct states
+physical-B-suffix-witness: reached SawRootRelease in 8 transitions
+physical-B-suffix-ignore-root: reached LiveRootsBacked in 6 transitions
+physical-B-register: 583 distinct states
+physical-B-register-witness: reached SawRegistrationWin in 2 transitions
+physical-B-register-stale-mark: reached LiveRootsBacked in 7 transitions
+physical-B-replace: 291 distinct states
+physical-B-replace-witness: reached SawReplacementSurvive in 9 transitions
+physical-B-replace-delete-latest: reached LiveRootsBacked in 7 transitions
+physical-B-replace-marker: reached ExactSettlement in 7 transitions
+physical-B-replace-hash-only: 291 distinct states
+physical-B-replace-hash-only-witness: reached SawVerifiedRefusal in 2 transitions
+physical-B-replace-trust-latest: reached NoWrongVersion in 2 transitions
+cuts-A-named: 8 distinct states
+cuts-A-named-witness: reached SawOldCutAfterPublish in 3 transitions
+cuts-A-fork: 5 distinct states
+cuts-A-fork-witness: reached SawForkTransfer in 3 transitions
+cuts-A-recovery: 8 distinct states
+cuts-A-recovery-witness: reached SawOldCutAfterPublish in 3 transitions
+cuts-A-named-omit-suffix: reached RequestedBasisBacked in 3 transitions
+cuts-A-named-omit-root: reached RequestedBasisBacked in 3 transitions
+cuts-pin-named: 8 distinct states
+cuts-pin-named-witness: reached SawOldCutAfterPublish in 3 transitions
+cuts-pin-fork: 5 distinct states
+cuts-pin-fork-witness: reached SawForkTransfer in 3 transitions
+cuts-pin-recovery: 8 distinct states
+cuts-pin-recovery-witness: reached SawOldCutAfterPublish in 3 transitions
+cuts-pin-named-omit-suffix: reached RequestedBasisBacked in 3 transitions
+cuts-pin-named-omit-root: reached RequestedBasisBacked in 3 transitions
+cuts-A-fork-ignore-child: reached ForkBacked in 4 transitions
+cuts-B-fork-ignore-child: reached ForkBacked in 4 transitions
+cuts-pin-fork-ignore-child: reached ForkBacked in 4 transitions
+cuts-B-latest: 17 distinct states
+cuts-B-latest-witness: reached SawFreshRetry in 6 transitions
+cuts-B-latest-stale-retry: reached RetryRereadsRoot in 4 transitions
+cuts-B-latest-retarget: reached NoWrongData in 4 transitions
+cuts-B-recovery: 17 distinct states
+cuts-B-recovery-witness: reached SawFreshRetry in 6 transitions
+cuts-B-recovery-stale-retry: reached RetryRereadsRoot in 4 transitions
+cuts-B-recovery-retarget: reached NoWrongData in 4 transitions
+cuts-B-named: 14 distinct states
+cuts-B-named-witness: reached SawRefusal in 5 transitions
+cuts-B-named-product-ExactNamedService: reached ExactNamedService in 4 transitions
+cuts-B-named-product-RequestedBasisBacked: reached RequestedBasisBacked in 3 transitions
+cuts-B-fork: 11 distinct states
+cuts-B-fork-witness: reached SawRefusal in 5 transitions
+cuts-B-fork-product-ExactNamedService: reached ExactNamedService in 4 transitions
+cuts-B-fork-product-RequestedBasisBacked: reached RequestedBasisBacked in 3 transitions
+cadence-B-latest-c4-o1-w2: 6 distinct states
+cadence-B-latest-c4-o1-w2-witness: reached SawCompletion in 5 transitions
+cadence-B-latest-c3-o1-w2: found temporal counterexample
+cadence-B-latest-c2-o1-w2: found temporal counterexample
+cadence-A-latest-c2-o1-w2: 6 distinct states
+cadence-A-latest-c2-o1-w2-witness: reached SawOvertakeAndFinish in 5 transitions
+cadence-pin-latest-c2-o1-w2: 6 distinct states
+cadence-pin-latest-c2-o1-w2-witness: reached SawOvertakeAndFinish in 5 transitions
+cadence-pin-latest-c2-o1-w2-pin2: found temporal counterexample
+cadence-B-recovery-c5-o1-w3: 7 distinct states
+cadence-B-recovery-c5-o1-w3-witness: reached SawCompletion in 6 transitions
+cadence-B-recovery-c4-o1-w3: found temporal counterexample
+cadence-B-recovery-c3-o1-w3: found temporal counterexample
+cadence-A-recovery-c2-o1-w3: 7 distinct states
+cadence-A-recovery-c2-o1-w3-witness: reached SawOvertakeAndFinish in 6 transitions
+cadence-pin-recovery-c2-o1-w3: 7 distinct states
+cadence-pin-recovery-c2-o1-w3-witness: reached SawOvertakeAndFinish in 6 transitions
+cadence-pin-recovery-c2-o1-w3-pin3: found temporal counterexample
+erasure-e0-arm6-none: 84 distinct states
+erasure-e0-arm6-none-SawRevocationAndRecovery: reached SawRevocationAndRecovery in 11 transitions
+erasure-e0-arm6-none-SawPredeadlineRead: reached SawPredeadlineRead in 4 transitions
+erasure-e1-arm4-none: 324 distinct states
+erasure-e1-arm4-none-SawRevocationAndRecovery: reached SawRevocationAndRecovery in 11 transitions
+erasure-e1-arm4-none-SawPredeadlineRead: reached SawPredeadlineRead in 4 transitions
+erasure-e1-arm4-none-FullViewWindow: reached FullViewWindow in 5 transitions
+erasure-e1-arm6-none-DeadlineUnreadable: reached DeadlineUnreadable in 9 transitions
+erasure-e1-arm4-grace-only-DeadlineUnreadable: reached DeadlineUnreadable in 9 transitions
+erasure-e1-arm4-old-selector-CleanRecovery: reached CleanRecovery in 2 transitions
+erasure-e1-arm4-old-append-CleanRecovery: reached CleanRecovery in 4 transitions
+erasure-e1-arm4-early-revoke-NoEarlyEraseAtCommit: reached NoEarlyEraseAtCommit in 3 transitions
+erasure-e1-arm4-drop-hold-HoldSurvives: reached HoldSurvives in 3 transitions
+erasure-e1-arm4-escape-copy-KeyDomainClosed: reached KeyDomainClosed in 4 transitions
+erasure-e1-arm4-admit-only-NoLatePlaintext: reached NoLatePlaintext in 10 transitions
+lean: 6 theorems checked with standard axioms only
+lean-control-allow-effect-at-grace-boundary: expected proof failed at line 19
+lean-control-ignore-pinned-root: expected proof failed at line 45
+lean-control-allow-completion-at-trim-boundary: expected proof failed at line 56
+lean-control-arm-without-clock-margin: expected proof failed at line 64
