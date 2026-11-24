@@ -327,8 +327,8 @@ READ_CONTROLS = {
         "empty_page_origin",
     ),
     "wait-past-read-deadline": (
-        "def remainingWait (deadline now : Nat) : Nat := deadline - now",
-        "def remainingWait (deadline now : Nat) : Nat := (deadline - now) + 1",
+        "(elapsed : deadline ≤ now) :",
+        "(elapsed : deadline ≤ now + 1) :",
         "no_wait_after_timeout",
     ),
     "wake-poll-before-requested-head": (
@@ -374,6 +374,11 @@ RECOVERY_CONTROLS = {
         "      Dispatch w k caller (.publish epoch head)",
         "      True →\n      Dispatch w k caller (.publish epoch head)",
         "dispatch_sendable",
+    ),
+    "dispatch-unfrozen-append-range": (
+        "(covered : position - 1 + payloads.length ≤ (next.writer.issued epoch).length)",
+        "(covered : position - 1 + payloads.length ≤ (next.writer.issued epoch).length + 1)",
+        "append_dispatch_after_freeze",
     ),
     "rewrite-an-issued-position": (
         "(growth : Grows before after) {source target : Keeper Payload}",

@@ -298,6 +298,41 @@ theorem dispatch_sendable {w : Writer Payload} {k : Keeper Payload} {caller : Na
       simpa [stamp] using lane_scan_exact (slot := fun i bound => slots i (by simpa [stamp] using bound))
   | trim elected => exact elected
 
+/-- The wire dispatch can see all assigned bytes, including provisional ones.
+    Freezing the covering prefix before a possible durability effect makes the
+    same exact request sendable against the monotone issued history. -/
+theorem append_dispatch_after_freeze {s next : State Payload} {epoch caller position head : Nat}
+    {keeper : KeeperId} {payloads frozen : List Payload}
+    (freeze : Next s (.issue epoch frozen) next)
+    (sent : Sendable (extend s.writer epoch (s.pending epoch).payloads) (s.keeper keeper) caller
+      (.append epoch position payloads head))
+    (covered : position - 1 + payloads.length ≤ (next.writer.issued epoch).length)
+    (headWithin : head ≤ position - 1 + payloads.length) :
+    Sendable next.writer (next.keeper keeper) caller (.append epoch position payloads head) := by
+  have assigned : next.writer.issued epoch <+:
+      (extend s.writer epoch (s.pending epoch).payloads).issued epoch := by
+    cases freeze with
+    | issue _ split =>
+        simp [extend, stamp, split]
+  have equality : ((next.writer.issued epoch).drop (position - 1)).take payloads.length =
+      (((extend s.writer epoch (s.pending epoch).payloads).issued epoch).drop (position - 1)).take payloads.length := by
+    rw [List.take_drop, List.take_drop, take_of_prefix assigned covered]
+  have headCovered := Nat.le_trans headWithin covered
+  have certified := sent.2.2.2.2
+  rw [← take_of_prefix assigned headCovered] at certified
+  refine ⟨?_, covered, sent.2.2.1.trans equality.symm, headCovered, ?_⟩
+  · cases freeze
+    exact sent.1
+  · cases freeze
+    exact certified
+
+theorem definitive_refusal_keeps_durable_state {s next : State Payload} {epoch revision : Nat}
+    {keeper : KeeperId} {reason : CapacityRefusal}
+    (refused : Next s (.rejectCapacity epoch keeper revision reason) next) :
+    next.writer = s.writer ∧ next.keeper = s.keeper := by
+  cases refused
+  exact ⟨rfl, rfl⟩
+
 /-- Reassigning a sent position to different bytes cannot refine two ordinary
     sends in the monotone issued-history model, even if all earlier replies refused. -/
 theorem issued_position_cannot_be_reassigned {before after : Writer Payload}
@@ -316,6 +351,8 @@ theorem issued_position_cannot_be_reassigned {before after : Writer Payload}
   exact congrArg Record.payload (Option.some.inj newAt)
 
 #print axioms dispatch_sendable
+#print axioms append_dispatch_after_freeze
+#print axioms definitive_refusal_keeps_durable_state
 #print axioms covering_run_epoch
 #print axioms discarded_runs_exact
 #print axioms recover_after_seal

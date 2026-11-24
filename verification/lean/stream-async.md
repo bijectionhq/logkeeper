@@ -211,7 +211,9 @@ elected seed installed by a complete Sync. Committed catch-up fetches return
 the exact assigned slice from a previously accepted slot. The send theorem
 covers every modeled request constructor when supplied local dispatch evidence.
 An Append uses its exact contiguous run and a cut certified from distinct
-durable lane votes.
+durable lane votes. Freezing a covering prefix transfers the pending request's
+send evidence to the issued history. A definitive capacity refusal is a
+stutter in the durable projection.
 
 These results quantify over three keepers, one stream, arbitrary payloads,
 and natural-number positions and event indices. Present wire epochs map to
