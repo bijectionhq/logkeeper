@@ -78,3 +78,24 @@ pub(super) fn recovery_choice(current: BallotRank, observed: BallotRank) -> Reco
         RecoveryChoice::Replace
     }
 }
+
+pub(super) fn sealed_for(selected_seal: Option<&[u8; 32]>, destination: &[u8; 32]) -> bool {
+    match selected_seal {
+        Some(target) => same_image(target, destination),
+        None => false,
+    }
+}
+
+pub(super) fn install_image<T>(
+    predecessor: Option<&[u8; 32]>,
+    destination: &[u8; 32],
+    source: &[u8; 32],
+    target: &[u8; 32],
+    image: T,
+) -> Option<T> {
+    if sealed_for(predecessor, source) && same_image(destination, target) {
+        Some(image)
+    } else {
+        None
+    }
+}

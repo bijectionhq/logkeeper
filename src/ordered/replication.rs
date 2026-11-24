@@ -287,7 +287,7 @@ impl Group {
             return Err(Error::Group);
         }
         let mut state = self.recover(peers, round).await?;
-        if state.successor != Some(destination.identity) {
+        if !rules::sealed_for(state.successor.as_ref(), &destination.identity) {
             return Err(Error::Sealed);
         }
         state.voter_scope = destination.identity;
@@ -302,10 +302,15 @@ impl Group {
     }
 
     fn install_seed(&self, seed: &RepairSeed) -> Result<Prefix, Error> {
-        if self.predecessor != Some(seed.predecessor) || self.identity != seed.destination {
-            return Err(Error::Group);
-        }
-        let prefix = Prefix::from_base(seed.base.clone(), self.max_prefix_bytes)?;
+        let base = rules::install_image(
+            self.predecessor.as_ref(),
+            &self.identity,
+            &seed.predecessor,
+            &seed.destination,
+            &seed.base,
+        )
+        .ok_or(Error::Group)?;
+        let prefix = Prefix::from_base(base.clone(), self.max_prefix_bytes)?;
         if self.replay(&prefix)?.successor.is_some() {
             return Err(Error::Sealed);
         }
