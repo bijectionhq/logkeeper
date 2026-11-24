@@ -164,6 +164,8 @@ pub trait Transport: Send + Sync {
         ensemble
     }
 
+    /// A capacity refusal ends delivery of this call. Return a transport error if
+    /// another copy can still reach the keeper.
     fn call(
         &self,
         keeper: KeeperId,

@@ -185,6 +185,8 @@ requests require writer authorization.
   `read_order(ensemble)` supplies member preference, defaulting to ensemble
   order. `call(keeper, request)` returns a boxed future for a reply or
   `TransportError` (`Unreachable`, `TimedOut`, or `Protocol(String)`).
+  A capacity refusal ends delivery of that call. If another copy can still
+  reach the keeper, the transport returns an error.
   TLS uses `logkeeper-stream/2`. A big-endian u32 length prefixes each
   protobuf request or reply. The payload limit for a frame is 64 MiB.
   A process shares one long-lived connection per keeper among all its

@@ -569,13 +569,21 @@ impl Transport for Client {
                 }
                 let result = network.deliver(&packet);
                 sleep(response).await;
-                let reply = if matches!(packet.fault, Some(Fault::ReplyLoss)) {
-                    Err(TransportError::TimedOut)
-                } else {
-                    result
-                };
+                let duplicate = matches!(packet.fault, Some(Fault::Duplicate));
+                let capacity = matches!(
+                    result,
+                    Ok(Reply::Refused(
+                        Refusal::Full { .. } | Refusal::TooLarge { .. }
+                    ))
+                );
+                let reply =
+                    if matches!(packet.fault, Some(Fault::ReplyLoss)) || (duplicate && capacity) {
+                        Err(TransportError::TimedOut)
+                    } else {
+                        result
+                    };
                 let _ = done.send(reply);
-                if matches!(packet.fault, Some(Fault::Duplicate)) {
+                if duplicate {
                     sleep(9).await;
                     packet.fault = None;
                     let _ = network.deliver(&packet);
