@@ -1,53 +1,158 @@
 # Asynchronous stream journal refinement
 
-Two reachable keeper effects cannot be a step or stutter of Study 119 under
-its linked keeper projection. Both use the current promise and preserve the
-committed payloads. The disagreement concerns when the keeper exposes its head
-and tail. [Study 119](Logkeeper/StreamJournal.lean) · [Lean proofs](Logkeeper/StreamAsync.lean)
+The shipped keeper is an exact refinement of Study 119's keeper step. Every keeper effect
+in the 10,000-seed simulator corpus replays as a reference step or a stutter. An I/O
+automaton of the shipped writer and keeper proves that every action is a step or stutter,
+and that Study 119's contract holds in every reachable state.
+[Study 119](Logkeeper/StreamJournal.lean) · [Automaton](Logkeeper/StreamIO.lean) ·
+[Replay](Logkeeper/StreamTrace.lean)
 
-1. **Publication after takeover.** A keeper holds an epoch-1 record at LSN 1
-   with head 0. The next writer seals and completes Sync at epoch 2 while
-   retaining that record and its epoch. The writer's empty Append publishes
-   head 1. Study 119 can raise a keeper's head on an append or retained retry.
-   The former would extend the history and the latter would require a retained
-   epoch-2 record. The Lean witness constructs the prior state from `initial`
-   and proves both step and stutter impossible. A companion witness projects
-   a publication with a retained record from the current epoch.
-   [Recovery](../../src/stream/writer/recovery.rs) · [Keeper effect](../../src/stream/keeper/state.rs)
-2. **Incomplete Sync.** The keeper applies a recovery chunk and exposes its
-   new tail while retaining its last completed `synced` epoch. Study 119 keeps
-   the incomplete image in `staging` and derives its visible tail from the
-   last accept. A later Seal can report the concrete intermediate tail for
-   recovery ranking. Lean proves that a change to the tail at the same synced
-   epoch cannot project while the promise is ahead of `synced`.
-   [Keeper effect](../../src/stream/keeper/state.rs) · [Seal and Check rules](../../src/stream/keeper/rules.rs)
+## The two counterexamples
 
-The 10,000-seed simulator corpus has one stream, three initial keepers,
-one optional replacement identity, two writer identities and an observer.
-It includes at most one disk loss per run. The inherited-publication Lean
-witness uses two modeled epochs, one record and a six-step path to its prior
-state. The impossibility lemmas allow arbitrary payloads and history lengths.
-The checked axioms are `propext`, `Classical.choice` and `Quot.sound`.
-[Simulation bounds](../simulation/README.md) · [Lean proofs](Logkeeper/StreamAsync.lean)
+**An empty Append publishes an inherited head. Kept; Study 119 extended.** Seal must
+return a head that a quorum has published, so that a later `head` or read from any keeper
+covers it. After a takeover the new epoch may own no record at all, so the only way to
+publish the adopted head without adding a consumer-visible record is an empty Append.
+Raft's alternative, a no-op entry, would put a record into a stream whose records belong to
+the consumer. The behaviour is therefore necessary. Study 119's retained-record retry
+becomes a `publish` step: a synced voter raises its head to a certified cut within its
+tail. Its soundness rests only on the cut being certified, which `keeper_head_was_advertised`
+already used, so the five contract proofs needed no change. The former rule is kept as the
+`RetainedRetry` control; `inherited_publication_witness` reaches a keeper with no epoch-2
+record, shows the old rule fails, and takes the new step.
+[Keeper rules](../../src/stream/keeper/rules.rs) · [Witness](Logkeeper/StreamAsync.lean)
 
-## Shipped effects and proof boundaries
+**An incomplete Sync exposes a partial history. Removed; the keeper stages it.** The
+partial image mixed the keeper's voted history with records of a newer seed under the old
+`synced` epoch, and a later Seal ranked that mixture as if it were a vote. It is safe, but
+only by a new argument about mixtures that the Paxos core cannot express. Clearing
+`synced` instead would lose a chosen record (a keeper in a commit quorum would rank below
+a stale keeper). The simpler result is the one view change Viewstamped Replication already
+makes atomic: the keeper stages an incomplete Sync's records and floor, and its view,
+including every Seal and Check reply, changes only when a complete Sync installs them. A
+new promise discards the staging. Staged records live in the WAL and in `.staged`
+checkpoint extents, so a long transfer survives rotation and reopen. Study 119's model
+was already staged, so it is unchanged. `incomplete_sync_with_changed_tail_has_no_reference_step`
+is now the negative control, and the replay rejects the former effect.
+[Keeper state](../../src/stream/keeper/state.rs) · [WAL](../../src/stream/keeper/wal.rs)
 
-| Await or effect | Reference correspondence and remaining work |
+Matching the shipped rules exactly also extended Study 119 in four smaller ways, each
+already in the code: Append carries several records, a Sync carries a floor that can skip
+a trimmed prefix and installs a certified head on completion, a synced keeper can install
+a floor over a prefix it never received, and Delete can tombstone a stream a keeper never
+created. The unused `SameCommitted` guard on Sync was dropped: the keeper preserves its
+committed prefix by starting at `head + 1`, and the complete Sync's head is certified.
+
+## The I/O automaton
+
+`StreamIO` composes three Study 119 keepers, a network that can lose, duplicate, delay and
+reorder whole packets, and one writer per epoch. A ghost writer records each epoch's round,
+its issued history and the certified cuts. Reply packets carry the durable fact their
+effect established: a Seal reply its saved snapshot, a complete Sync or Append reply its
+vote.
+
+| Action | Shipped await point or effect |
 | --- | --- |
-| Writer mutation lock, promise requests and seal replies | The mutation lock serializes elections, trims and deletes on one handle set. A seal gathers two eligible replies, fixes its recovery choice, starts lanes and waits for readiness and publication. Study 119 derives prefix agreement given the elected pair and immutable saved snapshots. The link covers seal admission and recovery rank. Reply provenance, preserving the chosen election on cancellation, and treating a later same-epoch Seal reply as a saved snapshot remain open. [Writer](../../src/stream/writer/mod.rs) · [Recovery](../../src/stream/writer/recovery.rs) |
-| Recover chunks, Sync chunks, completion and floor installation | The selected keeper serves the retained accepted suffix under the promise. A fallback keeper must report the same original record epoch. A lane awaits each Sync and skips ranges already carried by the target. The reference needs an explicit observable intermediate image and a link from that image to recovery ranking. The proof of exact payload and epoch-run reconstruction across fallbacks also remains open. [Recovery](../../src/stream/writer/recovery.rs) · [Keeper decisions](../../src/stream/keeper/rules.rs) |
-| Append lane wake, dispatch, durable replies, retries and publication | Each lane awaits one operation and updates its accepted and published positions. The decision link checks the chosen quorum for one epoch and position. Append acknowledgement also waits for publication. A separate empty Append publication step and a derivation of the two certificates from distinct durable replies remain open. [Append lanes](../../src/stream/writer/append.rs) · [Decision link](../link/README.md#stream-journal) |
-| Writer and observer head rounds | Pending callers are detached when a round opens. An active writer can use an append issued after that cut, then covers the sampled tails and awaits publication. An observer retries fresh Check rounds until one has enough same-epoch head coverage or times out. Study 119 proves the cut result given a confirmed fresh round, durable opening quorum and covered samples. The derivation of these facts from the actual lanes, watches and replies remains open. [Head rounds](../../src/stream/writer/head.rs) · [Cut theorems](Logkeeper/StreamJournal.lean) |
-| Read fallback, chunks and long-poll wake or deadline | A writer requests a page from one keeper at a time. The first chunk fixes the returned head. A keeper can requeue a read after a watch notification or timeout. Study 119 proves exact slices from a certified keeper head. Assembly across chunks, cancellation and choosing a floor after fallback remain open. [Reader](../../src/stream/writer/read.rs) · [Keeper call](../../src/stream/keeper/mod.rs) |
-| Trim and delete | Trim requires quorum head coverage, established before sending or by the successful Trim replies. The writer advances its floor after two replies. Delete broadcasts to the ensemble and waits for two acknowledgements. Each keeper defers its delete reply until WAL rotation finishes. Study 119 models a monotone floor and a terminal tombstone. Durable floor installation, delete before local Create, broadcast cancellation and quorum deletion remain open. [Writer](../../src/stream/writer/mod.rs) · [Keeper rounds](../../src/stream/keeper/mod.rs) |
-| Replacement | The sweeper seals both survivors, copies and publishes the selected history, syncs the learner and replaces both survivors before promoting the learner. Verus checks the local one-member-change guard. Study 119's Lean model has one fixed roster. Authority across split installs, retry and one disk loss remains open. [Sweeper](../../src/stream/keeper/sweep.rs) · [Replacement model bounds](../119-stream-journal/README.md) |
-| Keeper queue, WAL rounds, rotation, crash and reopen | The keeper finishes buffered entries and covers each round with a sync before returning ordinary replies. Delete replies wait for rotation. The simulator cuts selected unsynced writes and reopens the shipped WAL. A model needs to connect decision order, incomplete fragments, crash-adopted complete entries, the durable reply boundary and checkpoint selection. [Keeper rounds](../../src/stream/keeper/mod.rs) · [WAL](../../src/stream/keeper/wal.rs) |
-| Transport delay, duplication, cancellation, loss and writer crash | A timed-out call or dropped future may leave dispatched work running. The simulator delivers delayed and duplicate complete requests independently of replies. A full model needs request provenance across pending futures, writer loss and epoch replacement, and a correspondence from authenticated byte exchanges to typed packets. [RPCs](../../src/stream/writer/mod.rs) · [Simulation network](../../src/stream/keeper/simulation/network.rs) · [TLS transport](../../src/stream/transport.rs) |
+| `send` | Every request a writer dispatches: Seal in `Recovery::choose`, Sync chunks and completion in `Recovery::sync`, floor installation, lane Append and publication, Trim, Check, Read, Recover, Delete. The guard `Sendable` is what the writer guarantees. |
+| `deliver` | One keeper round for one request: decide, make the effect durable, reply. The packet stays in flight, so it can be delivered again. `Admitted` is the keeper's rule; `effect` its durable change. |
+| `refuse`, `drop`, `restart` | A refusal, request or reply loss, and a keeper reopen. None changes durable state. |
+| `collectSeal`, `choose` | Receive a Seal reply before the election, then select from two (`Round.winner`, linked to `outranks`). The epoch's issued history becomes the winner's history. |
+| `collectVote`, `certify` | A lane receives a durable vote; `decision::acknowledged` certifies a cut covered by two lanes. |
+| `issue` | `Active::append` assigns the next positions to a payload. |
 
-The correspondence inventory marks `sync_head_valid` and `may_replace` as local
-Verus laws awaiting a Lean link. An observer round can also open before the
-epoch in its samples has installed any quorum. Connecting that round to
-Study 119's opening-cut premise requires cross-epoch evidence. [Link inventory](../link/inventory.md#stream-journal) · [Observer rounds](../../src/stream/writer/head.rs#L116)
+A crashed or cancelled writer simply takes no further action; its packets stay in flight.
+
+| Theorem | Statement |
+| --- | --- |
+| `deliver_refines` | A delivered request that the keeper admits and the writer could send is a Study 119 step or stutter. |
+| `step_mono`, `reachable_mono` | Reference steps and reachability survive a growing ghost writer. |
+| `sendable_persists`, `reply_evidence` | An in-flight request stays sendable across every keeper step; a reply witnesses its durable fact. |
+| `next_inv`, `reachable_inv` | Thirteen invariants hold in every reachable state, including reply provenance, saved snapshots before election, seed-prefix staging and certified cuts chosen by two durable votes. |
+| `every_action_refines` | Every action is a Study 119 step or stutter at each keeper, and the ghost writer only grows. |
+| `run_refines` | Adjacent states of any run supply Study 119's `KeeperTrace`, the premise of its head theorems. |
+| `certified_cuts_agree`, `committed_contiguous` | Certified cuts are prefixes of one another; committed records are contiguous and irrevocable below any floor. |
+| `seal_covers_acknowledged` | A seal's adopted history contains every append acknowledged at a lower epoch. |
+| `read_exact` | A page from any keeper is exactly the committed slice it asks for, including records another keeper trimmed. |
+| `acknowledged_survives_one_disk_loss` | An acknowledged append has a durable vote on a keeper other than any one lost keeper. |
+
+`execution` turns every reachable state into a Study 119 `Execution`, so each of its
+contract theorems applies. [`automaton_witness`](Logkeeper/StreamIOWitness.lean) is a
+reachable 36-action run: two keepers sync at epoch 1, one accepts a record, epoch 2 elects
+both, completes Sync on one, stages and then completes on the other, certifies the
+inherited record and publishes head 1 on a keeper that holds no epoch-2 record. The 14
+automaton reports and the witness use only `propext`, `Classical.choice` and `Quot.sound`.
+
+Each automaton guard has a control. `run_stream_io_controls.py` weakens it and requires
+the first error in the named proof.
+
+| Weakened guard | Failing proof |
+| --- | --- |
+| Stage from another identity; stage after complete Sync; Sync without seed agreement; Append anywhere; Append of an unissued payload; publish while unsynced; publish an uncertified head; Trim above the head | `deliver_refines` |
+| Seal at epoch zero | `reply_evidence` |
+| Collect a Seal reply after election; choose an unsaved report; elect an epoch twice; certify on one lane | `next_inv` |
+
+## Trace correspondence
+
+The simulator records every delivered request with the keeper's durable image before and
+after it, including staged records, and every WAL reopen. The Lean replay checks each row
+against Study 119's step for that request: its keeper-side admission and its exact effect
+on the view, the staged history, and the epoch runs. Reopen must restore the durable image,
+and refusals and observations must not change it.
+
+| Corpus | Effects |
+| --- | ---: |
+| 10,000 seeds | 984,747 |
+| Stutters (refusals, observations, retries, reopens, Replace) | 599,269 |
+| Create · Seal · Delete | 30,909 · 62,727 · 30,000 |
+| Staged Sync · complete Sync · floor installation | 4,769 · 62,727 · 52 |
+| Append · publication · Trim | 81,595 · 82,751 · 29,948 |
+
+The runner mutates real rows into 43 controls, one per admission or effect check. These
+include the former visible incomplete Sync, a Seal that reports staged records, a Seal or
+complete Sync that keeps staging, a stale promise or another identity on each request, an
+unsynced or learner append or trim, gaps, wrong record epochs, uncertified publication, a
+read beyond the head and a reopen that loses state.
+
+```sh
+python3 verification/lean/run_stream_traces.py
+python3 verification/lean/run_stream_io_controls.py
+```
+
+## Boundaries
+
+The model still assumes these facts; no proof ties them to the code.
+
+- **Writer obligations.** `Sendable` states what the writer guarantees: a Sync's records
+  are the seed's from its start, and the target's history agrees with the seed below that
+  start; an Append carries the issued payloads at its position; a published head is
+  certified. The shipped writer establishes agreement by comparing epoch runs, which needs
+  the lemma that equal epochs at one position imply equal prefixes, and fetches inherited
+  records with an epoch check on fallback. Neither is proved over `recovery.rs` or
+  `append.rs`. [Recovery](../../src/stream/writer/recovery.rs) · [Append lanes](../../src/stream/writer/append.rs)
+- **Keeper decisions.** `Admitted` and `effect` are checked against the shipped
+  `decide` and `apply` by the replay of the corpus and, for local laws, by Verus and the
+  link runner. No theorem covers every input. [Keeper decisions](../../src/stream/keeper/rules.rs)
+- **One writer per epoch.** The automaton has one writer state per epoch. A restarted
+  process must not re-elect the same epoch with the same identity, because its Seal replies
+  would no longer be saved snapshots. The consumer's takeover policy elects a fresh epoch.
+- **Head rounds.** `run_refines` supplies Study 119's keeper trace. Its head theorems also
+  need the logical single-record commit cuts of an execution and a confirmed fresh round
+  whose samples cover the result. Deriving both from `head.rs` remains.
+  [Head rounds](../../src/stream/writer/head.rs)
+- **Reads.** `read_exact` covers one keeper's page. Chunk assembly, the first chunk's head
+  bound, fallback and long-poll wake-up in `read.rs` are not modeled.
+- **Trim and Delete quorums.** Keeper effects are modeled; the writer's coverage check
+  before Trim and Delete's broadcast and two acknowledgements are not.
+- **Replacement and authority.** Study 119 has one fixed roster, so Replace is a stutter
+  and learners are outside the model. Recovery after one disk loss, by the sweeper copying
+  the chosen history to both survivors before promoting a learner, and authority across
+  split installs, retries and stale routes remain open.
+  [Sweeper](../../src/stream/keeper/sweep.rs)
+- **WAL and transport.** Reopen rows show the reopened image equals the durable image for
+  every crash in the corpus, and Study 117's bridge covers reply survival. Torn frames,
+  checkpoint selection and the authenticated byte exchange are not modeled in Lean.
+- **Payload bytes.** The replay checks positions and record epochs. The conformance
+  history checker compares payload bytes.
 
 ## Await sites
 
@@ -68,24 +173,3 @@ to represent. Wrapper futures share the action of the delegated future.
 | Reads | [Try one keeper](../../src/stream/writer/read.rs#L23), [sample the first chunk](../../src/stream/writer/read.rs#L69) and [fetch subsequent chunks](../../src/stream/writer/read.rs#L97). The keeper [enqueues the request](../../src/stream/keeper/mod.rs#L115), [waits for the WAL worker's result](../../src/stream/keeper/mod.rs#L117) and [wakes or times out a long poll](../../src/stream/keeper/mod.rs#L121). |
 | Replacement coordination | [Complete a sweep plan](../../src/stream/keeper/sweep.rs#L38), [seal both survivors](../../src/stream/keeper/sweep.rs#L59), [copy to the other survivor](../../src/stream/keeper/sweep.rs#L87), [complete Sync on the source](../../src/stream/keeper/sweep.rs#L99), [publish on both survivors](../../src/stream/keeper/sweep.rs#L103), [create the learner](../../src/stream/keeper/sweep.rs#L116), [seal the learner](../../src/stream/keeper/sweep.rs#L117), [copy to the learner](../../src/stream/keeper/sweep.rs#L130), [install both survivors](../../src/stream/keeper/sweep.rs#L131) and [promote the learner](../../src/stream/keeper/sweep.rs#L135). |
 | Replacement RPCs | [Recover a chunk](../../src/stream/keeper/sweep.rs#L163), [install it](../../src/stream/keeper/sweep.rs#L207) or [complete an empty copy](../../src/stream/keeper/sweep.rs#L223). [Seal the old roster](../../src/stream/keeper/sweep.rs#L237) and [retry the new roster](../../src/stream/keeper/sweep.rs#L240) on a split installation. [Await Replace](../../src/stream/keeper/sweep.rs#L271), [await Sync](../../src/stream/keeper/sweep.rs#L301), [await publication](../../src/stream/keeper/sweep.rs#L322), [check the expected reply](../../src/stream/keeper/sweep.rs#L332) and [receive the transport reply](../../src/stream/keeper/sweep.rs#L348). |
-
-## Replay
-
-```sh
-python3 verification/lean/run_stream_traces.py
-```
-
-The recorder captures actual keeper state before and after successful empty
-Append and incomplete Sync requests. The Lean checker checks the promise,
-identity, position and head bounds, retained epoch runs for publication, and
-the observed state changes. It reports occurrences of both projection
-obstructions. The runner replays each obstruction in strict Study 119 mode
-and expects rejection at the named projection check. It also mutates the
-captured rows to exercise independent admission and effect checks. The other
-RPCs, failed calls, WAL bytes and writer state remain outside the exported
-projection. [Recorder](../../src/stream/keeper/simulation/network.rs) · [Checker](Logkeeper/StreamTrace.lean)
-
-The full I/O automaton, the derivation of Study 119's quorum premises from all
-reachable actions, and the end-to-end contract theorems remain open. The
-consumer still applies records through the head returned by `seal` before
-serving. [Specification](../target-journal.md) · [Conformance obligation](../../contract/src/conformance/mod.rs)

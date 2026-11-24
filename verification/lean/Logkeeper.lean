@@ -27,3 +27,5 @@ import Logkeeper.AsyncGroupWitness
 import Logkeeper.StreamJournal
 import Logkeeper.StreamAsync
 import Logkeeper.StreamTrace
+import Logkeeper.StreamIO
+import Logkeeper.StreamIOWitness

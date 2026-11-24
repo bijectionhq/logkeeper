@@ -135,12 +135,11 @@ inductive Step (w : Writer Payload) : Keeper Payload → Keeper Payload → Prop
       Step w k (sealKeeper k epoch identity)
   | syncPart {k epoch floor start records} : k.live → k.promised = epoch → w.owns k epoch →
       k.synced ≠ epoch → SyncAdmitted k floor start →
-      SameCommitted k (syncImage k (w.seed epoch) start records) →
       Step w k { k with staging := some (k.syncFloor floor,
         syncImage k (w.seed epoch) start records) }
   | sync {k epoch floor start records head} : k.live → k.promised = epoch → w.owns k epoch →
       SyncAdmitted k floor start →
-      syncImage k (w.seed epoch) start records = w.seed epoch → SameCommitted k (w.seed epoch) →
+      syncImage k (w.seed epoch) start records = w.seed epoch →
       (k.synced = epoch → k.history = w.seed epoch) → w.seed epoch <+: w.issued epoch →
       k.head ≤ head → head ≤ (w.seed epoch).length → k.syncFloor floor ≤ head + 1 →
       w.advertised ((w.seed epoch).take head) →
@@ -208,7 +207,7 @@ theorem keeper_step_refines_durable_acceptor {w : Writer Payload} {k next : Keep
         rcases allowed with higher | tied
         · exact .prepare _ higher
         · exact (differs tied.1).elim
-  | sync _ promised _ _ _ _ same _ _ _ _ _ =>
+  | sync _ promised _ _ _ same _ _ _ _ _ =>
       refine .accept _ (Nat.le_of_eq promised) ?_
       intro old latest
       have key : old = k.latest := by simp [Keeper.latest, latest]
@@ -243,7 +242,7 @@ theorem keeper_bounds {w : Writer Payload} {k : Keeper Payload} (reached : Reach
       | sealKeeper _ _ =>
           unfold sealKeeper
           split <;> exact ih
-      | @sync epoch floor _ _ head _ _ _ admitted _ _ _ _ raises within covered _ =>
+      | @sync epoch floor _ _ head _ _ _ admitted _ _ _ raises within covered _ =>
           change head ≤ (w.seed epoch).length ∧ 1 ≤ max before.floor (before.syncFloor floor) ∧
             max before.floor (before.syncFloor floor) ≤ head + 1
           refine ⟨within, Nat.le_trans ih.2.1 (Nat.le_max_left _ _), ?_⟩
@@ -335,7 +334,7 @@ def Execution.ledger (x : Execution Payload) : Ledger KeeperId (Record Payload) 
   issued := x.writer.issued
   voted k := (x.keeper k).durable.votes
 
-private theorem vote_follows_writer {w : Writer Payload} {k : Keeper Payload}
+theorem vote_follows_writer {w : Writer Payload} {k : Keeper Payload}
     (reached : Reachable w k) (reserved : w.round 0 = none) (initiallyEmpty : w.issued 0 = [])
     {vote : Vote (Record Payload)} (voted : k.durable.votes vote) :
     (vote.ballot = 0 ∨ (w.round vote.ballot).isSome = true) ∧
@@ -352,7 +351,7 @@ private theorem vote_follows_writer {w : Writer Payload} {k : Keeper Payload}
           apply ih
           unfold sealKeeper at voted
           split at voted <;> exact voted
-      | sync _ _ owns _ _ _ _ issued _ _ _ _ =>
+      | sync _ _ owns _ _ _ issued _ _ _ _ =>
           rcases voted with prior | rfl
           · exact ih prior
           · obtain ⟨r, elected, _⟩ := owns
@@ -486,12 +485,12 @@ theorem late_lower_epoch_cannot_extend_after_seal (x : Execution Payload)
     history.length ≤ head :=
   Nat.le_trans (seal_fences_and_covers_acknowledged_appends x elected lower lateAck).length_le sealReturned
 
-private theorem take_of_prefix {short long : History Payload} {n : Nat}
+theorem take_of_prefix {short long : History Payload} {n : Nat}
     (prefixed : short <+: long) (within : n ≤ short.length) : short.take n = long.take n := by
   obtain ⟨rest, rfl⟩ := prefixed
   exact (List.take_append_of_le_length within).symm
 
-private theorem keeper_head_was_advertised {w : Writer Payload} {k : Keeper Payload}
+theorem keeper_head_was_advertised {w : Writer Payload} {k : Keeper Payload}
     (emptyAdvertised : w.advertised []) (reached : Reachable w k) :
     w.advertised (k.history.take k.head) := by
   induction reached with
@@ -501,7 +500,7 @@ private theorem keeper_head_was_advertised {w : Writer Payload} {k : Keeper Payl
       | sealKeeper _ _ =>
           unfold sealKeeper
           split <;> exact ih
-      | sync _ _ _ _ _ _ _ _ _ _ _ advertised => exact advertised
+      | sync _ _ _ _ _ _ _ _ _ _ advertised => exact advertised
       | @installFloor epoch head _ _ _ _ _ history _ advertised =>
           change w.advertised (((w.issued epoch).take (max before.tail head)).take (max before.head head))
           rw [List.take_take]
@@ -682,7 +681,7 @@ structure KeeperTrace (writer : Writer Payload) where
   next : ∀ time keeper, Step writer (image time keeper) (image (time + 1) keeper) ∨
     image time keeper = image (time + 1) keeper
 
-private theorem durable_step_preserves_vote {before after : DurableAcceptor.State (Record Payload)}
+theorem durable_step_preserves_vote {before after : DurableAcceptor.State (Record Payload)}
     (step : DurableAcceptor.Step before after) {vote : Vote (Record Payload)}
     (voted : before.votes vote) : after.votes vote := by
   cases step with
@@ -808,7 +807,7 @@ private theorem example_reached : Reachable exampleWriter exampleAccepted := by
   have ownsSeal : exampleWriter.owns exampleSealed 1 := ⟨exampleRound, rfl, rfl⟩
   have synced : Reachable exampleWriter exampleSynced :=
     .extend sealed (.sync (epoch := 1) (floor := 1) (start := 1) (records := []) (head := 0)
-      ⟨rfl,rfl⟩ rfl ownsSeal (by unfold SyncAdmitted; decide) rfl ⟨by decide,rfl⟩ (fun _ => rfl)
+      ⟨rfl,rfl⟩ rfl ownsSeal (by unfold SyncAdmitted; decide) rfl (fun _ => rfl)
       (by decide) (Nat.le_refl _) (by decide) (by decide) rfl)
   have ownsSync : exampleWriter.owns exampleSynced 1 := ⟨exampleRound, rfl, rfl⟩
   have admitted : MayAppend exampleSynced 1 := by

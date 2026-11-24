@@ -50,7 +50,7 @@ theorem incomplete_sync_with_changed_tail_has_no_reference_step
     | sealKeeper _ _ =>
         unfold sealKeeper at changedTail
         split at changedTail <;> exact changedTail rfl
-    | sync _ promised _ _ _ _ _ _ _ _ _ _ =>
+    | sync _ promised _ _ _ _ _ _ _ _ _ =>
         exact awaitingSync (promised.trans sameEpoch)
     | installFloor _ admitted _ _ _ _ _ _ =>
         exact awaitingSync (admitted.1.trans admitted.2.symm)
@@ -67,13 +67,12 @@ theorem staged_sync_keeps_the_view {writer : Writer Payload} {before after : Kee
     {epoch floor start : Nat} {records : History Payload}
     (live : before.live) (promised : before.promised = epoch) (owns : writer.owns before epoch)
     (awaiting : before.synced ≠ epoch) (admitted : SyncAdmitted before floor start)
-    (committed : SameCommitted before (syncImage before (writer.seed epoch) start records))
     (staged : after = { before with staging := some (before.syncFloor floor,
       syncImage before (writer.seed epoch) start records) }) :
     Step writer before after ∧ after.latest = before.latest ∧ after.head = before.head ∧
       after.floor = before.floor ∧ after.promised = before.promised := by
   subst after
-  exact ⟨.syncPart live promised owns awaiting admitted committed, rfl, rfl, rfl, rfl⟩
+  exact ⟨.syncPart live promised owns awaiting admitted, rfl, rfl, rfl, rfl⟩
 
 private def prior : History Nat := [⟨1, 7⟩]
 private def first : Round Nat := ⟨0, 0, 1, by decide, fun _ => empty⟩
@@ -100,7 +99,7 @@ private theorem reachedReady : Reachable writer ready := by
   have s : Reachable writer sealed := .extend c (.sealKeeper ⟨rfl, rfl⟩ (Or.inl (by decide)))
   exact .extend s (.sync (epoch := 1) (floor := 1) (start := 1)
     (records := []) (head := 0) ⟨rfl, rfl⟩ rfl ⟨first, rfl, rfl⟩ (by unfold SyncAdmitted; decide)
-    rfl ⟨by decide, rfl⟩ (fun _ => rfl) (by decide) (Nat.le_refl _) (by decide) (by decide)
+    rfl (fun _ => rfl) (by decide) (Nat.le_refl _) (by decide) (by decide)
     (Or.inl rfl))
 
 private theorem reached : Reachable writer recovered := by
@@ -110,7 +109,7 @@ private theorem reached : Reachable writer recovered := by
   have p : Reachable writer promised := .extend a (.sealKeeper ⟨rfl, rfl⟩ (Or.inl (by decide)))
   exact .extend p (.sync (epoch := 2) (floor := 1) (start := 2) (records := []) (head := 0)
     ⟨rfl, rfl⟩ rfl ⟨second, rfl, rfl⟩ (by unfold SyncAdmitted; decide) (by decide)
-    ⟨by decide, rfl⟩ (fun impossible => by contradiction) (by decide) (Nat.le_refl _)
+    (fun impossible => by contradiction) (by decide) (Nat.le_refl _)
     (by decide) (by decide) (Or.inl rfl))
 
 /-- N8's first witness: after takeover no retained record has the new epoch, and the empty
@@ -144,7 +143,7 @@ theorem staged_sync_witness :
     .extend reachedReady (.sealKeeper ⟨rfl, rfl⟩ (Or.inl (by decide)))
   exact ⟨writer, fresh, _, reachedFresh,
     .syncPart (epoch := 2) (floor := 1) (start := 1) (records := prior) ⟨rfl, rfl⟩ rfl
-      ⟨second, rfl, rfl⟩ (by decide) (by unfold SyncAdmitted; decide) ⟨by decide, rfl⟩,
+      ⟨second, rfl, rfl⟩ (by decide) (by unfold SyncAdmitted; decide),
     rfl, rfl, rfl⟩
 
 #print axioms admitted_publication_is_a_step
