@@ -12,8 +12,9 @@ use journal_contract::BoxFuture;
 use parking_lot::Mutex;
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::Semaphore,
     task::JoinSet,
-    time::timeout,
+    time::{Instant as TokioInstant, sleep, timeout},
 };
 use tokio_rustls::{
     TlsAcceptor, TlsConnector,
@@ -47,7 +48,10 @@ const ALPN: &[u8] = b"logkeeper-stream/2";
 const KEEPER_URI: &str = "urn:logkeeper:keeper:";
 const CLIENT_URI: &str = "urn:logkeeper:client:";
 const CONNECTIONS: usize = 256;
+const ROUTE_CONNECTIONS: usize = 64;
+const WAITING_READS: usize = 16;
 const IDLE_CHANNELS: usize = 16;
+const IDLE_GRACE: Duration = Duration::from_millis(250);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -184,7 +188,57 @@ type Channel = TlsStream<TcpStream>;
 
 struct Route {
     address: String,
-    idle: Mutex<Vec<Channel>>,
+    idle: Arc<Mutex<Idle>>,
+    connections: Semaphore,
+    waiting_reads: Semaphore,
+}
+
+struct Idle {
+    channels: Vec<(TokioInstant, Channel)>,
+    pruning: bool,
+}
+
+impl Route {
+    fn new(address: String, idle: Vec<Channel>) -> Self {
+        Self {
+            address,
+            idle: Arc::new(Mutex::new(Idle {
+                channels: idle
+                    .into_iter()
+                    .map(|channel| (TokioInstant::now(), channel))
+                    .collect(),
+                pruning: false,
+            })),
+            connections: Semaphore::new(ROUTE_CONNECTIONS),
+            waiting_reads: Semaphore::new(WAITING_READS),
+        }
+    }
+
+    fn recycle(&self, channel: Channel) {
+        let mut idle = self.idle.lock();
+        idle.channels.push((TokioInstant::now(), channel));
+        if idle.channels.len() <= IDLE_CHANNELS || idle.pruning {
+            return;
+        }
+        idle.pruning = true;
+        let idle = Arc::downgrade(&self.idle);
+        tokio::spawn(async move {
+            loop {
+                sleep(IDLE_GRACE).await;
+                let Some(idle) = idle.upgrade() else { return };
+                let mut idle = idle.lock();
+                let excess = idle.channels.len().saturating_sub(IDLE_CHANNELS);
+                let expired = idle
+                    .channels
+                    .partition_point(|(used, _)| used.elapsed() >= IDLE_GRACE);
+                idle.channels.drain(..excess.min(expired));
+                if idle.channels.len() <= IDLE_CHANNELS {
+                    idle.pruning = false;
+                    return;
+                }
+            }
+        });
+    }
 }
 
 pub struct TcpTransport {
@@ -214,13 +268,7 @@ impl TcpTransport {
             if id.0 == 0
                 || transport
                     .routes
-                    .insert(
-                        id,
-                        Route {
-                            address,
-                            idle: Mutex::default(),
-                        },
-                    )
+                    .insert(id, Route::new(address, Vec::new()))
                     .is_some()
             {
                 return Err(invalid("invalid or duplicate keeper route"));
@@ -267,10 +315,7 @@ impl TcpTransport {
         for (index, (address, (elapsed, id, channel))) in
             addresses.into_iter().zip(connections).enumerate()
         {
-            let route = Route {
-                address: address.into(),
-                idle: Mutex::new(vec![channel]),
-            };
+            let route = Route::new(address.into(), vec![channel]);
             if transport.routes.insert(id, route).is_some() {
                 return Err(invalid("duplicate keeper identity"));
             }
@@ -289,8 +334,16 @@ impl TcpTransport {
             .routes
             .get(&keeper)
             .ok_or(TransportError::Unreachable)?;
+        // Leave capacity for mutations and checks while reads wait at the keeper.
+        let _read = match request {
+            Request::Read { wait_ms: 1.., .. } => {
+                Some(route.waiting_reads.acquire().await.expect("open route"))
+            }
+            _ => None,
+        };
+        let _connection = route.connections.acquire().await.expect("open route");
         let body = encode_request(&request).map_err(protocol)?;
-        let idle = route.idle.lock().pop();
+        let idle = route.idle.lock().channels.pop().map(|(_, channel)| channel);
         let mut channel = match idle {
             Some(channel) => channel,
             None => {
@@ -310,10 +363,7 @@ impl TcpTransport {
             .map_err(connection_error)?;
         let reply = decode_reply(read_frame(&mut channel).await.map_err(connection_error)?)
             .map_err(protocol)?;
-        let mut idle = route.idle.lock();
-        if idle.len() < IDLE_CHANNELS {
-            idle.push(channel);
-        }
+        route.recycle(channel);
         Ok(reply)
     }
 }
