@@ -7,6 +7,14 @@ use vstd::prelude::*;
 
 pub const MAX_OBJECT_REFERENCES: usize = 16_384;
 
+#[cfg(verus_keep_ghost)]
+verus! {
+    pub(super) proof fn reference_limit_is_16384()
+        ensures MAX_OBJECT_REFERENCES == 16_384,
+    {
+    }
+}
+
 /// Fixed stream charge for each record's identity and framing. Replica media
 /// also budget for staging and their own metadata.
 pub const APPEND_RECORD_CHARGE_BYTES: u64 = 217;

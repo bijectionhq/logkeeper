@@ -20,7 +20,7 @@ def main():
     slot = ROOT / "Logkeeper" / "VoterSlotHeader.lean"
     transport = ROOT / "Logkeeper" / "VoterTransport.lean"
     check_lean_theorems(ROOT, command, codec, count=7, case="codec")
-    check_lean_theorems(ROOT, command, image, count=10, case="compact-image")
+    check_lean_theorems(ROOT, command, image, count=12, case="compact-image")
     check_lean_theorems(ROOT, command, slot, count=4, case="voter-slot-header")
     check_lean_theorems(ROOT, command, transport, count=4, case="voter-transport")
     check_lean_mutation(
@@ -37,6 +37,11 @@ def main():
         ROOT, command, codec, "codec-ignore-maximum",
         [("minimum ≤ declared ∧ declared ≤ maximum", "minimum ≤ declared ∧ True")],
         "    boundedBodyLength declared minimum maximum = none := by",
+    )
+    check_lean_mutation(
+        ROOT, command, image, "object-name-allow-zero-first",
+        [("    | first :: _ => objectNameBefore zeroName first) ∧", "    | _ :: _ => True) ∧")],
+        "    have edge : objectNameBefore zeroName first := accepted.2.1",
     )
     check_lean_mutation(
         ROOT, command, image, "compact-image-allow-reused-receipt-position",

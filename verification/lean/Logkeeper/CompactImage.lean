@@ -172,6 +172,64 @@ theorem the_reducer_invariant_excludes_reused_receipt_positions (image : Reducer
     (valid : reducerInvariant image) : receiptPositionsUnique image.receiptPositions := by
   exact valid.1
 
+abbrev ObjectName := List UInt8
+
+def objectNameBefore (left right : ObjectName) : Prop :=
+  List.Lex (fun a b : UInt8 => a.toNat < b.toNat) left right
+
+def zeroName : ObjectName := List.replicate 32 0
+
+def adjacentObjectNames : List ObjectName → Prop
+  | [] | [_] => True
+  | a :: b :: rest => objectNameBefore a b ∧ adjacentObjectNames (b :: rest)
+
+def objectNamesCanonical (names : List ObjectName) : Prop :=
+  names.length ≤ 16384 ∧
+  (match names with
+    | [] => True
+    | first :: _ => objectNameBefore zeroName first) ∧
+  adjacentObjectNames names
+
+theorem object_name_order_is_transitive {left middle right : ObjectName}
+    (first : objectNameBefore left middle) (second : objectNameBefore middle right) :
+    objectNameBefore left right :=
+  List.lex_trans Nat.lt_trans first second
+
+private theorem all_names_ordered (names : List ObjectName) (adjacent : adjacentObjectNames names) :
+    names.Pairwise objectNameBefore := by
+  match names with
+  | [] => exact .nil
+  | [_] => exact .cons (by simp) .nil
+  | a :: b :: rest =>
+    have edge : objectNameBefore a b := adjacent.1
+    have tail := all_names_ordered (b :: rest) adjacent.2
+    refine .cons (fun name member => ?_) tail
+    rcases List.mem_cons.mp member with equal | later
+    · simpa [equal] using edge
+    · exact object_name_order_is_transitive edge ((List.pairwise_cons.mp tail).1 name later)
+
+theorem admitted_object_names_are_bounded_sorted_unique_and_nonzero (names : List ObjectName)
+    (accepted : objectNamesCanonical names) :
+    names.length ≤ 16384 ∧ names.Pairwise objectNameBefore ∧ names.Nodup ∧
+    (∀ name ∈ names, name ≠ zeroName) := by
+  have ordered := all_names_ordered names accepted.2.2
+  have irrefl (name : ObjectName) : ¬objectNameBefore name name :=
+    List.lex_irrefl (fun x => Nat.lt_irrefl x.toNat) name
+  have unique : names.Nodup := ordered.imp (fun before equal => by subst equal; exact irrefl _ before)
+  refine ⟨accepted.1, ordered, unique, ?_⟩
+  intro name member equal
+  subst name
+  cases names with
+  | nil => simp at member
+  | cons first rest =>
+    have edge : objectNameBefore zeroName first := accepted.2.1
+    rcases List.mem_cons.mp member with zero | later
+    · subst first
+      exact irrefl _ edge
+    · exact irrefl _ (object_name_order_is_transitive edge ((List.pairwise_cons.mp ordered).1 _ later))
+
+#print axioms object_name_order_is_transitive
+#print axioms admitted_object_names_are_bounded_sorted_unique_and_nonzero
 #print axioms one_invalid_hold_prevents_recovery
 #print axioms the_reducer_invariant_excludes_reused_receipt_positions
 #print axioms vacancy_preserves_generation
