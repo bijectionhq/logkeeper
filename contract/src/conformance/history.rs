@@ -1,5 +1,10 @@
+//! History checks with real-time ordering and committed keeper read snapshots.
+
 use super::{Clients, LIMITS, Schedule};
-use crate::{Epoch, Identity, JournalError, Lsn, Page, Result, StreamId};
+use crate::{
+    BoxFuture, Epoch, Identity, Journal, JournalError, Lsn, Page, Result, StreamId,
+    reference::Limits,
+};
 use bytes::Bytes;
 use std::{
     collections::{BTreeMap, HashSet},
@@ -9,29 +14,62 @@ use std::{
 };
 
 #[derive(Clone, Debug)]
-pub(super) enum Op {
+pub enum Op {
     Create,
     Seal(Epoch),
     Append(Epoch, Lsn, Bytes),
     Read(Lsn, usize),
     Head,
     Trim(Epoch, Lsn),
+    Delete,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Value {
+pub enum Value {
     Unit,
     Position(Lsn),
     Page(Page),
 }
 
 #[derive(Debug)]
-struct Call {
-    identity: Identity,
-    op: Op,
-    invocation: usize,
-    response: usize,
-    result: Result<Value>,
+/// One journal operation with invocation and response in a common event order.
+pub struct Call {
+    pub identity: Identity,
+    pub op: Op,
+    pub invocation: usize,
+    pub response: usize,
+    pub result: Result<Value>,
+}
+
+impl Op {
+    pub fn call<'a>(
+        &self,
+        journal: &'a dyn Journal,
+        stream: StreamId,
+    ) -> BoxFuture<'a, Result<Value>> {
+        match *self {
+            Op::Create => unit(journal.create(stream)),
+            Op::Seal(epoch) => position(journal.seal(stream, epoch)),
+            Op::Append(epoch, at, ref payload) => {
+                position(journal.append(stream, epoch, at, payload.clone()))
+            }
+            Op::Read(from, max) => {
+                let call = journal.read(stream, from, max, Duration::ZERO);
+                Box::pin(async move { call.await.map(Value::Page) })
+            }
+            Op::Head => position(journal.head(stream)),
+            Op::Trim(epoch, through) => unit(journal.trim(stream, epoch, through)),
+            Op::Delete => unit(journal.delete(stream)),
+        }
+    }
+}
+
+fn unit(call: BoxFuture<'_, Result<()>>) -> BoxFuture<'_, Result<Value>> {
+    Box::pin(async move { call.await.map(|()| Value::Unit) })
+}
+
+fn position(call: BoxFuture<'_, Result<Lsn>>) -> BoxFuture<'_, Result<Value>> {
+    Box::pin(async move { call.await.map(Value::Position) })
 }
 
 pub(super) struct History {
@@ -61,34 +99,7 @@ impl History {
             let identity = Clients::identity(client);
             let invocation = self.clock;
             self.clock += 1;
-            let journal = &clients.0[client];
-            let future = match &op {
-                Op::Create => {
-                    let call = journal.create(stream);
-                    Box::pin(async move { call.await.map(|()| Value::Unit) })
-                        as crate::BoxFuture<'_, _>
-                }
-                Op::Seal(epoch) => {
-                    let call = journal.seal(stream, *epoch);
-                    Box::pin(async move { call.await.map(Value::Position) })
-                }
-                Op::Append(epoch, at, payload) => {
-                    let call = journal.append(stream, *epoch, *at, payload.clone());
-                    Box::pin(async move { call.await.map(Value::Position) })
-                }
-                Op::Read(from, max) => {
-                    let call = journal.read(stream, *from, *max, Duration::ZERO);
-                    Box::pin(async move { call.await.map(Value::Page) })
-                }
-                Op::Head => {
-                    let call = journal.head(stream);
-                    Box::pin(async move { call.await.map(Value::Position) })
-                }
-                Op::Trim(epoch, through) => {
-                    let call = journal.trim(stream, *epoch, *through);
-                    Box::pin(async move { call.await.map(|()| Value::Unit) })
-                }
-            };
+            let future = op.call(&*clients.0[client], stream);
             future_calls.push((identity, op, invocation, future, None));
         }
 
@@ -132,7 +143,7 @@ impl History {
 
     pub(super) fn check(&self, name: &str) {
         assert!(
-            linearizable(&self.calls),
+            linearizable(&self.calls, LIMITS),
             "{name}: stream {:?} has no legal order for {:#?}",
             self.stream,
             self.calls
@@ -144,13 +155,17 @@ impl History {
 // operation whose real-time predecessors are placed, step the independent
 // sequential model, and backtrack when its response disagrees. Memoize dead
 // ends by the placed set and model state, not by the order used to reach them.
-fn linearizable(calls: &[Call]) -> bool {
+/// Checks a single stream's history of at most 63 calls.
+/// An unavailable mutation may have no effect or may complete after its reply.
+pub fn linearizable(calls: &[Call], limits: Limits) -> bool {
     assert!(calls.len() < 64);
     let predecessors: Vec<u64> = calls
         .iter()
         .map(|call| {
             calls.iter().enumerate().fold(0, |mask, (index, other)| {
-                if other.response < call.invocation {
+                if other.result != Err(JournalError::Unavailable)
+                    && other.response < call.invocation
+                {
                     mask | 1 << index
                 } else {
                     mask
@@ -163,6 +178,7 @@ fn linearizable(calls: &[Call]) -> bool {
         predecessors,
         all: (1 << calls.len()) - 1,
         rejected: HashSet::new(),
+        limits,
     };
     search.visit(0, Model::Absent)
 }
@@ -172,6 +188,7 @@ struct Search<'a> {
     predecessors: Vec<u64>,
     all: u64,
     rejected: HashSet<(u64, Model)>,
+    limits: Limits,
 }
 
 impl Search<'_> {
@@ -189,7 +206,20 @@ impl Search<'_> {
                 continue;
             }
             let mut next = key.1.clone();
-            if next.matches(call) && self.visit(placed | bit, next) {
+            if call.result == Err(JournalError::Unavailable) {
+                if self.visit(placed | bit, next.clone()) {
+                    return true;
+                }
+                if matches!(call.op, Op::Read(..) | Op::Head)
+                    || next.step(&call.identity, &call.op, self.limits).is_err()
+                    || next == key.1
+                {
+                    continue;
+                }
+            } else if !next.matches(call, self.limits) {
+                continue;
+            }
+            if self.visit(placed | bit, next) {
                 return true;
             }
         }
@@ -202,6 +232,7 @@ impl Search<'_> {
 enum Model {
     Absent,
     Created {
+        deleted: bool,
         sealed: Option<(Epoch, Identity)>,
         head: Lsn,
         floor: Lsn,
@@ -210,10 +241,10 @@ enum Model {
 }
 
 impl Model {
-    fn matches(&mut self, call: &Call) -> bool {
+    fn matches(&mut self, call: &Call, limits: Limits) -> bool {
         use JournalError::*;
         let Op::Read(from, max) = call.op else {
-            return self.step(&call.identity, &call.op) == call.result;
+            return self.step(&call.identity, &call.op, limits) == call.result;
         };
         match self {
             Self::Absent => call.result == Err(NotFound),
@@ -221,6 +252,7 @@ impl Model {
                 head,
                 floor,
                 committed,
+                deleted,
                 ..
             } => match &call.result {
                 Ok(Value::Page(page)) => {
@@ -239,17 +271,26 @@ impl Model {
                                 .take(max)
                                 .map(|(&lsn, (_, payload))| (lsn, payload)))
                 }
+                Err(Deleted) => *deleted,
                 Err(Trimmed { floor: observed }) => from < *observed && *observed <= *floor,
                 _ => false,
             },
         }
     }
 
-    fn step(&mut self, caller: &Identity, op: &Op) -> Result<Value> {
+    fn step(&mut self, caller: &Identity, op: &Op, limits: Limits) -> Result<Value> {
         use JournalError::*;
+        if matches!(self, Self::Created { deleted: true, .. }) {
+            return if matches!(op, Op::Delete) {
+                Ok(Value::Unit)
+            } else {
+                Err(Deleted)
+            };
+        }
         if matches!(op, Op::Create) {
             if matches!(self, Self::Absent) {
                 *self = Self::Created {
+                    deleted: false,
                     sealed: None,
                     head: Lsn(0),
                     floor: Lsn(1),
@@ -259,6 +300,7 @@ impl Model {
             return Ok(Value::Unit);
         }
         let Self::Created {
+            deleted,
             sealed,
             head,
             floor,
@@ -273,6 +315,10 @@ impl Model {
         let conflict = Conflict { head: *head };
         match op {
             Op::Create => unreachable!(),
+            Op::Delete => {
+                *deleted = true;
+                Ok(Value::Unit)
+            }
             Op::Seal(epoch) => {
                 if let Some((current, owner)) = sealed.as_ref()
                     && (epoch < current || (epoch == current && caller != owner))
@@ -293,16 +339,16 @@ impl Model {
                     return Err(Trimmed { floor: *floor });
                 }
                 if at.0 == head.0 + 1 {
-                    if payload.len() > LIMITS.max_record_bytes {
+                    if payload.len() > limits.max_record_bytes {
                         return Err(TooLarge {
-                            max: LIMITS.max_record_bytes,
+                            max: limits.max_record_bytes,
                         });
                     }
                     let bytes = committed
                         .range(*floor..)
                         .map(|(_, (_, record))| record.len() as u64)
                         .sum::<u64>();
-                    if bytes + payload.len() as u64 > LIMITS.stream_quota_bytes {
+                    if bytes + payload.len() as u64 > limits.stream_quota_bytes {
                         return Err(Full { floor: *floor });
                     }
                     committed.insert(*at, (*epoch, payload.clone()));
@@ -336,6 +382,50 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_append_may_complete_later_but_cannot_change_its_payload() {
+        let identity = Identity::from_static("urn:logkeeper:client:1");
+        let chosen = Bytes::from_static(b"chosen");
+        let at = Lsn(1);
+        let mut calls: Vec<_> = [
+            (Op::Create, Ok(Value::Unit)),
+            (Op::Seal(Epoch(1)), Ok(Value::Position(Lsn(0)))),
+            (
+                Op::Append(Epoch(1), at, chosen.clone()),
+                Err(JournalError::Unavailable),
+            ),
+            (Op::Head, Ok(Value::Position(Lsn(0)))),
+            (Op::Head, Ok(Value::Position(at))),
+            (
+                Op::Read(at, 1),
+                Ok(Value::Page(Page {
+                    floor: at,
+                    head: at,
+                    records: vec![(at, chosen)],
+                })),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (op, result))| Call {
+            identity: identity.clone(),
+            op,
+            invocation: 2 * index,
+            response: 2 * index + 1,
+            result,
+        })
+        .collect();
+        assert!(linearizable(&calls, LIMITS));
+        let Ok(Value::Page(page)) = &mut calls.last_mut().unwrap().result else {
+            unreachable!()
+        };
+        page.records[0].1 = Bytes::from_static(b"other");
+        assert!(
+            !linearizable(&calls, LIMITS),
+            "a fault cannot authorize a different record"
+        );
+    }
 
     #[test]
     fn witnesses_append_on_either_side_of_a_seal() {
@@ -377,19 +467,19 @@ mod tests {
         .collect();
 
         // The first seal reply forces the overlapping append to go first.
-        assert!(linearizable(&calls));
+        assert!(linearizable(&calls, LIMITS));
         calls[3].invocation = 8;
         calls[3].response = 9;
         calls[4].invocation = 10;
         calls[4].response = 11;
         // Identical replies become impossible once the seal returned first.
         assert!(
-            !linearizable(&calls),
+            !linearizable(&calls, LIMITS),
             "checker must respect real-time precedence"
         );
         calls[2].result = Ok(Value::Position(Lsn(0)));
         calls[3].result = Err(JournalError::Fenced { current: Epoch(2) });
         calls[4].result = Ok(Value::Position(Lsn(0)));
-        assert!(linearizable(&calls));
+        assert!(linearizable(&calls, LIMITS));
     }
 }

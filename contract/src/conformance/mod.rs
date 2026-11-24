@@ -7,7 +7,7 @@
 //! A consumer taking over a stream must apply records through the head returned
 //! by seal before it serves requests.
 
-mod history;
+pub mod history;
 
 use crate::{
     Epoch, Identity, Journal, JournalError::*, Lsn, Page, StreamId, reference::Limits, timer::Sleep,

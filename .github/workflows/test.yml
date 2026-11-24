@@ -17,5 +17,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Select Rust
         run: rustup toolchain install 1.94.1 --profile minimal
-      - name: Test server and client
-        run: cargo +1.94.1 test --locked --all-features
+      - name: Test the workspace and simulate 10,000 stream journals
+        env:
+          LOGKEEPER_SIM_SEEDS: 10000
+        run: cargo +1.94.1 test --locked --workspace --all-features -- --show-output

@@ -42,6 +42,8 @@ pub(super) struct Wal {
     pub rounds: Vec<usize>,
     #[cfg(test)]
     pub fail_sync: bool,
+    #[cfg(test)]
+    pub retain_unsynced: Option<usize>,
 }
 
 pub(super) fn entry(request: &Request, identity: Option<&Identity>) -> io::Result<Bytes> {
@@ -249,6 +251,8 @@ impl Wal {
             rounds: Vec::new(),
             #[cfg(test)]
             fail_sync: false,
+            #[cfg(test)]
+            retain_unsynced: None,
         };
         // Start on a clean segment so incomplete fragments from this boot need no replay state.
         if bytes != 0 || paths.len() > 1 || !wal.dirty.is_empty() {
@@ -262,6 +266,12 @@ impl Wal {
             return Ok(());
         }
         self.file.write_all(buffer)?;
+        #[cfg(test)]
+        if let Some(retain) = self.retain_unsynced.take() {
+            let retained = retain.min(buffer.len() - 1);
+            self.file.set_len(self.bytes + retained as u64)?;
+            return Err(io::Error::other("simulated crash before WAL sync"));
+        }
         #[cfg(test)]
         if self.fail_sync {
             return Err(io::Error::other("injected sync failure"));
