@@ -13,6 +13,7 @@ mod cohort;
 #[cfg(feature = "ordered-daemon")]
 pub mod daemon;
 mod lease;
+mod object_names;
 mod object_withdrawal;
 mod receipt;
 mod refusal;
@@ -24,6 +25,7 @@ pub mod service;
 mod writer;
 
 use bytes::Bytes;
+use object_names::valid_object_names;
 use receipt::ReceiptBook;
 use receipt::RetainedOutcome;
 use sha2::{Digest, Sha256};
@@ -1771,12 +1773,6 @@ fn append_fingerprint(
     hash.update(timestamp.to_be_bytes());
     hash.update(payload);
     hash.finalize().into()
-}
-
-fn valid_object_names(names: &[ObjectName]) -> bool {
-    names.len() <= MAX_OBJECT_REFERENCES
-        && names.first().is_none_or(|name| *name != [0; 32])
-        && names.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn record_charge(payload_len: usize, references: Option<&[ObjectName]>) -> Result<u64, Refusal> {
