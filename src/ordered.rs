@@ -313,12 +313,17 @@ pub enum Command {
     Lease {
         grant: Grant,
     },
-    /// Renews serving authority for an enrolled reader's exact protected basis.
+    /// Obtains or renews an enrolled reader's serving authority for the exact
+    /// live hold and its open checkpoint, including during writer vacancy.
     LeaseRead {
         hold: Hold,
     },
-    /// Disposes a withdrawn worker's holds without operator evidence once
-    /// journal time has passed its last lease end plus the clock drift bound.
+    /// Disposes a withdrawn identity's holds without operator evidence once
+    /// journal time reaches its greatest retained lease end plus the clock
+    /// drift bound. With no retained lease, disposal can proceed immediately.
+    /// Success attests only that no hold or lease remains for the exact
+    /// identity. An unissued identity with an in-range serial and no roster
+    /// match, hold or lease succeeds as a no-op.
     DisposeExpired {
         enrollment: Enrollment,
     },
@@ -504,7 +509,7 @@ pub struct State {
     authority: writer::Authority<Grant>,
     enrollment_serial: u64,
     roster: BTreeMap<Uuid, Enrollment>,
-    /// The last lease end issued to each enrollment that is enrolled or
+    /// The greatest lease end issued to each enrollment that is enrolled or
     /// still owns a hold.
     leases: BTreeMap<Enrollment, u64>,
     window: Window,

@@ -292,7 +292,9 @@ impl<R: Replica> Coordinator<R> {
     }
 
     /// Returns distinct withdrawn hold owners in enrollment order, strictly
-    /// after the cursor, from a recovered journal state.
+    /// after the cursor, from a recovered journal state. Each row includes
+    /// the earliest eligible disposal time, even when that time is in the
+    /// future. The page may include identities that still own several holds.
     pub async fn withdrawn_workers(
         &self,
         session: Session,
