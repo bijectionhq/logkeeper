@@ -118,31 +118,74 @@ python3 verification/lean/run_stream_traces.py
 python3 verification/lean/run_stream_io_controls.py
 ```
 
+## Writer decisions
+
+A keeper persists an optional proposal ID with each seal promise and verifies it on
+an equal-epoch retry. A writer instance and a sweep plan each generate a UUID and
+reuse it for their own retries. They require the returned view to echo it. Two
+proposals cannot both elect at one epoch on this roster because their promise quorums
+intersect. The model represents the pair of authenticated identity and proposal ID as
+one proposer. This projection uses distinct generated IDs and compliant senders. Older
+encodings retain their absent proposal, and a new proposer cannot resume one of those
+promises at the same epoch. [Seal admission](../../src/stream/keeper/rules.rs) ·
+[Writer](../../src/stream/writer/mod.rs) · [Sweeper](../../src/stream/keeper/sweep.rs)
+
+`issued_origins` tracks the originating epoch of each position in every issued
+history. `same_epoch_agrees` uses it to show equality through a position with
+the same record epoch. The recovery-start decision checks the predecessor above
+the transfer floor. At the floor the keeper discards the preceding positions and the
+ghost image takes that prefix from the seed. The link runner connects the checked
+predecessor to `Agrees` and the fallback comparison to exact record equality.
+A lagging keeper whose floor has advanced past the seed first installs that seed
+and then installs the issued floor. A committed retry checks retained bytes with
+`Recover` before publishing, so an arbitrary caller payload never serves as an
+Append probe. [Writer proofs](Logkeeper/StreamWriter.lean) ·
+[Recovery](../../src/stream/writer/recovery.rs) · [Append lanes](../../src/stream/writer/append.rs)
+
+`StreamHead` uses quorum-accepted cuts from the automaton. A physical event
+can choose several successive positions. Its logical cuts let a head result fall
+between individual records of that batch. An opening choice persists on its
+quorum. Intersection with the fresh sampling quorum bounds the choice by a sampled
+tail, including across an intervening takeover. A published head proves the chosen
+upper bound. The observer can confirm its pinned index in a later round.
+`inherited_head_witness` samples the two ready keepers of the 36-action
+automaton witness and returns the inherited cut. The proofs use three keepers,
+arbitrary payloads and natural-number event indices. Verus checks the numeric
+decisions over Rust's representable integers. [Head cuts](Logkeeper/StreamHead.lean) ·
+[Head rounds](../../src/stream/writer/head.rs) · [Verus links](../link/README.md#stream-journal)
+
 ## Boundaries
 
-The model still assumes these facts; no proof ties them to the code.
-
-- **Writer obligations.** `Sendable` states what the writer guarantees: a Sync's records
-  are the seed's from its start, and the target's history agrees with the seed below that
-  start; an Append carries the issued payloads at its position; a published head is
-  certified. The shipped writer establishes agreement by comparing epoch runs, which needs
-  the lemma that equal epochs at one position imply equal prefixes, and fetches inherited
-  records with an epoch check on fallback. Neither is proved over `recovery.rs` or
-  `append.rs`. [Recovery](../../src/stream/writer/recovery.rs) · [Append lanes](../../src/stream/writer/append.rs)
+- **Writer send refinement.** The linked decisions prove when a verified predecessor
+  establishes Sync agreement, when a fallback epoch identifies the seed record and
+  how an assigned append range bounds the published head. The projection of compressed
+  epoch runs, the binding of asynchronous Recover responses to their snapshots and
+  the construction of the exact assigned byte slice from the lanes' maps remain
+  code premises. `Sendable` also requires the published cut to be certified. The
+  link for `acknowledged` supplies quorum certification given correctly bound
+  lane slots. The model's issued history grows monotonically. The Rust writer can
+  clear a pending suffix after all three keepers reply `Full` or `TooLarge`,
+  and the automaton has no transition for reassigning that definitively refused suffix.
 - **Keeper decisions.** `Admitted` and `effect` are checked against the shipped
   `decide` and `apply` by the replay of the corpus and, for local laws, by Verus and the
   link runner. No theorem covers every input. [Keeper decisions](../../src/stream/keeper/rules.rs)
-- **One writer per epoch.** The automaton has one writer state per epoch. A restarted
-  process must not re-elect the same epoch with the same identity, because its Seal replies
-  would no longer be saved snapshots. The consumer's takeover policy elects a fresh epoch.
-- **Head rounds.** `run_refines` supplies Study 119's keeper trace. Its head theorems also
-  need the logical single-record commit cuts of an execution and a confirmed fresh round
-  whose samples cover the result. Deriving both from `head.rs` remains.
-  [Head rounds](../../src/stream/writer/head.rs)
-- **Reads.** `read_exact` covers one keeper's page. Chunk assembly, the first chunk's head
-  bound, fallback and long-poll wake-up in `read.rs` are not modeled.
-- **Trim and Delete quorums.** Keeper effects are modeled; the writer's coverage check
-  before Trim and Delete's broadcast and two acknowledgements are not.
+- **Head round projection.** The cut proof consumes the queue-open event, per-keeper
+  send and durable-sample events, and the exact keeper view at each sample. Verus and
+  the link cover serial freshness, epoch eligibility, the maximum sample and the quorum
+  count. Rust tests cover queued batching, later callers, stale-writer fallback and index
+  pinning. The async projection from Tokio queue and lane events to `Samples` and the
+  binding of raw reply tails to their durable send events remain open.
+- **Reads.** `read_exact` covers the keeper slice and `assemble_read_chunk` proves
+  that an exact following chunk bounded by the first head extends the page. The
+  async projection of subsequent replies to exact slices of that keeper remains open,
+  as do abandoned partial pages on fallback, observed floor precedence, and the
+  long-poll deadline and wake-up.
+- **Trim and Delete quorums.** Keeper effects and quorum intersection for durable
+  tombstones on one roster are proved. A Trim through a locally known head waits for
+  publication, and every successful Trim reply must have floor above the requested
+  cut. For Delete the writer broadcasts to three distinct keepers and counts two
+  durable tombstone replies. The async projection of the Trim publication wait and
+  both operations' reply collection into quorum evidence remains open.
 - **Replacement and authority.** Study 119 has one fixed roster, so Replace is a stutter
   and learners are outside the model. Recovery after one disk loss, by the sweeper copying
   the chosen history to both survivors before promoting a learner, and authority across

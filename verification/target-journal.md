@@ -36,7 +36,7 @@ LSN 1. The **head** is the last committed LSN, or 0 for an empty stream. A
 
 | Error | Meaning |
 | --- | --- |
-| `Fenced { current: Epoch }` | A higher epoch has sealed, or a different identity sealed this epoch. |
+| `Fenced { current: Epoch }` | A higher epoch has sealed, or a different proposer sealed this epoch. |
 | `Conflict { head: Lsn }` | The requested position or payload conflicts with the journal. |
 | `Trimmed { floor: Lsn }` | A requested position below an observed floor is unavailable. |
 | `TooLarge { max: usize }` | The payload exceeds the record limit. |

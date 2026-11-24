@@ -81,13 +81,18 @@ temporary Lean package and leaves the checkout unchanged.
 The generator extracts the single result postcondition from the shipped Verus
 contracts in `src/stream/keeper/rules.rs` and `src/stream/writer/decision.rs`.
 The Verus runner checks those contracts against their executable bodies.
-Thirteen Lean theorems link the generated definitions to Study 119. The
+Twenty-one Lean theorems link the generated definitions to Study 119. The
 epoch projection reserves model epoch zero for the initial empty vote.
 The acknowledgement link assumes the three slots project the observed durable
 prefix witnesses, and the keeper retry link covers the model's single-record
-case. Seven stream controls change the Verus postconditions or Lean model
+case. Sixteen stream controls change the Verus postconditions or Lean model
 definitions and must fail at their named equivalence.
 
-Study 119's Lean ensemble is fixed and its Sync step preserves head and floor.
-The keeper replacement and Sync head transfer predicates are generated for
-inspection. The inventory records their remaining correspondence.
+The writer links cover the recovery start and fallback epoch, append head and tail
+bounds, head sample freshness and eligibility, and the index and quorum decisions.
+The Lean statements apply these links to Sync agreement, exact fallback records,
+append sendability and confirmed sampling. They take reply provenance and the
+assigned byte slice from the async projection described in [the refinement notes](../lean/stream-async.md).
+
+Study 119's Lean ensemble is fixed. The inventory records the remaining
+correspondence for keeper replacement and Sync head transfer.
