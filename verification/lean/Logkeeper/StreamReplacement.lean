@@ -91,6 +91,32 @@ theorem learner_install_requires_both {first second : Bool}
   cases step with
   | replaceLearner guard => exact Bool.and_eq_true_iff.mp guard -- both survivor installs
 
+/-- Replace is routed outside the fixed-ensemble I/O automaton. The
+    installation phase starts after survivor repair and learner Sync.
+    Completed installs remain eligible for an idempotent retry. -/
+def ReplaceSendable : Phase → Node → Prop
+  | .installing first second, .learner => mayInstallLearner first second = true
+  | .installing .., .first | .installing .., .second => True
+  | .promoted, .first | .promoted, .second | .promoted, .learner => True
+  | _, _ => False
+
+theorem sendable_learner_replace_has_installed_survivors {phase : Phase}
+    (sent : ReplaceSendable phase .learner) :
+    voter phase .first = some .new ∧ voter phase .second = some .new := by
+  cases phase with
+  | intact | lost | repaired => exact False.elim sent
+  | installing first second =>
+      change (first && second) = true at sent
+      obtain ⟨rfl, rfl⟩ := Bool.and_eq_true_iff.mp sent
+      exact ⟨rfl, rfl⟩
+  | promoted => exact ⟨rfl, rfl⟩
+
+theorem replace_sendability_witness :
+    ∃ phase, Reachable phase ∧
+      ReplaceSendable phase .first ∧ ReplaceSendable phase .second ∧ ReplaceSendable phase .learner := by
+  refine ⟨.installing true true, ?_, trivial, trivial, rfl⟩
+  exact (((((Reachable.initial.next .lose).next .repair).next .syncLearner).next .installFirst).next .installSecond)
+
 private theorem noVoter {phase : Phase} {route : Route}
     (none : ∀ a, routedSeal phase a route = false) : ¬ Quorum phase route := by
   rintro ⟨a, _, _, accepts, _⟩
@@ -332,6 +358,8 @@ theorem split_then_promote_witness :
   exact ⟨split, rfl, rfl, .next both (.replaceLearner rfl),
     .intro .first (.intro .learner ⟨by decide, rfl, rfl⟩)⟩
 
+#print axioms sendable_learner_replace_has_installed_survivors
+#print axioms replace_sendability_witness
 #print axioms learner_install_requires_both
 #print axioms exclusive_ensemble_authority
 #print axioms split_install_has_no_quorum

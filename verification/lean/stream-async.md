@@ -52,12 +52,12 @@ vote.
 
 | Action | Shipped await point or effect |
 | --- | --- |
-| `send` | Every request a writer dispatches: Seal in `Recovery::choose`, Sync chunks and completion in `Recovery::sync`, floor installation, lane Append and publication, Trim, Check, Read, Recover, Delete. The guard `Sendable` is what the writer guarantees. |
+| `send` | The fixed-ensemble automaton enqueues Seal, Sync, floor installation, Append and publication, Trim, observations, and Delete. `Sendable` checks the request at durable issuance. `WireSendable` also covers Append bytes that are still pending at wire dispatch. |
 | `deliver` | One keeper round for one request: decide, make the effect durable, reply. The packet stays in flight, so it can be delivered again. `Admitted` is the keeper's rule; `effect` its durable change. |
 | `refuse`, `drop`, `restart` | A refusal, request or reply loss, and a keeper reopen. None changes durable state. |
 | `collectSeal`, `choose` | Receive a Seal reply before the election, then select from two (`Round.winner`, linked to `outranks`). The epoch's issued history becomes the winner's history. |
 | `collectVote`, `certify` | A lane receives a durable vote; `decision::acknowledged` certifies a cut covered by two lanes. |
-| `issue` | `Active::append` assigns the next positions to a payload. |
+| `issue` | Freeze a covering pending prefix at its first possible durable acceptance. |
 
 A crashed or cancelled writer simply takes no further action; its packets stay in flight.
 
@@ -225,6 +225,32 @@ late poll replies, and counting the same keeper twice for Trim or Delete.
 [Exchange proofs](Logkeeper/StreamRpc.lean) · [Read proofs](Logkeeper/StreamRead.lean) ·
 [Recovery proofs](Logkeeper/StreamRecovery.lean)
 
+## Wire dispatch and durable issuance
+
+The wire Append carries an exact slice of the issued history followed by
+the assigned suffix. Its advertised head must already lie in the issued
+history. Issuing a prefix preserves this combined view, including the
+bytes beyond the prefix that other lanes may still need. An admitted
+new Append gives an issue, an ordinary send of the same packet, and a
+durable delivery of that packet. This proof computes the covering prefix
+from the LSN and the payload count.
+
+In the 27-action capacity witness, three keepers definitively refuse a
+two-record pending batch. The new assignment at its first LSN has
+different bytes. Both sends satisfy `WireSendable`. Treating both as
+ordinary `Sendable` sends is impossible because issued history only
+grows. A native refinement must therefore record wire dispatch while
+the suffix is pending and enter the durable automaton at the issuance
+boundary. The witness uses one epoch, three keepers, and natural-number
+payloads. The transition proofs quantify over arbitrary payloads and
+positions. [Wire dispatch](Logkeeper/StreamIO.lean) ·
+[Capacity witness](Logkeeper/StreamIOWitness.lean)
+
+Replace uses the authority model's `ReplaceSendable` predicate. It permits
+the learner send only after both survivor installs and covers idempotent
+retries after promotion. A five-step witness reaches a phase where all
+three sends are permitted. [Authority model](Logkeeper/StreamReplacement.lean)
+
 ## Proposer transitions
 
 The proposer dispatches Read, observer Head, election and recovery Sync,
@@ -261,8 +287,10 @@ reuse an issued ticket and accept an outcome with a different ticket.
   Proving every shipped send `Sendable` still requires an induction relating
   the actual lane assignments, selected recovery runs and transferred bytes
   to `StreamIO`'s issued history. `Dispatch` remains a premise of
-  `dispatch_sendable`. The fixed-ensemble `Sendable` datatype also has no
-  `Replace` constructor.
+  `dispatch_sendable`. The Append transition supplies a `WireSendable`
+  projection once those assignments and bytes are related. Replace
+  uses the separate authority model, so it still needs a bridge from
+  the sweep's native state and replies to that model's phases.
 - **Completion provenance.** A matched ticket identifies the operation
   and slot. The Lean completion theorems need the exact keeper decision and
   delivery index, including the first read chunk, each continuation and each

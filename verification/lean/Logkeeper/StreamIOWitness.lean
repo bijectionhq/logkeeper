@@ -76,6 +76,20 @@ theorem automaton_witness :
   exact ⟨_, pub, rfl, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, rfl, Or.inr rfl,
     ⟨second, rfl, rfl⟩, ⟨rfl, rfl⟩, rfl⟩
 
+private theorem wire_append_at_empty {s : State Nat} (reached : StreamIO.Reachable s)
+    (elected : Elected s.writer 1 1) (issued : s.writer.issued 1 = [])
+    {payloads : List Nat} (assigned : (s.pending 1).payloads = payloads) (k : KeeperId) :
+    WireSendable s k 1 (.append 1 1 payloads 0) := by
+  have view : (extend s.writer 1 (s.pending 1).payloads).issued 1 = stamp 1 payloads := by
+    simp [extend, issued, assigned]
+  refine ⟨⟨elected, ?_, ?_, Nat.zero_le _, ?_⟩, Nat.zero_le _⟩
+  · simp [view, stamp]
+  · rw [view]
+    change stamp 1 payloads = (stamp 1 payloads).take payloads.length
+    have length : (stamp 1 payloads).length = payloads.length := by simp [stamp]
+    rw [← length, List.take_length]
+  · simpa [extend] using (reachable_inv reached).emptyAdvertised
+
 private theorem reuse_after_capacity {before : State Nat} (reached : StreamIO.Reachable before)
     (assigned : (before.pending 1).payloads = [7, 8])
     (unanimous : ∀ k, (before.pending 1).refused k ≠ none)
@@ -84,21 +98,35 @@ private theorem reuse_after_capacity {before : State Nat} (reached : StreamIO.Re
     ∃ after reused : State Nat, StreamIO.Reachable before ∧
       (before.pending 1).payloads = [7, 8] ∧ Next before (.discard 1) after ∧
       Next after (.assign 1 [9]) reused ∧ (reused.pending 1).payloads = [9] ∧
-      reused.writer.issued 1 = [] := by
+      reused.writer.issued 1 = [] ∧ (∀ k, WireSendable reused k 1 (.append 1 1 [9] 0)) := by
   let after := before.withPending 1 ((before.pending 1).reset [])
   let reused := after.withPending 1 ((after.pending 1).reset ((after.pending 1).payloads ++ [9]))
-  refine ⟨after, reused, reached, assigned, .discard ?_ unanimous certain, .assign elected, ?_, emptyIssued⟩
-  · rw [assigned]
+  have nonempty : (before.pending 1).payloads ≠ [] := by
+    rw [assigned]
     exact List.cons_ne_nil _ _
-  · simp [after, reused, State.withPending, Pending.reset]
+  have discarded : Next before (.discard 1) after := .discard nonempty unanimous certain
+  have reassigned : Next after (.assign 1 [9]) reused := .assign elected
+  have bytes : (reused.pending 1).payloads = [9] := by
+    simp [after, reused, State.withPending, Pending.reset]
+  exact ⟨after, reused, reached, assigned, discarded, reassigned, bytes, emptyIssued,
+    wire_append_at_empty ((reached.extend discarded).extend reassigned)
+      ⟨first, elected, rfl⟩ emptyIssued bytes⟩
+
+private def stateAt {s : State Nat} (_ : StreamIO.Reachable s) : State Nat := s
 
 /-- A two-record suffix is released after three current capacity refusals. The next
     assignment reuses the first position with different bytes. -/
-theorem capacity_discard_witness :
-    ∃ before after reused : State Nat, StreamIO.Reachable before ∧
-      (before.pending 1).payloads = [7, 8] ∧ Next before (.discard 1) after ∧
-      Next after (.assign 1 [9]) reused ∧ (reused.pending 1).payloads = [9] ∧
-      reused.writer.issued 1 = [] := by
+theorem capacity_reassignment_witness :
+    ∃ sent before after reused : State Nat, StreamIO.Reachable sent ∧
+      (∀ k, WireSendable sent k 1 (.append 1 1 [7, 8] 0)) ∧
+      (∃ left right,
+        Next sent (.rejectCapacity 1 0 1 .full) left ∧
+        Next left (.rejectCapacity 1 1 1 .full) right ∧
+        Next right (.rejectCapacity 1 2 1 .tooLarge) before) ∧
+      StreamIO.Reachable before ∧ (before.pending 1).payloads = [7, 8] ∧
+      Next before (.discard 1) after ∧ Next after (.assign 1 [9]) reused ∧
+      (reused.pending 1).payloads = [9] ∧ reused.writer.issued 1 = [] ∧
+      (∀ k, WireSendable reused k 1 (.append 1 1 [9] 0)) := by
   have c0 := (StreamIO.Reachable.initial (Payload := Nat)).call (k := 0) (i := 1) (req := .create) trivial rfl
   have c1 := c0.call (k := 1) (i := 1) (req := .create) trivial rfl
   have c2 := c1.call (k := 2) (i := 1) (req := .create) trivial rfl
@@ -120,25 +148,40 @@ theorem capacity_discard_witness :
     ⟨⟨first, rfl, rfl⟩, by decide, rfl, fun _ _ _ _ => rfl, by decide, rfl⟩
     ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide, by decide⟩
   have assigned := StreamIO.Reachable.extend y2 (Next.assign (e := 1) (payloads := [7, 8]) (r := first) rfl)
-  have denied0 := StreamIO.Reachable.extend assigned (Next.rejectCapacity
+  have refusal0 := Next.rejectCapacity (s := stateAt assigned)
     (e := 1) (k := 0) (revision := 1) (reason := .full) (caller := 1) (payloads := [7, 8]) (head := 0)
-    rfl ⟨first, rfl, rfl⟩ List.prefix_rfl ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, rfl, List.cons_ne_nil _ _, by decide⟩ rfl)
-  have denied1 := StreamIO.Reachable.extend denied0 (Next.rejectCapacity
+    rfl ⟨first, rfl, rfl⟩ List.prefix_rfl ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, rfl, List.cons_ne_nil _ _, Nat.zero_le _⟩ rfl
+  have denied0 := assigned.extend refusal0
+  have refusal1 := Next.rejectCapacity (s := stateAt denied0)
     (e := 1) (k := 1) (revision := 1) (reason := .full) (caller := 1) (payloads := [7, 8]) (head := 0)
-    rfl ⟨first, rfl, rfl⟩ List.prefix_rfl ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, rfl, List.cons_ne_nil _ _, by decide⟩ rfl)
-  have denied2 := StreamIO.Reachable.extend denied1 (Next.rejectCapacity
+    rfl ⟨first, rfl, rfl⟩ List.prefix_rfl ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, rfl, List.cons_ne_nil _ _, Nat.zero_le _⟩ rfl
+  have denied1 := denied0.extend refusal1
+  have refusal2 := Next.rejectCapacity (s := stateAt denied1)
     (e := 1) (k := 2) (revision := 1) (reason := .tooLarge) (caller := 1) (payloads := [7, 8]) (head := 0)
-    rfl ⟨first, rfl, rfl⟩ List.prefix_rfl ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, rfl, List.cons_ne_nil _ _, by decide⟩ rfl)
+    rfl ⟨first, rfl, rfl⟩ List.prefix_rfl ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, rfl, List.cons_ne_nil _ _, Nat.zero_le _⟩ rfl
+  have denied2 := denied1.extend refusal2
   have result := reuse_after_capacity denied2 rfl (by
     intro k
     have bound := k.isLt
     have cases : k = 0 ∨ k = 1 ∨ k = 2 := by
       simp only [Fin.ext_iff]
       omega
-    rcases cases with rfl | rfl | rfl <;> decide) (Nat.le_refl 0) rfl rfl
-  exact ⟨_, result⟩
+    rcases cases with rfl | rfl | rfl <;> (simp only [stateAt]; decide)) (Nat.le_refl 0) rfl rfl
+  obtain ⟨after, reused, facts⟩ := result
+  exact ⟨_, _, after, reused, assigned, wire_append_at_empty assigned ⟨first, rfl, rfl⟩ rfl rfl,
+    ⟨_, _, refusal0, refusal1, refusal2⟩, facts⟩
+
+theorem capacity_discard_witness :
+    ∃ before after reused : State Nat, StreamIO.Reachable before ∧
+      (before.pending 1).payloads = [7, 8] ∧ Next before (.discard 1) after ∧
+      Next after (.assign 1 [9]) reused ∧ (reused.pending 1).payloads = [9] ∧
+      reused.writer.issued 1 = [] := by
+  obtain ⟨_, before, after, reused, _, _, _, reach, pending, discarded, assigned, bytes, issued, _⟩ :=
+    capacity_reassignment_witness
+  exact ⟨before, after, reused, reach, pending, discarded, assigned, bytes, issued⟩
 
 #print axioms automaton_witness
+#print axioms capacity_reassignment_witness
 #print axioms capacity_discard_witness
 
 end Logkeeper.StreamIOWitness

@@ -337,9 +337,9 @@ theorem definitive_refusal_keeps_durable_state {s next : State Payload} {epoch r
     sends in the monotone issued-history model, even if all earlier replies refused. -/
 theorem issued_position_cannot_be_reassigned {before after : Writer Payload}
     (growth : Grows before after) {source target : Keeper Payload} {caller epoch position : Nat}
-    {old new : Payload}
-    (first : Sendable before source caller (.append epoch position [old] 0))
-    (second : Sendable after target caller (.append epoch position [new] 0)) : old = new := by
+    {old new : Payload} {oldRest newRest : List Payload}
+    (first : Sendable before source caller (.append epoch position (old :: oldRest) 0))
+    (second : Sendable after target caller (.append epoch position (new :: newRest) 0)) : old = new := by
   have oldAt : (before.issued epoch)[position - 1]? = some ⟨epoch, old⟩ := by
     have exactSlice := congrArg (fun (h : History Payload) => h[0]?) first.2.2.1
     simpa [stamp, List.getElem?_take, List.getElem?_drop] using exactSlice.symm
@@ -350,6 +350,16 @@ theorem issued_position_cannot_be_reassigned {before after : Writer Payload}
   rw [← issuedExtension, List.getElem?_append_left (List.getElem?_eq_some_iff.mp oldAt).1, oldAt] at newAt
   exact congrArg Record.payload (Option.some.inj newAt)
 
+/-- The reachable capacity-reassignment witness cannot interpret both wire
+    sends as sends in the monotonically growing issued history. -/
+theorem ordinary_sends_exclude_capacity_reassignment {before after : Writer Nat}
+    (growth : Grows before after) {source target : Keeper Nat}
+    (first : Sendable before source 1 (.append 1 1 [7, 8] 0))
+    (second : Sendable after target 1 (.append 1 1 [9] 0)) : False := by
+  have impossible := issued_position_cannot_be_reassigned growth first second
+  exact (by decide : 7 ≠ 9) impossible
+
+#print axioms ordinary_sends_exclude_capacity_reassignment
 #print axioms dispatch_sendable
 #print axioms append_dispatch_after_freeze
 #print axioms definitive_refusal_keeps_durable_state

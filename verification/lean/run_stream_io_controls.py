@@ -13,6 +13,26 @@ MODULES = HERE / "Logkeeper"
 
 # name: (original text, weakened text, theorem whose proof must fail first)
 IO_CONTROLS = {
+    "wire-append-advertises-pending-head": (
+        "(.append epoch start payloads head) ∧ head ≤ (s.writer.issued epoch).length",
+        "(.append epoch start payloads head) ∧ head ≤ ((extend s.writer epoch (s.pending epoch).payloads).issued epoch).length",
+        "wire_append_head_is_issued",
+    ),
+    "issue-drops-unissued-tail": (
+        "        { s.withPending e ((s.pending e).reset rest) with writer := extend s.writer e payloads }",
+        "        { s.withPending e ((s.pending e).reset []) with writer := extend s.writer e payloads }",
+        "wire_append_after_issue",
+    ),
+    "issue-too-short-for-wire-append": (
+        "    let count := position - 1 + payloads.length - (s.writer.issued epoch).length",
+        "    let count := position - 1 - (s.writer.issued epoch).length",
+        "issue_for_wire_append",
+    ),
+    "wire-deliver-a-different-append": (
+        "    let packet := Packet.call keeper caller request\n",
+        "    let packet := Packet.call keeper caller (Request.append epoch position payloads (head + 1))\n",
+        "wire_append_delivery",
+    ),
     "discard-after-minority-capacity-refusals": (
         "      (∀ k, (s.pending e).refused k ≠ none) →",
         "      (∃ k, (s.pending e).refused k ≠ none) →",
@@ -109,6 +129,11 @@ IO_CONTROLS = {
 }
 
 REPLACEMENT_CONTROLS = {
+    "send-learner-replace-after-one-install": (
+        "  | .installing first second, .learner => mayInstallLearner first second = true",
+        "  | .installing first second, .learner => (first || second) = true",
+        "sendable_learner_replace_has_installed_survivors",
+    ),
     "repair-chain-does-not-require-a-new-epoch": (
         "      StreamIO.Reachable next → old < epoch → SweepPublications s epoch round →",
         "      StreamIO.Reachable next → True → SweepPublications s epoch round →",

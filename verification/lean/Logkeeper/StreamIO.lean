@@ -291,6 +291,15 @@ def elect (w : Writer Payload) (e : Nat) (r : Round Payload) : Writer Payload :=
 def extend (w : Writer Payload) (e : Nat) (payloads : List Payload) : Writer Payload :=
   { w with issued := fun x => if x = e then w.issued e ++ stamp e payloads else w.issued x }
 
+/-- Appends can be dispatched from the assigned suffix before any keeper can
+    durably accept it. The durable automaton only admits ordinary sends after
+    the covering prefix has been issued. -/
+def WireSendable (s : State Payload) (k : KeeperId) (caller : Nat) : Request Payload → Prop
+  | .append epoch start payloads head =>
+      Sendable (extend s.writer epoch (s.pending epoch).payloads) (s.keeper k) caller
+        (.append epoch start payloads head) ∧ head ≤ (s.writer.issued epoch).length
+  | request => Sendable s.writer (s.keeper k) caller request
+
 def State.withSeal (s : State Payload) (e : Nat) (k : KeeperId) (report : Nat × Vote (Record Payload)) :
     State Payload :=
   { s with seals := fun x j => if x = e ∧ j = k then some report else s.seals x j }
@@ -1230,6 +1239,105 @@ theorem Reachable.call {s : State Payload} (reached : Reachable s) {k : KeeperId
     Reachable (({ s with net := .call k i req :: s.net } : State Payload).apply k i req) :=
   .extend (.extend reached (.send sendable)) (.deliver List.mem_cons_self admitted)
 
+theorem wire_append_head_is_issued {s : State Payload} {k : KeeperId}
+    {caller epoch position head : Nat} {payloads : List Payload}
+    (sent : WireSendable s k caller (.append epoch position payloads head)) :
+    head ≤ (s.writer.issued epoch).length :=
+  sent.2
+
+/-- Issuing the front of the assigned suffix preserves the view of the
+    assignments used by other in-flight appends. -/
+theorem wire_append_after_issue {s next : State Payload} {k : KeeperId}
+    {caller epoch position head : Nat} {payloads frozen : List Payload}
+    (sent : WireSendable s k caller (.append epoch position payloads head))
+    (issued : Next s (.issue epoch frozen) next) :
+    WireSendable next k caller (.append epoch position payloads head) := by
+  obtain ⟨⟨elected, within, exactBytes, headWithin, certified⟩, headIssued⟩ := sent
+  cases issued with
+  | @issue _ _ rest _ _ split =>
+    have same : ((extend (extend s.writer epoch frozen) epoch rest).issued epoch) =
+        ((extend s.writer epoch (s.pending epoch).payloads).issued epoch) := by
+      simp [extend, split, stamp, List.append_assoc]
+    refine ⟨⟨elected, ?_, ?_, ?_, ?_⟩, ?_⟩
+    · simpa [State.withPending, Pending.reset, same] using within
+    · simpa [State.withPending, Pending.reset, same] using exactBytes
+    · simpa [State.withPending, Pending.reset, same] using headWithin
+    · simp [State.withPending, Pending.reset, same]
+      change s.writer.advertised (((extend s.writer epoch (s.pending epoch).payloads).issued epoch).take head)
+      exact certified
+    · have grew : (s.writer.issued epoch).length ≤ ((extend s.writer epoch frozen).issued epoch).length := by
+        simp [extend]
+      exact Nat.le_trans headIssued grew
+
+/-- Freeze exactly the pending prefix needed by an Append that can reach a
+    durable decision. A definitive refusal can leave the assignment pending. -/
+theorem issue_for_wire_append {s : State Payload} {k : KeeperId}
+    {caller epoch position head : Nat} {payloads : List Payload}
+    (sendable : WireSendable s k caller (.append epoch position payloads head)) :
+    let count := position - 1 + payloads.length - (s.writer.issued epoch).length
+    let frozen := (s.pending epoch).payloads.take count
+    ∃ next, Next s (.issue epoch frozen) next ∧
+      Sendable next.writer (next.keeper k) caller (.append epoch position payloads head) := by
+  intro count frozen
+  obtain ⟨⟨⟨round, elected, owner⟩, within, exactBytes, _, certified⟩, headIssued⟩ := sendable
+  have electedBefore : s.writer.round epoch = some round := elected
+  let rest := (s.pending epoch).payloads.drop count
+  have split : (s.pending epoch).payloads = frozen ++ rest := (List.take_append_drop ..).symm
+  let next := { s.withPending epoch ((s.pending epoch).reset rest) with
+                writer := extend s.writer epoch frozen }
+  have assignedLength : ((extend s.writer epoch (s.pending epoch).payloads).issued epoch).length =
+      (s.writer.issued epoch).length + (s.pending epoch).payloads.length := by
+    simp [extend, stamp]
+  have enough : count ≤ (s.pending epoch).payloads.length := by
+    rw [assignedLength] at within
+    dsimp only [count]
+    omega
+  have frozenLength : frozen.length = count := by simp [frozen, Nat.min_eq_left enough]
+  have issuedLength : (next.writer.issued epoch).length = (s.writer.issued epoch).length + count := by
+    simp [next, extend, stamp, frozenLength]
+  have covered : position - 1 + payloads.length ≤ (next.writer.issued epoch).length := by
+    rw [issuedLength]
+    dsimp only [count]
+    omega
+  have headCovered : head ≤ (next.writer.issued epoch).length := by omega
+  have prefixed : next.writer.issued epoch <+: (extend s.writer epoch (s.pending epoch).payloads).issued epoch := by
+    have stamped : stamp epoch (s.pending epoch).payloads = stamp epoch frozen ++ stamp epoch rest := by
+      simpa only [stamp, List.map_append] using congrArg (stamp epoch) split
+    simp only [next, extend, stamped, ← List.append_assoc]
+    exact ⟨stamp epoch rest, rfl⟩
+  refine ⟨next, .issue electedBefore split, ⟨round, electedBefore, owner⟩, covered, ?_, headCovered, ?_⟩
+  · rw [exactBytes, List.take_drop, List.take_drop, take_of_prefix prefixed covered]
+  · rw [take_of_prefix prefixed headCovered]
+    exact certified
+
+/-- A new Append that reaches an admitted durable decision projects to an
+    issue, ordinary send, and delivery of the exact wire request. -/
+theorem wire_append_delivery {s : State Payload} {keeper : KeeperId}
+    {caller epoch position head : Nat} {payloads : List Payload}
+    (sent : WireSendable s keeper caller (.append epoch position payloads head))
+    (admitted : Admitted (s.keeper keeper) caller (.append epoch position payloads head)) :
+    let request := Request.append epoch position payloads head
+    let packet := Packet.call keeper caller request
+    ∃ frozen afterIssue afterSend,
+      Next s (.issue epoch frozen) afterIssue ∧
+      Next afterIssue (.send packet) afterSend ∧
+      Next afterSend (.deliver packet) (afterSend.apply keeper caller request) := by
+  intro request packet
+  obtain ⟨afterIssue, issue, ready⟩ := issue_for_wire_append sent
+  have unchanged : afterIssue.keeper = s.keeper := by cases issue; rfl
+  let afterSend := { afterIssue with net := packet :: afterIssue.net }
+  have send : Next afterIssue (.send packet) afterSend := .send ready
+  have deliver : Next afterSend (.deliver packet) (afterSend.apply keeper caller request) := by
+    refine .deliver (.head _) ?_
+    change Admitted (afterIssue.keeper keeper) caller request
+    rw [unchanged]
+    exact admitted
+  exact ⟨_, afterIssue, afterSend, issue, send, deliver⟩
+
+#print axioms wire_append_delivery
+#print axioms wire_append_head_is_issued
+#print axioms wire_append_after_issue
+#print axioms issue_for_wire_append
 #print axioms capacity_refusal_excludes_retry
 #print axioms discard_preserves_pending_evidence
 #print axioms step_mono
