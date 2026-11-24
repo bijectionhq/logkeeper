@@ -70,3 +70,17 @@ pub enum Refusal {
     Deleted,
     Unauthorized,
 }
+
+/// A transport failure. The request may or may not have taken effect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransportError {
+    Unreachable,
+    TimedOut,
+    Protocol(String),
+}
+
+/// How the writer reaches keepers. The keeper side owns the TCP implementation (`src/stream/transport.rs`);
+/// tests and simulation use in-memory implementations.
+pub trait Transport: Send + Sync {
+    fn call(&self, keeper: KeeperId, request: Request) -> journal_contract::BoxFuture<'_, Result<Reply, TransportError>>;
+}

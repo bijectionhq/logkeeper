@@ -111,6 +111,19 @@ These are not Logkeeper's job, but the journal must not prevent them:
 
 Logkeeper ships its own binary (`logkeeper keeper --config FILE`), its own image and its own infrastructure module, which places three keepers in three zones on local disks and outputs a `journal_url`. A consumer receives only the `journal_url` and credentials, and never sees keepers, zones or subnets.
 
+### Formats shared by the keeper, writer and deployment
+
+`journal_url`: `logkeeper+tls://HOST:PORT,HOST:PORT,HOST:PORT`, listing the cluster's keepers. A keeper's identity (`KeeperId`) is the UUID in its certificate's URI SAN `urn:logkeeper:keeper:UUID`. The client presents its own certificate, key and CA separately. `create` uses the first three keepers as the ensemble unless one is given.
+
+Keeper configuration (JSON, `logkeeper keeper --config FILE`):
+
+```json
+{ "keeper": "UUID", "listen": "0.0.0.0:5448", "data": "/var/lib/logkeeper", "zone": "eu-north-1a",
+  "tls": { "certificate": "PATH", "private_key": "PATH", "ca": "PATH" },
+  "clients": ["urn:logkeeper:client:NAME"],
+  "limits": { "stream_quota_bytes": 8589934592, "max_record_bytes": 33554432, "round_bytes_per_stream": 4194304 } }
+```
+
 ## 6. Verification
 
 - **Lean.** The per-stream keeper and writer protocol refines `PrefixAgreement` and `DurableAcceptor`. The ledger maps directly:
