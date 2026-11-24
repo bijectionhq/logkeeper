@@ -1,3 +1,4 @@
+use super::rules::{AcceptBallot, accept_ballot, depose_prepare};
 use super::{
     Accepted, Ballot, Error, Fingerprint, Group, Prefix, Promise, RepairSeed, Replica, SlotImage,
     SlotPair, Vote,
@@ -366,7 +367,7 @@ impl Inner {
         self.check(group, ballot)?;
         let mut media = self.media.lock();
         let current = &media.selected.as_ref().ok_or(Error::Stopped)?.state;
-        if let Some(promised) = current.promised.filter(|promised| *promised > ballot) {
+        if let Some(promised) = current.promised.filter(|promised| depose_prepare(Some(promised.rank()), ballot.rank())) {
             return Err(Error::Deposed(promised));
         }
         let accepted = current.accepted.clone();
@@ -399,10 +400,10 @@ impl Inner {
         let digest = prefix.identity(group);
         let mut media = self.media.lock();
         let current = &media.selected.as_ref().ok_or(Error::Stopped)?.state;
-        match current.promised {
-            Some(promised) if promised > ballot => return Err(Error::Deposed(promised)),
-            Some(promised) if promised == ballot => {}
-            _ => return Err(Error::Group),
+        match accept_ballot(current.promised.map(Ballot::rank), ballot.rank()) {
+            AcceptBallot::Deposed => return Err(Error::Deposed(current.promised.unwrap())),
+            AcceptBallot::Promised => {}
+            AcceptBallot::Unprepared => return Err(Error::Group),
         }
         if current
             .accepted

@@ -8,6 +8,7 @@
 mod disk;
 mod evidence;
 mod rotation;
+mod rules;
 pub mod transport;
 
 pub use disk::DurableVoter;
@@ -29,6 +30,12 @@ use uuid::Uuid;
 pub struct Ballot {
     pub round: u64,
     pub nonce: Uuid,
+}
+
+impl Ballot {
+    fn rank(self) -> rules::BallotRank {
+        (self.round, self.nonce.as_u128())
+    }
 }
 
 #[derive(Clone)]
