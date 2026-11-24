@@ -274,6 +274,12 @@ pub enum Command {
         from: u64,
         through: u64,
     },
+    /// Admit one previously published root and its exact retained suffix together.
+    ProtectCheckpoint {
+        root: Fingerprint,
+        from: u64,
+        through: u64,
+    },
     ProtectRoot {
         source: Hold,
     },
@@ -938,6 +944,40 @@ impl State {
         )
     }
 
+    fn protect_checkpoint(
+        &mut self,
+        principal: Principal,
+        id: RequestId,
+        root: Fingerprint,
+        from: u64,
+        through: u64,
+    ) -> Result<Hold, Refusal> {
+        let Principal::Worker(enrollment) = principal else {
+            return Err(Refusal::Unauthorized);
+        };
+        if self.roster.get(&enrollment.worker) != Some(&enrollment) {
+            return Err(Refusal::Stale);
+        }
+        let checkpoint = std::iter::once(self.checkpoint)
+            .chain(self.old_roots.values().map(|entry| entry.checkpoint))
+            .chain(self.holds.values().map(|entry| entry.hold.checkpoint))
+            .find(|candidate| {
+                candidate.root == root && candidate.cut.next_lsn == from
+                    && self.checkpoint_open(*candidate)
+            })
+            .ok_or(Refusal::Unavailable)?;
+        let start = checkpoint.cut;
+        let end = if from == through {
+            start
+        } else {
+            if from > through || self.cut(from) != Some(start) {
+                return Err(Refusal::Unavailable);
+            }
+            self.cut(through).ok_or(Refusal::Unavailable)?
+        };
+        self.admit_hold(principal, id, enrollment, checkpoint, start, end, HoldKind::Ordinary)
+    }
+
     fn admit_hold(
         &mut self,
         origin: Principal,
@@ -1334,6 +1374,10 @@ impl State {
                 let start = self.cut(from).ok_or(Refusal::Unavailable)?;
                 let through = self.cut(through).ok_or(Refusal::Unavailable)?;
                 let hold = self.protect_range(principal, id, enrollment, start, through)?;
+                Ok(Outcome::Protected(hold))
+            }
+            Command::ProtectCheckpoint { root, from, through } => {
+                let hold = self.protect_checkpoint(principal, id, root, from, through)?;
                 Ok(Outcome::Protected(hold))
             }
             Command::ProtectRoot { source } => {

@@ -156,6 +156,12 @@ impl Request {
                 output.put_u64(*from);
                 output.put_u64(*through);
             }
+            Command::ProtectCheckpoint { root, from, through } => {
+                output.put_u8(27);
+                output.put_slice(root);
+                output.put_u64(*from);
+                output.put_u64(*through);
+            }
             Command::ProtectRoot { source } => {
                 output.put_u8(12);
                 hold_row(&mut output, *source);
@@ -239,6 +245,11 @@ impl Request {
                 window: input.window()?,
             },
             11 => Command::ProtectRange {
+                from: input.u64()?,
+                through: input.u64()?,
+            },
+            27 => Command::ProtectCheckpoint {
+                root: input.take()?,
                 from: input.u64()?,
                 through: input.u64()?,
             },

@@ -1732,3 +1732,74 @@ fn compact_image_rejects_a_hold_without_its_exact_admission_receipt() {
         Err(Refusal::Invalid)
     ));
 }
+
+#[test]
+fn exact_snapshot_hold_pins_an_older_checkpoint_and_its_suffix() {
+    let initial = codec_initial_state();
+    let mut state = initial.clone();
+    let enrollment = enroll(&mut state);
+    let worker = Principal::Worker(enrollment);
+    let custodian = Principal::Custodian;
+    let (grant, _) = grant(&mut state, enrollment);
+
+    let publish = |state: &mut State, revision: u64| {
+        let expected_next = state.head.next_lsn;
+        let Ok(Outcome::Appended(boundary)) = apply(state, worker, Command::Append {
+            references: Some(Vec::new()),
+            class: AppendClass::Data,
+            grant,
+            expected_next,
+            timestamp: revision as i64,
+            payload: Bytes::from_static(b"snapshot"),
+        }).outcome else { panic!("append failed"); };
+        let checkpoint = Checkpoint {
+            cut: boundary.cut,
+            root: [revision as u8; 32],
+            manifest: [9; 32],
+            custody: Custody { allocation: Uuid::new_v4(), revision, provider: [7; 32] },
+        };
+        let preparation = CheckpointPreparation {
+            erasure: false,
+            checkpoint: checkpoint.cut,
+            root: checkpoint.root,
+            source: grant,
+            base: state.checkpoint(),
+            custody: checkpoint.custody,
+            usable_bytes: 256,
+            descriptor: [11; 32],
+        };
+        assert_eq!(apply(state, custodian, Command::PrepareCheckpoint {
+            preparation, references: Some(Vec::new()),
+        }).outcome, Ok(Outcome::CheckpointPrepared(preparation)));
+        assert_eq!(apply(state, custodian, Command::Publish { checkpoint }).outcome,
+            Ok(Outcome::Published(checkpoint)));
+        checkpoint
+    };
+
+    let older = publish(&mut state, 2);
+    let newer = publish(&mut state, 3);
+    let command = Command::ProtectCheckpoint {
+        root: older.root, from: older.cut.next_lsn, through: newer.cut.next_lsn,
+    };
+    assert_eq!(apply(&mut state, Principal::RouteReader, command.clone()).outcome, Err(Refusal::Unauthorized));
+    assert_eq!(apply(&mut state, worker, Command::ProtectCheckpoint {
+        root: newer.root, from: older.cut.next_lsn, through: newer.cut.next_lsn,
+    }).outcome, Err(Refusal::Unavailable));
+
+    let request = Request {
+        id: RequestId::fresh(state.position(), state.limits.retry_positions).unwrap(),
+        principal: worker, placement: state.placement(), command: command.clone(),
+    };
+    assert_eq!(Request::decode(request.encode()).unwrap(), request);
+    let Ok(Outcome::Protected(hold)) = apply(&mut state, worker, command.clone()).outcome
+        else { panic!("the older checkpoint was not protected"); };
+    assert_eq!((hold.checkpoint, hold.start, hold.through), (older, older.cut, newer.cut));
+    let mut replacement = State::decode_base(&initial, state.encode_base()).unwrap();
+    assert_eq!(replacement.held_replay(worker, hold).unwrap().records().count(), 1);
+    assert_eq!(apply(&mut replacement, custodian, Command::CloseCheckpoint { checkpoint: older }).outcome,
+        Err(Refusal::Unavailable));
+    assert_eq!(apply(&mut replacement, worker, Command::Release { hold }).outcome, Ok(Outcome::Released));
+    assert_eq!(apply(&mut replacement, custodian, Command::CloseCheckpoint { checkpoint: older }).outcome,
+        Ok(Outcome::CheckpointClosed(older)));
+    assert_eq!(apply(&mut replacement, worker, command).outcome, Err(Refusal::Unavailable));
+}
