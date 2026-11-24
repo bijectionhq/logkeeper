@@ -473,6 +473,7 @@ fn trace_row(
             "replace",
             format!("{} {} {}", epoch.0, ensemble(from), ensemble(to)),
         ),
+        Request::Batch(_) => unreachable!("the simulator delivers single requests"),
     };
     let mut row = format!(
         "{verb} {} {} {caller} {before} {after} {fields}",
@@ -503,6 +504,7 @@ fn trace_row(
             }
             Reply::Deleted => row.push_str(" 8"),
             Reply::Replaced => row.push_str(" 9"),
+            Reply::Batch(_) => unreachable!("the simulator delivers single requests"),
         },
     }
     row
