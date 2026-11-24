@@ -11,6 +11,28 @@ use std::{fmt, future::Future, pin::Pin, time::Duration};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub u128);
 
+/// The caller identity associated with a journal handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Identity(pub u128);
+
+/// Static payload limits for every stream in a reference journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum size in bytes of a single record.
+    pub max_record_bytes: usize,
+    /// Maximum total payload bytes retained by a stream.
+    pub stream_quota_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_record_bytes: 32 * 1024 * 1024,
+            stream_quota_bytes: 8 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
 /// The writer fence. A stream accepts appends only under its sealed epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Epoch(pub u64);
