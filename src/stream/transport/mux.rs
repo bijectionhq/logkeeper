@@ -20,7 +20,7 @@ use tokio_rustls::TlsConnector;
 
 use super::{Channel, connect, connection_error, protocol};
 use crate::stream::{
-    codec::{batched_request_len, decode_reply, encode_request, read_frame, write_frame},
+    codec::{batched_request_len, decode_reply, read_frame, request_write::RequestWrite},
     wire::{KeeperId, Reply, Request, TransportError},
 };
 
@@ -224,8 +224,8 @@ async fn send(
             1 => requests.into_iter().next().unwrap(),
             _ => Request::Batch(requests),
         };
-        let body = match encode_request(&request) {
-            Ok(body) => body,
+        let request = match RequestWrite::preflight(request) {
+            Ok(request) => request,
             Err(error) => {
                 fail(replies, TransportError::Protocol(error.to_string()));
                 continue;
@@ -235,8 +235,9 @@ async fn send(
             fail(replies, TransportError::Unreachable);
             return TransportError::Unreachable;
         };
+        // Register the ordered reply slot before any bytes from this frame are sent.
         permit.send(replies);
-        if let Err(error) = write_frame(&mut write, &body).await {
+        if let Err(error) = request.write(&mut write).await {
             return connection_error(error);
         }
     }
