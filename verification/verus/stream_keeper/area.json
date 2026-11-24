@@ -1,5 +1,5 @@
 {
-  "summary": "Verify keeper admission, head bounds, and reply projections over the primitive shipped rules.",
+  "summary": "Verify keeper rules, retained range arithmetic, and Sync staging cut calculations.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 30,
+  "min_verified_functions": 39,
   "controls": {
     "reuse-deleted-stream": {
       "defect": "Create passes a tombstone.",
@@ -572,6 +572,132 @@
         }
       ],
       "min_verified_functions": 29
+    },
+    "quota-charge-wraps": {
+      "defect": "quota charge wraps",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    used.saturating_add(charge)",
+          "replace": "    used.wrapping_add(charge)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "add_charge",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 35
+    },
+    "retained-cut-ignores-floor": {
+      "defect": "retained cut ignores floor",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    at.saturating_sub(floor).min(count as u64) as usize",
+          "replace": "    at.min(count as u64) as usize"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "retained_offset",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 35
+    },
+    "retained-index-accepts-exclusive-end": {
+      "defect": "retained index accepts exclusive end",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    if index < count {",
+          "replace": "    if index <= count {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "retained_index",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 35
+    },
+    "run-lookup-drops-last-position": {
+      "defect": "run lookup drops last position",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    first <= at && at <= last",
+          "replace": "    first <= at && at < last"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "epoch_run_contains",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 35
+    },
+    "sync-start-overwrites-head": {
+      "defect": "sync start overwrites head",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "        .max(head.saturating_add(1))",
+          "replace": "        .max(head)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "sync_start",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 35
+    },
+    "staged-prefix-drops-its-end-cut": {
+      "defect": "staged prefix drops its end cut",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    if keep <= count as u64 {",
+          "replace": "    if keep < count as u64 {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "staged_prefix",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 35
+    },
+    "ignore-first-record-charge": {
+      "defect": "Quota accumulation omits the first record.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "        used = add_charge(used, charge);",
+          "replace": "        used = add_charge(used, if index > 0 { charge } else { 0 });"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "quota_charge",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 38
     }
   }
 }

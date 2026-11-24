@@ -25,7 +25,12 @@ pub(super) fn seal_matches(same_owner: bool, stored: u128, requested: u128) -> b
     ensures out == (epoch <= promised && first == next && first <= last && last <= tail)
 ))]
 pub(super) fn valid_epoch_run(
-    epoch: u64, promised: u64, first: u64, last: u64, next: u64, tail: u64,
+    epoch: u64,
+    promised: u64,
+    first: u64,
+    last: u64,
+    next: u64,
+    tail: u64,
 ) -> bool {
     epoch <= promised && first == next && first <= last && last <= tail
 }
@@ -35,6 +40,77 @@ pub(super) fn valid_epoch_run(
 ))]
 pub(super) fn record_charge(len: usize) -> u64 {
     len.max(1) as u64
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if used as int + charge as int > 18446744073709551615 {
+        18446744073709551615u64
+    } else {
+        (used as int + charge as int) as u64
+    }
+))]
+pub(super) fn add_charge(used: u64, charge: u64) -> u64 {
+    used.saturating_add(charge)
+}
+
+/// A cut in the records, clipped to either end of the retained range.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if at < floor { 0 }
+        else if at as int - floor as int > count as int { count }
+        else { (at as int - floor as int) as usize }
+))]
+pub(super) fn retained_offset(floor: u64, count: usize, at: u64) -> usize {
+    at.saturating_sub(floor).min(count as u64) as usize
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if floor <= at && (at as int - floor as int) < count as int {
+        Some((at as int - floor as int) as usize)
+    } else {
+        None
+    }
+))]
+pub(super) fn retained_index(floor: u64, count: usize, at: u64) -> Option<usize> {
+    if at < floor {
+        return None;
+    }
+    let index = retained_offset(floor, count, at);
+    if index < count { Some(index) } else { None }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (first <= at && at <= last)))]
+pub(super) fn epoch_run_contains(first: u64, last: u64, at: u64) -> bool {
+    first <= at && at <= last
+}
+
+/// The first incoming position that can replace local history.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if head >= from && head >= requested_floor && head >= floor {
+        if head == 18446744073709551615 { head } else { (head as int + 1) as u64 }
+    } else if from >= requested_floor && from >= floor { from }
+    else if requested_floor >= floor { requested_floor } else { floor }
+))]
+pub(super) fn sync_start(from: u64, requested_floor: u64, floor: u64, head: u64) -> u64 {
+    from.max(requested_floor)
+        .max(floor)
+        .max(head.saturating_add(1))
+}
+
+/// Number of existing staged records to keep when replacing the suffix at `start`.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if from <= start && start as int - from as int <= count as int {
+        Some((start as int - from as int) as usize)
+    } else {
+        None
+    }
+))]
+pub(super) fn staged_prefix(from: u64, count: usize, start: u64) -> Option<usize> {
+    let keep = start.checked_sub(from)?;
+    if keep <= count as u64 {
+        Some(keep as usize)
+    } else {
+        None
+    }
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (from > head || identical)))]
@@ -147,8 +223,64 @@ pub(crate) fn decide_replace(
 pub use implementation::Limits;
 #[cfg(not(verus_keep_ghost))]
 pub(super) use implementation::{
-    Decision, StreamView, decide, installs_floor, promised, sync_start, valid_limits,
+    Decision, StreamView, decide, installs_floor, promised, valid_limits,
 };
+
+#[cfg(verus_keep_ghost)]
+verus! {
+    pub type Lengths = spec_fn(int) -> nat;
+
+    pub(super) open spec fn quota_total(lengths: spec_fn(int) -> nat, count: nat) -> nat
+        decreases count,
+    {
+        if count == 0 {
+            0
+        } else {
+            let last = lengths(count as int - 1);
+            quota_total(lengths, (count - 1) as nat) + if last == 0 { 1 } else { last }
+        }
+    }
+
+    pub(super) open spec fn clamp_quota(total: nat) -> nat {
+        if total > u64::MAX as nat { u64::MAX as nat } else { total }
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires
+        forall|i: usize| i < count ==> #[trigger] call_requires(length, (i,)),
+        forall|i: usize, n: usize| i < count && #[trigger] call_ensures(length, (i,), n)
+            ==> n as nat == lengths@(i as int),
+    ensures out as nat == clamp_quota(quota_total(lengths@, count as nat)),
+))]
+pub(super) fn quota_charge(
+    count: usize,
+    length: impl Fn(usize) -> usize,
+    #[cfg(verus_keep_ghost)] lengths: Ghost<Lengths>,
+) -> u64 {
+    let mut used = 0;
+    let mut index = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            index <= count,
+            forall|i: usize| i < count ==> #[trigger] call_requires(length, (i,)),
+            forall|i: usize, n: usize| i < count && #[trigger] call_ensures(length, (i,), n)
+                ==> n as nat == lengths@(i as int),
+            used as nat == clamp_quota(quota_total(lengths@, index as nat)),
+        decreases count - index,
+    ))]
+    while index < count {
+        let charge = record_charge(length(index));
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            assert(quota_total(lengths@, (index + 1) as nat)
+                == quota_total(lengths@, index as nat) + charge as nat);
+        }
+        used = add_charge(used, charge);
+        index += 1;
+    }
+    used
+}
 
 #[cfg(not(verus_keep_ghost))]
 mod implementation {
@@ -246,9 +378,7 @@ mod implementation {
                 max: limits.max_record_bytes,
             }));
         }
-        let bytes = records
-            .iter()
-            .fold(retained, |sum, record| sum.saturating_add(record_charge(record.len())));
+        let bytes = add_charge(retained, quota_charge(records.len(), |i| records[i].len()));
         (bytes > limits.stream_quota_bytes).then(|| refuse(Refusal::Full { floor }))
     }
 
@@ -261,10 +391,6 @@ mod implementation {
             next = run.last.0 + 1;
         }
         next == tail.0 + 1
-    }
-
-    pub(crate) fn sync_start(state: &wire::StreamView, from: Lsn, floor: Lsn) -> Lsn {
-        from.max(state.floor).max(floor).max(Lsn(state.head.0 + 1))
     }
 
     pub(crate) fn installs_floor(state: &wire::StreamView, request: &Request) -> bool {
@@ -369,9 +495,10 @@ mod implementation {
                 let Some(tail) = last(*from, records.len()) else {
                     return refuse(Refusal::Gap { head: state.head });
                 };
-                let (floor, image_tail) = view
-                    .staged
-                    .map_or((*floor, state.tail), |(staged, tail)| (staged.max(*floor), tail));
+                let (floor, image_tail) =
+                    view.staged.map_or((*floor, state.tail), |(staged, tail)| {
+                        (staged.max(*floor), tail)
+                    });
                 if floor.0 == 0 || floor > *from || *from < state.floor {
                     return refuse(Refusal::BelowFloor { floor: state.floor });
                 }
@@ -398,14 +525,10 @@ mod implementation {
                         refuse(Refusal::Conflict { head: state.head })
                     };
                 }
-                let skip = (sync_start(state, *from, floor).0 - from.0).min(records.len() as u64);
-                capacity(
-                    &records[skip as usize..],
-                    view.retained_bytes,
-                    state.floor,
-                    limits,
-                )
-                .unwrap_or(Decision::Persist)
+                let start = sync_start(from.0, floor.0, state.floor.0, state.head.0);
+                let skip = retained_offset(from.0, records.len(), start);
+                capacity(&records[skip..], view.retained_bytes, state.floor, limits)
+                    .unwrap_or(Decision::Persist)
             }
             Request::Append {
                 epoch,

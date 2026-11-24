@@ -477,6 +477,63 @@ fn staged_floor_skips_the_retained_history_on_completion() {
 }
 
 #[test]
+fn sync_charges_only_the_retained_and_staged_prefixes_it_keeps() {
+    let mut test = Harness::new(Limits {
+        stream_quota_bytes: 4,
+        ..Limits::default()
+    });
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"a", b"bb"], 1));
+    test.send(seal(A, 2));
+    assert_eq!(
+        test.send(sync(A, 2, 2, &[b"c", b"dd"], 1, false)),
+        Reply::Synced { tail: Lsn(2) },
+        "Sync replaces the uncommitted retained suffix"
+    );
+    assert_eq!(
+        test.send(sync(A, 2, 3, &[b"eee"], 1, false)),
+        Reply::Refused(Refusal::Full { floor: Lsn(1) }),
+        "quota includes the staged prefix"
+    );
+    assert_eq!(
+        test.send(sync(A, 2, 3, &[b"ff"], 1, true)),
+        Reply::Synced { tail: Lsn(3) },
+        "quota excludes the replaced staged suffix"
+    );
+    assert_eq!(
+        test.send(recover(A, 2, 1)),
+        page(1, 1, &[(1, b"a"), (2, b"c"), (3, b"ff")])
+    );
+}
+
+#[test]
+fn complete_sync_can_skip_past_an_empty_keeper() {
+    let mut test = Harness::new(Limits::default());
+    assert_eq!(test.send(create(A)), Reply::Created);
+    assert!(matches!(test.send(seal(A, 1)), Reply::Sealed(_)));
+    let request = Request::Sync {
+        stream: A,
+        epoch: Epoch(1),
+        floor: Lsn(2),
+        from: Lsn(2),
+        records: vec![],
+        runs: vec![],
+        head: Lsn(1),
+        complete: true,
+    };
+    assert_eq!(
+        test.send(request),
+        Reply::Synced { tail: Lsn(1) },
+        "the skipped prefix is absent from the request and local history"
+    );
+    let Reply::Checked(view) = test.send(check(A)) else {
+        panic!("missing stream");
+    };
+    assert_eq!((view.floor, view.head, view.tail), (Lsn(2), Lsn(1), Lsn(1)));
+    assert!(view.runs.is_empty());
+}
+
+#[test]
 fn append_requires_current_sync_next_position_or_an_identical_retry() {
     let mut test = Harness::new(Limits {
         stream_quota_bytes: 4,

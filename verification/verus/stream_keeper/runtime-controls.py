@@ -15,6 +15,20 @@ TLS_TEST = "stream::transport::tests::loopback_mtls_checks_certificate_authority
 # name, source, existing text, substituted text, exact test, expected panic text
 CONTROLS = [
     (
+        "ignore-staged-prefix-charge", "keeper/state.rs",
+        "range_charge(&staging.records, staging.from, first, end),",
+        "0,",
+        KEEPER_TEST + "sync_charges_only_the_retained_and_staged_prefixes_it_keeps",
+        "quota includes the staged prefix",
+    ),
+    (
+        "reject-sync-at-skipped-floor", "keeper/rules.rs",
+        "if *from > Lsn(image_tail.0 + 1) && *from != floor {",
+        "if *from > Lsn(image_tail.0 + 1) {",
+        KEEPER_TEST + "complete_sync_can_skip_past_an_empty_keeper",
+        "the skipped prefix is absent from the request and local history",
+    ),
+    (
         "one-sync-per-request", "keeper/mod.rs",
         "            let identity = work.seal_identity().cloned();",
         "            self.wal.write_round(&buffer)?;\n            buffer.clear();\n"

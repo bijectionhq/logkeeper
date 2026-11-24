@@ -141,10 +141,13 @@ pub(super) fn decide(
     limits: &Limits,
     reader: &mut ExtentReader,
 ) -> io::Result<Decision> {
-    let (identical, retained_bytes) = state
-        .map(|state| state.facts(request, identity, reader))
-        .transpose()?
-        .unwrap_or((false, 0));
+    let (identical, retained_bytes) = match state {
+        Some(state) => (
+            state.matches_retained(request, identity, reader)?,
+            state.retained_charge(request),
+        ),
+        None => (false, 0),
+    };
     let view = rules::StreamView {
         keeper,
         durable: state.map(|state| &state.view),
@@ -214,20 +217,18 @@ impl Stream {
         })
     }
 
-    /// Compare the retained overlap and calculate the charge of the prefix that a Sync will keep.
-    fn facts(
+    fn matches_retained(
         &self,
         request: &Request,
         identity: &Identity,
         reader: &mut ExtentReader,
-    ) -> io::Result<(bool, u64)> {
-        let (from, records, runs, epoch, match_through, bytes) = match request {
+    ) -> io::Result<bool> {
+        let (from, records, runs, epoch, through) = match request {
             Request::Append {
                 at, records, epoch, ..
-            } => (*at, records, None, *epoch, self.view.tail, self.bytes),
+            } => (*at, records, None, *epoch, self.view.tail),
             Request::Sync {
                 from,
-                floor,
                 records,
                 runs,
                 epoch,
@@ -238,35 +239,34 @@ impl Stream {
                 } else {
                     self.view.head
                 };
-                let floor = self.staged_floor(*floor);
-                let start = rules::sync_start(&self.view, *from, floor);
-                let bytes = self.image_bytes(self.view.floor.max(floor), start);
-                (*from, records, Some(runs), *epoch, through, bytes)
+                (*from, records, Some(runs), *epoch, through)
             }
-            _ => return Ok((true, self.bytes)),
+            _ => return Ok(true),
         };
         if !rules::promised(&self.view, epoch, identity) || from < self.view.floor {
-            return Ok((false, bytes));
+            return Ok(false);
         }
         let mut remaining_runs = runs.into_iter().flatten().peekable();
         for (index, payload) in records.iter().enumerate() {
             let Some(position) = from.0.checked_add(index as u64) else {
-                return Ok((false, bytes));
+                return Ok(false);
             };
             let lsn = Lsn(position);
-            if lsn > match_through {
+            if lsn > through {
                 break;
             }
-            let Some(stored) = self.records.get((lsn.0 - self.view.floor.0) as usize) else {
-                return Ok((false, bytes));
+            let Some(offset) = rules::retained_index(self.view.floor.0, self.records.len(), lsn.0)
+            else {
+                return Ok(false);
             };
+            let stored = &self.records[offset];
             let expected = if runs.is_some() {
                 while remaining_runs.peek().is_some_and(|run| run.last < lsn) {
                     remaining_runs.next();
                 }
                 remaining_runs
                     .peek()
-                    .filter(|run| run.first <= lsn)
+                    .filter(|run| rules::epoch_run_contains(run.first.0, run.last.0, lsn.0))
                     .map(|run| run.epoch)
             } else {
                 Some(epoch)
@@ -275,10 +275,20 @@ impl Stream {
                 || payload.len() != stored.len()
                 || *payload != stored.read(reader)?
             {
-                return Ok((false, bytes));
+                return Ok(false);
             }
         }
-        Ok((true, bytes))
+        Ok(true)
+    }
+
+    /// The charge already used by the records that the request will keep.
+    fn retained_charge(&self, request: &Request) -> u64 {
+        let Request::Sync { from, floor, .. } = request else {
+            return self.bytes;
+        };
+        let floor = self.staged_floor(*floor);
+        let start = rules::sync_start(from.0, floor.0, self.view.floor.0, self.view.head.0);
+        self.image_charge(self.view.floor.max(floor), Lsn(start))
     }
 
     fn staged_floor(&self, floor: Lsn) -> Lsn {
@@ -288,38 +298,21 @@ impl Stream {
     }
 
     /// The charge of the positions in `[first, end)` of the history an incomplete Sync builds.
-    fn image_bytes(&self, first: Lsn, end: Lsn) -> u64 {
+    fn image_charge(&self, first: Lsn, end: Lsn) -> u64 {
         let Some(staging) = &self.staging else {
-            return self.bytes_between(first, end);
+            return range_charge(&self.records, self.view.floor, first, end);
         };
-        let index = |lsn: Lsn| lsn.0.saturating_sub(staging.from.0) as usize;
-        let end_index = index(end).min(staging.records.len());
-        self.bytes_between(first, end.min(staging.from))
-            + staging
-                .records
-                .range(index(first).min(end_index)..end_index)
-                .map(|record| rules::record_charge(record.len()))
-                .sum::<u64>()
-    }
-
-    fn bytes_between(&self, first: Lsn, tail: Lsn) -> u64 {
-        let offset = |lsn: Lsn| {
-            lsn.0
-                .saturating_sub(self.view.floor.0)
-                .min(self.records.len() as u64) as usize
-        };
-        let tail = offset(tail);
-        self.records
-            .range(offset(first).min(tail)..tail)
-            .map(|record| rules::record_charge(record.len()))
-            .sum()
+        rules::add_charge(
+            range_charge(&self.records, self.view.floor, first, end.min(staging.from)),
+            range_charge(&staging.records, staging.from, first, end),
+        )
     }
 
     fn discard_before(&mut self, floor: Lsn) {
         if floor <= self.view.floor {
             return;
         }
-        let count = (floor.0 - self.view.floor.0).min(self.records.len() as u64) as usize;
+        let count = rules::retained_offset(self.view.floor.0, self.records.len(), floor.0);
         for record in self.records.drain(..count) {
             self.bytes -= rules::record_charge(record.len());
         }
@@ -332,7 +325,7 @@ impl Stream {
     }
 
     fn truncate(&mut self, from: Lsn) {
-        let keep = (from.0 - self.view.floor.0).min(self.records.len() as u64) as usize;
+        let keep = rules::retained_offset(self.view.floor.0, self.records.len(), from.0);
         for record in self.records.drain(keep..) {
             self.bytes -= rules::record_charge(record.len());
         }
@@ -398,7 +391,9 @@ impl Stream {
                 self.view.learner = !ensemble.contains(&keeper);
                 Ok(Reply::Created)
             }
-            Request::Seal { epoch, proposal, .. } => {
+            Request::Seal {
+                epoch, proposal, ..
+            } => {
                 self.staging = None;
                 self.view.promised = Some((
                     epoch,
@@ -418,24 +413,28 @@ impl Stream {
                 ..
             } => {
                 let floor = self.staged_floor(floor);
-                let start = rules::sync_start(&self.view, from, floor);
-                let mut staging = match self.staging.take() {
-                    Some(mut staging)
-                        if staging.from <= start && start.0 <= staging.tail().0 + 1 =>
-                    {
-                        staging
-                            .records
-                            .truncate((start.0 - staging.from.0) as usize);
-                        staging
-                    }
-                    _ => Staging {
+                let start = Lsn(rules::sync_start(
+                    from.0,
+                    floor.0,
+                    self.view.floor.0,
+                    self.view.head.0,
+                ));
+                let mut staging = self
+                    .staging
+                    .take()
+                    .and_then(|mut staging| {
+                        let keep =
+                            rules::staged_prefix(staging.from.0, staging.records.len(), start.0)?;
+                        staging.records.truncate(keep);
+                        Some(staging)
+                    })
+                    .unwrap_or_else(|| Staging {
                         from: start,
                         floor,
                         records: VecDeque::new(),
-                    },
-                };
+                    });
                 staging.floor = floor;
-                let skip = (start.0 - from.0).min(records.len() as u64) as usize;
+                let skip = rules::retained_offset(from.0, records.len(), start.0);
                 let epochs = runs
                     .into_iter()
                     .flat_map(|run| (run.first.0..=run.last.0).map(move |_| run.epoch));
@@ -493,4 +492,11 @@ impl Stream {
             _ => Err(invalid("nonmutation in stream WAL")),
         }
     }
+}
+
+fn range_charge(records: &VecDeque<Record>, from: Lsn, first: Lsn, end: Lsn) -> u64 {
+    let offset = |at: Lsn| rules::retained_offset(from.0, records.len(), at.0);
+    let end = offset(end);
+    let start = offset(first).min(end);
+    rules::quota_charge(end - start, |i| records[start + i].len())
 }
