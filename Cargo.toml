@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "contract"]
+
 [package]
 name = "logkeeper"
 version = "0.2.0"
@@ -13,6 +16,7 @@ simulation = []
 ordered-daemon = ["dep:ring", "dep:serde", "dep:serde_json", "dep:tokio-rustls", "uuid/serde"]
 
 [dependencies]
+journal-contract = { path = "contract" }
 bytes = "1"
 crc32fast = "1.5"
 fs2 = "0.4"

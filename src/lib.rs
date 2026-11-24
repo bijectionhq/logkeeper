@@ -14,6 +14,7 @@ mod local;
 mod server;
 
 pub mod ordered;
+pub mod stream;
 
 pub use endpoint::{JournalEndpoint, valid_journal_identity};
 pub use error::{Error, ErrorKind, Result};
