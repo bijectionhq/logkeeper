@@ -147,6 +147,54 @@ async fn trim_conflict_uses_writer_authorization() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn trim_and_delete_wait_for_a_distinct_durable_reply() {
+    use crate::stream::wire::{Refusal, Reply, Request, Transport};
+
+    let (network, writer) = started().await;
+    let [first, second, unavailable] = KEEPERS[..3].try_into().unwrap();
+    network.down(unavailable, true);
+
+    let gate = Gate::new();
+    network.fault(second, Kind::Trim, Fault::HoldReply(gate.clone()));
+    let trim = writer.trim(STREAM, E1, Lsn(0));
+    tokio::pin!(trim);
+    tokio::select! {
+        _ = gate.reached() => {}
+        _ = &mut trim => panic!("Trim returned without the second keeper reply"),
+    }
+    assert!(poll!(&mut trim).is_pending());
+    gate.release();
+    assert_eq!(trim.await, Ok(()));
+
+    let gate = Gate::new();
+    network.fault(second, Kind::Delete, Fault::HoldReply(gate.clone()));
+    let delete = writer.delete(STREAM);
+    tokio::pin!(delete);
+    tokio::select! {
+        _ = gate.reached() => {}
+        _ = &mut delete => panic!("Delete returned without the second keeper reply"),
+    }
+    assert!(poll!(&mut delete).is_pending());
+    gate.release();
+    assert_eq!(delete.await, Ok(()));
+    for keeper in [first, second] {
+        assert_eq!(
+            network
+                .client(1)
+                .call(
+                    keeper,
+                    Request::Check {
+                        stream: STREAM,
+                        epoch: E1
+                    }
+                )
+                .await,
+            Ok(Reply::Refused(Refusal::Deleted))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn zombie_writer_is_fenced_and_recovery_contains_the_prior_commit() {
     let (network, zombie) = started().await;
     assert_eq!(

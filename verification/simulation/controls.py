@@ -78,6 +78,26 @@ def controls():
         "committed retry sent unassigned bytes", 0,
     )
     yield (
+        "count-one-keeper-twice-for-trim",
+        [edit(WRITER + "mod.rs", "let floors = quorum(stream.ensemble.map(|keeper| async move {",
+              "let floors = quorum(stream.ensemble.map(|_| async move {\n"
+              "            let keeper = stream.ensemble[0];")],
+        "stream::writer::tests::trim_and_delete_wait_for_a_distinct_durable_reply",
+        "Trim returned without the second keeper reply", 0,
+    )
+    yield (
+        "count-one-keeper-twice-for-delete",
+        [edit(WRITER + "mod.rs", "        let calls = stream.ensemble.map(|keeper| {\n",
+              "        let calls = stream.ensemble.map(|keeper| {\n"
+              "            let keeper = if matches!(request, Request::Delete { .. }) {\n"
+              "                stream.ensemble[0]\n"
+              "            } else {\n"
+              "                keeper\n"
+              "            };\n")],
+        "stream::writer::tests::trim_and_delete_wait_for_a_distinct_durable_reply",
+        "Delete returned without the second keeper reply", 0,
+    )
+    yield (
         "poll-past-read-deadline",
         [edit(WRITER + "read.rs", "timeout_at(deadline, request(from, max, wait_ms))",
               "timeout_at(deadline + super::RPC_TIMEOUT, request(from, max, wait_ms))")],
