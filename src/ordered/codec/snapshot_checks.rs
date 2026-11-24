@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
@@ -44,10 +44,22 @@ pub(crate) open spec fn holdReceiptMatches(admitted_at: u64, receipt_position: O
 }
 
 pub(crate) open spec fn rootReferenceRowValid(revision: u64, previous: Option<u64>, known: bool) -> bool {
-    known && match previous {
+    known && oldRootKeyIncreases(revision, previous)
+}
+
+pub(crate) open spec fn oldRootKeyIncreases(revision: u64, previous: Option<u64>) -> bool {
+    match previous {
         Some(key) => key < revision,
         None => true,
     }
+}
+
+pub(crate) open spec fn objectControlTrailerCanonical(present: bool, roots: usize, fences: usize) -> bool {
+    present == (roots != 0 || fences != 0)
+}
+
+pub(crate) open spec fn receiptPositionFresh(positions: Set<u64>, position: u64) -> bool {
+    !positions.contains(position)
 }
 
 pub(super) open spec fn allSnapshotRowsValid<Row>(rows: Set<Row>, passing: Set<Row>) -> bool {
@@ -234,6 +246,33 @@ pub(super) fn root_reference_row_valid(
         Some(previous) => previous < revision,
         None => true,
     }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == oldRootKeyIncreases(revision, previous),
+))]
+pub(super) fn old_root_key_increases(revision: u64, previous: Option<u64>) -> bool {
+    match previous {
+        Some(last) => last < revision,
+        None => true,
+    }
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == objectControlTrailerCanonical(present, roots, fences),
+))]
+pub(super) fn object_control_trailer_canonical(present: bool, roots: usize, fences: usize) -> bool {
+    present == (roots != 0 || fences != 0)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires btree_set_wf(old(positions)),
+    ensures btree_set_wf(final(positions)),
+        out == receiptPositionFresh(old(positions)@, position),
+        final(positions)@ == old(positions)@.insert(position),
+))]
+pub(super) fn insert_receipt_position(positions: &mut BTreeSet<u64>, position: u64) -> bool {
+    positions.insert(position)
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>

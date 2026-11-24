@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 13,
+  "min_verified_functions": 19,
   "controls": {
     "allow-zero-generation": {
       "defect": "A vacant state may decode with generation zero.",
@@ -144,6 +144,75 @@
         }
       ],
       "min_verified_functions": 12
+    },
+    "allow-reordered-old-roots": {
+      "defect": "A distinct old-root revision may arrive below the last retained revision.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "Some(last) => last < revision,",
+          "replace": "Some(last) => last != revision,"
+        },
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "ensures out == oldRootKeyIncreases(revision, previous),",
+          "replace": "ensures out == (previous != Some(revision)),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/compact_image/laws.rs",
+          "function": "accepted_old_root_rows_are_in_revision_order",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "allow-explicit-empty-trailer": {
+      "defect": "An explicit trailer with neither a root reference nor an object fence aliases the absent trailer.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "fn object_control_trailer_canonical(present: bool, roots: usize, fences: usize) -> bool {\n    present == (roots != 0 || fences != 0)\n}",
+          "replace": "fn object_control_trailer_canonical(present: bool, roots: usize, fences: usize) -> bool {\n    present || (roots == 0 && fences == 0)\n}"
+        },
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "ensures out == objectControlTrailerCanonical(present, roots, fences),",
+          "replace": "ensures out == (present || (roots == 0 && fences == 0)),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/compact_image/laws.rs",
+          "function": "accepted_object_control_trailer_matches_encoder_presence",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "reuse-receipt-position": {
+      "defect": "Accepting a second retry key at the same decision position breaks the receipt partition.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "    positions.insert(position)\n}",
+          "replace": "    positions.insert(position);\n    true\n}"
+        },
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "out == receiptPositionFresh(old(positions)@, position),",
+          "replace": "out,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/compact_image/laws.rs",
+          "function": "accepting_a_receipt_preserves_unique_decision_positions",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
     }
   }
 }

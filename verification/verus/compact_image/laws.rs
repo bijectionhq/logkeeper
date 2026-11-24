@@ -1,10 +1,11 @@
 use crate::production::{
     fence_row_valid, generation_in_range, hold_receipt_matches, lease_row_valid,
     root_reference_row_valid, all_snapshot_rows, checksSnapshotRow,
-    ReducerImage, reducerInvariant,
+    insert_receipt_position, object_control_trailer_canonical, old_root_key_increases,
+    ReducerImage, reducerInvariant, receiptPositionsUnique,
 };
 use vstd::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use vstd::std_specs::btree::*;
 
 verus! {
@@ -47,6 +48,63 @@ fn a_checked_hold_has_a_matching_receipt(admitted_at: u64, receipt: Option<u64>)
 fn accepted_reference_has_known_root_and_increasing_key(revision: u64, previous: u64, known: bool) {
     let accepted = root_reference_row_valid(revision, Some(previous), known);
     assert(accepted ==> known && previous < revision);
+}
+
+fn accepted_old_root_rows_are_in_revision_order(revision: u64, previous: Option<u64>) {
+    let accepted = old_root_key_increases(revision, previous);
+    assert(accepted ==> match previous {
+        Some(key) => key < revision,
+        None => true,
+    });
+}
+
+fn accepted_object_control_trailer_matches_encoder_presence(
+    present: bool, roots: usize, fences: usize,
+) {
+    let accepted = object_control_trailer_canonical(present, roots, fences);
+    assert(accepted ==> present == (roots > 0 || fences > 0));
+}
+
+fn accepting_a_receipt_preserves_unique_decision_positions(
+    positions: &mut BTreeSet<u64>, position: u64, Ghost(decoded): Ghost<Seq<u64>>,
+)
+    requires btree_set_wf(old(positions)), old(positions)@ == decoded.to_set(),
+        receiptPositionsUnique(decoded),
+{
+    let ghost before = positions@;
+    let accepted = insert_receipt_position(positions, position);
+    if accepted {
+        assert(!decoded.contains(position));
+        let ghost next = decoded.push(position);
+        assert forall|i: int, j: int| 0 <= i < j < next.len()
+            implies (#[trigger] next[i]) != (#[trigger] next[j]) by {
+            if j == decoded.len() {
+                if decoded[i] == position {
+                    assert(decoded.contains(position));
+                }
+            }
+        }
+        assert(receiptPositionsUnique(next));
+        assert forall|p: u64| positions@.contains(p) <==> #[trigger] next.to_set().contains(p) by {
+            assert(positions@.contains(p) == (before.contains(p) || p == position));
+            if next.contains(p) {
+                let i = choose|i: int| 0 <= i < next.len() && #[trigger] next[i] == p;
+                if i < decoded.len() {
+                    assert(decoded[i] == p);
+                    assert(decoded.contains(p));
+                }
+            }
+            if decoded.contains(p) {
+                let i = choose|i: int| 0 <= i < decoded.len() && #[trigger] decoded[i] == p;
+                assert(next[i] == p);
+                assert(next.contains(p));
+            }
+            assert(next[decoded.len() as int] == position);
+            assert(next.contains(position));
+            assert(next.contains(p) == (decoded.contains(p) || p == position));
+        }
+        assert(positions@ =~= next.to_set());
+    }
 }
 
 fn one_invalid_hold_prevents_recovery(

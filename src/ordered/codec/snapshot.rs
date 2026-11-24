@@ -4,7 +4,8 @@ use super::{
 };
 use super::frame::{bounded_body_length, decode_flag, encode_flag};
 use super::snapshot_checks::{
-    all_snapshot_rows, fence_row_valid, generation_in_range, hold_receipt_matches, lease_row_valid,
+    all_snapshot_rows, fence_row_valid, generation_in_range, hold_receipt_matches,
+    insert_receipt_position, lease_row_valid, object_control_trailer_canonical, old_root_key_increases,
     root_reference_row_valid,
 };
 use crate::ordered::{
@@ -150,6 +151,8 @@ impl State {
         for _ in 0..input.count(state.limits.replay_holds)? {
             let checkpoint = input.checkpoint()?;
             let closed = decode_flag(input.read_byte()?).ok_or(Refusal::Invalid)?;
+            let revision = checkpoint.custody.revision;
+            let previous = state.old_roots.last_key_value().map(|(&key, _)| key);
             if checkpoint.custody.revision == 0
                 || checkpoint.custody.revision >= state.checkpoint.custody.revision
                 || checkpoint.custody.allocation.is_nil()
@@ -157,16 +160,13 @@ impl State {
                 || checkpoint.manifest == [0; 32]
                 || checkpoint.cut.next_lsn >= state.checkpoint.cut.next_lsn
                 || (!closed && checkpoint.cut.next_lsn < state.erasure_floor)
-                || state
-                    .old_roots
-                    .insert(
-                        checkpoint.custody.revision,
-                        RetainedCheckpoint { checkpoint, closed },
-                    )
-                    .is_some()
+                || !old_root_key_increases(revision, previous)
             {
                 return Err(Refusal::Invalid);
             }
+            state
+                .old_roots
+                .insert(revision, RetainedCheckpoint { checkpoint, closed });
         }
         if state.position == 0
             || state.voter_scope != initial.voter_scope
@@ -248,6 +248,9 @@ impl State {
         } else {
             input.count(self.object_control_bytes / WITHDRAWAL_BYTES)?
         };
+        if !object_control_trailer_canonical(!legacy, roots, fences) {
+            return Err(Refusal::Invalid);
+        }
         for _ in 0..fences {
             let fence = input.object_fence()?;
             if !fence_row_valid(
@@ -531,6 +534,7 @@ impl State {
         let retries = usize::try_from(self.limits.retry_positions).unwrap_or(usize::MAX);
         let count = input
             .count(retries.saturating_add(self.limits.replay_holds + ACTIVATION_HOLD_SLOTS))?;
+        let mut positions = BTreeSet::new();
         for _ in 0..count {
             let issuer = input.principal()?;
             let id = input.request_id()?;
@@ -543,6 +547,7 @@ impl State {
                 || position > self.position
                 || position >= id.expires_at
                 || id.expires_at - position > self.limits.retry_positions
+                || !insert_receipt_position(&mut positions, position)
                 || self
                     .outcomes
                     .last_key_value()

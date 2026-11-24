@@ -1580,7 +1580,7 @@ fn codec_initial_state() -> State {
 }
 
 #[test]
-fn compact_image_accepts_explicit_empty_object_control() {
+fn compact_image_rejects_explicit_empty_object_control() {
     let initial = codec_initial_state();
     let mut state = initial.clone();
     enroll(&mut state);
@@ -1599,13 +1599,14 @@ fn compact_image_accepts_explicit_empty_object_control() {
         Err(Refusal::Invalid)
     ));
     explicit.extend_from_slice(&0u64.to_be_bytes());
-    let decoded = State::decode_base(&initial, explicit.clone().into()).unwrap();
-    assert_ne!(decoded.encode_base().as_ref(), explicit.as_slice());
-    assert_eq!(decoded.encode_base(), canonical);
+    assert!(matches!(
+        State::decode_base(&initial, explicit.into()),
+        Err(Refusal::Invalid)
+    ));
 }
 
 #[test]
-fn compact_image_accepts_reordered_old_roots_but_rejects_duplicate_revisions() {
+fn compact_image_rejects_reordered_old_roots_and_duplicate_revisions() {
     let initial = codec_initial_state();
     let mut state = initial.clone();
     let enrollment = enroll(&mut state);
@@ -1672,6 +1673,12 @@ fn compact_image_accepts_reordered_old_roots_but_rejects_duplicate_revisions() {
     });
 
     let canonical = state.encode_base();
+    assert_eq!(
+        State::decode_base(&initial, canonical.clone())
+            .unwrap()
+            .encode_base(),
+        canonical
+    );
     let cut_bytes = |checkpoint: Checkpoint| {
         let mut cut = checkpoint.cut.next_lsn.to_be_bytes().to_vec();
         cut.extend_from_slice(&checkpoint.cut.history);
@@ -1689,12 +1696,10 @@ fn compact_image_accepts_reordered_old_roots_but_rejects_duplicate_revisions() {
     let mut reordered = canonical.to_vec();
     reordered[start..end].rotate_left(ROOT_ROW_BYTES);
     assert_ne!(&reordered[..], canonical.as_ref());
-    assert_eq!(
-        State::decode_base(&initial, reordered.into())
-            .unwrap()
-            .encode_base(),
-        canonical
-    );
+    assert!(matches!(
+        State::decode_base(&initial, reordered.into()),
+        Err(Refusal::Invalid)
+    ));
 
     let mut duplicate = canonical.to_vec();
     duplicate[middle..end].copy_from_slice(&canonical[start..middle]);
@@ -1800,10 +1805,11 @@ fn exact_snapshot_hold_pins_an_older_checkpoint_and_its_suffix() {
 
 #[test]
 fn compact_image_accepts_receipts_that_overfill_the_retry_book_after_apply() {
+fn compact_image_rejects_distinct_retry_keys_at_one_position() {
     let initial = codec_initial_state();
     let mut state = initial.clone();
     enroll(&mut state);
-    let canonical = state.encode_base();
+    assert!(State::decode_base(&initial, state.encode_base()).is_ok());
     let cap = state.limits.retry_positions as usize
         + state.limits.replay_holds
         + ACTIVATION_HOLD_SLOTS;
@@ -1818,25 +1824,10 @@ fn compact_image_accepts_receipts_that_overfill_the_retry_book_after_apply() {
         let request = retained.receipt.request;
         state.outcomes.insert((retained.receipt.principal, request), retained);
     }
-    let mut clean = State::decode_base(&initial, canonical).unwrap();
-    let mut decoded = State::decode_base(&initial, state.encode_base()).unwrap();
-    assert_eq!(decoded.outcomes.len(), cap);
-    assert!(decoded.outcomes.values().all(|row| row.receipt.position == 1));
-
-    // A new retained refusal needs another slot, and none of the copied
-    // receipts expires at position two.
-    let command = Command::Enroll {
-        worker: Uuid::from_u128(100),
-        expected: None,
-    };
-    assert_eq!(apply(&mut clean, Principal::Administrator, command.clone()).outcome,
-        Err(Refusal::Capacity));
-    assert_eq!(apply(&mut decoded, Principal::Administrator, command).outcome,
-        Err(Refusal::Capacity));
-    assert_eq!(decoded.outcomes.len(), cap + 1);
-    assert!(State::decode_base(&initial, clean.encode_base()).is_ok());
+    assert_eq!(state.outcomes.len(), cap);
+    assert!(state.outcomes.values().all(|row| row.receipt.position == 1));
     assert!(matches!(
-        State::decode_base(&initial, decoded.encode_base()),
+        State::decode_base(&initial, state.encode_base()),
         Err(Refusal::Invalid)
     ));
 }
