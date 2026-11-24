@@ -136,9 +136,39 @@ impl Operation {
     }
 }
 
-impl Reply {
-    pub(in crate::ordered) fn encode(&self) -> Bytes {
+pub(in crate::ordered) struct EncodedReply {
+    header: Bytes,
+    records: Vec<EncodedRecord>,
+}
+
+struct EncodedRecord {
+    header: Bytes,
+    payload: Bytes,
+}
+
+impl EncodedReply {
+    pub(in crate::ordered) fn parts(&self) -> impl Iterator<Item = &[u8]> + Clone {
+        std::iter::once(self.header.as_ref()).chain(
+            self.records
+                .iter()
+                .flat_map(|record| [record.header.as_ref(), record.payload.as_ref()]),
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::ordered) fn collect_bytes(&self) -> Bytes {
         let mut output = BytesMut::new();
+        for part in self.parts() {
+            output.put_slice(part);
+        }
+        output.freeze()
+    }
+}
+
+impl Reply {
+    pub(in crate::ordered) fn into_frame(self) -> EncodedReply {
+        let mut output = BytesMut::new();
+        let mut records = Vec::new();
         match self {
             Self::Route(route) => {
                 output.put_u8(0);
@@ -203,24 +233,30 @@ impl Reply {
             }
             Self::Reconciled(append) => {
                 output.put_u8(2);
-                snapshot::append_result(&mut output, *append);
+                snapshot::append_result(&mut output, append);
             }
             Self::Replay(page) => {
                 output.put_u8(3);
                 checkpoint(&mut output, page.checkpoint);
                 cut(&mut output, page.through);
                 output.put_u64(page.records.len() as u64);
-                for record in &page.records {
-                    snapshot::record(&mut output, record);
+                records.reserve(page.records.len());
+                for record in page.records {
+                    let mut header = BytesMut::new();
+                    snapshot::record_header(&mut header, &record);
+                    records.push(EncodedRecord {
+                        header: header.freeze(),
+                        payload: record.payload,
+                    });
                 }
             }
             Self::Refused(refusal) => {
                 output.put_u8(4);
-                snapshot::result(&mut output, Err(*refusal));
+                snapshot::result(&mut output, Err(refusal));
             }
             Self::CheckpointCut(selected) => {
                 output.put_u8(7);
-                cut(&mut output, *selected);
+                cut(&mut output, selected);
             }
             Self::WithdrawnWorkers(workers) => {
                 output.put_u8(8);
@@ -235,7 +271,7 @@ impl Reply {
             }
             Self::Released(hold) => {
                 output.put_u8(6);
-                hold_row(&mut output, *hold);
+                hold_row(&mut output, hold);
             }
             Self::ReplayHead(head) => {
                 output.put_u8(5);
@@ -248,7 +284,15 @@ impl Reply {
                 }
             }
         }
-        output.freeze()
+        EncodedReply {
+            header: output.freeze(),
+            records,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::ordered) fn encode(self) -> Bytes {
+        self.into_frame().collect_bytes()
     }
 
     pub(in crate::ordered) fn decode(body: Bytes) -> Result<Self, Refusal> {

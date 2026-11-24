@@ -713,6 +713,11 @@ pub(super) fn append_result(output: &mut BytesMut, value: AppendResult) {
 }
 
 pub(super) fn record(output: &mut BytesMut, entry: &Record) {
+    record_header(output, entry);
+    output.put_slice(&entry.payload);
+}
+
+pub(super) fn record_header(output: &mut BytesMut, entry: &Record) {
     append_result(output, entry.result);
     grant(output, entry.grant);
     output.put_i64(entry.timestamp);
@@ -726,7 +731,6 @@ pub(super) fn record(output: &mut BytesMut, entry: &Record) {
         }
         None => output.put_u64(length),
     }
-    output.put_slice(&entry.payload);
 }
 
 fn encode_fence(output: &mut BytesMut, fence: ObjectFence) {

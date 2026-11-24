@@ -1295,12 +1295,20 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
         [old]
     );
     let suffix = recovered.record(checkpoint.cut.next_lsn).unwrap().clone();
+    let payload = suffix.payload.clone();
     let reply = service::wire::Reply::Replay(service::ReplayPage {
         checkpoint,
         through: suffix.result.cut,
         records: vec![suffix],
     });
-    let service::wire::Reply::Replay(page) = service::wire::Reply::decode(reply.encode()).unwrap()
+    let frame = reply.into_frame();
+    assert!(
+        frame
+            .parts()
+            .any(|part| part.as_ptr() == payload.as_ptr() && part == payload.as_ref())
+    );
+    let service::wire::Reply::Replay(page) =
+        service::wire::Reply::decode(frame.collect_bytes()).unwrap()
     else {
         panic!("not a replay reply");
     };
