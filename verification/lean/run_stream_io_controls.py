@@ -13,6 +13,16 @@ MODULES = HERE / "Logkeeper"
 
 # name: (original text, weakened text, theorem whose proof must fail first)
 IO_CONTROLS = {
+    "complete-sync-head-past-request": (
+        "      SyncHeadAdmitted k.head head (start - 1 + records.length) (k.syncFloor floor)",
+        "      SyncHeadAdmitted k.head head (max head (start - 1 + records.length)) (k.syncFloor floor)",
+        "complete_sync_head_within_request",
+    ),
+    "complete-sync-installs-ghost-seed": (
+        "      { accept k e (syncImage k (w.seed e) floor start records) with\n",
+        "      { accept k e (w.seed e) with\n",
+        "complete_sync_uses_request_records",
+    ),
     "stage-from-another-identity": (
         "  | .stage e floor start _ => k.live ∧ k.promised = e ∧ k.identity = caller ∧ k.synced ≠ e ∧",
         "  | .stage e floor start _ => k.live ∧ k.promised = e ∧ True ∧ k.synced ≠ e ∧",

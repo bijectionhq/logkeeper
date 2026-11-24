@@ -34,10 +34,10 @@ theorem automaton_witness :
   -- Epoch 1 installs the empty seed on both keepers and appends one record on the first.
   have y0 := e1.call (k := 0) (i := 1) (req := .sync 1 1 1 [] 0)
     ⟨⟨first, rfl, rfl⟩, by decide, rfl, fun _ _ _ _ => rfl, by decide, rfl⟩
-    ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide, by decide, by decide⟩
+    ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide, by decide⟩
   have y1 := y0.call (k := 1) (i := 1) (req := .sync 1 1 1 [] 0)
     ⟨⟨first, rfl, rfl⟩, by decide, rfl, fun _ _ _ _ => rfl, by decide, rfl⟩
-    ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide, by decide, by decide⟩
+    ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide, by decide⟩
   have i1 := StreamIO.Reachable.extend y1 (Next.issue (e := 1) (payloads := [7]) (r := first) rfl)
   have a0 := i1.call (k := 0) (i := 1) (req := .append 1 1 [7] 0)
     ⟨⟨first, rfl, rfl⟩, by decide, rfl, by decide, rfl⟩
@@ -55,13 +55,13 @@ theorem automaton_witness :
   -- The first keeper completes Sync directly; the second stages the inherited record first.
   have z0 := e2.call (k := 0) (i := 2) (req := .sync 2 1 2 [] 0)
     ⟨⟨second, rfl, rfl⟩, by decide, rfl, fun _ _ _ _ => rfl, by decide, rfl⟩
-    ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide, by decide, by decide⟩
+    ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide, by decide⟩
   have t1 := z0.call (k := 1) (i := 2) (req := .stage 2 1 1 prior)
     ⟨⟨second, rfl, rfl⟩, by decide, List.prefix_rfl, fun _ _ _ _ => rfl⟩
     ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide⟩
   have z1 := t1.call (k := 1) (i := 2) (req := .sync 2 1 2 [] 0)
     ⟨⟨second, rfl, rfl⟩, by decide, rfl, fun _ _ _ _ => rfl, by decide, rfl⟩
-    ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide, by decide, by decide⟩
+    ⟨⟨rfl, rfl⟩, rfl, rfl, by decide, by unfold SyncAdmitted; decide, by decide⟩
   have v0 := StreamIO.Reachable.extend z1 (Next.collectVote (k := 0) (e := 2) (h := prior)
     (.tail _ (.tail _ (.tail _ (.tail _ (.head _))))))
   have v1 := StreamIO.Reachable.extend v0 (Next.collectVote (k := 1) (e := 2) (h := prior) (.head _))

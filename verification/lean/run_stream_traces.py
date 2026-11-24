@@ -104,11 +104,11 @@ def text(row):
     return " ".join(words)
 
 
-def check_trace(path, *, error=None):
+def check_trace(path, *, error=None, line=2):
     command = [LAKE, "env", "lean", "--run", "check_stream_trace.lean", path]
     result = subprocess.run(command, cwd=LEAN, capture_output=True, text=True)
     if error is not None:
-        if result.returncode != 1 or result.stderr.strip() != f"line 2: {error}":
+        if result.returncode != 1 or result.stderr.strip() != f"line {line}: {error}":
             raise RuntimeError(f"{path.name}: expected {error!r}, got {result}")
         print(f"{path.name}: rejected at {error}", flush=True)
     elif result.returncode:
@@ -316,6 +316,18 @@ def controls(trace, evidence):
     path = evidence / "learner-without-survivor-installs.trace"
     path.write_text(f"seed {seed}\n{text(row)}\n")
     check_trace(path, error="learner installs after both survivors")
+    seed, row = first(trace, kind("lose"))
+    reopened = {**row, "verb": "reopen", "before": row["after"]}
+    path = evidence / "lost-identity-returns.trace"
+    path.write_text(f"seed {seed}\n{text(row)}\n{text(reopened)}\n")
+    check_trace(path, error="lost keeper identity cannot return", line=3)
+    seed, row = first(trace, kind("replace", lambda r: r["after"] != r["before"]))
+    before = row["after"]
+    _, *rosters = row["fields"]
+    reinstalled = {**row, "before": before, "reply": [12] + rosters[3:]}
+    path = evidence / "wrong-ensemble-rejects-replace-retry.trace"
+    path.write_text(f"seed {seed}\n{text(reinstalled)}\n")
+    check_trace(path, error="WrongEnsemble follows Replace promise and retry checks")
     seed, row = first(trace, kind("append", inherited))
     print(f"inherited publication: seed {seed}, RPC {row['serial']}, keeper {row['keeper']} "
           "is a Study 119 publication step", flush=True)

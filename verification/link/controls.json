@@ -182,5 +182,13 @@
     "file": "src/stream/keeper/rules.rs",
     "find": "&& first != second && first != third && second != third)",
     "replace": "&& first != second && first != third)"
+  },
+  {
+    "name": "verus-sync-head-past-tail",
+    "area": "stream_keeper",
+    "theorem": "link_sync_head_valid",
+    "file": "src/stream/keeper/rules.rs",
+    "find": "current <= next && next <= tail && 0 < floor",
+    "replace": "current <= next && 0 < floor"
   }
 ]

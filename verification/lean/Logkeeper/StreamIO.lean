@@ -104,14 +104,21 @@ inductive Request (Payload : Type) where
   | observe
   | delete
 
+def SyncHeadAdmitted (current head tail floor : Nat) : Prop :=
+  current ≤ head ∧ head ≤ tail ∧ 0 < floor ∧ floor ≤ head + 1
+
+instance (current head tail floor : Nat) : Decidable (SyncHeadAdmitted current head tail floor) :=
+  inferInstanceAs (Decidable (current ≤ head ∧ head ≤ tail ∧ 0 < floor ∧ floor ≤ head + 1))
+
 /-- The keeper's own admission rule for a request from `caller`. -/
 def Admitted (k : Keeper Payload) (caller : Nat) : Request Payload → Prop
   | .create => k.deleted = false
   | .promise e => k.live ∧ SealAllowed k e caller
   | .stage e floor start _ => k.live ∧ k.promised = e ∧ k.identity = caller ∧ k.synced ≠ e ∧
       SyncAdmitted k floor start
-  | .sync e floor start _ head => k.live ∧ k.promised = e ∧ k.identity = caller ∧
-      k.synced ≠ e ∧ SyncAdmitted k floor start ∧ k.head ≤ head ∧ k.syncFloor floor ≤ head + 1
+  | .sync e floor start records head => k.live ∧ k.promised = e ∧ k.identity = caller ∧
+      k.synced ≠ e ∧ SyncAdmitted k floor start ∧
+      SyncHeadAdmitted k.head head (start - 1 + records.length) (k.syncFloor floor)
   | .installFloor e head => k.live ∧ MayAppend k e ∧ k.identity = caller ∧ k.floor ≤ head
   | .append e position payloads head => k.live ∧ MayAppend k e ∧ k.identity = caller ∧
       position = k.tail + 1 ∧ payloads ≠ [] ∧ head ≤ k.tail + payloads.length
@@ -120,6 +127,13 @@ def Admitted (k : Keeper Payload) (caller : Nat) : Request Payload → Prop
   | .observe => k.live
   | .delete => True
 
+theorem complete_sync_head_within_request {k : Keeper Payload}
+    {caller epoch floor start head : Nat} {records : History Payload}
+    (admitted : Admitted k caller (.sync epoch floor start records head)) :
+    head ≤ start - 1 + records.length := by
+  obtain ⟨_, _, _, _, _, bounds⟩ := admitted
+  exact bounds.2.1
+
 /-- The keeper's durable effect. The ghost writer supplies only the seed and issued history
     that ghost-fill positions the keeper skips over a trimmed prefix. -/
 def effect (w : Writer Payload) (caller : Nat) (k : Keeper Payload) : Request Payload → Keeper Payload
@@ -127,8 +141,9 @@ def effect (w : Writer Payload) (caller : Nat) (k : Keeper Payload) : Request Pa
   | .promise e => sealKeeper k e caller
   | .stage e floor start records =>
       { k with staging := some (k.syncFloor floor, syncImage k (w.seed e) floor start records) }
-  | .sync e floor _ _ head =>
-      { accept k e (w.seed e) with head, floor := max k.floor (k.syncFloor floor) }
+  | .sync e floor start records head =>
+      { accept k e (syncImage k (w.seed e) floor start records) with
+        head, floor := max k.floor (k.syncFloor floor) }
   | .installFloor e head =>
       { accept k e ((w.issued e).take (max k.tail head)) with
         head := max k.head head, floor := head + 1 }
@@ -138,6 +153,16 @@ def effect (w : Writer Payload) (caller : Nat) (k : Keeper Payload) : Request Pa
   | .trim _ through => { k with floor := max k.floor (through + 1) }
   | .observe => k
   | .delete => deleteKeeper k true
+
+/-- Complete Sync builds from the incoming records. The writer's seed supplies
+    only ghost records before a skipped prefix. -/
+theorem complete_sync_uses_request_records (w : Writer Payload) (k : Keeper Payload)
+    (caller epoch floor start head : Nat) (records : History Payload)
+    (kept : start ≠ k.syncFloor floor) :
+    (effect w caller k (.sync epoch floor start records head)).history =
+      k.image.take (start - 1) ++ records := by
+  change syncImage k (w.seed epoch) floor start records = _
+  simp [syncImage, kept]
 
 /-- A reply and the durable fact its effect established. -/
 inductive Reply (Payload : Type) where
@@ -317,18 +342,21 @@ theorem deliver_refines {w : Writer Payload} {k : Keeper Payload} {i : Nat} {req
       obtain ⟨⟨r, round, owner⟩, _, _, _⟩ := sendable
       exact Or.inl (.syncPart live promised ⟨r, round, owner.trans identity.symm⟩ awaiting sync)
   | sync e floor start records head =>
-      obtain ⟨live, promised, identity, awaiting, sync, raises, covered⟩ := admitted
+      obtain ⟨live, promised, identity, awaiting, sync, bounds⟩ := admitted
       obtain ⟨⟨r, round, owner⟩, _, exact, agrees, within, advertised⟩ := sendable
-      refine Or.inl (.sync (start := start) (records := records) live promised
-        ⟨r, round, owner.trans identity.symm⟩ sync ?_ (fun same => absurd same awaiting)
-        (seeded e) raises within covered advertised)
-      unfold syncImage
-      rw [exact]
-      split
-      · exact List.take_append_drop _ _
-      · rename_i kept
-        rw [agrees promised awaiting (sync.2.2.2.2.resolve_right kept) kept]
-        exact List.take_append_drop _ _
+      have built : syncImage k (w.seed e) floor start records = w.seed e := by
+        unfold syncImage
+        rw [exact]
+        split
+        · exact List.take_append_drop _ _
+        · rename_i kept
+          rw [agrees promised awaiting (sync.2.2.2.2.resolve_right kept) kept]
+          exact List.take_append_drop _ _
+      refine Or.inl ?_
+      simp only [effect, built]
+      exact .sync (start := start) (records := records) live promised
+        ⟨r, round, owner.trans identity.symm⟩ sync built (fun same => absurd same awaiting)
+        (seeded e) bounds.1 within bounds.2.2.2 advertised
   | installFloor e head =>
       obtain ⟨live, synced, identity, floor⟩ := admitted
       obtain ⟨⟨r, round, owner⟩, within, advertised⟩ := sendable
@@ -676,7 +704,7 @@ theorem deliver_local {w : Writer Payload} {K : Keeper Payload} {i : Nat} {req :
       subst same
       exact staged_image_is_seed_prefix promised unsynced agrees valid slice
   | sync e =>
-      obtain ⟨_, promised, _, _, _, _, _⟩ := admitted
+      obtain ⟨_, promised, _, _, _, _⟩ := admitted
       obtain ⟨⟨r, round, _⟩, _⟩ := sendable
       refine ⟨?_, fun _ _ staged => by simp [effect, accept] at staged,
         fun _ _ _ _ _ _ _ staged => by simp [effect, accept] at staged⟩
@@ -1128,6 +1156,8 @@ theorem Reachable.call {s : State Payload} (reached : Reachable s) {k : KeeperId
   .extend (.extend reached (.send sendable)) (.deliver List.mem_cons_self admitted)
 
 #print axioms step_mono
+#print axioms complete_sync_head_within_request
+#print axioms complete_sync_uses_request_records
 #print axioms deliver_refines
 #print axioms sendable_persists
 #print axioms reply_evidence

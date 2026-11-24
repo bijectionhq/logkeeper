@@ -187,7 +187,7 @@
       "checked_tail": "Logkeeper.StreamJournal.check",
       "read_head": "Logkeeper.StreamJournal.readPage",
       "tombstone": "Logkeeper.StreamJournal.deleteKeeper",
-      "sync_head_valid": null,
+      "sync_head_valid": "Logkeeper.StreamIO.SyncHeadAdmitted",
       "append_retry": "Logkeeper.StreamJournal.appendAt",
       "may_read": "Logkeeper.StreamJournal.readPage",
       "may_replace": "Logkeeper.StreamReplacement.ReplaceAllowed",

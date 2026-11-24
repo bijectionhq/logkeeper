@@ -196,7 +196,8 @@ def syncEffect (row : Row) (epoch floor origin count head complete : Nat) : Exce
     check (covers row.runs origin (origin + count - 1)) "sync epoch runs"
     let skip := min (start - origin) count
     let tail := start - 1 + (count - skip)
-    check (before.head ≤ head && head ≤ tail && stagedFloor ≤ head + 1) "sync head"
+    check (decide (StreamIO.SyncHeadAdmitted before.head head (origin + count - 1) stagedFloor))
+      "sync head"
     let below := if start ≤ build.tail + 1 then clip build.runs build.floor (start - 1) else []
     let image := merge below (clip row.runs start tail)
     if complete == 0 then
@@ -246,13 +247,18 @@ def trimEffect (row : Row) (epoch through : Nat) : Except String Projection := d
   check (row.after == { row.before with view }) "trim effect"
   return if before.floor < floor then .trim else .stutter
 
-def replaceEffect (row : Row) (epoch : Nat) (origin to : List Nat) : Except String Projection := do
+def replaceDecision (row : Row) (epoch : Nat) (origin to : List Nat) :
+    StreamReplacement.ReplaceDecision :=
   let before := row.before.view
-  check (promisedTo row epoch && before.synced == epoch + 1) "replace requires a synced promise"
-  let decision := StreamReplacement.replaceDecision (promisedTo row epoch)
+  StreamReplacement.replaceDecision (promisedTo row epoch)
     (before.synced == epoch + 1) (before.ensemble == to) (before.ensemble == origin)
     (!to.contains 0 && to.Nodup) (to.contains row.keeper)
     ((List.zip origin to).countP (fun pair => pair.1 != pair.2))
+
+def replaceEffect (row : Row) (epoch : Nat) (origin to : List Nat) : Except String Projection := do
+  let before := row.before.view
+  check (promisedTo row epoch && before.synced == epoch + 1) "replace requires a synced promise"
+  let decision := replaceDecision row epoch origin to
   if decision == .replaced then return ← unchanged row
   check (decision == .persist) "replace ensemble"
   let (ensemble, learner) := StreamReplacement.installEnsemble to
@@ -262,7 +268,13 @@ def replaceEffect (row : Row) (epoch : Nat) (origin to : List Nat) : Except Stri
 
 def wrongEnsembleEffect (row : Row) (reported : List Nat) : Except String Projection := do
   let requested ← match row.verb, row.fields with
-    | "seal", [_, a, b, c] | "replace", [_, a, b, c, _, _, _]
+    | "replace", [epoch, a, b, c, d, e, f] => do
+        check (!row.before.deleted && replaceDecision row epoch [a, b, c] [d, e, f] == .wrongEnsemble)
+          "WrongEnsemble follows Replace promise and retry checks"
+        pure [a, b, c]
+    | "seal", [_, a, b, c] => do
+        check (!row.before.deleted) "WrongEnsemble Seal requires a live stream"
+        pure [a, b, c]
     | "delete", [a, b, c] => pure [a, b, c]
     | _, _ => throw "WrongEnsemble request"
   check (row.before.present && row.before.view.ensemble == reported &&
@@ -289,8 +301,8 @@ def step (row : Row) : Except String Projection := do
     check (row.after == row.before) "reopen restores the durable image"
     return .stutter
   if row.verb == "lose" then
-    check (row.before.present && !row.after.present && !row.after.deleted &&
-      row.after.staged.isNone) "disk loss clears the image"
+    check (row.before.present && row.after == ⟨false, false, defaultView [0, 0, 0] row.keeper, none⟩)
+      "disk loss clears the image"
     return .lose
   if let .wrongEnsemble ensemble := row.reply then
     return ← wrongEnsembleEffect row ensemble
@@ -320,18 +332,20 @@ structure SweepProgress where
   lost : Option Nat := none
   installed : List (Nat × List Nat) := []
 
-def SweepProgress.advance (sweep : SweepProgress) (row : Row) :
-    Projection → Except String SweepProgress
-  | .lose => do
+def SweepProgress.advance (sweep : SweepProgress) (row : Row)
+    (projection : Projection) : Except String SweepProgress := do
+  check (sweep.lost != some row.keeper) "lost keeper identity cannot return"
+  match projection with
+  | .lose =>
       check sweep.lost.isNone "multiple disk losses in one simulation seed"
       return { sweep with lost := some row.keeper }
-  | .replace => do
+  | .replace =>
       let old := row.before.view.ensemble
       let next := row.after.view.ensemble
       check (old.contains row.keeper && sweep.lost.any (fun lost =>
         old.contains lost && !next.contains lost)) "survivor replaced the lost member"
       return { sweep with installed := (row.keeper, next) :: sweep.installed }
-  | .promote => do
+  | .promote =>
       let old := row.before.view.ensemble
       let next := row.after.view.ensemble
       let survivors := old.filter next.contains

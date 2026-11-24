@@ -329,7 +329,7 @@ the module named in each Verus area's README.
 | `src/stream/keeper/rules.rs` | `checked_tail` | `Logkeeper.StreamJournal.check` | Equivalence |
 | `src/stream/keeper/rules.rs` | `read_head` | `Logkeeper.StreamJournal.readPage` | Equivalence |
 | `src/stream/keeper/rules.rs` | `tombstone` | `Logkeeper.StreamJournal.deleteKeeper` | Equivalence |
-| `src/stream/keeper/rules.rs` | `sync_head_valid` | — | The Lean Sync step retains head and does not transfer a floor. |
+| `src/stream/keeper/rules.rs` | `sync_head_valid` | `Logkeeper.StreamIO.SyncHeadAdmitted` | Equivalence |
 | `src/stream/keeper/rules.rs` | `append_retry` | `Logkeeper.StreamJournal.appendAt` | Equivalence |
 | `src/stream/keeper/rules.rs` | `may_read` | `Logkeeper.StreamJournal.readPage` | Equivalence |
 | `src/stream/keeper/rules.rs` | `may_replace` | `Logkeeper.StreamReplacement.ReplaceAllowed` | Equivalence |

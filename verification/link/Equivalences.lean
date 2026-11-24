@@ -945,6 +945,11 @@ theorem link_may_read {P : Type} (k : Keeper P) (start max : Nat) :
   simp only [may_read, readPage]
   split <;> simp_all <;> omega
 
+theorem link_sync_head_valid (current head tail floor : Nat) :
+    sync_head_valid current head tail floor ↔ StreamIO.SyncHeadAdmitted current head tail floor := by
+  unfold sync_head_valid StreamIO.SyncHeadAdmitted
+  omega
+
 theorem link_may_replace (current synced member : Bool) (changed : Nat) :
     may_replace current synced member changed ↔
       StreamReplacement.ReplaceAllowed current synced member changed := by

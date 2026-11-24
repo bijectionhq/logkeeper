@@ -6,9 +6,10 @@ lengths count transitions after the initial state.
 
 ## Lean
 
-The Lake package builds. The 21 stream-journal axiom reports and the one
-Study 117 bridge report contain only standard axioms. The reachable
-two-keeper commit witness is part of the 21 stream-journal reports.
+The Lake package builds. The 21 stream-journal reports, nine replacement
+reports, seven WAL reports and one Study 117 bridge report contain only
+standard axioms. The reports include the two-keeper commit, split install
+and background checkpoint witnesses.
 
 | Control | Failing check |
 | --- | --- |
@@ -25,10 +26,11 @@ two-keeper commit witness is part of the 21 stream-journal reports.
 | --- | ---: |
 | rules | 26 |
 | rank | 18 |
-| protocol | 20,289 |
+| protocol | 27,083 |
 | wal | 544 |
 | handoff | 17 |
 | retention | 23 |
+| replacement | 86 |
 
 ## Reachable TLC executions
 
@@ -42,6 +44,10 @@ that state is reachable with the baseline guards.
 | `NoWalWitness` | One barrier covers both streams, both reply and a later tail from both streams tears. | 8 |
 | `NoDelayedAppendWitness` | The original writer's delayed second accept succeeds at the unfenced third keeper after the new seal publishes the same record. | 16 |
 | `NoTrimReadWitness` | One keeper returns the committed record below the completed trim's floor and hides its accepted tail. | 19 |
+| `NoSplitInstallWitness` | One survivor installs, the old route is refused, and the retry on the installed route succeeds. Neither route has a quorum. | 25 |
+| `NoReplacementRecoveryWitness` | The sweep resumes from a split and promotes the learner with the acknowledged prefix on all three keepers. | 27 |
+| `NoSecondLossWitness` | A second loss after promotion leaves two copies of the transferred record. | 26 |
+| `NoNewEnsembleWriteWitness` | After a split and recovery, a later epoch publishes a new record and a read returns both records. | 36 |
 
 ## TLC controls
 
@@ -77,6 +83,13 @@ that state is reachable with the baseline guards.
 | cross-frontier | `ReplyDurable` | 5 |
 | wrong-stream | `ExactDemux` | 4 |
 | read-uncommitted (retention) | `RetentionReadCommitted` | 19 |
+| stale-route (replacement) | `StaleRouteRefused` | 24 |
+| count-wrong-route (replacement) | `OneEnsembleAuthority` | 3 |
+| early-learner-install (replacement) | `LearnerAfterSurvivors` | 23 |
+| learner-append (replacement) | `LearnerCannotAppend` | 23 |
+| skip-repair (replacement) | `PublishedOnSurvivors` | 19 |
+| append-promise (replacement) | `ReplacementFencesOldAppends` | 16 |
+| read-uncommitted (replacement) | `ReplacementReadExact` | 31 |
 
 ## TLC specification probes
 

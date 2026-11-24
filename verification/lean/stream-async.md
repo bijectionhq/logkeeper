@@ -108,7 +108,7 @@ and refusals and observations must not change it.
 | Disk loss · survivor installation · learner installation | 909 · 1,818 · 909 |
 | WrongEnsemble | 4,545 |
 
-The runner mutates real rows into 45 controls. These
+The runner mutates real rows into 47 controls. These
 include the former visible incomplete Sync, a Seal that reports staged records, a Seal or
 complete Sync that keeps staging, a stale promise or another identity on each request, an
 unsynced or learner append or trim, gaps, wrong record epochs, uncertified publication, a
