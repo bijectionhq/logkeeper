@@ -16,10 +16,9 @@ use journal_contract::{
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
-use self::{append::Active, recovery::Recovery};
+use self::{append::Active, decision::QUORUM, recovery::Recovery};
 use super::wire::{KeeperId, Refusal, Reply, Request, Transport};
 
-const QUORUM: usize = 2;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Optional admission policy for seal. By default any authenticated identity can seal.

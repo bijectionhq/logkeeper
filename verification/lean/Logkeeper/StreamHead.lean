@@ -14,6 +14,12 @@ def FreshSample (opened sent : Nat) : Prop := opened < sent
 
 def SampleIndex (a b : Nat) : Nat := max a b
 
+def EligibleSample (promised synced highest : Option Nat) (same : Bool) : Prop :=
+  same = true ∧ promised = highest ∧ synced = highest
+
+def HeadQuorum (count : Nat) : Prop := 2 ≤ count
+
+
 theorem sample_bounds (a b : Nat) :
     a ≤ SampleIndex a b ∧ b ≤ SampleIndex a b := ⟨Nat.le_max_left .., Nat.le_max_right ..⟩
 

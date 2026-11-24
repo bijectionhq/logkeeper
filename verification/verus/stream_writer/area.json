@@ -1,98 +1,126 @@
 {
   "summary": "The shipped recovery, append, seal and head decisions.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 16,
+  "min_verified_functions": 18,
   "controls": {
     "one-keeper": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "(a && b) || (a && c) || (b && c)", "replace": "a || (b && c)"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "acknowledged", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "ignore-epoch": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "Some((accepted_epoch, tail)) => accepted_epoch == epoch && tail >= at,\n        None => false,\n    }\n}", "replace": "Some((_accepted_epoch, tail)) => tail >= at,\n        None => false,\n    }\n}"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "covers", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "ignore-tail": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "Some((accepted_epoch, tail)) => accepted_epoch == epoch && tail >= at,\n        None => false,\n    }\n}", "replace": "Some((accepted_epoch, _tail)) => accepted_epoch == epoch,\n        None => false,\n    }\n}"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "covers", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "prefer-longer-over-newer": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "(Some(a), Some(b)) => b > a || (b == a && right_tail > left_tail),\n        (None, Some(_)) => true,\n        (None, None) => right_tail > left_tail,\n        (Some(_), None) => false,\n    }\n}", "replace": "(Some(a), Some(b)) => right_tail > left_tail || (right_tail == left_tail && b > a),\n        (None, Some(_)) => true,\n        (None, None) => right_tail > left_tail,\n        (Some(_), None) => false,\n    }\n}"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "outranks", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "ignore-tie-break": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "(Some(a), Some(b)) => b > a || (b == a && right_tail > left_tail),\n        (None, Some(_)) => true,\n        (None, None) => right_tail > left_tail,\n        (Some(_), None) => false,\n    }\n}", "replace": "(Some(a), Some(b)) => b > a,\n        (None, Some(_)) => true,\n        (None, None) => right_tail > left_tail,\n        (Some(_), None) => false,\n    }\n}"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "outranks", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "fallback-ignores-epoch": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "    checked == Some(expected)\n", "replace": "    checked.is_some()\n"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "matches_epoch", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "append-head-over-tail": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "    head.min(last)\n", "replace": "    head.max(last)\n"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "append_head", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "adopt-unissued-tail": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "    tail.min(issued).max(last)\n", "replace": "    tail.max(last)\n"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "accepted_tail", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "reuse-prefresh-sample": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "    sent > opened\n", "replace": "    sent >= opened\n"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "fresh_sample", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "sample-shorter-tail": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "    a.max(b)\n", "replace": "    a.min(b)\n"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "sample_index", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "sync-overwrites-head": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "    floor <= start && head < start && (floor == start || matched)\n", "replace": "    floor <= start && head <= start && (floor == start || matched)\n"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "can_sync_from", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "sync-skips-floor": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "    floor <= start && head < start && (floor == start || matched)\n", "replace": "    head < start && (floor == start || matched)\n"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "can_sync_from", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
     },
     "sync-skips-prefix": {
       "mutate": [
         {"file": "src/stream/writer/decision.rs", "find": "    floor <= start && head < start && (floor == start || matched)\n", "replace": "    floor <= start && head < start\n"}
       ],
       "expect": [{"file": "src/stream/writer/decision.rs", "function": "can_sync_from", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 15
+      "min_verified_functions": 17
+    },
+    "head-other-proposal": {
+      "mutate": [
+        {"file": "src/stream/writer/decision.rs", "find": "    same_proposal && promised == highest && synced == highest\n", "replace": "    promised == highest && synced == highest\n"}
+      ],
+      "expect": [{"file": "src/stream/writer/decision.rs", "function": "eligible_sample", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 17
+    },
+    "head-unsynced": {
+      "mutate": [
+        {"file": "src/stream/writer/decision.rs", "find": "    same_proposal && promised == highest && synced == highest\n", "replace": "    same_proposal && promised == highest\n"}
+      ],
+      "expect": [{"file": "src/stream/writer/decision.rs", "function": "eligible_sample", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 17
+    },
+    "head-lower-epoch": {
+      "mutate": [
+        {"file": "src/stream/writer/decision.rs", "find": "    same_proposal && promised == highest && synced == highest\n", "replace": "    same_proposal && synced == promised\n"}
+      ],
+      "expect": [{"file": "src/stream/writer/decision.rs", "function": "eligible_sample", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 17
+    },
+    "head-minority": {
+      "mutate": [
+        {"file": "src/stream/writer/decision.rs", "find": "    count >= QUORUM\n", "replace": "    count >= 1\n"}
+      ],
+      "expect": [{"file": "src/stream/writer/decision.rs", "function": "head_quorum", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 17
     }
   }
 }

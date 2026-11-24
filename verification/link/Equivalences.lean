@@ -1044,6 +1044,22 @@ theorem link_sample_index (a b : Nat) :
   simp only [sample_index, StreamHead.SampleIndex]
   split <;> omega
 
+theorem link_eligible_sample (promised synced highest : Option Nat) (same : Bool) :
+    eligible_sample promised synced highest same ↔
+      StreamHead.EligibleSample promised synced highest same := by
+  simp [eligible_sample, StreamHead.EligibleSample, and_assoc]
+
+theorem link_head_quorum (count : Nat) :
+    head_quorum count ↔ StreamHead.HeadQuorum count := by
+  simp [head_quorum, StreamHead.HeadQuorum]
+
+theorem head_quorum_is_majority (covered : KeeperId → Bool) :
+    head_quorum (ensemble.countP covered) ↔ Majority ensemble covered := by
+  rw [link_head_quorum]
+  unfold StreamHead.HeadQuorum Majority
+  have size : ensemble.length = 3 := rfl
+  omega
+
 /-- The generated recovery-start decision supplies the writer's agreement premise. -/
 theorem recovery_start_agrees {P : Type} {s : StreamIO.State P}
     (reached : StreamIO.Reachable s) (keeper : KeeperId)

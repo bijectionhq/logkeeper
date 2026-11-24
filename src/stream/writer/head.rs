@@ -7,7 +7,10 @@ use journal_contract::{Epoch, JournalError, Lsn, Result};
 use tokio::sync::oneshot;
 
 use super::{
-    Io, KeeperId, QUORUM, Reply, Request, Stream, append::Active, decision::sample_index, refusal,
+    Io, KeeperId, Reply, Request, Stream,
+    append::Active,
+    decision::{eligible_sample, head_quorum, sample_index},
+    refusal,
 };
 use crate::stream::wire::StreamView;
 
@@ -92,7 +95,7 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
             Ok(tail) => {
                 count += 1;
                 sample = Lsn(sample_index(sample.0, tail.0));
-                if count == QUORUM {
+                if head_quorum(count) {
                     let head = active.cover(sample).await?;
                     active.published(head).await?;
                     return Ok(head);
@@ -187,17 +190,19 @@ fn eligible<'a>(
         .filter_map(|view| view.promised.as_ref().map(|p| p.0))
         .max();
     views.iter().filter(move |view| {
-        view.promised == candidate.promised
-            && view.proposal == candidate.proposal
-            && view.synced == epoch
-            && view.promised.as_ref().map(|p| p.0) == epoch
+        eligible_sample(
+            view.promised.as_ref().map(|p| (p.0).0),
+            view.synced.map(|epoch| epoch.0),
+            epoch.map(|epoch| epoch.0),
+            view.promised == candidate.promised && view.proposal == candidate.proposal,
+        )
     })
 }
 
 /// The maximum tail of an eligible quorum, if the views contain one.
 fn read_index(views: &[StreamView]) -> Option<Lsn> {
     views.iter().find_map(|candidate| {
-        (eligible(views, candidate).count() >= QUORUM)
+        head_quorum(eligible(views, candidate).count())
             .then(|| eligible(views, candidate).map(|view| view.tail).max())
             .flatten()
     })
@@ -211,11 +216,12 @@ pub(super) fn observed_head(views: &[StreamView], target: Option<Lsn>) -> Option
             Some(target) => target,
             None => eligible(views, candidate).map(|view| view.tail).max()?,
         };
-        (eligible(views, candidate)
-            .filter(|view| view.head >= index)
-            .count()
-            >= QUORUM)
-            .then_some(index)
+        head_quorum(
+            eligible(views, candidate)
+                .filter(|view| view.head >= index)
+                .count(),
+        )
+        .then_some(index)
     })
 }
 

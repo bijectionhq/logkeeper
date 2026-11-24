@@ -342,6 +342,8 @@ the module named in each Verus area's README.
 | `src/stream/writer/decision.rs` | `accepted_tail` | `Logkeeper.StreamWriter.AcceptedTail` | Equivalence |
 | `src/stream/writer/decision.rs` | `fresh_sample` | `Logkeeper.StreamHead.FreshSample` | Equivalence |
 | `src/stream/writer/decision.rs` | `sample_index` | `Logkeeper.StreamHead.SampleIndex` | Equivalence |
+| `src/stream/writer/decision.rs` | `eligible_sample` | `Logkeeper.StreamHead.EligibleSample` | Equivalence |
+| `src/stream/writer/decision.rs` | `head_quorum` | `Logkeeper.StreamHead.HeadQuorum` | Equivalence |
 | `verification/verus/stream_keeper/laws.rs` | `create_cannot_reuse_a_stream_id` | See `live` | Verus checks the executable law. |
 | `verification/verus/stream_keeper/laws.rs` | `seal_requires_a_higher_epoch_or_same_identity` | See `may_seal` | Verus checks the executable law. |
 | `verification/verus/stream_keeper/laws.rs` | `sync_cannot_replace_headted_records` | See `preserves_head` | Verus checks the executable law. |

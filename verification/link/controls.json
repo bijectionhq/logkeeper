@@ -134,5 +134,21 @@
     "theorem": "link_can_sync_from",
     "find": "ensures out == (floor <= start && head < start && (floor == start || matched))",
     "replace": "ensures out == (floor <= start && head < start)"
+  },
+  {
+    "name": "stream-head-eligibility",
+    "file": "src/stream/writer/decision.rs",
+    "area": "stream_writer",
+    "theorem": "link_eligible_sample",
+    "find": "ensures out == (same_proposal && promised == highest && synced == highest)",
+    "replace": "ensures out == (promised == highest && synced == highest)"
+  },
+  {
+    "name": "stream-head-quorum",
+    "file": "src/stream/writer/decision.rs",
+    "area": "stream_writer",
+    "theorem": "link_head_quorum",
+    "find": "ensures out == (count >= 2)",
+    "replace": "ensures out == (count >= 1)"
   }
 ]

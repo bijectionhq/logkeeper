@@ -203,7 +203,9 @@
       "append_head": "Logkeeper.StreamWriter.AppendHead",
       "accepted_tail": "Logkeeper.StreamWriter.AcceptedTail",
       "fresh_sample": "Logkeeper.StreamHead.FreshSample",
-      "sample_index": "Logkeeper.StreamHead.SampleIndex"
+      "sample_index": "Logkeeper.StreamHead.SampleIndex",
+      "eligible_sample": "Logkeeper.StreamHead.EligibleSample",
+      "head_quorum": "Logkeeper.StreamHead.HeadQuorum"
     }
   }
 }

@@ -169,8 +169,11 @@ def controls():
     )
     yield (
         "observer-no-head-quorum",
-        [edit(WRITER + "head.rs", ".filter(|view| view.head >= index)\n            .count()\n            >= QUORUM)",
-              ".filter(|view| view.head >= index)\n            .count()\n            >= 1)")],
+        [edit(WRITER + "head.rs", """        head_quorum(
+            eligible(views, candidate)
+                .filter(|view| view.head >= index)
+                .count(),
+        )""", """        eligible(views, candidate).any(|view| view.head >= index)""")],
         SIM + "guards::head_covers_acknowledged_appends_with_a_lagging_keeper",
         "observer head missed an acknowledged append", 0,
     )

@@ -1,6 +1,8 @@
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
+pub(super) const QUORUM: usize = 2;
+
 // A slot is bound to a single keeper of the ensemble and to the append request.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == match ack {
@@ -109,4 +111,21 @@ pub(super) fn sample_index(a: u64, b: u64) -> u64 {
 ))]
 pub(super) fn can_sync_from(floor: u64, head: u64, start: u64, matched: bool) -> bool {
     floor <= start && head < start && (floor == start || matched)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (same_proposal && promised == highest && synced == highest)
+))]
+pub(super) fn eligible_sample(
+    promised: Option<u64>,
+    synced: Option<u64>,
+    highest: Option<u64>,
+    same_proposal: bool,
+) -> bool {
+    same_proposal && promised == highest && synced == highest
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (count >= 2)))]
+pub(super) fn head_quorum(count: usize) -> bool {
+    count >= QUORUM
 }
