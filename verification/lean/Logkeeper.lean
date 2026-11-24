@@ -33,3 +33,6 @@ import Logkeeper.StreamWriter
 import Logkeeper.StreamHead
 import Logkeeper.StreamReplacement
 import Logkeeper.StreamWAL
+import Logkeeper.StreamRpc
+import Logkeeper.StreamRead
+import Logkeeper.StreamRecovery

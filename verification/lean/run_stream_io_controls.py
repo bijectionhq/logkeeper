@@ -287,6 +287,101 @@ HEAD_CONTROLS = {
     ),
 }
 
+RPC_CONTROLS = {
+    "reply-from-another-request": (
+        "  deliver : Next (trace.state decided) (.deliver (.call keeper caller request))",
+        "  deliver : Next (trace.state decided) (.deliver (.call keeper caller .observe))",
+        "Exchange.effect",
+    ),
+    "publication-past-requested-head": (
+        "| .append _ _ _ head, cut | .publish _ head, cut => cut ≤ head",
+        "| .append _ _ _ head, cut | .publish _ head, cut => cut ≤ head + 1",
+        "publication_covers",
+    ),
+    "one-delete-reply-counts-twice": (
+        "(distinct : a ≠ b) (received : left.received ≤ completion ∧ right.received ≤ completion) :",
+        "(distinct : a = a) (received : left.received ≤ completion ∧ right.received ≤ completion) :",
+        "delete_completion",
+    ),
+    "trim-skips-publication-wait": (
+        "(waited : through ≤ localHead → PublishedBefore trace through checked)",
+        "(waited : through ≤ localHead → checked = checked)",
+        "trim_completion",
+    ),
+}
+
+READ_CONTROLS = {
+    "continue-beyond-first-sample": (
+        "first.start - 1 + copied + next.count ≤ first.head",
+        "first.start - 1 + copied ≤ first.head",
+        "read_continuation",
+    ),
+    "trimmed-at-observed-floor": (
+        "(valid : ∀ f, .below f ∈ attempts → start < f)",
+        "(valid : ∀ f, .below f ∈ attempts → start ≤ f)",
+        "selected_floor_observed",
+    ),
+    "empty-page-at-the-sampled-head": (
+        "(requested : 0 < chunk.count) (empty : chunk.records = [])",
+        "(requested : 0 ≤ chunk.count) (empty : chunk.records = [])",
+        "empty_page_origin",
+    ),
+    "wait-past-read-deadline": (
+        "def remainingWait (deadline now : Nat) : Nat := deadline - now",
+        "def remainingWait (deadline now : Nat) : Nat := (deadline - now) + 1",
+        "no_wait_after_timeout",
+    ),
+    "wake-poll-before-requested-head": (
+        "decide (0 < wait ∧ 0 < count ∧ head < start)",
+        "decide (0 < wait ∧ 0 < count ∧ start < head)",
+        "early_poll_has_head",
+    ),
+}
+
+RECOVERY_CONTROLS = {
+    "run-with-the-wrong-epoch": (
+        "record.epoch = run.epoch) ∧",
+        "record.epoch = record.epoch) ∧",
+        "covering_run_epoch",
+    ),
+    "run-trim-keeps-discarded-start": (
+        "let start := max first run.first",
+        "let start := min first run.first",
+        "clipped_run_exact",
+    ),
+    "recover-across-another-promise": (
+        "(admitted : ((trace.state last).keeper keeper).promised = epoch)",
+        "(admitted : ((trace.state last).keeper keeper).promised ≤ epoch + 1)",
+        "recover_after_seal",
+    ),
+    "recover-from-mismatched-epoch": (
+        "(matched : old.epoch = wanted.epoch) :\n",
+        "(matched : old.epoch = old.epoch) :\n",
+        "recover_after_seal",
+    ),
+    "scan-from-unassigned-bytes": (
+        "run[i]? = issued[offset + i]?)",
+        "run[i]? = run[i]?)",
+        "lane_scan_exact",
+    ),
+    "certify-beyond-a-durable-vote": (
+        "(covered : cut ≤ left.length ∧ cut ≤ right.length)",
+        "(covered : cut ≤ left.length ∧ cut ≤ right.length + 1)",
+        "certify_lane_cut",
+    ),
+    "dispatch-uncertified-publication": (
+        "      w.advertised ((w.issued epoch).take head) →\n"
+        "      Dispatch w k caller (.publish epoch head)",
+        "      True →\n      Dispatch w k caller (.publish epoch head)",
+        "dispatch_sendable",
+    ),
+    "rewrite-an-issued-position": (
+        "(growth : Grows before after) {source target : Keeper Payload}",
+        "(growth : before = before) {source target : Keeper Payload}",
+        "issued_position_cannot_be_reassigned",
+    ),
+}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -294,7 +389,8 @@ def main():
     args = parser.parse_args()
     subprocess.run([args.lake, "build", "Logkeeper.StreamIOWitness",
                     "Logkeeper.StreamWriter", "Logkeeper.StreamHead",
-                    "Logkeeper.StreamReplacement", "Logkeeper.StreamWAL"], cwd=HERE, check=True,
+                    "Logkeeper.StreamReplacement", "Logkeeper.StreamWAL",
+                    "Logkeeper.StreamRecovery"], cwd=HERE, check=True,
                    capture_output=True)
     directory = HERE / ".results"
     directory.mkdir(exist_ok=True)
@@ -306,6 +402,9 @@ def main():
         "StreamHead": HEAD_CONTROLS,
         "StreamReplacement": REPLACEMENT_CONTROLS,
         "StreamWAL": WAL_CONTROLS,
+        "StreamRpc": RPC_CONTROLS,
+        "StreamRead": READ_CONTROLS,
+        "StreamRecovery": RECOVERY_CONTROLS,
     }
     for (module, cases) in modules.items():
         check_controls(args.lake, (MODULES / f"{module}.lean").read_text(), cases, evidence)

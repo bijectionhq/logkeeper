@@ -21,7 +21,8 @@ private def second : Round Nat :=
 
 theorem automaton_witness :
     ∃ s : State Nat, StreamIO.Reachable s ∧ (s.keeper 0).head = 1 ∧ Synced (s.keeper 0) 2 ∧
-      Synced (s.keeper 1) 2 ∧ (s.keeper 0).history = prior ∧ (s.keeper 1).history = prior ∧ s.writer.advertised prior := by
+      Synced (s.keeper 1) 2 ∧ (s.keeper 0).history = prior ∧ (s.keeper 1).history = prior ∧
+      s.writer.advertised prior ∧ Elected s.writer 2 2 ∧ (s.keeper 0).live ∧ (s.keeper 0).identity = 2 := by
   have c0 := (StreamIO.Reachable.initial (Payload := Nat)).call (k := 0) (i := 1) (req := .create) trivial rfl
   have c1 := c0.call (k := 1) (i := 1) (req := .create) trivial rfl
   have p0 := c1.call (k := 0) (i := 1) (req := .promise 1) (show 0 < 1 by decide) ⟨⟨rfl, rfl⟩, Or.inl (by decide)⟩
@@ -72,7 +73,8 @@ theorem automaton_witness :
   have pub := cert.call (k := 0) (i := 2) (req := .publish 2 1)
     ⟨⟨second, rfl, rfl⟩, by decide, Or.inr rfl⟩
     ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, by decide⟩
-  exact ⟨_, pub, rfl, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, rfl, Or.inr rfl⟩
+  exact ⟨_, pub, rfl, ⟨rfl, rfl⟩, ⟨rfl, rfl⟩, rfl, rfl, Or.inr rfl,
+    ⟨second, rfl, rfl⟩, ⟨rfl, rfl⟩, rfl⟩
 
 private theorem reuse_after_capacity {before : State Nat} (reached : StreamIO.Reachable before)
     (assigned : (before.pending 1).payloads = [7, 8])

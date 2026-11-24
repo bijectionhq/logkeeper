@@ -178,46 +178,75 @@ either index recovers the same image and newer WAL. A reachable two-stream run a
 during checkpointing and reopens before publication and after retirement.
 [WAL projection](Logkeeper/StreamWAL.lean)
 
+## Completed exchanges
+
+`StreamRpc.Exchange` indexes a send, the keeper decision for that request and
+the reply receive on the same three-keeper timeline. For `head`, queue drain
+precedes the round, each slot carries its keeper's exact Check or Append sample,
+and the writer supplies two publication completions. The observer can use a
+later confirmation round. The two completion theorems derive the logical
+linearization cut from those exchanges. The Rust queue and lane serials determine
+which replies to include. A lane's observation sender is local to the Append
+future that fills it.
+
+For Trim, both counted exchanges return floors strictly above the request. The
+model uses the local publication wait when the writer knows the cut and the
+keepers' durable head checks when the local snapshot is behind. For Delete, two
+distinct exchanges establish tombstones that exclude any later live quorum on
+the same ensemble. The Rust quorum collector takes one future per ensemble
+slot. Broadcast keeps the third future running after the first two replies.
+
+For Read, committed prefixes of the same keeper extend over time. A later
+chunk therefore supplies the exact continuation within the first head. The
+fallback selector carries only complete pages and selects a Trimmed floor from
+an observed reply above the original request. For a positive count, an empty
+page samples a head below the requested start. The writer ends a long poll at
+the call deadline and takes an immediate sample if the timer fires. Fallback
+uses the remaining time and page continuation requests have no wait.
+
+For recovery, the retained runs describe the epoch at each covered position,
+including after clipping a prefix or suffix. A Recover that still observes
+the promised epoch either sees the earlier Seal's unchanged history or the
+elected seed installed by a complete Sync. Committed catch-up fetches return
+the exact assigned slice from a previously accepted slot. The send theorem
+covers every modeled request constructor when supplied local dispatch evidence.
+An Append uses its exact contiguous run and a cut certified from distinct
+durable lane votes.
+
+These results quantify over three keepers, one stream, arbitrary payloads,
+and natural-number positions and event indices. Present wire epochs map to
+one plus their value to leave model epoch zero for the absent promise. The
+new Trim witness extends the reachable 36-action inherited publication run
+with a send and durable delivery. The clock lemmas use elapsed time independently
+of the event indices. The runtime controls cover dropped read continuations,
+late poll replies, and counting the same keeper twice for Trim or Delete.
+[Exchange proofs](Logkeeper/StreamRpc.lean) · [Read proofs](Logkeeper/StreamRead.lean) ·
+[Recovery proofs](Logkeeper/StreamRecovery.lean)
+
 ## Boundaries
 
-- **Writer send refinement.** The linked decisions prove when a verified predecessor
-  establishes Sync agreement, when a fallback epoch identifies the seed record and
-  how an assigned append range bounds the published head. The projection of compressed
-  epoch runs, the binding of asynchronous Recover responses to their snapshots and
-  the construction of the exact assigned byte slice from the lanes' maps remain
-  code premises. `Sendable` also requires the published cut to be certified. The
-  link for `acknowledged` supplies quorum certification given correctly bound
-  lane slots. Pending assignments are separate from the issued history.
-  `issue` freezes an assigned prefix at its first possible durable acceptance.
-  `discard` clears the pending suffix after three current capacity refusals
-  when the unanswered-append bound is covered by the issued prefix. A
-  three-keeper witness discards two assigned records and reassigns their first
-  position. The automaton takes the capacity outcome and lane completion as
-  inputs. Study 119 checks the bounded quota and duplicate cases, and the
-  Rust control delays a timed-out request across trim.
+- **Writer send refinement.** The executable construction of run and byte
+  evidence and the induction that produces `Dispatch` at every Rust send
+  remain open. The model separates pending assignments from issued history.
+  `issue` freezes a pending prefix before possible durable acceptance, and
+  `discard` requires three current capacity refusals and coverage of the
+  unanswered-append bound. The capacity witness discards two assignments and
+  reassigns their first position. The model takes lane completion and the
+  capacity outcome as inputs. The revised transport contract makes a reported
+  capacity refusal terminal for its call, and the Rust control delays a
+  timed-out request across trim.
 - **Keeper decisions.** Verus and the link runner cover proposal equality, per-run
   bounds, record charge, Sync head bounds, the projected Replace decision, valid
   ensembles, and installation's ensemble and learner fields. Full refinement of
   `decide` and `apply` still needs the wire request projection, retained bytes and
   run lookup, quota accumulation and the native retained and staged transitions.
   [Keeper decisions](../../src/stream/keeper/rules.rs)
-- **Head round projection.** The cut proof consumes the queue-open event, per-keeper
-  send and durable-sample events, and the exact keeper view at each sample. Verus and
-  the link cover serial freshness, epoch eligibility, the maximum sample and the quorum
-  count. Rust tests cover queued batching, later callers, stale-writer fallback and index
-  pinning. The async projection from Tokio queue and lane events to `Samples` and the
-  binding of raw reply tails to their durable send events remain open.
-- **Reads.** `read_exact` covers the keeper slice and `assemble_read_chunk` proves
-  that an exact following chunk bounded by the first head extends the page. The
-  async projection of subsequent replies to exact slices of that keeper remains open,
-  as do abandoned partial pages on fallback, observed floor precedence, and the
-  long-poll deadline and wake-up.
-- **Trim and Delete quorums.** Keeper effects and quorum intersection for durable
-  tombstones on one roster are proved. A Trim through a locally known head waits for
-  publication, and every successful Trim reply must have floor above the requested
-  cut. For Delete the writer broadcasts to three distinct keepers and counts two
-  durable tombstone replies. The async projection of the Trim publication wait and
-  both operations' reply collection into quorum evidence remains open.
+- **Async Rust binding.** The completion theorems use exchanges tagged with
+  their exact request and durable decision. A mechanized correspondence from
+  Tokio queue, watch and transport events to those exchanges remains open,
+  including the local publication wait, read timers, and construction of the
+  wire reply's exact byte and epoch image. Tests exercise the shipped paths and
+  the Verus links check the corresponding pure decision functions.
 - **Replacement and authority.** The repeatable transfer theorem starts from two
   projected publication deliveries and preserved survivor states. It assumes that
   the next roster supplies a reachable automaton state. The raw Seal, Recover, Sync
