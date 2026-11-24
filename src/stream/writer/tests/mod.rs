@@ -560,6 +560,35 @@ async fn an_append_reply_waits_for_quorum_commit_visibility() {
 }
 
 #[tokio::test]
+async fn head_and_trim_wait_for_a_sampled_append_to_be_visible() {
+    let (network, writer) = started().await;
+    network.down(KEEPERS[2], true);
+    let gate = Gate::new();
+    network.fault(KEEPERS[1], Kind::Publish, Fault::HoldReply(gate.clone()));
+    let append = writer.append(STREAM, E1, Lsn(1), record("visible"));
+    tokio::pin!(append);
+    assert!(poll!(&mut append).is_pending());
+    gate.reached().await;
+
+    let head = writer.head(STREAM);
+    let trim = writer.trim(STREAM, E1, Lsn(1));
+    tokio::pin!(head, trim);
+    let quiet = Duration::from_millis(25);
+    assert!(
+        tokio::time::timeout(quiet, &mut head).await.is_err(),
+        "head must wait for quorum commit visibility"
+    );
+    assert!(
+        tokio::time::timeout(quiet, &mut trim).await.is_err(),
+        "trim must wait for quorum commit visibility"
+    );
+    gate.release();
+    assert_eq!(head.await, Ok(Lsn(1)));
+    assert_eq!(trim.await, Ok(()));
+    assert_eq!(append.await, Ok(Lsn(1)));
+}
+
+#[tokio::test]
 async fn a_fenced_publication_leaves_a_chosen_append_outcome_unknown() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);

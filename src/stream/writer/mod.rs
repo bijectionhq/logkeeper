@@ -171,6 +171,7 @@ impl Writer {
                 committed_end: commit,
             });
         }
+        active.published(through).await?;
         let floor = quorum(FuturesUnordered::from_iter(stream.ensemble.map(
             |keeper| async move {
                 match self

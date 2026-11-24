@@ -87,7 +87,9 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
                 count += 1;
                 sample = sample.max(end);
                 if count == QUORUM {
-                    return active.cover(sample).await;
+                    let end = active.cover(sample).await?;
+                    active.published(end).await?;
+                    return Ok(end);
                 }
             }
             Err(error @ JournalError::Fenced { current }) if current > active.epoch => {
