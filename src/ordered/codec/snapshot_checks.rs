@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
@@ -110,4 +112,11 @@ pub(super) fn root_reference_row_valid(
         Some(previous) => previous < revision,
         None => true,
     }
+}
+
+pub(super) fn all_snapshot_rows<K: Ord, Row>(
+    rows: &BTreeMap<K, Row>,
+    valid: impl Fn(&Row) -> bool,
+) -> bool {
+    rows.values().all(valid)
 }

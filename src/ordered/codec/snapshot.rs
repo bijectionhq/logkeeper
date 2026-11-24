@@ -2,9 +2,9 @@ use super::{
     Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, object_names,
     principal, request_id, window, withdrawal, writer_state,
 };
-use super::frame::{decode_flag, encode_flag};
+use super::frame::{bounded_body_length, decode_flag, encode_flag};
 use super::snapshot_checks::{
-    fence_row_valid, generation_in_range, hold_receipt_matches, lease_row_valid,
+    all_snapshot_rows, fence_row_valid, generation_in_range, hold_receipt_matches, lease_row_valid,
     root_reference_row_valid,
 };
 use crate::ordered::{
@@ -276,14 +276,16 @@ impl State {
                 self.admit_object_references(Some(names))?;
             }
         }
-        for retained in self.outcomes.values() {
-            if let Ok(Outcome::ObjectWithdrawn(fence)) = retained.receipt.outcome
-                && (retained.receipt.principal != Principal::Custodian
-                    || fence.position > retained.receipt.position
-                    || self.object_fences.get(&fence.object.name) != Some(&fence))
-            {
-                return Err(Refusal::Invalid);
+        if !all_snapshot_rows(&self.outcomes, |retained| {
+            if let Ok(Outcome::ObjectWithdrawn(fence)) = retained.receipt.outcome {
+                retained.receipt.principal == Principal::Custodian
+                    && fence.position <= retained.receipt.position
+                    && self.object_fences.get(&fence.object.name) == Some(&fence)
+            } else {
+                true
             }
+        }) {
+            return Err(Refusal::Invalid);
         }
         Ok(())
     }
@@ -573,7 +575,7 @@ impl State {
                 },
             );
         }
-        for entry in self.holds.values() {
+        if !all_snapshot_rows(&self.holds, |entry| {
             let hold = entry.hold;
             let receipt_position = self
                 .outcomes
@@ -591,9 +593,9 @@ impl State {
                     };
                     (admitted == hold).then_some(receipt.position)
                 });
-            if !hold_receipt_matches(hold.admitted_at, receipt_position) {
-                return Err(Refusal::Invalid);
-            }
+            hold_receipt_matches(hold.admitted_at, receipt_position)
+        }) {
+            return Err(Refusal::Invalid);
         }
         Ok(())
     }
@@ -601,11 +603,8 @@ impl State {
 
 impl Input {
     pub(super) fn count(&mut self, maximum: usize) -> Result<usize, Refusal> {
-        let count = usize::try_from(self.u64()?).map_err(|_| Refusal::Invalid)?;
-        if count > maximum || count > self.0.len() {
-            return Err(Refusal::Invalid);
-        }
-        Ok(count)
+        let declared = self.u64()?;
+        bounded_body_length(declared, 0, maximum.min(self.0.len())).ok_or(Refusal::Invalid)
     }
 
     pub(super) fn append_result(&mut self) -> Result<AppendResult, Refusal> {
