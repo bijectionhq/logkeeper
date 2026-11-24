@@ -52,6 +52,7 @@ pub(super) const KEEPERS: [KeeperId; 4] = [KeeperId(1), KeeperId(2), KeeperId(3)
 #[derive(Clone)]
 pub(super) enum Fault {
     LoseReply,
+    DelayRequest(Arc<Gate>),
     HoldReply(Arc<Gate>),
 }
 
@@ -193,7 +194,25 @@ impl Transport for Client {
                 if state.down[slot(keeper)] {
                     return Err(TransportError::Unreachable);
                 }
-                (apply(&mut state), state.faults.remove(&(keeper, kind)))
+                let fault = state.faults.remove(&(keeper, kind));
+                if let Some(Fault::DelayRequest(gate)) = fault {
+                    let network = Arc::clone(network);
+                    let identity = self.identity.clone();
+                    tokio::spawn(async move {
+                        gate.reached.add_permits(1);
+                        gate.released.acquire().await.unwrap().forget();
+                        let mut state = network.state.lock();
+                        state.keepers[slot(keeper)].call(
+                            keeper,
+                            &identity,
+                            request,
+                            &network.limits,
+                        );
+                        network.change.send_replace(());
+                    });
+                    return Err(TransportError::TimedOut);
+                }
+                (apply(&mut state), fault)
             };
             if let Request::Read {
                 from, wait_ms, max, ..
@@ -217,6 +236,7 @@ impl Transport for Client {
             }
             match fault {
                 Some(Fault::LoseReply) => Err(TransportError::TimedOut),
+                Some(Fault::DelayRequest(_)) => unreachable!("delayed before delivery"),
                 Some(Fault::HoldReply(gate)) => {
                     gate.reached.add_permits(1);
                     gate.released.acquire().await.unwrap().forget();

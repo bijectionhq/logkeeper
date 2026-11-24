@@ -63,7 +63,7 @@ certificates and the keeper traces. A concrete witness creates, seals and
 syncs two keepers, then chooses a record while the third keeper is empty.
 
 [WALBridge.lean](WALBridge.lean) imports Study 117's SharedWAL source at
-`logkeeper-k5/verification/117-shared-wal/SharedWAL.lean`. It specializes the
+`../117-shared-wal/SharedWAL.lean`. It specializes the
 reply-survival theorem to stream keeper images. A covered frame survives
 in the correct stream's recovered projection. The runner compiles Study
 117's source into Study 119's results directory.
@@ -84,7 +84,7 @@ any retained and staged state.
 
 ## TLC model and bounds
 
-[StreamJournal.tla](StreamJournal.tla) uses a shared keeper reducer in seven
+[StreamJournal.tla](StreamJournal.tla) uses a shared keeper reducer in eight
 scenarios. TLC explores each bounded program and its permitted interleavings.
 
 | Scenario | Bounds |
@@ -95,6 +95,7 @@ scenarios. TLC explores each bounded program and its permitted interleavings.
 | `wal` | One keeper, two streams, at most four abstract frames and at most one pending frame per stream. A shared covering sync, replies and tears can interleave. |
 | `handoff` | One stream, two epochs, three keepers and one record. The newer writer syncs the inherited suffix to two keepers before the older writer's delayed accept reaches the third. |
 | `retention` | One stream, one epoch and three keepers. Two keepers trim the committed record. The third retains it and has one further accepted record. A read chooses one keeper and one of the two LSNs. |
+| `capacity` | One stream, one epoch, three keepers, two assigned pending positions, and a one-byte record limit and quota. The first pending record can exceed the quota or the record limit. One unanswered request can arrive after trim. A retained duplicate is then sent at the same position. |
 | `replacement` | One stream, three original identities, one learner, a permanent disk loss and three epochs. Two survivor installs can finish in either order. The model exercises stale Seal, a same-epoch retry on the installed route, delayed old Append, learner promotion, a second disk loss probe, and a new write and read. |
 
 The protocol tear occurs at the keeper that later holds the only live copy
@@ -103,8 +104,9 @@ stream. The covered frames and their reply evidence survive. The learner
 can vote after receiving the chosen prefix. Study 117's EmptyRejoin control
 covers reusing a blank voter identity. Its covering frontier and stream
 projection inform the WAL actions here. The frames represent already
-decoded decisions. CRCs, quotas, authentication, runtime scheduling,
-liveness and long-poll deadlines are outside these bounds.
+decoded decisions. Quota is exercised in the capacity scenario. CRCs,
+authentication, runtime scheduling, liveness and long-poll deadlines are
+outside these bounds.
 
 ## Specification probes
 

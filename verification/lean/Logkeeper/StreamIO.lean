@@ -212,6 +212,31 @@ def Sendable (w : Writer Payload) (k : Keeper Payload) (identity : Nat) : Reques
 
 /-! ## State and actions -/
 
+inductive CapacityRefusal where
+  | full
+  | tooLarge
+  deriving DecidableEq
+
+/-- Capacity is checked only for a new append. A retained identical retry bypasses it. -/
+def CapacityAt (k : Keeper Payload) (position : Nat) : Prop :=
+  position = k.tail + 1
+
+theorem capacity_refusal_excludes_retry {k : Keeper Payload} {position : Nat}
+    (refused : CapacityAt k position) : k.tail < position := by
+  unfold CapacityAt at refused
+  omega
+
+/-- The suffix still waiting for its first durable acceptance. A lost reply pins every
+    position its request could still reach. Replies are scoped to one writer revision. -/
+structure Pending (Payload : Type) where
+  payloads : List Payload := []
+  revision : Nat := 0
+  uncertainThrough : Nat := 0
+  refused : KeeperId → Option CapacityRefusal := fun _ => none
+
+def Pending.reset (p : Pending Payload) (payloads : List Payload) : Pending Payload :=
+  { p with payloads, revision := p.revision + 1, refused := fun _ => none }
+
 structure State (Payload : Type) where
   keeper : KeeperId → Keeper Payload
   writer : Writer Payload
@@ -220,10 +245,11 @@ structure State (Payload : Type) where
   seals : Nat → KeeperId → Option (Nat × Vote (Record Payload))
   /-- The latest vote each writer's lane has received from each keeper. -/
   votes : Nat → KeeperId → Option (History Payload)
+  pending : Nat → Pending Payload
 
 def State.initial : State Payload :=
   ⟨fun _ => StreamJournal.initial, ⟨fun _ => none, fun _ => [], fun h => h = []⟩, [], fun _ _ => none,
-    fun _ _ => none⟩
+    fun _ _ => none, fun _ => {}⟩
 
 def update {α : Type} (f : KeeperId → α) (k : KeeperId) (value : α) : KeeperId → α :=
   fun j => if j = k then value else f j
@@ -240,6 +266,10 @@ inductive Action (Payload : Type) where
   | choose (epoch : Nat) (round : Round Payload)
   | collectVote (epoch : Nat) (keeper : KeeperId)
   | certify (epoch : Nat) (history : History Payload)
+  | assign (epoch : Nat) (payloads : List Payload)
+  | loseAppend (epoch count : Nat)
+  | rejectCapacity (epoch : Nat) (keeper : KeeperId) (revision : Nat) (reason : CapacityRefusal)
+  | discard (epoch : Nat)
   | issue (epoch : Nat) (payloads : List Payload)
   | restart (keeper : KeeperId)
 
@@ -260,6 +290,9 @@ def State.withSeal (s : State Payload) (e : Nat) (k : KeeperId) (report : Nat ×
 def State.withVote (s : State Payload) (e : Nat) (k : KeeperId) (h : History Payload) :
     State Payload :=
   { s with votes := fun x j => if x = e ∧ j = k then some h else s.votes x j }
+
+def State.withPending (s : State Payload) (e : Nat) (p : Pending Payload) : State Payload :=
+  { s with pending := fun x => if x = e then p else s.pending x }
 
 def State.apply (s : State Payload) (k : KeeperId) (i : Nat) (req : Request Payload) :
     State Payload :=
@@ -287,10 +320,42 @@ inductive Next : State Payload → Action Payload → State Payload → Prop
   | certify {s e h} (a b : KeeperId) {ha hb : History Payload} : a ≠ b →
       s.votes e a = some ha → s.votes e b = some hb → h <+: ha → h <+: hb →
       Next s (.certify e h) { s with writer := advertise s.writer h }
-  | issue {s e payloads} {r : Round Payload} : s.writer.round e = some r →
-      Next s (.issue e payloads) { s with writer := extend s.writer e payloads }
+  | assign {s e payloads} {r : Round Payload} : s.writer.round e = some r →
+      Next s (.assign e payloads) (s.withPending e ((s.pending e).reset ((s.pending e).payloads ++ payloads)))
+  /-- An unanswered pending Append can still have a durable effect. -/
+  | loseAppend {s e count} : 0 < count → count ≤ (s.pending e).payloads.length →
+      Next s (.loseAppend e count) (s.withPending e { s.pending e with
+        uncertainThrough := max (s.pending e).uncertainThrough ((s.writer.issued e).length + count) })
+  /-- A lane's completed capacity reply. The model compresses the request and collection
+      of this definitive refusal. It supplies the capacity outcome as an input. -/
+  | rejectCapacity {s e k revision reason caller payloads head} :
+      revision = (s.pending e).revision → Elected s.writer e caller →
+      payloads <+: (s.pending e).payloads →
+      Admitted (s.keeper k) caller (.append e ((s.writer.issued e).length + 1) payloads head) →
+      CapacityAt (s.keeper k) ((s.writer.issued e).length + 1) →
+      Next s (.rejectCapacity e k revision reason) (s.withPending e { s.pending e with
+        refused := update (s.pending e).refused k (some reason) })
+  | discard {s e} : (s.pending e).payloads ≠ [] →
+      (∀ k, (s.pending e).refused k ≠ none) →
+      (s.pending e).uncertainThrough ≤ (s.writer.issued e).length →
+      Next s (.discard e) (s.withPending e ((s.pending e).reset []))
+  /-- Freeze the exact assigned prefix at the boundary of its first possible durable
+      acceptance. Subsequent sends use the ordinary issued-history rule. -/
+  | issue {s e payloads rest} {r : Round Payload} : s.writer.round e = some r →
+      (s.pending e).payloads = payloads ++ rest →
+      Next s (.issue e payloads)
+        { s.withPending e ((s.pending e).reset rest) with writer := extend s.writer e payloads }
   /-- A keeper restart reopens its durable state; the trace replay checks the WAL image. -/
   | restart {s k} : Next s (.restart k) s
+
+theorem discard_preserves_pending_evidence {s s' : State Payload} {e : Nat}
+    (next : Next s (.discard e) s') :
+    (∀ k, (s.pending e).refused k ≠ none) ∧
+      (s.pending e).uncertainThrough ≤ (s.writer.issued e).length ∧
+      s'.writer = s.writer ∧ (s'.pending e).payloads = [] := by
+  cases next with
+  | discard _ unanimous certain =>
+      exact ⟨unanimous, certain, rfl, by simp [State.withPending, Pending.reset]⟩
 
 /-! ## Keeper actions refine Study 119 -/
 
@@ -1001,7 +1066,9 @@ theorem next_inv {s s' : State Payload} {a : Action Payload} (inv : Inv s) (next
         rcases acked with rfl | rfl
         · exact ⟨ha, inv.votes e j ha first, inA⟩
         · exact ⟨hb, inv.votes e j hb second, inB⟩
-  | @issue e payloads r elected =>
+  | assign | loseAppend | rejectCapacity | discard =>
+      exact ⟨{ inv with reached := inv.reached }, unchanged, Grows.refl _⟩
+  | @issue e payloads rest r elected _ =>
       have grows : Grows s.writer (extend s.writer e payloads) := by
         refine ⟨fun _ _ round => round, fun x => ?_, fun _ old => old⟩
         by_cases same : x = e
@@ -1155,6 +1222,8 @@ theorem Reachable.call {s : State Payload} (reached : Reachable s) {k : KeeperId
     Reachable (({ s with net := .call k i req :: s.net } : State Payload).apply k i req) :=
   .extend (.extend reached (.send sendable)) (.deliver List.mem_cons_self admitted)
 
+#print axioms capacity_refusal_excludes_retry
+#print axioms discard_preserves_pending_evidence
 #print axioms step_mono
 #print axioms complete_sync_head_within_request
 #print axioms complete_sync_uses_request_records

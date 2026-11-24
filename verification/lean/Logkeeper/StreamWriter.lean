@@ -62,7 +62,7 @@ theorem issued_origins {s : State Payload} (reached : StreamIO.Reachable s) :
               (inv.unelected 0 inv.reserved) voted
             exact ((ih r.winner.ballot).prefix follows.2.2).grows grows
           · simpa [elect, same] using (ih x).grows grows
-      | @issue e payloads r elected =>
+      | @issue e payloads rest r elected assigned =>
           intro x
           by_cases same : x = e
           · subst x
@@ -85,7 +85,8 @@ theorem issued_origins {s : State Payload} (reached : StreamIO.Reachable s) :
               exact ⟨(List.getElem?_eq_some_iff.mp found).1, rfl⟩
           · simpa [extend, same] using (ih x).grows grows
       | certify => exact ih
-      | send | deliver | refuse | drop | collectSeal | collectVote | restart => exact ih
+      | send | deliver | refuse | drop | collectSeal | collectVote | restart
+      | assign | loseAppend | rejectCapacity | discard => exact ih
 
 theorem keeper_origins {s : State Payload} (reached : StreamIO.Reachable s) (k : KeeperId) :
     Origins s.writer (s.keeper k).history := by

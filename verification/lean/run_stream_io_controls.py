@@ -13,6 +13,21 @@ MODULES = HERE / "Logkeeper"
 
 # name: (original text, weakened text, theorem whose proof must fail first)
 IO_CONTROLS = {
+    "discard-after-minority-capacity-refusals": (
+        "      (∀ k, (s.pending e).refused k ≠ none) →",
+        "      (∃ k, (s.pending e).refused k ≠ none) →",
+        "discard_preserves_pending_evidence",
+    ),
+    "discard-after-an-unanswered-append": (
+        "      (s.pending e).uncertainThrough ≤ (s.writer.issued e).length →",
+        "      (s.pending e).uncertainThrough = (s.pending e).uncertainThrough →",
+        "discard_preserves_pending_evidence",
+    ),
+    "capacity-refusal-for-a-duplicate": (
+        "def CapacityAt (k : Keeper Payload) (position : Nat) : Prop :=\n  position = k.tail + 1",
+        "def CapacityAt (k : Keeper Payload) (position : Nat) : Prop :=\n  position = k.tail",
+        "capacity_refusal_excludes_retry",
+    ),
     "complete-sync-head-past-request": (
         "      SyncHeadAdmitted k.head head (start - 1 + records.length) (k.syncFloor floor)",
         "      SyncHeadAdmitted k.head head (max head (start - 1 + records.length)) (k.syncFloor floor)",

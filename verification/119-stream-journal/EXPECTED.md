@@ -6,10 +6,10 @@ lengths count transitions after the initial state.
 
 ## Lean
 
-The Lake package builds. The 21 stream-journal reports, 16 I/O automaton
+The Lake package builds. The 21 stream-journal reports, 19 I/O automaton
 reports, nine replacement reports, nine WAL reports and one Study 117
 bridge report contain only standard axioms. The reports include the
-two-keeper commit, split install and background checkpoint witnesses.
+two-keeper commit, capacity discard, split install and background checkpoint witnesses.
 
 | Control | Failing check |
 | --- | --- |
@@ -31,6 +31,7 @@ two-keeper commit, split install and background checkpoint witnesses.
 | handoff | 17 |
 | retention | 23 |
 | replacement | 86 |
+| capacity | 43 |
 
 ## Reachable TLC executions
 
@@ -98,3 +99,17 @@ that state is reachable with the baseline guards.
 | Immediate D03 with two acknowledgements | `BothSurvivorsAfterLoss` | 13 |
 | Writer answers with its locally known cut after a lost reply | `HeadLinearizable` | 16 |
 | Seal returns only the advertised commit watermark | `DelayedAppendAlreadyCommitted` | 16 |
+
+## Pending capacity
+
+The capacity program reaches 43 distinct states. It witnesses a two-position
+discard and reassignment after three capacity replies, a delayed acceptance
+after trim followed by an identical duplicate, and three oversized-record
+refusals. The first two witnesses take 26 transitions each. The oversized
+witness takes 19.
+
+| Mutation | Failing invariant | Transitions |
+| --- | --- | ---: |
+| Discard after two replies | `DiscardSafe` | 19 |
+| Discard with an unanswered request | `DiscardSafe` | 20 |
+| Check capacity on a duplicate | `CapacityDuplicate` | 13 |

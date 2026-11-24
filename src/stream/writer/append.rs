@@ -45,6 +45,8 @@ struct State {
     head: Lsn,
     floor: Lsn,
     pending: BTreeMap<Lsn, Pending>,
+    /// An unanswered Append can still reach a keeper after a later capacity refusal.
+    uncertain_through: Lsn,
     /// Chosen payloads that some lane may still need. Bounded by `RETAIN_BYTES`.
     committed: BTreeMap<Lsn, Bytes>,
     committed_bytes: usize,
@@ -100,6 +102,7 @@ impl Active {
                 head: recovery.tail(),
                 floor: recovery.floor,
                 pending: BTreeMap::new(),
+                uncertain_through: Lsn(0),
                 committed: BTreeMap::new(),
                 committed_bytes: 0,
                 lanes: std::array::from_fn(|_| Lane::default()),
@@ -359,8 +362,8 @@ impl Active {
                 let result = self.send_append(keeper, at, payloads, head).await;
                 observed.send_replace(Some(result.clone()));
                 // After a lost reply the keeper can already hold more of this writer's
-                // records than the retry carried. Positions are never reassigned within
-                // an epoch, so its tail is accepted up to the highest known position.
+                // records than the retry carried. Those positions stay assigned, so
+                // its tail is accepted up to the highest known position.
                 let known = {
                     let state = self.state.lock();
                     state
@@ -590,8 +593,9 @@ impl State {
                     )
             })
         });
-        if failed_at_first {
-            // A different payload is safe only if every keeper definitively refused this one.
+        if failed_at_first && first > self.uncertain_through {
+            // Every lane finished without accepting the first pending record.
+            // An earlier unanswered request covering it would still own its bytes.
             let error = self.impossible(first).unwrap();
             for (_, mut pending) in std::mem::take(&mut self.pending) {
                 notify(&mut pending, Err(error.clone()));
@@ -607,7 +611,26 @@ impl State {
             .pending
             .iter()
             .filter(|(_, pending)| !pending.waiters.is_empty())
-            .filter_map(|(&at, _)| self.impossible(at).map(|error| (at, error)))
+            .filter_map(|(&at, _)| {
+                let error = self.impossible(at)?;
+                if matches!(
+                    error,
+                    JournalError::Full { .. } | JournalError::TooLarge { .. }
+                ) {
+                    // A third reply can still make the refusal definitive.
+                    let outstanding = self.lanes.iter().any(|lane| {
+                        lane.accepted.is_none_or(|tail| tail < at)
+                            && !lane.failure.as_ref().is_some_and(|failure| {
+                                failure.revision == self.revision && failure.at <= at
+                            })
+                    });
+                    if outstanding && at > self.uncertain_through {
+                        return None;
+                    }
+                    return Some((at, JournalError::Unavailable));
+                }
+                Some((at, error))
+            })
             .collect();
         for (at, error) in failed {
             let error = match error {
@@ -631,6 +654,7 @@ mod tests {
             head: Lsn(3),
             floor: Lsn(1),
             pending: BTreeMap::new(),
+            uncertain_through: Lsn(0),
             committed: BTreeMap::new(),
             committed_bytes: 0,
             lanes: [
@@ -700,6 +724,14 @@ async fn replicate(active: Weak<Active>, index: usize, mut change: watch::Receiv
             Work::Append { at, head, .. } => (*at, *head, None),
             Work::Publish(head) => (Lsn(head.0 + 1), *head, None),
         };
+        let sent_through = match &work {
+            Work::Append {
+                at,
+                payloads: Some(payloads),
+                ..
+            } => Some(Lsn(at.0 + payloads.len() as u64 - 1)),
+            _ => None,
+        };
         let result = current.run(index, work).await;
         {
             let mut state = current.state.lock();
@@ -718,14 +750,18 @@ async fn replicate(active: Weak<Active>, index: usize, mut change: watch::Receiv
                     state.advance(current.epoch);
                 }
                 Err(error) => {
+                    let uncertain = matches!(error, JournalError::Unavailable);
                     lane.failure = Some(Failure {
                         revision,
                         at,
                         error,
                     });
-                    state.fail_waiters();
+                    if let Some(last) = sent_through.filter(|_| uncertain) {
+                        state.uncertain_through = state.uncertain_through.max(last);
+                    }
                 }
             }
+            state.fail_waiters();
             current.wake();
         }
     }

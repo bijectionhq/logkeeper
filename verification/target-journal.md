@@ -149,8 +149,15 @@ requests require writer authorization.
   contiguous run of known records from its tail in one `Append`, so
   concurrent appends to one stream share a keeper round. The writer keeps
   committed payloads, within a byte bound, until every lane has accepted
-  them. After an uncertain result a lane resends one record, and adopts the
-  keeper's tail up to the highest position the writer has assigned. Two
+  them. A keeper checks capacity for a new append. An identical retained
+  retry bypasses capacity checks. The writer can discard its pending suffix
+  after current capacity refusals at its first position from all three
+  lanes, provided no unanswered append can still reach that position. An
+  unanswered append pins its assigned bytes until the position is chosen
+  or the epoch ends. A capacity failure without definitive refusal of the
+  suffix returns `Unavailable`. After an uncertain result a lane resends
+  one record and adopts the keeper's tail up to the highest position the
+  writer has assigned. Two
   durable acceptances at the writer's epoch choose the record. Publish the
   head to a quorum before acknowledging the append, using the head on
   subsequent or empty appends. An isolated append takes an accept round

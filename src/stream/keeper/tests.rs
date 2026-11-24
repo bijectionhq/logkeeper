@@ -527,6 +527,11 @@ fn append_requires_current_sync_next_position_or_an_identical_retry() {
         test.send(append(A, 1, 2, &[b"ab"], 1)),
         Reply::Refused(Refusal::Full { floor: Lsn(1) })
     );
+    assert_eq!(
+        test.send(append(A, 1, 1, &[b"abc"], 1)),
+        Reply::Appended { tail: Lsn(1) },
+        "a retained identical retry charged quota"
+    );
     assert_eq!(test.engine.wal.rounds.len(), rounds);
 }
 

@@ -51,6 +51,11 @@ Refuse(k) == [ok |-> FALSE, image |-> k, value |-> Null]
 Reply(k,v) == [ok |-> TRUE, image |-> k, value |-> v]
 Stay(k) == Reply(k,Null)
 
+RecordBytes(record) == IF record.payload = "oversized" THEN 2 ELSE 1
+Capacity(k,r) ==
+    IF \E i \in 1..Len(r.records) : RecordBytes(r.records[i]) > 1 THEN "too-large"
+    ELSE IF Len(k.history) + 1 - k.floor + Len(r.records) > 1 THEN "full" ELSE Null
+
 Decide(id,k,r) ==
     LET e == r.epoch IN
     CASE r.verb = "create" ->
@@ -87,7 +92,10 @@ Decide(id,k,r) ==
            /\ (NextPosition(k,r) \/ Identical(k,r)
                 \/ Fault = "append-gap" \/ (Fault = "append-conflict" /\ r.pos \in k.floor..Len(k.history)))
            /\ r.head <= Max(Len(k.history),r.pos)
-        THEN Stay([k EXCEPT
+        THEN LET limit == IF Scenario = "capacity" /\ (NextPosition(k,r) \/ Fault = "charge-duplicate")
+                          THEN Capacity(k,r) ELSE Null
+             IN IF limit # Null THEN [Refuse(k) EXCEPT !.value = limit]
+                ELSE Stay([k EXCEPT
                       !.history = IF NextPosition(k,r) \/ Fault = "append-gap"
                                   THEN @ \o r.records
                                   ELSE IF Fault = "append-conflict" THEN r.records
@@ -124,7 +132,8 @@ InitialWriter ==
     [epoch |-> 0, seed |-> <<>>, committed |-> <<>>, acknowledged |-> 0,
      cuts |-> <<0>>, voters |-> Originals, live |-> Originals, learner |-> FALSE,
      lost |-> FALSE, repaired |-> FALSE, zombie |-> FALSE, tried |-> FALSE,
-     retried |-> FALSE, rankOK |-> TRUE, sealedEnd |-> 0, sealPrior |-> 0]
+     retried |-> FALSE, rankOK |-> TRUE, sealedEnd |-> 0, sealPrior |-> 0,
+     pending |-> <<>>, refused |-> {}, uncertain |-> FALSE, discarded |-> FALSE]
 Init ==
     /\ store = [k \in Keepers |-> [s \in Streams |-> Empty]]
     /\ pc = 1
@@ -558,6 +567,49 @@ TrimRead ==
       [] pc = 19 -> \E source \in Originals, pos \in 1..2 : Do(source,Stream,Read(pos,2))
       [] OTHER -> FALSE
 
+\* One committed record fills the quota. Two pending positions share the same
+\* refusal round. A timed-out request can arrive after Trim frees space.
+PendingRecords(payload) == <<History(1,payload),History(1,"suffix")>>
+DiscardPending ==
+    /\ pc \in 19..20
+    /\ IF Fault = "discard-minority" THEN Cardinality(writer.refused) >= 2
+       ELSE writer.refused = Originals
+    /\ ~writer.uncertain \/ Fault = "discard-uncertain"
+    /\ writer' = [writer EXCEPT !.pending = <<>>, !.discarded = TRUE]
+    /\ pc' = 21
+    /\ UNCHANGED <<store,event,wal,head>>
+
+CapacityAppend ==
+    CASE pc \in 10..12 -> Do(pc-9,Stream,AppendTo(1,1,X,0))
+      [] pc \in 13..15 -> Do(pc-12,Stream,AppendTo(1,1,X,1))
+      [] pc = 16 ->
+         /\ \E payload \in {"pending","oversized"}, uncertain \in BOOLEAN :
+              /\ uncertain => payload = "pending"
+              /\ writer' = [writer EXCEPT !.pending = PendingRecords(payload), !.uncertain = uncertain]
+              /\ IF uncertain THEN Observe(1,Stream,AppendTo(1,2,<<History(1,payload)>>,1))
+                 ELSE UNCHANGED <<store,event>>
+         /\ pc' = pc+1
+         /\ UNCHANGED <<wal,head>>
+      [] pc \in 17..19 ->
+         LET k == pc-16
+             request == AppendTo(1,2,SubSeq(writer.pending,1,1),1)
+             result == Decide(k,store[k][Stream],request)
+         IN /\ Observe(k,Stream,request)
+            /\ result.value \in {"full","too-large"}
+            /\ writer' = [writer EXCEPT !.refused = @ \cup {k}]
+            /\ pc' = pc+1
+            /\ UNCHANGED <<wal,head>>
+      [] pc = 20 /\ writer.uncertain ->
+         /\ Advance
+         /\ UNCHANGED writer
+      [] pc \in 21..23 -> Do(pc-20,Stream,Trim(1,1))
+      [] pc = 24 ->
+         /\ writer' = IF writer.discarded THEN [writer EXCEPT !.pending = <<History(1,"replacement")>>]
+                       ELSE writer
+         /\ Advance
+      [] pc \in 25..26 -> Do(1,Stream,AppendTo(1,2,SubSeq(writer.pending,1,1),1))
+      [] OTHER -> FALSE
+
 Next ==
     CASE Scenario = "rules" -> Rules
       [] Scenario = "rank" -> StartupStep \/ RankProbe
@@ -565,6 +617,7 @@ Next ==
       [] Scenario = "replacement" -> ChangingEnsemble
       [] Scenario = "handoff" -> StartupStep \/ Handoff
       [] Scenario = "retention" -> StartupStep \/ TrimRead
+      [] Scenario = "capacity" -> StartupStep \/ CapacityAppend \/ DiscardPending
       [] Scenario = "wal" -> WalWriteNext \/ WalFlush \/ WalReply \/ WalTear(1)
 Spec == Init /\ [][Next]_vars
 
@@ -632,6 +685,15 @@ NoTrimReadWitness == ~(Scenario = "retention" /\ pc = 20
     /\ store[1][Stream].floor = 2 /\ store[2][Stream].floor = 2
     /\ event.before.floor = 1 /\ Len(event.before.history) = 2 /\ event.request.pos = 1
     /\ event.result.ok /\ event.result.value.records = X)
+DiscardSafe == writer.discarded => writer.refused = Originals /\ ~writer.uncertain
+CapacityDuplicate == (Scenario = "capacity" /\ pc \in {14,15,16,27}) =>
+    event.result.ok /\ event.result.image.history = event.before.history
+NoCapacityDiscardWitness == ~(Scenario = "capacity" /\ pc = 27 /\ writer.discarded
+    /\ event.result.ok /\ event.result.image.history[2].payload = "replacement")
+NoCapacityUncertainWitness == ~(Scenario = "capacity" /\ pc = 27 /\ writer.uncertain
+    /\ ~writer.discarded /\ event.result.ok /\ event.result.image.history[2].payload = "pending")
+NoTooLargeWitness == ~(Scenario = "capacity" /\ pc = 20 /\ writer.refused = Originals
+    /\ event.result.value = "too-large")
 NoDelayedAppendWitness == ~(writer.tried /\ writer.epoch = 2 /\ writer.committed = X
     /\ store[3][Stream].promised = 1 /\ event.result.ok)
 NoProtocolWitness == ~(writer.epoch = 2 /\ writer.lost /\ writer.retried /\ writer.tried

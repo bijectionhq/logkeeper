@@ -865,6 +865,54 @@ async fn limits_refuse_without_consuming_a_position_and_trim_frees_capacity() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn capacity_refusals_do_not_release_a_timed_out_append() {
+    let (network, writer) = started().await;
+    for i in 1..=3 {
+        writer
+            .append(STREAM, E1, Lsn(i), Bytes::from(vec![i as u8; 64]))
+            .await
+            .unwrap();
+    }
+    network
+        .until(|| {
+            KEEPERS[..3].iter().all(|&keeper| {
+                network
+                    .view(keeper, STREAM)
+                    .is_some_and(|view| view.head == Lsn(3))
+            })
+        })
+        .await;
+
+    let delayed = Gate::new();
+    network.fault(
+        KEEPERS[0],
+        Kind::Append,
+        Fault::DelayRequest(delayed.clone()),
+    );
+    let append = |payload| writer.append(STREAM, E1, Lsn(4), record(payload));
+    assert_eq!(append("original").await, Err(JournalError::Unavailable));
+    delayed.reached().await;
+    assert_eq!(
+        append("original").await,
+        Err(JournalError::Unavailable),
+        "capacity refusals released a position with an unanswered append"
+    );
+
+    writer.trim(STREAM, E1, Lsn(1)).await.unwrap();
+    assert_eq!(
+        append("different").await,
+        Err(JournalError::Unavailable),
+        "capacity refusals released a position with an unanswered append"
+    );
+    delayed.release();
+    assert_eq!(append("original").await, Ok(Lsn(4)));
+    assert_eq!(
+        append("different").await,
+        Err(JournalError::Conflict { head: Lsn(4) })
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn seal_policy_refuses_before_sending_a_seal() {
     struct Deny;
     impl SealPolicy for Deny {

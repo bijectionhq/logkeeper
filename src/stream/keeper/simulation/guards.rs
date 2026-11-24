@@ -486,9 +486,60 @@ async fn conflicting_retry_cannot_publish_on_a_lagging_keeper() {
             .await,
         Err(JournalError::Conflict { head: at }),
     );
+    assert_eq!(
+        network.copies(&[lagging], STREAM, at, &Bytes::from_static(b"other"), false),
+        0,
+        "conflicting retry installed bytes on a lagging keeper"
+    );
     history
         .call(&reader, &READER, Op::Read(at, 1))
         .await
         .unwrap();
     history.check(0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_reply_is_uncertain_while_a_duplicate_can_arrive() {
+    let network = Network::new(
+        0,
+        Limits {
+            stream_quota_bytes: 1,
+            max_record_bytes: 1,
+            ..Limits::default()
+        },
+    );
+    let old = writer(&network, &OLD, ENSEMBLE);
+    let history = History::new(&network);
+    history.call(&old, &OLD, Op::Create).await.unwrap();
+    sleep(20).await;
+    history.call(&old, &OLD, Op::Seal(E1)).await.unwrap();
+    sleep(45).await;
+    history
+        .call(&old, &OLD, Op::Append(E1, Lsn(1), Bytes::from_static(b"x")))
+        .await
+        .unwrap();
+    sleep(45).await;
+
+    let keeper = ENSEMBLE[0];
+    network.arm(keeper, Fault::Duplicate);
+    let reply = network
+        .client(&OLD)
+        .call(
+            keeper,
+            Request::Append {
+                stream: STREAM,
+                epoch: E1,
+                at: Lsn(2),
+                records: vec![Bytes::from_static(b"y")],
+                head: Lsn(1),
+            },
+        )
+        .await;
+    assert_eq!(
+        reply,
+        Err(TransportError::TimedOut),
+        "a duplicated capacity refusal escaped while redelivery was pending"
+    );
+    sleep(20).await;
+    assert_eq!(network.coverage().get("duplicate delivered"), Some(&1));
 }

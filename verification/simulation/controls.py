@@ -66,9 +66,56 @@ def controls():
     )
     yield (
         "ignore-seal-proposal",
-        [edit(RULES, "promised(*epoch) && state.proposal == *proposal", "promised(*epoch)")],
+        [edit(RULES, "current == epoch && owner == view.identity && id == proposal",
+              "current == epoch && owner == view.identity")],
         "stream::keeper::tests::a_checkpoint_retains_the_seal_proposal",
         "reopened keeper accepted a different proposal", 0,
+    )
+    yield (
+        "discard-uncertain-append",
+        [edit(WRITER + "append.rs", "if failed_at_first && first > self.uncertain_through {",
+              "if failed_at_first {")],
+        "stream::writer::tests::capacity_refusals_do_not_release_a_timed_out_append",
+        "capacity refusals released a position with an unanswered append", 0,
+    )
+    yield (
+        "decode-missing-seal-proposal",
+        [edit("src/stream/codec.rs", "decode::<RequestFrame>(body)?.try_into()", """{
+            let mut frame = decode::<RequestFrame>(body)?;
+            if let Some(RequestBody::Seal(seal)) = &mut frame.body
+                && seal.proposal.is_empty()
+            {
+                seal.proposal = encode_id(0);
+            }
+            frame.try_into()
+        }""")],
+        "stream::codec::tests::requires_a_proposal_id_on_seal_and_in_a_promise",
+        "decoded a Seal without a valid proposal ID", 0,
+    )
+    yield (
+        "decode-missing-promise-proposal",
+        [edit("src/stream/codec.rs", "decode_id(&promise.proposal)", "if promise.proposal.is_empty() { Ok(0) } else { decode_id(&promise.proposal) }")],
+        "stream::codec::tests::requires_a_proposal_id_on_seal_and_in_a_promise",
+        "decoded a reply promise without a valid proposal ID", 0,
+    )
+    yield (
+        "charge-append-duplicate",
+        [edit(RULES, "                if *at < next || records.is_empty() {",
+              """                if *at < next && !records.is_empty() && *head == state.head
+                    && let Some(error) = capacity(records, view.retained_bytes, state.floor, limits)
+                {
+                    return error;
+                }
+                if *at < next || records.is_empty() {""")],
+        "stream::keeper::tests::append_requires_current_sync_next_position_or_an_identical_retry",
+        "a retained identical retry charged quota", 0,
+    )
+    yield (
+        "reply-before-capacity-redelivery",
+        [edit("src/stream/keeper/simulation/network.rs", "(duplicate && capacity)",
+              "(duplicate && capacity && false)")],
+        SIM + "guards::capacity_reply_is_uncertain_while_a_duplicate_can_arrive",
+        "a duplicated capacity refusal escaped while redelivery was pending", 0,
     )
     yield (
         "sync-past-seed",
@@ -199,15 +246,26 @@ def controls():
         "skip-survivor-repair", [edit(str(sweep.relative_to(ROOT)), line[start:end], "")],
         SEEDED, "replacement did not repair both survivors", 9,
     )
-    append = ROOT / (WRITER + "append.rs")
-    line = append.read_text()
-    start = line.index("        let accepted = {", line.index("    async fn retry_committed("))
-    end = line.index("        quorum(", start)
     yield (
-        "retry-fills-gaps", [edit(str(append.relative_to(ROOT)), line[start:end],
-                                 "        let accepted = self.ensemble.map(Some);\n")],
+        "retry-fills-gaps",
+        [edit(WRITER + "append.rs", """        let accepted = {
+            let state = self.state.lock();
+            std::array::from_fn::<_, 3, _>(|index| {
+                state.lanes[index]
+                    .accepted
+                    .is_some_and(|tail| tail >= at)
+                    .then_some(self.ensemble[index])
+            })
+        };""", "        let accepted = self.ensemble.map(Some);"),
+         edit(WRITER + "append.rs", """                    let retained =
+                        recovery::fetch(&self.io, keeper, self.stream, self.epoch, at).await?;
+                    if retained != *payload {
+                        return Err(JournalError::Conflict { head: self.head() });
+                    }
+                    self.io.publish(keeper, self.stream, self.epoch, at).await""",
+              "                    self.send_append(keeper, at, vec![payload.clone()], at).await")],
         SIM + "guards::conflicting_retry_cannot_publish_on_a_lagging_keeper",
-        "journal contract violated in seed 0", 0,
+        "conflicting retry installed bytes on a lagging keeper", 0,
     )
 
 

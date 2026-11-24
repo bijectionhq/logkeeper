@@ -18,7 +18,7 @@ from study_tools import (
 
 LEAN = ROOT.parent / "lean"
 LAKE = Path.home() / ".elan/bin/lake"
-STUDY_117 = ROOT.parents[2] / "logkeeper-k5/verification/117-shared-wal"
+STUDY_117 = ROOT.parent / "117-shared-wal"
 JAVA = Path("/Users/sachaichbiah/cycle3/jdk/Contents/Home/bin/java")
 TLC = Path("/Users/sachaichbiah/cycle3/tools/formal/tla-1.7.4/tla2tools.jar")
 
@@ -39,6 +39,7 @@ BASELINES = {
     "wal": WAL,
     "handoff": (*RULES, "DelayedAppendAlreadyCommitted"),
     "retention": (*RULES, "KeeperBounds", "RetentionReadCommitted"),
+    "capacity": (*RULES, "KeeperBounds", "DiscardSafe", "CapacityDuplicate"),
     "replacement": (*RULES, "KeeperBounds", "StaleRouteRefused", "OneEnsembleAuthority",
                     "LearnerAfterSurvivors", "LearnerCannotAppend", "PublishedOnSurvivors",
                     "ReplacementDurability", "ReplacementCommittedPrefix",
@@ -50,6 +51,9 @@ WITNESSES = (
     ("wal", "NoWalWitness"),
     ("handoff", "NoDelayedAppendWitness"),
     ("retention", "NoTrimReadWitness"),
+    ("capacity", "NoCapacityDiscardWitness"),
+    ("capacity", "NoCapacityUncertainWitness"),
+    ("capacity", "NoTooLargeWitness"),
     ("replacement", "NoSplitInstallWitness"),
     ("replacement", "NoReplacementRecoveryWitness"),
     ("replacement", "NoSecondLossWitness"),
@@ -86,6 +90,9 @@ CONTROLS = (
     ("wal", "cross-frontier", "ReplyDurable"),
     ("wal", "wrong-stream", "ExactDemux"),
     ("retention", "read-uncommitted", "RetentionReadCommitted"),
+    ("capacity", "discard-minority", "DiscardSafe"),
+    ("capacity", "discard-uncertain", "DiscardSafe"),
+    ("capacity", "charge-duplicate", "CapacityDuplicate"),
     ("replacement", "stale-route", "StaleRouteRefused"),
     ("replacement", "count-wrong-route", "OneEnsembleAuthority"),
     ("replacement", "early-learner-install", "LearnerAfterSurvivors"),
@@ -138,7 +145,7 @@ def verify_lean(shared_wal):
     command = [str(LAKE), f"+{toolchain}", "-d", str(LEAN), "env", "lean"]
     source = LEAN / "Logkeeper/StreamJournal.lean"
     check_lean_theorems(ROOT, command, source, count=21)
-    for model, count in (("StreamIO", 15), ("StreamIOWitness", 1),
+    for model, count in (("StreamIO", 17), ("StreamIOWitness", 2),
                          ("StreamReplacement", 9), ("StreamWAL", 9)):
         check_lean_theorems(ROOT, command, LEAN / f"Logkeeper/{model}.lean",
                             count=count, case=f"lean-{model}")

@@ -122,14 +122,12 @@ python3 verification/lean/run_stream_io_controls.py
 
 ## Writer decisions
 
-A keeper persists an optional proposal ID with each seal promise and verifies it on
+A keeper persists a proposal ID with each seal promise and verifies it on
 an equal-epoch retry. A writer instance and a sweep plan each generate a UUID and
 reuse it for their own retries. They require the returned view to echo it. Two
 proposals cannot both elect at one epoch on this roster because their promise quorums
 intersect. The model represents the pair of authenticated identity and proposal ID as
-one proposer. This projection uses distinct generated IDs and compliant senders. Older
-encodings retain their absent proposal, and a new proposer cannot resume one of those
-promises at the same epoch. [Seal admission](../../src/stream/keeper/rules.rs) ·
+one proposer. This projection uses distinct generated IDs and compliant senders. [Seal admission](../../src/stream/keeper/rules.rs) ·
 [Writer](../../src/stream/writer/mod.rs) · [Sweeper](../../src/stream/keeper/sweep.rs)
 
 `issued_origins` tracks the originating epoch of each position in every issued
@@ -183,9 +181,14 @@ before publication and after retirement.
   the construction of the exact assigned byte slice from the lanes' maps remain
   code premises. `Sendable` also requires the published cut to be certified. The
   link for `acknowledged` supplies quorum certification given correctly bound
-  lane slots. The model's issued history grows monotonically. The Rust writer can
-  clear a pending suffix after all three keepers reply `Full` or `TooLarge`,
-  and the automaton has no transition for reassigning that definitively refused suffix.
+  lane slots. Pending assignments are separate from the issued history.
+  `issue` freezes an assigned prefix at its first possible durable acceptance.
+  `discard` clears the pending suffix after three current capacity refusals
+  when the unanswered-append bound is covered by the issued prefix. A
+  three-keeper witness discards two assigned records and reassigns their first
+  position. The automaton takes the capacity outcome and lane completion as
+  inputs. Study 119 checks the bounded quota and duplicate cases, and the
+  Rust control delays a timed-out request across trim.
 - **Keeper decisions.** Verus and the link runner cover the Sync head bounds and the Replace decision over
   projected inputs, the valid-ensemble predicate and installation's ensemble and
   learner fields. Full refinement of `decide` and `apply`, including construction
