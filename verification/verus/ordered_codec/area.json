@@ -10,7 +10,7 @@
   "min_verified_functions": 15,
   "controls": {
     "accept-future-command-version": {
-      "defect": "A later command version is treated as v8.",
+      "defect": "A later command version is treated as v9.",
       "mutate": [
         {
           "file": "src/ordered/codec/frame.rs",
