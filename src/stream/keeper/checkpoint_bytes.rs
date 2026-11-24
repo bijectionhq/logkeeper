@@ -247,27 +247,6 @@ fn decode_extent_table(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((rows, rest))
 }
 
-#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures
-    if out {
-        valid_extent_table(rows@) && final(output)@ == old(output)@ + extent_table(rows@)
-    } else {
-        final(output)@ == old(output)@ && !valid_extent_table(rows@)
-    }
-))]
-fn encode_extent_table(output: &mut Vec<u8>, rows: &[u8]) -> bool {
-    if rows.len() % EXTENT_BYTES != 0 {
-        return false;
-    }
-    let Some(count) = stored_length(rows.len() / EXTENT_BYTES) else {
-        return false;
-    };
-    append_bytes(output, &encode_u32(count));
-    append_bytes(output, rows);
-    #[cfg(verus_keep_ghost)]
-    proof! { assert(output@ =~= old(output)@ + extent_table(rows@)); }
-    true
-}
-
 #[derive(Clone, Copy)]
 pub(super) struct StagedIndex<'a> {
     pub from: u64,
@@ -286,6 +265,13 @@ pub(super) struct StreamIndex<'a> {
 
 #[cfg(verus_keep_ghost)]
 verus! {
+
+pub(super) open spec fn staged_index_prefix(stage: Option<(u64, u64, u32)>) -> Seq<u8> {
+    match stage {
+        None => seq![0u8],
+        Some((from, floor, count)) => seq![1u8] + be64(from) + be64(floor) + be32(count),
+    }
+}
 
 pub(super) open spec fn staged_index(stage: Option<StagedIndex>) -> Seq<u8> {
     match stage {
@@ -317,6 +303,81 @@ pub(super) open spec fn valid_stream_index(index: StreamIndex) -> bool {
 
 }
 
+/// Size the body before writing any extents. INDEX uses a u32 frame length.
+pub(super) fn stream_index_len(view: usize, retained: u32, staged: Option<u32>) -> Option<usize> {
+    // Stream ID, deleted flag, view length, retained count, and staging flag.
+    const STREAM_FIELDS: usize = 16 + 1 + 4 + 4 + 1;
+    // Staging start, floor, and extent count.
+    const STAGED_FIELDS: usize = 8 + 8 + 4;
+
+    let retained_bytes = (retained as usize).checked_mul(EXTENT_BYTES)?;
+    let mut len = STREAM_FIELDS.checked_add(view)?.checked_add(retained_bytes)?;
+    if let Some(count) = staged {
+        let staged_bytes = (count as usize).checked_mul(EXTENT_BYTES)?;
+        len = len.checked_add(STAGED_FIELDS)?.checked_add(staged_bytes)?;
+    }
+    stored_length(len)?;
+    Some(len)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures
+    if out {
+        view@.len() <= u32::MAX && final(output)@ == old(output)@ + stream_index_wire(
+            be128(stream), if deleted { 1u8 } else { 0u8 }, be32(view@.len() as u32),
+            view@, be32(retained), Seq::empty())
+    } else {
+        view@.len() > u32::MAX
+    }
+))]
+pub(super) fn encode_stream_index_prefix(
+    output: &mut Vec<u8>,
+    stream: u128,
+    deleted: bool,
+    view: &[u8],
+    retained: u32,
+) -> bool {
+    append_bytes(output, &encode_u128(stream));
+    append_bytes(output, &[encode_flag(deleted)]);
+    if !encode_field(output, view) {
+        return false;
+    }
+    append_bytes(output, &encode_u32(retained));
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(output@ =~= old(output)@ + stream_index_wire(
+            be128(stream), if deleted { 1u8 } else { 0u8 }, be32(view@.len() as u32),
+            view@, be32(retained), Seq::empty()));
+    }
+    true
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures
+    final(output)@ == old(output)@ + staged_index_prefix(stage)
+))]
+pub(super) fn encode_staged_index_prefix(output: &mut Vec<u8>, stage: Option<(u64, u64, u32)>) {
+    append_bytes(output, &[encode_flag(stage.is_some())]);
+    if let Some((from, floor, count)) = stage {
+        append_bytes(output, &encode_u64(from));
+        append_bytes(output, &encode_u64(floor));
+        append_bytes(output, &encode_u32(count));
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! { assert(output@ =~= old(output)@ + staged_index_prefix(stage)); }
+}
+
+#[cfg(verus_keep_ghost)]
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures
+    out == if valid_extent_table(rows@) { Some((rows@.len() / 32) as u32) } else { None }
+))]
+fn extent_count(rows: &[u8]) -> Option<u32> {
+    if rows.len() % EXTENT_BYTES != 0 {
+        return None;
+    }
+    stored_length(rows.len() / EXTENT_BYTES)
+}
+
+/// Compose the production prefixes and encoded extents for the byte laws.
+#[cfg(verus_keep_ghost)]
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures
     match out {
         Some(bytes) => valid_stream_index(index) && bytes@ == stream_index(index),
@@ -324,30 +385,31 @@ pub(super) open spec fn valid_stream_index(index: StreamIndex) -> bool {
     }
 ))]
 pub(super) fn encode_stream_index(index: StreamIndex<'_>) -> Option<Vec<u8>> {
+    let retained = extent_count(index.retained)?;
+    let staged = match index.staged {
+        Some(stage) => {
+            if stage.from == 0 {
+                return None;
+            }
+            Some((stage.from, stage.floor, extent_count(stage.rows)?))
+        }
+        None => None,
+    };
     let mut output = Vec::new();
-    append_bytes(&mut output, &encode_u128(index.stream));
-    append_bytes(&mut output, &[encode_flag(index.deleted)]);
-    if !encode_field(&mut output, index.view) || !encode_extent_table(&mut output, index.retained) {
+    if !encode_stream_index_prefix(&mut output, index.stream, index.deleted, index.view, retained) {
         return None;
     }
+    append_bytes(&mut output, index.retained);
     #[cfg(verus_keep_ghost)]
-
     proof_decl! { let ghost prefix = output@; }
-    append_bytes(&mut output, &[encode_flag(index.staged.is_some())]);
+    encode_staged_index_prefix(&mut output, staged);
     if let Some(stage) = index.staged {
-        if stage.from == 0 {
-            return None;
-        }
-        append_bytes(&mut output, &encode_u64(stage.from));
-        append_bytes(&mut output, &encode_u64(stage.floor));
-        if !encode_extent_table(&mut output, stage.rows) {
-            return None;
-        }
+        append_bytes(&mut output, stage.rows);
     }
     #[cfg(verus_keep_ghost)]
     proof! {
-        assert(prefix =~= be128(index.stream).push(if index.deleted { 1u8 } else { 0u8 })
-            + be32(index.view@.len() as u32) + index.view@ + extent_table(index.retained@));
+        assert(prefix =~= stream_index_prefix(index));
+        assert(output@ =~= prefix + staged_index(index.staged));
         assert(output@ =~= stream_index(index));
     }
     Some(output)
@@ -468,7 +530,7 @@ fn decode_staged_index<'a>(bytes: &'a [u8]) -> Option<(StagedIndex<'a>, &'a [u8]
         expected matches Some(index) ==> out matches Some((actual, rest))
             && same_prefix(actual, index) && rest@ == staged_index(index.staged),
 ))]
-#[cfg_attr(verus_keep_ghost, verifier::rlimit(20))]
+#[cfg_attr(verus_keep_ghost, verifier::rlimit(80))]
 fn decode_index_prefix<'a>(bytes: &'a [u8]) -> Option<(StreamIndex<'a>, &'a [u8])> {
     #[cfg(verus_keep_ghost)]
     proof! {

@@ -12,9 +12,7 @@ use std::{
 use bytes::Bytes;
 
 use super::{
-    checkpoint_bytes::{
-        self, EXTENT_BYTES, INDEX_HEADER_BYTES, Location, StagedIndex, StreamIndex,
-    },
+    checkpoint_bytes::{self, EXTENT_BYTES, INDEX_HEADER_BYTES, Location},
     durability::{sync_directory, sync_file},
     state::{EXTENT_COPY_BYTES, Extent, ExtentReader, Payload, Record, Staging, Stream},
     wal::{SEGMENT_BYTES, atomic_file, read_frame, sequence},
@@ -36,6 +34,11 @@ pub(super) struct Checkpoint {
 
 struct Indexed {
     snapshot: Snapshot,
+    encoded: EncodedIndex,
+}
+
+#[derive(Default)]
+struct EncodedIndex {
     body: Bytes,
     packs: HashSet<u64>,
     bytes: u64,
@@ -45,40 +48,53 @@ impl Indexed {
     fn new(snapshot: Snapshot) -> Self {
         Self {
             snapshot,
-            body: Bytes::new(),
-            packs: HashSet::new(),
-            bytes: 0,
+            encoded: EncodedIndex::default(),
         }
     }
 
-    fn write(&mut self, pack: &mut Pack) -> io::Result<()> {
-        self.packs.clear();
+    fn encode(&self, pack: &mut Pack) -> io::Result<EncodedIndex> {
         let snapshot = &self.snapshot;
         let view = codec::encode_checkpoint_view(&snapshot.view)?;
-        let (retained, retained_bytes) = pack.index(&mut self.packs, &snapshot.records)?;
-        let (staged, staged_bytes) = match &snapshot.staged {
-            Some((_, _, records)) => pack.index(&mut self.packs, records)?,
-            None => (Vec::new(), 0),
+        let retained = stored_length(snapshot.records.len())
+            .ok_or_else(|| invalid("too many indexed records"))?;
+        let staged = match &snapshot.staged {
+            Some((from, floor, records)) if from.0 != 0 => {
+                let count = stored_length(records.len())
+                    .ok_or_else(|| invalid("too many indexed records"))?;
+                Some((from.0, floor.0, count))
+            }
+            Some(_) => return Err(invalid("invalid stream index")),
+            None => None,
         };
-        self.bytes = retained_bytes + staged_bytes;
-        self.body = Bytes::from(
-            checkpoint_bytes::encode_stream_index(StreamIndex {
-                stream: snapshot.stream.0,
-                deleted: snapshot.deleted,
-                view: &view,
-                retained: &retained,
-                staged: snapshot
-                    .staged
-                    .as_ref()
-                    .map(|(from, floor, _)| StagedIndex {
-                        from: from.0,
-                        floor: floor.0,
-                        rows: &staged,
-                    }),
-            })
-            .ok_or_else(|| invalid("invalid stream index"))?,
-        );
-        Ok(())
+        let capacity = checkpoint_bytes::stream_index_len(
+            view.len(),
+            retained,
+            staged.map(|(_, _, count)| count),
+        )
+        .ok_or_else(|| invalid("stream index too large"))?;
+        let mut body = Vec::new();
+        body.try_reserve_exact(capacity).map_err(io::Error::other)?;
+        if !checkpoint_bytes::encode_stream_index_prefix(
+            &mut body,
+            snapshot.stream.0,
+            snapshot.deleted,
+            &view,
+            retained,
+        ) {
+            return Err(invalid("invalid stream index"));
+        }
+        let mut packs = HashSet::new();
+        let mut bytes = pack.index(&mut packs, &snapshot.records, &mut body)?;
+        checkpoint_bytes::encode_staged_index_prefix(&mut body, staged);
+        if let Some((_, _, records)) = &snapshot.staged {
+            bytes += pack.index(&mut packs, records, &mut body)?;
+        }
+        debug_assert_eq!(body.len(), capacity);
+        Ok(EncodedIndex {
+            body: Bytes::from(body),
+            packs,
+            bytes,
+        })
     }
 }
 
@@ -123,12 +139,9 @@ impl Pack {
         &mut self,
         packs: &mut HashSet<u64>,
         records: &VecDeque<Record>,
-    ) -> io::Result<(Vec<u8>, u64)> {
+        body: &mut Vec<u8>,
+    ) -> io::Result<u64> {
         let mut bytes = 0;
-        let capacity = stored_length(records.len())
-            .and_then(|count| (count as usize).checked_mul(EXTENT_BYTES))
-            .ok_or_else(|| invalid("too many indexed records"))?;
-        let mut rows = Vec::with_capacity(capacity);
         for record in records {
             let location = match &*record.payload.read() {
                 Payload::Extent {
@@ -144,11 +157,11 @@ impl Pack {
                 },
                 payload => self.append(record, payload)?,
             };
-            rows.extend_from_slice(&checkpoint_bytes::encode_extent(record.epoch.0, location));
+            wal_bytes::append_bytes(body, &checkpoint_bytes::encode_extent(record.epoch.0, location));
             packs.insert(location.seq);
             bytes += u64::from(location.len);
         }
-        Ok((rows, bytes))
+        Ok(bytes)
     }
 
     fn append(&mut self, record: &Record, payload: &Payload) -> io::Result<Location> {
@@ -260,14 +273,27 @@ impl Checkpoint {
             moved: Vec::new(),
         };
         for snapshot in snapshots {
-            self.streams.insert(snapshot.stream, Indexed::new(snapshot));
+            if let Some(indexed) = self.streams.get_mut(&snapshot.stream) {
+                indexed.snapshot = snapshot;
+                indexed.encoded.body = Bytes::new();
+            } else {
+                self.streams.insert(snapshot.stream, Indexed::new(snapshot));
+            }
         }
+        let mut prepared = Vec::new();
         for indexed in self.streams.values_mut() {
-            if rewrite || indexed.body.is_empty() {
-                indexed.write(&mut pack)?;
+            if rewrite || indexed.encoded.body.is_empty() {
+                // Release the old body before allocating the replacement. Keep
+                // its pack references until the new pack has synced.
+                indexed.encoded.body = Bytes::new();
+                let encoded = indexed.encode(&mut pack)?;
+                prepared.push((indexed, encoded));
             }
         }
         pack.sync(root)?;
+        for (indexed, encoded) in prepared {
+            indexed.encoded = encoded;
+        }
         atomic_file(&root.join("INDEX"), |file| {
             let count: u32 = self
                 .streams
@@ -275,7 +301,7 @@ impl Checkpoint {
                 .try_into()
                 .map_err(|_| invalid("too many indexed streams"))?;
             file.write_all(&checkpoint_bytes::encode_index_header(next, count))?;
-            for stream in self.streams.values() {
+            for stream in self.streams.values().map(|indexed| &indexed.encoded) {
                 let header = wal_bytes::encode_frame(&[], &stream.body)
                     .ok_or_else(|| invalid("stream index too large"))?;
                 file.write_all(&header)?;
@@ -290,13 +316,13 @@ impl Checkpoint {
     pub fn references(&self, seq: u64) -> bool {
         self.streams
             .values()
-            .any(|stream| stream.packs.contains(&seq))
+            .any(|stream| stream.encoded.packs.contains(&seq))
     }
 
     fn live_packs(&self) -> HashSet<u64> {
         self.streams
             .values()
-            .flat_map(|stream| stream.packs.iter().copied())
+            .flat_map(|stream| stream.encoded.packs.iter().copied())
             .collect()
     }
 
@@ -333,7 +359,11 @@ impl Checkpoint {
                 }
             }
         }
-        let live_bytes: u64 = self.streams.values().map(|stream| stream.bytes).sum();
+        let live_bytes: u64 = self
+            .streams
+            .values()
+            .map(|stream| stream.encoded.bytes)
+            .sum();
         self.compaction_due =
             packed_bytes > SEGMENT_BYTES.saturating_add(live_bytes.saturating_mul(2));
         if removed {
@@ -421,9 +451,11 @@ impl Checkpoint {
                 stream,
                 Indexed {
                     snapshot,
-                    body,
-                    packs: live,
-                    bytes,
+                    encoded: EncodedIndex {
+                        body,
+                        packs: live,
+                        bytes,
+                    },
                 },
             );
         }
