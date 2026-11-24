@@ -417,15 +417,22 @@ impl Prefix {
         Ok(())
     }
 
+    fn base_tag(&self) -> u8 {
+        u8::from(self.base.is_some())
+    }
+
+    fn framed_payloads(&self) -> impl Iterator<Item = ([u8; 8], &[u8])> {
+        self.base
+            .iter()
+            .chain(&self.frames)
+            .map(|payload| ((payload.len() as u64).to_be_bytes(), payload.as_ref()))
+    }
+
     fn encode_into(&self, output: &mut BytesMut) {
-        output.put_u8(u8::from(self.base.is_some()));
-        if let Some(base) = &self.base {
-            output.put_u64(base.len() as u64);
-            output.put_slice(base);
-        }
-        for frame in &self.frames {
-            output.put_u64(frame.len() as u64);
-            output.put_slice(frame);
+        output.put_u8(self.base_tag());
+        for (length, payload) in self.framed_payloads() {
+            output.put_slice(&length);
+            output.put_slice(payload);
         }
     }
 
@@ -454,14 +461,10 @@ impl Prefix {
         let mut hash = Sha256::new();
         hash.update(b"logkeeper.ordered-prefix.v2");
         hash.update(group);
-        hash.update([u8::from(self.base.is_some())]);
-        if let Some(base) = &self.base {
-            hash.update((base.len() as u64).to_be_bytes());
-            hash.update(base);
-        }
-        for frame in &self.frames {
-            hash.update((frame.len() as u64).to_be_bytes());
-            hash.update(frame);
+        hash.update([self.base_tag()]);
+        for (length, payload) in self.framed_payloads() {
+            hash.update(length);
+            hash.update(payload);
         }
         hash.finalize().into()
     }
