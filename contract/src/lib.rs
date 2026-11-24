@@ -7,6 +7,14 @@
 use bytes::Bytes;
 use std::{fmt, future::Future, pin::Pin, time::Duration};
 
+mod file;
+mod reference;
+mod state;
+mod timer;
+
+pub use file::FileJournal;
+pub use reference::MemoryJournal;
+
 /// A stream's identity. Never reused after `delete`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub u128);
@@ -102,3 +110,6 @@ pub trait Journal: Send + Sync {
     /// Deletes the stream permanently.
     fn delete(&self, stream: StreamId) -> BoxFuture<'_, Result<()>>;
 }
+
+#[cfg(test)]
+mod test_support;
