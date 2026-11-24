@@ -54,6 +54,10 @@ pub(super) fn authorize<E: Eq + Copy>(
     Ok(())
 }
 
+pub(super) fn is_current_enrollment<E: Eq>(current: Option<E>, presented: E) -> bool {
+    current == Some(presented)
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == if epoch < u64::MAX { Ok((epoch as int + 1) as u64) }
         else { Err(Refusal::Capacity) },

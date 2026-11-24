@@ -786,7 +786,7 @@ impl State {
             )
             .unwrap_or_else(|| receipt(Err(Refusal::Conflict))));
         }
-        if id.expires_at <= position {
+        if receipt::fresh_request_expired(position, id.expires_at) {
             return Ok(receipt(Err(Refusal::Expired)));
         }
         if !cohort::may_extend(self.successor) {
@@ -1380,7 +1380,10 @@ impl State {
                 let Principal::Worker(enrollment) = principal else {
                     return Err(Refusal::Unauthorized);
                 };
-                if self.roster.get(&enrollment.worker) != Some(&enrollment) {
+                if !writer::is_current_enrollment(
+                    self.roster.get(&enrollment.worker).copied(),
+                    enrollment,
+                ) {
                     return Err(Refusal::Stale);
                 }
                 let start = self.cut(from).ok_or(Refusal::Unavailable)?;

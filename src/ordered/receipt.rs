@@ -36,6 +36,10 @@ pub(super) fn require_original_placement<P: Eq>(original: P, installed: P) -> Re
     Ok(())
 }
 
+pub(super) fn fresh_request_expired(position: u64, expires_at: u64) -> bool {
+    expires_at <= position
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == if stored@ == presented@ { Some(original) } else { None },
 ))]
