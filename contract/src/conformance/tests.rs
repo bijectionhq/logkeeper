@@ -6,17 +6,22 @@ use crate::{
 };
 use std::task::Context;
 
+async fn run_controlled(make: impl Fn(Identity) -> Arc<dyn Journal>) {
+    let start = tokio::time::Instant::now();
+    run_with_clock(make, || start.elapsed(), tokio::time::sleep).await;
+}
+
 #[test]
 fn memory() {
     let journal = MemoryJournal::new(LIMITS);
-    block_on(run(|identity| Arc::new(journal.handle(identity))));
+    block_on(run_controlled(|identity| Arc::new(journal.handle(identity))));
 }
 
 #[test]
 fn file() {
     let scratch = Scratch::new();
     let journal = FileJournal::open(scratch.path().join("journal"), LIMITS).unwrap();
-    block_on(run(|identity| Arc::new(journal.handle(identity))));
+    block_on(run_controlled(|identity| Arc::new(journal.handle(identity))));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -227,7 +232,7 @@ impl Journal for Broken {
 fn rejects(fault: Fault, check: &str) {
     let journal = MemoryJournal::new(LIMITS);
     panics_at(check, || {
-        block_on(run(|identity| {
+        block_on(run_controlled(|identity| {
             Arc::new(Broken {
                 journal: journal.clone(),
                 inner: Arc::new(journal.handle(identity.clone())),

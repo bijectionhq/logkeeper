@@ -66,7 +66,7 @@ const FIRST_SEED_STREAM: u128 = 100;
 const SEEDS: u64 = 24;
 const PHASES: u64 = 3;
 
-const QUIET: Duration = Duration::from_millis(30);
+const READ_WAIT: Duration = Duration::from_millis(30);
 const WAKE_DEADLINE: Duration = Duration::from_secs(2);
 const LONG_WAIT: Duration = Duration::from_secs(10);
 const SUITE_DEADLINE: Duration = Duration::from_secs(90);
@@ -76,13 +76,27 @@ const SUITE_DEADLINE: Duration = Duration::from_secs(90);
 /// The factory is called once per identity. Use an isolated test fixture with
 /// [LIMITS], since the suite creates streams and permanently deletes one.
 pub async fn run<F: Fn(Identity) -> Arc<dyn Journal>>(make: F) {
+    let start = Instant::now();
+    run_with_clock(make, || start.elapsed(), Sleep::new).await;
+}
+
+/// Runs conformance with the fixture's clock. `now` returns time since an
+/// arbitrary origin, and `sleep` waits on that same clock.
+pub async fn run_with_clock<F, Timer>(
+    make: F,
+    now: impl Fn() -> Duration,
+    sleep: impl Fn(Duration) -> Timer,
+) where
+    F: Fn(Identity) -> Arc<dyn Journal>,
+    Timer: Future<Output = ()>,
+{
     let clients = Clients([0, 1, 2].map(|index| make(Clients::identity(index))));
-    within("suite deadline", SUITE_DEADLINE, async {
-        sequence(&clients).await;
+    within("suite deadline", SUITE_DEADLINE, &sleep, async {
+        sequence(&clients, &sleep).await;
         fencing(&clients).await;
         retries(&clients).await;
         trimming(&clients).await;
-        long_polls(&clients).await;
+        long_polls(&clients, &now, &sleep).await;
         limits_and_lifecycle(&clients).await;
         for seed in 0..SEEDS {
             seeded(&clients, seed)
@@ -105,9 +119,14 @@ fn expect<T: Debug + PartialEq>(name: &str, actual: T, expected: T) {
     assert_eq!(actual, expected, "{name}");
 }
 
-async fn within<F: Future>(check: &str, duration: Duration, future: F) -> F::Output {
+async fn within<F: Future, Timer: Future<Output = ()>>(
+    check: &str,
+    duration: Duration,
+    sleep: &impl Fn(Duration) -> Timer,
+    future: F,
+) -> F::Output {
     let mut future = pin!(future);
-    let mut timeout = pin!(Sleep::new(duration));
+    let mut timeout = pin!(sleep(duration));
     poll_fn(|cx| {
         let result = future.as_mut().poll(cx);
         if result.is_pending() {
@@ -133,27 +152,31 @@ fn page(floor: u64, head: u64, entries: &[(u64, &'static [u8])]) -> crate::Resul
 }
 
 // The healthy fixture must eventually make each append visible on the read path.
-async fn read_through(
+async fn read_through<Timer: Future<Output = ()>>(
     journal: &dyn Journal,
     check: &str,
     stream: StreamId,
     from: Lsn,
     max: usize,
     head: Lsn,
+    sleep: &impl Fn(Duration) -> Timer,
 ) -> crate::Result<Page> {
-    within(check, WAKE_DEADLINE, async {
+    within(check, WAKE_DEADLINE, sleep, async {
         loop {
             let reply = journal.read(stream, from, max, Duration::ZERO).await;
             if !matches!(&reply, Ok(page) if page.head < head) {
                 return reply;
             }
-            Sleep::new(Duration::from_millis(1)).await;
+            sleep(Duration::from_millis(1)).await;
         }
     })
     .await
 }
 
-async fn sequence(clients: &Clients) {
+async fn sequence<Timer: Future<Output = ()>>(
+    clients: &Clients,
+    sleep: &impl Fn(Duration) -> Timer,
+) {
     let [a, b, _] = &clients.0;
     let stream = SEQUENCE_STREAM;
     expect(SEQUENCE, a.create(stream).await, Ok(()));
@@ -178,22 +201,22 @@ async fn sequence(clients: &Clients) {
     );
     expect(
         SEQUENCE,
-        read_through(b.as_ref(), SEQUENCE, stream, Lsn(1), 2, Lsn(2)).await,
+        read_through(b.as_ref(), SEQUENCE, stream, Lsn(1), 2, Lsn(2), sleep).await,
         page(1, 2, &[(1, b"one"), (2, b"two")]),
     );
     expect(
         EXACT_READ,
-        read_through(b.as_ref(), EXACT_READ, stream, Lsn(1), 1, Lsn(2)).await,
+        read_through(b.as_ref(), EXACT_READ, stream, Lsn(1), 1, Lsn(2), sleep).await,
         page(1, 2, &[(1, b"one")]),
     );
     expect(
         EXACT_READ,
-        read_through(b.as_ref(), EXACT_READ, stream, Lsn(2), 2, Lsn(2)).await,
+        read_through(b.as_ref(), EXACT_READ, stream, Lsn(2), 2, Lsn(2), sleep).await,
         page(1, 2, &[(2, b"two")]),
     );
     expect(
         EXACT_READ,
-        read_through(b.as_ref(), EXACT_READ, stream, Lsn(3), 2, Lsn(2)).await,
+        read_through(b.as_ref(), EXACT_READ, stream, Lsn(3), 2, Lsn(2), sleep).await,
         page(1, 2, &[]),
     );
     expect(HEAD, b.head(stream).await, Ok(Lsn(2)));
@@ -363,7 +386,11 @@ async fn trimming(clients: &Clients) {
     history.check(TRIM_RACE);
 }
 
-async fn long_polls(clients: &Clients) {
+async fn long_polls<Timer: Future<Output = ()>>(
+    clients: &Clients,
+    now: &impl Fn() -> Duration,
+    sleep: &impl Fn(Duration) -> Timer,
+) {
     let [a, b, c] = &clients.0;
     let stream = POLL_STREAM;
     a.create(stream).await.unwrap();
@@ -374,30 +401,30 @@ async fn long_polls(clients: &Clients) {
 
     let mut waiting =
         [b, c].map(|journal| Box::pin(on_wake(journal.read(stream, Lsn(2), 2, LONG_WAIT))));
-    let mut quiet = pin!(Sleep::new(QUIET));
     poll_fn(|cx| {
         for read in &mut waiting {
             assert!(read.as_mut().poll(cx).is_pending(), "{POLL_PENDING}");
         }
-        quiet.as_mut().poll(cx)
+        Poll::Ready(())
     })
     .await;
 
     a.append(stream, Epoch(1), Lsn(2), Bytes::from_static(b"wake"))
         .await
         .unwrap();
-    within(POLL_WAKE, WAKE_DEADLINE, async {
+    within(POLL_WAKE, WAKE_DEADLINE, sleep, async {
         for read in waiting {
             expect(POLL_WAKE, read.await, page(1, 2, &[(2, b"wake")]));
         }
     })
     .await;
 
-    let start = Instant::now();
+    let start = now();
     let result = within(
         POLL_TIMEOUT,
         WAKE_DEADLINE,
-        b.read(stream, Lsn(3), 2, QUIET),
+        sleep,
+        b.read(stream, Lsn(3), 2, READ_WAIT),
     )
     .await;
     let result = result.unwrap_or_else(|error| panic!("{POLL_TIMEOUT}: {error}"));
@@ -406,12 +433,13 @@ async fn long_polls(clients: &Clients) {
         "{POLL_TIMEOUT}: invalid empty page {result:?}"
     );
     assert!(
-        start.elapsed() >= QUIET,
+        now() - start >= READ_WAIT,
         "{POLL_TIMEOUT}: returned before the deadline"
     );
 }
 
-// Isolate each read's wakeups from the fixture's quiet and watchdog timers.
+// Repoll a read only after it signals progress, independently of the other
+// read and the watchdog.
 async fn on_wake<F: Future>(future: F) -> F::Output {
     let mut future = pin!(future);
     let ready = Arc::new(Readiness {

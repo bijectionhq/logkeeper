@@ -1,8 +1,10 @@
 use std::{fs, fs::OpenOptions, io::Write, path::PathBuf};
 
 use bytes::Buf;
+use futures::poll;
 use journal_contract::BoxFuture;
 use tempfile::{TempDir, tempdir};
+use tokio::sync::Notify;
 
 use super::*;
 
@@ -708,47 +710,51 @@ fn existing_keeper_directory_rejects_identity_change_and_missing_wal() {
     assert!(Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn read_waits_for_commit_and_times_out_at_the_end() {
-    let dir = tempdir().unwrap();
-    let keeper = Keeper::open(dir.path(), MEMBERS[0], Limits::default()).unwrap();
-    for request in [
-        create(A),
-        seal(A, 1),
-        sync(A, 1, 1, &[], 0, true),
-        append(A, 1, 1, &[b"x"], 0),
-    ] {
-        keeper.call(&CLIENT, request).await.unwrap();
-    }
-    let delayed = Request::Read {
+    const WAIT_MS: u32 = 100;
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"x"], 0));
+    let (work, mut incoming) = mpsc::channel(1);
+    let keeper = Keeper { work };
+    let process_read = |test: &mut Harness, incoming: &mut mpsc::Receiver<Work>, wait_ms, check| {
+        let work = incoming.try_recv().expect(check);
+        assert!(matches!(work.request, Request::Read { wait_ms: actual, .. } if actual == wait_ms));
+        test.engine.process(VecDeque::from([work])).unwrap();
+    };
+    let read = |from| Request::Read {
         stream: A,
-        from: Lsn(1),
+        from: Lsn(from),
         max: 1,
-        wait_ms: 1000,
+        wait_ms: WAIT_MS,
     };
-    let started = tokio::time::Instant::now();
-    let waiting = keeper.call(&CLIENT, delayed);
-    let publish = async {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        keeper.call(&CLIENT, append(A, 1, 2, &[], 1)).await.unwrap()
-    };
-    let (result, _) = tokio::join!(waiting, publish);
-    assert_eq!(result.unwrap(), page(1, 1, &[(1, b"x")]));
-    assert!(started.elapsed() >= Duration::from_millis(25));
-    let started = tokio::time::Instant::now();
-    let result = keeper
-        .call(
-            &CLIENT,
-            Request::Read {
-                stream: A,
-                from: Lsn(2),
-                max: 1,
-                wait_ms: 15,
-            },
-        )
-        .await;
-    assert_eq!(result.unwrap(), page(1, 1, &[]));
-    assert!(started.elapsed() >= Duration::from_millis(15));
+    let mut waiting = std::pin::pin!(keeper.call(&CLIENT, read(1)));
+    assert!(poll!(waiting.as_mut()).is_pending());
+    process_read(&mut test, &mut incoming, WAIT_MS, "keeper queued the read");
+    assert!(
+        poll!(waiting.as_mut()).is_pending(),
+        "read completed before commit"
+    );
+    assert_eq!(
+        test.send(append(A, 1, 2, &[], 1)),
+        Reply::Appended { tail: Lsn(1) }
+    );
+    assert!(poll!(waiting.as_mut()).is_pending());
+    process_read(&mut test, &mut incoming, WAIT_MS, "read did not recheck after commit");
+    assert_eq!(waiting.await.unwrap(), page(1, 1, &[(1, b"x")]));
+
+    let mut expiring = std::pin::pin!(keeper.call(&CLIENT, read(2)));
+    assert!(poll!(expiring.as_mut()).is_pending());
+    process_read(&mut test, &mut incoming, WAIT_MS, "keeper queued the read");
+    assert!(poll!(expiring.as_mut()).is_pending());
+    tokio::time::advance(Duration::from_millis(u64::from(WAIT_MS - 1))).await;
+    assert!(poll!(expiring.as_mut()).is_pending());
+    assert!(incoming.is_empty(), "read resampled before deadline");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(poll!(expiring.as_mut()).is_pending());
+    process_read(&mut test, &mut incoming, 0, "read did not recheck at the deadline");
+    assert_eq!(expiring.await.unwrap(), page(1, 1, &[]));
 }
 
 #[test]
@@ -946,7 +952,10 @@ fn corrupt_extent_cannot_supply_a_read() {
     ));
 }
 
-struct SplitReplacement<'a>(&'a Local);
+struct SplitReplacement<'a> {
+    transport: &'a Local,
+    first_installed: Notify,
+}
 impl Transport for SplitReplacement<'_> {
     fn identity(&self) -> &Identity {
         &CLIENT
@@ -954,12 +963,17 @@ impl Transport for SplitReplacement<'_> {
 
     fn call(&self, keeper: KeeperId, request: Request) -> BoxFuture<'_, CallResult> {
         Box::pin(async move {
-            if keeper == MEMBERS[1] && matches!(request, Request::Replace { .. }) {
-                // Durably move the first survivor before failing the second.
-                assert_eq!(self.0.call(MEMBERS[0], request).await?, Reply::Replaced);
+            let replacing = matches!(request, Request::Replace { .. });
+            if keeper == MEMBERS[1] && replacing {
+                self.first_installed.notified().await;
                 return Err(TransportError::Unreachable);
             }
-            self.0.call(keeper, request).await
+            let result = self.transport.call(keeper, request).await;
+            if keeper == MEMBERS[0] && replacing {
+                assert_eq!(result, Ok(Reply::Replaced));
+                self.first_installed.notify_one();
+            }
+            result
         })
     }
 }
@@ -989,15 +1003,20 @@ async fn replacement_fences_stale_routes_and_resumes_a_split_install() {
         learner,
         epoch: Epoch(2),
     };
-    let lifetime = SplitReplacement(&transport);
-    assert!(
-        sweep_idle(&lifetime, [plan])
-            .await
-            .pop()
-            .unwrap()
-            .1
-            .is_err()
-    );
+    let split = SplitReplacement {
+        transport: &transport,
+        first_installed: Notify::new(),
+    };
+    let [(stream, outcome)] = sweep_idle(&split, [plan]).await.try_into().unwrap();
+    assert_eq!(stream, A);
+    assert!(matches!(outcome, Err(SweepError::Transport {
+        keeper,
+        error: TransportError::Unreachable,
+    }) if keeper == MEMBERS[1]));
+    let Reply::Checked(second) = transport.call(MEMBERS[1], check(A)).await.unwrap() else {
+        panic!("missing second survivor")
+    };
+    assert_eq!(second.ensemble, MEMBERS, "the second survivor already moved");
     let Reply::Checked(view) = transport.call(learner, check(A)).await.unwrap() else {
         panic!("missing learner")
     };

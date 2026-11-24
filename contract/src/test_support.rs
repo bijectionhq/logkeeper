@@ -1,32 +1,16 @@
 use std::{
     future::Future,
     path::{Path, PathBuf},
-    pin::pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    task::{Context, Poll, Wake, Waker},
-    thread,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub(crate) fn block_on<F: Future>(future: F) -> F::Output {
-    struct Unpark(thread::Thread);
-    impl Wake for Unpark {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
-    let waker = Waker::from(Arc::new(Unpark(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(result) => return result,
-            Poll::Pending => thread::park(),
-        }
-    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap()
+        .block_on(future)
 }
 
 pub(crate) struct Scratch(PathBuf);

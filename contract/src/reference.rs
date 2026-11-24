@@ -2,7 +2,6 @@ use crate::{
     BoxFuture, Epoch, Identity, Journal, JournalError, Lsn, Page, Result, StreamId,
     file::Storage,
     state::{Mutation, State},
-    timer::Sleep,
 };
 use bytes::Bytes;
 use std::{
@@ -132,7 +131,10 @@ impl Engine {
     }
 
     async fn read(&self, stream: StreamId, from: Lsn, max: usize, wait: Duration) -> Result<Page> {
-        let mut timeout = pin!(Sleep::new(wait));
+        #[cfg(not(test))]
+        let mut timeout = pin!(crate::timer::Sleep::new(wait));
+        #[cfg(test)]
+        let mut timeout = pin!(tokio::time::sleep(wait));
         let mut reader = Reader {
             engine: self,
             stream,

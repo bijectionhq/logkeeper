@@ -45,7 +45,7 @@ fn record(value: &'static str) -> Bytes {
     Bytes::from_static(value.as_bytes())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn zombie_writer_is_fenced_and_recovery_contains_the_prior_commit() {
     let (network, zombie) = started().await;
     assert_eq!(
@@ -67,7 +67,7 @@ async fn zombie_writer_is_fenced_and_recovery_contains_the_prior_commit() {
     assert_eq!(page.records[0], (Lsn(1), record("prior")));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn two_identities_at_the_same_epoch_cannot_both_seal() {
     let (network, _) = started().await;
     let a = writer(&network, 2);
@@ -89,7 +89,7 @@ async fn two_identities_at_the_same_epoch_cannot_both_seal() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn head_and_reseal_accept_the_winning_identity_amid_a_split_promise() {
     use crate::stream::wire::{Reply, Request, Transport};
 
@@ -127,7 +127,7 @@ async fn head_and_reseal_accept_the_winning_identity_amid_a_split_promise() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn recovery_discards_a_longer_tail_from_a_lower_synced_epoch() {
     let (network, first) = started().await;
     first
@@ -168,7 +168,7 @@ async fn recovery_discards_a_longer_tail_from_a_lower_synced_epoch() {
     assert_eq!(page.records, [(Lsn(2), record("replacement"))]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn recovery_fetches_a_durable_tail_before_any_keeper_advertises_commit() {
     let (network, first) = started().await;
     network.down(KEEPERS[2], true);
@@ -208,7 +208,7 @@ async fn recovery_fetches_a_durable_tail_before_any_keeper_advertises_commit() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn append_retry_after_lost_replies_is_exact() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);
@@ -241,7 +241,7 @@ async fn append_retry_after_lost_replies_is_exact() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn seal_retries_lost_promises_and_completed_syncs_at_the_same_epoch() {
     let (network, _) = started().await;
     let next = writer(&network, 2);
@@ -262,7 +262,7 @@ async fn seal_retries_lost_promises_and_completed_syncs_at_the_same_epoch() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn one_keeper_down_requires_both_survivors_to_acknowledge() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);
@@ -288,7 +288,7 @@ async fn one_keeper_down_requires_both_survivors_to_acknowledge() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn append_pipeline_advances_without_waiting_for_a_slow_third_keeper() {
     let (network, writer) = started().await;
     let gate = Gate::new();
@@ -311,7 +311,7 @@ async fn append_pipeline_advances_without_waiting_for_a_slow_third_keeper() {
         .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn heads_waiting_on_the_same_stream_batch_into_one_fresh_round() {
     let (network, writer) = started().await;
     let start = network.calls(Kind::Check).len();
@@ -330,7 +330,7 @@ async fn heads_waiting_on_the_same_stream_batch_into_one_fresh_round() {
     assert!(network.calls(Kind::Check).len() > checks.len());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn head_joining_after_a_round_opens_gets_a_new_round() {
     let (network, writer) = started().await;
     let gate = Gate::new();
@@ -355,7 +355,7 @@ async fn head_joining_after_a_round_opens_gets_a_new_round() {
     assert!(old.await.unwrap().is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn observer_head_requires_quorum_commit_coverage() {
     let (network, writer) = started().await;
     let observer = self::writer(&network, 9);
@@ -379,7 +379,7 @@ async fn observer_head_requires_quorum_commit_coverage() {
     assert_eq!(observer.head(STREAM).await, Ok(Lsn(1)));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn read_long_poll_wakes_when_the_keeper_publishes_head() {
     let (network, writer) = started().await;
     let reader = self::writer(&network, 9);
@@ -418,7 +418,7 @@ async fn read_long_poll_wakes_when_the_keeper_publishes_head() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn single_keeper_read_serves_committed_records_below_a_remote_floor() {
     let (network, writer) = started().await;
     writer
@@ -481,7 +481,7 @@ async fn single_keeper_read_serves_committed_records_below_a_remote_floor() {
     assert_eq!(reader.head(STREAM).await, Err(JournalError::Unavailable));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stale_routes_can_read_committed_records_after_a_replacement_trim() {
     use crate::stream::keeper::{Sweep, sweep_idle};
 
@@ -541,7 +541,7 @@ async fn stale_routes_can_read_committed_records_after_a_replacement_trim() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_append_reply_waits_for_quorum_commit_visibility() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);
@@ -559,7 +559,7 @@ async fn an_append_reply_waits_for_quorum_commit_visibility() {
     assert_eq!(append.await, Ok(Lsn(1)));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn head_and_trim_wait_for_a_sampled_append_to_be_visible() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);
@@ -588,7 +588,7 @@ async fn head_and_trim_wait_for_a_sampled_append_to_be_visible() {
     assert_eq!(append.await, Ok(Lsn(1)));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_fenced_publication_leaves_a_chosen_append_outcome_unknown() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);
@@ -622,7 +622,7 @@ async fn a_fenced_publication_leaves_a_chosen_append_outcome_unknown() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn create_uses_url_order_or_explicit_ensemble_and_delete_is_terminal() {
     let network = Arc::new(Network::default());
     let order = [KEEPERS[3], KEEPERS[1], KEEPERS[2], KEEPERS[0]];
@@ -651,7 +651,7 @@ async fn create_uses_url_order_or_explicit_ensemble_and_delete_is_terminal() {
     assert!(Writer::new(network.client(2), [KEEPERS[0]; 3]).is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn limits_refuse_without_consuming_a_position_and_trim_frees_capacity() {
     let (network, writer) = started().await;
     assert_eq!(
@@ -682,7 +682,7 @@ async fn limits_refuse_without_consuming_a_position_and_trim_frees_capacity() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn seal_policy_refuses_before_sending_a_seal() {
     struct Deny;
     impl SealPolicy for Deny {
@@ -699,7 +699,7 @@ async fn seal_policy_refuses_before_sending_a_seal() {
     assert!(network.calls(Kind::Seal).is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_writer_head_reuses_only_append_requests_opened_inside_its_round() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);
@@ -747,7 +747,7 @@ async fn a_writer_head_reuses_only_append_requests_opened_inside_its_round() {
     assert_eq!(later.await, Ok(Lsn(1)));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn lagging_keeper_can_rejoin_after_a_committed_trim() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);
@@ -766,7 +766,7 @@ async fn lagging_keeper_can_rejoin_after_a_committed_trim() {
     assert_eq!((view.floor, view.tail), (Lsn(2), Lsn(2)));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn seal_requires_two_complete_sync_replies() {
     let (network, _) = started().await;
     let next = writer(&network, 2);
@@ -776,22 +776,27 @@ async fn seal_requires_two_complete_sync_replies() {
     assert_eq!(next.seal(STREAM, E2).await, Ok(Lsn(0)));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn journal_contract_conformance() {
-    use journal_contract::conformance::{LIMITS, run};
+    use journal_contract::conformance::{LIMITS, run_with_clock};
 
     let network = Arc::new(Network::new(
         3,
         LIMITS.max_record_bytes.try_into().unwrap(),
         LIMITS.stream_quota_bytes,
     ));
-    run(|identity| {
-        Arc::new(Writer::new(network.connect(identity), KEEPERS[..3].iter().copied()).unwrap())
-    })
+    let start = tokio::time::Instant::now();
+    run_with_clock(
+        |identity| {
+            Arc::new(Writer::new(network.connect(identity), KEEPERS[..3].iter().copied()).unwrap())
+        },
+        || start.elapsed(),
+        tokio::time::sleep,
+    )
     .await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn read_assembles_a_page_across_keeper_frames() {
     let size = 32 * 1024 * 1024;
     let network = Arc::new(Network::new(3, size, 2 * u64::from(size)));

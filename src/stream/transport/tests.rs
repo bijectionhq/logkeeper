@@ -1,7 +1,7 @@
 use std::fs;
 
 use bytes::Bytes;
-use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, SanType};
+use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, SanType};
 
 use super::*;
 
@@ -11,6 +11,8 @@ const READ_ONLY: &str = "urn:logkeeper:client:reader";
 fn ca(path: &Path) -> Issuer<'static, KeyPair> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let name = path.file_stem().unwrap().to_str().unwrap();
+    params.distinguished_name.push(DnType::CommonName, name);
     let key = KeyPair::generate().unwrap();
     fs::write(path, params.self_signed(&key).unwrap().pem()).unwrap();
     Issuer::new(params, key)
@@ -48,7 +50,7 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
     let other_roots = dir.join("other-ca.pem");
     let root = ca(&roots);
     let other = ca(&other_roots);
-    let keeper = uuid::Uuid::new_v4();
+    let keeper = uuid::Uuid::from_u128(1);
     let id = KeeperId(keeper.as_u128());
     let server = credentials(
         dir,
@@ -112,21 +114,20 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
     let config = Config::read(&path).unwrap();
     assert_eq!(config.listen, address);
     let stop = CancellationToken::new();
-    let task = tokio::spawn(config.serve(listener, stop.clone()));
+    let mut task = tokio::spawn(config.serve(listener, stop.clone()));
 
-    let deadline = Duration::from_secs(3);
+    let deadline = Duration::MAX;
     let address = address.to_string();
     let transport = TcpTransport::new(&writer, [(id, address.clone())], deadline).unwrap();
     let stream = StreamId(11);
     let epoch = Epoch(1);
     let ensemble = [id, KeeperId(2), KeeperId(3)];
-    assert_eq!(
-        transport
-            .call(id, Request::Create { stream, ensemble })
-            .await
-            .unwrap(),
-        Reply::Created
-    );
+    let create = transport.call(id, Request::Create { stream, ensemble });
+    let created = tokio::select! {
+        reply = create => reply.unwrap(),
+        server = &mut task => panic!("keeper stopped before serving create: {server:?}"),
+    };
+    assert_eq!(created, Reply::Created);
     let seal = Request::Seal {
         stream,
         epoch,
@@ -220,7 +221,10 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
     ] {
         let denied = TcpTransport::new(&credentials, [(id, address.clone())], deadline).unwrap();
         assert!(
-            denied.call(id, read.clone()).await.is_err(),
+            matches!(
+                denied.call(id, read.clone()).await,
+                Err(TransportError::Protocol(_) | TransportError::Unreachable)
+            ),
             "accepted {label}"
         );
     }
@@ -275,7 +279,7 @@ async fn writer_round_trips_through_three_tls_keepers() {
     let mut routes = Vec::new();
     let mut tasks = Vec::new();
     for zone in 0..3 {
-        let keeper = uuid::Uuid::new_v4();
+        let keeper = uuid::Uuid::from_u128(zone + 1);
         let name = format!("keeper-{zone}");
         let tls = credentials(
             dir,
@@ -304,7 +308,7 @@ async fn writer_round_trips_through_three_tls_keepers() {
     let url = format!("logkeeper+tls://{}", routes.join(","));
     let open = async |credentials: &Credentials| {
         let (transport, ensemble) =
-            TcpTransport::discover(&url, credentials, Duration::from_secs(3))
+            TcpTransport::discover(&url, credentials, Duration::MAX)
                 .await
                 .unwrap();
         Writer::new(Arc::new(transport), ensemble).unwrap()

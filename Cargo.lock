@@ -364,6 +364,7 @@ name = "journal-contract"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "tokio",
 ]
 
 [[package]]

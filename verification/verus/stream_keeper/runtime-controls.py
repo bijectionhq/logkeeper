@@ -3,11 +3,11 @@
 
 import argparse
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
-STREAM = ROOT / "src/stream"
 GUARD = Path.home() / "code/codesign-agents/guarded-cargo.py"
 KEEPER_TEST = "stream::keeper::tests::"
 TLS_TEST = "stream::transport::tests::loopback_mtls_checks_certificate_authority_uri_and_route"
@@ -40,6 +40,22 @@ CONTROLS = [
         "            Err(error @ (JournalError::Deleted | JournalError::Trimmed { .. })) => return Err(error),",
         "stream::writer::tests::single_keeper_read_serves_committed_records_below_a_remote_floor",
         "a reachable keeper still retains the committed record",
+    ),
+    (
+        "skip-read-wait", "keeper/mod.rs",
+        "(wait && max != 0 && from > through)", "(wait && false && max != 0 && from > through)",
+        KEEPER_TEST + "read_waits_for_commit_and_times_out_at_the_end", "read completed before commit",
+    ),
+    (
+        "skip-read-wakeup", "keeper/mod.rs",
+        "self.streams[&id].changed.send_replace(());", "let _ = id;",
+        KEEPER_TEST + "read_waits_for_commit_and_times_out_at_the_end", "read did not recheck after commit",
+    ),
+    (
+        "shorten-read-wait", "keeper/mod.rs",
+        "let deadline = tokio::time::Instant::now() + wait;",
+        "let deadline = tokio::time::Instant::now() + wait.min(Duration::from_millis(1));",
+        KEEPER_TEST + "read_waits_for_commit_and_times_out_at_the_end", "read resampled before deadline",
     ),
     (
         "ignore-authenticated-identity", "keeper/rules.rs",
@@ -142,9 +158,9 @@ CONTROLS = [
 ]
 
 
-def run(control, evidence):
+def run(control, source, evidence):
     name, relative, old, new, test, assertion = control
-    path = STREAM / relative
+    path = source / "src/stream" / relative
     original = path.read_bytes()
     old = old.encode()
     if original.count(old) != 1:
@@ -157,7 +173,11 @@ def run(control, evidence):
         mutated = mutated.replace(old_return, b"            let _ = done.send(reply);\n        }\n        covering_sync", 1)
     try:
         path.write_bytes(mutated)
-        command = [str(GUARD), "logkeeper", "test", "--lib", "--all-features", test, "--", "--exact"]
+        command = [
+            str(GUARD), "logkeeper", "test", "--manifest-path", str(source / "Cargo.toml"),
+            "--target-dir", str(source / "target"), "--config", "profile.test.debug=0",
+            "--lib", "--all-features", test, "--", "--exact",
+        ]
         result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
     finally:
         path.write_bytes(original)
@@ -174,16 +194,23 @@ def main():
     selected = set(args.controls) or {control[0] for control in CONTROLS}
     if unknown := selected - {control[0] for control in CONTROLS}:
         parser.error(f"unknown controls: {', '.join(sorted(unknown))}")
-    # Testing one mutation at a time requires exclusive use of this worktree's source.
     if subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "src/stream"], cwd=ROOT).returncode:
         parser.error("commit the keeper source before running the controls")
     results = ROOT / "verification/verus/.results"
     results.mkdir(exist_ok=True)
     evidence = Path(tempfile.mkdtemp(prefix="keeper-runtime-", dir=results))
     print(f"Evidence: {evidence}", flush=True)
-    for control in CONTROLS:
-        if control[0] in selected:
-            run(control, evidence)
+    # A guarded Cargo invocation serializes builds. Keep the mutations outside
+    # the production source tree so a normal build can never compile a control.
+    with tempfile.TemporaryDirectory(prefix="source-", dir=evidence) as scratch:
+        source = Path(scratch)
+        for name in ("Cargo.toml", "Cargo.lock"):
+            shutil.copyfile(ROOT / name, source / name)
+        for name in ("contract", "src"):
+            shutil.copytree(ROOT / name, source / name)
+        for control in CONTROLS:
+            if control[0] in selected:
+                run(control, source, evidence)
 
 
 if __name__ == "__main__":
