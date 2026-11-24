@@ -19,3 +19,6 @@ These predicates verify the ordered authorization for checkpoint custody.
 [Study 20](../../20-registration-recovery/report.md) models an original custodian's receiver floor across cancellation and compaction.
 [RecoveryCertificate.Binds](../../lean/Logkeeper/RecoveryCertificate.lean) also requires the physical version of each member, supplied in RTDB by the archive manifest and the provider observations.
 The receiver floor, physical borrows, provider effects and manifest member bindings remain separate proof obligations.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

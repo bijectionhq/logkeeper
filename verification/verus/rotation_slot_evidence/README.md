@@ -44,3 +44,6 @@ separate L3 and R5 obligations.
 The Lean witness uses a configured roster of three and two exact attestations.
 The majority and exact-read theorem is general in the roster and evidence
 list lengths.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

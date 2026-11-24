@@ -60,3 +60,6 @@ checkpoint, start and through cuts.
   The five named negative witnesses cover dropped history, historical
   repair authority, omitted invocation, changed receipt cut, and omitted
   domain.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

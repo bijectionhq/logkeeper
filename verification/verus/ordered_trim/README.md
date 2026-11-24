@@ -25,3 +25,6 @@ scan, drop a record beyond the removed prefix, and omit the maintenance
 counter refund. Lean
 supplies the safe-cut witness and counterexamples for ignoring a pin, passing
 the checkpoint, or refunding the wrong class.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

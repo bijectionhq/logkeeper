@@ -14,3 +14,6 @@ It also verifies the byte operations imported from the [slot header codec](../vo
 The adapter reads fields in protocol order and handles one request or reply. An envelope may be followed by bytes on the underlying stream, as witnessed by the native vote fixture. The bounds on the transported prefix length and the promise flag are covered by [ordered codec framing](../ordered_codec/README.md). Async I/O, echoed ballot comparison, the depose ordering test, server dispatch, and nested `Prefix::decode` and replay remain to be composed end to end.
 
 The [manifest](area.json) checks each declared mutation against the associated law.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

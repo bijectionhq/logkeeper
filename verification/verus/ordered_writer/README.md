@@ -63,3 +63,6 @@ evaluation with Verus specs on boundary cases.
 `reuse-occupied-lsn` allows a request below the current frontier. It fails `append_only_by_current_grant_at_next_lsn` and `applied_append_extends_history`.
 `ignore-authenticated-principal` keeps the exact grant and drops only holder authentication in the authorization decision shared by append and reconciliation. It fails `append_only_by_current_grant_at_next_lsn`.
 `match-worker-without-enrollment` lets a still-enrolled worker ID use an obsolete serial to admit `ProtectRange`. It fails `a_displaced_enrollment_cannot_acquire_replay`, which uses `Logkeeper.Kernel.Ordered.is_current_enrollment` and compares the installed row to the full presented enrollment.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

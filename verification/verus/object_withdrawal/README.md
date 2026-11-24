@@ -32,3 +32,6 @@ permit withdrawal against an incomplete inventory, or weaken the exact
 version check. The existing native
 `exact_object_withdrawal_survives_compaction_and_cohort_repair` test
 exercises the encoded, installed path.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

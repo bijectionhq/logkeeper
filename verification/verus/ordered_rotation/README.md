@@ -46,3 +46,6 @@ With the pinned F0 runner, run
 Run `python3 verification/lean/run_ordered_lease_rotation.py` for the
 reference theorems and controls, and `run_ordered_correspondence.py` in the
 same directory for sampled Lean and Verus agreement.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

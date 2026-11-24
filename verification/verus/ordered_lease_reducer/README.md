@@ -75,3 +75,6 @@ Run the area with `verification/verus/run.py ordered_lease_reducer` and the
 pinned launcher. The Lean package's `run_ordered_lease_rotation.py` audits
 theorems and negative controls. `run_ordered_correspondence.py` checks the
 same boundary cases in Lean and the Verus specifications.
+
+The [mechanical link inventory](../../link/inventory.md) identifies the linked
+protected-read interval and admission guard, along with the remaining transition links.

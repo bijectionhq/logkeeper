@@ -25,3 +25,6 @@ retained-space check, and let maintenance debit the ordinary capacity.
 Lean reaches a full paid
 window and witnesses both an undercharged reference list and an underfunded
 maintenance append.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

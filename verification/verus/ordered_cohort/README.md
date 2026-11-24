@@ -20,3 +20,6 @@ The call-site audit identifies how these values are obtained.
 The [prefix agreement area](../prefix_agreement/README.md) checks exact vote collection, the final configured majority and ranked recovery, and exercises the coordinator with recorded traces.
 An arbitrary-execution refinement to `PrefixAgreement.Chosen` and `SelectionFence.DurableReports` remains open, including AZ placement and live fault classification.
 The paid ticket check covers physical repair of one journal cohort. [Study 70](../../70-distributed-preparation/report.md) additionally requires an entire vector across independent pools for an installed move.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

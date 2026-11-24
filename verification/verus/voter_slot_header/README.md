@@ -13,3 +13,6 @@ The Verus sequence views correspond to byte lists in [Logkeeper.VoterSlotHeader]
 The file adapter reads the exact bounded payload extent, computes SHA-256 and checks the digest before applying the scope check. An all-zero header fails the minimum-length check. File I/O, SHA-256, the payload's ballot and prefix decoder, and durability are outside this area.
 
 The [manifest](area.json) covers a wrong generation offset, a skipped payload capacity check, a wrong digest offset, and a weakened voter check.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

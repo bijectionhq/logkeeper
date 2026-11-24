@@ -37,3 +37,6 @@ compact-image preservation remain separate obligations.
 
 Run the [Verus runner](../README.md) with `ordered_admission` and the
 [Lean reference control runner](../../lean/README.md) for both layers.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

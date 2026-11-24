@@ -72,3 +72,6 @@ and application field reads.
 The full typed left inverses still require refinement of `Bytes` reads and writes,
 fixed field and tag composition, and the service decision evidence and replay record
 adapters.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

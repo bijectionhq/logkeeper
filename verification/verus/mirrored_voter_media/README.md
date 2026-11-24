@@ -38,3 +38,6 @@ accepting majority and a sealed successor repaired from surviving images.
 The Lean witnesses reach two syncs followed by acknowledgment and a selected
 slot tear after a majority change. The general theorems have no fixed
 trace-length or command-history bound.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

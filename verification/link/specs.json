@@ -1,0 +1,180 @@
+{
+  "compact_image": {
+    "src/ordered/codec/snapshot_checks.rs": {
+      "generationInRange": "Logkeeper.CompactImage.generationInRange",
+      "leaseRowValid": "Logkeeper.CompactImage.leaseRowValid",
+      "fenceRowValid": "Logkeeper.CompactImage.fenceRowValid",
+      "holdReceiptMatches": "Logkeeper.CompactImage.holdReceiptMatches",
+      "allSnapshotRowsValid": "Logkeeper.CompactImage.allSnapshotRowsValid",
+      "strictlyIncreasingKeys": "Logkeeper.CompactImage.strictlyIncreasingKeys",
+      "boundedMap": "Logkeeper.CompactImage.boundedMap",
+      "receiptPositionsUnique": "Logkeeper.CompactImage.receiptPositionsUnique",
+      "reducerInvariant": "Logkeeper.CompactImage.reducerInvariant",
+      "oldRootKeyIncreases": "Logkeeper.CompactImage.oldRootKeyIncreases",
+      "objectControlTrailerCanonical": "Logkeeper.CompactImage.objectControlTrailerCanonical",
+      "receiptPositionFresh": "Logkeeper.CompactImage.receiptPositionFresh",
+      "receiptRowValid": "Logkeeper.CompactImage.receiptRowValid",
+      "rootReferenceRowValid": "Logkeeper.CompactImage.rootReferenceRowValid"
+    }
+  },
+  "mirrored_voter_media": {
+    "verification/verus/mirrored_voter_media/laws.rs": {
+      "state_of": null,
+      "ballot_le": "Logkeeper.PrefixAgreement.ballotRank",
+      "promise_le": null,
+      "dominates": "Logkeeper.SelectionFence.Image.Dominates",
+      "keeps": "Logkeeper.SelectionFence.Keeps"
+    }
+  },
+  "object_name_codec": {
+    "src/ordered/object_names.rs": {
+      "zeroName": "Logkeeper.CompactImage.zeroName"
+    }
+  },
+  "object_withdrawal": {
+    "verification/verus/object_withdrawal/laws.rs": {
+      "fenced": "Logkeeper.ObjectWithdrawal.fenced",
+      "canAdmitReferences": "Logkeeper.ObjectWithdrawal.canAdmitReferences",
+      "canWithdraw": "Logkeeper.ObjectWithdrawal.canWithdraw"
+    }
+  },
+  "ordered_admission": {
+    "verification/verus/ordered_admission/laws.rs": {
+      "debit": "Logkeeper.OrderedAdmission.debit",
+      "pinsSuffix": "Logkeeper.OrderedAdmission.pinsSuffix",
+      "retainsReceipt": "Logkeeper.OrderedAdmission.retainsReceipt",
+      "matchesFingerprint": "Logkeeper.OrderedAdmission.matchesFingerprint",
+      "debit_value": null
+    }
+  },
+  "ordered_budgets": {
+    "verification/verus/ordered_budgets/laws.rs": {
+      "referenceCharge": "Logkeeper.OrderedBudgets.referenceCharge",
+      "recordCharge": "Logkeeper.OrderedBudgets.recordCharge",
+      "fundedBudget": "Logkeeper.OrderedBudgets.fundedBudget"
+    }
+  },
+  "ordered_checkpoint": {
+    "verification/verus/ordered_checkpoint/laws.rs": {
+      "matches_preparation": "Logkeeper.OrderedCheckpoint.matches_preparation",
+      "next_revision": "Logkeeper.OrderedCheckpoint.next_revision",
+      "may_close": "Logkeeper.OrderedCheckpoint.may_close",
+      "may_acquire": "Logkeeper.OrderedCheckpoint.may_acquire"
+    }
+  },
+  "ordered_codec": {
+    "src/ordered/codec/frame.rs": {
+      "commandVersion": "Logkeeper.Codec.commandVersion",
+      "decisionHeader": "Logkeeper.Codec.decisionHeader",
+      "decisionHeaderMatches": "Logkeeper.Codec.decisionHeaderMatches",
+      "flagByte": "Logkeeper.Codec.flagByte",
+      "readFlag": "Logkeeper.Codec.readFlag",
+      "bodyLengthBounded": "Logkeeper.Codec.bodyLengthBounded",
+      "objectNameCountFits": "Logkeeper.CompactImage.objectNameCountFits",
+      "decisionRequestBytes": "Logkeeper.Codec.decisionRequestBytes",
+      "withdrawalIdentityAdmissible": "Logkeeper.Codec.withdrawalIdentityAdmissible",
+      "withdrawnWorkerCountBounded": "Logkeeper.Codec.withdrawnWorkerCountBounded",
+      "readFixedField": "Logkeeper.Codec.readFixedField"
+    }
+  },
+  "ordered_cohort": {
+    "verification/verus/ordered_cohort/laws.rs": {
+      "accept_quorum": "Logkeeper.OrderedCohort.accept_quorum",
+      "has_paid_repair_quorum": "Logkeeper.OrderedCohort.has_paid_repair_quorum",
+      "may_extend": "Logkeeper.OrderedCohort.may_extend",
+      "matches_chosen_seal": "Logkeeper.OrderedCohort.matches_chosen_seal"
+    }
+  },
+  "ordered_lease_reducer": {
+    "src/ordered/lease_reducer.rs": {
+      "interval_available": "DisposalLease.interval_available"
+    },
+    "verification/verus/ordered_lease_reducer/laws.rs": {
+      "read_lease_end": "DisposalLease.read_lease_end"
+    }
+  },
+  "ordered_receipt": {
+    "verification/verus/ordered_receipt/laws.rs": {
+      "abstract_book": "Logkeeper.Protocol.Ordered.abstract_book",
+      "replay_mutation": "Logkeeper.Protocol.Ordered.replay_mutation",
+      "replay": "Logkeeper.Protocol.Ordered.replay",
+      "record_after_apply": "Logkeeper.Protocol.Ordered.record_after_apply",
+      "retain_applied": "Logkeeper.Protocol.Ordered.retain_applied",
+      "retains_receipt": "Logkeeper.Protocol.Ordered.retains_receipt",
+      "original_placement_matches": "Logkeeper.Protocol.Ordered.original_placement_matches",
+      "fresh_request_expired": "Logkeeper.Protocol.Ordered.fresh_request_expired"
+    }
+  },
+  "ordered_rotation": {
+    "verification/verus/ordered_rotation/laws.rs": {
+      "rotation_head": "ErasureCommit.rotation_head",
+      "exact_preparation": "ErasureCommit.exact_preparation",
+      "successor_generation": "ErasureCommit.successor_generation",
+      "erasure_floor": "ErasureCommit.erasure_floor",
+      "admits_history": "ErasureCommit.admits_history"
+    }
+  },
+  "ordered_serving_lease": {
+    "verification/verus/ordered_serving_lease/laws.rs": {
+      "decision_time": "DisposalLease.decision_time",
+      "lease_end": "DisposalLease.lease_end",
+      "withdrawn": "DisposalLease.withdrawn",
+      "may_dispose": "DisposalLease.MayDispose",
+      "admits": "DisposalLease.Admits",
+      "withdrawn_owners": "DisposalLease.qualifying_owners"
+    }
+  },
+  "ordered_trim": {
+    "verification/verus/ordered_trim/laws.rs": {
+      "between": null,
+      "trimPrefixSafe": "Logkeeper.Protocol.trimPrefixSafe"
+    },
+    "src/ordered/retention.rs": {
+      "recordCredit": "Logkeeper.Protocol.Credit.addDebit",
+      "trimCredit": "Logkeeper.Protocol.trimCredit",
+      "pinsSuffix": "Logkeeper.Protocol.pinsSuffix"
+    }
+  },
+  "ordered_writer": {
+    "verification/verus/ordered_writer/laws.rs": {
+      "authorize_writer": "Logkeeper.Kernel.Ordered.authorize_writer",
+      "append_next_lsn": "Logkeeper.Kernel.Ordered.append_next_lsn",
+      "next_writer_epoch": "Logkeeper.Kernel.Ordered.next_writer_epoch",
+      "withdraw_grant": "Logkeeper.Kernel.Ordered.withdraw_grant",
+      "abstract_authority": "Logkeeper.Kernel.Ordered.abstract_authority",
+      "abstract_history": "Logkeeper.Kernel.Ordered.abstract_history",
+      "abstract_state": "Logkeeper.Kernel.Ordered.abstract_state",
+      "is_current_enrollment": "Logkeeper.Kernel.Ordered.is_current_enrollment"
+    }
+  },
+  "prefix_agreement": {
+    "src/ordered/replication/rules.rs": {
+      "ballot_lt": "Logkeeper.PrefixAgreement.ballotRank"
+    }
+  },
+  "receipt_signatures": {
+    "verification/verus/receipt_signatures/reference.rs": {
+      "verificationKeys": "Logkeeper.Premises.BarrierKeys.verificationKeys",
+      "repairAuthority": "Logkeeper.Premises.BarrierKeys.repairAuthority",
+      "validSuccessorKeys": "Logkeeper.Premises.BarrierKeys.validSuccessorKeys"
+    }
+  },
+  "rotation_slot_evidence": {
+    "verification/verus/rotation_slot_evidence/laws.rs": {
+      "distinct_voters": "List.Nodup",
+      "at_fence": "Logkeeper.SelectionFence.AtFence"
+    }
+  },
+  "voter_slot_header": {
+    "src/ordered/replication/slot_header.rs": {
+      "voterSlotMagic": "Logkeeper.VoterSlotHeader.voterSlotMagic"
+    }
+  },
+  "voter_transport": {
+    "src/ordered/replication/transport_fields.rs": {
+      "transportMagic": "Logkeeper.VoterTransport.transportMagic",
+      "transportGroupMatches": "Logkeeper.VoterTransport.transportGroupMatches",
+      "responseKind": "Logkeeper.VoterTransport.responseKind"
+    }
+  }
+}

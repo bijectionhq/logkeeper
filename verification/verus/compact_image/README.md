@@ -62,3 +62,6 @@ proving the roster and old-root coordinate checks, the hold partition and cut
 coverage, the exact joins to receipt outcomes, record history and liveness accounting,
 and global reference coverage and aggregate budget. The [writer area](../ordered_writer/README.md)
 checks generation preservation through vacancy.
+
+The [mechanical link inventory](../../link/inventory.md) lists the checked
+projections and the remaining Lean correspondence for this area.

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "verus-permits-empty-pin",
+    "file": "verification/verus/ordered_admission/laws.rs",
+    "find": "    start < end && start < floor",
+    "replace": "    start <= end && start < floor",
+    "area": "ordered_admission",
+    "theorem": "link_pinsSuffix"
+  },
+  {
+    "name": "verus-omits-lease-key-order",
+    "file": "src/ordered/codec/snapshot_checks.rs",
+    "find": "        && duration <= lease_end <= time + duration\n        && key_increases",
+    "replace": "        && duration <= lease_end <= time + duration",
+    "area": "compact_image",
+    "theorem": "link_leaseRowValid"
+  },
+  {
+    "name": "lean-reverses-fence-key-order",
+    "file": "verification/lean/Logkeeper/CompactImage.lean",
+    "find": "0 < position ∧ position ≤ lastPosition ∧ time ≤ lastTime ∧ keyIncreases = true",
+    "replace": "0 < position ∧ position ≤ lastPosition ∧ time ≤ lastTime ∧ keyIncreases = false",
+    "area": "compact_image",
+    "theorem": "link_fenceRowValid"
+  }
+]

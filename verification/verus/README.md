@@ -39,6 +39,14 @@ The runner makes a fresh copy for the baseline and for each control. Success
 requires the baseline to verify and each control to produce exactly its
 declared proof failures while meeting its verification count.
 
+Run the [mechanical Lean correspondence checker](../link/README.md) alongside
+the Verus runner. It regenerates Lean predicates from the live Rust spec
+functions, checks the named equivalences, and runs controls on both sides.
+
+```sh
+python3 verification/link/run.py
+```
+
 The area READMEs describe the checked production functions and Lean mappings.
 
 - [Compact image](compact_image/README.md)
