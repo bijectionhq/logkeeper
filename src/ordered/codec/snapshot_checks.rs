@@ -1,9 +1,16 @@
+use crate::ordered::{
+    admission,
+    receipt::{Receipt, ReceiptBook, RetainedOutcome},
+};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq};
+#[cfg(verus_keep_ghost)]
+use vstd::std_specs::cmp::OrdSpec;
 #[cfg(verus_keep_ghost)]
 use vstd::std_specs::{btree::*, iter::IteratorSpec};
 
@@ -60,6 +67,48 @@ pub(crate) open spec fn objectControlTrailerCanonical(present: bool, roots: usiz
 
 pub(crate) open spec fn receiptPositionFresh(positions: Set<u64>, position: u64) -> bool {
     !positions.contains(position)
+}
+
+pub(crate) open spec fn receiptRowValid(
+    snapshot_position: u64, decision_position: u64, expires_at: u64, retry_horizon: u64,
+    nonce_present: bool, owns_live_hold: bool,
+) -> bool {
+    nonce_present && 0 < decision_position <= snapshot_position
+        && decision_position < expires_at
+        && expires_at as int - decision_position <= retry_horizon
+        && (snapshot_position < expires_at || owns_live_hold)
+}
+
+pub(crate) open spec fn receiptPartition<P, I, K, A>(
+    book: Map<(I, K), RetainedOutcome<Receipt<P, I, K, A>>>, positions: Set<u64>,
+) -> bool {
+    &&& forall|key: (I, K)| #[trigger] book.contains_key(key) ==> {
+        let row = book[key].receipt;
+        key == (row.principal, row.request) && positions.contains(row.position)
+    }
+    &&& forall|left: (I, K), right: (I, K)|
+        #[trigger] book.contains_key(left) && #[trigger] book.contains_key(right) && left != right
+        ==> book[left].receipt.position != book[right].receipt.position
+    &&& forall|position: u64| #[trigger] positions.contains(position) ==> exists|key: (I, K)|
+        #[trigger] book.contains_key(key) && book[key].receipt.position == position
+}
+
+pub(crate) open spec fn receiptExpiryPartition<P, I, K, A>(
+    book: Map<(I, K), RetainedOutcome<Receipt<P, I, K, A>>>,
+    expiry: Map<(u64, (I, K)), ()>,
+    now: u64,
+    expires: spec_fn(K) -> u64,
+) -> bool {
+    forall|entry: (u64, (I, K))| #[trigger] expiry.contains_key(entry)
+        <==> book.contains_key(entry.1) && entry.0 == expires(entry.1.1) && now < entry.0
+}
+
+pub(crate) open spec fn lastSnapshotKey<K: Ord, V>(rows: Map<K, V>, last: Option<K>) -> bool {
+    match last {
+        None => rows.is_empty(),
+        Some(last) => rows.contains_key(last) && forall|key: K| #[trigger] rows.contains_key(key)
+            ==> last.cmp_spec(&key) != Ordering::Less,
+    }
 }
 
 pub(super) open spec fn allSnapshotRowsValid<Row>(rows: Set<Row>, passing: Set<Row>) -> bool {
@@ -273,6 +322,169 @@ pub(super) fn object_control_trailer_canonical(present: bool, roots: usize, fenc
 ))]
 pub(super) fn insert_receipt_position(positions: &mut BTreeSet<u64>, position: u64) -> bool {
     positions.insert(position)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(
+    requires btree_map_inv(old(rows)), obeys_cmp::<K>(), obeys_cmp_concrete_eq::<K>(),
+    ensures btree_map_inv(final(rows)), final(rows)@ == old(rows)@.insert(key, row),
+))]
+pub(super) fn insert_snapshot_row<K: Ord, Row>(rows: &mut BTreeMap<K, Row>, key: K, row: Row) {
+    rows.insert(key, row);
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires btree_map_inv(old(outcomes)), btree_map_inv(old(expiry)), btree_set_wf(old(positions)),
+        obeys_cmp::<(I, K)>(), obeys_cmp_concrete_eq::<(I, K)>(),
+        obeys_cmp::<(u64, (I, K))>(), obeys_cmp_concrete_eq::<(u64, (I, K))>(),
+        receiptPartition(old(outcomes)@, old(positions)@),
+        receiptExpiryPartition(old(outcomes)@, old(expiry)@, snapshot_position, expires@),
+        expires_at == expires@(receipt.request),
+        lastSnapshotKey(old(outcomes)@, *old(previous)),
+    ensures
+        btree_map_inv(final(outcomes)), btree_map_inv(final(expiry)), btree_set_wf(final(positions)),
+        receiptPartition(final(outcomes)@, final(positions)@),
+        receiptExpiryPartition(final(outcomes)@, final(expiry)@, snapshot_position, expires@),
+        lastSnapshotKey(final(outcomes)@, *final(previous)),
+        *final(previous) == if out { Some((receipt.principal, receipt.request)) } else { *old(previous) },
+        out == (receiptRowValid(snapshot_position, receipt.position, expires_at, retry_horizon,
+            nonce_present, owns_live_hold)
+            && receiptPositionFresh(old(positions)@, receipt.position)
+            && match *old(previous) {
+                Some(last) => last.cmp_spec(&(receipt.principal, receipt.request)) == Ordering::Less,
+                None => true,
+            }),
+        out ==> !old(outcomes)@.contains_key((receipt.principal, receipt.request)),
+        final(outcomes)@ == if out {
+            old(outcomes)@.insert((receipt.principal, receipt.request), RetainedOutcome { fingerprint, receipt })
+        } else { old(outcomes)@ },
+        final(expiry)@ == if out && snapshot_position < expires_at {
+            old(expiry)@.insert((expires_at, (receipt.principal, receipt.request)), ())
+        } else { old(expiry)@ },
+))]
+pub(super) fn insert_snapshot_receipt<P, I: Ord + Copy, K: Ord + Copy, A>(
+    outcomes: &mut ReceiptBook<P, I, K, A>,
+    expiry: &mut BTreeMap<(u64, (I, K)), ()>,
+    positions: &mut BTreeSet<u64>,
+    previous: &mut Option<(I, K)>,
+    snapshot_position: u64,
+    retry_horizon: u64,
+    expires_at: u64,
+    nonce_present: bool,
+    owns_live_hold: bool,
+    receipt: Receipt<P, I, K, A>,
+    fingerprint: [u8; 32],
+    #[cfg(verus_keep_ghost)] expires: Ghost<FnSpec<(K,), u64>>,
+) -> bool {
+    let key = (receipt.principal, receipt.request);
+    let position = receipt.position;
+    if !nonce_present
+        || position == 0
+        || position > snapshot_position
+        || position >= expires_at
+        || expires_at - position > retry_horizon
+        || !admission::retains_receipt(snapshot_position, expires_at, owns_live_hold)
+    {
+        return false;
+    }
+    #[cfg(verus_keep_ghost)]
+    proof_decl! {
+        let ghost before = outcomes@;
+        let ghost seen = positions@;
+        let ghost last_key = *previous;
+        let ghost old_expiry = expiry@;
+    }
+    if let Some(last) = *previous {
+        let order = last.cmp(&key);
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            reveal(vstd::laws_cmp::obeys_cmp_ord);
+            assert(order == last.cmp_spec(&key));
+        }
+        if !matches!(order, Ordering::Less) {
+            return false;
+        }
+    }
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        assert(lastSnapshotKey(before, last_key));
+        if before.contains_key(key) {
+            let last = last_key.unwrap();
+            assert(last.cmp_spec(&key) != Ordering::Less);
+        }
+        assert(!before.contains_key(key));
+    }
+    if !insert_receipt_position(positions, position) {
+        return false;
+    }
+    if expires_at > snapshot_position {
+        insert_snapshot_row(expiry, (expires_at, key), ());
+    }
+    insert_snapshot_row(outcomes, key, RetainedOutcome { fingerprint, receipt });
+    *previous = Some(key);
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        use vstd::laws_cmp::{obeys_cmp_ord, obeys_partial_cmp_spec_properties};
+        use vstd::std_specs::cmp::PartialOrdSpec;
+        reveal(obeys_cmp_ord);
+        reveal(obeys_partial_cmp_spec_properties);
+        assert(!before.contains_key(key));
+        assert forall|other: (I, K)| #[trigger] outcomes@.contains_key(other)
+            implies key.cmp_spec(&other) != Ordering::Less by {
+            if other != key {
+                assert(before.contains_key(other));
+                let last = last_key.unwrap();
+                assert(last.cmp_spec(&other) != Ordering::Less);
+                assert(last.cmp_spec(&key) == Ordering::Less);
+                if other != last {
+                    assert(other.partial_cmp_spec(&last) == Some(Ordering::Less));
+                    assert(last.partial_cmp_spec(&key) == Some(Ordering::Less));
+                    assert(other.partial_cmp_spec(&key) == Some(Ordering::Less));
+                }
+                assert(other.cmp_spec(&key) == Ordering::Less);
+                assert(key.partial_cmp_spec(&other) == Some(Ordering::Greater));
+            }
+        }
+        assert forall|other: (I, K)| #[trigger] outcomes@.contains_key(other) implies {
+            let row = outcomes@[other].receipt;
+            other == (row.principal, row.request) && positions@.contains(row.position)
+        } by {
+            if other != key {
+                assert(before.contains_key(other));
+            }
+        }
+        assert forall|left: (I, K), right: (I, K)|
+            #[trigger] outcomes@.contains_key(left) && #[trigger] outcomes@.contains_key(right)
+                && left != right
+            implies outcomes@[left].receipt.position != outcomes@[right].receipt.position by {
+            if left != key {
+                assert(before.contains_key(left));
+                assert(seen.contains(before[left].receipt.position));
+            }
+            if right != key {
+                assert(before.contains_key(right));
+                assert(seen.contains(before[right].receipt.position));
+            }
+        }
+        assert forall|p: u64| #[trigger] positions@.contains(p) implies exists|other: (I, K)|
+            #[trigger] outcomes@.contains_key(other) && outcomes@[other].receipt.position == p by {
+            if p == position {
+                assert(outcomes@.contains_key(key) && outcomes@[key].receipt.position == p);
+            } else {
+                assert(seen.contains(p));
+                let other = choose|other: (I, K)|
+                    #[trigger] before.contains_key(other) && before[other].receipt.position == p;
+                assert(outcomes@.contains_key(other) && outcomes@[other].receipt.position == p);
+            }
+        }
+        assert forall|entry: (u64, (I, K))| #[trigger] expiry@.contains_key(entry)
+            <==> outcomes@.contains_key(entry.1) && entry.0 == expires@(entry.1.1)
+                && snapshot_position < entry.0 by {
+            assert(old_expiry.contains_key(entry)
+                == (before.contains_key(entry.1) && entry.0 == expires@(entry.1.1)
+                    && snapshot_position < entry.0));
+        }
+    }
+    true
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>

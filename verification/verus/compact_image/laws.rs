@@ -1,11 +1,14 @@
 use crate::production::{
     fence_row_valid, generation_in_range, hold_receipt_matches, lease_row_valid,
     root_reference_row_valid, all_snapshot_rows, checksSnapshotRow,
-    insert_receipt_position, object_control_trailer_canonical, old_root_key_increases,
+    insert_receipt_position, insert_snapshot_receipt, insert_snapshot_row,
+    object_control_trailer_canonical, old_root_key_increases, receiptExpiryPartition, receiptPartition,
     ReducerImage, reducerInvariant, receiptPositionsUnique,
 };
 use vstd::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
+use crate::receipt::Receipt;
+use vstd::laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq};
 use vstd::std_specs::btree::*;
 
 verus! {
@@ -121,6 +124,46 @@ fn one_invalid_hold_prevents_recovery(
 {
     let accepted = all_snapshot_rows(rows, check, Ghost(passing));
     assert(!accepted);
+}
+
+fn insertion_preserves_checked_snapshot_rows<K: Ord + Copy, Row>(
+    rows: &mut BTreeMap<K, Row>, key: K, row: Row,
+    Ghost(valid): Ghost<spec_fn(K, Row) -> bool>,
+)
+    requires
+        btree_map_inv(old(rows)), obeys_cmp::<K>(), obeys_cmp_concrete_eq::<K>(),
+        valid(key, row),
+        forall|stored: K| #[trigger] old(rows)@.contains_key(stored) ==> valid(stored, old(rows)@[stored]),
+{
+    let ghost before = rows@;
+    insert_snapshot_row(rows, key, row);
+    assert(rows@[key] == row);
+    assert forall|stored: K| #[trigger] rows@.contains_key(stored) implies valid(stored, rows@[stored]) by {
+        if stored != key {
+            assert(before.contains_key(stored));
+        }
+    }
+}
+
+fn decoded_receipts_use_exact_retry_and_expiry_keys(now: u64, at: u64, until: u64, live_hold: bool)
+    requires 0 < at <= now, at < until, now < until || live_hold,
+{
+    let mut book = BTreeMap::new();
+    let mut expiry = BTreeMap::new();
+    let mut positions = BTreeSet::new();
+    let mut previous = None;
+    let receipt = Receipt { placement: (), principal: 1u64, request: (2u64, until), position: at, outcome: () };
+    let ghost deadline = |id: (u64, u64)| id.1;
+    let accepted = insert_snapshot_receipt(
+        &mut book, &mut expiry, &mut positions, &mut previous, now, u64::MAX, until, true, live_hold,
+        receipt, [0; 32], Ghost(deadline),
+    );
+    let ghost key = (receipt.principal, receipt.request);
+    assert(accepted);
+    assert(book@[key].receipt == receipt);
+    assert(expiry@.contains_key((until, key)) == (now < until));
+    assert(receiptPartition(book@, positions@));
+    assert(receiptExpiryPartition(book@, expiry@, now, deadline));
 }
 
 proof fn the_reducer_invariant_excludes_reused_receipt_positions(image: ReducerImage, i: int, j: int)

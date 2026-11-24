@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 19,
+  "min_verified_functions": 23,
   "controls": {
     "allow-zero-generation": {
       "defect": "A vacant state may decode with generation zero.",
@@ -210,9 +210,37 @@
           "file": "verification/verus/compact_image/laws.rs",
           "function": "accepting_a_receipt_preserves_unique_decision_positions",
           "category": "assertion failed"
+        },
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "function": "insert_snapshot_receipt",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "function": "insert_snapshot_receipt",
+          "category": "assertion failed"
         }
       ],
       "min_verified_functions": 16
+    },
+    "skip-receipt-expiry-entry": {
+      "defect": "A future receipt is installed without its expiry index entry.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "    if expires_at > snapshot_position {\n        insert_snapshot_row(expiry, (expires_at, key), ());\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "function": "insert_snapshot_receipt",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 22
     }
   }
 }

@@ -27,7 +27,6 @@ mod writer;
 use bytes::Bytes;
 use object_names::valid_object_names;
 use receipt::ReceiptBook;
-use receipt::RetainedOutcome;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use uuid::Uuid;

@@ -5,13 +5,13 @@ use super::{
 use super::frame::{bounded_body_length, decode_flag, encode_flag};
 use super::snapshot_checks::{
     all_snapshot_rows, fence_row_valid, generation_in_range, hold_receipt_matches,
-    insert_receipt_position, lease_row_valid, object_control_trailer_canonical, old_root_key_increases,
-    root_reference_row_valid,
+    insert_snapshot_receipt, insert_snapshot_row, lease_row_valid, object_control_trailer_canonical,
+    old_root_key_increases, root_reference_row_valid,
 };
 use crate::ordered::{
     ACTIVATION_HOLD_SLOTS, AppendClass, AppendResult, Command, Grant, HeldAdmission, HoldKind,
     ObjectFence, Outcome, Principal, Receipt, Record, Refusal, Request, RetainedCheckpoint,
-    RetainedOutcome, State, WITHDRAWAL_BYTES, Window, admission, append_fingerprint, fingerprint,
+    State, WITHDRAWAL_BYTES, Window, admission, append_fingerprint, fingerprint,
     record_charge,
 };
 use bytes::{BufMut, Bytes, BytesMut};
@@ -164,9 +164,11 @@ impl State {
             {
                 return Err(Refusal::Invalid);
             }
-            state
-                .old_roots
-                .insert(revision, RetainedCheckpoint { checkpoint, closed });
+            insert_snapshot_row(
+                &mut state.old_roots,
+                revision,
+                RetainedCheckpoint { checkpoint, closed },
+            );
         }
         if state.position == 0
             || state.voter_scope != initial.voter_scope
@@ -241,7 +243,7 @@ impl State {
             if !root_reference_row_valid(revision, previous, known) {
                 return Err(Refusal::Invalid);
             }
-            self.root_references.insert(revision, input.object_names()?);
+            insert_snapshot_row(&mut self.root_references, revision, input.object_names()?);
         }
         let fences = if legacy {
             0
@@ -264,7 +266,7 @@ impl State {
             ) {
                 return Err(Refusal::Invalid);
             }
-            self.object_fences.insert(fence.object.name, fence);
+            insert_snapshot_row(&mut self.object_fences, fence.object.name, fence);
         }
         self.charge_object_control(0)?;
         if !self.object_fences.is_empty() {
@@ -313,7 +315,7 @@ impl State {
             ) {
                 return Err(Refusal::Invalid);
             }
-            self.leases.insert(member, lease_end);
+            insert_snapshot_row(&mut self.leases, member, lease_end);
         }
         Ok(())
     }
@@ -333,7 +335,7 @@ impl State {
             {
                 return Err(Refusal::Invalid);
             }
-            self.roster.insert(member.worker, member);
+            insert_snapshot_row(&mut self.roster, member.worker, member);
         }
         if let Some(writer) = self.authority.grant {
             if writer.epoch == 0
@@ -524,8 +526,7 @@ impl State {
             {
                 return Err(Refusal::Invalid);
             }
-            self.holds
-                .insert(hold.id, HeldAdmission { hold, origin, kind });
+            insert_snapshot_row(&mut self.holds, hold.id, HeldAdmission { hold, origin, kind });
         }
         Ok(())
     }
@@ -535,36 +536,17 @@ impl State {
         let count = input
             .count(retries.saturating_add(self.limits.replay_holds + ACTIVATION_HOLD_SLOTS))?;
         let mut positions = BTreeSet::new();
+        let mut previous = None;
         for _ in 0..count {
             let issuer = input.principal()?;
             let id = input.request_id()?;
-            let key = (issuer, id);
             let fingerprint = input.take()?;
             let position = input.u64()?;
             let outcome = input.result()?;
-            if id.nonce.is_nil()
-                || position == 0
-                || position > self.position
-                || position >= id.expires_at
-                || id.expires_at - position > self.limits.retry_positions
-                || !insert_receipt_position(&mut positions, position)
-                || self
-                    .outcomes
-                    .last_key_value()
-                    .is_some_and(|(old, _)| *old >= key)
-            {
-                return Err(Refusal::Invalid);
-            }
             let live_hold = self
                 .holds
                 .get(&id)
                 .is_some_and(|entry| entry.origin == issuer);
-            if !admission::retains_receipt(self.position, id.expires_at, live_hold) {
-                return Err(Refusal::Invalid);
-            }
-            if id.expires_at > self.position {
-                self.expiry.insert((id.expires_at, key), ());
-            }
             let receipt = Receipt {
                 placement: self.placement,
                 principal: issuer,
@@ -572,13 +554,23 @@ impl State {
                 position,
                 outcome,
             };
-            self.outcomes.insert(
-                key,
-                RetainedOutcome {
-                    fingerprint,
-                    receipt,
-                },
-            );
+            if !insert_snapshot_receipt(
+                &mut self.outcomes,
+                &mut self.expiry,
+                &mut positions,
+                &mut previous,
+                self.position,
+                self.limits.retry_positions,
+                id.expires_at,
+                !id.nonce.is_nil(),
+                live_hold,
+                receipt,
+                fingerprint,
+                #[cfg(verus_keep_ghost)]
+                vstd::prelude::Ghost(|id: super::RequestId| id.expires_at),
+            ) {
+                return Err(Refusal::Invalid);
+            }
         }
         if !all_snapshot_rows(&self.holds, |entry| {
             let hold = entry.hold;
