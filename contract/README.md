@@ -12,8 +12,7 @@ for each caller. Handles outlive the journal value that created them.
 To persist the fixture, create it with
 `FileJournal::open(path, Limits::default())?`. Reopen with the same limits
 after dropping every handle. File mutations perform synchronous file writes
-and `fsync` on the calling thread. Older numeric identities reopen as
-`urn:logkeeper:client:<number>` reference identities. Trim releases the stream's payload quota.
+and `fsync` on the calling thread. Trim releases the stream's payload quota.
 The underlying append-only file retains past mutations. Use the file journal
 on a local filesystem for development.
 

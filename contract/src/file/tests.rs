@@ -25,7 +25,7 @@ fn bytes(data: &'static [u8]) -> Bytes {
 }
 
 #[test]
-fn reopens_numeric_identities_as_reference_uris() {
+fn refuses_numeric_identity_frames() {
     let scratch = Scratch::new();
     let path = scratch.path().join("journal");
     {
@@ -49,15 +49,10 @@ fn reopens_numeric_identities_as_reference_uris() {
         .write_all(&frame)
         .unwrap();
 
-    let journal = FileJournal::open(&path, LIMITS).unwrap();
-    assert_eq!(
-        block_on(journal.handle(OWNER).seal(LIVE, EPOCH)),
-        Ok(Lsn(0))
-    );
-    assert_eq!(
-        block_on(journal.handle(OTHER).seal(LIVE, EPOCH)),
-        Err(Fenced { current: EPOCH }),
-    );
+    assert!(matches!(
+        FileJournal::open(&path, LIMITS),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData
+    ), "reference journal accepted an obsolete numeric identity frame");
 }
 
 async fn populate(journal: &FileJournal) {

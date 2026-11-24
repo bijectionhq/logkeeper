@@ -1,7 +1,6 @@
 //! A durable keeper for many streams. The keeper serializes decisions and WAL rounds.
 mod checkpoint;
 mod durability;
-mod legacy;
 #[cfg(test)]
 pub(super) mod memory;
 mod rules;

@@ -147,12 +147,7 @@ mod implementation {
         pub stream_quota_bytes: u64,
         pub max_record_bytes: u32,
         pub round_bytes_per_stream: usize,
-        #[cfg_attr(feature = "stream", serde(default = "default_round_requests"))]
         pub round_requests: usize,
-    }
-
-    const fn default_round_requests() -> usize {
-        64
     }
 
     impl Default for Limits {
@@ -161,7 +156,7 @@ mod implementation {
                 stream_quota_bytes: 8 * 1024 * 1024 * 1024,
                 max_record_bytes: 32 * 1024 * 1024,
                 round_bytes_per_stream: 4 * 1024 * 1024,
-                round_requests: default_round_requests(),
+                round_requests: 64,
             }
         }
     }

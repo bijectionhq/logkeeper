@@ -191,12 +191,6 @@ CONTROLS = [
         "excess discarded bytes still pin the mixed pack",
     ),
     (
-        "skip-legacy-checkpoint", "keeper/wal.rs",
-        "None if streams.exists() =>", "None if false && streams.exists() =>",
-        KEEPER_TEST + "legacy_checkpoint_migrates_with_an_uncaptured_wal_suffix",
-        "legacy keeper lost its checkpoint format",
-    ),
-    (
         "publish-before-choice", "writer/append.rs",
         "head: self.head.min(last),", "head: last,",
         "stream::writer::tests::publishing_on_first_accept_would_expose_a_history_takeover_can_discard",

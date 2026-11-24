@@ -109,7 +109,7 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
         "tls": { "certificate": server.certificate, "private_key": server.private_key, "ca": server.ca },
         "clients": [CLIENT, READ_ONLY],
         "writers": [CLIENT],
-        "limits": { "stream_quota_bytes": 1024, "max_record_bytes": 128, "round_bytes_per_stream": 256 }
+        "limits": { "stream_quota_bytes": 1024, "max_record_bytes": 128, "round_bytes_per_stream": 256, "round_requests": 64 }
     })).unwrap()).unwrap();
     let config = Config::read(&path).unwrap();
     assert_eq!(config.listen, address);

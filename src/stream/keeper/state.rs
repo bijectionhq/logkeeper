@@ -126,7 +126,6 @@ pub(super) struct Stream {
     pub records: VecDeque<Record>,
     pub staging: Option<Staging>,
     pub bytes: u64,
-    pub checkpoint: Option<u64>,
     pub changed: watch::Sender<()>,
 }
 
@@ -176,7 +175,6 @@ impl Default for Stream {
             records: VecDeque::new(),
             staging: None,
             bytes: 0,
-            checkpoint: None,
             changed: watch::channel(()).0,
         }
     }
@@ -481,7 +479,6 @@ impl Stream {
                 *self = Self {
                     deleted: rules::tombstone(self.deleted, true),
                     changed: self.changed.clone(),
-                    checkpoint: self.checkpoint,
                     ..Self::default()
                 };
                 self.view.ensemble = ensemble;

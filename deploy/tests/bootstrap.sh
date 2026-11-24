@@ -82,7 +82,7 @@ cat > "$fixture/deployment.json" <<'JSON'
   "zone": "eu-north-1a",
   "clients": ["urn:logkeeper:client:rtdb"],
   "writers": ["urn:logkeeper:client:ingestor"],
-  "limits": {"stream_quota_bytes": 8589934592, "max_record_bytes": 33554432, "round_bytes_per_stream": 4194304}
+  "limits": {"stream_quota_bytes": 8589934592, "max_record_bytes": 33554432, "round_bytes_per_stream": 4194304, "round_requests": 64}
 }
 JSON
 

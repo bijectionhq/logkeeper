@@ -310,11 +310,6 @@ impl Checkpoint {
         let live_bytes: u64 = self.streams.values().map(|stream| stream.bytes).sum();
         self.compaction_due =
             packed_bytes > SEGMENT_BYTES.saturating_add(live_bytes.saturating_mul(2));
-        let legacy = root.join("streams");
-        if legacy.exists() {
-            fs::remove_dir_all(legacy)?;
-            removed = true;
-        }
         if removed {
             sync_directory(root)?;
         }

@@ -202,21 +202,16 @@ fn decode(mut body: Bytes) -> Option<(StreamId, Mutation)> {
     let stream = StreamId(body.try_get_u128_le().ok()?);
     let mutation = match tag {
         0 => Mutation::Create,
-        1..=3 | 5..=7 => {
+        5..=7 => {
             let epoch = Epoch(body.try_get_u64_le().ok()?);
-            let identity = if tag < 5 {
-                let id = body.try_get_u128_le().ok()?;
-                Identity::from(format!("urn:logkeeper:client:{id}"))
-            } else {
-                let len = body.try_get_u32_le().ok()? as usize;
-                if len > body.len() {
-                    return None;
-                }
-                Identity::from(std::str::from_utf8(&body.split_to(len)).ok()?)
-            };
+            let len = body.try_get_u32_le().ok()? as usize;
+            if len > body.len() {
+                return None;
+            }
+            let identity = Identity::from(std::str::from_utf8(&body.split_to(len)).ok()?);
             match tag {
-                1 | 5 => Mutation::Seal { epoch, identity },
-                2 | 6 => {
+                5 => Mutation::Seal { epoch, identity },
+                6 => {
                     let at = Lsn(body.try_get_u64_le().ok()?);
                     let payload = std::mem::take(&mut body);
                     Mutation::Append {
@@ -226,7 +221,7 @@ fn decode(mut body: Bytes) -> Option<(StreamId, Mutation)> {
                         payload,
                     }
                 }
-                3 | 7 => {
+                7 => {
                     let through = Lsn(body.try_get_u64_le().ok()?);
                     Mutation::Trim {
                         epoch,

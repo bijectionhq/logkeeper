@@ -13,7 +13,6 @@ use fs2::FileExt;
 use super::{
     checkpoint::{Checkpoint, Snapshot},
     durability::{sync_directory, sync_file},
-    legacy,
     state::{ExtentReader, Stream},
 };
 use crate::stream::{
@@ -39,7 +38,6 @@ pub(super) struct Wal {
     bytes: u64,
     pub uncheckpointed: u64,
     pub bootstrap: bool,
-    migrate: bool,
     index: Option<Checkpoint>,
     pub dirty: HashSet<StreamId>,
     pub reader: ExtentReader,
@@ -207,7 +205,6 @@ impl Wal {
             .write(true)
             .open(data.join("LOCK"))?;
         lock.try_lock_exclusive()?;
-        let streams = data.join("streams");
         let segment_dir = data.join("segments");
         directories(&segment_dir)?;
         let identity = data.join("KEEPER");
@@ -221,10 +218,7 @@ impl Wal {
                         && paths.get(&0).is_some_and(|path| {
                             fs::metadata(path).is_ok_and(|meta| meta.len() == 0)
                         }));
-                if streams.exists() && fs::read_dir(&streams)?.next().is_some()
-                    || data.join("INDEX").exists()
-                    || !empty_initial
-                {
+                if data.join("INDEX").exists() || !empty_initial {
                     return Err(invalid("existing keeper data has no installed identity"));
                 }
                 if paths.is_empty() {
@@ -238,25 +232,15 @@ impl Wal {
         let (&latest, path) = paths
             .last_key_value()
             .expect("installed keeper has a segment");
-        let (first, index, mut states, migrate) = match Checkpoint::load(data)? {
+        let (first, index, mut states) = match Checkpoint::load(data)? {
             Some((first, index, states)) => {
                 // Also finish namespace changes left visible by an interrupted cleanup.
                 sync_directory(data)?;
-                (first, index, states, false)
+                (first, index, states)
             }
-            None if streams.exists() => (
-                *paths.first_key_value().expect("segments").0,
-                Checkpoint::default(),
-                legacy::load(&streams)?,
-                true,
-            ),
-            None => (0, Checkpoint::default(), HashMap::new(), false),
+            None => (0, Checkpoint::default(), HashMap::new()),
         };
-        if !paths.contains_key(&first)
-            || states
-                .values()
-                .any(|s| s.checkpoint.is_some_and(|seq| seq > latest))
-        {
+        if !paths.contains_key(&first) {
             return Err(invalid("keeper checkpoint does not match its WAL"));
         }
         let mut dirty = HashSet::new();
@@ -268,7 +252,6 @@ impl Wal {
             }
             uncheckpointed += replay(
                 segment,
-                seq,
                 seq == latest,
                 keeper,
                 &mut states,
@@ -278,11 +261,7 @@ impl Wal {
         }
         let file = OpenOptions::new().append(true).open(path)?;
         let bytes = file.metadata()?.len();
-        if migrate {
-            dirty.extend(states.keys().copied());
-        }
-        let bootstrap = streams.exists()
-            || !dirty.is_empty()
+        let bootstrap = !dirty.is_empty()
             || paths.len() > 1
             || bytes != 0
             || data.join("INDEX.tmp").exists()
@@ -297,7 +276,6 @@ impl Wal {
             uncheckpointed,
             index: Some(index),
             bootstrap,
-            migrate,
             dirty,
             reader: ExtentReader::default(),
             rotation: None,
@@ -376,8 +354,7 @@ impl Wal {
     ) -> io::Result<()> {
         let mut index = self.index.take().expect("one checkpoint at a time");
         let dirty = std::mem::take(&mut self.dirty);
-        let rewrite = self.migrate
-            || delete
+        let rewrite = delete
             || index.compaction_due()
             || dirty.iter().any(|id| states[id].deleted);
         let snapshots = dirty
@@ -420,7 +397,6 @@ impl Wal {
             covered: self.uncheckpointed,
         });
         self.bootstrap = false;
-        self.migrate = false;
         Ok(())
     }
 
@@ -502,7 +478,6 @@ struct Rotation {
 
 fn replay(
     path: &Path,
-    sequence: u64,
     tail: bool,
     keeper: KeeperId,
     states: &mut HashMap<StreamId, Stream>,
@@ -533,13 +508,6 @@ fn replay(
         }
         if flags > START | END || frame.0.is_empty() {
             return Err(invalid("invalid keeper WAL fragment"));
-        }
-        if states
-            .get(&id)
-            .and_then(|stream| stream.checkpoint)
-            .is_some_and(|last| sequence <= last)
-        {
-            continue;
         }
         let body = if flags == START | END {
             if fragments.contains_key(&id) {

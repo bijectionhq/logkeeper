@@ -107,12 +107,13 @@ variable "limits" {
     stream_quota_bytes     = number
     max_record_bytes       = number
     round_bytes_per_stream = number
-    round_requests         = optional(number, 64)
+    round_requests         = number
   })
   default = {
     stream_quota_bytes     = 8589934592
     max_record_bytes       = 33554432
     round_bytes_per_stream = 4194304
+    round_requests         = 64
   }
 
   validation {
