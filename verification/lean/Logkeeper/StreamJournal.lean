@@ -1,0 +1,797 @@
+import Logkeeper.DurableAcceptor
+
+namespace Logkeeper.StreamJournal
+
+open PrefixAgreement
+open JournalRefinement (Majority majorities_overlap)
+
+set_option warningAsError true
+
+abbrev KeeperId := Fin 3
+def ensemble : List KeeperId := [0, 1, 2]
+
+structure Record (Payload : Type) where
+  epoch : Nat
+  payload : Payload
+  deriving DecidableEq
+
+abbrev History (Payload : Type) := List (Record Payload)
+
+def empty : Vote (Record Payload) := ⟨0, []⟩
+def boot : DurableAcceptor.State (Record Payload) :=
+  DurableAcceptor.acceptVote DurableAcceptor.initial empty
+
+theorem boot_reachable : DurableAcceptor.Reachable (boot : DurableAcceptor.State (Record Payload)) :=
+  .extend .initial (.accept empty (Nat.le_refl 0) (by simp [DurableAcceptor.initial]))
+
+structure Keeper (Payload : Type) where
+  durable : DurableAcceptor.State (Record Payload)
+  holder : Nat
+  created : Bool
+  deleted : Bool
+  commit : Nat
+  floor : Nat
+  staging : Option (History Payload)
+
+def initial : Keeper Payload := ⟨boot, 0, false, false, 0, 1, none⟩
+
+def Keeper.promised (k : Keeper Payload) : Nat := k.durable.promised
+def Keeper.latest (k : Keeper Payload) : Vote (Record Payload) := k.durable.latest.getD empty
+def Keeper.synced (k : Keeper Payload) : Nat := k.latest.ballot
+def Keeper.history (k : Keeper Payload) : History Payload := k.latest.history
+def Keeper.endLsn (k : Keeper Payload) : Nat := k.history.length
+def Keeper.live (k : Keeper Payload) : Prop := k.created = true ∧ k.deleted = false
+
+def SealAllowed (k : Keeper Payload) (epoch holder : Nat) : Prop :=
+  k.promised < epoch ∨ (k.promised = epoch ∧ k.holder = holder)
+
+def Synced (k : Keeper Payload) (epoch : Nat) : Prop :=
+  k.promised = epoch ∧ k.synced = epoch
+
+def MayAppend (k : Keeper Payload) (epoch : Nat) : Prop := Synced k epoch
+
+def MayTrim (k : Keeper Payload) (epoch through : Nat) : Prop :=
+  Synced k epoch ∧ through ≤ k.commit
+
+def SameCommitted (k : Keeper Payload) (history : History Payload) : Prop :=
+  k.commit ≤ history.length ∧ history.take k.commit = k.history.take k.commit
+
+/-- An incomplete transfer stages a suffix. Completing installs the writer's exact seed.
+    A delayed same-epoch transfer may neither truncate nor replace an append. -/
+def syncImage (k : Keeper Payload) (start : Nat) (records : History Payload) : History Payload :=
+  (k.staging.getD k.history).take (start - 1) ++ records
+
+def sealKeeper (k : Keeper Payload) (epoch holder : Nat) : Keeper Payload :=
+  if k.promised = epoch then k
+  else { k with durable := DurableAcceptor.promise k.durable epoch, holder, staging := none }
+
+def accept (k : Keeper Payload) (epoch : Nat) (history : History Payload) : Keeper Payload :=
+  { k with durable := DurableAcceptor.acceptVote k.durable ⟨epoch, history⟩, staging := none }
+
+structure Round (Payload : Type) where
+  holder : Nat
+  first : KeeperId
+  second : KeeperId
+  distinct : first ≠ second
+  report : KeeperId → Vote (Record Payload)
+
+def Round.sealed (r : Round Payload) (k : KeeperId) : Bool :=
+  decide (k = r.first ∨ k = r.second)
+
+def recoveryEpoch (vote : Vote (Record Payload)) : Nat := vote.ballot
+
+def RecoveryLE (left right : Vote (Record Payload)) : Prop :=
+  recoveryEpoch left ≤ recoveryEpoch right ∧
+  (recoveryEpoch left = recoveryEpoch right → left.history.length ≤ right.history.length)
+
+instance (left right : Vote (Record Payload)) : Decidable (RecoveryLE left right) :=
+  inferInstanceAs (Decidable (_ ≤ _ ∧ (_ = _ → _ ≤ _)))
+
+theorem recovery_rank_is_synced_then_end (left right : Vote (Record Payload)) :
+    RecoveryLE left right ↔ RankLE left right := by
+  rfl -- recovery key
+
+def Round.source (r : Round Payload) : KeeperId :=
+  if RecoveryLE (r.report r.first) (r.report r.second) then r.second else r.first
+
+def Round.winner (r : Round Payload) : Vote (Record Payload) := r.report r.source
+
+structure Writer (Payload : Type) where
+  round : Nat → Option (Round Payload)
+  issued : Nat → History Payload
+  advertised : History Payload → Prop
+
+def Writer.seed (w : Writer Payload) (epoch : Nat) : History Payload :=
+  ((w.round epoch).map Round.winner).elim [] Vote.history
+
+def Writer.owns (w : Writer Payload) (k : Keeper Payload) (epoch : Nat) : Prop :=
+  ∃ r, w.round epoch = some r ∧ r.holder = k.holder
+
+inductive Step (w : Writer Payload) : Keeper Payload → Keeper Payload → Prop
+  | create {k} : k.deleted = false → Step w k { k with created := true }
+  | sealKeeper {k epoch holder} : k.live → SealAllowed k epoch holder →
+      Step w k (sealKeeper k epoch holder)
+  | syncPart {k epoch start records} : k.live → k.promised = epoch → w.owns k epoch →
+      start ∈ List.range' 1 ((k.staging.getD k.history).length + 1) →
+      SameCommitted k (syncImage k start records) →
+      Step w k { k with staging := some (syncImage k start records) }
+  | sync {k epoch start records} : k.live → k.promised = epoch → w.owns k epoch →
+      start ∈ List.range' 1 ((k.staging.getD k.history).length + 1) →
+      syncImage k start records = w.seed epoch → SameCommitted k (w.seed epoch) →
+      (k.synced = epoch → k.history = w.seed epoch) → w.seed epoch <+: w.issued epoch →
+      Step w k (accept k epoch (w.seed epoch))
+  | append {k epoch lsn payload commit} : k.live → MayAppend k epoch → w.owns k epoch →
+      lsn = k.endLsn + 1 →
+      w.seed epoch <+: k.history → k.history ++ [Record.mk epoch payload] <+: w.issued epoch →
+      commit ≤ k.endLsn + 1 →
+      w.advertised ((k.history ++ [Record.mk epoch payload]).take commit) →
+      Step w k { accept k epoch (k.history ++ [Record.mk epoch payload]) with commit := max k.commit commit }
+  | retry {k epoch lsn payload commit} : k.live → MayAppend k epoch → w.owns k epoch →
+      k.floor ≤ lsn → k.history[lsn - 1]? = some ⟨epoch, payload⟩ → commit ≤ k.endLsn →
+      w.advertised (k.history.take commit) →
+      Step w k { k with commit := max k.commit commit }
+  | trim {k epoch through} : k.live → w.owns k epoch → MayTrim k epoch through →
+      Step w k { k with floor := max k.floor (through + 1) }
+  | check {k} : k.live → Step w k k
+  | read {k} : k.live → Step w k k
+  | delete {k} : k.created = true → Step w k { k with deleted := true }
+
+inductive Reachable (w : Writer Payload) : Keeper Payload → Prop
+  | initial : Reachable w initial
+  | extend : Reachable w k → Step w k next → Reachable w next
+
+theorem append_requires_sync {k : Keeper Payload} {epoch : Nat}
+    (admitted : MayAppend k epoch) : k.synced = epoch := by
+  exact admitted.2 -- synced guard
+
+theorem seal_tie_has_same_holder {k : Keeper Payload} {epoch holder : Nat}
+    (admitted : SealAllowed k epoch holder) (same : k.promised = epoch) :
+    k.holder = holder := by
+  rcases admitted with higher | tied
+  · omega
+  · exact tied.2 -- holder guard
+
+theorem trim_below_commit {k : Keeper Payload} {epoch through : Nat}
+    (admitted : MayTrim k epoch through) : through ≤ k.commit := by
+  exact admitted.2 -- trim guard
+
+theorem keeper_step_refines_durable_acceptor {w : Writer Payload} {k next : Keeper Payload}
+    (sound : DurableAcceptor.Sound k.durable) (step : Step w k next) : DurableAcceptor.Step k.durable next.durable := by
+  cases step with
+  | sealKeeper _ allowed =>
+      unfold sealKeeper
+      split
+      · exact .restart
+      · rename_i differs
+        rcases allowed with higher | tied
+        · exact .prepare _ higher
+        · exact (differs tied.1).elim
+  | sync _ promised _ _ _ _ same _ =>
+      refine .accept _ (Nat.le_of_eq promised) ?_
+      intro old latest
+      have key : old = k.latest := by simp [Keeper.latest, latest]
+      have ballot := (show old.ballot = k.synced from congrArg Vote.ballot key)
+      have history := (show old.history = k.history from congrArg Vote.history key)
+      refine ⟨?_, ?_⟩
+      · exact Nat.le_trans (sound.latestRecorded old latest).2 (Nat.le_of_eq promised)
+      · intro equal
+        simp [history, same (ballot.symm.trans equal)]
+  | append _ admitted _ _ _ _ _ _ =>
+      refine .accept _ (Nat.le_of_eq admitted.1) ?_
+      intro old latest
+      have key : old = k.latest := by simp [Keeper.latest, latest]
+      have ballot := (show old.ballot = k.synced from congrArg Vote.ballot key)
+      have history := (show old.history = k.history from congrArg Vote.history key)
+      exact ⟨Nat.le_of_eq (ballot.trans (append_requires_sync admitted)), by simp [history]⟩
+  | _ => exact .restart
+
+theorem reachable_keeper_refines_durable_acceptor {w : Writer Payload} {k : Keeper Payload}
+    (reached : Reachable w k) : DurableAcceptor.Reachable k.durable := by
+  induction reached with
+  | initial => exact boot_reachable
+  | extend _ step prior =>
+      exact .extend prior (keeper_step_refines_durable_acceptor
+        (DurableAcceptor.reachable_replies_cover_every_lower_vote prior) step)
+
+theorem keeper_bounds {w : Writer Payload} {k : Keeper Payload} (reached : Reachable w k) :
+    k.commit ≤ k.endLsn ∧ 1 ≤ k.floor ∧ k.floor ≤ k.commit + 1 := by
+  induction reached with
+  | initial => exact ⟨Nat.zero_le _, Nat.le_refl _, Nat.le_refl _⟩
+  | @extend before _ _ step ih =>
+      cases step with
+      | sealKeeper _ _ =>
+          unfold sealKeeper
+          split <;> exact ih
+      | sync _ _ _ _ _ same _ _ => exact ⟨same.1, ih.2⟩
+      | @append epoch _ payload commit _ _ _ _ _ _ bounded _ =>
+          refine ⟨?_, ih.2.1, ?_⟩
+          · change max before.commit commit ≤ (before.history ++ [Record.mk epoch payload]).length
+            simp only [List.length_append, List.length_cons, List.length_nil]
+            exact Nat.max_le_of_le_of_le (Nat.le_trans ih.1 (Nat.le_succ _)) bounded
+          · have increases := Nat.le_max_left before.commit commit
+            change before.floor ≤ max _ _ + 1
+            omega
+      | retry _ _ _ _ _ bounded _ =>
+          exact ⟨Nat.max_le_of_le_of_le ih.1 bounded, ih.2.1,
+            Nat.le_trans ih.2.2 (Nat.add_le_add_right (Nat.le_max_left _ _) 1)⟩
+      | trim _ _ bounded =>
+          exact ⟨ih.1, Nat.le_trans ih.2.1 (Nat.le_max_left _ _),
+            Nat.max_le_of_le_of_le ih.2.2 (Nat.add_le_add_right (trim_below_commit bounded) 1)⟩
+      | _ => exact ih
+
+theorem two_of_three_is_majority (a b : KeeperId) (distinct : a ≠ b) :
+    Majority ensemble (fun k => decide (k = a ∨ k = b)) := by
+  exact (by decide : ∀ a b : KeeperId, a ≠ b →
+    Majority ensemble (fun k => decide (k = a ∨ k = b))) a b distinct
+
+theorem seal_source_is_a_signer (r : Round Payload) : r.sealed r.source = true := by
+  unfold Round.source
+  split <;> simp [Round.sealed]
+
+theorem seal_winner_dominates (r : Round Payload) (k : KeeperId) (signed : r.sealed k = true) :
+    RankLE (r.report k) r.winner := by
+  have comparable : ¬ RankLE (r.report r.first) (r.report r.second) →
+      RankLE (r.report r.second) (r.report r.first) := by
+    unfold RankLE
+    omega
+  simp only [Round.sealed, decide_eq_true_eq] at signed
+  unfold Round.winner Round.source
+  split
+  · rename_i ranked
+    rcases signed with rfl | rfl
+    · exact (recovery_rank_is_synced_then_end _ _).mp ranked
+    · exact rank_refl _
+  · rename_i ranked
+    rcases signed with rfl | rfl
+    · exact rank_refl _
+    · exact comparable (fun le => ranked ((recovery_rank_is_synced_then_end _ _).mpr le))
+
+def QuorumAccepted (keepers : KeeperId → Keeper Payload) (epoch : Nat)
+    (history : History Payload) : Prop :=
+  ∃ ack, Majority ensemble ack ∧
+    ∀ k ∈ ensemble, ack k = true →
+      ∃ held, (keepers k).durable.votes ⟨epoch, held⟩ ∧ history <+: held
+
+/-- A completed election records the first durable Seal snapshots from its two signers.
+    The retry of an already elected holder does not replace a snapshot. -/
+structure Execution (Payload : Type) where
+  writer : Writer Payload
+  keeper : KeeperId → Keeper Payload
+  reached : ∀ k, Reachable writer (keeper k)
+  reserved : writer.round 0 = none
+  initiallyEmpty : writer.issued 0 = []
+  emptyAdvertised : writer.advertised []
+  advertisedChosen : ∀ history, writer.advertised history →
+    ∃ epoch, QuorumAccepted keeper epoch history
+  captured : ∀ epoch r, writer.round epoch = some r → ∀ k, r.sealed k = true →
+    (keeper k).durable.replies epoch = some (some (r.report k))
+
+def Execution.ledger (x : Execution Payload) : Ledger KeeperId (Record Payload) where
+  members := ensemble
+  active epoch := epoch = 0 ∨ (x.writer.round epoch).isSome = true
+  prepared epoch k := if epoch = 0 then true else (x.writer.round epoch).elim false (·.sealed k)
+  report epoch k := (x.writer.round epoch).map (·.report k)
+  selected epoch := (x.writer.round epoch).map Round.winner
+  issued := x.writer.issued
+  voted k := (x.keeper k).durable.votes
+
+private theorem vote_follows_writer {w : Writer Payload} {k : Keeper Payload}
+    (reached : Reachable w k) (reserved : w.round 0 = none) (initiallyEmpty : w.issued 0 = [])
+    {vote : Vote (Record Payload)} (voted : k.durable.votes vote) :
+    (vote.ballot = 0 ∨ (w.round vote.ballot).isSome = true) ∧
+      w.seed vote.ballot <+: vote.history ∧ vote.history <+: w.issued vote.ballot := by
+  induction reached with
+  | initial =>
+      have eq : vote = empty := by simpa [initial, boot, DurableAcceptor.acceptVote,
+        DurableAcceptor.initial] using voted
+      subst vote
+      simp [empty, Writer.seed, reserved, initiallyEmpty]
+  | extend _ step ih =>
+      cases step with
+      | sealKeeper _ _ =>
+          apply ih
+          unfold sealKeeper at voted
+          split at voted <;> exact voted
+      | sync _ _ owns _ _ _ _ issued =>
+          rcases voted with prior | rfl
+          · exact ih prior
+          · obtain ⟨r, elected, _⟩ := owns
+            exact ⟨Or.inr (by simp [elected]), List.prefix_rfl, issued⟩
+      | append _ _ owns _ seed issued _ _ =>
+          rcases voted with prior | rfl
+          · exact ih prior
+          · obtain ⟨r, elected, _⟩ := owns
+            exact ⟨Or.inr (by simp [elected]), seed.trans (by simp), issued⟩
+      | _ => exact ih voted
+
+private theorem captured_vote {x : Execution Payload} {epoch : Nat} {r : Round Payload}
+    (elected : x.writer.round epoch = some r) {k : KeeperId} (signs : r.sealed k = true) :
+    (x.keeper k).durable.votes (r.report k) ∧ (r.report k).ballot < epoch := by
+  have sound := DurableAcceptor.reachable_replies_cover_every_lower_vote
+    (reachable_keeper_refines_durable_acceptor (x.reached k))
+  exact (sound.repliesSound epoch _ (x.captured epoch r elected k signs)).2.1 _ rfl
+
+theorem execution_refines_prefix_agreement (x : Execution Payload) : Rules x.ledger := by
+  constructor
+  · constructor
+    · intro epoch active
+      change epoch = 0 ∨ (x.writer.round epoch).isSome = true at active
+      rcases active with rfl | active
+      · change Majority ensemble (fun _ => true)
+        decide
+      · cases elected : x.writer.round epoch with
+        | none => simp [elected] at active
+        | some r =>
+            have positive : epoch ≠ 0 := by
+              intro zero
+              subst epoch
+              simp [x.reserved] at elected
+            simpa [Execution.ledger, positive, elected, Round.sealed] using
+              two_of_three_is_majority r.first r.second r.distinct
+    · intro epoch k observed _ _ prepared reported
+      cases elected : x.writer.round epoch with
+      | none => simp [Execution.ledger, elected] at reported
+      | some r =>
+          have positive : epoch ≠ 0 := by
+            intro zero
+            subst epoch
+            simp [x.reserved] at elected
+          have signs : r.sealed k = true := by simpa [Execution.ledger, positive, elected] using prepared
+          have exactReport : r.report k = observed := by simpa [Execution.ledger, elected] using reported
+          have source := seal_source_is_a_signer r
+          have faithful := captured_vote (x := x) elected source
+          refine ⟨r.source, r.winner, ?_, ?_, ?_, ?_, faithful.1, faithful.2, ?_⟩
+          · change r.source ∈ ensemble
+            have all : ∀ i : KeeperId, i ∈ ensemble := by decide
+            exact all _
+          · simpa [Execution.ledger, positive, elected] using source
+          · simp [Execution.ledger, elected, Round.winner]
+          · simp [Execution.ledger, elected]
+          · exact exactReport ▸ seal_winner_dominates r k signs
+    · intro k vote voted
+      exact vote_follows_writer (x.reached k) x.reserved x.initiallyEmpty voted
+  · intro epoch k _ prepared vote voted lower
+    have positive : epoch ≠ 0 := by omega
+    cases elected : x.writer.round epoch with
+    | none => simp [Execution.ledger, positive, elected] at prepared
+    | some r =>
+        have signs : r.sealed k = true := by simpa [Execution.ledger, positive, elected] using prepared
+        have sound := DurableAcceptor.reachable_replies_cover_every_lower_vote
+          (reachable_keeper_refines_durable_acceptor (x.reached k))
+        obtain ⟨observed, exactReport, ranked⟩ :=
+          (sound.repliesSound epoch _ (x.captured epoch r elected k signs)).2.2 vote voted lower
+        exact ⟨observed, by simpa [Execution.ledger, elected] using exactReport, ranked⟩
+
+/-- An acknowledgement is a durable accept of a prefix at the writer's epoch.
+    Delivery can be lost without retracting the accept. -/
+def Acknowledged (x : Execution Payload) (epoch : Nat) (history : History Payload) : Prop :=
+  QuorumAccepted x.keeper epoch history
+
+theorem quorum_acknowledgements_choose (x : Execution Payload) {epoch : Nat} {history : History Payload}
+    (acks : Acknowledged x epoch history) : Chosen x.ledger epoch history := by
+  obtain ⟨ack, majority, held⟩ := acks
+  exact ⟨ack, majority, fun k member voted =>
+    let ⟨h, hs, contains⟩ := held k member voted
+    ⟨⟨epoch, h⟩, hs, rfl, contains⟩⟩
+
+/-- The logical cut stores a ghost prefix. Physical retention starts at floor. -/
+def retained (history : History Payload) (floor : Nat) := history.drop (floor - 1)
+
+theorem committed_contiguous_and_irrevocable (x : Execution Payload)
+    {oldEpoch epoch floor : Nat} {old current : History Payload}
+    (oldCut : Chosen x.ledger oldEpoch old) (currentCut : Chosen x.ledger epoch current)
+    (grows : old.length ≤ current.length) :
+    (retained current floor).length = current.length + 1 - max floor 1 ∧
+    retained old floor <+: retained current floor := by
+  have agrees := every_chosen_prefix_agrees (execution_refines_prefix_agreement x) oldCut currentCut
+  have prefixes : old <+: current := by
+    rcases agrees with forward | reverse
+    · exact forward
+    · exact (reverse.eq_of_length_le grows) ▸ List.prefix_rfl
+  constructor
+  · simp only [retained, List.length_drop]
+    omega
+  · obtain ⟨tail, rfl⟩ := prefixes
+    unfold retained
+    by_cases fits : floor - 1 ≤ old.length
+    · rw [List.drop_append_of_le_length fits]
+      exact ⟨tail, rfl⟩
+    · simp [List.drop_eq_nil_of_le (by omega : old.length ≤ floor - 1)]
+
+theorem seal_fences_and_covers_acknowledged_appends (x : Execution Payload)
+    {oldEpoch epoch : Nat} {history : History Payload} {r : Round Payload}
+    (elected : x.writer.round epoch = some r) (lower : oldEpoch < epoch)
+    (oldAck : Acknowledged x oldEpoch history) :
+    history <+: r.winner.history := by
+  have active : x.ledger.active epoch := Or.inr (by simp [elected])
+  have inherited := later_ballot_inherits_chosen_prefix (execution_refines_prefix_agreement x)
+    (quorum_acknowledgements_choose x oldAck) epoch lower active
+  simpa [PrefixAgreement.seed, Execution.ledger, elected] using inherited
+
+theorem late_lower_epoch_cannot_extend_after_seal (x : Execution Payload)
+    {oldEpoch epoch committedEnd : Nat} {r : Round Payload} {history : History Payload}
+    (elected : x.writer.round epoch = some r) (lower : oldEpoch < epoch)
+    (sealReturned : r.winner.history.length ≤ committedEnd)
+    (lateAck : Acknowledged x oldEpoch history) :
+    history.length ≤ committedEnd :=
+  Nat.le_trans (seal_fences_and_covers_acknowledged_appends x elected lower lateAck).length_le sealReturned
+
+private theorem keeper_commit_was_advertised {w : Writer Payload} {k : Keeper Payload}
+    (emptyAdvertised : w.advertised []) (reached : Reachable w k) :
+    w.advertised (k.history.take k.commit) := by
+  induction reached with
+  | initial => exact emptyAdvertised
+  | @extend before _ prior step ih =>
+      cases step with
+      | sealKeeper _ _ =>
+          unfold sealKeeper
+          split <;> exact ih
+      | sync _ _ _ _ _ same _ _ =>
+          exact same.2.symm ▸ ih
+      | @append epoch _ payload commit _ _ _ _ _ _ _ advertised =>
+          change w.advertised ((before.history ++ [Record.mk epoch payload]).take (max before.commit commit))
+          by_cases newer : before.commit ≤ commit
+          · rw [Nat.max_eq_right newer]
+            exact advertised
+          · rw [Nat.max_eq_left (Nat.le_of_lt (Nat.lt_of_not_ge newer)),
+                List.take_append_of_le_length (keeper_bounds prior).1]
+            exact ih
+      | @retry _ _ _ commit _ _ _ _ _ _ advertised =>
+          change w.advertised (before.history.take (max before.commit commit))
+          by_cases newer : before.commit ≤ commit
+          · rw [Nat.max_eq_right newer]
+            exact advertised
+          · rw [Nat.max_eq_left (Nat.le_of_lt (Nat.lt_of_not_ge newer))]
+            exact ih
+      | _ => exact ih
+
+theorem reachable_keeper_commit_is_chosen (x : Execution Payload) (k : KeeperId) :
+    let view := x.keeper k
+    ∃ epoch, Chosen x.ledger epoch (view.history.take view.commit) := by
+  obtain ⟨epoch, certified⟩ := x.advertisedChosen _
+    (keeper_commit_was_advertised x.emptyAdvertised (x.reached k))
+  exact ⟨epoch, quorum_acknowledgements_choose x certified⟩
+
+structure Page (Payload : Type) where
+  floor : Nat
+  endLsn : Nat
+  records : History Payload
+
+def readPage (k : Keeper Payload) (start maxRecords : Nat) : Option (Page Payload) :=
+  if start < k.floor then none
+  else some ⟨k.floor, k.commit, ((k.history.take k.commit).drop (start - 1)).take maxRecords⟩
+
+theorem read_returns_exact_committed_records (x : Execution Payload)
+    (keeper : KeeperId) {epoch start maxRecords : Nat} {current : History Payload}
+    (committed : Chosen x.ledger epoch current) (known : (x.keeper keeper).commit ≤ current.length)
+    (retainedFrom : (x.keeper keeper).floor ≤ start) :
+    let k := x.keeper keeper
+    readPage k start maxRecords = some
+      ⟨k.floor, k.commit, ((current.take k.commit).drop (start - 1)).take maxRecords⟩ := by
+  let k := x.keeper keeper
+  have bounded := (keeper_bounds (x.reached keeper)).1
+  obtain ⟨e, certified⟩ := reachable_keeper_commit_is_chosen x keeper
+  have length : (k.history.take k.commit).length = k.commit := by
+    simp [Nat.min_eq_left (show k.commit ≤ k.history.length from bounded)]
+  have agrees := every_chosen_prefix_agrees (execution_refines_prefix_agreement x) certified committed
+  have retainedCut : k.history.take k.commit <+: current := by
+    rcases agrees with forward | backward
+    · exact forward
+    · exact (backward.eq_of_length_le (length.symm ▸ known)) ▸ List.prefix_rfl
+  have cut : current.take k.commit = k.history.take k.commit := by
+    obtain ⟨tail, exactCut⟩ := retainedCut
+    exact exactCut ▸ List.take_left' length
+  change readPage k start maxRecords = some
+    ⟨k.floor, k.commit, ((current.take k.commit).drop (start - 1)).take maxRecords⟩
+  rw [readPage, ite_eq_right (Nat.not_lt_of_ge retainedFrom), cut]
+
+inductive AppendResult where
+  | append | retry | conflict | trimmed | fenced
+  deriving DecidableEq
+
+def appendAt [DecidableEq Payload] (history : History Payload) (floor holder epoch caller request lsn : Nat)
+    (payload : Payload) : AppendResult :=
+  if request ≠ epoch ∨ caller ≠ holder then .fenced
+  else if lsn < floor then .trimmed
+  else if lsn = history.length + 1 then .append
+  else if history[lsn - 1]? = some ⟨request, payload⟩ then .retry
+  else .conflict
+
+theorem append_is_conditional_and_idempotent [DecidableEq Payload] (history : History Payload)
+    {floor holder epoch caller request lsn : Nat} {payload : Payload} :
+    (appendAt history floor holder epoch caller request lsn payload = .append ↔
+      request = epoch ∧ caller = holder ∧ floor ≤ lsn ∧ lsn = history.length + 1) ∧
+    (appendAt history floor holder epoch caller request lsn payload = .retry ↔
+      request = epoch ∧ caller = holder ∧ floor ≤ lsn ∧
+      history[lsn - 1]? = some ⟨request, payload⟩) := by
+  have noNext : lsn = history.length + 1 → history[lsn - 1]? ≠ some ⟨request, payload⟩ := by
+    intro equal
+    simp [equal]
+  unfold appendAt
+  by_cases e : request = epoch <;> by_cases h : caller = holder <;>
+    by_cases f : lsn < floor <;> by_cases n : lsn = history.length + 1 <;>
+    by_cases r : history[lsn - 1]? = some ⟨request, payload⟩ <;>
+    simp_all [Nat.not_lt, Nat.not_lt_of_ge]
+
+
+structure CheckView where
+  promised : Nat
+  synced : Nat
+  endLsn : Nat
+  commit : Nat
+
+def check (k : Keeper Payload) : CheckView := ⟨k.promised, k.synced, k.endLsn, k.commit⟩
+
+structure Invocation where
+  started : Nat
+  replied : Nat
+
+structure CheckRound where
+  epoch : Nat
+  opened : Nat
+  answered : KeeperId → Bool
+  sampled : KeeperId → Nat
+  view : KeeperId → CheckView
+
+def Fresh (call : Invocation) (round : CheckRound) : Prop :=
+  call.started ≤ round.opened
+
+structure Confirmed (call : Invocation) (round : CheckRound) : Prop where
+  fresh : Fresh call round
+  beforeReply : round.opened ≤ call.replied
+  quorum : Majority ensemble round.answered
+  samples : ∀ k ∈ ensemble, round.answered k = true →
+    round.opened ≤ round.sampled k ∧ round.sampled k ≤ call.replied ∧
+      (round.view k).promised = round.epoch ∧ (round.view k).synced = round.epoch
+
+theorem confirmed_round_is_fresh {call : Invocation} {round : CheckRound}
+    (confirmed : Confirmed call round) : call.started ≤ round.opened := by
+  exact confirmed.fresh -- fresh round guard
+
+/-- The commit cuts of a logical record-by-record execution. Times are event indices. -/
+structure CommitTrace where
+  endAt : Nat → Nat
+  monotone : ∀ earlier later, earlier ≤ later → endAt earlier ≤ endAt later
+  unit : ∀ time, endAt (time + 1) ≤ endAt time + 1
+
+/-- Study 29's read-index cut argument, specialized to LSNs. -/
+private theorem commit_cut_in_window (trace : CommitTrace) {first last result : Nat}
+    (ordered : first ≤ last) (lower : trace.endAt first ≤ result)
+    (upper : result ≤ trace.endAt last) :
+    ∃ point, first ≤ point ∧ point ≤ last ∧ trace.endAt point = result := by
+  induction last with
+  | zero =>
+      have equal : first = 0 := by omega
+      subst first
+      exact ⟨0, Nat.le_refl _, Nat.le_refl _, Nat.le_antisymm lower upper⟩
+  | succ previous prior =>
+      by_cases earlier : first ≤ previous ∧ result ≤ trace.endAt previous
+      · obtain ⟨point, within, before, cut⟩ := prior earlier.1 earlier.2
+        exact ⟨point, within, Nat.le_trans before (Nat.le_succ _), cut⟩
+      · refine ⟨previous + 1, ordered, Nat.le_refl _, ?_⟩
+        have unit := trace.unit previous
+        rcases Nat.lt_or_ge previous first with after | before
+        · have atEnd : first = previous + 1 := by omega
+          subst first
+          omega
+        · have tooShort : trace.endAt previous < result := by omega
+          omega
+
+/-- A ready writer has installed the opening cut on a quorum at its epoch.
+    That prefix remains present at later eligible checks in the same epoch. -/
+def OpeningCut (trace : CommitTrace) (round : CheckRound) : Prop :=
+  ∃ copies, Majority ensemble copies ∧
+    ∀ k ∈ ensemble, copies k = true → round.answered k = true →
+      trace.endAt round.opened ≤ (round.view k).endLsn
+
+/-- Keeper timelines use protocol steps or idle events. Check replies name their
+    exact event, and the opening commit has a durable ballot-specific quorum. -/
+structure KeeperTrace (writer : Writer Payload) where
+  image : Nat → KeeperId → Keeper Payload
+  reached : ∀ time keeper, Reachable writer (image time keeper)
+  next : ∀ time keeper, Step writer (image time keeper) (image (time + 1) keeper) ∨
+    image time keeper = image (time + 1) keeper
+
+private theorem durable_step_preserves_vote {before after : DurableAcceptor.State (Record Payload)}
+    (step : DurableAcceptor.Step before after) {vote : Vote (Record Payload)}
+    (voted : before.votes vote) : after.votes vote := by
+  cases step with
+  | accept => exact Or.inl voted
+  | prepare => exact voted
+  | restart => exact voted
+
+private theorem votes_persist {writer : Writer Payload} (stores : KeeperTrace writer)
+    {first last : Nat} {k : KeeperId} {vote : Vote (Record Payload)}
+    (ordered : first ≤ last) (voted : (stores.image first k).durable.votes vote) :
+    (stores.image last k).durable.votes vote := by
+  induction last with
+  | zero =>
+      have equal : first = 0 := by omega
+      exact equal ▸ voted
+  | succ previous prior =>
+      by_cases before : first ≤ previous
+      · have previousVote := prior before
+        rcases stores.next previous k with step | idle
+        · have sound := DurableAcceptor.reachable_replies_cover_every_lower_vote
+            (reachable_keeper_refines_durable_acceptor (stores.reached previous k))
+          exact durable_step_preserves_vote (keeper_step_refines_durable_acceptor sound step) previousVote
+        · exact idle ▸ previousVote
+      · have equal : first = previous + 1 := by omega
+        exact equal ▸ voted
+
+theorem opening_cut_from_durable_copies {writer : Writer Payload} (stores : KeeperTrace writer)
+    (trace : CommitTrace) {call : Invocation} {round : CheckRound}
+    (confirmed : Confirmed call round)
+    (observes : ∀ k ∈ ensemble, round.answered k = true →
+      round.view k = check (stores.image (round.sampled k) k))
+    (openingQuorum : ∃ copies, Majority ensemble copies ∧
+      ∀ k ∈ ensemble, copies k = true → ∃ held : History Payload,
+        (stores.image round.opened k).durable.votes ⟨round.epoch, held⟩ ∧
+        trace.endAt round.opened ≤ held.length) :
+    OpeningCut trace round := by
+  obtain ⟨copies, quorum, basis⟩ := openingQuorum
+  refine ⟨copies, quorum, ?_⟩
+  intro k member copy answered
+  obtain ⟨held, voted, openingEnd⟩ := basis k member copy
+  obtain ⟨afterOpen, _, _, synced⟩ := confirmed.samples k member answered
+  let sample := stores.image (round.sampled k) k
+  have exactView := observes k member answered
+  have persists := votes_persist stores afterOpen voted
+  have sound := DurableAcceptor.reachable_replies_cover_every_lower_vote
+    (reachable_keeper_refines_durable_acceptor (stores.reached (round.sampled k) k))
+  obtain ⟨observed, saved, ranked⟩ := sound.dominates _ persists
+  have latest : sample.latest = observed := by simp [sample, Keeper.latest, saved]
+  have same : round.epoch = observed.ballot := by
+    rw [exactView] at synced
+    change sample.latest.ballot = round.epoch at synced
+    rw [latest] at synced
+    exact synced.symm
+  rw [exactView]
+  change trace.endAt round.opened ≤ sample.latest.history.length
+  rw [latest]
+  exact Nat.le_trans openingEnd (ranked.2 same)
+
+def SamplesCovered (round : CheckRound) (lsn : Nat) : Prop :=
+  ∀ k ∈ ensemble, round.answered k = true → (round.view k).endLsn ≤ lsn
+
+theorem head_linearizable (trace : CommitTrace) {call : Invocation} {round : CheckRound}
+    {result priorAck : Nat} (confirmed : Confirmed call round)
+    (durable : OpeningCut trace round) (covers : SamplesCovered round result)
+    (chosen : result ≤ trace.endAt call.replied)
+    (acknowledged : priorAck ≤ trace.endAt call.started) :
+    priorAck ≤ result ∧ ∃ point,
+      call.started ≤ point ∧ point ≤ call.replied ∧ trace.endAt point = result := by
+  obtain ⟨copies, enough, installed⟩ := durable
+  obtain ⟨k, member, copy, answered⟩ :=
+    majorities_overlap ensemble copies round.answered enough confirmed.quorum
+  have lower := Nat.le_trans (installed k member copy answered) (covers k member answered)
+  have fresh := confirmed_round_is_fresh confirmed
+  obtain ⟨point, afterOpen, beforeReply, exactCut⟩ :=
+    commit_cut_in_window trace confirmed.beforeReply lower chosen
+  exact ⟨Nat.le_trans (Nat.le_trans acknowledged (trace.monotone _ _ fresh)) lower,
+    point, Nat.le_trans fresh afterOpen, beforeReply, exactCut⟩
+
+theorem non_writer_head_linearizable (trace : CommitTrace)
+    {call : Invocation} {round : CheckRound} {result priorAck : Nat}
+    (confirmed : Confirmed call round) (durable : OpeningCut trace round)
+    (maximum : SamplesCovered round result)
+    (commitQuorum : Majority ensemble (fun k => round.answered k && decide (result ≤ (round.view k).commit)))
+    (sound : ∀ k ∈ ensemble, round.answered k = true →
+      (round.view k).commit ≤ trace.endAt (round.sampled k))
+    (acknowledged : priorAck ≤ trace.endAt call.started) :
+    priorAck ≤ result ∧ ∃ point,
+      call.started ≤ point ∧ point ≤ call.replied ∧ trace.endAt point = result := by
+  obtain ⟨k, member, heard, committed⟩ := majorities_overlap ensemble round.answered
+    (fun k => round.answered k && decide (result ≤ (round.view k).commit)) confirmed.quorum commitQuorum
+  have localCommit : result ≤ (round.view k).commit := by simpa [heard] using committed
+  have beforeReply := (confirmed.samples k member heard).2.1
+  have upper := Nat.le_trans localCommit
+    (Nat.le_trans (sound k member heard) (trace.monotone _ _ beforeReply))
+  exact head_linearizable trace confirmed durable maximum upper acknowledged
+
+theorem tombstone_is_terminal {w : Writer Payload} {k next : Keeper Payload}
+    (step : Step w k next) (deleted : k.deleted = true) : next.deleted = true := by
+  cases step with
+  | create notDeleted => simp [deleted] at notDeleted
+  | sealKeeper _ _ =>
+      unfold sealKeeper
+      split <;> exact deleted
+  | delete _ => rfl
+  | _ => exact deleted
+
+private def exampleRound : Round Nat := ⟨0, 0, 1, by decide, fun _ => empty⟩
+private def exampleWriter : Writer Nat where
+  round e := if e = 1 then some exampleRound else none
+  issued e := if e = 1 then [⟨1, 7⟩] else []
+  advertised h := h = []
+private def exampleCreated : Keeper Nat := { initial with created := true }
+private def exampleSealed : Keeper Nat := sealKeeper exampleCreated 1 0
+private def exampleSynced : Keeper Nat := accept exampleSealed 1 []
+private def exampleAccepted : Keeper Nat :=
+  { accept exampleSynced 1 [⟨1, 7⟩] with commit := 0 }
+
+private theorem example_reached : Reachable exampleWriter exampleAccepted := by
+  have created : Reachable exampleWriter exampleCreated := .extend .initial (.create rfl)
+  have sealed : Reachable exampleWriter exampleSealed :=
+    .extend created (.sealKeeper ⟨rfl, rfl⟩ (Or.inl (by decide)))
+  have ownsSeal : exampleWriter.owns exampleSealed 1 := ⟨exampleRound, rfl, rfl⟩
+  have synced : Reachable exampleWriter exampleSynced :=
+    .extend sealed (.sync (epoch := 1) (start := 1) (records := []) ⟨rfl,rfl⟩ rfl ownsSeal
+      (by decide) rfl ⟨by decide,rfl⟩ (fun _ => rfl) (by decide))
+  have ownsSync : exampleWriter.owns exampleSynced 1 := ⟨exampleRound, rfl, rfl⟩
+  have admitted : MayAppend exampleSynced 1 := by
+    unfold MayAppend
+    try unfold Synced
+    decide
+  exact .extend synced (.append (lsn := 1) ⟨rfl,rfl⟩ admitted ownsSync rfl
+    (by decide) (by decide) (by decide) rfl)
+
+private def exampleExecution : Execution Nat where
+  writer := exampleWriter
+  keeper k := if k = 2 then initial else exampleAccepted
+  reached k := by split <;> first | exact .initial | exact example_reached
+  reserved := rfl
+  initiallyEmpty := rfl
+  emptyAdvertised := rfl
+  advertisedChosen history h := by
+    change history = [] at h
+    subst history
+    refine ⟨0, fun _ => true, by decide, ?_⟩
+    intro k _ _
+    refine ⟨[], ?_, List.prefix_rfl⟩
+    change (if k = 2 then initial else exampleAccepted).durable.votes _
+    split
+    · exact Or.inr rfl
+    · exact Or.inl (Or.inl (Or.inr rfl))
+  captured epoch r elected k signed := by
+    have epochOne : epoch = 1 := by
+      by_cases one : epoch = 1
+      · exact one
+      · simp [exampleWriter, one] at elected
+    subst epoch
+    have equal : exampleRound = r := Option.some.inj elected
+    subst r
+    have notThird : k ≠ 2 := by
+      intro third
+      subst k
+      exact (by decide : exampleRound.sealed 2 ≠ true) signed
+    simp [notThird]
+    rfl
+
+theorem reachable_two_keeper_commit :
+    ∃ x : Execution Nat, Acknowledged x 1 [⟨1, 7⟩] ∧
+      (x.keeper 2).endLsn = 0 := by
+  refine ⟨exampleExecution, ?_, rfl⟩
+  refine ⟨exampleRound.sealed, two_of_three_is_majority 0 1 (by decide), ?_⟩
+  intro k _ voted
+  have notThird : k ≠ 2 := by
+    intro third
+    subst k
+    exact (by decide : exampleRound.sealed 2 ≠ true) voted
+  refine ⟨[⟨1, 7⟩], ?_, List.prefix_rfl⟩
+  simp only [exampleExecution, ite_eq_right notThird]
+  exact Or.inr rfl
+
+#print axioms append_requires_sync
+#print axioms seal_tie_has_same_holder
+#print axioms trim_below_commit
+#print axioms keeper_bounds
+#print axioms reachable_keeper_refines_durable_acceptor
+#print axioms recovery_rank_is_synced_then_end
+#print axioms seal_winner_dominates
+#print axioms execution_refines_prefix_agreement
+#print axioms quorum_acknowledgements_choose
+#print axioms committed_contiguous_and_irrevocable
+#print axioms seal_fences_and_covers_acknowledged_appends
+#print axioms late_lower_epoch_cannot_extend_after_seal
+#print axioms reachable_keeper_commit_is_chosen
+#print axioms read_returns_exact_committed_records
+#print axioms append_is_conditional_and_idempotent
+#print axioms confirmed_round_is_fresh
+#print axioms opening_cut_from_durable_copies
+#print axioms head_linearizable
+#print axioms non_writer_head_linearizable
+#print axioms tombstone_is_terminal
+#print axioms reachable_two_keeper_commit
+
+end Logkeeper.StreamJournal

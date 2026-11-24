@@ -23,3 +23,5 @@ import Logkeeper.RuntimeGroups
 import Logkeeper.Reducer
 import Logkeeper.AsyncGroup
 import Logkeeper.AsyncGroupWitness
+
+import Logkeeper.StreamJournal
