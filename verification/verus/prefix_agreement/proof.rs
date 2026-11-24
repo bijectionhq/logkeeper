@@ -2,8 +2,13 @@
 
 #[path = "../../../src/ordered/replication/rules.rs"]
 mod production;
+use production as rules;
 #[path = "../rotation_slot_evidence/production.rs"]
 mod rotation_support;
+use rotation_support::{Ballot, Fingerprint, Uuid, Vote, VoterSlots, evidence, record_matches};
+
+#[path = "../../../src/ordered/replication/confirmation.rs"]
+mod confirmation;
 
 #[path = "../../../src/ordered/admission.rs"]
 mod admission;

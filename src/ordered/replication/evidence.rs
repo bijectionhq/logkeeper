@@ -161,6 +161,7 @@ pub(crate) fn valid_voters(voters: &[VoterSlots]) -> bool {
                     assert(voters@[i] == *current);
                 }
             }
+            assert(valid_voter_prefix(voters@, index as int + 1));
         }
         index += 1;
     }

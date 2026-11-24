@@ -1,25 +1,43 @@
 {
-  "summary": "Logkeeper selects the complete retained slice, requires the original in-range replay cursor and checks the exact successor and byte charge for head preparation and page delivery.",
+  "summary": "Logkeeper selects the complete retained slice, requires the original in-range replay cursor and runs one cursor machine for head and page delivery. Emission preserves the original record and byte charge, and completion requires the exact terminal cut.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 6,
+  "min_verified_functions": 11,
   "controls": {
     "lose_last_record": {
       "defect": "Interpret the terminal cut as one record earlier.",
       "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "(through - floor) as usize))", "replace": "(through - floor).saturating_sub(1) as usize))"}],
       "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "retained_indices", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 5
+      "min_verified_functions": 10
     },
     "substitute_cursor_history": {
       "defect": "Resume from a numerically admissible cursor from a different history.",
       "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "!exact_cut || from < start", "replace": "from < start"}],
       "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "cursor_offset", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 5
+      "min_verified_functions": 10
     },
     "deliver_later_record": {
       "defect": "Report a later record as the next value in a replay interval.",
       "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "from.checked_add(1) != Some(record_cut)", "replace": "from >= record_cut"}],
       "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "replay_record_charge", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 5
+      "min_verified_functions": 10
+    },
+    "complete_before_terminal": {
+      "defect": "Treat exhausted storage as proof of reaching the selected terminal cut.",
+      "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "return if same_cut(self.next, self.through) {", "replace": "return if self.next.0 <= self.through.0 {"}],
+      "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "step", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 10
+    },
+    "substitute_terminal_history": {
+      "defect": "Emit a record with the selected terminal coordinate but a different history.",
+      "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "if cut.0 == self.through.0 && !same_cut(cut, self.through) {", "replace": "if cut.0 > self.through.0 && !same_cut(cut, self.through) {"}],
+      "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "step", "category": "postcondition not satisfied"}, {"file": "src/ordered/replay_bounds.rs", "function": "step", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 10
+    },
+    "finish_on_empty_budget": {
+      "defect": "Return an empty successful page for an oversized first record.",
+      "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "return if self.emitted { ReplayStep::PageFull } else { ReplayStep::Capacity };", "replace": "return ReplayStep::PageFull;"}],
+      "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "step", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 10
     }
   }
 }

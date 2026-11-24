@@ -93,7 +93,8 @@ CommitCurrent(votes, bytes) ==
     /\ state.phase \in {"joint", "new"}
     /\ Len(state.history) < MaxLsn
     /\ CurrentReady(votes)
-    /\ Majority(New, votes)
+    /\ (Majority(New, votes) \/ (Mutation = "new_below_quorum" /\ state.phase = "new"
+                                  /\ Cardinality(votes \cap New) = 1))
     /\ state.phase = "new" \/ Majority(Old, votes) \/ Mutation = "joint_old_optional"
     /\ state' = [state EXCEPT !.history = Append(@, bytes),
          !.data = [r \in Replicas |-> IF r \in votes THEN Append(@[r], bytes) ELSE @[r]],

@@ -165,7 +165,8 @@ theorem compatible {ledger : PrefixAgreement.Ledger Voter Decision}
   DurableAcceptor.durable_replica_histories_agree evidence.ballots evidence.replicas
     evidence.reached evidence.accepts evidence.reported first.chosen later.chosen
 
-private theorem agrees_at_position {xs ys : List Decision} {position : Nat} {left right : Decision}
+private theorem agrees_at_position {Value : Type} {xs ys : List Value} {position : Nat}
+    {left right : Value}
     (extendsHistory : xs <+: ys)
     (atFirst : xs[position]? = some left) (atLater : ys[position]? = some right) :
     left = right := by
@@ -231,11 +232,47 @@ theorem same_chosen_append {ledger : PrefixAgreement.Ledger Voter Decision}
     (atLater : later.decisions[position]? = some (.append right)) : left = right :=
   Decision.append.inj (same_chosen_decision evidence first later atFirst atLater)
 
+/-- Control entries do not change the application indices of a chosen prefix. -/
+theorem application_preserves_prefix {first later : List Decision}
+    (chosen : first <+: later) : application first <+: application later := by
+  obtain ⟨suffix, rfl⟩ := chosen
+  exact ⟨application suffix, by simp [application]⟩
+
+/-- An index in a held suffix cannot be removed by an admitted trim. It still
+names the original append after the successor installs the exact sealed base
+and confirms a later decision prefix. The live hold comes from the selected
+retention state. -/
+theorem held_record_survives_trim_and_transfer
+    {source : PrefixAgreement.Ledger SourceVoter Decision}
+    {destination : PrefixAgreement.Ledger DestinationVoter Decision}
+    (oldVoters : Evidence source) (newVoters : Evidence destination)
+    (transfer : Transfer source destination) (first : Seal source) (later : Seal destination)
+    (beforeSeal : first.decisions.length ≤ transfer.finalSource.decisions.length)
+    (afterInstall : transfer.installedBase.decisions.length ≤ later.decisions.length)
+    {oldFloor newFloor checkpoint start through lsn : Nat}
+    {live : List (Nat × Nat)} {record : Append}
+    (safe : trimPrefixSafe oldFloor newFloor checkpoint live)
+    (held : (start, through) ∈ live) (atFloor : oldFloor ≤ start)
+    (inHold : start ≤ lsn ∧ lsn < through)
+    (original : (application first.decisions)[lsn]? = some record) :
+    newFloor ≤ lsn ∧ (application later.decisions)[lsn]? = some record := by
+  constructor
+  · by_cases retained : newFloor ≤ lsn
+    · exact retained
+    · exact False.elim ((safe lsn (Nat.le_trans atFloor inHold.1) (by omega)).2
+        (start, through) held inHold)
+  · have preserved := application_preserves_prefix
+      (transfer_extends_chosen_history oldVoters newVoters transfer first later beforeSeal afterInstall)
+    obtain ⟨suffix, eq⟩ := preserved
+    rw [← eq, List.getElem?_append_left (List.getElem?_eq_some_iff.mp original).1, original]
+
 theorem empty_trim_returns_zero (history : List Decision) (floor : Nat) :
     trimCredit history floor floor = ⟨0, 0⟩ := by
   simp [trimCredit]
 
 #print axioms same_chosen_append
 #print axioms same_append_after_transfer
+#print axioms application_preserves_prefix
+#print axioms held_record_survives_trim_and_transfer
 
 end Logkeeper.Protocol

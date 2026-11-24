@@ -1,4 +1,7 @@
-use crate::production::{cursor_offset, replay_record_charge, retained_indices};
+use crate::production::{
+    ReplayCut, ReplayRecord, ReplayStep, cursor_offset, replay_cursor, replay_record_charge,
+    retained_indices,
+};
 use vstd::prelude::*;
 
 verus! {
@@ -44,6 +47,31 @@ pub fn replay_head_and_page_charge_the_exact_successor(
         && record_cut <= through && byte_start as int + bytes == byte_end,
 {
     replay_record_charge(from, record_cut, through, byte_start, byte_end)
+}
+
+
+pub(super) fn exhausted_replay_has_the_original_terminal_cut(
+    from: ReplayCut, through: ReplayCut,
+) -> (result: ReplayStep<()>)
+    ensures
+        (result is Complete) == (from.0 == through.0 && from.1@ == through.1@),
+        (result is Invalid) == (from.0 != through.0 || from.1@ != through.1@),
+{
+    replay_cursor(from, through, 0).step(None)
+}
+
+pub(super) fn bounded_replay_emits_original_record<T>(
+    from: ReplayCut, through: ReplayCut, remaining: u64, record: ReplayRecord<T>,
+) -> (result: ReplayStep<T>)
+    ensures
+        result matches ReplayStep::Emit(original, charge) ==>
+            original == record.original
+            && from.0 as int + 1 == record.cut.0 && record.cut.0 <= through.0
+            && (record.cut.0 == through.0 ==> record.cut.1@ == through.1@)
+            && record.start as int + charge == record.end && charge <= remaining,
+        !(result is Complete) && !(result is PageFull),
+{
+    replay_cursor(from, through, remaining).step(Some(record))
 }
 
 }

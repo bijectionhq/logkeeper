@@ -14,9 +14,9 @@ LEAN = os.environ.get("LEAN_BIN", "lean")
 LAWS = ("PublishedBeforeTrim", "ReplayProtected", "RecoveryBound", "RetainedBound")
 
 
-def check(name, invariants, *, mutation="none", expected=None, bound=5):
+def check(name, invariants, *, mutation="none", expected=None, bound=5, spec="Spec"):
     constants = {"Mutation": f'"{mutation}"', "MaxLsn": bound, "ReplayBudget": 2, "RetainedBudget": 3}
-    check_tla(ROOT, "Retention", name, "Spec", constants,
+    check_tla(ROOT, "Retention", name, spec, constants,
               tuple(("INVARIANT", law) for law in invariants), expected=expected)
 
 
@@ -79,6 +79,17 @@ def main():
         check(f"baseline-{bound}", LAWS, bound=bound)
     for law in ("NeverPausedByHold", "NeverReclaimsAfterClose"):
         check(f"witness-{law}", (law,), expected=law)
+    replay_laws = ("ReplayContiguous", "ReplayOriginal", "ReplayExactEnd")
+    for mutation, law in (
+        ("skip_record", "ReplayContiguous"),
+        ("foreign_terminal", "ReplayOriginal"),
+        ("early_end", "ReplayExactEnd"),
+    ):
+        check(f"replay-control-{mutation}", (law,), mutation=mutation, expected=law, spec="ReplaySpec")
+    for bound in (5, 8):
+        check(f"replay-baseline-{bound}", (*LAWS, *replay_laws), bound=bound, spec="ReplaySpec")
+    witness = "NeverCompletesWhileHeadAdvances"
+    check("replay-witness-advancing-head", (witness,), expected=witness, spec="ReplaySpec")
     check_lean()
 
 
