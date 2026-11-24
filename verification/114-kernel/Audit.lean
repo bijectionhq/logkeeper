@@ -1,0 +1,43 @@
+import Footprint
+
+open Logkeeper.DecisionKernel
+
+#print axioms step_preserves_inv
+#print axioms trace_preserves_history
+#print axioms append_uses_current_writer
+#print axioms cached_mutation_returns_original
+#print axioms barrier_holds_exact_cut
+#print axioms a_cached_barrier_refuses
+#print axioms a_refused_barrier_leaves_no_receipt
+#print axioms trim_respects_protected_range
+#print axioms step_preserves_budget
+#print axioms step_preserves_object_separation
+#print axioms trace_preserves_fence
+#print axioms lease_renewals_preserve_later_end
+#print axioms disposal_leaves_no_custody
+#print axioms expiry_disposal_cannot_race_a_bounded_worker
+#print axioms rotation_requires_exact_preparation
+#print axioms erasure_commit_is_atomic
+#print axioms erasure_closes_every_old_root
+#print axioms erased_recovery_readability_requires_image_evidence
+#print axioms effect_refines
+#print axioms step_refines
+#print axioms trace_refines
+#print axioms enrolled_holder_is_preserved
+#print axioms protect_step_is_range
+#print axioms deletion_preserves_reachable_states
+#print axioms trimmed_records_are_unreachable
+#print axioms settled_root_is_unreachable
+#print axioms settlement_requires_closed_root_and_exact_evidence
+#print axioms fence_requires_complete_unreferenced_name
+#print axioms unleased_hold_still_pins_record
+#print axioms reachable_funding
+#print axioms fence_is_not_graph_determined
+#print axioms original_step_keeps_window_and_fences
+#print axioms original_trace_keeps_window_and_fences
+#print axioms original_five_cannot_install_a_fence
+#print axioms reachable_refined_funding
+#print axioms original_five_cannot_fund_a_successor
+#print axioms disposal_success_requires_dispose
+#print axioms read_renewal_requires_open_basis
+#print axioms trim_drops_only_unreachable_record_references
