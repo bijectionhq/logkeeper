@@ -8,6 +8,7 @@ mod state;
 mod sweep;
 
 mod wal;
+mod wal_layout;
 
 pub use rules::Limits;
 pub use sweep::{Sweep, SweepError, sweep_idle};

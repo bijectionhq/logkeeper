@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 
 from mappings import ENUMS, SHAPES
+from stream_wal import generated_publication
 from translate import Emitter, Parser, Unsupported, declarations, postcondition
 
 
@@ -73,6 +74,7 @@ def generate(replacements=None):
             except Unsupported as error:
                 raise Unsupported(f"{path}:{spec.line}: {spec.name}: {error}") from error
         out.append(f"end {area}\n")
+    out.append(generated_publication(lambda path: source(path, replacements)))
     out.append("end\nend Logkeeper.Generated\n")
     return "\n".join(out)
 
@@ -136,6 +138,9 @@ def audit_module():
         proof = f"Logkeeper.Generated.{area}.link_{name}"
         generated = f"Logkeeper.Generated.{area}.{name}"
         lines.append(f"run_cmd checkLink ``{proof} ``{generated} ``{reference}")
+    lines.append("run_cmd checkLink ``Logkeeper.Generated.stream_wal.link_publication "
+                 "``Logkeeper.Generated.stream_wal.publication ``Logkeeper.StreamWAL.PublicationOrder")
+    count += 1
     return "\n".join(lines) + "\n", count
 
 
@@ -188,7 +193,9 @@ def check_controls(lake, package, baseline, equivalences):
     controls = json.loads((LINK / "controls.json").read_text())
     for control in controls:
         path = control["file"]
-        mutated = replace_once((ROOT / path).read_text(), control["find"], control["replace"], control["name"])
+        mutated = (ROOT / path).read_text()
+        for edit in control.get("edits", [control]):
+            mutated = replace_once(mutated, edit["find"], edit["replace"], control["name"])
         if path.startswith("verification/lean/"):
             target = package / Path(path).relative_to("verification/lean")
             target.write_text(mutated)

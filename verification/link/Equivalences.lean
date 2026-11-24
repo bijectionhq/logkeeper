@@ -888,6 +888,24 @@ theorem link_live {P : Type} (k : Keeper P) (created : k.created = true) :
     live k.deleted ↔ k.live := by
   simp [live, Keeper.live, created]
 
+theorem link_seal_matches (sameOwner : Bool) (stored requested : Nat) :
+    seal_matches sameOwner stored requested ↔ StreamIO.SealMatches sameOwner stored requested :=
+  Iff.rfl
+
+theorem link_valid_epoch_run (epoch promised first last next tail : Nat) :
+    valid_epoch_run epoch promised first last next tail ↔
+      StreamIO.EpochRunValid epoch promised first last next tail := by
+  unfold valid_epoch_run StreamIO.EpochRunValid
+  omega
+
+theorem link_record_charge (len : Nat) (within : len < 2 ^ 64) :
+    record_charge len = StreamIO.RecordCharge len := by
+  unfold record_charge StreamIO.RecordCharge
+  split
+  · omega
+  · rw [clipUnsigned_nat 64 len within]
+    omega
+
 -- Model epoch zero is the initial sentinel. Real epochs, including wire epoch
 -- zero, are shifted by one in the model.
 theorem link_may_seal {P : Type} (k : Keeper P) (promise : Option Nat)
@@ -970,6 +988,38 @@ theorem link_install_ensemble {T : Type} [Nonempty T] (to : T) :
   simp [install_ensemble, StreamReplacement.installEnsemble]
 
 end stream_keeper
+
+namespace stream_wal
+
+open StreamWAL
+
+theorem link_publication : PublicationOrder publication := by decide
+
+theorem link_frame_body_fits (remaining len max : Nat) :
+    frame_body_fits remaining len max ↔ FrameBodyFits remaining len max := by
+  unfold frame_body_fits FrameBodyFits
+  omega
+
+theorem link_checksum_matches (expected actual : Nat) :
+    checksum_matches expected actual ↔ ChecksumMatches expected actual := Iff.rfl
+
+theorem link_extent_fits (seq next offset len max size : Nat) :
+    extent_fits seq next offset len max size ↔ ExtentFits seq next offset len max size := by
+  unfold extent_fits ExtentFits
+  omega
+
+theorem link_place_extent (offset len : Nat) :
+    place_extent offset len = PlaceExtent offset len := by
+  have same : ((len : Int) ≤ 4294967295 ∧ (offset : Int) + (len : Int) ≤ 18446744073709551615) ↔
+      (len ≤ 4294967295 ∧ offset + len ≤ 18446744073709551615) := by omega
+  by_cases fits : len ≤ 4294967295 ∧ offset + len ≤ 18446744073709551615
+  · simp only [place_extent, PlaceExtent, ite_eq_left fits, ite_eq_left (same.mpr fits)]
+    have lenBound : len < 2 ^ 32 := by omega
+    have endBound : offset + len < 2 ^ 64 := by omega
+    rw [clipUnsigned_nat 32 len lenBound, ← Int.natCast_add, clipUnsigned_nat 64 _ endBound]
+  · simp [place_extent, PlaceExtent, fits, mt same.mp fits]
+
+end stream_wal
 
 namespace stream_writer
 

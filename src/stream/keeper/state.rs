@@ -3,7 +3,10 @@ use std::{collections::VecDeque, fs::File, io, path::PathBuf, sync::Arc};
 use bytes::Bytes;
 use tokio::sync::watch;
 
-use super::rules::{self, Decision, Limits};
+use super::{
+    rules::{self, Decision, Limits},
+    wal_layout::checksum_matches,
+};
 use crate::stream::{
     codec::{PAGE_BYTES, invalid},
     wire::{self, *},
@@ -73,7 +76,7 @@ impl Payload {
             } => {
                 let mut bytes = vec![0; *len as usize];
                 read_at(reader.file(extent)?, &mut bytes, *offset)?;
-                if crc32fast::hash(&bytes) != *crc {
+                if !checksum_matches(*crc, crc32fast::hash(&bytes)) {
                     return Err(invalid("stream extent checksum mismatch"));
                 }
                 Ok(Bytes::from(bytes))
@@ -295,7 +298,7 @@ impl Stream {
             + staging
                 .records
                 .range(index(first).min(end_index)..end_index)
-                .map(|record| record.len().max(1) as u64)
+                .map(|record| rules::record_charge(record.len()))
                 .sum::<u64>()
     }
 
@@ -308,7 +311,7 @@ impl Stream {
         let tail = offset(tail);
         self.records
             .range(offset(first).min(tail)..tail)
-            .map(|record| record.len().max(1) as u64)
+            .map(|record| rules::record_charge(record.len()))
             .sum()
     }
 
@@ -318,7 +321,7 @@ impl Stream {
         }
         let count = (floor.0 - self.view.floor.0).min(self.records.len() as u64) as usize;
         for record in self.records.drain(..count) {
-            self.bytes -= record.len().max(1) as u64;
+            self.bytes -= rules::record_charge(record.len());
         }
         let count = self.view.runs.partition_point(|run| run.last < floor);
         self.view.runs.drain(..count);
@@ -331,7 +334,7 @@ impl Stream {
     fn truncate(&mut self, from: Lsn) {
         let keep = (from.0 - self.view.floor.0).min(self.records.len() as u64) as usize;
         for record in self.records.drain(keep..) {
-            self.bytes -= record.len().max(1) as u64;
+            self.bytes -= rules::record_charge(record.len());
         }
         let keep = self.view.runs.partition_point(|run| run.first < from);
         self.view.runs.truncate(keep);
@@ -351,7 +354,7 @@ impl Stream {
                 last: lsn,
             }),
         }
-        self.bytes += record.len().max(1) as u64;
+        self.bytes += rules::record_charge(record.len());
         self.records.push_back(record);
         self.view.tail = lsn;
     }

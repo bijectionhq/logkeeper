@@ -14,6 +14,7 @@ use super::{
     checkpoint::{Checkpoint, Snapshot},
     durability::{sync_directory, sync_file},
     state::{ExtentReader, Stream},
+    wal_layout::{checksum_matches, frame_body_fits},
 };
 use crate::stream::{
     codec::{self, MAX_FRAME_BYTES, invalid},
@@ -117,14 +118,14 @@ pub(super) fn read_frame(
     let mut header = [0; 8];
     reader.read_exact(&mut header)?;
     let mut header = &header[..];
-    let len = header.get_u32() as usize;
+    let len = header.get_u32();
     let crc = header.get_u32();
-    if len > max || len as u64 > remaining - 8 {
+    if !frame_body_fits(remaining, len, max) {
         return Ok(None);
     }
-    let mut bytes = vec![0; len];
+    let mut bytes = vec![0; len as usize];
     reader.read_exact(&mut bytes)?;
-    Ok((crc32fast::hash(&bytes) == crc).then(|| Bytes::from(bytes)))
+    Ok(checksum_matches(crc, crc32fast::hash(&bytes)).then(|| Bytes::from(bytes)))
 }
 
 pub(super) fn atomic_file(

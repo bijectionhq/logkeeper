@@ -13,6 +13,20 @@ variable {Stream Image : Type} [DecidableEq Stream]
 
 abbrev Entry (Stream Image : Type) := Stream × Image
 
+def FrameBodyFits (remaining length limit : Nat) : Prop :=
+  8 + length ≤ remaining ∧ length ≤ limit
+
+def ChecksumMatches (expected actual : Nat) : Prop :=
+  expected = actual
+
+def ExtentFits (sequence boundary offset length limit size : Nat) : Prop :=
+  sequence ≤ boundary ∧ length ≤ limit ∧ offset + length ≤ size
+
+def PlaceExtent (offset length : Nat) : Option (Nat × Nat) :=
+  if length ≤ 4294967295 ∧ offset + length ≤ 18446744073709551615 then
+    some (length, offset + length)
+  else none
+
 inductive Frame (Stream Image : Type) where
   | start (stream : Stream)
   | middle (stream : Stream)
@@ -182,6 +196,151 @@ theorem background_checkpoint_witness :
     .next (.next rp (.append [(true, 4)])) (.retire rfl)
   exact ⟨copying, published, retired, rc, rp, rr, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-- A file sync persists contents. The directory sync persists its name. A crash
+    after rename and before the directory sync may select either complete index. -/
+structure Publication where
+  segmentSynced : Bool := false
+  segmentNamed : Bool := false
+  packSynced : Bool := false
+  packNamed : Bool := false
+  indexSynced : Bool := false
+  indexRenamed : Bool := false
+  indexNamed : Bool := false
+  retired : Bool := false
+
+inductive PublishStep : Publication → Publication → Prop
+  | syncSegmentFile {p} : PublishStep p { p with segmentSynced := true }
+  | nameSegment {p} : p.segmentSynced = true → PublishStep p { p with segmentNamed := true }
+  | syncPackFile {p} : p.segmentNamed = true → PublishStep p { p with packSynced := true }
+  | syncPackDirectory {p} : p.packSynced = true → PublishStep p { p with packNamed := true }
+  | syncIndexFile {p} : p.packNamed = true → PublishStep p { p with indexSynced := true }
+  | renameIndex {p} : p.indexSynced = true → PublishStep p { p with indexRenamed := true }
+  | syncIndexDirectory {p} : p.indexRenamed = true → PublishStep p { p with indexNamed := true }
+  | retireFiles {p} : p.indexNamed = true → PublishStep p { p with retired := true }
+
+inductive PublicationReached : Publication → Prop
+  | initial : PublicationReached {}
+  | step {p q} : PublicationReached p → PublishStep p q → PublicationReached q
+
+structure Ordered (p : Publication) : Prop where
+  segmentVisible : p.segmentNamed = true → p.segmentSynced = true
+  packed : p.packSynced = true → p.segmentNamed = true
+  packVisible : p.packNamed = true → p.packSynced = true
+  indexed : p.indexSynced = true → p.packNamed = true
+  renamed : p.indexRenamed = true → p.indexSynced = true
+  indexVisible : p.indexNamed = true → p.indexRenamed = true
+  retired : p.retired = true → p.indexNamed = true
+
+theorem publish_step_ordered {p q : Publication} (o : Ordered p) (step : PublishStep p q) :
+    Ordered q := by
+  obtain ⟨segmentVisible, packed, packVisible, indexed, renamed, indexVisible, retired⟩ := o
+  cases step with
+  | syncSegmentFile => exact ⟨fun _ => rfl, packed, packVisible, indexed, renamed, indexVisible, retired⟩
+  | nameSegment h => exact ⟨fun _ => h, fun _ => rfl, packVisible, indexed, renamed, indexVisible, retired⟩
+  | syncPackFile h => exact ⟨segmentVisible, fun _ => h, fun _ => rfl, indexed, renamed, indexVisible, retired⟩
+  | syncPackDirectory h => exact ⟨segmentVisible, packed, fun _ => h, fun _ => rfl, renamed, indexVisible, retired⟩
+  | syncIndexFile h => exact ⟨segmentVisible, packed, packVisible, fun _ => h, fun _ => rfl, indexVisible, retired⟩
+  | renameIndex h => exact ⟨segmentVisible, packed, packVisible, indexed, fun _ => h, fun _ => rfl, retired⟩
+  | syncIndexDirectory h => exact ⟨segmentVisible, packed, packVisible, indexed, renamed, fun _ => h, fun _ => rfl⟩
+  | retireFiles h => exact ⟨segmentVisible, packed, packVisible, indexed, renamed, indexVisible, fun _ => h⟩
+
+theorem publication_ordered {p : Publication} (reach : PublicationReached p) : Ordered p := by
+  induction reach with
+  | initial => exact ⟨nofun, nofun, nofun, nofun, nofun, nofun, nofun⟩
+  | step _ step ih => exact publish_step_ordered ih step
+
+inductive PublishEvent where
+  | syncSegmentFile | nameSegment | syncPackFile | syncPackDirectory
+  | syncIndexFile | renameIndex | syncIndexDirectory | retireFiles
+
+def publishEvent (p : Publication) : PublishEvent → Option Publication
+  | .syncSegmentFile => some { p with segmentSynced := true }
+  | .nameSegment => if p.segmentSynced then some { p with segmentNamed := true } else none
+  | .syncPackFile => if p.segmentNamed then some { p with packSynced := true } else none
+  | .syncPackDirectory => if p.packSynced then some { p with packNamed := true } else none
+  | .syncIndexFile => if p.packNamed then some { p with indexSynced := true } else none
+  | .renameIndex => if p.indexSynced then some { p with indexRenamed := true } else none
+  | .syncIndexDirectory => if p.indexRenamed then some { p with indexNamed := true } else none
+  | .retireFiles => if p.indexNamed then some { p with retired := true } else none
+
+theorem publish_event_step {p q : Publication} {event : PublishEvent}
+    (accepted : publishEvent p event = some q) : PublishStep p q := by
+  cases event <;> simp only [publishEvent] at accepted
+  · cases accepted; exact .syncSegmentFile
+  all_goals split at accepted <;> cases accepted <;> constructor <;> assumption
+
+def PublicationOrder (events : List PublishEvent) : Prop :=
+  ((events.foldlM publishEvent ({} : Publication)).map (·.retired)) = some true
+
+instance (events : List PublishEvent) : Decidable (PublicationOrder events) :=
+  inferInstanceAs (Decidable (_ = some true))
+
+theorem execute_publication {p q : Publication} (start : PublicationReached p)
+    (events : List PublishEvent) (run : events.foldlM publishEvent p = some q) :
+    PublicationReached q := by
+  induction events generalizing p with
+  | nil => cases run; exact start
+  | cons event rest ih =>
+    simp only [List.foldlM_cons] at run
+    cases performed : publishEvent p event with
+    | none => simp [performed] at run
+    | some next =>
+      exact ih (.step start (publish_event_step performed)) (by simpa [performed] using run)
+
+theorem publication_prefix_reachable {done later : List PublishEvent}
+    (ordered : PublicationOrder (done ++ later)) :
+    ∃ p, done.foldlM publishEvent ({} : Publication) = some p ∧ PublicationReached p := by
+  cases atPrefix : done.foldlM publishEvent ({} : Publication) with
+  | none => simp [PublicationOrder, List.foldlM_append, atPrefix] at ordered
+  | some p => exact ⟨p, rfl, execute_publication .initial done atPrefix⟩
+
+/-- The storage interface permits either name at the unsynced rename boundary.
+    Old files may be missing after retirement. -/
+def CrashChoice (p : Publication) (newIndex : Bool) : Prop :=
+  if newIndex then p.indexRenamed = true else p.indexNamed = false
+
+def durableRotation (base : Stream → Image) (old newer : List (Entry Stream Image))
+    (p : Publication) (newIndex : Bool) : Rotation Stream Image :=
+  { oldOnDisk := !p.retired
+    packDurable := p.packNamed
+    index := if newIndex then some (boundary base old) else none
+    newer }
+
+theorem crash_recovers_across_index_rename {p : Publication} (reach : PublicationReached p)
+    {newIndex : Bool} (choice : CrashChoice p newIndex)
+    (base : Stream → Image) (old newer : List (Entry Stream Image)) (stream : Stream) :
+    readBack base old (durableRotation base old newer p newIndex) stream =
+      some (replay stream (base stream) (old ++ newer)) := by
+  have ordered := publication_ordered reach
+  have appended : replay stream (base stream) (old ++ newer) =
+      replay stream (boundary base old stream) newer := by
+    simp [replay, boundary, List.foldl_append]
+  cases newIndex
+  · have named : p.indexNamed = false := choice
+    have kept : p.retired = false := by
+      cases retired : p.retired
+      · rfl
+      · have impossible := ordered.retired retired
+        simp [named] at impossible
+    simp [readBack, durableRotation, kept, appended]
+  · have renamed : p.indexRenamed = true := choice
+    have pack : p.packNamed = true := ordered.indexed (ordered.renamed renamed)
+    simp [readBack, durableRotation, pack, appended]
+
+theorem rename_crash_witness :
+    ∃ p : Publication, PublicationReached p ∧ CrashChoice p false ∧ CrashChoice p true := by
+  let segment : Publication := { segmentSynced := true }
+  let openSegment := { segment with segmentNamed := true }
+  let packed := { openSegment with packSynced := true }
+  let named := { packed with packNamed := true }
+  let indexed := { named with indexSynced := true }
+  let renamed := { indexed with indexRenamed := true }
+  have step0 : PublicationReached openSegment := .step (.step .initial .syncSegmentFile) (.nameSegment rfl)
+  have step1 : PublicationReached packed := .step step0 (.syncPackFile rfl)
+  have step2 : PublicationReached named := .step step1 (.syncPackDirectory rfl)
+  have step3 : PublicationReached indexed := .step step2 (.syncIndexFile rfl)
+  exact ⟨renamed, .step step3 (.renameIndex rfl), rfl, rfl⟩
+
 #print axioms torn_tail_keeps_complete_entries
 #print axioms torn_closed_segment_fails
 #print axioms incomplete_entry_is_discarded
@@ -191,5 +350,10 @@ theorem background_checkpoint_witness :
 #print axioms next_sound
 #print axioms reopen_recovers_each_stream
 #print axioms background_checkpoint_witness
+#print axioms publish_step_ordered
+#print axioms execute_publication
+#print axioms publication_prefix_reachable
+#print axioms crash_recovers_across_index_rename
+#print axioms rename_crash_witness
 
 end Logkeeper.StreamWAL

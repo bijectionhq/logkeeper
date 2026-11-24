@@ -55,6 +55,19 @@ def controls():
         "another sweep plan re-elected the same epoch", 0,
     )
     yield (
+        "expect-staged-tail-in-sweep",
+        [edit("src/stream/keeper/sweep.rs", "        let tail = if complete {",
+              "        let tail = if complete || !complete {")],
+        "stream::keeper::tests::sweeper_transfers_multiple_pages_across_successive_replacements",
+        "sweep rejected its incomplete Sync reply", 0,
+    )
+    yield (
+        "count-stale-roster-head",
+        [edit(WRITER + "head.rs", "                && view.ensemble == stream.ensemble\n", "")],
+        "stream::keeper::tests::sweeper_transfers_multiple_pages_across_successive_replacements",
+        "stale roster supplied a fresh head", 0,
+    )
+    yield (
         "send-unassigned-retry",
         [edit(WRITER + "append.rs", "                    let retained =\n",
               "                    if keeper.0 != 0 {\n"
@@ -66,7 +79,7 @@ def controls():
     )
     yield (
         "ignore-seal-proposal",
-        [edit(RULES, "current == epoch && owner == view.identity && id == proposal",
+        [edit(RULES, "seal_matches(current == epoch && owner == view.identity, *id, *proposal)",
               "current == epoch && owner == view.identity")],
         "stream::keeper::tests::a_checkpoint_retains_the_seal_proposal",
         "reopened keeper accepted a different proposal", 0,

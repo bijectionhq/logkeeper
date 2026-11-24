@@ -15,6 +15,7 @@ use super::{
     durability::{sync_directory, sync_file},
     state::{Extent, ExtentReader, Payload, Record, Staging, Stream},
     wal::{Decoder, SEGMENT_BYTES, atomic_file, put_bytes, put_count, read_frame, sequence},
+    wal_layout::{extent_fits, place_extent},
 };
 use crate::stream::{
     codec::{self, MAX_FRAME_BYTES, invalid},
@@ -139,6 +140,8 @@ impl Pack {
                 location
             } else {
                 let payload = record.read(&mut self.reader)?;
+                let (len, end) = place_extent(self.offset, payload.len())
+                    .ok_or_else(|| invalid("keeper pack extent is too large"))?;
                 if self.output.is_none() {
                     self.output = Some(BufWriter::new(
                         File::options()
@@ -154,10 +157,10 @@ impl Pack {
                 let location = Location {
                     seq: self.extent.sequence,
                     offset: self.offset,
-                    len: payload.len() as u32,
+                    len,
                     crc: crc32fast::hash(&payload),
                 };
-                self.offset += u64::from(location.len);
+                self.offset = end;
                 self.moved.push((record.clone(), location));
                 location
             };
@@ -453,12 +456,7 @@ impl PackReader<'_> {
                         ))
                     }
                 };
-                if seq > self.next
-                    || len as usize > MAX_FRAME_BYTES
-                    || offset
-                        .checked_add(u64::from(len))
-                        .is_none_or(|end| end > *size)
-                {
+                if !extent_fits(seq, self.next, offset, len, MAX_FRAME_BYTES, *size) {
                     return Err(invalid("invalid extent reference in keeper index"));
                 }
                 self.live.insert(seq);

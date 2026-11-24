@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 27,
+  "min_verified_functions": 30,
   "controls": {
     "reuse-deleted-stream": {
       "defect": "Create passes a tombstone.",
@@ -464,6 +464,114 @@
         }
       ],
       "min_verified_functions": 26
+    },
+    "equal-epoch-retries-another-proposal": {
+      "defect": "equal epoch retries another proposal",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    same_owner && stored == requested\n",
+          "replace": "    same_owner && stored <= requested\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "seal_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 29
+    },
+    "allow-epoch-run-gaps": {
+      "defect": "allow epoch run gaps",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    epoch <= promised && first == next && first <= last && last <= tail",
+          "replace": "    epoch <= promised && first <= last && last <= tail"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "valid_epoch_run",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 29
+    },
+    "allow-epoch-run-above-promise": {
+      "defect": "allow epoch run above promise",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    epoch <= promised && first == next && first <= last && last <= tail",
+          "replace": "    first == next && first <= last && last <= tail"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "valid_epoch_run",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 29
+    },
+    "allow-epoch-run-to-go-backwards": {
+      "defect": "allow epoch run to go backwards",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    epoch <= promised && first == next && first <= last && last <= tail",
+          "replace": "    epoch <= promised && first == next && last <= tail"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "valid_epoch_run",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 29
+    },
+    "allow-epoch-run-past-tail": {
+      "defect": "allow epoch run past tail",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    epoch <= promised && first == next && first <= last && last <= tail",
+          "replace": "    epoch <= promised && first == next && first <= last"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "valid_epoch_run",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 29
+    },
+    "empty-records-exempt-from-quota": {
+      "defect": "empty records exempt from quota",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    len.max(1) as u64",
+          "replace": "    len as u64"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "record_charge",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 29
     }
   }
 }

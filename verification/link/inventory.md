@@ -321,6 +321,9 @@ the module named in each Verus area's README.
 
 | Rust source | Declaration | Lean counterpart | Coverage |
 |---|---|---|---|
+| `src/stream/keeper/rules.rs` | `seal_matches` | `Logkeeper.StreamIO.SealMatches` | Equivalence |
+| `src/stream/keeper/rules.rs` | `valid_epoch_run` | `Logkeeper.StreamIO.EpochRunValid` | Equivalence |
+| `src/stream/keeper/rules.rs` | `record_charge` | `Logkeeper.StreamIO.RecordCharge` | Equivalence |
 | `src/stream/keeper/rules.rs` | `live` | `Logkeeper.StreamJournal.Keeper.live` | Equivalence |
 | `src/stream/keeper/rules.rs` | `may_seal` | `Logkeeper.StreamJournal.SealAllowed` | Equivalence |
 | `src/stream/keeper/rules.rs` | `preserves_head` | `Logkeeper.StreamJournal.SameCommitted` | Equivalence |
@@ -366,3 +369,15 @@ the module named in each Verus area's README.
 | `verification/verus/stream_writer/laws.rs` | `latest_synced_wins_even_if_shorter` | See `outranks` | Verus checks the executable law. |
 | `verification/verus/stream_writer/laws.rs` | `longer_history_wins_at_equal_synced` | See `outranks` | Verus checks the executable law. |
 | `verification/verus/stream_writer/laws.rs` | `synced_zero_outranks_no_synced_epoch` | See `outranks` | Verus checks the executable law. |
+
+## Stream WAL
+
+| Source | Declaration | Reference | Status |
+| --- | --- | --- | --- |
+| `src/stream/keeper/wal_layout.rs` | `frame_body_fits` | `Logkeeper.StreamWAL.FrameBodyFits` | Equivalence |
+| `src/stream/keeper/wal_layout.rs` | `checksum_matches` | `Logkeeper.StreamWAL.ChecksumMatches` | Equivalence |
+| `src/stream/keeper/wal_layout.rs` | `extent_fits` | `Logkeeper.StreamWAL.ExtentFits` | Equivalence |
+| `src/stream/keeper/wal_layout.rs` | `place_extent` | `Logkeeper.StreamWAL.PlaceExtent` | Equivalence |
+| `verification/verus/stream_wal/laws.rs` | `frame_never_reads_past_segment` | `Logkeeper.StreamWAL.FrameBodyFits` | Arithmetic consequence |
+| `verification/verus/stream_wal/laws.rs` | `extent_stays_in_its_pack` | `Logkeeper.StreamWAL.ExtentFits` | Arithmetic consequence |
+| `verification/verus/stream_wal/laws.rs` | `new_extents_are_adjacent` | `Logkeeper.StreamWAL.PlaceExtent` | Arithmetic consequence |

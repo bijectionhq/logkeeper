@@ -81,11 +81,11 @@ temporary Lean package and leaves the checkout unchanged.
 The generator extracts the single result postcondition from the shipped Verus
 contracts in `src/stream/keeper/rules.rs` and `src/stream/writer/decision.rs`.
 The Verus runner checks those contracts against their executable bodies.
-Twenty-six Lean theorems link the generated definitions to Study 119 and its I/O automaton. The
+Twenty-nine Lean theorems link the generated definitions to Study 119 and its I/O automaton. The
 epoch projection reserves model epoch zero for the initial empty vote.
 The acknowledgement link assumes the three slots project the observed durable
 prefix witnesses, and the keeper retry link covers the model's single-record
-case. Twenty-one stream controls change the Verus postconditions or Lean model
+case. Twenty-four stream controls change the Verus postconditions or Lean model
 definitions and must fail at their named equivalence.
 
 The writer links cover the recovery start and fallback epoch, append head and tail
@@ -98,3 +98,10 @@ The replacement links cover every projected Replace decision and the
 installation's ensemble and learner fields. The ensemble check also links
 the three concrete keeper IDs to nonzero, distinct model IDs. The inventory
 records the remaining projection work for the keeper's native state.
+
+The WAL links cover frame length bounds, CRC equality, extent bounds and checked
+offset placement. The runner also extracts the fallible calls involved in checkpoint
+publication from `new_segment`, `start_rotation`, `Pack::sync`, `Checkpoint::write`
+and `atomic_file`. Lean validates the resulting sequence against the WAL publication
+model. The extractor covers these call sites and the model treats successful file
+and directory syncs and atomic rename as its filesystem boundary.

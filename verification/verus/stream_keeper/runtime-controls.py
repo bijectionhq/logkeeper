@@ -80,7 +80,7 @@ CONTROLS = [
     ),
     (
         "ignore-wal-crc", "keeper/wal.rs",
-        "Ok((crc32fast::hash(&bytes) == crc).then(|| Bytes::from(bytes)))",
+        "Ok(checksum_matches(crc, crc32fast::hash(&bytes)).then(|| Bytes::from(bytes)))",
         "let _ = crc;\n    Ok(Some(Bytes::from(bytes)))",
         KEEPER_TEST + "recovery_cuts_interleaved_torn_tail_and_keeps_the_other_stream", "torn record was replayed",
     ),
@@ -97,7 +97,8 @@ CONTROLS = [
     ),
     (
         "ignore-extent-crc", "keeper/state.rs",
-        "if crc32fast::hash(&bytes) != *crc {", "if crc32fast::hash(&bytes) != *crc && false {",
+        "if !checksum_matches(*crc, crc32fast::hash(&bytes)) {",
+        "if !checksum_matches(*crc, crc32fast::hash(&bytes)) && false {",
         KEEPER_TEST + "corrupt_extent_cannot_supply_a_read", "called `Result::unwrap_err()` on an `Ok` value",
     ),
     (

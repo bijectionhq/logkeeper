@@ -109,6 +109,21 @@ IO_CONTROLS = {
 }
 
 REPLACEMENT_CONTROLS = {
+    "repair-chain-does-not-require-a-new-epoch": (
+        "      StreamIO.Reachable next → old < epoch → SweepPublications s epoch round →",
+        "      StreamIO.Reachable next → True → SweepPublications s epoch round →",
+        "repair_history_carries_original",
+    ),
+    "publish-twice-to-the-first-survivor": (
+        "    (.deliver (.call round.second round.identity (publishSeed epoch round)))",
+        "    (.deliver (.call round.first round.identity (publishSeed epoch round)))",
+        "survivor_installs_transfer_certificate",
+    ),
+    "publish-at-an-epoch-with-other-issues": (
+        "  idle : s.writer.issued epoch = round.winner.history",
+        "  idle : True",
+        "survivor_installs_transfer_certificate",
+    ),
     "promote-before-both-installs": (
         "def mayInstallLearner (first second : Bool) : Bool := first && second",
         "def mayInstallLearner (first second : Bool) : Bool := first || second",
@@ -148,6 +163,46 @@ REPLACEMENT_CONTROLS = {
 }
 
 WAL_CONTROLS = {
+    "name-segment-before-file-sync": (
+        "  | nameSegment {p} : p.segmentSynced = true →",
+        "  | nameSegment {p} : True →",
+        "publish_step_ordered",
+    ),
+    "sync-pack-before-segment-name": (
+        "  | syncPackFile {p} : p.segmentNamed = true →",
+        "  | syncPackFile {p} : True →",
+        "publish_step_ordered",
+    ),
+    "name-pack-before-file-sync": (
+        "  | syncPackDirectory {p} : p.packSynced = true →",
+        "  | syncPackDirectory {p} : True →",
+        "publish_step_ordered",
+    ),
+    "write-index-before-pack-name": (
+        "  | syncIndexFile {p} : p.packNamed = true →",
+        "  | syncIndexFile {p} : True →",
+        "publish_step_ordered",
+    ),
+    "rename-index-before-file-sync": (
+        "  | renameIndex {p} : p.indexSynced = true →",
+        "  | renameIndex {p} : True →",
+        "publish_step_ordered",
+    ),
+    "sync-index-directory-before-rename": (
+        "  | syncIndexDirectory {p} : p.indexRenamed = true →",
+        "  | syncIndexDirectory {p} : True →",
+        "publish_step_ordered",
+    ),
+    "unlink-before-index-directory-sync": (
+        "  | retireFiles {p} : p.indexNamed = true →",
+        "  | retireFiles {p} : True →",
+        "publish_step_ordered",
+    ),
+    "reopen-old-index-after-directory-sync": (
+        "  if newIndex then p.indexRenamed = true else p.indexNamed = false",
+        "  if newIndex then p.indexRenamed = true else True",
+        "crash_recovers_across_index_rename",
+    ),
     "torn-tail-loses-complete-entries": (
         "  | .torn :: _ => if newest then some ([], pending) else none",
         "  | .torn :: _ => none",

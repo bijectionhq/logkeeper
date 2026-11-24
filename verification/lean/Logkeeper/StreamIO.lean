@@ -104,6 +104,14 @@ inductive Request (Payload : Type) where
   | observe
   | delete
 
+def SealMatches (sameOwner : Bool) (stored requested : Nat) : Prop :=
+  sameOwner = true ∧ stored = requested
+
+def EpochRunValid (epoch promised first last next tail : Nat) : Prop :=
+  first = next ∧ first ≤ last ∧ last ≤ tail ∧ epoch ≤ promised
+
+def RecordCharge (len : Nat) : Nat := max 1 len
+
 def SyncHeadAdmitted (current head tail floor : Nat) : Prop :=
   current ≤ head ∧ head ≤ tail ∧ 0 < floor ∧ floor ≤ head + 1
 

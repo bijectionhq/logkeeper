@@ -190,5 +190,153 @@
     "file": "src/stream/keeper/rules.rs",
     "find": "current <= next && next <= tail && 0 < floor",
     "replace": "current <= next && 0 < floor"
+  },
+  {
+    "name": "stream-wal-frame-body-fits",
+    "area": "stream_wal",
+    "theorem": "link_frame_body_fits",
+    "file": "src/stream/keeper/wal_layout.rs",
+    "find": "&& 8 + len as int <= remaining as int",
+    "replace": "&& len as int <= remaining as int"
+  },
+  {
+    "name": "stream-wal-checksum-matches",
+    "area": "stream_wal",
+    "theorem": "link_checksum_matches",
+    "file": "src/stream/keeper/wal_layout.rs",
+    "find": "ensures out == (expected == actual)",
+    "replace": "ensures out == (expected != actual)"
+  },
+  {
+    "name": "stream-wal-extent-fits",
+    "area": "stream_wal",
+    "theorem": "link_extent_fits",
+    "file": "src/stream/keeper/wal_layout.rs",
+    "find": "offset as int + len as int <= size as int)",
+    "replace": "offset as int <= size as int)"
+  },
+  {
+    "name": "stream-wal-place-extent",
+    "area": "stream_wal",
+    "theorem": "link_place_extent",
+    "file": "src/stream/keeper/wal_layout.rs",
+    "find": "Some((len as u32, (offset as int + len as int) as u64))",
+    "replace": "Some((len as u32, offset))"
+  },
+  {
+    "name": "stream-keeper-seal-matches",
+    "file": "src/stream/keeper/rules.rs",
+    "area": "stream_keeper",
+    "theorem": "link_seal_matches",
+    "find": "ensures out == (same_owner && stored == requested)",
+    "replace": "ensures out == same_owner"
+  },
+  {
+    "name": "stream-keeper-valid-epoch-run",
+    "file": "src/stream/keeper/rules.rs",
+    "area": "stream_keeper",
+    "theorem": "link_valid_epoch_run",
+    "find": "ensures out == (epoch <= promised && first == next && first <= last && last <= tail)",
+    "replace": "ensures out == (epoch <= promised && first <= last && last <= tail)"
+  },
+  {
+    "name": "stream-keeper-record-charge",
+    "file": "src/stream/keeper/rules.rs",
+    "area": "stream_keeper",
+    "theorem": "link_record_charge",
+    "find": "if len == 0 { 1 } else { len as u64 }",
+    "replace": "if len == 0 { 0 } else { len as u64 }"
+  },
+  {
+    "name": "stream-wal-name-segment-before-sync",
+    "file": "src/stream/keeper/wal.rs",
+    "area": "stream_wal",
+    "theorem": "link_publication",
+    "edits": [
+      {
+        "find": "    sync_file(&file)?;\n    sync_directory(dir)?;",
+        "replace": "    sync_directory(dir)?;\n    sync_file(&file)?;"
+      }
+    ]
+  },
+  {
+    "name": "stream-wal-name-pack-before-sync",
+    "file": "src/stream/keeper/checkpoint.rs",
+    "area": "stream_wal",
+    "theorem": "link_publication",
+    "edits": [
+      {
+        "find": "            sync_file(file.get_ref())?;\n            // Publish the pack name before the index can refer to it.\n            sync_directory(root)?;",
+        "replace": "            sync_directory(root)?;\n            sync_file(file.get_ref())?;"
+      }
+    ]
+  },
+  {
+    "name": "stream-wal-publish-index-before-naming-pack",
+    "file": "src/stream/keeper/checkpoint.rs",
+    "area": "stream_wal",
+    "theorem": "link_publication",
+    "edits": [
+      {
+        "find": "        pack.sync(root)?;\n",
+        "replace": ""
+      },
+      {
+        "find": "        pack.install();",
+        "replace": "        pack.sync(root)?;\n        pack.install();"
+      }
+    ]
+  },
+  {
+    "name": "stream-wal-rename-index-before-sync",
+    "file": "src/stream/keeper/wal.rs",
+    "area": "stream_wal",
+    "theorem": "link_publication",
+    "edits": [
+      {
+        "find": "    sync_file(file.get_ref())?;\n    drop(file);\n    fs::rename(temporary, path)?;",
+        "replace": "    fs::rename(temporary, path)?;\n    sync_file(file.get_ref())?;\n    drop(file);"
+      }
+    ]
+  },
+  {
+    "name": "stream-wal-sync-index-name-before-rename",
+    "file": "src/stream/keeper/wal.rs",
+    "area": "stream_wal",
+    "theorem": "link_publication",
+    "edits": [
+      {
+        "find": "    fs::rename(temporary, path)?;\n    sync_directory(path.parent().expect(\"file has parent\"))",
+        "replace": "    sync_directory(path.parent().expect(\"file has parent\"))?;\n    fs::rename(temporary, path)?;\n    Ok(())"
+      }
+    ]
+  },
+  {
+    "name": "stream-wal-retire-pack-before-index",
+    "file": "src/stream/keeper/checkpoint.rs",
+    "area": "stream_wal",
+    "theorem": "link_publication",
+    "edits": [
+      {
+        "find": "        pack.sync(root)?;",
+        "replace": "        self.retire_packs(root)?;\n        pack.sync(root)?;"
+      },
+      {
+        "find": "        self.retire_packs(root)\n",
+        "replace": "        Ok(())\n"
+      }
+    ]
+  },
+  {
+    "name": "stream-wal-retire-wal-before-index",
+    "file": "src/stream/keeper/wal.rs",
+    "area": "stream_wal",
+    "theorem": "link_publication",
+    "edits": [
+      {
+        "find": "                    index.write(&root, next, snapshots, rewrite)?;\n                    retire_segments(&segment_dir, next)?;",
+        "replace": "                    retire_segments(&segment_dir, next)?;\n                    index.write(&root, next, snapshots, rewrite)?;"
+      }
+    ]
   }
 ]

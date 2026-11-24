@@ -156,20 +156,26 @@ decisions over Rust's representable integers. [Head cuts](Logkeeper/StreamHead.l
 
 ## Replacement and WAL
 
-The replacement projection follows one permanent disk loss, both survivor repairs, two
+The authority projection follows one permanent disk loss, both survivor repairs, two
 independent installs, and learner promotion. Neither route can form a fresh Seal quorum
-during a split. Once promoted, any further single disk loss leaves two copies of the
-transferred history. The proof composes the ranked recovery and later-seal theorems through
-the transferred quorum certificate. Study 119 and the seeded simulation exercise that
-transfer in their bounded schedules.
+during a split. Once promoted, a further single disk loss leaves two copies of the
+transferred history. In the I/O projection, two successful empty Append deliveries at
+the adopted tail supply the survivor votes. With those durable images preserved across
+installation, they form the next roster's certificate. `RepairHistory` composes any
+number of such transfers with fixed-roster steps. The fresh head proof applies after the
+last transfer and covers the original acknowledged cut. A Rust test transfers 8,193
+records across two successive replacements, appends between them, and checks old and
+current routes.
 [Replacement projection](Logkeeper/StreamReplacement.lean) · [Study 119](../119-stream-journal/README.md)
 
 The WAL projection treats complete decoded entries as stream-local images. It proves
 that a torn newest frame leaves complete entries intact and the continuation marker
 carries only per-stream pending fragments. Recovery uses the old WAL until the
-keeper-wide index is published above durable extent packs. Retirement follows index
-publication. A reachable two-stream run appends during checkpointing and reopens both
-before publication and after retirement.
+keeper-wide index is published above durable extent packs. The link runner projects the
+ordered file sync, rename, directory sync and retirement calls from the rotation code.
+Every prefix of that publication sequence is reachable in Lean. At the rename boundary,
+either index recovers the same image and newer WAL. A reachable two-stream run appends
+during checkpointing and reopens before publication and after retirement.
 [WAL projection](Logkeeper/StreamWAL.lean)
 
 ## Boundaries
@@ -189,10 +195,11 @@ before publication and after retirement.
   position. The automaton takes the capacity outcome and lane completion as
   inputs. Study 119 checks the bounded quota and duplicate cases, and the
   Rust control delays a timed-out request across trim.
-- **Keeper decisions.** Verus and the link runner cover the Sync head bounds and the Replace decision over
-  projected inputs, the valid-ensemble predicate and installation's ensemble and
-  learner fields. Full refinement of `decide` and `apply`, including construction
-  of the payload and capacity facts and projection of native state, remains open.
+- **Keeper decisions.** Verus and the link runner cover proposal equality, per-run
+  bounds, record charge, Sync head bounds, the projected Replace decision, valid
+  ensembles, and installation's ensemble and learner fields. Full refinement of
+  `decide` and `apply` still needs the wire request projection, retained bytes and
+  run lookup, quota accumulation and the native retained and staged transitions.
   [Keeper decisions](../../src/stream/keeper/rules.rs)
 - **Head round projection.** The cut proof consumes the queue-open event, per-keeper
   send and durable-sample events, and the exact keeper view at each sample. Verus and
@@ -211,17 +218,18 @@ before publication and after retirement.
   cut. For Delete the writer broadcasts to three distinct keepers and counts two
   durable tombstone replies. The async projection of the Trim publication wait and
   both operations' reply collection into quorum evidence remains open.
-- **Replacement and authority.** The Lean authority projection assumes one move and
-  a permanently lost identity. The fixed-ensemble I/O automaton still needs a simulation
-  relation that constructs the later execution's imported certificate from actual sweep
-  RPCs. Arbitrary concurrent moves and the contract's full head-round proof across the
-  switch remain open.
+- **Replacement and authority.** The repeatable transfer theorem starts from two
+  projected publication deliveries and preserved survivor states. It assumes that
+  the next roster supplies a reachable automaton state. The raw Seal, Recover, Sync
+  and Replace RPC projections, learner activation in that state, concurrent moves,
+  and a fresh head round that overlaps a switch remain open.
   [Sweeper](../../src/stream/keeper/sweep.rs)
-- **WAL and transport.** Reopen rows show the reopened image equals the durable image for
-  every recorded reopen, and Study 117's bridge covers reply survival. The WAL proof
-  starts at validated framing and models pack and index durability events.
-  CRC collision behavior, extent offsets, renames and directory sync are outside
-  that projection. A `Batch` envelope
+- **WAL and transport.** Reopen rows check the durable image for every recorded reopen.
+  The frame and extent links start from decoded length and offset fields and computed
+  CRC values. They rely on the `crc32fast` implementation and successful filesystem
+  calls obeying the file and directory durability boundary. Full frame serialization,
+  byte-level CRC implementation, and the contents of the file writes are open.
+  A `Batch` envelope
   is transport framing that the keeper splits into single requests before deciding.
 - **Payload bytes.** The replay checks positions and record epochs. The conformance
   history checker compares payload bytes.

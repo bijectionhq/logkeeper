@@ -146,7 +146,8 @@ def verify_lean(shared_wal):
     source = LEAN / "Logkeeper/StreamJournal.lean"
     check_lean_theorems(ROOT, command, source, count=21)
     for model, count in (("StreamIO", 17), ("StreamIOWitness", 2),
-                         ("StreamReplacement", 9), ("StreamWAL", 9)):
+                         ("StreamReplacement", 13), ("StreamWAL", 14),
+                         ("StreamWriter", 11), ("StreamHead", 4)):
         check_lean_theorems(ROOT, command, LEAN / f"Logkeeper/{model}.lean",
                             count=count, case=f"lean-{model}")
 

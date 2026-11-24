@@ -14,6 +14,29 @@ pub(crate) fn may_seal(has_promise: bool, current: u64, epoch: u64, same_identit
     !has_promise || current < epoch || (current == epoch && same_identity)
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (same_owner && stored == requested)
+))]
+pub(super) fn seal_matches(same_owner: bool, stored: u128, requested: u128) -> bool {
+    same_owner && stored == requested
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (epoch <= promised && first == next && first <= last && last <= tail)
+))]
+pub(super) fn valid_epoch_run(
+    epoch: u64, promised: u64, first: u64, last: u64, next: u64, tail: u64,
+) -> bool {
+    epoch <= promised && first == next && first <= last && last <= tail
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if len == 0 { 1 } else { len as u64 }
+))]
+pub(super) fn record_charge(len: usize) -> u64 {
+    len.max(1) as u64
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (from > head || identical)))]
 pub(crate) fn preserves_head(from: u64, head: u64, identical: bool) -> bool {
     from > head || identical
@@ -214,10 +237,6 @@ mod implementation {
             .map(Lsn)
     }
 
-    pub(crate) fn charge(record: &[u8]) -> u64 {
-        record.len().max(1) as u64
-    }
-
     fn capacity(records: &[Bytes], retained: u64, floor: Lsn, limits: &Limits) -> Option<Decision> {
         if records
             .iter()
@@ -229,14 +248,14 @@ mod implementation {
         }
         let bytes = records
             .iter()
-            .fold(retained, |sum, record| sum.saturating_add(charge(record)));
+            .fold(retained, |sum, record| sum.saturating_add(record_charge(record.len())));
         (bytes > limits.stream_quota_bytes).then(|| refuse(Refusal::Full { floor }))
     }
 
     fn valid_runs(epoch: Epoch, from: Lsn, tail: Lsn, runs: &[EpochRun]) -> bool {
         let mut next = from.0;
         for run in runs {
-            if run.epoch > epoch || run.first.0 != next || run.last < run.first || run.last > tail {
+            if !valid_epoch_run(run.epoch.0, epoch.0, run.first.0, run.last.0, next, tail.0) {
                 return false;
             }
             next = run.last.0 + 1;
@@ -314,7 +333,7 @@ mod implementation {
                 }
                 let current = state.promised.as_ref().map_or(0, |(current, ..)| current.0);
                 let identical = state.promised.as_ref().is_some_and(|(current, owner, id)| {
-                    current == epoch && owner == view.identity && id == proposal
+                    seal_matches(current == epoch && owner == view.identity, *id, *proposal)
                 });
                 if !may_seal(state.promised.is_some(), current, epoch.0, identical) {
                     return fenced(state);

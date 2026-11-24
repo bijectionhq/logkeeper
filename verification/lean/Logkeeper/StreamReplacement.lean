@@ -1,4 +1,4 @@
-import Logkeeper.StreamIO
+import Logkeeper.StreamHead
 
 /-! The authority and durable copy projection of a single replacement. The surviving
 identities stay in their slots. The lost identity never votes again. -/
@@ -176,6 +176,71 @@ theorem promoted_cut_survives_any_one_loss {cut seed : History Payload} (adopted
   · exact ⟨.first, .learner, by decide, rfl, rfl, adopted⟩
   · exact ⟨.first, .second, by decide, rfl, rfl, adopted⟩
 
+/-- An empty Append at the adopted tail, which the sweep requires from each survivor
+    after the complete Syncs. -/
+def publishSeed (epoch : Nat) (round : Round Payload) : StreamIO.Request Payload :=
+  .publish epoch round.winner.history.length
+
+def SweepPublished (s : StreamIO.State Payload) (epoch : Nat) (round : Round Payload) :
+    StreamIO.State Payload :=
+  let req := publishSeed epoch round
+  (s.apply round.first round.identity req).apply round.second round.identity req
+
+/-- The two publication acknowledgements are projected from deliveries. The sweep
+    issues no records at its repair epoch, so both synced histories are the adopted seed. -/
+structure SweepPublications (s : StreamIO.State Payload) (epoch : Nat) (round : Round Payload) : Prop where
+  elected : s.writer.round epoch = some round
+  idle : s.writer.issued epoch = round.winner.history
+  first : StreamIO.Next s (.deliver (.call round.first round.identity (publishSeed epoch round)))
+    (s.apply round.first round.identity (publishSeed epoch round))
+  second : StreamIO.Next (s.apply round.first round.identity (publishSeed epoch round))
+    (.deliver (.call round.second round.identity (publishSeed epoch round)))
+    (SweepPublished s epoch round)
+
+private theorem published_seed_vote {s : StreamIO.State Payload} (reached : StreamIO.Reachable s)
+    {epoch : Nat} {round : Round Payload} (elected : s.writer.round epoch = some round)
+    (idle : s.writer.issued epoch = round.winner.history) {k : KeeperId}
+    (rpc : StreamIO.Next s (.deliver (.call k round.identity (publishSeed epoch round)))
+      (s.apply k round.identity (publishSeed epoch round))) :
+    (s.apply k round.identity (publishSeed epoch round) |>.keeper k).durable.votes
+      ⟨epoch, round.winner.history⟩ := by
+  cases rpc with
+  | deliver _ admitted =>
+      have inv := StreamIO.reachable_inv reached
+      have sync : (s.keeper k).synced = epoch := admitted.2.1.2
+      have between := StreamIO.synced_history (inv.reached k) inv.reserved (inv.unelected 0 inv.reserved) sync
+      have adopted : s.writer.seed epoch = round.winner.history := by simp [Writer.seed, elected]
+      rw [adopted, idle] at between
+      have len := Nat.le_antisymm between.2.length_le between.1.length_le
+      have image := StreamIO.take_of_issued between.2
+      rw [len, List.take_length] at image
+      have vote := StreamIO.latest_voted (inv.reached k)
+      rw [StreamIO.latest_eta, sync, image] at vote
+      simpa [StreamIO.State.apply, publishSeed, StreamIO.effect] using vote
+
+/-- Replacing the failed slot keeps the durable survivor images used as signers. -/
+theorem survivor_installs_transfer_certificate {s : StreamIO.State Payload} (reached : StreamIO.Reachable s)
+    {repair : Nat} {round : Round Payload} (publications : SweepPublications s repair round)
+    (after : KeeperId → Keeper Payload)
+    (first : after round.first = (SweepPublished s repair round).keeper round.first)
+    (second : after round.second = (SweepPublished s repair round).keeper round.second) :
+    QuorumAccepted after repair round.winner.history := by
+  have left := published_seed_vote reached publications.elected publications.idle publications.first
+  have right := published_seed_vote (reached.extend publications.first)
+    publications.elected publications.idle publications.second
+  refine ⟨fun k => decide (k = round.first ∨ k = round.second),
+    two_of_three_is_majority _ _ round.distinct, ?_⟩
+  intro k _ answered
+  rcases of_decide_eq_true answered with same | same
+  · subst k
+    refine ⟨_, ?_, List.prefix_rfl⟩
+    rw [first]
+    simpa [SweepPublished, StreamIO.State.apply, round.distinct] using left
+  · subst k
+    refine ⟨_, ?_, List.prefix_rfl⟩
+    rw [second]
+    exact right
+
 /-- A transferred quorum certificate connects the two fixed-ensemble executions. -/
 theorem seal_after_replacement_covers_acknowledged
     {before after : StreamIO.State Payload}
@@ -189,6 +254,71 @@ theorem seal_after_replacement_covers_acknowledged
     cut <+: next.winner.history :=
   (StreamIO.seal_covers_acknowledged beforeReached repairElected repairHigher acknowledged).trans
     (StreamIO.seal_covers_acknowledged afterReached nextElected nextHigher installed)
+
+theorem seal_after_sweep_covers_acknowledged
+    {before after : StreamIO.State Payload}
+    (beforeReached : StreamIO.Reachable before) (afterReached : StreamIO.Reachable after)
+    {old repair epoch : Nat} {cut : History Payload} {moved next : Round Payload}
+    (acknowledged : QuorumAccepted before.keeper old cut)
+    (publication : SweepPublications before repair moved)
+    (repairHigher : old < repair)
+    (first : after.keeper moved.first = (SweepPublished before repair moved).keeper moved.first)
+    (second : after.keeper moved.second = (SweepPublished before repair moved).keeper moved.second)
+    (nextElected : after.writer.round epoch = some next) (nextHigher : repair < epoch) :
+    cut <+: next.winner.history :=
+  seal_after_replacement_covers_acknowledged beforeReached afterReached acknowledged
+    publication.elected repairHigher
+    (survivor_installs_transfer_certificate beforeReached publication after.keeper first second)
+    nextElected nextHigher
+
+/-- The original cut can cross any number of sweep publications. Between those
+    boundaries the fixed-ensemble automaton can process ordinary journal calls. -/
+inductive RepairHistory (original : History Payload) :
+    StreamIO.State Payload → Nat → History Payload → Prop
+  | original {s epoch} : StreamIO.Reachable s →
+      QuorumAccepted s.keeper epoch original → RepairHistory original s epoch original
+  | advance {s next action epoch cut} : RepairHistory original s epoch cut →
+      StreamIO.Next s action next → RepairHistory original next epoch cut
+  | transfer {s next old epoch cut round} : RepairHistory original s old cut →
+      StreamIO.Reachable next → old < epoch → SweepPublications s epoch round →
+      next.keeper round.first = (SweepPublished s epoch round).keeper round.first →
+      next.keeper round.second = (SweepPublished s epoch round).keeper round.second →
+      RepairHistory original next epoch round.winner.history
+
+theorem repair_history_carries_original {original cut : History Payload} {s : StreamIO.State Payload}
+    {epoch : Nat} (trace : RepairHistory original s epoch cut) :
+    StreamIO.Reachable s ∧ QuorumAccepted s.keeper epoch cut ∧ original <+: cut := by
+  induction trace with
+  | original reached accepted => exact ⟨reached, accepted, List.prefix_rfl⟩
+  | advance _ step ih =>
+    obtain ⟨reached, accepted, prefixCut⟩ := ih
+    have preserved := (StreamIO.next_inv (StreamIO.reachable_inv reached) step).2.1
+    exact ⟨reached.extend step, StreamIO.quorum_persists (fun k _ => preserved.votes k) accepted, prefixCut⟩
+  | transfer _ nextReached higher publications first second ih =>
+    obtain ⟨reached, accepted, prefixCut⟩ := ih
+    exact ⟨nextReached, survivor_installs_transfer_certificate reached publications _ first second,
+      prefixCut.trans (StreamIO.seal_covers_acknowledged reached publications.elected higher accepted)⟩
+
+/-- A fresh call in the installed ensemble keeps the original invocation bound
+    after any number of completed transfers. -/
+theorem head_after_repairs (trace : StreamHead.Timeline Payload) {call : Invocation}
+    {original cut : History Payload} {epoch result : Nat}
+    (repaired : RepairHistory original (trace.state call.started) epoch cut)
+    {sampled confirmed : CheckRound} (samples : StreamHead.Samples call sampled)
+    (confirmation : StreamHead.Samples call confirmed)
+    (observes : ∀ k ∈ ensemble, sampled.answered k = true →
+      sampled.view k = check (trace.state (sampled.sampled k) |>.keeper k))
+    (confirms : ∀ k ∈ ensemble, confirmed.answered k = true →
+      confirmed.view k = check (trace.state (confirmed.sampled k) |>.keeper k))
+    (covers : SamplesCovered sampled result)
+    (published : JournalRefinement.Majority ensemble
+      (fun k => confirmed.answered k && decide (result ≤ (confirmed.view k).head))) :
+    original.length ≤ result ∧ ∃ event, call.started ≤ event ∧ event ≤ call.replied ∧
+      StreamHead.AtCut trace sampled.opened result event := by
+  obtain ⟨_, held, includes⟩ := repair_history_carries_original repaired
+  have bound := StreamHead.head_after_publication trace samples confirmation observes confirms
+    covers published ⟨epoch, cut, held, Nat.le_refl _⟩
+  exact ⟨Nat.le_trans includes.length_le bound.1, bound.2⟩
 
 theorem split_then_promote_witness :
     Reachable (.installing true false) ∧
@@ -209,7 +339,11 @@ theorem split_then_promote_witness :
 #print axioms surviving_copy_and_adopted_seed
 #print axioms repaired_survivors_cover
 #print axioms promoted_cut_survives_any_one_loss
+#print axioms survivor_installs_transfer_certificate
 #print axioms seal_after_replacement_covers_acknowledged
+#print axioms seal_after_sweep_covers_acknowledged
+#print axioms repair_history_carries_original
+#print axioms head_after_repairs
 #print axioms split_then_promote_witness
 
 end Logkeeper.StreamReplacement

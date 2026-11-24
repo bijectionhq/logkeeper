@@ -1,0 +1,139 @@
+{
+  "summary": "Verify the shipped frame length, checksum comparison and shared extent layout checks.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 7,
+  "controls": {
+    "ignore-frame-limit": {
+      "defect": "ignore frame limit",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "find": "len as usize <= max && remaining >= 8",
+          "replace": "remaining >= 8"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "function": "frame_body_fits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "ignore-segment-end": {
+      "defect": "ignore segment end",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "find": " && u64::from(len) <= remaining - 8",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "function": "frame_body_fits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "accept-mismatched-crc": {
+      "defect": "accept mismatched crc",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "find": "    expected == actual",
+          "replace": "    expected != actual"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "function": "checksum_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "allow-future-pack": {
+      "defect": "allow future pack",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "find": "    seq <= next && len as usize <= max",
+          "replace": "    len as usize <= max"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "function": "extent_fits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "allow-oversized-extent": {
+      "defect": "allow oversized extent",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "find": " && len as usize <= max",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "function": "extent_fits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "allow-extent-past-pack": {
+      "defect": "allow extent past pack",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "find": " && u64::from(len) <= size - offset",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "function": "extent_fits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    },
+    "overlap-packed-extents": {
+      "defect": "overlap packed extents",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "find": "    Some((len, end))",
+          "replace": "    Some((len, offset))"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_layout.rs",
+          "function": "place_extent",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 6
+    }
+  }
+}

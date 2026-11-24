@@ -193,7 +193,10 @@
       "may_replace": "Logkeeper.StreamReplacement.ReplaceAllowed",
       "decide_replace": "Logkeeper.StreamReplacement.replaceDecision",
       "valid_ensemble_ids": "Logkeeper.StreamReplacement.ValidEnsemble",
-      "install_ensemble": "Logkeeper.StreamReplacement.installEnsemble"
+      "install_ensemble": "Logkeeper.StreamReplacement.installEnsemble",
+      "seal_matches": "Logkeeper.StreamIO.SealMatches",
+      "valid_epoch_run": "Logkeeper.StreamIO.EpochRunValid",
+      "record_charge": "Logkeeper.StreamIO.RecordCharge"
     }
   },
   "stream_writer": {
@@ -209,6 +212,14 @@
       "sample_index": "Logkeeper.StreamHead.SampleIndex",
       "eligible_sample": "Logkeeper.StreamHead.EligibleSample",
       "head_quorum": "Logkeeper.StreamHead.HeadQuorum"
+    }
+  },
+  "stream_wal": {
+    "src/stream/keeper/wal_layout.rs": {
+      "frame_body_fits": "Logkeeper.StreamWAL.FrameBodyFits",
+      "checksum_matches": "Logkeeper.StreamWAL.ChecksumMatches",
+      "extent_fits": "Logkeeper.StreamWAL.ExtentFits",
+      "place_extent": "Logkeeper.StreamWAL.PlaceExtent"
     }
   }
 }
