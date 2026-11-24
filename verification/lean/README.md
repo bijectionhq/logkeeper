@@ -77,3 +77,11 @@ Run `python3 run_ordered_lease_rotation.py` for the theorem and mutation checks.
 for [ordered receipt signatures and repair keys](../verus/receipt_signatures/README.md).
 The package build checks the arbitrary-chain retention theorem, the exact
 signature and repair laws, and their reachability and negative witnesses.
+
+`Logkeeper.Reducer` composes the writer-image, budget, erasure authority,
+object withdrawal, lease, hold and receipt references for a chosen command.
+`Step` separates rejection of the decision coordinates from the application
+of the request at a chosen position. Run `python3 run_reducer_refinement.py`
+for the invariant, projection and reachability proofs and their controls.
+The [ordered reducer area](../verus/ordered_reducer/README.md) records which
+state updates are checked against production and the remaining adapter work.

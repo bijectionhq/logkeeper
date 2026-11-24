@@ -1,0 +1,153 @@
+{
+  "summary": "Composed reducer projections for append commit, funding, vacancy, request admission and recording, and paid object fence installation.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "request",
+    "--verify-module",
+    "retention",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 12,
+  "controls": {
+    "keep_old_append_head": {
+      "defect": "The record and debit commit while the head stays at the previous cut.",
+      "mutate": [
+        {
+          "file": "src/ordered/reducer.rs",
+          "find": "    writer::commit_append(records, head, record, cut);",
+          "replace": "    let prior = *head;\n    writer::commit_append(records, head, record, prior);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/reducer.rs",
+          "function": "finish_append",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "skip_ordinary_spend": {
+      "defect": "A paid ordinary append does not advance the window's spent counter.",
+      "mutate": [
+        {
+          "file": "src/ordered/reducer.rs",
+          "find": "            *spent = debit.end;",
+          "replace": "            *spent = debit.start;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/reducer.rs",
+          "function": "finish_append",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "reuse_old_window_spend": {
+      "defect": "The funded successor window keeps the previous allocation's spend.",
+      "mutate": [
+        {
+          "file": "src/ordered/reducer.rs",
+          "find": "    *spent = 0;\n    Ok(())",
+          "replace": "    Ok(())"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/reducer.rs",
+          "function": "fund_window",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/reducer.rs",
+          "function": "fund_window",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "keep_vacated_grant": {
+      "defect": "Vacancy returns success while keeping the incumbent grant.",
+      "mutate": [
+        {
+          "file": "src/ordered/reducer.rs",
+          "find": "    authority.vacate();\n    Ok(())",
+          "replace": "    Ok(())"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/reducer.rs",
+          "function": "vacate",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "replay_old_barrier": {
+      "defect": "An old barrier can be replayed by request admission.",
+      "mutate": [
+        {
+          "file": "src/ordered/reducer_request.rs",
+          "find": "            reading,\n            &previous.fingerprint,",
+          "replace": "            false,\n            &previous.fingerprint,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/reducer_request.rs",
+          "function": "admit_request",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "omit_receipt_from_expiry": {
+      "defect": "The applied receipt remains in the book without an expiry entry.",
+      "mutate": [
+        {
+          "file": "src/ordered/reducer_request.rs",
+          "find": "        expiry.insert((expires_at, key), ());",
+          "replace": "        let _ = (expiry, expires_at, key);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/reducer_request.rs",
+          "function": "finish_request",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    },
+    "omit_paid_fence": {
+      "defect": "A paid fresh withdrawal succeeds without storing the fence.",
+      "mutate": [
+        {
+          "file": "src/ordered/reducer_retention.rs",
+          "find": "    object_withdrawal::install_fence(fences, name, fence);",
+          "replace": "    let _ = (fences, name, fence);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/reducer_retention.rs",
+          "function": "commit_withdrawal",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/reducer_retention.rs",
+          "function": "commit_withdrawal",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 11
+    }
+  }
+}

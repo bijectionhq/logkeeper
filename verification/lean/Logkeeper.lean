@@ -20,3 +20,4 @@ import Logkeeper.VoterSlotHeader
 import Logkeeper.VoterTransport
 import Logkeeper.CodecDomains
 import Logkeeper.RuntimeGroups
+import Logkeeper.Reducer
