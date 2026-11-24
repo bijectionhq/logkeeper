@@ -17,6 +17,7 @@ mod object_names;
 mod lease_reducer;
 mod object_withdrawal;
 mod receipt;
+mod reducer;
 mod refusal;
 pub mod replication;
 mod replay_bounds;
@@ -1158,14 +1159,17 @@ impl State {
                     request: id,
                     request_fingerprint,
                 };
-                writer::commit_append(&mut self.records, &mut self.head, record, cut);
-                match class {
-                    AppendClass::Data => {
-                        self.spent = debit.end;
-                        self.retained_bytes = debit.retained;
-                    }
-                    AppendClass::Maintenance => self.maintenance_retained = debit.retained,
-                };
+                reducer::finish_append(
+                    &mut self.records,
+                    &mut self.head,
+                    record,
+                    cut,
+                    class,
+                    debit,
+                    &mut self.spent,
+                    &mut self.retained_bytes,
+                    &mut self.maintenance_retained,
+                );
                 Ok(Outcome::Appended(result))
             }
             Command::Barrier => {
@@ -1365,16 +1369,19 @@ impl State {
             }
             Command::FundWindow { window } => {
                 Self::custodian(principal)?;
-                if window.allocation.is_nil()
-                    || window.bytes == 0
-                    || Some(window.serial) != self.window.serial.checked_add(1)
-                {
-                    return Err(Refusal::Invalid);
-                }
-                admission::debit(self.retained_bytes, window.bytes, self.ordinary_capacity())
-                    .ok_or(Refusal::Capacity)?;
-                self.window = window;
-                self.spent = 0;
+                let capacity = self.ordinary_capacity();
+                let previous_serial = self.window.serial;
+                reducer::fund_window(
+                    &mut self.window,
+                    window,
+                    &mut self.spent,
+                    !window.allocation.is_nil(),
+                    previous_serial,
+                    window.serial,
+                    window.bytes,
+                    self.retained_bytes,
+                    capacity,
+                )?;
                 Ok(Outcome::WindowFunded(window))
             }
             Command::Protect { grant, through } => {
@@ -1432,9 +1439,14 @@ impl State {
                 Ok(Outcome::Protected(hold))
             }
             Command::Vacate { grant } => {
-                self.writer(principal, grant)?;
-                rotation::check_writer_open(self.preparing.is_some_and(|pending| pending.erasure))?;
-                self.authority.vacate();
+                let current = self.authority.grant.map(Grant::identity);
+                reducer::vacate(
+                    &mut self.authority,
+                    Self::worker_principal(principal),
+                    current,
+                    grant.identity(),
+                    self.preparing.is_some_and(|pending| pending.erasure),
+                )?;
                 Ok(Outcome::Vacated)
             }
             Command::SealCohort {
