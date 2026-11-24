@@ -402,10 +402,11 @@ impl<R: Replica> Coordinator<R> {
     ) -> Result<Option<ReplayHead>, Error> {
         let state = self.recover(session).await?;
         let (replay, skip) = replay_from(&state, session, hold, from)?;
+        let through = replay.through();
         let Some(entry) = replay.records().nth(skip) else {
-            return if from == replay.through() { Ok(None) } else { Err(Refusal::Invalid.into()) };
+            return if from == through { Ok(None) } else { Err(Refusal::Invalid.into()) };
         };
-        let record_bytes = record_charge(from.next_lsn, replay.through().next_lsn, entry)?;
+        let record_bytes = record_charge(from.next_lsn, through.next_lsn, entry)?;
         Ok(Some(ReplayHead {
             next: entry.result.cut,
             timestamp: entry.timestamp,
