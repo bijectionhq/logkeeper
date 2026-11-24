@@ -107,7 +107,7 @@ and refusals and observations must not change it.
 | Staged Sync · complete Sync · floor installation | 4,358 · 62,727 · 55 |
 | Append · publication · Trim | 82,022 · 82,841 · 29,945 |
 
-The runner mutates real rows into 43 controls, one per admission or effect check. These
+The runner mutates real rows into 42 controls, one per admission or effect check. These
 include the former visible incomplete Sync, a Seal that reports staged records, a Seal or
 complete Sync that keeps staging, a stale promise or another identity on each request, an
 unsynced or learner append or trim, gaps, wrong record epochs, uncertified publication, a

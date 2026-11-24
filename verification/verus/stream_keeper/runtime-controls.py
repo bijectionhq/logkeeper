@@ -121,6 +121,23 @@ CONTROLS = [
         "delete replied before the tombstone and erasure checkpoint",
     ),
     (
+        "inline-delete-compaction", "keeper/mod.rs",
+        "                .start_rotation(&self.streams, !self.deletions.is_empty())?;",
+        "                .start_rotation(&self.streams, !self.deletions.is_empty())?;\n"
+        "            self.wal.finish_rotation()?;",
+        KEEPER_TEST + "delete_joins_its_compaction_without_blocking_other_rounds",
+        "delete blocked the keeper round thread on compaction",
+    ),
+    (
+        "retire-wal-before-index", "keeper/wal.rs",
+        "                    index.write(&root, next, snapshots, rewrite)?;\n"
+        "                    retire_segments(&segment_dir, next)?;",
+        "                    retire_segments(&segment_dir, next)?;\n"
+        "                    index.write(&root, next, snapshots, rewrite)?;",
+        KEEPER_TEST + "failed_index_publication_leaves_covered_wal_for_recovery",
+        "covered WAL was retired before index publication",
+    ),
+    (
         "inline-startup-compaction", "keeper/wal.rs",
         "        Ok((wal, states))",
         "        #[cfg(test)]\n        if wal.bootstrap { wal.rotate(&states)?; }\n        Ok((wal, states))",
@@ -165,6 +182,13 @@ CONTROLS = [
         "Decision::Persist if backlogged =>", "Decision::Persist if backlogged && false =>",
         KEEPER_TEST + "wal_backlog_keeps_observations_running_without_growing_replay",
         "the keeper admitted a new mutation above the recovery bound",
+    ),
+    (
+        "keep-mixed-packs", "keeper/wal.rs",
+        "            || index.compaction_due()",
+        "            || (false && index.compaction_due())",
+        KEEPER_TEST + "rotation_reclaims_mixed_packs_with_excess_discarded_bytes",
+        "excess discarded bytes still pin the mixed pack",
     ),
     (
         "skip-legacy-checkpoint", "keeper/wal.rs",
@@ -230,7 +254,9 @@ CONTROLS = [
         TLS_TEST, "accepted unauthorized URI",
     ),
     (
-        "bypass-keeper-uri", "transport.rs", "if peer != keeper {", "if peer != keeper && false {",
+        "bypass-keeper-uri", "transport/mux.rs",
+        "Ok(Ok((peer, _))) if peer != keeper =>",
+        "Ok(Ok((peer, _))) if peer != keeper && false =>",
         TLS_TEST, "keeper URI does not match route",
     ),
 ]

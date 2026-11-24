@@ -218,8 +218,8 @@ of file and directory syncs.
 A delete first syncs its tombstone in the WAL. Its checkpoint copies only
 live records into a new pack and retires all old packs and the covered WAL
 before replying. The worker also reclaims unreferenced packs during regular
-rotation and compacts mixed packs when their physical bytes exceed twice
-their live bytes plus one segment. Rounds continue during the copy and an
+rotation. When mixed packs occupy more than twice their live bytes plus one
+segment, the next rotation rewrites them. Rounds continue during the copy and an
 idempotent delete waits if its cleanup is outstanding. Reads after a keeper
 installs the tombstone are refused immediately. Removal is from the keeper's
 durable file namespace. RTDB completes cryptographic erasure as described in

@@ -1538,7 +1538,21 @@ fn delete_joins_its_compaction_without_blocking_other_rounds() {
     test.engine.wal.rotation_gate = Some(wait);
 
     let (delete_work, mut deleted) = work(&CLIENT, delete(B));
-    test.engine.process(VecDeque::from([delete_work])).unwrap();
+    let Harness { mut engine, dir } = test;
+    let (return_engine, returned) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        engine.process(VecDeque::from([delete_work])).unwrap();
+        let _ = return_engine.send(engine);
+    });
+    let engine = returned.recv_timeout(Duration::from_secs(5));
+    assert!(
+        engine.is_ok(),
+        "delete blocked the keeper round thread on compaction"
+    );
+    let mut test = Harness {
+        engine: engine.unwrap(),
+        dir,
+    };
     let (retry_work, mut retried) = work(&CLIENT, delete(B));
     test.engine.process(VecDeque::from([retry_work])).unwrap();
 
@@ -1786,4 +1800,70 @@ fn legacy_checkpoint_migrates_with_an_uncaptured_wal_suffix() {
         test.send(read(A, 1)),
         page(1, 2, &[(1, b"legacy"), (2, b"suffix")])
     );
+}
+
+#[test]
+fn failed_index_publication_leaves_covered_wal_for_recovery() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"durable"], 1));
+    let old = test.segment();
+    let blocker = test.dir.path().join("INDEX.tmp");
+    fs::create_dir(&blocker).unwrap();
+    test.engine
+        .wal
+        .start_rotation(&test.engine.streams, false)
+        .unwrap();
+    assert!(test.engine.wal.finish_rotation().is_err());
+    assert!(
+        old.exists(),
+        "covered WAL was retired before index publication"
+    );
+    assert!(!test.dir.path().join("INDEX").exists());
+    assert_eq!(
+        pack_files(test.dir.path()).len(),
+        1,
+        "the pack precedes index publication"
+    );
+    fs::remove_dir(blocker).unwrap();
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let engine = Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
+    let mut test = Harness { engine, dir };
+    assert_eq!(test.send(read(A, 1)), page(1, 1, &[(1, b"durable")]));
+    test.engine.drain_checkpoints().unwrap();
+    assert!(!old.exists());
+}
+
+#[test]
+fn rotation_reclaims_mixed_packs_with_excess_discarded_bytes() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.writer(B);
+    test.batch([
+        append(A, 1, 1, &[b"retained"], 1),
+        append(B, 1, 1, &[b"trimmed"], 1),
+    ]);
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+    let mixed = pack_files(test.dir.path()).pop().unwrap();
+    // A sparse tail supplies the same physical file-length input without writing
+    // tens of megabytes of payloads in this regression.
+    OpenOptions::new()
+        .write(true)
+        .open(&mixed)
+        .unwrap()
+        .set_len(2 * wal::SEGMENT_BYTES)
+        .unwrap();
+    test.send(trim(B, 1, 1));
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+    assert!(
+        mixed.exists(),
+        "the first rotation still indexes the retained record"
+    );
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+    assert!(
+        !mixed.exists(),
+        "excess discarded bytes still pin the mixed pack"
+    );
+    assert_eq!(test.send(read(A, 1)), page(1, 1, &[(1, b"retained")]));
 }
