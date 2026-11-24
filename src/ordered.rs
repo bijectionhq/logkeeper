@@ -7,7 +7,9 @@
 mod acceptance;
 mod admission;
 mod budget;
+mod checkpoint_guards;
 mod codec;
+mod cohort;
 #[cfg(feature = "ordered-daemon")]
 pub mod daemon;
 mod lease;
@@ -362,7 +364,9 @@ pub enum Outcome {
         recovery: Hold,
     },
     Appended(AppendResult),
-    Barrier { read: Hold },
+    Barrier {
+        read: Hold,
+    },
     Published(Checkpoint),
     CheckpointPrepared(CheckpointPreparation),
     ObjectWithdrawn(ObjectFence),
@@ -685,9 +689,7 @@ impl State {
         else {
             return Err(Refusal::Invalid);
         };
-        if request.placement != self.placement {
-            return Err(Refusal::WrongPlacement);
-        }
+        receipt::require_original_placement(request.placement, self.placement)?;
         if request.principal != Principal::Worker(grant.enrollment) {
             return Err(Refusal::Unauthorized);
         }
@@ -787,7 +789,7 @@ impl State {
         if id.expires_at <= position {
             return Ok(receipt(Err(Refusal::Expired)));
         }
-        if self.successor.is_some() {
+        if !cohort::may_extend(self.successor) {
             return Ok(receipt(Err(Refusal::CohortSealed)));
         }
         if id.expires_at - position > self.limits.retry_positions {
@@ -1205,8 +1207,10 @@ impl State {
                     || self.cut(preparation.checkpoint.next_lsn) != Some(preparation.checkpoint)
                     || preparation.custody.allocation.is_nil()
                     || preparation.custody.provider == [0; 32]
-                    || Some(preparation.custody.revision)
-                        != self.checkpoint.custody.revision.checked_add(1)
+                    || !checkpoint_guards::next_revision(
+                        self.checkpoint.custody.revision,
+                        preparation.custody.revision,
+                    )
                     || preparation.usable_bytes == 0
                     || preparation.root == [0; 32]
                     || !self.checkpoint_open(preparation.base)
@@ -1249,14 +1253,15 @@ impl State {
                     .get_mut(&checkpoint.custody.revision)
                     .filter(|entry| entry.checkpoint == checkpoint)
                     .ok_or(Refusal::Stale)?;
-                if self
-                    .preparing
-                    .is_some_and(|pending| pending.base == checkpoint)
-                    || self
-                        .holds
-                        .values()
-                        .any(|entry| entry.hold.checkpoint == checkpoint)
-                {
+                if !checkpoint_guards::may_close(
+                    self.preparing
+                        .is_some_and(|pending| pending.base == checkpoint),
+                    || {
+                        self.holds
+                            .values()
+                            .any(|entry| entry.hold.checkpoint == checkpoint)
+                    },
+                ) {
                     return Err(Refusal::Unavailable);
                 }
                 entry.closed = true;
@@ -1685,12 +1690,15 @@ impl State {
     }
 
     fn checkpoint_open(&self, checkpoint: Checkpoint) -> bool {
-        rotation::admits_history(self.erasure_floor, checkpoint.cut.next_lsn)
-            && self.checkpoint_retained(checkpoint)
-            && !self
-                .old_roots
-                .get(&checkpoint.custody.revision)
-                .is_some_and(|entry| entry.closed)
+        checkpoint_guards::may_acquire(
+            rotation::admits_history(self.erasure_floor, checkpoint.cut.next_lsn),
+            || self.checkpoint_retained(checkpoint),
+            || {
+                self.old_roots
+                    .get(&checkpoint.custody.revision)
+                    .is_some_and(|entry| entry.closed)
+            },
+        )
     }
 
     fn next_checkpoint_retirement(&self) -> Option<RetainedCheckpoint> {

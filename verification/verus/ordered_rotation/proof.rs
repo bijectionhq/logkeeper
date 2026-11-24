@@ -14,6 +14,9 @@ mod production;
 #[path = "../../../src/ordered/admission.rs"]
 mod admission;
 
+#[path = "../../../src/ordered/checkpoint_guards.rs"]
+mod checkpoint_guards;
+
 mod laws;
 
 fn main() {}

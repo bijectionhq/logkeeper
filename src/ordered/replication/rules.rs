@@ -1,5 +1,7 @@
 //! Local decisions for the durable prefix protocol.
 
+use crate::ordered::cohort::{accept_quorum, matches_chosen_seal};
+
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
@@ -82,13 +84,6 @@ pub(super) fn same_image(left: &[u8; 32], right: &[u8; 32]) -> bool {
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (2 * votes as int > configured as int),
-))]
-pub(super) fn strict_majority(configured: usize, votes: usize) -> bool {
-    votes > configured / 2
-}
-
-#[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == configured@.contains(voter),
 ))]
 fn contains_voter(configured: &[u128], voter: u128) -> bool {
@@ -118,7 +113,7 @@ fn contains_voter(configured: &[u128], voter: u128) -> bool {
         out ==> forall|i: int| 0 < i < votes@.len() ==> #[trigger] votes@[i - 1] < #[trigger] votes@[i],
 ))]
 pub(super) fn configured_majority(configured: &[u128], votes: &[u128]) -> bool {
-    if !strict_majority(configured.len(), votes.len()) {
+    if !accept_quorum(votes.len(), configured.len()) {
         return false;
     }
     let mut index = 0;
@@ -169,10 +164,7 @@ pub(super) fn recovery_choice(current: BallotRank, observed: BallotRank) -> Reco
     },
 ))]
 pub(super) fn sealed_for(selected_seal: Option<&[u8; 32]>, destination: &[u8; 32]) -> bool {
-    match selected_seal {
-        Some(target) => same_image(target, destination),
-        None => false,
-    }
+    matches_chosen_seal(selected_seal, destination)
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>

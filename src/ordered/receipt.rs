@@ -1,5 +1,6 @@
 //! Receipt replay and persistence decisions shared by the ordered reducer.
 
+use super::Refusal;
 use super::admission;
 use std::collections::BTreeMap;
 
@@ -27,6 +28,13 @@ use vstd::laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq};
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::std_specs::btree::btree_map_inv;
+
+pub(super) fn require_original_placement<P: Eq>(original: P, installed: P) -> Result<(), Refusal> {
+    if original != installed {
+        return Err(Refusal::WrongPlacement);
+    }
+    Ok(())
+}
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == if stored@ == presented@ { Some(original) } else { None },
@@ -64,7 +72,7 @@ pub(super) fn replay<R: Copy>(
             old(outcomes)@
         },
 ))]
-pub(super) fn record_after_apply<P, I: Ord + Copy, K: Ord + Copy, O, E>(
+pub(super) fn record_after_apply<P, I: Ord + Copy, K: Ord + Copy, O: Copy, E: Copy>(
     outcomes: &mut ReceiptBook<P, I, K, Result<O, E>>,
     reading: bool,
     fingerprint: [u8; 32],

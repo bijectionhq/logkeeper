@@ -665,7 +665,7 @@ impl Group {
                         choose_base(&mut winner, accepted)?;
                     }
                     voters.insert(expected);
-                    if rules::strict_majority(self.voters.len(), voters.len()) {
+                    if super::cohort::accept_quorum(voters.len(), self.voters.len()) {
                         break;
                     }
                 }
@@ -725,7 +725,7 @@ impl Group {
             match reply {
                 Ok(vote) => {
                     if record_vote(&mut voters, expected, ballot, digest, read_back, vote)
-                        && rules::strict_majority(self.voters.len(), voters.len())
+                        && super::cohort::accept_quorum(voters.len(), self.voters.len())
                     {
                         voters.sort_unstable_by_key(|evidence| evidence.voter);
                         let configured: Vec<_> = self.voters.iter().map(Uuid::as_u128).collect();

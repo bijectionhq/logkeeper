@@ -99,7 +99,7 @@ pub(super) fn expiry_preserves_recoverable_receipts<K: Ord + Copy, R>(
     });
 }
 
-pub(super) fn recording_uses_the_applied_outcome<P, I: Ord + Copy, K: Ord + Copy, O, E>(
+pub(super) fn recording_uses_the_applied_outcome<P, I: Ord + Copy, K: Ord + Copy, O: Copy, E: Copy>(
     book: &mut ReceiptBook<P, I, K, Result<O, E>>,
     reading: bool, receipt: Receipt<P, I, K, Result<O, E>>, fingerprint: [u8; 32],
 )

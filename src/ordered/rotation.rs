@@ -1,7 +1,7 @@
 //! Exact-cut checks and selected-state updates for checkpoint publication.
 
 use super::admission::matches_fingerprint;
-use super::{Cut, Refusal};
+use super::{checkpoint_guards::matches_preparation, Cut, Refusal};
 
 #[cfg(verus_keep_ghost)]
 use vstd::laws_eq::obeys_concrete_eq;
@@ -79,7 +79,7 @@ pub(super) fn check_preparation<C: Eq>(
     }
     if !same_cut(prepared_cut, cut)
         || !matches_fingerprint(&prepared_root, &root)
-        || prepared_custody != custody
+        || !matches_preparation(prepared_custody, custody)
         || matches_fingerprint(&manifest, &empty_manifest)
         || !matches!(observed_cut, Some(observed) if same_cut(observed, cut))
     {

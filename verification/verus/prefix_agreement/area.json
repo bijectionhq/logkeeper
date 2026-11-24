@@ -85,7 +85,7 @@
       "mutate": [
         {
           "file": "src/ordered/replication/rules.rs",
-          "find": "    if !strict_majority(configured.len(), votes.len()) {",
+          "find": "    if !accept_quorum(votes.len(), configured.len()) {",
           "replace": "    if votes.len() < configured.len() / 2 {"
         },
         {
