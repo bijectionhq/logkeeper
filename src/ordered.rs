@@ -1340,6 +1340,9 @@ impl State {
                     return Err(Refusal::Stale);
                 }
                 self.held_replay(principal, hold)?;
+                if !self.checkpoint_open(hold.checkpoint) {
+                    return Err(Refusal::Unavailable);
+                }
                 let lease_end = self.time.checked_add(self.limits.serving_lease).ok_or(Refusal::Capacity)?;
                 let last = self.leases.entry(hold.owner).or_default();
                 *last = (*last).max(lease_end);

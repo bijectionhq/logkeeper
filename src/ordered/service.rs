@@ -46,6 +46,8 @@ pub struct Route {
     pub last_maintenance: Option<Cut>,
     pub floor: Cut,
     pub erasure_floor: u64,
+    /// Custodian-only accounting for the old roots fenced by the erasure floor.
+    pub erasure_retirement: Option<ErasureRetirement>,
     pub checkpoint: Checkpoint,
     pub preparing: Option<CheckpointPreparation>,
     pub retirement: Option<RetainedCheckpoint>,
@@ -60,6 +62,12 @@ pub struct Route {
     pub time: u64,
     pub serving_lease: u64,
     pub clock_drift: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ErasureRetirement {
+    pub outstanding_holds: u64,
+    pub unsettled_checkpoints: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,6 +196,18 @@ impl<R: Replica> Coordinator<R> {
                 .map(|record| record.result.cut),
             floor: state.floor(),
             erasure_floor: state.erasure_floor(),
+            erasure_retirement: (session.principal == Principal::Custodian && state.erasure_floor() != 0)
+                .then(|| {
+                    let floor = state.erasure_floor();
+                    ErasureRetirement {
+                        outstanding_holds: state.holds.values()
+                            .filter(|entry| entry.hold.checkpoint.cut.next_lsn < floor)
+                            .count() as u64,
+                        unsettled_checkpoints: state.old_roots.values()
+                            .filter(|entry| entry.checkpoint.cut.next_lsn < floor)
+                            .count() as u64,
+                    }
+                }),
             checkpoint: state.checkpoint(),
             preparing: state.preparing,
             retirement: (session.principal == Principal::Custodian)

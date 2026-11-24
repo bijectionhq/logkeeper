@@ -8,7 +8,7 @@ use crate::ordered::{
     BarrierClaim, Outcome, Placement, Principal, Receipt, Refusal, Request,
     replication::{Ballot, RotationSlots, SlotImage, SlotPair, VoterSlots},
     service::{
-        MAX_WITHDRAWN_WORKERS, ReplayHead, ReplayPage, Route, WithdrawnWorker,
+        ErasureRetirement, MAX_WITHDRAWN_WORKERS, ReplayHead, ReplayPage, Route, WithdrawnWorker,
         wire::{Decision, Operation, Reply, Signature, SignedBarrier, SignedRotationSlots},
     },
 };
@@ -155,6 +155,11 @@ impl Reply {
                 }
                 cut(&mut output, route.floor);
                 output.put_u64(route.erasure_floor);
+                output.put_u8(encode_flag(route.erasure_retirement.is_some()));
+                if let Some(retirement) = route.erasure_retirement {
+                    output.put_u64(retirement.outstanding_holds);
+                    output.put_u64(retirement.unsettled_checkpoints);
+                }
                 checkpoint(&mut output, route.checkpoint);
                 output.put_u8(encode_flag(route.preparing.is_some()));
                 if let Some(item) = route.preparing {
@@ -257,6 +262,10 @@ impl Reply {
                 last_maintenance: input.optional(Input::cut)?,
                 floor: input.cut()?,
                 erasure_floor: input.u64()?,
+                erasure_retirement: input.optional(|input| Ok(ErasureRetirement {
+                    outstanding_holds: input.u64()?,
+                    unsettled_checkpoints: input.u64()?,
+                }))?,
                 checkpoint: input.checkpoint()?,
                 preparing: input.optional(Input::checkpoint_preparation)?,
                 retirement: input.optional(|input| {
