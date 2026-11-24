@@ -35,7 +35,7 @@ pub(super) struct Active {
 struct State {
     enabled: bool,
     closed: Option<JournalError>,
-    commit: Lsn,
+    head: Lsn,
     floor: Lsn,
     pending: BTreeMap<Lsn, Pending>,
     lanes: [Lane; 3],
@@ -69,7 +69,7 @@ enum Work {
     Append {
         at: Lsn,
         payload: Option<Bytes>,
-        commit: Lsn,
+        head: Lsn,
     },
     Publish(Lsn),
 }
@@ -84,7 +84,7 @@ impl Active {
             state: Mutex::new(State {
                 enabled: false,
                 closed: None,
-                commit: recovery.end(),
+                head: recovery.tail(),
                 floor: recovery.floor,
                 pending: BTreeMap::new(),
                 lanes: std::array::from_fn(|_| Lane::default()),
@@ -131,12 +131,12 @@ impl Active {
         }
     }
 
-    pub(super) fn commit(&self) -> Lsn {
-        self.state.lock().commit
+    pub(super) fn head(&self) -> Lsn {
+        self.state.lock().head
     }
 
-    pub(super) async fn published(&self, end: Lsn) -> Result<()> {
-        if end == Lsn(0) {
+    pub(super) async fn published(&self, tail: Lsn) -> Result<()> {
+        if tail == Lsn(0) {
             return Ok(());
         }
         let mut change = self.change.subscribe();
@@ -149,13 +149,13 @@ impl Active {
                 if state
                     .lanes
                     .iter()
-                    .filter(|lane| lane.published.is_some_and(|at| at >= end))
+                    .filter(|lane| lane.published.is_some_and(|at| at >= tail))
                     .count()
                     >= QUORUM
                 {
                     return Ok(());
                 }
-                if let Some(error) = state.impossible(Lsn(end.0 + 1)) {
+                if let Some(error) = state.impossible(Lsn(tail.0 + 1)) {
                     return Err(error);
                 }
             }
@@ -193,15 +193,15 @@ impl Active {
                 if at < state.floor {
                     return Err(JournalError::Trimmed { floor: state.floor });
                 }
-                if at <= state.commit {
+                if at <= state.head {
                     break None;
                 }
                 let last = state
                     .pending
                     .last_key_value()
-                    .map_or(state.commit, |(at, _)| *at);
+                    .map_or(state.head, |(at, _)| *at);
                 let conflict = JournalError::Conflict {
-                    committed_end: state.commit,
+                    head: state.head,
                 };
                 if at.0 == u64::MAX || at.0 > last.0 + 1 {
                     return Err(conflict);
@@ -222,7 +222,7 @@ impl Active {
                 }
             }
             // A competing live append can choose this position. Wait for that
-            // decision before reporting the committed end in a conflict.
+            // decision before reporting the head in a conflict.
             change
                 .changed()
                 .await
@@ -242,15 +242,15 @@ impl Active {
     }
 
     async fn retry_committed(&self, at: Lsn, payload: Bytes) -> Result<Lsn> {
-        let commit = self.commit();
+        let head = self.head();
         quorum(FuturesUnordered::from_iter(self.ensemble.map(|keeper| {
-            self.send_append(keeper, at, payload.clone(), commit)
+            self.send_append(keeper, at, payload.clone(), head)
         })))
         .await
         .map(|_| at)
         .map_err(|error| match error {
             JournalError::Conflict { .. } => JournalError::Conflict {
-                committed_end: self.commit(),
+                head: self.head(),
             },
             error => error,
         })
@@ -280,8 +280,8 @@ impl Active {
                 if let Some(error) = &state.closed {
                     return Err(error.clone());
                 }
-                if state.commit >= sample {
-                    return Ok(state.commit);
+                if state.head >= sample {
+                    return Ok(state.head);
                 }
                 if !state.pending.contains_key(&sample) {
                     return Err(JournalError::Unavailable);
@@ -313,22 +313,22 @@ impl Active {
             Work::Append {
                 at,
                 payload,
-                commit,
+                head,
             } => {
                 let payload = match payload {
                     Some(payload) => payload,
                     None => self.fetch_committed(at, index).await?,
                 };
                 let observed = self.observe(index);
-                let result = self.send_append(keeper, at, payload, commit).await;
+                let result = self.send_append(keeper, at, payload, head).await;
                 observed.send_replace(Some(result.clone()));
                 result.map(|_| Some(at))
             }
-            Work::Publish(commit) => {
+            Work::Publish(head) => {
                 let observed = self.observe(index);
                 let result = self
                     .io
-                    .publish(keeper, self.stream, self.epoch, commit)
+                    .publish(keeper, self.stream, self.epoch, head)
                     .await;
                 observed.send_replace(Some(result.clone()));
                 result.map(|_| None)
@@ -352,7 +352,7 @@ impl Active {
                 return Err(JournalError::Trimmed { floor: state.floor });
             }
             std::array::from_fn::<_, 3, _>(|i| {
-                (i != index && state.lanes[i].accepted.is_some_and(|end| end >= at))
+                (i != index && state.lanes[i].accepted.is_some_and(|tail| tail >= at))
                     .then_some(self.ensemble[i])
             })
         };
@@ -375,7 +375,7 @@ impl Active {
         keeper: KeeperId,
         at: Lsn,
         payload: Bytes,
-        commit: Lsn,
+        head: Lsn,
     ) -> Result<Lsn> {
         match self
             .io
@@ -384,15 +384,14 @@ impl Active {
                 Request::Append {
                     stream: self.stream,
                     epoch: self.epoch,
-                    holder: self.io.holder,
                     at,
                     records: vec![payload],
-                    commit,
+                    head,
                 },
             )
             .await?
         {
-            Reply::Appended { end } if end >= at => Ok(end),
+            Reply::Appended { tail } if tail >= at => Ok(tail),
             _ => Err(JournalError::Unavailable),
         }
     }
@@ -409,29 +408,29 @@ impl State {
         {
             return None;
         }
-        let Some(end) = lane.accepted else {
+        let Some(tail) = lane.accepted else {
             return Some(Work::Sync(self.floor));
         };
         if !self.enabled {
             return None;
         }
-        let at = Lsn(end.0 + 1);
+        let at = Lsn(tail.0 + 1);
         if lane.floor.is_none_or(|floor| floor < self.floor) {
             return Some(Work::InstallFloor(self.floor));
         }
         let pending = self.pending.get(&at);
-        if pending.is_some() || at <= self.commit {
+        if pending.is_some() || at <= self.head {
             return Some(Work::Append {
                 at,
                 payload: pending.map(|p| p.payload.clone()),
-                commit: self.commit.min(at),
+                head: self.head.min(at),
             });
         }
         if lane
             .published
-            .is_none_or(|published| published < self.commit)
+            .is_none_or(|published| published < self.head)
         {
-            return Some(Work::Publish(self.commit));
+            return Some(Work::Publish(self.head));
         }
         None
     }
@@ -458,12 +457,12 @@ impl State {
         let [a, b, c] = self
             .lanes
             .each_ref()
-            .map(|lane| lane.accepted.map(|end| (epoch.0, end.0)));
+            .map(|lane| lane.accepted.map(|tail| (epoch.0, tail.0)));
         while let Some((&at, _)) = self.pending.first_key_value() {
             if !acknowledged(a, b, c, epoch.0, at.0) {
                 break;
             }
-            self.commit = at;
+            self.head = at;
             notify(&mut self.pending.pop_first().unwrap().1, Ok(at));
         }
     }
@@ -504,7 +503,7 @@ impl State {
         for (at, error) in failed {
             let error = match error {
                 JournalError::Conflict { .. } => JournalError::Conflict {
-                    committed_end: self.commit,
+                    head: self.head,
                 },
                 error => error,
             };
@@ -539,8 +538,8 @@ async fn replicate(active: Weak<Active>, index: usize, mut change: watch::Receiv
         let (at, published, floor) = match &work {
             Work::Sync(floor) => (Lsn(0), Lsn(floor.0 - 1), Some(*floor)),
             Work::InstallFloor(floor) => (*floor, Lsn(floor.0 - 1), Some(*floor)),
-            Work::Append { at, commit, .. } => (*at, *commit, None),
-            Work::Publish(commit) => (Lsn(commit.0 + 1), *commit, None),
+            Work::Append { at, head, .. } => (*at, *head, None),
+            Work::Publish(head) => (Lsn(head.0 + 1), *head, None),
         };
         let result = current.run(index, work).await;
         {
@@ -551,8 +550,8 @@ async fn replicate(active: Weak<Active>, index: usize, mut change: watch::Receiv
             let lane = &mut state.lanes[index];
             match result {
                 Ok(accepted) => {
-                    if let Some(end) = accepted {
-                        lane.accepted = Some(end);
+                    if let Some(tail) = accepted {
+                        lane.accepted = Some(tail);
                     }
                     lane.published = lane.published.max(Some(published));
                     lane.floor = lane.floor.max(floor);

@@ -1,5 +1,5 @@
 {
-  "summary": "Verify keeper admission, commit bounds, and reply projections over the primitive shipped rules.",
+  "summary": "Verify keeper admission, head bounds, and reply projections over the primitive shipped rules.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -32,70 +32,70 @@
       ],
       "min_verified_functions": 23
     },
-    "seal-equal-other-holder": {
-      "defect": "An equal epoch may switch holders.",
+    "seal-equal-other-identity": {
+      "defect": "An equal epoch may switch identities.",
       "mutate": [
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "    !has_promise || current < epoch || (current == epoch && same_holder)\n",
-          "replace": "    let _ = same_holder;\n    !has_promise || current <= epoch\n"
+          "find": "    !has_promise || current < epoch || (current == epoch && same_identity)\n",
+          "replace": "    let _ = same_identity;\n    !has_promise || current <= epoch\n"
         },
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "out == (!has_promise || current < epoch || (current == epoch && same_holder))",
+          "find": "out == (!has_promise || current < epoch || (current == epoch && same_identity))",
           "replace": "out == (!has_promise || current <= epoch)"
         }
       ],
       "expect": [
         {
           "file": "verification/verus/stream_keeper/laws.rs",
-          "function": "seal_requires_a_higher_epoch_or_same_holder",
+          "function": "seal_requires_a_higher_epoch_or_same_identity",
           "category": "assertion failed"
         }
       ],
       "min_verified_functions": 23
     },
-    "sync-overwrite-commit": {
+    "sync-overwrite-head": {
       "defect": "Sync can replace an unequal committed record.",
       "mutate": [
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "    from > commit || identical\n",
-          "replace": "    let _ = (from, commit, identical);\n    true\n"
+          "find": "    from > head || identical\n",
+          "replace": "    let _ = (from, head, identical);\n    true\n"
         },
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "ensures out == (from > commit || identical)",
+          "find": "ensures out == (from > head || identical)",
           "replace": "ensures out"
         }
       ],
       "expect": [
         {
           "file": "verification/verus/stream_keeper/laws.rs",
-          "function": "sync_cannot_replace_committed_records",
+          "function": "sync_cannot_replace_headted_records",
           "category": "assertion failed"
         }
       ],
       "min_verified_functions": 23
     },
-    "sync-regress-commit": {
-      "defect": "Sync can move the local commit backwards.",
+    "sync-regress-head": {
+      "defect": "Sync can move the local head backwards.",
       "mutate": [
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "    current <= next && next <= end && floor > 0 && floor - 1 <= next\n",
-          "replace": "    let _ = current;\n    next <= end && floor > 0 && floor - 1 <= next\n"
+          "find": "    current <= next && next <= tail && floor > 0 && floor - 1 <= next\n",
+          "replace": "    let _ = current;\n    next <= tail && floor > 0 && floor - 1 <= next\n"
         },
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "out == (current <= next && next <= end && 0 < floor && floor as int <= next as int + 1)",
-          "replace": "out == (next <= end && 0 < floor && floor as int <= next as int + 1)"
+          "find": "out == (current <= next && next <= tail && 0 < floor && floor as int <= next as int + 1)",
+          "replace": "out == (next <= tail && 0 < floor && floor as int <= next as int + 1)"
         }
       ],
       "expect": [
         {
           "file": "verification/verus/stream_keeper/laws.rs",
-          "function": "sync_commit_is_monotone_and_bounded",
+          "function": "sync_head_is_monotone_and_bounded",
           "category": "assertion failed"
         }
       ],
@@ -129,13 +129,13 @@
       "mutate": [
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "    nonempty && last <= end && identical\n",
-          "replace": "    let _ = identical;\n    nonempty && last <= end\n"
+          "find": "    nonempty && last <= tail && identical\n",
+          "replace": "    let _ = identical;\n    nonempty && last <= tail\n"
         },
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "out == (nonempty && last <= end && identical)",
-          "replace": "out == (nonempty && last <= end)"
+          "find": "out == (nonempty && last <= tail && identical)",
+          "replace": "out == (nonempty && last <= tail)"
         }
       ],
       "expect": [
@@ -152,26 +152,26 @@
       "mutate": [
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "    through <= commit\n",
-          "replace": "    let _ = (through, commit);\n    true\n"
+          "find": "    through <= head\n",
+          "replace": "    let _ = (through, head);\n    true\n"
         },
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "ensures out == (through <= commit)",
+          "find": "ensures out == (through <= head)",
           "replace": "ensures out"
         }
       ],
       "expect": [
         {
           "file": "verification/verus/stream_keeper/laws.rs",
-          "function": "trim_cannot_cross_the_commit",
+          "function": "trim_cannot_cross_the_head",
           "category": "assertion failed"
         }
       ],
       "min_verified_functions": 23
     },
-    "check-invent-end": {
-      "defect": "Check returns a request field as the durable end.",
+    "check-invent-tail": {
+      "defect": "Check returns a request field as the durable tail.",
       "mutate": [
         {
           "file": "src/stream/keeper/rules.rs",
@@ -187,7 +187,7 @@
       "expect": [
         {
           "file": "verification/verus/stream_keeper/laws.rs",
-          "function": "check_reports_the_existing_end",
+          "function": "check_reports_the_existing_tail",
           "category": "assertion failed"
         }
       ],
@@ -198,12 +198,12 @@
       "mutate": [
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "    commit\n",
-          "replace": "    let _ = commit;\n    _accepted\n"
+          "find": "    head\n",
+          "replace": "    let _ = head;\n    _accepted\n"
         },
         {
           "file": "src/stream/keeper/rules.rs",
-          "find": "out == commit))]",
+          "find": "out == head))]",
           "replace": "out == _accepted))]"
         }
       ],

@@ -1,6 +1,6 @@
 use std::{fs, fs::OpenOptions, io::Write, path::PathBuf};
 
-use bytes::Buf;
+use bytes::{Buf, BufMut};
 use journal_contract::BoxFuture;
 use tempfile::{TempDir, tempdir};
 
@@ -9,8 +9,8 @@ use super::*;
 const A: StreamId = StreamId(10);
 const B: StreamId = StreamId(20);
 const MEMBERS: [KeeperId; 3] = [KeeperId(1), KeeperId(2), KeeperId(3)];
-const CLIENT: &str = "writer-a";
-const HOLDER: Holder = Holder(7);
+static CLIENT: Identity = Identity::from_static("urn:logkeeper:client:writer-a");
+static OTHER: Identity = Identity::from_static("urn:logkeeper:client:writer-b");
 
 fn create(stream: StreamId) -> Request {
     Request::Create {
@@ -25,7 +25,6 @@ fn seal_at(stream: StreamId, epoch: u64, ensemble: [KeeperId; 3]) -> Request {
     Request::Seal {
         stream,
         epoch: Epoch(epoch),
-        holder: HOLDER,
         ensemble,
     }
 }
@@ -40,7 +39,7 @@ fn sync(
     epoch: u64,
     from: u64,
     records: &[&'static [u8]],
-    commit: u64,
+    head: u64,
     complete: bool,
 ) -> Request {
     let runs = if records.is_empty() {
@@ -55,7 +54,6 @@ fn sync(
     Request::Sync {
         stream,
         epoch: Epoch(epoch),
-        holder: HOLDER,
         floor: Lsn(1),
         from: Lsn(from),
         records: records
@@ -63,23 +61,16 @@ fn sync(
             .map(|record| Bytes::from_static(record))
             .collect(),
         runs,
-        commit: Lsn(commit),
+        head: Lsn(head),
         complete,
     }
 }
-fn append(
-    stream: StreamId,
-    epoch: u64,
-    at: u64,
-    records: &[&'static [u8]],
-    commit: u64,
-) -> Request {
+fn append(stream: StreamId, epoch: u64, at: u64, records: &[&'static [u8]], head: u64) -> Request {
     Request::Append {
         stream,
         epoch: Epoch(epoch),
-        holder: HOLDER,
         at: Lsn(at),
-        commit: Lsn(commit),
+        head: Lsn(head),
         records: records
             .iter()
             .map(|record| Bytes::from_static(record))
@@ -90,7 +81,6 @@ fn trim(stream: StreamId, epoch: u64, through: u64) -> Request {
     Request::Trim {
         stream,
         epoch: Epoch(epoch),
-        holder: HOLDER,
         through: Lsn(through),
     }
 }
@@ -112,15 +102,14 @@ fn recover(stream: StreamId, epoch: u64, from: u64) -> Request {
     Request::Recover {
         stream,
         epoch: Epoch(epoch),
-        holder: HOLDER,
         from: Lsn(from),
         max: 100,
     }
 }
-fn page(floor: u64, commit: u64, records: &[(u64, &'static [u8])]) -> Reply {
+fn page(floor: u64, head: u64, records: &[(u64, &'static [u8])]) -> Reply {
     Reply::Records {
         floor: Lsn(floor),
-        commit: Lsn(commit),
+        head: Lsn(head),
         records: records
             .iter()
             .map(|(lsn, record)| (Lsn(*lsn), Bytes::from_static(record)))
@@ -128,12 +117,12 @@ fn page(floor: u64, commit: u64, records: &[(u64, &'static [u8])]) -> Reply {
     }
 }
 
-fn work(principal: &str, request: Request) -> (Work, oneshot::Receiver<Response>) {
+fn work(identity: &Identity, request: Request) -> (Work, oneshot::Receiver<Response>) {
     let (done, result) = oneshot::channel();
     (
         Work {
             request,
-            principal: Bytes::copy_from_slice(principal.as_bytes()),
+            identity: identity.clone(),
             done,
             pending: None,
         },
@@ -154,11 +143,11 @@ impl Harness {
     }
 
     fn batch(&mut self, requests: impl IntoIterator<Item = Request>) -> Vec<Reply> {
-        let (wave, results): (VecDeque<_>, Vec<_>) = requests
+        let (pending, results): (VecDeque<_>, Vec<_>) = requests
             .into_iter()
-            .map(|request| work(CLIENT, request))
+            .map(|request| work(&CLIENT, request))
             .unzip();
-        self.engine.process(wave).unwrap();
+        self.engine.process(pending).unwrap();
         results
             .into_iter()
             .map(|mut result| result.try_recv().unwrap().0.unwrap())
@@ -202,8 +191,8 @@ fn create_is_durable_and_idempotent() {
         (
             view.promised,
             view.synced,
-            view.end,
-            view.commit,
+            view.tail,
+            view.head,
             view.floor,
             view.learner
         ),
@@ -219,7 +208,7 @@ fn create_is_durable_and_idempotent() {
 }
 
 #[test]
-fn seal_fences_lower_epochs_other_holders_and_other_principals() {
+fn seal_fences_lower_epochs_and_equal_epochs_from_other_identities() {
     let mut test = Harness::new(Limits::default());
     test.writer(A);
     test.send(append(A, 1, 1, &[b"accepted"], 0));
@@ -236,30 +225,58 @@ fn seal_fences_lower_epochs_other_holders_and_other_principals() {
         }]
     );
     assert_eq!(
-        (view.end, view.commit, view.synced),
+        (view.tail, view.head, view.synced),
         (Lsn(1), Lsn(0), Some(Epoch(1)))
     );
     let synced_rounds = test.engine.wal.rounds.len();
     assert_eq!(test.send(seal(A, 2)), accepted);
     let fenced = Reply::Refused(Refusal::Fenced { promised: Epoch(2) });
     assert_eq!(test.send(seal(A, 1)), fenced);
-    assert_eq!(
-        test.send(Request::Seal {
-            stream: A,
-            ensemble: MEMBERS,
-            epoch: Epoch(2),
-            holder: Holder(8)
-        }),
-        fenced
-    );
-    let (work, mut result) = work("writer-b", seal(A, 2));
+    let (work, mut result) = work(&OTHER, seal(A, 2));
     test.engine.process(VecDeque::from([work])).unwrap();
     assert_eq!(result.try_recv().unwrap().0.unwrap(), fenced);
     assert_eq!(test.engine.wal.rounds.len(), synced_rounds);
 }
 
 #[test]
-fn sync_preserves_commit_and_completes_explicitly() {
+fn replay_uses_the_legacy_certificate_identity() {
+    let mut test = Harness::new(Limits::default());
+    assert_eq!(test.send(create(A)), Reply::Created);
+
+    let uri = CLIENT.as_str().as_bytes();
+    let mut old = BytesMut::new();
+    old.put_u32(uri.len() as u32);
+    old.put_slice(uri);
+    old.put_u8(1); // Legacy Seal.
+    old.put_u128(A.0);
+    old.put_u64(1);
+    old.put_u128(7); // Legacy claimed holder.
+    for member in MEMBERS {
+        old.put_u128(member.0);
+    }
+    let mut round = BytesMut::new();
+    wal::fragment(&mut round, A, true, true, &old);
+    test.engine.wal.write_round(&round).unwrap();
+
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let mut test = Harness {
+        engine: Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap(),
+        dir,
+    };
+    let Reply::Checked(view) = test.send(check(A)) else {
+        panic!("the legacy seal did not replay");
+    };
+    assert_eq!(
+        view.promised,
+        Some((Epoch(1), CLIENT.clone())),
+        "replay must preserve the authenticated certificate identity"
+    );
+    assert!(matches!(test.send(seal(A, 1)), Reply::Sealed(_)));
+}
+
+#[test]
+fn sync_preserves_head_and_completes_explicitly() {
     let mut test = Harness::new(Limits::default());
     test.writer(A);
     test.send(append(A, 1, 1, &[b"committed", b"tail"], 1));
@@ -270,19 +287,19 @@ fn sync_preserves_commit_and_completes_explicitly() {
     );
     assert_eq!(
         test.send(sync(A, 2, 1, &[b"wrong"], 1, true)),
-        Reply::Refused(Refusal::Conflict { end: Lsn(2) })
+        Reply::Refused(Refusal::Conflict { head: Lsn(1) })
     );
     assert_eq!(
         test.send(sync(A, 2, 1, &[], 0, true)),
-        Reply::Refused(Refusal::AboveCommit { commit: Lsn(1) })
+        Reply::Refused(Refusal::AboveHead { head: Lsn(1) })
     );
     assert_eq!(
         test.send(sync(A, 2, 4, &[], 1, true)),
-        Reply::Refused(Refusal::Gap { end: Lsn(2) })
+        Reply::Refused(Refusal::Gap { head: Lsn(1) })
     );
     assert_eq!(
         test.send(sync(A, 2, 2, &[b"replacement"], 1, false)),
-        Reply::Synced { end: Lsn(2) }
+        Reply::Synced { tail: Lsn(2) }
     );
     assert_eq!(
         test.send(append(A, 2, 3, &[b"early"], 1)),
@@ -290,19 +307,19 @@ fn sync_preserves_commit_and_completes_explicitly() {
     );
     assert_eq!(
         test.send(sync(A, 2, 3, &[], 1, true)),
-        Reply::Synced { end: Lsn(2) }
+        Reply::Synced { tail: Lsn(2) }
     );
     assert_eq!(
         test.send(append(A, 2, 3, &[b"new"], 1)),
-        Reply::Appended { end: Lsn(3) }
+        Reply::Appended { tail: Lsn(3) }
     );
     assert_eq!(
         test.send(sync(A, 2, 3, &[], 1, true)),
-        Reply::Synced { end: Lsn(3) }
+        Reply::Synced { tail: Lsn(3) }
     );
     assert_eq!(
         test.send(sync(A, 2, 3, &[], 1, false)),
-        Reply::Refused(Refusal::Conflict { end: Lsn(3) })
+        Reply::Refused(Refusal::Conflict { head: Lsn(1) })
     );
     assert_eq!(
         test.send(recover(A, 2, 1)),
@@ -322,7 +339,7 @@ fn append_requires_current_sync_next_position_or_an_identical_retry() {
         test.send(append(A, 0, 1, &[b"a"], 0)),
         Reply::Refused(Refusal::Fenced { promised: Epoch(1) })
     );
-    let (job, mut result) = work("writer-b", append(A, 1, 1, &[b"a"], 0));
+    let (job, mut result) = work(&OTHER, append(A, 1, 1, &[b"a"], 0));
     test.engine.process(VecDeque::from([job])).unwrap();
     assert_eq!(
         result.try_recv().unwrap().0.unwrap(),
@@ -330,7 +347,7 @@ fn append_requires_current_sync_next_position_or_an_identical_retry() {
     );
     assert_eq!(
         test.send(append(A, 1, 2, &[b"a"], 0)),
-        Reply::Refused(Refusal::Gap { end: Lsn(0) })
+        Reply::Refused(Refusal::Gap { head: Lsn(0) })
     );
     assert_eq!(
         test.send(append(A, 1, 1, &[b"long"], 0)),
@@ -338,24 +355,24 @@ fn append_requires_current_sync_next_position_or_an_identical_retry() {
     );
     assert_eq!(
         test.send(append(A, 1, 1, &[b"abc"], 2)),
-        Reply::Refused(Refusal::AboveCommit { commit: Lsn(0) })
+        Reply::Refused(Refusal::AboveHead { head: Lsn(0) })
     );
     assert_eq!(
         test.send(append(A, 1, 1, &[b"abc"], 0)),
-        Reply::Appended { end: Lsn(1) }
+        Reply::Appended { tail: Lsn(1) }
     );
     assert_eq!(
         test.send(append(A, 1, 1, &[b"abc"], 1)),
-        Reply::Appended { end: Lsn(1) }
+        Reply::Appended { tail: Lsn(1) }
     );
     let rounds = test.engine.wal.rounds.len();
     assert_eq!(
         test.send(append(A, 1, 1, &[b"abc"], 0)),
-        Reply::Appended { end: Lsn(1) }
+        Reply::Appended { tail: Lsn(1) }
     );
     assert_eq!(
         test.send(append(A, 1, 1, &[b"abd"], 0)),
-        Reply::Refused(Refusal::Conflict { end: Lsn(1) })
+        Reply::Refused(Refusal::Conflict { head: Lsn(1) })
     );
     assert_eq!(
         test.send(append(A, 1, 2, &[b"ab"], 1)),
@@ -371,8 +388,8 @@ fn commit_only_append_preserves_a_later_accepted_record() {
     test.send(append(A, 1, 1, &[b"first", b"later"], 0));
     assert_eq!(
         test.send(append(A, 1, 2, &[], 1)),
-        Reply::Appended { end: Lsn(2) },
-        "commit publication inside the accepted prefix"
+        Reply::Appended { tail: Lsn(2) },
+        "head publication inside the accepted prefix"
     );
     assert_eq!(test.send(read(A, 1)), page(1, 1, &[(1, b"first")]));
     assert_eq!(
@@ -381,7 +398,7 @@ fn commit_only_append_preserves_a_later_accepted_record() {
     );
     assert_eq!(
         test.send(append(A, 1, 2, &[], 3)),
-        Reply::Refused(Refusal::AboveCommit { commit: Lsn(1) })
+        Reply::Refused(Refusal::AboveHead { head: Lsn(1) })
     );
 }
 
@@ -393,12 +410,11 @@ fn synced_floor_catch_up_preserves_the_retained_suffix() {
     let floor = |epoch| Request::Sync {
         stream: A,
         epoch: Epoch(epoch),
-        holder: HOLDER,
         floor: Lsn(2),
         from: Lsn(2),
         records: vec![],
         runs: vec![],
-        commit: Lsn(1),
+        head: Lsn(1),
         complete: false,
     };
     assert_eq!(
@@ -408,8 +424,8 @@ fn synced_floor_catch_up_preserves_the_retained_suffix() {
     );
     assert_eq!(
         test.send(floor(1)),
-        Reply::Synced { end: Lsn(3) },
-        "floor catch-up preserves accepted end"
+        Reply::Synced { tail: Lsn(3) },
+        "floor catch-up preserves accepted tail"
     );
     assert_eq!(
         test.send(recover(A, 1, 2)),
@@ -440,11 +456,11 @@ fn trim_is_monotone_committed_and_frees_quota() {
     );
     assert_eq!(
         test.send(trim(A, 1, 1)),
-        Reply::Refused(Refusal::AboveCommit { commit: Lsn(0) })
+        Reply::Refused(Refusal::AboveHead { head: Lsn(0) })
     );
     assert_eq!(
         test.send(append(A, 1, 2, &[], 1)),
-        Reply::Appended { end: Lsn(1) }
+        Reply::Appended { tail: Lsn(1) }
     );
     assert_eq!(test.send(trim(A, 1, 1)), Reply::Trimmed { floor: Lsn(2) });
     assert_eq!(test.send(trim(A, 1, 0)), Reply::Trimmed { floor: Lsn(2) });
@@ -454,7 +470,7 @@ fn trim_is_monotone_committed_and_frees_quota() {
     );
     assert_eq!(
         test.send(append(A, 1, 2, &[b"y"], 2)),
-        Reply::Appended { end: Lsn(2) }
+        Reply::Appended { tail: Lsn(2) }
     );
     assert_eq!(test.send(read(A, 2)), page(2, 2, &[(2, b"y")]));
 }
@@ -469,14 +485,19 @@ fn check_reports_the_durable_view_without_writing() {
         panic!("missing check")
     };
     assert_eq!(
-        (view.promised, view.synced, view.end, view.commit),
-        (Some((Epoch(1), HOLDER)), Some(Epoch(1)), Lsn(2), Lsn(1))
+        (view.promised, view.synced, view.tail, view.head),
+        (
+            Some((Epoch(1), CLIENT.clone())),
+            Some(Epoch(1)),
+            Lsn(2),
+            Lsn(1)
+        )
     );
     assert_eq!(test.engine.wal.rounds.len(), rounds);
 }
 
 #[test]
-fn read_stops_at_commit_and_recover_requires_the_holder() {
+fn read_stops_at_head_and_recover_requires_the_writer() {
     let mut test = Harness::new(Limits::default());
     test.writer(A);
     test.send(append(A, 1, 1, &[b"committed", b"accepted"], 1));
@@ -566,8 +587,8 @@ fn group_commit_covers_multiple_streams_in_one_sync() {
             check(A)
         ]),
         [
-            Reply::Appended { end: Lsn(1) },
-            Reply::Appended { end: Lsn(1) },
+            Reply::Appended { tail: Lsn(1) },
+            Reply::Appended { tail: Lsn(1) },
             Reply::Checked(test.engine.streams[&A].view.clone())
         ]
     );
@@ -583,16 +604,16 @@ fn sync_failure_publishes_neither_the_ack_nor_a_read_of_staged_data() {
     let mut test = Harness::new(Limits::default());
     test.writer(A);
     test.writer(B);
-    let (wave, results): (VecDeque<_>, Vec<_>) = [
+    let (pending, results): (VecDeque<_>, Vec<_>) = [
         append(A, 1, 1, &[b"a"], 1),
         append(B, 1, 1, &[b"b"], 1),
         read(A, 1),
     ]
     .into_iter()
-    .map(|request| work(CLIENT, request))
+    .map(|request| work(&CLIENT, request))
     .unzip();
     test.engine.wal.fail_sync = true;
-    assert!(test.engine.process(wave).is_err());
+    assert!(test.engine.process(pending).is_err());
     for mut result in results {
         assert!(
             matches!(result.try_recv(), Err(oneshot::error::TryRecvError::Closed)),
@@ -619,8 +640,8 @@ fn round_cap_is_enforced_even_for_a_record_larger_than_the_cap() {
     assert_eq!(
         test.batch([request, append(B, 1, 1, &[b"small"], 1)]),
         [
-            Reply::Appended { end: Lsn(1) },
-            Reply::Appended { end: Lsn(1) }
+            Reply::Appended { tail: Lsn(1) },
+            Reply::Appended { tail: Lsn(1) }
         ]
     );
     let file = fs::read(test.segment()).unwrap();
@@ -658,8 +679,8 @@ fn recovery_cuts_interleaved_torn_tail_and_keeps_the_other_stream() {
     test.writer(B);
     test.batch([append(A, 1, 1, &[b"a1"], 1), append(B, 1, 1, &[b"b1"], 1)]);
     let segment = test.segment();
-    let a = wal::entry(&append(A, 1, 2, &[b"a2"], 2), &Bytes::new()).unwrap();
-    let b = wal::entry(&append(B, 1, 2, &[b"b2"], 2), &Bytes::new()).unwrap();
+    let a = wal::entry(&append(A, 1, 2, &[b"a2"], 2), None).unwrap();
+    let b = wal::entry(&append(B, 1, 2, &[b"b2"], 2), None).unwrap();
     let mut tail = BytesMut::new();
     wal::fragment(&mut tail, A, true, false, &a[..30]);
     wal::fragment(&mut tail, B, true, true, &b);
@@ -734,7 +755,7 @@ async fn read_waits_for_commit_and_times_out_at_the_end() {
         sync(A, 1, 1, &[], 0, true),
         append(A, 1, 1, &[b"x"], 0),
     ] {
-        keeper.call(CLIENT, request).await.unwrap();
+        keeper.call(&CLIENT, request).await.unwrap();
     }
     let delayed = Request::Read {
         stream: A,
@@ -743,10 +764,10 @@ async fn read_waits_for_commit_and_times_out_at_the_end() {
         wait_ms: 1000,
     };
     let started = tokio::time::Instant::now();
-    let waiting = keeper.call(CLIENT, delayed);
+    let waiting = keeper.call(&CLIENT, delayed);
     let publish = async {
         tokio::time::sleep(Duration::from_millis(25)).await;
-        keeper.call(CLIENT, append(A, 1, 2, &[], 1)).await.unwrap()
+        keeper.call(&CLIENT, append(A, 1, 2, &[], 1)).await.unwrap()
     };
     let (result, _) = tokio::join!(waiting, publish);
     assert_eq!(result.unwrap(), page(1, 1, &[(1, b"x")]));
@@ -754,7 +775,7 @@ async fn read_waits_for_commit_and_times_out_at_the_end() {
     let started = tokio::time::Instant::now();
     let result = keeper
         .call(
-            CLIENT,
+            &CLIENT,
             Request::Read {
                 stream: A,
                 from: Lsn(2),
@@ -770,7 +791,7 @@ async fn read_waits_for_commit_and_times_out_at_the_end() {
 #[test]
 fn nomination_policy_can_refuse_a_seal() {
     let mut test = Harness::new(Limits::default());
-    test.engine.policy = Arc::new(|_: &str, stream, epoch, _| stream == A && epoch == Epoch(2));
+    test.engine.policy = Arc::new(|_: &Identity, stream, epoch| stream == A && epoch == Epoch(2));
     test.send(create(A));
     assert_eq!(test.send(seal(A, 1)), Reply::Refused(Refusal::Unauthorized));
     assert!(matches!(test.send(seal(A, 2)), Reply::Sealed(_)));
@@ -778,12 +799,16 @@ fn nomination_policy_can_refuse_a_seal() {
 
 struct Local(HashMap<KeeperId, Keeper>);
 impl Transport for Local {
+    fn identity(&self) -> &Identity {
+        &CLIENT
+    }
+
     fn call(&self, keeper: KeeperId, request: Request) -> BoxFuture<'_, CallResult> {
         Box::pin(async move {
             self.0
                 .get(&keeper)
                 .ok_or(TransportError::Unreachable)?
-                .call(CLIENT, request)
+                .call(&CLIENT, request)
                 .await
         })
     }
@@ -822,7 +847,7 @@ async fn sweeper_uses_two_survivors_and_activates_the_trimmed_learner() {
             .call(second, sync(A, 2, 3, &[], 1, true))
             .await
             .unwrap(),
-        Reply::Synced { end: Lsn(2) }
+        Reply::Synced { tail: Lsn(2) }
     );
 
     assert_eq!(
@@ -839,7 +864,6 @@ async fn sweeper_uses_two_survivors_and_activates_the_trimmed_learner() {
         survivors: [first, second],
         learner: replacement,
         epoch: Epoch(3),
-        holder: HOLDER,
     };
     let missing = transport.0.remove(&second).unwrap();
     let outcome = sweep_idle(&transport, [plan]).await.pop().unwrap().1;
@@ -861,7 +885,7 @@ async fn sweeper_uses_two_survivors_and_activates_the_trimmed_learner() {
             panic!("missing swept stream")
         };
         assert_eq!(
-            (view.learner, view.synced, view.end, view.floor, view.commit),
+            (view.learner, view.synced, view.tail, view.floor, view.head),
             (false, Some(Epoch(3)), Lsn(2), Lsn(2), Lsn(2))
         );
         assert_eq!(
@@ -950,7 +974,7 @@ fn corrupt_extent_cannot_supply_a_read() {
     let mut file = OpenOptions::new().write(true).open(path).unwrap();
     file.seek(SeekFrom::End(-1)).unwrap();
     file.write_all(b"!").unwrap();
-    let (work, mut result) = work(CLIENT, read(A, 1));
+    let (work, mut result) = work(&CLIENT, read(A, 1));
     let error = test.engine.process(VecDeque::from([work])).unwrap_err();
     assert_eq!(error.to_string(), "stream extent checksum mismatch");
     assert!(matches!(
@@ -961,6 +985,10 @@ fn corrupt_extent_cannot_supply_a_read() {
 
 struct SplitReplacement<'a>(&'a Local);
 impl Transport for SplitReplacement<'_> {
+    fn identity(&self) -> &Identity {
+        &CLIENT
+    }
+
     fn call(&self, keeper: KeeperId, request: Request) -> BoxFuture<'_, CallResult> {
         Box::pin(async move {
             if keeper == MEMBERS[1] && matches!(request, Request::Replace { .. }) {
@@ -997,7 +1025,6 @@ async fn replacement_fences_stale_routes_and_resumes_a_split_install() {
         survivors: [MEMBERS[0], MEMBERS[1]],
         learner,
         epoch: Epoch(2),
-        holder: HOLDER,
     };
     let lifetime = SplitReplacement(&transport);
     assert!(
@@ -1070,7 +1097,6 @@ fn replacement_ensemble_survives_wal_recovery() {
         test.send(Request::Replace {
             stream: A,
             epoch: Epoch(1),
-            holder: HOLDER,
             from: MEMBERS,
             to: new,
         }),

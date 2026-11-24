@@ -43,7 +43,7 @@ use super::{
     wire::*,
 };
 
-const ALPN: &[u8] = b"logkeeper-stream/1";
+const ALPN: &[u8] = b"logkeeper-stream/2";
 const KEEPER_URI: &str = "urn:logkeeper:keeper:";
 const CLIENT_URI: &str = "urn:logkeeper:client:";
 const CONNECTIONS: usize = 256;
@@ -148,9 +148,9 @@ async fn serve_connection(
     let mut channel = timeout(FRAME_TIMEOUT, acceptor.accept(socket)).await??;
     let (_, peer) = channel.get_ref();
     let leaf = leaf(peer.peer_certificates())?;
-    let principal = certificate_uri(leaf, CLIENT_URI)?;
-    let can_read = clients.contains(&principal);
-    let can_write = writers.contains(&principal);
+    let identity = client_identity(leaf)?;
+    let can_read = clients.contains(identity.as_str());
+    let can_write = writers.contains(identity.as_str());
     if peer.alpn_protocol() != Some(ALPN) || (!can_read && !can_write) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -166,7 +166,7 @@ async fn serve_connection(
         };
         let reply = if allowed {
             keeper
-                .call(&principal, request)
+                .call(&identity, request)
                 .await
                 .map_err(|error| io::Error::other(format!("{error:?}")))?
         } else {
@@ -188,6 +188,8 @@ struct Route {
 }
 
 pub struct TcpTransport {
+    identity: Identity,
+    read_order: Vec<KeeperId>,
     tls: TlsConnector,
     routes: BTreeMap<KeeperId, Route>,
     deadline: Duration,
@@ -200,8 +202,11 @@ impl TcpTransport {
         routes: impl IntoIterator<Item = (KeeperId, String)>,
         deadline: Duration,
     ) -> io::Result<Self> {
+        let (tls, identity) = credentials.client()?;
         let mut transport = Self {
-            tls: credentials.client()?,
+            identity,
+            read_order: Vec::new(),
+            tls,
             routes: BTreeMap::new(),
             deadline,
         };
@@ -220,6 +225,7 @@ impl TcpTransport {
             {
                 return Err(invalid("invalid or duplicate keeper route"));
             }
+            transport.read_order.push(id);
         }
         Ok(transport)
     }
@@ -263,6 +269,7 @@ impl TcpTransport {
             if transport.routes.insert(id, route).is_some() {
                 return Err(invalid("duplicate keeper identity"));
             }
+            transport.read_order.push(id);
             ensemble[index] = id;
         }
         Ok((transport, ensemble))
@@ -303,6 +310,15 @@ impl TcpTransport {
 }
 
 impl Transport for TcpTransport {
+    fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    fn read_order(&self, mut ensemble: [KeeperId; 3]) -> [KeeperId; 3] {
+        ensemble.sort_by_key(|keeper| self.read_order.iter().position(|id| id == keeper).unwrap_or(usize::MAX));
+        ensemble
+    }
+
     fn call(
         &self,
         keeper: KeeperId,
@@ -361,23 +377,25 @@ impl Credentials {
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
-    fn client(&self) -> io::Result<TlsConnector> {
+    fn client(&self) -> io::Result<(TlsConnector, Identity)> {
         let provider = Arc::new(ring::default_provider());
         let verifier = Arc::new(KeeperVerifier {
             roots: self.root_store()?,
             algorithms: provider.signature_verification_algorithms,
         });
+        let chain = certificates(&self.certificate)?;
+        let identity = client_identity(leaf(Some(&chain))?)?;
         let mut config = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&TLS13])
             .map_err(display_error)?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
-            .with_client_auth_cert(certificates(&self.certificate)?, self.key()?)
+            .with_client_auth_cert(chain, self.key()?)
             .map_err(display_error)?;
         config.alpn_protocols = vec![ALPN.to_vec()];
         config.enable_sni = false;
         config.resumption = rustls::client::Resumption::disabled();
-        Ok(TlsConnector::from(Arc::new(config)))
+        Ok((TlsConnector::from(Arc::new(config)), identity))
     }
 
     fn key(&self) -> io::Result<PrivateKeyDer<'static>> {
@@ -484,6 +502,14 @@ fn certificate_uri(certificate: &CertificateDer<'_>, prefix: &str) -> io::Result
         return Err(invalid("ambiguous or empty Logkeeper certificate URI"));
     }
     Ok(uri.to_owned())
+}
+
+fn client_identity(certificate: &CertificateDer<'_>) -> io::Result<Identity> {
+    let uri = certificate_uri(certificate, CLIENT_URI)?;
+    if !valid_client_uri(&uri) {
+        return Err(invalid("invalid client URI"));
+    }
+    Ok(Identity::from(uri))
 }
 
 fn keeper_id(certificate: &CertificateDer<'_>) -> io::Result<KeeperId> {

@@ -49,7 +49,7 @@ impl History {
         }
     }
 
-    pub(super) async fn wave(
+    pub(super) async fn round(
         &mut self,
         clients: &Clients,
         operations: impl IntoIterator<Item = (usize, Op)>,
@@ -189,7 +189,7 @@ impl Search<'_> {
                 continue;
             }
             let mut next = key.1.clone();
-            if next.step(call.identity, &call.op) == call.result && self.visit(placed | bit, next) {
+            if next.step(&call.identity, &call.op) == call.result && self.visit(placed | bit, next) {
                 return true;
             }
         }
@@ -203,20 +203,20 @@ enum Model {
     Absent,
     Created {
         sealed: Option<(Epoch, Identity)>,
-        end: Lsn,
+        head: Lsn,
         floor: Lsn,
         retained: BTreeMap<Lsn, (Epoch, Bytes)>,
     },
 }
 
 impl Model {
-    fn step(&mut self, caller: Identity, op: &Op) -> Result<Value> {
+    fn step(&mut self, caller: &Identity, op: &Op) -> Result<Value> {
         use JournalError::*;
         if matches!(op, Op::Create) {
             if matches!(self, Self::Absent) {
                 *self = Self::Created {
                     sealed: None,
-                    end: Lsn(0),
+                    head: Lsn(0),
                     floor: Lsn(1),
                     retained: BTreeMap::new(),
                 };
@@ -225,7 +225,7 @@ impl Model {
         }
         let Self::Created {
             sealed,
-            end,
+            head,
             floor,
             retained,
         } = self
@@ -233,30 +233,30 @@ impl Model {
             return Err(NotFound);
         };
         let fence = Fenced {
-            current: sealed.map_or(Epoch(0), |(epoch, _)| epoch),
+            current: sealed.as_ref().map_or(Epoch(0), |(epoch, _)| *epoch),
         };
         let conflict = Conflict {
-            committed_end: *end,
+            head: *head,
         };
         match op {
             Op::Create => unreachable!(),
             Op::Seal(epoch) => {
-                if let Some((current, owner)) = *sealed
-                    && (*epoch < current || (*epoch == current && caller != owner))
+                if let Some((current, owner)) = sealed.as_ref()
+                    && (epoch < current || (epoch == current && caller != owner))
                 {
                     return Err(fence);
                 }
-                *sealed = Some((*epoch, caller));
-                Ok(Value::Position(*end))
+                *sealed = Some((*epoch, caller.clone()));
+                Ok(Value::Position(*head))
             }
             Op::Append(epoch, at, payload) => {
-                if *sealed != Some((*epoch, caller)) {
+                if !sealed.as_ref().is_some_and(|(current, owner)| current == epoch && owner == caller) {
                     return Err(fence);
                 }
                 if at < floor {
                     return Err(Trimmed { floor: *floor });
                 }
-                if at.0 == end.0 + 1 {
+                if at.0 == head.0 + 1 {
                     if payload.len() > LIMITS.max_record_bytes {
                         return Err(TooLarge {
                             max: LIMITS.max_record_bytes,
@@ -270,7 +270,7 @@ impl Model {
                         return Err(Full { floor: *floor });
                     }
                     retained.insert(*at, (*epoch, payload.clone()));
-                    *end = *at;
+                    *head = *at;
                 } else if retained.get(at) != Some(&(*epoch, payload.clone())) {
                     return Err(conflict);
                 }
@@ -288,15 +288,15 @@ impl Model {
                 Ok(Value::Page(Page {
                     floor: *floor,
                     records,
-                    end: *end,
+                    head: *head,
                 }))
             }
-            Op::Head => Ok(Value::Position(*end)),
+            Op::Head => Ok(Value::Position(*head)),
             Op::Trim(epoch, through) => {
-                if *sealed != Some((*epoch, caller)) {
+                if !sealed.as_ref().is_some_and(|(current, owner)| current == epoch && owner == caller) {
                     return Err(fence);
                 }
-                if through > end {
+                if through > head {
                     return Err(conflict);
                 }
                 if through >= floor {
@@ -315,12 +315,12 @@ mod tests {
 
     #[test]
     fn witnesses_append_on_either_side_of_a_seal() {
-        let old = Identity(1);
-        let new = Identity(2);
+        let old = Identity::from_static("urn:logkeeper:client:1");
+        let new = Identity::from_static("urn:logkeeper:client:2");
         let mut calls: Vec<_> = [
-            (old, Op::Create, 0, 1, Ok(Value::Unit)),
-            (old, Op::Seal(Epoch(1)), 2, 3, Ok(Value::Position(Lsn(0)))),
-            (new, Op::Seal(Epoch(2)), 4, 7, Ok(Value::Position(Lsn(1)))),
+            (old.clone(), Op::Create, 0, 1, Ok(Value::Unit)),
+            (old.clone(), Op::Seal(Epoch(1)), 2, 3, Ok(Value::Position(Lsn(0)))),
+            (new.clone(), Op::Seal(Epoch(2)), 4, 7, Ok(Value::Position(Lsn(1)))),
             (
                 old,
                 Op::Append(Epoch(1), Lsn(1), Bytes::from_static(b"a")),
@@ -328,7 +328,7 @@ mod tests {
                 6,
                 Ok(Value::Position(Lsn(1))),
             ),
-            (new, Op::Head, 8, 9, Ok(Value::Position(Lsn(1)))),
+            (new.clone(), Op::Head, 8, 9, Ok(Value::Position(Lsn(1)))),
         ]
         .into_iter()
         .map(|(identity, op, invocation, response, result)| Call {

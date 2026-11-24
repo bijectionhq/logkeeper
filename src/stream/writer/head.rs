@@ -55,9 +55,9 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
     let mut calls = FuturesUnordered::from_iter(stream.ensemble.into_iter().enumerate().map(
         |(index, keeper)| async move {
             if let Some(mut observation) = active.observation(index, opened) {
-                if let Ok(end) = observation.wait_for(|seen| seen.is_some()).await {
-                    match end.as_ref().unwrap() {
-                        Ok(end) => return Ok(*end),
+                if let Ok(tail) = observation.wait_for(|seen| seen.is_some()).await {
+                    match tail.as_ref().unwrap() {
+                        Ok(tail) => return Ok(*tail),
                         Err(error @ JournalError::Fenced { .. }) => return Err(error.clone()),
                         _ => {}
                     }
@@ -67,12 +67,12 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
             match view.promised {
                 Some((current, holder))
                     if current > active.epoch
-                        || (current == active.epoch && holder != io.holder) =>
+                        || (current == active.epoch && &holder != io.transport.identity()) =>
                 {
                     Err(JournalError::Fenced { current })
                 }
                 Some((epoch, _)) if epoch == active.epoch && view.synced == Some(epoch) => {
-                    Ok(view.end)
+                    Ok(view.tail)
                 }
                 _ => Err(JournalError::Unavailable),
             }
@@ -83,13 +83,13 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
     let mut errors = Vec::new();
     while let Some(reply) = calls.next().await {
         match reply {
-            Ok(end) => {
+            Ok(tail) => {
                 count += 1;
-                sample = sample.max(end);
+                sample = sample.max(tail);
                 if count == QUORUM {
-                    let end = active.cover(sample).await?;
-                    active.published(end).await?;
-                    return Ok(end);
+                    let head = active.cover(sample).await?;
+                    active.published(head).await?;
+                    return Ok(head);
                 }
             }
             Err(error @ JournalError::Fenced { current }) if current > active.epoch => {
@@ -102,7 +102,7 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
 }
 
 async fn observer(io: &Io, stream: &Stream) -> Result<Lsn> {
-    // Allow a concurrent seal or commit publication to finish. Each attempt
+    // Allow a concurrent seal or head publication to finish. Each attempt
     // opens its own quorum round and must independently cover the result.
     let deadline = tokio::time::Instant::now() + SETTLE;
     loop {
@@ -127,17 +127,17 @@ async fn observer_round(io: &Io, stream: &Stream) -> Result<Lsn> {
             Ok(view) => views.push(view),
             Err(error) => errors.push(error),
         }
-        if let Some(end) = observed_end(&views) {
-            return Ok(end);
+        if let Some(head) = observed_head(&views) {
+            return Ok(head);
         }
     }
     Err(refusal(&errors))
 }
 
-fn observed_end(views: &[StreamView]) -> Option<Lsn> {
+fn observed_head(views: &[StreamView]) -> Option<Lsn> {
     let epoch = views
         .iter()
-        .filter_map(|view| view.promised.map(|p| p.0))
+        .filter_map(|view| view.promised.as_ref().map(|p| p.0))
         .max();
     views
         .iter()
@@ -146,16 +146,16 @@ fn observed_end(views: &[StreamView]) -> Option<Lsn> {
             let eligible = |view: &&StreamView| {
                 view.promised == candidate.promised
                     && view.synced == epoch
-                    && view.promised.map(|p| p.0) == epoch
+                    && view.promised.as_ref().map(|p| p.0) == epoch
             };
-            let end = views.iter().filter(eligible).map(|view| view.end).max()?;
+            let tail = views.iter().filter(eligible).map(|view| view.tail).max()?;
             (views
                 .iter()
                 .filter(eligible)
-                .filter(|view| view.commit >= end)
+                .filter(|view| view.head >= tail)
                 .count()
                 >= QUORUM)
-                .then_some(end)
+                .then_some(tail)
         })
 }
 
@@ -176,9 +176,9 @@ pub(super) async fn check_keeper(
         .await?
     {
         Reply::Checked(view)
-            if view.commit <= view.end
+            if view.head <= view.tail
                 && view.floor.0 > 0
-                && view.floor.0 - 1 <= view.commit.0
+                && view.floor.0 - 1 <= view.head.0
                 && view.ensemble == stream.ensemble
                 && !view.learner =>
         {

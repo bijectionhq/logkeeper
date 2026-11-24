@@ -10,19 +10,19 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
-use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, Result, StreamId};
+use journal_contract::{BoxFuture, Epoch, Identity, Journal, JournalError, Lsn, Page, Result, StreamId};
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use self::{append::Active, recovery::Recovery};
-use super::wire::{Holder, KeeperId, Refusal, Reply, Request, Transport};
+use super::wire::{ KeeperId, Refusal, Reply, Request, Transport};
 
 const QUORUM: usize = 2;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Optional admission policy for seal. By default any authenticated holder can seal.
+/// Optional admission policy for seal. By default any authenticated identity can seal.
 pub trait SealPolicy: Send + Sync {
-    fn authorize(&self, stream: StreamId, epoch: Epoch, holder: Holder) -> Result<()>;
+    fn authorize(&self, stream: StreamId, epoch: Epoch, identity: &Identity) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -35,7 +35,6 @@ pub struct Writer {
 
 struct Io {
     transport: Arc<dyn Transport>,
-    holder: Holder,
 }
 
 type Heads = Vec<oneshot::Sender<Result<Lsn>>>;
@@ -50,12 +49,10 @@ struct Stream {
 
 impl Writer {
     /// `keepers` are the authenticated keeper IDs in `journal_url` order. The transport
-    /// owns endpoint discovery and TLS. Use one holder per writer process incarnation
-    /// and clone the writer to share its per-stream state.
+    /// authenticates the writer identity. Clone the writer to share its per-stream state.
     pub fn new(
         transport: Arc<dyn Transport>,
-        holder: Holder,
-        keepers: impl IntoIterator<Item = KeeperId>,
+            keepers: impl IntoIterator<Item = KeeperId>,
     ) -> Result<Self> {
         let keepers: Arc<[KeeperId]> = keepers.into_iter().collect();
         if keepers.len() < 3
@@ -67,7 +64,7 @@ impl Writer {
             return Err(JournalError::Unavailable);
         }
         Ok(Self {
-            io: Arc::new(Io { transport, holder }),
+            io: Arc::new(Io { transport }),
             keepers,
             streams: Arc::default(),
             seal_policy: None,
@@ -115,7 +112,7 @@ impl Writer {
     async fn seal_stream(&self, stream: &Arc<Stream>, epoch: Epoch) -> Result<Lsn> {
         let mut recovery = stream.mutation.lock().await;
         if let Some(policy) = &self.seal_policy {
-            policy.authorize(stream.id, epoch, self.io.holder)?;
+            policy.authorize(stream.id, epoch, self.io.transport.identity())?;
         }
         let active = stream.active.lock().clone();
         if let Some(active) = active {
@@ -140,12 +137,12 @@ impl Writer {
         let selected = recovery.as_ref().unwrap();
         let active = Active::start(self.io.clone(), stream, selected.clone());
         active.ready().await?;
-        let end = selected.end();
-        active.published(end).await?;
+        let head = selected.tail();
+        active.published(head).await?;
         if let Some(previous) = stream.active.lock().replace(active) {
             previous.close(JournalError::Fenced { current: epoch });
         }
-        Ok(end)
+        Ok(head)
     }
 
     fn active(&self, stream: &Stream, epoch: Epoch) -> Result<Arc<Active>> {
@@ -165,10 +162,10 @@ impl Writer {
             Ok(active) => active,
             Err(error) => return Err(self.authority(stream, epoch, error).await),
         };
-        let commit = active.commit();
-        if through > commit || through.0 == u64::MAX {
+        let head = active.head();
+        if through > head || through.0 == u64::MAX {
             return Err(JournalError::Conflict {
-                committed_end: commit,
+                head: head,
             });
         }
         active.published(through).await?;
@@ -181,7 +178,6 @@ impl Writer {
                         Request::Trim {
                             stream: stream.id,
                             epoch,
-                            holder: self.io.holder,
                             through,
                         },
                     )
@@ -227,7 +223,7 @@ impl Writer {
             match reply {
                 Ok(Reply::Checked(view)) => {
                     if let Some((current, holder)) = view.promised {
-                        if current > epoch || (current == epoch && holder != self.io.holder) {
+                        if current > epoch || (current == epoch && &holder != self.io.transport.identity()) {
                             errors.push(JournalError::Fenced { current });
                         }
                     }
@@ -392,7 +388,7 @@ impl Io {
         keeper: KeeperId,
         stream: StreamId,
         epoch: Epoch,
-        commit: Lsn,
+        head: Lsn,
     ) -> Result<Lsn> {
         match self
             .call(
@@ -400,15 +396,14 @@ impl Io {
                 Request::Append {
                     stream,
                     epoch,
-                    holder: self.holder,
-                    at: Lsn(commit.0 + 1),
+                    at: Lsn(head.0 + 1),
                     records: Vec::new(),
-                    commit,
+                    head,
                 },
             )
             .await?
         {
-            Reply::Appended { end } if end >= commit => Ok(end),
+            Reply::Appended { tail } if tail >= head => Ok(tail),
             _ => Err(JournalError::Unavailable),
         }
     }
@@ -437,12 +432,7 @@ where
 fn map_refusal(refusal: Refusal) -> JournalError {
     match refusal {
         Refusal::Fenced { promised } => JournalError::Fenced { current: promised },
-        Refusal::Gap { end } | Refusal::Conflict { end } => {
-            JournalError::Conflict { committed_end: end }
-        }
-        Refusal::AboveCommit { commit } => JournalError::Conflict {
-            committed_end: commit,
-        },
+        Refusal::Gap { head } | Refusal::Conflict { head } | Refusal::AboveHead { head } => JournalError::Conflict { head },
         Refusal::BelowFloor { floor } => JournalError::Trimmed { floor },
         Refusal::Full { floor } => JournalError::Full { floor },
         Refusal::TooLarge { max } => JournalError::TooLarge { max: max as usize },

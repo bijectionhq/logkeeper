@@ -12,7 +12,6 @@ pub struct Sweep {
     pub survivors: [KeeperId; 2],
     pub learner: KeeperId,
     pub epoch: Epoch,
-    pub holder: Holder,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,15 +63,15 @@ impl Sweep {
         if left.learner || right.learner {
             return Err(SweepError::History);
         }
-        let known_commit = left.commit.max(right.commit);
+        let known_commit = left.head.max(right.head);
         let floor = left.floor.max(right.floor);
         let (source, history, other, target) =
-            if (left.synced, left.end) >= (right.synced, right.end) {
+            if (left.synced, left.tail) >= (right.synced, right.tail) {
                 (first, left, second, right)
             } else {
                 (second, right, first, left)
             };
-        if history.end < known_commit || floor.0 > known_commit.0 + 1 {
+        if history.tail < known_commit || floor.0 > known_commit.0 + 1 {
             return Err(SweepError::History);
         }
 
@@ -91,7 +90,7 @@ impl Sweep {
                 transport,
                 source,
                 floor,
-                Lsn(history.end.0 + 1),
+                Lsn(history.tail.0 + 1),
                 Vec::new(),
                 Vec::new(),
                 known_commit,
@@ -99,11 +98,11 @@ impl Sweep {
             )
             .await?;
         }
-        // Both survivors now hold the selected history. Publish the adopted end to
+        // Both survivors now hold the selected history. Publish the adopted tail to
         // them before the replacement can acknowledge that it is a member.
         tokio::try_join!(
-            self.commit(transport, first, history.end),
-            self.commit(transport, second, history.end),
+            self.head(transport, first, history.tail),
+            self.head(transport, second, history.tail),
         )?;
         self.expect(
             transport,
@@ -126,7 +125,7 @@ impl Sweep {
             self.learner,
             &learner,
             floor,
-            history.end,
+            history.tail,
         )
         .await?;
         tokio::try_join!(
@@ -144,21 +143,20 @@ impl Sweep {
         keeper: KeeperId,
         target: &StreamView,
         floor: Lsn,
-        commit: Lsn,
+        head: Lsn,
     ) -> Result<(), SweepError> {
         if target.synced == Some(self.epoch) {
-            return if target.end == history.end {
+            return if target.tail == history.tail {
                 Ok(())
             } else {
                 Err(SweepError::History)
             };
         }
-        let mut from = Lsn(target.commit.0 + 1).max(floor);
-        while from <= history.end {
+        let mut from = Lsn(target.head.0 + 1).max(floor);
+        while from <= history.tail {
             let request = Request::Recover {
                 stream: self.stream,
                 epoch: self.epoch,
-                holder: self.holder,
                 from,
                 max: 8192,
             };
@@ -173,10 +171,10 @@ impl Sweep {
             let mut last = Lsn(from.0 - 1);
             let mut chunk = Vec::new();
             for (lsn, payload) in records {
-                if lsn.0 != last.0 + 1 || lsn > history.end {
+                if lsn.0 != last.0 + 1 || lsn > history.tail {
                     return Err(SweepError::History);
                 }
-                used += 28 + payload.len();
+                used += 35 + payload.len();
                 if used > MAX_FRAME_BYTES {
                     break;
                 }
@@ -203,11 +201,11 @@ impl Sweep {
                 from,
                 chunk,
                 runs,
-                commit.min(last),
-                last == history.end,
+                head.min(last),
+                last == history.tail,
             )
             .await?;
-            if last == history.end {
+            if last == history.tail {
                 return Ok(());
             }
             from = Lsn(last.0 + 1);
@@ -219,7 +217,7 @@ impl Sweep {
             from,
             Vec::new(),
             Vec::new(),
-            commit,
+            head,
             true,
         )
         .await
@@ -235,7 +233,6 @@ impl Sweep {
             stream: self.stream,
             ensemble,
             epoch: self.epoch,
-            holder: self.holder,
         };
         let mut reply = self.call(transport, keeper, seal(self.ensemble)).await?;
         // A crash can leave one survivor on each ensemble. Resume the same move.
@@ -243,7 +240,7 @@ impl Sweep {
             reply = self.call(transport, keeper, seal(next)).await?;
         }
         match reply {
-            Reply::Sealed(view) if view.promised == Some((self.epoch, self.holder)) => Ok(view),
+            Reply::Sealed(view) if view.promised.as_ref().is_some_and(|(epoch, identity)| *epoch == self.epoch && identity == transport.identity()) => Ok(view),
             _ => Err(SweepError::Reply { keeper, reply }),
         }
     }
@@ -260,7 +257,6 @@ impl Sweep {
             Request::Replace {
                 stream: self.stream,
                 epoch: self.epoch,
-                holder: self.holder,
                 from: self.ensemble,
                 to,
             },
@@ -277,34 +273,33 @@ impl Sweep {
         from: Lsn,
         records: Vec<Bytes>,
         runs: Vec<EpochRun>,
-        commit: Lsn,
+        head: Lsn,
         complete: bool,
     ) -> Result<(), SweepError> {
-        let end = Lsn(from.0 - 1 + records.len() as u64);
+        let tail = Lsn(from.0 - 1 + records.len() as u64);
         self.expect(
             transport,
             keeper,
             Request::Sync {
                 stream: self.stream,
                 epoch: self.epoch,
-                holder: self.holder,
                 floor,
                 from,
                 records,
                 runs,
-                commit,
+                head,
                 complete,
             },
-            Reply::Synced { end },
+            Reply::Synced { tail },
         )
         .await
     }
 
-    async fn commit(
+    async fn head(
         &self,
         transport: &dyn Transport,
         keeper: KeeperId,
-        end: Lsn,
+        tail: Lsn,
     ) -> Result<(), SweepError> {
         self.expect(
             transport,
@@ -312,12 +307,11 @@ impl Sweep {
             Request::Append {
                 stream: self.stream,
                 epoch: self.epoch,
-                holder: self.holder,
-                at: Lsn(end.0 + 1),
+                at: Lsn(tail.0 + 1),
                 records: Vec::new(),
-                commit: end,
+                head: tail,
             },
-            Reply::Appended { end },
+            Reply::Appended { tail },
         )
         .await
     }

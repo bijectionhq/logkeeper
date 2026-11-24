@@ -4,13 +4,13 @@ use vstd::prelude::*;
 // A slot is bound to a single keeper of the ensemble and to the append request.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == match ack {
-        Some((accepted_epoch, end)) => accepted_epoch == epoch && end >= at,
+        Some((accepted_epoch, tail)) => accepted_epoch == epoch && tail >= at,
         None => false,
     }
 ))]
 pub(super) fn covers(ack: Option<(u64, u64)>, epoch: u64, at: u64) -> bool {
     match ack {
-        Some((accepted_epoch, end)) => accepted_epoch == epoch && end >= at,
+        Some((accepted_epoch, tail)) => accepted_epoch == epoch && tail >= at,
         None => false,
     }
 }
@@ -40,22 +40,22 @@ pub(super) fn acknowledged(
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == match (left, right) {
-        (Some(a), Some(b)) => b > a || (b == a && right_end > left_end),
+        (Some(a), Some(b)) => b > a || (b == a && right_tail > left_tail),
         (None, Some(_)) => true,
-        (None, None) => right_end > left_end,
+        (None, None) => right_tail > left_tail,
         (Some(_), None) => false,
     }
 ))]
 pub(super) fn outranks(
     left: Option<u64>,
-    left_end: u64,
+    left_tail: u64,
     right: Option<u64>,
-    right_end: u64,
+    right_tail: u64,
 ) -> bool {
     match (left, right) {
-        (Some(a), Some(b)) => b > a || (b == a && right_end > left_end),
+        (Some(a), Some(b)) => b > a || (b == a && right_tail > left_tail),
         (None, Some(_)) => true,
-        (None, None) => right_end > left_end,
+        (None, None) => right_tail > left_tail,
         (Some(_), None) => false,
     }
 }

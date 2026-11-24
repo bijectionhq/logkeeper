@@ -8,15 +8,15 @@ pub(crate) fn live(deleted: bool) -> bool {
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (!has_promise || current < epoch || (current == epoch && same_holder))
+    ensures out == (!has_promise || current < epoch || (current == epoch && same_identity))
 ))]
-pub(crate) fn may_seal(has_promise: bool, current: u64, epoch: u64, same_holder: bool) -> bool {
-    !has_promise || current < epoch || (current == epoch && same_holder)
+pub(crate) fn may_seal(has_promise: bool, current: u64, epoch: u64, same_identity: bool) -> bool {
+    !has_promise || current < epoch || (current == epoch && same_identity)
 }
 
-#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (from > commit || identical)))]
-pub(crate) fn preserves_commit(from: u64, commit: u64, identical: bool) -> bool {
-    from > commit || identical
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (from > head || identical)))]
+pub(crate) fn preserves_head(from: u64, head: u64, identical: bool) -> bool {
+    from > head || identical
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (promised && synced)))]
@@ -24,19 +24,19 @@ pub(crate) fn may_append(promised: bool, synced: bool) -> bool {
     promised && synced
 }
 
-#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (through <= commit)))]
-pub(crate) fn may_trim(through: u64, commit: u64) -> bool {
-    through <= commit
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (through <= head)))]
+pub(crate) fn may_trim(through: u64, head: u64) -> bool {
+    through <= head
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == current))]
-pub(crate) fn checked_end(current: u64, _request_epoch: u64) -> u64 {
+pub(crate) fn checked_tail(current: u64, _request_epoch: u64) -> u64 {
     current
 }
 
-#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == commit))]
-pub(crate) fn read_end(commit: u64, _accepted: u64) -> u64 {
-    commit
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == head))]
+pub(crate) fn read_head(head: u64, _accepted: u64) -> u64 {
+    head
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (deleted || deleting)))]
@@ -45,15 +45,15 @@ pub(crate) fn tombstone(deleted: bool, deleting: bool) -> bool {
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (current <= next && next <= end && 0 < floor && floor as int <= next as int + 1)
+    ensures out == (current <= next && next <= tail && 0 < floor && floor as int <= next as int + 1)
 ))]
-pub(crate) fn sync_commit_valid(current: u64, next: u64, end: u64, floor: u64) -> bool {
-    current <= next && next <= end && floor > 0 && floor - 1 <= next
+pub(crate) fn sync_head_valid(current: u64, next: u64, tail: u64, floor: u64) -> bool {
+    current <= next && next <= tail && floor > 0 && floor - 1 <= next
 }
 
-#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (nonempty && last <= end && identical)))]
-pub(crate) fn append_retry(nonempty: bool, last: u64, end: u64, identical: bool) -> bool {
-    nonempty && last <= end && identical
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (nonempty && last <= tail && identical)))]
+pub(crate) fn append_retry(nonempty: bool, last: u64, tail: u64, identical: bool) -> bool {
+    nonempty && last <= tail && identical
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (floor <= from)))]
@@ -70,7 +70,7 @@ pub(crate) fn may_replace(current: bool, synced: bool, member: bool, changed: us
 pub use implementation::Limits;
 #[cfg(not(verus_keep_ghost))]
 pub(super) use implementation::{
-    Decision, StreamView, charge, decide, installs_floor, sync_start, valid_limits,
+    Decision, StreamView, charge, decide, installs_floor, promised, sync_start, valid_limits,
 };
 
 #[cfg(not(verus_keep_ghost))]
@@ -110,7 +110,7 @@ mod implementation {
         pub keeper: KeeperId,
         pub durable: Option<&'a wire::StreamView>,
         pub deleted: bool,
-        pub same_principal: bool,
+        pub identity: &'a Identity,
         pub seal_allowed: bool,
         pub identical: bool,
         pub retained_bytes: u64,
@@ -129,7 +129,7 @@ mod implementation {
 
     fn fenced(state: &wire::StreamView) -> Decision {
         refuse(Refusal::Fenced {
-            promised: state.promised.map_or(Epoch(0), |(epoch, _)| epoch),
+            promised: state.promised.as_ref().map_or(Epoch(0), |(epoch, _)| *epoch),
         })
     }
 
@@ -151,7 +151,7 @@ mod implementation {
         from.0
             .checked_sub(1)?
             .checked_add(count as u64)
-            .filter(|end| *end != u64::MAX)
+            .filter(|tail| *tail != u64::MAX)
             .map(Lsn)
     }
 
@@ -174,29 +174,33 @@ mod implementation {
         (bytes > limits.stream_quota_bytes).then(|| refuse(Refusal::Full { floor }))
     }
 
-    fn valid_runs(epoch: Epoch, from: Lsn, end: Lsn, runs: &[EpochRun]) -> bool {
+    fn valid_runs(epoch: Epoch, from: Lsn, tail: Lsn, runs: &[EpochRun]) -> bool {
         let mut next = from.0;
         for run in runs {
-            if run.epoch > epoch || run.first.0 != next || run.last < run.first || run.last > end {
+            if run.epoch > epoch || run.first.0 != next || run.last < run.first || run.last > tail {
                 return false;
             }
             next = run.last.0 + 1;
         }
-        next == end.0 + 1
+        next == tail.0 + 1
     }
 
     pub(crate) fn sync_start(state: &wire::StreamView, from: Lsn, floor: Lsn) -> Lsn {
         from.max(state.floor)
             .max(floor)
-            .max(Lsn(state.commit.0 + 1))
+            .max(Lsn(state.head.0 + 1))
     }
 
     pub(crate) fn installs_floor(state: &wire::StreamView, request: &Request) -> bool {
         matches!(request, Request::Sync {
-            epoch, floor, from, records, runs, commit, complete: false, ..
+            epoch, floor, from, records, runs, head, complete: false, ..
         } if state.synced == Some(*epoch)
-            && floor == from && floor.0.checked_sub(1) == Some(commit.0)
+            && floor == from && floor.0.checked_sub(1) == Some(head.0)
             && records.is_empty() && runs.is_empty())
+    }
+
+    pub(crate) fn promised(state: &wire::StreamView, epoch: Epoch, identity: &Identity) -> bool {
+        state.promised.as_ref().is_some_and(|(current, owner)| *current == epoch && owner == identity)
     }
 
     pub(crate) fn decide(view: &StreamView<'_>, request: &Request, limits: &Limits) -> Decision {
@@ -233,13 +237,11 @@ mod implementation {
         let Some(state) = view.durable else {
             return refuse(Refusal::NotFound);
         };
-        let promised =
-            |epoch, holder| state.promised == Some((epoch, holder)) && view.same_principal;
+        let promised = |epoch| promised(state, epoch, view.identity);
 
         match request {
             Request::Seal {
                 epoch,
-                holder,
                 ensemble,
                 ..
             } => {
@@ -249,8 +251,8 @@ mod implementation {
                 if *ensemble != state.ensemble {
                     return wrong_ensemble(state);
                 }
-                let current = state.promised.map_or(0, |(current, _)| current.0);
-                let identical = promised(*epoch, *holder);
+                let current = state.promised.as_ref().map_or(0, |(current, _)| current.0);
+                let identical = promised(*epoch);
                 if !may_seal(state.promised.is_some(), current, epoch.0, identical) {
                     return fenced(state);
                 }
@@ -262,56 +264,55 @@ mod implementation {
             }
             Request::Sync {
                 epoch,
-                holder,
                 floor,
                 from,
                 records,
                 runs,
-                commit,
+                head,
                 complete,
                 ..
             } => {
-                if !promised(*epoch, *holder) {
+                if !promised(*epoch) {
                     return fenced(state);
                 }
                 // A synced replica can skip a prefix that the writer has already trimmed.
-                // This Sync form never replaces the retained suffix or lowers the commit.
+                // This Sync form never replaces the retained suffix or lowers the head.
                 if installs_floor(state, request) {
                     return if *floor > state.floor {
                         Decision::Persist
                     } else {
-                        Decision::Reply(Reply::Synced { end: state.end })
+                        Decision::Reply(Reply::Synced { tail: state.tail })
                     };
                 }
-                let Some(end) = last(*from, records.len()) else {
-                    return refuse(Refusal::Gap { end: state.end });
+                let Some(tail) = last(*from, records.len()) else {
+                    return refuse(Refusal::Gap { head: state.head });
                 };
                 if floor.0 == 0 || *floor > *from || *from < state.floor {
                     return refuse(Refusal::BelowFloor { floor: state.floor });
                 }
-                if !sync_commit_valid(state.commit.0, commit.0, end.0, floor.0) {
-                    return refuse(Refusal::AboveCommit {
-                        commit: state.commit,
+                if !sync_head_valid(state.head.0, head.0, tail.0, floor.0) {
+                    return refuse(Refusal::AboveHead {
+                        head: state.head,
                     });
                 }
-                if *from > Lsn(state.end.0 + 1) && from != floor {
-                    return refuse(Refusal::Gap { end: state.end });
+                if *from > Lsn(state.tail.0 + 1) && from != floor {
+                    return refuse(Refusal::Gap { head: state.head });
                 }
-                if !valid_runs(*epoch, *from, end, runs)
-                    || !preserves_commit(from.0, state.commit.0, view.identical)
+                if !valid_runs(*epoch, *from, tail, runs)
+                    || !preserves_head(from.0, state.head.0, view.identical)
                 {
-                    return refuse(Refusal::Conflict { end: state.end });
+                    return refuse(Refusal::Conflict { head: state.head });
                 }
                 if state.synced == Some(*epoch) {
                     return if *complete
                         && view.identical
-                        && end <= state.end
-                        && *commit == state.commit
+                        && tail <= state.tail
+                        && *head == state.head
                         && *floor <= state.floor
                     {
-                        Decision::Reply(Reply::Synced { end: state.end })
+                        Decision::Reply(Reply::Synced { tail: state.tail })
                     } else {
-                        refuse(Refusal::Conflict { end: state.end })
+                        refuse(Refusal::Conflict { head: state.head })
                     };
                 }
                 let skip = (sync_start(state, *from, *floor).0 - from.0).min(records.len() as u64);
@@ -325,17 +326,16 @@ mod implementation {
             }
             Request::Append {
                 epoch,
-                holder,
                 at,
                 records,
-                commit,
+                head,
                 ..
             } => {
                 if !may_append(
-                    promised(*epoch, *holder),
+                    promised(*epoch),
                     state.synced == Some(*epoch) && !state.learner,
                 ) {
-                    return if promised(*epoch, *holder) {
+                    return if promised(*epoch) {
                         refuse(Refusal::NotSynced)
                     } else {
                         fenced(state)
@@ -345,29 +345,29 @@ mod implementation {
                     return refuse(Refusal::BelowFloor { floor: state.floor });
                 }
                 let Some(last) = last(*at, records.len()) else {
-                    return refuse(Refusal::Gap { end: state.end });
+                    return refuse(Refusal::Gap { head: state.head });
                 };
-                let next = Lsn(state.end.0 + 1);
+                let next = Lsn(state.tail.0 + 1);
                 if *at > next {
-                    return refuse(Refusal::Gap { end: state.end });
+                    return refuse(Refusal::Gap { head: state.head });
                 }
                 if *at < next
                     && !records.is_empty()
-                    && !append_retry(!records.is_empty(), last.0, state.end.0, view.identical)
+                    && !append_retry(!records.is_empty(), last.0, state.tail.0, view.identical)
                 {
-                    return refuse(Refusal::Conflict { end: state.end });
+                    return refuse(Refusal::Conflict { head: state.head });
                 }
-                let end = state.end.max(last);
-                if *commit > end {
-                    return refuse(Refusal::AboveCommit {
-                        commit: state.commit,
+                let tail = state.tail.max(last);
+                if *head > tail {
+                    return refuse(Refusal::AboveHead {
+                        head: state.head,
                     });
                 }
                 if *at < next || records.is_empty() {
-                    return if *commit > state.commit {
+                    return if *head > state.head {
                         Decision::Persist
                     } else {
-                        Decision::Reply(Reply::Appended { end: state.end })
+                        Decision::Reply(Reply::Appended { tail: state.tail })
                     };
                 }
                 capacity(records, view.retained_bytes, state.floor, limits)
@@ -375,19 +375,18 @@ mod implementation {
             }
             Request::Trim {
                 epoch,
-                holder,
                 through,
                 ..
             } => {
-                if !promised(*epoch, *holder) {
+                if !promised(*epoch) {
                     return fenced(state);
                 }
                 if state.synced != Some(*epoch) || state.learner {
                     return refuse(Refusal::NotSynced);
                 }
-                if !may_trim(through.0, state.commit.0) {
-                    return refuse(Refusal::AboveCommit {
-                        commit: state.commit,
+                if !may_trim(through.0, state.head.0) {
+                    return refuse(Refusal::AboveHead {
+                        head: state.head,
                     });
                 }
                 if *through < state.floor {
@@ -398,37 +397,35 @@ mod implementation {
             }
             Request::Check { epoch, .. } => {
                 let mut checked = state.clone();
-                checked.end = Lsn(checked_end(state.end.0, epoch.0));
+                checked.tail = Lsn(checked_tail(state.tail.0, epoch.0));
                 Decision::Reply(Reply::Checked(checked))
             }
             Request::Read { from, .. } if !may_read(state.floor.0, from.0) => {
                 refuse(Refusal::BelowFloor { floor: state.floor })
             }
             Request::Read { .. } => Decision::Page {
-                through: Lsn(read_end(state.commit.0, state.end.0)),
+                through: Lsn(read_head(state.head.0, state.tail.0)),
             },
             Request::Recover {
                 epoch,
-                holder,
                 from,
                 ..
             } => {
-                if !promised(*epoch, *holder) {
+                if !promised(*epoch) {
                     return fenced(state);
                 }
                 if !may_read(state.floor.0, from.0) {
                     return refuse(Refusal::BelowFloor { floor: state.floor });
                 }
-                Decision::Page { through: state.end }
+                Decision::Page { through: state.tail }
             }
             Request::Replace {
                 epoch,
-                holder,
                 from,
                 to,
                 ..
             } => {
-                if !promised(*epoch, *holder) {
+                if !promised(*epoch) {
                     return fenced(state);
                 }
                 if state.synced != Some(*epoch) {

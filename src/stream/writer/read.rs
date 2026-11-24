@@ -20,7 +20,7 @@ pub(super) async fn read(
         let mut samples = quorum(FuturesUnordered::from_iter(stream.ensemble.map(
             |keeper| async move {
                 let view = check_keeper(io, stream, keeper, Epoch(0)).await?;
-                Ok((keeper, view.floor, view.commit))
+                Ok((keeper, view.floor, view.head))
             },
         )))
         .await?;
@@ -30,21 +30,21 @@ pub(super) async fn read(
         if from < floor {
             return Err(JournalError::Trimmed { floor });
         }
-        samples.sort_unstable_by_key(|&(_, _, end)| std::cmp::Reverse(end));
-        let end = samples[0].2;
+        samples.sort_unstable_by_key(|&(_, _, tail)| std::cmp::Reverse(tail));
+        let tail = samples[0].2;
 
-        if from <= end {
+        if from <= tail {
             let mut errors = Vec::new();
-            for (keeper, _, commit) in samples {
-                if commit < end {
+            for (keeper, _, head) in samples {
+                if head < tail {
                     break;
                 }
-                match records(io, keeper, stream, from, max, end).await {
+                match records(io, keeper, stream, from, max, tail).await {
                     Ok(records) => {
                         return Ok(Page {
                             floor,
                             records,
-                            end,
+                            head: tail,
                         });
                     }
                     Err(error @ JournalError::Trimmed { .. }) => return Err(error),
@@ -57,7 +57,7 @@ pub(super) async fn read(
             return Ok(Page {
                 floor,
                 records: Vec::new(),
-                end,
+                head: tail,
             });
         }
 
@@ -77,7 +77,7 @@ pub(super) async fn read(
         }));
         while let Ok(Some(reply)) = timeout_at(deadline, polls.next()).await {
             match reply {
-                Ok(Reply::Records { commit, .. }) if commit >= from => break,
+                Ok(Reply::Records { head, .. }) if head >= from => break,
                 Err(JournalError::Trimmed { .. } | JournalError::Deleted) => break,
                 _ if !polls.is_empty() => continue,
                 _ => tokio::time::sleep_until(deadline).await,
@@ -92,9 +92,9 @@ async fn records(
     stream: &Stream,
     from: Lsn,
     max: usize,
-    end: Lsn,
+    tail: Lsn,
 ) -> Result<Vec<(Lsn, bytes::Bytes)>> {
-    let count = (end.0 - from.0 + 1).min(max as u64);
+    let count = (tail.0 - from.0 + 1).min(max as u64);
     let mut records = Vec::new();
     while (records.len() as u64) < count {
         let at = Lsn(from.0 + records.len() as u64);
@@ -112,13 +112,13 @@ async fn records(
             .await?;
         let Reply::Records {
             records: chunk,
-            commit,
+            head,
             ..
         } = reply
         else {
             return Err(JournalError::Unavailable);
         };
-        if commit < end
+        if head < tail
             || chunk.is_empty()
             || chunk.len() > max as usize
             || !chunk

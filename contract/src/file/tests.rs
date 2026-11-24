@@ -4,6 +4,7 @@ use crate::{
     Page,
     test_support::{Scratch, block_on, panics_at},
 };
+use bytes::BytesMut;
 
 const LIMITS: Limits = Limits {
     max_record_bytes: 4,
@@ -11,8 +12,8 @@ const LIMITS: Limits = Limits {
 };
 const LIVE: StreamId = StreamId(1);
 const DEAD: StreamId = StreamId(2);
-const OWNER: Identity = Identity(10);
-const OTHER: Identity = Identity(11);
+const OWNER: Identity = Identity::from_static("urn:logkeeper:client:10");
+const OTHER: Identity = Identity::from_static("urn:logkeeper:client:11");
 const EPOCH: Epoch = Epoch(0);
 const LIVE_RECOVERY: &str = "recovery preserves committed data and trim";
 const SEAL_RECOVERY: &str = "recovery preserves sealed identity";
@@ -21,6 +22,42 @@ const BEFORE_SYNC: &str = "durability precedes acknowledgement";
 
 fn bytes(data: &'static [u8]) -> Bytes {
     Bytes::from_static(data)
+}
+
+#[test]
+fn reopens_numeric_identities_as_reference_uris() {
+    let scratch = Scratch::new();
+    let path = scratch.path().join("journal");
+    {
+        let journal = FileJournal::open(&path, LIMITS).unwrap();
+        block_on(journal.handle(OWNER).create(LIVE)).unwrap();
+    }
+    let mut body = BytesMut::new();
+    body.put_u8(1);
+    body.put_u128_le(LIVE.0);
+    body.put_u64_le(EPOCH.0);
+    body.put_u128_le(10);
+    let mut frame = BytesMut::new();
+    frame.put_u64_le(body.len() as u64);
+    frame.put_u64_le(!(body.len() as u64));
+    frame.put_u32_le(crc32(&[&body]));
+    frame.put_slice(&body);
+    OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(&frame)
+        .unwrap();
+
+    let journal = FileJournal::open(&path, LIMITS).unwrap();
+    assert_eq!(
+        block_on(journal.handle(OWNER).seal(LIVE, EPOCH)),
+        Ok(Lsn(0))
+    );
+    assert_eq!(
+        block_on(journal.handle(OTHER).seal(LIVE, EPOCH)),
+        Err(Fenced { current: EPOCH }),
+    );
 }
 
 async fn populate(journal: &FileJournal) {
@@ -48,7 +85,7 @@ async fn check_live(journal: &FileJournal) {
             .await,
         Ok(Page {
             floor: Lsn(2),
-            end: Lsn(3),
+            head: Lsn(3),
             records: vec![(Lsn(2), bytes(b"bbbb")), (Lsn(3), bytes(b"cccc"))]
         }),
         "{LIVE_RECOVERY}"

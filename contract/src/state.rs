@@ -1,4 +1,4 @@
-use crate::{Epoch, Identity, JournalError, Limits, Lsn, Page, Result, StreamId};
+use crate::{Epoch, Identity, JournalError, reference::Limits, Lsn, Page, Result, StreamId};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 
@@ -42,7 +42,7 @@ enum Stream {
 pub(crate) struct Live {
     sealed: Option<(Epoch, Identity)>,
     pub(crate) floor: Lsn,
-    pub(crate) end: Lsn,
+    pub(crate) head: Lsn,
     records: VecDeque<(Epoch, Bytes)>,
     bytes: u64,
 }
@@ -72,7 +72,7 @@ impl State {
         if matches!(mutation, Mutation::Create) {
             return match self.live(stream) {
                 Ok(live) => Ok(Decision {
-                    position: live.end,
+                    position: live.head,
                     changed: false,
                 }),
                 Err(JournalError::NotFound) => Ok(Decision {
@@ -84,13 +84,13 @@ impl State {
         }
 
         let live = self.live(stream)?;
-        let mut end = live.end;
+        let mut head = live.head;
         let changed = match mutation {
             Mutation::Create => unreachable!(),
-            Mutation::Seal { epoch, identity } => match live.sealed {
-                Some(sealed) if sealed == (*epoch, *identity) => false,
-                Some((current, _)) if *epoch <= current => {
-                    return Err(JournalError::Fenced { current });
+            Mutation::Seal { epoch, identity } => match live.sealed.as_ref() {
+                Some((current, owner)) if current == epoch && owner == identity => false,
+                Some((current, _)) if epoch <= current => {
+                    return Err(JournalError::Fenced { current: *current });
                 }
                 _ => true,
             },
@@ -100,11 +100,11 @@ impl State {
                 at,
                 payload,
             } => {
-                live.check_seal(*epoch, *identity)?;
+                live.check_seal(*epoch, identity)?;
                 if *at < live.floor {
                     return Err(JournalError::Trimmed { floor: live.floor });
                 }
-                if *at <= live.end {
+                if *at <= live.head {
                     let index = (at.0 - live.floor.0) as usize;
                     let (record_epoch, record) = &live.records[index];
                     if record_epoch == epoch && record == payload {
@@ -115,7 +115,7 @@ impl State {
                     }
                     return Err(live.conflict());
                 }
-                if end.0.checked_add(1) != Some(at.0) {
+                if head.0.checked_add(1) != Some(at.0) {
                     return Err(live.conflict());
                 }
                 if payload.len() > self.limits.max_record_bytes {
@@ -126,7 +126,7 @@ impl State {
                 if payload.len() as u64 > self.limits.stream_quota_bytes - live.bytes {
                     return Err(JournalError::Full { floor: live.floor });
                 }
-                end = *at;
+                head = *at;
                 true
             }
             Mutation::Trim {
@@ -134,8 +134,8 @@ impl State {
                 identity,
                 through,
             } => {
-                live.check_seal(*epoch, *identity)?;
-                if *through > end {
+                live.check_seal(*epoch, identity)?;
+                if *through > head {
                     return Err(live.conflict());
                 }
                 if through.0 == u64::MAX {
@@ -146,7 +146,7 @@ impl State {
             Mutation::Delete => true,
         };
         Ok(Decision {
-            position: end,
+            position: head,
             changed,
         })
     }
@@ -160,7 +160,7 @@ impl State {
                     Stream::Live(Live {
                         sealed: None,
                         floor: Lsn(1),
-                        end: Lsn(0),
+                        head: Lsn(0),
                         records: VecDeque::new(),
                         bytes: 0,
                     }),
@@ -180,7 +180,7 @@ impl State {
                     } => {
                         live.bytes += payload.len() as u64;
                         live.records.push_back((epoch, payload));
-                        live.end = at;
+                        live.head = at;
                     }
                     Mutation::Trim { through, .. } => {
                         let count = (through.0 - live.floor.0 + 1) as usize;
@@ -197,23 +197,23 @@ impl State {
 }
 
 impl Live {
-    fn check_seal(&self, epoch: Epoch, identity: Identity) -> Result<()> {
-        if self.sealed == Some((epoch, identity)) {
+    fn check_seal(&self, epoch: Epoch, identity: &Identity) -> Result<()> {
+        if self.sealed.as_ref().is_some_and(|(current, owner)| *current == epoch && owner == identity) {
             return Ok(());
         }
         Err(JournalError::Fenced {
-            current: self.sealed.map_or(Epoch(0), |(epoch, _)| epoch),
+            current: self.sealed.as_ref().map_or(Epoch(0), |(epoch, _)| *epoch),
         })
     }
 
     fn conflict(&self) -> JournalError {
         JournalError::Conflict {
-            committed_end: self.end,
+            head: self.head,
         }
     }
 
     pub(crate) fn page(&self, from: Lsn, max: usize) -> Page {
-        let records = if from > self.end {
+        let records = if from > self.head {
             Vec::new()
         } else {
             let offset = (from.0 - self.floor.0) as usize;
@@ -228,7 +228,7 @@ impl Live {
         Page {
             floor: self.floor,
             records,
-            end: self.end,
+            head: self.head,
         }
     }
 }

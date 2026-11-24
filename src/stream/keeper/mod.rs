@@ -25,7 +25,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use self::{
     rules::Decision,
     state::Stream,
-    wal::{FRAME_OVERHEAD, MAX_PRINCIPAL, Wal},
+    wal::{FRAME_OVERHEAD, MAX_IDENTITY_BYTES, Wal},
 };
 use super::{codec, wire::*};
 
@@ -34,23 +34,23 @@ const WAVE_BYTES: usize = 64 * 1024 * 1024;
 const WAVE_REQUESTS: usize = 64;
 type CallResult = Result<Reply, TransportError>;
 
-/// Nomination policy receives the authenticated certificate URI and proposed holder.
+/// Optional policy for the authenticated certificate identity.
 pub trait SealPolicy: Send + Sync + 'static {
-    fn allow(&self, principal: &str, stream: StreamId, epoch: Epoch, holder: Holder) -> bool;
+    fn allow(&self, identity: &Identity, stream: StreamId, epoch: Epoch) -> bool;
 }
 
 impl<F> SealPolicy for F
 where
-    F: Fn(&str, StreamId, Epoch, Holder) -> bool + Send + Sync + 'static,
+    F: Fn(&Identity, StreamId, Epoch) -> bool + Send + Sync + 'static,
 {
-    fn allow(&self, principal: &str, stream: StreamId, epoch: Epoch, holder: Holder) -> bool {
-        self(principal, stream, epoch, holder)
+    fn allow(&self, identity: &Identity, stream: StreamId, epoch: Epoch) -> bool {
+        self(identity, stream, epoch)
     }
 }
 
 struct Allow;
 impl SealPolicy for Allow {
-    fn allow(&self, _: &str, _: StreamId, _: Epoch, _: Holder) -> bool {
+    fn allow(&self, _: &Identity, _: StreamId, _: Epoch) -> bool {
         true
     }
 }
@@ -98,9 +98,9 @@ impl Keeper {
         Ok(Self { work })
     }
 
-    /// Process one request from an already authenticated principal.
-    pub async fn call(&self, principal: &str, mut request: Request) -> CallResult {
-        if principal.is_empty() || principal.len() > MAX_PRINCIPAL {
+    /// Process one request from an already authenticated identity.
+    pub async fn call(&self, identity: &Identity, mut request: Request) -> CallResult {
+        if identity.as_str().is_empty() || identity.as_str().len() > MAX_IDENTITY_BYTES {
             return Ok(Reply::Refused(Refusal::Unauthorized));
         }
         let wait = match request {
@@ -108,12 +108,11 @@ impl Keeper {
             _ => Duration::ZERO,
         };
         let deadline = tokio::time::Instant::now() + wait;
-        let principal = Bytes::copy_from_slice(principal.as_bytes());
         loop {
             let (done, result) = oneshot::channel();
             self.work
                 .send(Work {
-                    principal: principal.clone(),
+                    identity: identity.clone(),
                     request: request.clone(),
                     done,
                     pending: None,
@@ -128,7 +127,7 @@ impl Keeper {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Err(TransportError::Unreachable),
                 Err(_) => {
-                    // Sample once more at the deadline in case a commit raced the timer.
+                    // Sample once more at the deadline in case a head raced the timer.
                     if let Request::Read { wait_ms, .. } = &mut request {
                         *wait_ms = 0;
                     }
@@ -143,12 +142,16 @@ type Done = oneshot::Sender<Response>;
 
 struct Work {
     request: Request,
-    principal: Bytes,
+    identity: Identity,
     done: Done,
     pending: Option<(Bytes, usize)>,
 }
 
 impl Work {
+    fn seal_identity(&self) -> Option<&Identity> {
+        matches!(self.request, Request::Seal { .. }).then_some(&self.identity)
+    }
+
     fn is_mutation(&self) -> bool {
         !matches!(
             self.request,
@@ -157,7 +160,7 @@ impl Work {
     }
 
     fn estimated_bytes(&self) -> usize {
-        128 + self.principal.len()
+        128 + self.identity.as_str().len()
             + match &self.request {
                 Request::Append { records, .. } => {
                     records.iter().map(|record| 4 + record.len()).sum()
@@ -235,19 +238,14 @@ impl Engine {
             if work.pending.is_none() {
                 let state = self.streams.get(&id);
                 let seal_allowed = match work.request {
-                    Request::Seal { epoch, holder, .. } => self.policy.allow(
-                        std::str::from_utf8(&work.principal).expect("principal is UTF-8"),
-                        id,
-                        epoch,
-                        holder,
-                    ),
+                    Request::Seal { epoch, .. } => self.policy.allow(&work.identity, id, epoch),
                     _ => true,
                 };
                 match state::decide(
                     state,
                     self.keeper,
                     &work.request,
-                    &work.principal,
+                    &work.identity,
                     seal_allowed,
                     &self.limits,
                     &mut self.wal.reader,
@@ -290,12 +288,8 @@ impl Engine {
                 continue;
             }
             if work.pending.is_none() {
-                let principal = if matches!(work.request, Request::Seal { .. }) {
-                    work.principal.clone()
-                } else {
-                    Bytes::new()
-                };
-                match wal::entry(&work.request, &principal) {
+                let identity = work.seal_identity();
+                match wal::entry(&work.request, identity) {
                     Ok(entry) => work.pending = Some((entry, 0)),
                     Err(error) => {
                         replies.push((
@@ -318,10 +312,11 @@ impl Engine {
                 continue;
             }
 
+            let identity = work.seal_identity().cloned();
             let reply = self.streams.entry(id).or_default().apply(
                 self.keeper,
                 work.request,
-                work.principal,
+                identity,
             )?;
             self.wal.dirty.insert(id);
             changed.insert(id);

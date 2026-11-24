@@ -1,4 +1,4 @@
-//! A shared timer for long polls, independent of the caller's async executor.
+//! Reference journals share one timer thread so long polls work on any executor without spawning a thread per read.
 
 use std::{
     collections::BTreeMap,

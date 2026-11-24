@@ -89,7 +89,6 @@ pub(super) struct Record {
 
 pub(super) struct Stream {
     pub view: wire::StreamView,
-    pub principal: Bytes,
     pub deleted: bool,
     pub records: VecDeque<Record>,
     pub bytes: u64,
@@ -101,20 +100,20 @@ pub(super) fn decide(
     state: Option<&Stream>,
     keeper: KeeperId,
     request: &Request,
-    principal: &[u8],
+    identity: &Identity,
     seal_allowed: bool,
     limits: &Limits,
     reader: &mut ExtentReader,
 ) -> io::Result<Decision> {
     let (identical, retained_bytes) = state
-        .map(|state| state.facts(request, principal, reader))
+        .map(|state| state.facts(request, identity, reader))
         .transpose()?
         .unwrap_or((false, 0));
     let view = rules::StreamView {
         keeper,
         durable: state.map(|state| &state.view),
         deleted: state.is_some_and(|state| state.deleted),
-        same_principal: state.is_some_and(|state| state.principal == principal),
+        identity,
         seal_allowed,
         identical,
         retained_bytes,
@@ -128,14 +127,13 @@ impl Default for Stream {
             view: wire::StreamView {
                 promised: None,
                 synced: None,
-                end: Lsn(0),
-                commit: Lsn(0),
+                tail: Lsn(0),
+                head: Lsn(0),
                 floor: Lsn(1),
                 runs: Vec::new(),
                 ensemble: [KeeperId(0); 3],
                 learner: true,
             },
-            principal: Bytes::new(),
             deleted: false,
             records: VecDeque::new(),
             bytes: 0,
@@ -163,7 +161,7 @@ impl Stream {
                 .range(offset..offset + count as usize)
                 .enumerate()
             {
-                bytes += 12 + record.payload.len();
+                bytes += 20 + record.payload.len();
                 if bytes > PAGE_BYTES {
                     break;
                 }
@@ -173,7 +171,7 @@ impl Stream {
         Ok(Reply::Records {
             floor: self.view.floor,
             records,
-            commit: self.view.commit,
+            head: self.view.head,
         })
     }
 
@@ -181,50 +179,34 @@ impl Stream {
     fn facts(
         &self,
         request: &Request,
-        principal: &[u8],
+        identity: &Identity,
         reader: &mut ExtentReader,
     ) -> io::Result<(bool, u64)> {
-        let (from, records, runs, epoch, holder, match_through, bytes) = match request {
+        let (from, records, runs, epoch, match_through, bytes) = match request {
             Request::Append {
-                at,
-                records,
-                epoch,
-                holder,
-                ..
-            } => (
-                *at,
-                records,
-                None,
-                *epoch,
-                *holder,
-                self.view.end,
-                self.bytes,
-            ),
+                at, records, epoch, ..
+            } => (*at, records, None, *epoch, self.view.tail, self.bytes),
             Request::Sync {
                 from,
                 floor,
                 records,
                 runs,
                 epoch,
-                holder,
                 ..
             } => {
                 let through = if self.view.synced == Some(*epoch) {
-                    self.view.end
+                    self.view.tail
                 } else {
-                    self.view.commit
+                    self.view.head
                 };
                 let start = rules::sync_start(&self.view, *from, *floor);
                 let first = self.view.floor.max(*floor);
                 let bytes = self.bytes_between(first, start);
-                (*from, records, Some(runs), *epoch, *holder, through, bytes)
+                (*from, records, Some(runs), *epoch, through, bytes)
             }
             _ => return Ok((true, self.bytes)),
         };
-        if self.view.promised != Some((epoch, holder))
-            || self.principal != principal
-            || from < self.view.floor
-        {
+        if !rules::promised(&self.view, epoch, identity) || from < self.view.floor {
             return Ok((false, bytes));
         }
         let mut remaining_runs = runs.into_iter().flatten().peekable();
@@ -260,15 +242,15 @@ impl Stream {
         Ok((true, bytes))
     }
 
-    fn bytes_between(&self, first: Lsn, end: Lsn) -> u64 {
+    fn bytes_between(&self, first: Lsn, tail: Lsn) -> u64 {
         let offset = |lsn: Lsn| {
             lsn.0
                 .saturating_sub(self.view.floor.0)
                 .min(self.records.len() as u64) as usize
         };
-        let end = offset(end);
+        let tail = offset(tail);
         self.records
-            .range(offset(first).min(end)..end)
+            .range(offset(first).min(tail)..tail)
             .map(|record| record.payload.len().max(1) as u64)
             .sum()
     }
@@ -299,11 +281,11 @@ impl Stream {
         if let Some(last) = self.view.runs.last_mut() {
             last.last = last.last.min(Lsn(from.0 - 1));
         }
-        self.view.end = Lsn(from.0 - 1);
+        self.view.tail = Lsn(from.0 - 1);
     }
 
     fn push(&mut self, epoch: Epoch, payload: Bytes) {
-        let lsn = Lsn(self.view.end.0 + 1);
+        let lsn = Lsn(self.view.tail.0 + 1);
         match self.view.runs.last_mut() {
             Some(run) if run.epoch == epoch => run.last = lsn,
             _ => self.view.runs.push(EpochRun {
@@ -317,7 +299,7 @@ impl Stream {
             epoch,
             payload: Payload::Pending(payload),
         });
-        self.view.end = lsn;
+        self.view.tail = lsn;
     }
 
     /// Apply an admitted WAL entry. Replay uses the identical transition.
@@ -325,15 +307,17 @@ impl Stream {
         &mut self,
         keeper: KeeperId,
         request: Request,
-        principal: Bytes,
+        identity: Option<Identity>,
     ) -> io::Result<Reply> {
         if rules::installs_floor(&self.view, &request)
-            && let Request::Sync { floor, commit, .. } = request
+            && let Request::Sync { floor, head, .. } = request
         {
             self.discard_before(floor);
-            self.view.end = self.view.end.max(commit);
-            self.view.commit = self.view.commit.max(commit);
-            return Ok(Reply::Synced { end: self.view.end });
+            self.view.tail = self.view.tail.max(head);
+            self.view.head = self.view.head.max(head);
+            return Ok(Reply::Synced {
+                tail: self.view.tail,
+            });
         }
         match request {
             Request::Create { ensemble, .. } => {
@@ -341,9 +325,11 @@ impl Stream {
                 self.view.learner = !ensemble.contains(&keeper);
                 Ok(Reply::Created)
             }
-            Request::Seal { epoch, holder, .. } => {
-                self.view.promised = Some((epoch, holder));
-                self.principal = principal;
+            Request::Seal { epoch, .. } => {
+                self.view.promised = Some((
+                    epoch,
+                    identity.ok_or_else(|| invalid("missing seal identity"))?,
+                ));
                 Ok(Reply::Sealed(self.view.clone()))
             }
             Request::Sync {
@@ -352,7 +338,7 @@ impl Stream {
                 floor,
                 records,
                 runs,
-                commit,
+                head,
                 complete,
                 ..
             } => {
@@ -366,26 +352,30 @@ impl Stream {
                 for (payload, epoch) in records.into_iter().zip(epochs).skip(skip) {
                     self.push(epoch, payload);
                 }
-                self.view.commit = commit;
+                self.view.head = head;
                 if complete {
                     self.view.synced = Some(epoch);
                 }
-                Ok(Reply::Synced { end: self.view.end })
+                Ok(Reply::Synced {
+                    tail: self.view.tail,
+                })
             }
             Request::Append {
                 epoch,
                 at,
                 records,
-                commit,
+                head,
                 ..
             } => {
-                if at > self.view.end {
+                if at > self.view.tail {
                     for payload in records {
                         self.push(epoch, payload);
                     }
                 }
-                self.view.commit = self.view.commit.max(commit);
-                Ok(Reply::Appended { end: self.view.end })
+                self.view.head = self.view.head.max(head);
+                Ok(Reply::Appended {
+                    tail: self.view.tail,
+                })
             }
             Request::Trim { through, .. } => {
                 self.discard_before(Lsn(through.0 + 1));

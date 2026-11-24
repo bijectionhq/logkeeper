@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    BoxFuture, FileJournal, MemoryJournal, Result,
+    BoxFuture, Result, reference::{FileJournal, MemoryJournal},
     test_support::{Scratch, block_on, panics_at},
 };
 use std::task::Context;
@@ -56,7 +56,7 @@ struct Broken {
 
 impl Broken {
     async fn bypass_fence(&self, stream: StreamId, at: Lsn, payload: Bytes) -> Result<Lsn> {
-        for identity in [Identity(2), Identity(3)] {
+        for identity in [Identity::from_static("urn:logkeeper:client:2"), Identity::from_static("urn:logkeeper:client:3")] {
             let result = self
                 .journal
                 .handle(identity)
@@ -78,7 +78,7 @@ impl Journal for Broken {
                 && self.inner.head(stream).await == Ok(Lsn(1))
             {
                 self.journal
-                    .handle(Identity(1))
+                    .handle(Identity::from_static("urn:logkeeper:client:1"))
                     .trim(stream, Epoch(1), Lsn(1))
                     .await?;
             }
@@ -122,7 +122,7 @@ impl Journal for Broken {
                     if self.inner.head(stream).await == Ok(Lsn(2)) =>
                 {
                     return Err(Conflict {
-                        committed_end: Lsn(2),
+                        head: Lsn(2),
                     });
                 }
                 (Fault::AcceptConflict, RETRY_STREAM, Lsn(1), b"other")
@@ -157,7 +157,7 @@ impl Journal for Broken {
             let mut read = self.inner.read(stream, from, max, wait);
             let result = if self.fault == Fault::LoseWake
                 && stream == POLL_STREAM
-                && self.identity == Identity(3)
+                && self.identity == Identity::from_static("urn:logkeeper:client:3")
                 && from == Lsn(2)
             {
                 poll_fn(|_| read.as_mut().poll(&mut Context::from_waker(Waker::noop()))).await
@@ -176,13 +176,13 @@ impl Journal for Broken {
         Box::pin(async move {
             let result = self.inner.head(stream).await;
             match self.fault {
-                Fault::FutureHead if stream == SEQUENCE_STREAM => result.map(|end| Lsn(end.0 + 1)),
+                Fault::FutureHead if stream == SEQUENCE_STREAM => result.map(|head| Lsn(head.0 + 1)),
                 Fault::MissingAsEmpty if stream == LIMITS_STREAM && result == Err(NotFound) => {
                     Ok(Lsn(0))
                 }
                 Fault::StaleHistoryHead if stream.0 >= FIRST_SEED_STREAM => result.map(|_| Lsn(0)),
                 Fault::FutureHistoryHead if stream.0 >= FIRST_SEED_STREAM => {
-                    result.map(|end| Lsn(end.0 + 1))
+                    result.map(|head| Lsn(head.0 + 1))
                 }
                 _ => result,
             }
@@ -193,8 +193,8 @@ impl Journal for Broken {
         Box::pin(async move {
             if stream == TRIM_STREAM
                 && match self.fault {
-                    Fault::ForgetTrim => through == Lsn(2) && self.identity == Identity(1),
-                    Fault::WrongTrimCaller => self.identity == Identity(2),
+                    Fault::ForgetTrim => through == Lsn(2) && self.identity == Identity::from_static("urn:logkeeper:client:1"),
+                    Fault::WrongTrimCaller => self.identity == Identity::from_static("urn:logkeeper:client:2"),
                     Fault::TrimBeyondEnd => through == Lsn(4),
                     _ => false,
                 }
@@ -221,7 +221,7 @@ fn rejects(fault: Fault, check: &str) {
         block_on(run(|identity| {
             Arc::new(Broken {
                 journal: journal.clone(),
-                inner: Arc::new(journal.handle(identity)),
+                inner: Arc::new(journal.handle(identity.clone())),
                 identity,
                 fault,
                 sealed: AtomicBool::new(false),

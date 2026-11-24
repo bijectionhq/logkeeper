@@ -119,7 +119,6 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
     let transport = TcpTransport::new(&writer, [(id, address.clone())], deadline).unwrap();
     let stream = StreamId(11);
     let epoch = Epoch(1);
-    let holder = Holder(42);
     let ensemble = [id, KeeperId(2), KeeperId(3)];
     assert_eq!(
         transport
@@ -128,21 +127,19 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
             .unwrap(),
         Reply::Created
     );
-    assert!(matches!(
-        transport
-            .call(
-                id,
-                Request::Seal {
-                    stream,
-                    epoch,
-                    holder,
-                    ensemble,
-                }
-            )
-            .await
-            .unwrap(),
-        Reply::Sealed(_)
-    ));
+    let seal = Request::Seal {
+        stream,
+        epoch,
+        ensemble,
+    };
+    let Reply::Sealed(view) = transport.call(id, seal).await.unwrap() else {
+        panic!("TLS writer did not seal");
+    };
+    assert_eq!(
+        view.promised,
+        Some((epoch, Identity::from(CLIENT))),
+        "the promise must contain the authenticated certificate URI"
+    );
     assert_eq!(
         transport
             .call(
@@ -150,18 +147,17 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
                 Request::Sync {
                     stream,
                     epoch,
-                    holder,
                     floor: Lsn(1),
                     from: Lsn(1),
                     records: vec![],
                     runs: vec![],
-                    commit: Lsn(0),
+                    head: Lsn(0),
                     complete: true,
                 }
             )
             .await
             .unwrap(),
-        Reply::Synced { end: Lsn(0) }
+        Reply::Synced { tail: Lsn(0) }
     );
     assert_eq!(
         transport
@@ -170,15 +166,14 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
                 Request::Append {
                     stream,
                     epoch,
-                    holder,
                     at: Lsn(1),
                     records: vec![Bytes::from_static(b"record")],
-                    commit: Lsn(1),
+                    head: Lsn(1),
                 }
             )
             .await
             .unwrap(),
-        Reply::Appended { end: Lsn(1) }
+        Reply::Appended { tail: Lsn(1) }
     );
     let read = Request::Read {
         stream,
@@ -196,7 +191,6 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
         Request::Seal {
             stream,
             epoch: Epoch(2),
-            holder,
             ensemble,
         },
         Request::Delete { stream, ensemble },
@@ -212,7 +206,7 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
         Reply::Records {
             floor: Lsn(1),
             records: vec![(Lsn(1), Bytes::from_static(b"record"))],
-            commit: Lsn(1),
+            head: Lsn(1),
         }
     );
     let wrong_roots = Credentials {
@@ -260,6 +254,15 @@ async fn writer_round_trips_through_three_tls_keepers() {
         &root,
         &roots,
     );
+    let successor_uri = "urn:logkeeper:client:successor";
+    let successor_credentials = credentials(
+        dir,
+        "successor",
+        successor_uri,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &root,
+        &roots,
+    );
     let reader_credentials = credentials(
         dir,
         "reader",
@@ -290,8 +293,8 @@ async fn writer_round_trips_through_three_tls_keepers() {
             data: dir.join(name),
             zone: format!("test-zone-{zone}"),
             tls,
-            clients: vec![CLIENT.into(), READ_ONLY.into()],
-            writers: vec![CLIENT.into()],
+            clients: vec![CLIENT.into(), successor_uri.into(), READ_ONLY.into()],
+            writers: vec![CLIENT.into(), successor_uri.into()],
             limits: Limits::default(),
         };
         tasks.push(tokio::spawn(config.serve(listener, stop.clone())));
@@ -299,16 +302,16 @@ async fn writer_round_trips_through_three_tls_keepers() {
     }
 
     let url = format!("logkeeper+tls://{}", routes.join(","));
-    let open = async |credentials: &Credentials, holder| {
+    let open = async |credentials: &Credentials| {
         let (transport, ensemble) =
             TcpTransport::discover(&url, credentials, Duration::from_secs(3))
                 .await
                 .unwrap();
-        Writer::new(Arc::new(transport), Holder(holder), ensemble).unwrap()
+        Writer::new(Arc::new(transport), ensemble).unwrap()
     };
-    let writer = open(&writer_credentials, 1).await;
-    let successor = open(&writer_credentials, 2).await;
-    let reader = open(&reader_credentials, 3).await;
+    let writer = open(&writer_credentials).await;
+    let successor = open(&successor_credentials).await;
+    let reader = open(&reader_credentials).await;
     let stream = StreamId(12);
     writer.create(stream).await.unwrap();
     assert_eq!(writer.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
@@ -319,6 +322,13 @@ async fn writer_round_trips_through_three_tls_keepers() {
             .await,
         Ok(Lsn(1))
     );
+    assert_eq!(
+        successor.seal(stream, Epoch(1)).await,
+        Err(JournalError::Fenced { current: Epoch(1) }),
+        "a different certificate identity must be fenced at the same epoch"
+    );
+    let resumed = open(&writer_credentials).await;
+    assert_eq!(resumed.seal(stream, Epoch(1)).await, Ok(Lsn(1)));
     assert_eq!(successor.seal(stream, Epoch(2)).await, Ok(Lsn(1)));
     assert_eq!(reader.head(stream).await, Ok(Lsn(1)));
     assert_eq!(

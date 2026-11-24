@@ -1,7 +1,8 @@
-//! Length-prefixed keeper messages. The length is a big-endian u32, excluding itself.
+//! Protobuf keeper messages inside big-endian length-prefixed frames.
 use std::io;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
+use prost::Message;
 #[cfg(any(test, feature = "stream"))]
 use tokio::io::{AsyncRead, AsyncReadExt};
 #[cfg(feature = "stream")]
@@ -40,158 +41,6 @@ pub(super) async fn write_frame(
     channel.flush().await
 }
 
-pub(super) fn put_count(out: &mut BytesMut, len: usize) -> io::Result<()> {
-    out.put_u32(
-        len.try_into()
-            .map_err(|_| invalid("keeper collection too large"))?,
-    );
-    Ok(())
-}
-
-pub(super) fn put_bytes(out: &mut BytesMut, bytes: &[u8]) -> io::Result<()> {
-    put_count(out, bytes.len())?;
-    out.put_slice(bytes);
-    Ok(())
-}
-
-fn put_records(out: &mut BytesMut, records: &[Bytes]) -> io::Result<()> {
-    put_count(out, records.len())?;
-    for record in records {
-        put_bytes(out, record)?;
-    }
-    Ok(())
-}
-
-fn put_runs(out: &mut BytesMut, runs: &[EpochRun]) -> io::Result<()> {
-    put_count(out, runs.len())?;
-    for run in runs {
-        out.put_u64(run.epoch.0);
-        out.put_u64(run.first.0);
-        out.put_u64(run.last.0);
-    }
-    Ok(())
-}
-
-fn put_ensemble(out: &mut BytesMut, ensemble: &[KeeperId; 3]) {
-    for keeper in ensemble {
-        out.put_u128(keeper.0);
-    }
-}
-
-pub(super) fn put_view(out: &mut BytesMut, view: &StreamView) -> io::Result<()> {
-    out.put_u8(u8::from(view.promised.is_some()));
-    if let Some((epoch, holder)) = view.promised {
-        out.put_u64(epoch.0);
-        out.put_u128(holder.0);
-    }
-    out.put_u8(u8::from(view.synced.is_some()));
-    if let Some(epoch) = view.synced {
-        out.put_u64(epoch.0);
-    }
-    out.put_u64(view.end.0);
-    out.put_u64(view.commit.0);
-    out.put_u64(view.floor.0);
-    put_ensemble(out, &view.ensemble);
-    out.put_u8(u8::from(view.learner));
-    put_runs(out, &view.runs)
-}
-
-pub(super) struct Decoder(pub Bytes);
-
-impl Decoder {
-    fn take(&mut self, length: usize) -> io::Result<Bytes> {
-        if self.0.len() < length {
-            return Err(invalid("short keeper message"));
-        }
-        Ok(self.0.split_to(length))
-    }
-
-    pub(super) fn u8(&mut self) -> io::Result<u8> {
-        Ok(self.take(1)?.get_u8())
-    }
-
-    pub(super) fn u32(&mut self) -> io::Result<u32> {
-        Ok(self.take(4)?.get_u32())
-    }
-
-    pub(super) fn u64(&mut self) -> io::Result<u64> {
-        Ok(self.take(8)?.get_u64())
-    }
-
-    pub(super) fn u128(&mut self) -> io::Result<u128> {
-        Ok(self.take(16)?.get_u128())
-    }
-
-    pub(super) fn boolean(&mut self) -> io::Result<bool> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(invalid("invalid keeper boolean")),
-        }
-    }
-
-    pub(super) fn bytes(&mut self) -> io::Result<Bytes> {
-        let count = self.u32()? as usize;
-        self.take(count)
-    }
-
-    pub(super) fn count(&mut self, element_minimum: usize) -> io::Result<usize> {
-        let count = self.u32()? as usize;
-        if count > self.0.len() / element_minimum {
-            return Err(invalid("short keeper collection"));
-        }
-        Ok(count)
-    }
-
-    fn records(&mut self) -> io::Result<Vec<Bytes>> {
-        (0..self.count(4)?).map(|_| self.bytes()).collect()
-    }
-
-    fn runs(&mut self) -> io::Result<Vec<EpochRun>> {
-        (0..self.count(24)?)
-            .map(|_| {
-                Ok(EpochRun {
-                    epoch: Epoch(self.u64()?),
-                    first: Lsn(self.u64()?),
-                    last: Lsn(self.u64()?),
-                })
-            })
-            .collect()
-    }
-
-    fn ensemble(&mut self) -> io::Result<[KeeperId; 3]> {
-        Ok([
-            KeeperId(self.u128()?),
-            KeeperId(self.u128()?),
-            KeeperId(self.u128()?),
-        ])
-    }
-
-    pub(super) fn view(&mut self) -> io::Result<StreamView> {
-        Ok(StreamView {
-            promised: self
-                .boolean()?
-                .then(|| Ok::<_, io::Error>((Epoch(self.u64()?), Holder(self.u128()?))))
-                .transpose()?,
-            synced: self.boolean()?.then(|| self.u64().map(Epoch)).transpose()?,
-            end: Lsn(self.u64()?),
-            commit: Lsn(self.u64()?),
-            floor: Lsn(self.u64()?),
-            ensemble: self.ensemble()?,
-            learner: self.boolean()?,
-            runs: self.runs()?,
-        })
-    }
-
-    pub(super) fn finish(self) -> io::Result<()> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            Err(invalid("trailing keeper message bytes"))
-        }
-    }
-}
-
 pub(super) fn stream(request: &Request) -> StreamId {
     match *request {
         Request::Create { stream, .. }
@@ -208,347 +57,568 @@ pub(super) fn stream(request: &Request) -> StreamId {
 }
 
 pub fn encode_request(request: &Request) -> io::Result<Bytes> {
-    let mut out = BytesMut::new();
-    write_request(&mut out, request)?;
-    if out.len() > MAX_FRAME_BYTES {
-        return Err(invalid("keeper request too large"));
-    }
-    Ok(out.freeze())
-}
-
-fn write_request(out: &mut BytesMut, request: &Request) -> io::Result<()> {
-    let tag = match request {
-        Request::Create { .. } => 0,
-        Request::Seal { .. } => 1,
-        Request::Sync { .. } => 2,
-        Request::Append { .. } => 3,
-        Request::Trim { .. } => 4,
-        Request::Check { .. } => 5,
-        Request::Read { .. } => 6,
-        Request::Delete { .. } => 7,
-        Request::Recover { .. } => 8,
-        Request::Replace { .. } => 9,
-    };
-    out.put_u8(tag);
-    out.put_u128(stream(request).0);
-    match request {
-        Request::Create { ensemble, .. } => put_ensemble(out, ensemble),
-        Request::Seal {
-            epoch,
-            holder,
-            ensemble,
-            ..
-        } => {
-            out.put_u64(epoch.0);
-            out.put_u128(holder.0);
-            put_ensemble(out, ensemble);
-        }
-        Request::Sync {
-            epoch,
-            holder,
-            floor,
-            from,
-            records,
-            runs,
-            commit,
-            complete,
-            ..
-        } => {
-            out.put_u64(epoch.0);
-            out.put_u128(holder.0);
-            out.put_u64(floor.0);
-            out.put_u64(from.0);
-            out.put_u64(commit.0);
-            out.put_u8(u8::from(*complete));
-            put_runs(out, runs)?;
-            put_records(out, records)?;
-        }
-        Request::Append {
-            epoch,
-            holder,
-            at,
-            records,
-            commit,
-            ..
-        } => {
-            out.put_u64(epoch.0);
-            out.put_u128(holder.0);
-            out.put_u64(at.0);
-            out.put_u64(commit.0);
-            put_records(out, records)?;
-        }
-        Request::Trim {
-            epoch,
-            holder,
-            through,
-            ..
-        } => {
-            out.put_u64(epoch.0);
-            out.put_u128(holder.0);
-            out.put_u64(through.0);
-        }
-        Request::Check { epoch, .. } => out.put_u64(epoch.0),
-        Request::Read {
-            from, max, wait_ms, ..
-        } => {
-            out.put_u64(from.0);
-            out.put_u32(*max);
-            out.put_u32(*wait_ms);
-        }
-        Request::Recover {
-            epoch,
-            holder,
-            from,
-            max,
-            ..
-        } => {
-            out.put_u64(epoch.0);
-            out.put_u128(holder.0);
-            out.put_u64(from.0);
-            out.put_u32(*max);
-        }
-        Request::Replace {
-            epoch,
-            holder,
-            from,
-            to,
-            ..
-        } => {
-            out.put_u64(epoch.0);
-            out.put_u128(holder.0);
-            put_ensemble(out, from);
-            put_ensemble(out, to);
-        }
-        Request::Delete { ensemble, .. } => put_ensemble(out, ensemble),
-    }
-    Ok(())
+    encode(&RequestFrame::from(request), MAX_FRAME_BYTES)
 }
 
 pub fn decode_request(body: Bytes) -> io::Result<Request> {
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(invalid("keeper request too large"));
-    }
-    let mut input = Decoder(body);
-    let tag = input.u8()?;
-    let stream = StreamId(input.u128()?);
-    let request = match tag {
-        0 => Request::Create {
-            stream,
-            ensemble: input.ensemble()?,
-        },
-        1 => Request::Seal {
-            stream,
-            epoch: Epoch(input.u64()?),
-            holder: Holder(input.u128()?),
-            ensemble: input.ensemble()?,
-        },
-        2 => Request::Sync {
-            stream,
-            epoch: Epoch(input.u64()?),
-            holder: Holder(input.u128()?),
-            floor: Lsn(input.u64()?),
-            from: Lsn(input.u64()?),
-            commit: Lsn(input.u64()?),
-            complete: input.boolean()?,
-            runs: input.runs()?,
-            records: input.records()?,
-        },
-        3 => Request::Append {
-            stream,
-            epoch: Epoch(input.u64()?),
-            holder: Holder(input.u128()?),
-            at: Lsn(input.u64()?),
-            commit: Lsn(input.u64()?),
-            records: input.records()?,
-        },
-        4 => Request::Trim {
-            stream,
-            epoch: Epoch(input.u64()?),
-            holder: Holder(input.u128()?),
-            through: Lsn(input.u64()?),
-        },
-        5 => Request::Check {
-            stream,
-            epoch: Epoch(input.u64()?),
-        },
-        6 => Request::Read {
-            stream,
-            from: Lsn(input.u64()?),
-            max: input.u32()?,
-            wait_ms: input.u32()?,
-        },
-        7 => Request::Delete {
-            stream,
-            ensemble: input.ensemble()?,
-        },
-        8 => Request::Recover {
-            stream,
-            epoch: Epoch(input.u64()?),
-            holder: Holder(input.u128()?),
-            from: Lsn(input.u64()?),
-            max: input.u32()?,
-        },
-        9 => Request::Replace {
-            stream,
-            epoch: Epoch(input.u64()?),
-            holder: Holder(input.u128()?),
-            from: input.ensemble()?,
-            to: input.ensemble()?,
-        },
-        _ => return Err(invalid("unknown keeper request")),
-    };
-    input.finish()?;
-    Ok(request)
+    decode::<RequestFrame>(body)?.try_into()
 }
 
 pub fn encode_reply(reply: &Reply) -> io::Result<Bytes> {
-    let mut out = BytesMut::new();
-    match reply {
-        Reply::Created => out.put_u8(0),
-        Reply::Sealed(view) => {
-            out.put_u8(1);
-            put_view(&mut out, view)?;
-        }
-        Reply::Synced { end } => {
-            out.put_u8(2);
-            out.put_u64(end.0);
-        }
-        Reply::Appended { end } => {
-            out.put_u8(3);
-            out.put_u64(end.0);
-        }
-        Reply::Trimmed { floor } => {
-            out.put_u8(4);
-            out.put_u64(floor.0);
-        }
-        Reply::Checked(view) => {
-            out.put_u8(5);
-            put_view(&mut out, view)?;
-        }
-        Reply::Records {
-            floor,
-            records,
-            commit,
-        } => {
-            out.put_u8(6);
-            out.put_u64(floor.0);
-            out.put_u64(commit.0);
-            put_count(&mut out, records.len())?;
-            for (lsn, payload) in records {
-                out.put_u64(lsn.0);
-                put_bytes(&mut out, payload)?;
-            }
-        }
-        Reply::Deleted => out.put_u8(7),
-        Reply::Replaced => out.put_u8(9),
-        Reply::Refused(refusal) => {
-            out.put_u8(8);
-            match refusal {
-                Refusal::Fenced { promised } => {
-                    out.put_u8(0);
-                    out.put_u64(promised.0);
-                }
-                Refusal::NotSynced => out.put_u8(1),
-                Refusal::Gap { end } => {
-                    out.put_u8(2);
-                    out.put_u64(end.0);
-                }
-                Refusal::Conflict { end } => {
-                    out.put_u8(3);
-                    out.put_u64(end.0);
-                }
-                Refusal::BelowFloor { floor } => {
-                    out.put_u8(4);
-                    out.put_u64(floor.0);
-                }
-                Refusal::AboveCommit { commit } => {
-                    out.put_u8(5);
-                    out.put_u64(commit.0);
-                }
-                Refusal::Full { floor } => {
-                    out.put_u8(6);
-                    out.put_u64(floor.0);
-                }
-                Refusal::TooLarge { max } => {
-                    out.put_u8(7);
-                    out.put_u32(*max);
-                }
-                Refusal::NotFound => out.put_u8(8),
-                Refusal::Deleted => out.put_u8(9),
-                Refusal::Unauthorized => out.put_u8(10),
-                Refusal::WrongEnsemble { ensemble } => {
-                    out.put_u8(11);
-                    put_ensemble(&mut out, ensemble);
-                }
-            }
-        }
-    }
-    if out.len() > MAX_FRAME_BYTES {
-        return Err(invalid("keeper reply too large"));
-    }
-    Ok(out.freeze())
+    encode(&ReplyFrame::from(reply), MAX_FRAME_BYTES)
 }
 
 pub fn decode_reply(body: Bytes) -> io::Result<Reply> {
-    if body.len() > MAX_FRAME_BYTES {
-        return Err(invalid("keeper reply too large"));
+    decode::<ReplyFrame>(body)?.try_into()
+}
+
+pub(super) fn encode_checkpoint_view(view: &StreamView) -> io::Result<Bytes> {
+    encode(&encode_view(view), u32::MAX as usize)
+}
+
+pub(super) fn decode_checkpoint_view(body: Bytes) -> io::Result<StreamView> {
+    decode_view(View::decode(body).map_err(io::Error::other)?)
+}
+
+fn encode(message: &impl Message, limit: usize) -> io::Result<Bytes> {
+    let len = message.encoded_len();
+    if len > limit {
+        return Err(invalid("keeper message too large"));
     }
-    let mut input = Decoder(body);
-    let reply = match input.u8()? {
-        0 => Reply::Created,
-        1 => Reply::Sealed(input.view()?),
-        2 => Reply::Synced {
-            end: Lsn(input.u64()?),
-        },
-        3 => Reply::Appended {
-            end: Lsn(input.u64()?),
-        },
-        4 => Reply::Trimmed {
-            floor: Lsn(input.u64()?),
-        },
-        5 => Reply::Checked(input.view()?),
-        6 => Reply::Records {
-            floor: Lsn(input.u64()?),
-            commit: Lsn(input.u64()?),
-            records: (0..input.count(12)?)
-                .map(|_| Ok((Lsn(input.u64()?), input.bytes()?)))
-                .collect::<io::Result<_>>()?,
-        },
-        7 => Reply::Deleted,
-        9 => Reply::Replaced,
-        8 => Reply::Refused(match input.u8()? {
-            0 => Refusal::Fenced {
-                promised: Epoch(input.u64()?),
-            },
-            1 => Refusal::NotSynced,
-            2 => Refusal::Gap {
-                end: Lsn(input.u64()?),
-            },
-            3 => Refusal::Conflict {
-                end: Lsn(input.u64()?),
-            },
-            4 => Refusal::BelowFloor {
-                floor: Lsn(input.u64()?),
-            },
-            5 => Refusal::AboveCommit {
-                commit: Lsn(input.u64()?),
-            },
-            6 => Refusal::Full {
-                floor: Lsn(input.u64()?),
-            },
-            7 => Refusal::TooLarge { max: input.u32()? },
-            8 => Refusal::NotFound,
-            9 => Refusal::Deleted,
-            10 => Refusal::Unauthorized,
-            11 => Refusal::WrongEnsemble {
-                ensemble: input.ensemble()?,
-            },
-            _ => return Err(invalid("unknown keeper refusal")),
+    let mut body = BytesMut::with_capacity(len);
+    message.encode(&mut body).map_err(io::Error::other)?;
+    Ok(body.freeze())
+}
+
+fn decode<M: Message + Default>(body: Bytes) -> io::Result<M> {
+    if body.is_empty() || body.len() > MAX_FRAME_BYTES {
+        return Err(invalid("invalid keeper message length"));
+    }
+    M::decode(body).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn encode_id(id: u128) -> Bytes {
+    Bytes::copy_from_slice(&id.to_be_bytes())
+}
+
+fn decode_id(id: &[u8]) -> io::Result<u128> {
+    Ok(u128::from_be_bytes(
+        id.try_into().map_err(|_| invalid("invalid ID length"))?,
+    ))
+}
+
+fn encode_ensemble(ensemble: &[KeeperId; 3]) -> Vec<Bytes> {
+    ensemble.iter().map(|id| encode_id(id.0)).collect()
+}
+
+fn decode_ensemble(ensemble: Vec<Bytes>) -> io::Result<[KeeperId; 3]> {
+    let [a, b, c]: [Bytes; 3] = ensemble
+        .try_into()
+        .map_err(|_| invalid("invalid ensemble size"))?;
+    Ok([
+        KeeperId(decode_id(&a)?),
+        KeeperId(decode_id(&b)?),
+        KeeperId(decode_id(&c)?),
+    ])
+}
+
+fn encode_runs(runs: &[EpochRun]) -> Vec<Run> {
+    runs.iter()
+        .map(|run| Run {
+            epoch: run.epoch.0,
+            first: run.first.0,
+            last: run.last.0,
+        })
+        .collect()
+}
+
+fn decode_runs(runs: Vec<Run>) -> Vec<EpochRun> {
+    runs.into_iter()
+        .map(|run| EpochRun {
+            epoch: Epoch(run.epoch),
+            first: Lsn(run.first),
+            last: Lsn(run.last),
+        })
+        .collect()
+}
+
+fn encode_view(view: &StreamView) -> View {
+    View {
+        promised: view.promised.as_ref().map(|(epoch, identity)| Promise {
+            epoch: epoch.0,
+            identity: identity.as_str().to_owned(),
         }),
-        _ => return Err(invalid("unknown keeper reply")),
+        synced: view.synced.map(|epoch| epoch.0),
+        tail: view.tail.0,
+        head: view.head.0,
+        floor: view.floor.0,
+        runs: encode_runs(&view.runs),
+        ensemble: encode_ensemble(&view.ensemble),
+        learner: view.learner,
+    }
+}
+
+fn decode_view(view: View) -> io::Result<StreamView> {
+    Ok(StreamView {
+        promised: view
+            .promised
+            .map(|promise| (Epoch(promise.epoch), Identity::from(promise.identity))),
+        synced: view.synced.map(Epoch),
+        tail: Lsn(view.tail),
+        head: Lsn(view.head),
+        floor: Lsn(view.floor),
+        runs: decode_runs(view.runs),
+        ensemble: decode_ensemble(view.ensemble)?,
+        learner: view.learner,
+    })
+}
+
+#[derive(Clone, Message)]
+struct Empty {}
+
+#[derive(Clone, Message)]
+struct Run {
+    #[prost(fixed64, tag = "1")]
+    epoch: u64,
+    #[prost(fixed64, tag = "2")]
+    first: u64,
+    #[prost(fixed64, tag = "3")]
+    last: u64,
+}
+
+#[derive(Clone, Message)]
+struct Record {
+    #[prost(fixed64, tag = "1")]
+    lsn: u64,
+    #[prost(bytes = "bytes", tag = "2")]
+    payload: Bytes,
+}
+
+#[derive(Clone, Message)]
+struct Promise {
+    #[prost(fixed64, tag = "1")]
+    epoch: u64,
+    #[prost(string, tag = "2")]
+    identity: String,
+}
+
+#[derive(Clone, Message)]
+struct View {
+    #[prost(message, optional, tag = "1")]
+    promised: Option<Promise>,
+    #[prost(fixed64, optional, tag = "2")]
+    synced: Option<u64>,
+    #[prost(fixed64, tag = "3")]
+    tail: u64,
+    #[prost(fixed64, tag = "4")]
+    head: u64,
+    #[prost(fixed64, tag = "5")]
+    floor: u64,
+    #[prost(message, repeated, tag = "6")]
+    runs: Vec<Run>,
+    #[prost(bytes = "bytes", repeated, tag = "7")]
+    ensemble: Vec<Bytes>,
+    #[prost(bool, tag = "8")]
+    learner: bool,
+}
+
+#[derive(Clone, Message)]
+struct RequestFrame {
+    #[prost(bytes = "bytes", tag = "1")]
+    stream: Bytes,
+    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
+    body: Option<RequestBody>,
+}
+
+// Each request schema declares its protobuf fields and their domain conversion together.
+macro_rules! request_messages {
+    ($($variant:ident = $tag:literal {
+        $($(#[$field_encoding:meta])* $field:ident: $wire_type:ty => $conversion:ident),+ $(,)?
+    }),+ $(,)?) => {
+        mod request {
+            use super::*;
+
+            $(
+                #[derive(Clone, Message)]
+                pub(super) struct $variant {
+                    $($(#[$field_encoding])* pub(super) $field: $wire_type,)+
+                }
+            )+
+        }
+
+        #[derive(Clone, prost::Oneof)]
+        enum RequestBody {
+            $(#[prost(message, tag = $tag)] $variant(request::$variant),)+
+        }
+
+        impl From<&Request> for RequestFrame {
+            fn from(value: &Request) -> Self {
+                let body = match value {
+                    $(Request::$variant { stream: _, $($field),+ } =>
+                        RequestBody::$variant(request::$variant {
+                            $($field: request_field!(encode $conversion, $field),)+
+                        }),)+
+                };
+                Self { stream: encode_id(stream(value).0), body: Some(body) }
+            }
+        }
+
+        impl TryFrom<RequestFrame> for Request {
+            type Error = io::Error;
+
+            fn try_from(frame: RequestFrame) -> io::Result<Self> {
+                let stream = StreamId(decode_id(&frame.stream)?);
+                Ok(match frame.body.ok_or_else(|| invalid("missing keeper request variant"))? {
+                    $(RequestBody::$variant(body) => Self::$variant {
+                        stream,
+                        $($field: request_field!(decode $conversion, body.$field),)+
+                    },)+
+                })
+            }
+        }
     };
-    input.finish()?;
-    Ok(reply)
+}
+
+macro_rules! request_field {
+    (encode copy, $value:expr) => {
+        *$value
+    };
+    (encode clone, $value:expr) => {
+        $value.clone()
+    };
+    (encode position, $value:expr) => {
+        $value.0
+    };
+    (encode epoch, $value:expr) => {
+        $value.0
+    };
+    (encode ensemble, $value:expr) => {
+        encode_ensemble($value)
+    };
+    (encode runs, $value:expr) => {
+        encode_runs($value)
+    };
+    (decode copy, $value:expr) => {
+        $value
+    };
+    (decode clone, $value:expr) => {
+        $value
+    };
+    (decode position, $value:expr) => {
+        Lsn($value)
+    };
+    (decode epoch, $value:expr) => {
+        Epoch($value)
+    };
+    (decode ensemble, $value:expr) => {
+        decode_ensemble($value)?
+    };
+    (decode runs, $value:expr) => {
+        decode_runs($value)
+    };
+}
+
+request_messages! {
+    Create = "2" {
+        #[prost(bytes = "bytes", repeated, tag = "1")]
+        ensemble: Vec<Bytes> => ensemble,
+    },
+    Seal = "3" {
+        #[prost(bytes = "bytes", repeated, tag = "1")]
+        ensemble: Vec<Bytes> => ensemble,
+        #[prost(fixed64, tag = "2")]
+        epoch: u64 => epoch,
+    },
+    Sync = "4" {
+        #[prost(fixed64, tag = "1")]
+        epoch: u64 => epoch,
+        #[prost(fixed64, tag = "2")]
+        floor: u64 => position,
+        #[prost(fixed64, tag = "3")]
+        from: u64 => position,
+        #[prost(bytes = "bytes", repeated, tag = "4")]
+        records: Vec<Bytes> => clone,
+        #[prost(message, repeated, tag = "5")]
+        runs: Vec<Run> => runs,
+        #[prost(fixed64, tag = "6")]
+        head: u64 => position,
+        #[prost(bool, tag = "7")]
+        complete: bool => copy,
+    },
+    Append = "5" {
+        #[prost(fixed64, tag = "1")]
+        epoch: u64 => epoch,
+        #[prost(fixed64, tag = "2")]
+        at: u64 => position,
+        #[prost(bytes = "bytes", repeated, tag = "3")]
+        records: Vec<Bytes> => clone,
+        #[prost(fixed64, tag = "4")]
+        head: u64 => position,
+    },
+    Trim = "6" {
+        #[prost(fixed64, tag = "1")]
+        epoch: u64 => epoch,
+        #[prost(fixed64, tag = "2")]
+        through: u64 => position,
+    },
+    Check = "7" {
+        #[prost(fixed64, tag = "1")]
+        epoch: u64 => epoch,
+    },
+    Recover = "8" {
+        #[prost(fixed64, tag = "1")]
+        epoch: u64 => epoch,
+        #[prost(fixed64, tag = "2")]
+        from: u64 => position,
+        #[prost(uint32, tag = "3")]
+        max: u32 => copy,
+    },
+    Read = "9" {
+        #[prost(fixed64, tag = "1")]
+        from: u64 => position,
+        #[prost(uint32, tag = "2")]
+        max: u32 => copy,
+        #[prost(uint32, tag = "3")]
+        wait_ms: u32 => copy,
+    },
+    Delete = "10" {
+        #[prost(bytes = "bytes", repeated, tag = "1")]
+        ensemble: Vec<Bytes> => ensemble,
+    },
+    Replace = "11" {
+        #[prost(fixed64, tag = "1")]
+        epoch: u64 => epoch,
+        #[prost(bytes = "bytes", repeated, tag = "2")]
+        from: Vec<Bytes> => ensemble,
+        #[prost(bytes = "bytes", repeated, tag = "3")]
+        to: Vec<Bytes> => ensemble,
+    },
+}
+
+#[derive(Clone, Message)]
+struct ReplyFrame {
+    #[prost(oneof = "ReplyBody", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    body: Option<ReplyBody>,
+}
+
+#[derive(Clone, prost::Oneof)]
+enum ReplyBody {
+    #[prost(message, tag = "1")]
+    Created(Empty),
+    #[prost(message, tag = "2")]
+    Sealed(View),
+    #[prost(message, tag = "3")]
+    Synced(Position),
+    #[prost(message, tag = "4")]
+    Appended(Position),
+    #[prost(message, tag = "5")]
+    Trimmed(Position),
+    #[prost(message, tag = "6")]
+    Checked(View),
+    #[prost(message, tag = "7")]
+    Records(ReplyRecords),
+    #[prost(message, tag = "8")]
+    Deleted(Empty),
+    #[prost(message, tag = "9")]
+    Replaced(Empty),
+    #[prost(message, tag = "10")]
+    Refused(RefusalFrame),
+}
+
+#[derive(Clone, Message)]
+struct Position {
+    #[prost(fixed64, tag = "1")]
+    lsn: u64,
+}
+
+#[derive(Clone, Message)]
+struct ReplyRecords {
+    #[prost(fixed64, tag = "1")]
+    floor: u64,
+    #[prost(message, repeated, tag = "2")]
+    records: Vec<Record>,
+    #[prost(fixed64, tag = "3")]
+    head: u64,
+}
+
+#[derive(Clone, Message)]
+struct RefusalFrame {
+    #[prost(oneof = "RefusalBody", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12")]
+    body: Option<RefusalBody>,
+}
+
+#[derive(Clone, prost::Oneof)]
+enum RefusalBody {
+    #[prost(message, tag = "1")]
+    Fenced(Position),
+    #[prost(message, tag = "2")]
+    NotSynced(Empty),
+    #[prost(message, tag = "3")]
+    Gap(Position),
+    #[prost(message, tag = "4")]
+    Conflict(Position),
+    #[prost(message, tag = "5")]
+    BelowFloor(Position),
+    #[prost(message, tag = "6")]
+    AboveHead(Position),
+    #[prost(message, tag = "7")]
+    Full(Position),
+    #[prost(message, tag = "8")]
+    TooLarge(RefusalTooLarge),
+    #[prost(message, tag = "9")]
+    NotFound(Empty),
+    #[prost(message, tag = "10")]
+    Deleted(Empty),
+    #[prost(message, tag = "11")]
+    Unauthorized(Empty),
+    #[prost(message, tag = "12")]
+    WrongEnsemble(RefusalWrongEnsemble),
+}
+
+#[derive(Clone, Message)]
+struct RefusalTooLarge {
+    #[prost(uint32, tag = "1")]
+    max: u32,
+}
+
+#[derive(Clone, Message)]
+struct RefusalWrongEnsemble {
+    #[prost(bytes = "bytes", repeated, tag = "1")]
+    ensemble: Vec<Bytes>,
+}
+
+impl From<&Reply> for ReplyFrame {
+    fn from(value: &Reply) -> Self {
+        let body = match value {
+            Reply::Created => ReplyBody::Created(Empty {}),
+            Reply::Sealed(view) => ReplyBody::Sealed(encode_view(view)),
+            Reply::Synced { tail } => ReplyBody::Synced(Position { lsn: tail.0 }),
+            Reply::Appended { tail } => ReplyBody::Appended(Position { lsn: tail.0 }),
+            Reply::Trimmed { floor } => ReplyBody::Trimmed(Position { lsn: floor.0 }),
+            Reply::Checked(view) => ReplyBody::Checked(encode_view(view)),
+            Reply::Records {
+                floor,
+                records,
+                head,
+            } => ReplyBody::Records(ReplyRecords {
+                floor: floor.0,
+                records: records
+                    .iter()
+                    .map(|(lsn, payload)| Record {
+                        lsn: lsn.0,
+                        payload: payload.clone(),
+                    })
+                    .collect(),
+                head: head.0,
+            }),
+            Reply::Deleted => ReplyBody::Deleted(Empty {}),
+            Reply::Replaced => ReplyBody::Replaced(Empty {}),
+            Reply::Refused(refusal) => ReplyBody::Refused(RefusalFrame::from(refusal)),
+        };
+        Self { body: Some(body) }
+    }
+}
+
+impl TryFrom<ReplyFrame> for Reply {
+    type Error = io::Error;
+
+    fn try_from(frame: ReplyFrame) -> io::Result<Self> {
+        Ok(
+            match frame
+                .body
+                .ok_or_else(|| invalid("missing keeper message variant"))?
+            {
+                ReplyBody::Created(_) => Self::Created,
+                ReplyBody::Sealed(body) => Self::Sealed(decode_view(body)?),
+                ReplyBody::Synced(body) => Self::Synced {
+                    tail: Lsn(body.lsn),
+                },
+                ReplyBody::Appended(body) => Self::Appended {
+                    tail: Lsn(body.lsn),
+                },
+                ReplyBody::Trimmed(body) => Self::Trimmed {
+                    floor: Lsn(body.lsn),
+                },
+                ReplyBody::Checked(body) => Self::Checked(decode_view(body)?),
+                ReplyBody::Records(body) => Self::Records {
+                    floor: Lsn(body.floor),
+                    records: body
+                        .records
+                        .into_iter()
+                        .map(|record| (Lsn(record.lsn), record.payload))
+                        .collect(),
+                    head: Lsn(body.head),
+                },
+                ReplyBody::Deleted(_) => Self::Deleted,
+                ReplyBody::Replaced(_) => Self::Replaced,
+                ReplyBody::Refused(body) => Self::Refused(Refusal::try_from(body)?),
+            },
+        )
+    }
+}
+
+impl From<&Refusal> for RefusalFrame {
+    fn from(value: &Refusal) -> Self {
+        let body = match value {
+            Refusal::Fenced { promised } => RefusalBody::Fenced(Position { lsn: promised.0 }),
+            Refusal::NotSynced => RefusalBody::NotSynced(Empty {}),
+            Refusal::Gap { head } => RefusalBody::Gap(Position { lsn: head.0 }),
+            Refusal::Conflict { head } => RefusalBody::Conflict(Position { lsn: head.0 }),
+            Refusal::BelowFloor { floor } => RefusalBody::BelowFloor(Position { lsn: floor.0 }),
+            Refusal::AboveHead { head } => RefusalBody::AboveHead(Position { lsn: head.0 }),
+            Refusal::Full { floor } => RefusalBody::Full(Position { lsn: floor.0 }),
+            Refusal::TooLarge { max } => RefusalBody::TooLarge(RefusalTooLarge { max: *max }),
+            Refusal::NotFound => RefusalBody::NotFound(Empty {}),
+            Refusal::Deleted => RefusalBody::Deleted(Empty {}),
+            Refusal::Unauthorized => RefusalBody::Unauthorized(Empty {}),
+            Refusal::WrongEnsemble { ensemble } => {
+                RefusalBody::WrongEnsemble(RefusalWrongEnsemble {
+                    ensemble: encode_ensemble(ensemble),
+                })
+            }
+        };
+        Self { body: Some(body) }
+    }
+}
+
+impl TryFrom<RefusalFrame> for Refusal {
+    type Error = io::Error;
+
+    fn try_from(frame: RefusalFrame) -> io::Result<Self> {
+        Ok(
+            match frame
+                .body
+                .ok_or_else(|| invalid("missing keeper message variant"))?
+            {
+                RefusalBody::Fenced(body) => Self::Fenced {
+                    promised: Epoch(body.lsn),
+                },
+                RefusalBody::NotSynced(_) => Self::NotSynced,
+                RefusalBody::Gap(body) => Self::Gap {
+                    head: Lsn(body.lsn),
+                },
+                RefusalBody::Conflict(body) => Self::Conflict {
+                    head: Lsn(body.lsn),
+                },
+                RefusalBody::BelowFloor(body) => Self::BelowFloor {
+                    floor: Lsn(body.lsn),
+                },
+                RefusalBody::AboveHead(body) => Self::AboveHead {
+                    head: Lsn(body.lsn),
+                },
+                RefusalBody::Full(body) => Self::Full {
+                    floor: Lsn(body.lsn),
+                },
+                RefusalBody::TooLarge(body) => Self::TooLarge { max: body.max },
+                RefusalBody::NotFound(_) => Self::NotFound,
+                RefusalBody::Deleted(_) => Self::Deleted,
+                RefusalBody::Unauthorized(_) => Self::Unauthorized,
+                RefusalBody::WrongEnsemble(body) => Self::WrongEnsemble {
+                    ensemble: decode_ensemble(body.ensemble)?,
+                },
+            },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -559,7 +629,6 @@ mod tests {
     fn round_trips_every_keeper_message() {
         let stream = StreamId(6);
         let epoch = Epoch(2);
-        let holder = Holder(1);
         let ensemble = [KeeperId(1), KeeperId(2), KeeperId(3)];
         let records = vec![Bytes::new(), Bytes::from_static(b"record")];
         let runs = vec![EpochRun {
@@ -572,39 +641,34 @@ mod tests {
             Request::Seal {
                 stream,
                 epoch,
-                holder,
                 ensemble,
             },
             Request::Sync {
                 stream,
                 epoch,
-                holder,
                 from: Lsn(1),
                 floor: Lsn(1),
                 records: records.clone(),
                 runs: runs.clone(),
-                commit: Lsn(2),
+                head: Lsn(2),
                 complete: true,
             },
             Request::Append {
                 stream,
                 epoch,
-                holder,
                 at: Lsn(1),
                 records,
-                commit: Lsn(1),
+                head: Lsn(1),
             },
             Request::Trim {
                 stream,
                 epoch,
-                holder,
                 through: Lsn(1),
             },
             Request::Check { stream, epoch },
             Request::Recover {
                 stream,
                 epoch,
-                holder,
                 from: Lsn(1),
                 max: 5,
             },
@@ -618,7 +682,6 @@ mod tests {
             Request::Replace {
                 stream,
                 epoch,
-                holder,
                 from: ensemble,
                 to: [KeeperId(1), KeeperId(2), KeeperId(4)],
             },
@@ -629,11 +692,11 @@ mod tests {
         }
 
         let view = StreamView {
-            promised: Some((epoch, holder)),
+            promised: Some((epoch, Identity::from_static("urn:logkeeper:client:1"))),
             synced: Some(epoch),
-            end: Lsn(2),
+            tail: Lsn(2),
             floor: Lsn(1),
-            commit: Lsn(1),
+            head: Lsn(1),
             runs,
             ensemble,
             learner: true,
@@ -641,10 +704,10 @@ mod tests {
         let refusals = [
             Refusal::Fenced { promised: epoch },
             Refusal::NotSynced,
-            Refusal::Gap { end: Lsn(2) },
-            Refusal::Conflict { end: Lsn(2) },
+            Refusal::Gap { head: Lsn(2) },
+            Refusal::Conflict { head: Lsn(2) },
             Refusal::BelowFloor { floor: Lsn(1) },
-            Refusal::AboveCommit { commit: Lsn(1) },
+            Refusal::AboveHead { head: Lsn(1) },
             Refusal::Full { floor: Lsn(1) },
             Refusal::TooLarge { max: 10 },
             Refusal::NotFound,
@@ -655,14 +718,14 @@ mod tests {
         let replies = [
             Reply::Created,
             Reply::Sealed(view.clone()),
-            Reply::Synced { end: Lsn(2) },
-            Reply::Appended { end: Lsn(2) },
+            Reply::Synced { tail: Lsn(2) },
+            Reply::Appended { tail: Lsn(2) },
             Reply::Trimmed { floor: Lsn(1) },
             Reply::Checked(view),
             Reply::Records {
                 floor: Lsn(1),
                 records: vec![(Lsn(1), Bytes::from_static(b"record"))],
-                commit: Lsn(1),
+                head: Lsn(1),
             },
             Reply::Deleted,
             Reply::Replaced,

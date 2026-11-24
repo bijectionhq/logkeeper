@@ -148,7 +148,7 @@ def main():
         parser.error(f"unknown controls: {', '.join(sorted(unknown))}")
     # Testing one mutation at a time requires exclusive use of this worktree's source.
     if subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "src/stream"], cwd=ROOT).returncode:
-        parser.error("commit the keeper source before running the controls")
+        parser.error("head the keeper source before running the controls")
     results = ROOT / "verification/verus/.results"
     results.mkdir(exist_ok=True)
     evidence = Path(tempfile.mkdtemp(prefix="keeper-runtime-", dir=results))

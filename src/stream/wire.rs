@@ -2,11 +2,7 @@
 
 use bytes::Bytes;
 
-pub use journal_contract::{Epoch, Lsn, StreamId};
-
-/// The identity of the process that sealed an epoch. Ties at one epoch never succeed for two holders.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Holder(pub u128);
+pub use journal_contract::{Epoch, Identity, Lsn, StreamId};
 
 /// A keeper's identity. A replacement keeper always gets a new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -22,32 +18,79 @@ pub struct EpochRun {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
-    Create { stream: StreamId, ensemble: [KeeperId; 3] },
+    Create {
+        stream: StreamId,
+        ensemble: [KeeperId; 3],
+    },
     /// Promise only within the caller's ensemble. Stale routes are fenced after replacement.
-    Seal { stream: StreamId, ensemble: [KeeperId; 3], epoch: Epoch, holder: Holder },
+    Seal {
+        stream: StreamId,
+        ensemble: [KeeperId; 3],
+        epoch: Epoch,
+    },
     /// Install a range from the chosen history. `runs` covers exactly `records`;
-    /// `floor` and `commit` describe the prefix installed by the end of this chunk.
-    Sync { stream: StreamId, epoch: Epoch, holder: Holder, floor: Lsn, from: Lsn, records: Vec<Bytes>, runs: Vec<EpochRun>, commit: Lsn, complete: bool },
-    Append { stream: StreamId, epoch: Epoch, holder: Holder, at: Lsn, records: Vec<Bytes>, commit: Lsn },
-    Trim { stream: StreamId, epoch: Epoch, holder: Holder, through: Lsn },
-    Check { stream: StreamId, epoch: Epoch },
-    /// Fetch accepted history under the current promise, including above `commit`.
-    Recover { stream: StreamId, epoch: Epoch, holder: Holder, from: Lsn, max: u32 },
+    /// `floor` and `head` describe the prefix installed by this chunk.
+    Sync {
+        stream: StreamId,
+        epoch: Epoch,
+        floor: Lsn,
+        from: Lsn,
+        records: Vec<Bytes>,
+        runs: Vec<EpochRun>,
+        head: Lsn,
+        complete: bool,
+    },
+    Append {
+        stream: StreamId,
+        epoch: Epoch,
+        at: Lsn,
+        records: Vec<Bytes>,
+        head: Lsn,
+    },
+    Trim {
+        stream: StreamId,
+        epoch: Epoch,
+        through: Lsn,
+    },
+    Check {
+        stream: StreamId,
+        epoch: Epoch,
+    },
+    /// Fetch accepted history under the current promise, including above `head`.
+    Recover {
+        stream: StreamId,
+        epoch: Epoch,
+        from: Lsn,
+        max: u32,
+    },
     /// Fetch committed history. A page can stop early at the wire byte limit.
-    Read { stream: StreamId, from: Lsn, max: u32, wait_ms: u32 },
-    Delete { stream: StreamId, ensemble: [KeeperId; 3] },
+    Read {
+        stream: StreamId,
+        from: Lsn,
+        max: u32,
+        wait_ms: u32,
+    },
+    Delete {
+        stream: StreamId,
+        ensemble: [KeeperId; 3],
+    },
     /// Install a one-keeper replacement at a synced epoch. The proposer must
     /// obtain durable replies from both survivors before installing the learner.
-    Replace { stream: StreamId, epoch: Epoch, holder: Holder, from: [KeeperId; 3], to: [KeeperId; 3] },
+    Replace {
+        stream: StreamId,
+        epoch: Epoch,
+        from: [KeeperId; 3],
+        to: [KeeperId; 3],
+    },
 }
 
 /// A keeper's durable view of one stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamView {
-    pub promised: Option<(Epoch, Holder)>,
+    pub promised: Option<(Epoch, Identity)>,
     pub synced: Option<Epoch>,
-    pub end: Lsn,
-    pub commit: Lsn,
+    pub tail: Lsn,
+    pub head: Lsn,
     pub floor: Lsn,
     pub runs: Vec<EpochRun>,
     pub ensemble: [KeeperId; 3],
@@ -59,11 +102,21 @@ pub struct StreamView {
 pub enum Reply {
     Created,
     Sealed(StreamView),
-    Synced { end: Lsn },
-    Appended { end: Lsn },
-    Trimmed { floor: Lsn },
+    Synced {
+        tail: Lsn,
+    },
+    Appended {
+        tail: Lsn,
+    },
+    Trimmed {
+        floor: Lsn,
+    },
     Checked(StreamView),
-    Records { floor: Lsn, records: Vec<(Lsn, Bytes)>, commit: Lsn },
+    Records {
+        floor: Lsn,
+        records: Vec<(Lsn, Bytes)>,
+        head: Lsn,
+    },
     Deleted,
     Replaced,
     Refused(Refusal),
@@ -73,10 +126,10 @@ pub enum Reply {
 pub enum Refusal {
     Fenced { promised: Epoch },
     NotSynced,
-    Gap { end: Lsn },
-    Conflict { end: Lsn },
+    Gap { head: Lsn },
+    Conflict { head: Lsn },
     BelowFloor { floor: Lsn },
-    AboveCommit { commit: Lsn },
+    AboveHead { head: Lsn },
     Full { floor: Lsn },
     TooLarge { max: u32 },
     NotFound,
@@ -96,5 +149,17 @@ pub enum TransportError {
 /// How the writer reaches keepers. The keeper side owns the TCP implementation (`src/stream/transport.rs`);
 /// tests and simulation use in-memory implementations.
 pub trait Transport: Send + Sync {
-    fn call(&self, keeper: KeeperId, request: Request) -> journal_contract::BoxFuture<'_, Result<Reply, TransportError>>;
+    /// Identity authenticated for requests made by this transport.
+    fn identity(&self) -> &Identity;
+
+    /// Prefer the nearest member first. The default uses ensemble order.
+    fn read_order(&self, ensemble: [KeeperId; 3]) -> [KeeperId; 3] {
+        ensemble
+    }
+
+    fn call(
+        &self,
+        keeper: KeeperId,
+        request: Request,
+    ) -> journal_contract::BoxFuture<'_, Result<Reply, TransportError>>;
 }

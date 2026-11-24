@@ -11,36 +11,37 @@ use std::{fmt, future::Future, pin::Pin, time::Duration};
 pub mod conformance;
 
 mod file;
-mod reference;
+pub mod reference;
 mod state;
 mod timer;
-
-pub use file::FileJournal;
-pub use reference::MemoryJournal;
 
 /// A stream's identity. Never reused after `delete`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub u128);
 
-/// The caller identity associated with a journal handle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Identity(pub u128);
+/// The authenticated caller identity associated with a journal handle.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Identity(Bytes);
 
-/// Static payload limits for every stream in a reference journal.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Limits {
-    /// Maximum size in bytes of a single record.
-    pub max_record_bytes: usize,
-    /// Maximum total payload bytes retained by a stream.
-    pub stream_quota_bytes: u64,
+impl Identity {
+    pub const fn from_static(uri: &'static str) -> Self {
+        Self(Bytes::from_static(uri.as_bytes()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("identity is UTF-8")
+    }
 }
 
-impl Default for Limits {
-    fn default() -> Self {
-        Self {
-            max_record_bytes: 32 * 1024 * 1024,
-            stream_quota_bytes: 8 * 1024 * 1024 * 1024,
-        }
+impl From<&str> for Identity {
+    fn from(uri: &str) -> Self {
+        Self(Bytes::copy_from_slice(uri.as_bytes()))
+    }
+}
+
+impl From<String> for Identity {
+    fn from(uri: String) -> Self {
+        Self(Bytes::from(uri))
     }
 }
 
@@ -48,7 +49,7 @@ impl Default for Limits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Epoch(pub u64);
 
-/// A record's position. The first record of a stream is at 1; an empty stream's end is 0.
+/// A record's position. The first record of a stream is at 1; an empty stream's head is 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lsn(pub u64);
 
@@ -59,8 +60,8 @@ pub struct Page {
     pub floor: Lsn,
     /// Committed records, in LSN order, contiguous from the requested start.
     pub records: Vec<(Lsn, Bytes)>,
-    /// The committed end the journal observed while serving the read.
-    pub end: Lsn,
+    /// The head the journal observed while serving the read.
+    pub head: Lsn,
 }
 
 /// Every way a journal call can fail.
@@ -69,7 +70,7 @@ pub enum JournalError {
     /// A higher epoch has sealed the stream, or another identity sealed this epoch.
     Fenced { current: Epoch },
     /// `at` is not the next LSN, or a different record is committed at `at`.
-    Conflict { committed_end: Lsn },
+    Conflict { head: Lsn },
     /// `from` is below the retained floor.
     Trimmed { floor: Lsn },
     /// The payload exceeds the per-record limit.
@@ -99,14 +100,14 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait Journal: Send + Sync {
     /// Creates an empty stream. Idempotent. Refused with `Deleted` after `delete`.
     fn create(&self, stream: StreamId) -> BoxFuture<'_, Result<()>>;
-    /// Fences every append under a lower epoch and returns the committed end.
+    /// Fences every append under a lower epoch and returns the head.
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, Result<Lsn>>;
     /// Commits `payload` at `at` iff `epoch` is sealed by this caller and `at` is the next LSN.
     /// An identical retry returns `at`.
     fn append(&self, stream: StreamId, epoch: Epoch, at: Lsn, payload: Bytes) -> BoxFuture<'_, Result<Lsn>>;
-    /// Committed records in `[from, from + max)`, waiting up to `wait` at the end.
+    /// Committed records in `[from, from + max)`, waiting up to `wait` at the head.
     fn read(&self, stream: StreamId, from: Lsn, max: usize, wait: Duration) -> BoxFuture<'_, Result<Page>>;
-    /// A linearizable committed end.
+    /// A linearizable head.
     fn head(&self, stream: StreamId) -> BoxFuture<'_, Result<Lsn>>;
     /// Discards records up to and including `through`. Only the sealed epoch may trim.
     fn trim(&self, stream: StreamId, epoch: Epoch, through: Lsn) -> BoxFuture<'_, Result<()>>;

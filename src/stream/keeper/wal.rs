@@ -18,14 +18,18 @@ use super::{
     state::{Extent, ExtentReader, Payload, Record, Stream},
 };
 use crate::stream::{
-    codec::{self, Decoder, MAX_FRAME_BYTES, invalid},
-    wire::{Epoch, KeeperId, Lsn, Request, StreamId},
+    codec::{self, MAX_FRAME_BYTES, invalid},
+    wire::{Epoch, Identity, KeeperId, Lsn, Request, StreamId, StreamView},
 };
+
+mod legacy;
 
 pub(super) const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const FRAME_OVERHEAD: usize = 8 + 16 + 1;
-pub(super) const MAX_PRINCIPAL: usize = 4096;
-const MAX_ENTRY_BYTES: usize = MAX_FRAME_BYTES + 4 + MAX_PRINCIPAL;
+pub(super) const MAX_IDENTITY_BYTES: usize = 4096;
+const MAX_ENTRY_BYTES: usize = MAX_FRAME_BYTES + 8 + MAX_IDENTITY_BYTES;
+// The legacy format starts with a bounded identity length at these offsets.
+const PROTOBUF: u32 = u32::MAX;
 const START: u8 = 1;
 const END: u8 = 2;
 
@@ -44,12 +48,39 @@ pub(super) struct Wal {
     pub fail_sync: bool,
 }
 
-pub(super) fn entry(request: &Request, principal: &Bytes) -> io::Result<Bytes> {
+pub(super) fn entry(request: &Request, identity: Option<&Identity>) -> io::Result<Bytes> {
     let body = codec::encode_request(request)?;
-    let mut entry = BytesMut::with_capacity(4 + principal.len() + body.len());
-    codec::put_bytes(&mut entry, principal)?;
+    let identity = identity.map_or("", Identity::as_str).as_bytes();
+    let mut entry = BytesMut::with_capacity(8 + identity.len() + body.len());
+    entry.put_u32(PROTOBUF);
+    put_bytes(&mut entry, identity)?;
     entry.put_slice(&body);
     Ok(entry.freeze())
+}
+
+fn put_count(out: &mut BytesMut, len: usize) -> io::Result<()> {
+    out.put_u32(
+        len.try_into()
+            .map_err(|_| invalid("keeper collection too large"))?,
+    );
+    Ok(())
+}
+
+fn put_bytes(out: &mut BytesMut, bytes: &[u8]) -> io::Result<()> {
+    put_count(out, bytes.len())?;
+    out.put_slice(bytes);
+    Ok(())
+}
+
+fn decode_identity(uri: Bytes) -> io::Result<Option<Identity>> {
+    if uri.is_empty() {
+        return Ok(None);
+    }
+    if uri.len() > MAX_IDENTITY_BYTES {
+        return Err(invalid("oversized WAL identity"));
+    }
+    let uri = std::str::from_utf8(&uri).map_err(|_| invalid("invalid WAL identity"))?;
+    Ok(Some(Identity::from(uri)))
 }
 
 pub(super) fn fragment(
@@ -332,15 +363,22 @@ fn replay(
             fragments.remove(&id).expect("finished entry").freeze()
         };
         let mut entry = Decoder(body);
-        let principal = entry.bytes()?;
-        let request = codec::decode_request(entry.0)?;
-        if codec::stream(&request) != id || principal.len() > MAX_PRINCIPAL {
+        let protobuf = entry.take_format();
+        let identity = decode_identity(entry.bytes()?)?;
+        let request = if protobuf {
+            codec::decode_request(entry.0)?
+        } else {
+            entry.legacy_request()?
+        };
+        if codec::stream(&request) != id
+            || identity.is_some() != matches!(request, Request::Seal { .. })
+        {
             return Err(invalid("invalid keeper WAL entry"));
         }
         states
             .entry(id)
             .or_default()
-            .apply(keeper, request, principal)?;
+            .apply(keeper, request, identity)?;
         dirty.insert(id);
     }
     if position != length {
@@ -416,9 +454,9 @@ fn checkpoint(dir: &Path, sequence: u64, state: &mut Stream) -> io::Result<()> {
     let mut body = BytesMut::new();
     body.put_u64(sequence);
     body.put_u8(u8::from(state.deleted));
-    codec::put_bytes(&mut body, &state.principal)?;
-    codec::put_view(&mut body, &state.view)?;
-    codec::put_count(&mut body, spans.len())?;
+    body.put_u32(PROTOBUF);
+    put_bytes(&mut body, &codec::encode_checkpoint_view(&state.view)?)?;
+    put_count(&mut body, spans.len())?;
     for span in &spans {
         body.put_u64(span.sequence);
         body.put_u64(span.first.0);
@@ -480,11 +518,18 @@ fn load_streams(root: &Path) -> io::Result<HashMap<StreamId, Stream>> {
             .filter(|body| body.len() as u64 + 8 == length)
             .ok_or_else(|| invalid("damaged stream checkpoint"))?;
         let mut input = Decoder(body);
+        let checkpoint = Some(input.u64()?);
+        let deleted = input.boolean()?;
+        let view = if input.take_format() {
+            codec::decode_checkpoint_view(input.bytes()?)?
+        } else {
+            let identity = decode_identity(input.bytes()?)?;
+            input.legacy_view(identity)?
+        };
         let mut state = Stream {
-            checkpoint: Some(input.u64()?),
-            deleted: input.boolean()?,
-            principal: input.bytes()?,
-            view: input.view()?,
+            checkpoint,
+            deleted,
+            view,
             ..Stream::default()
         };
         let spans = (0..input.count(24)?)
@@ -499,13 +544,13 @@ fn load_streams(root: &Path) -> io::Result<HashMap<StreamId, Stream>> {
         input.finish()?;
         let mut next = state.view.floor.0;
         for span in &spans {
-            if span.first.0 != next || span.last < span.first || span.last > state.view.end {
+            if span.first.0 != next || span.last < span.first || span.last > state.view.tail {
                 return Err(invalid("noncontiguous stream checkpoint extents"));
             }
             read_extent(&dir, *span, &mut state)?;
             next = span.last.0 + 1;
         }
-        if next != state.view.end.0 + 1 {
+        if next != state.view.tail.0 + 1 {
             return Err(invalid("stream checkpoint is missing records"));
         }
         clean_extents(&dir, &spans)?;
@@ -567,5 +612,70 @@ fn charge_len(len: u32) -> u64 {
         charge(&[])
     } else {
         u64::from(len)
+    }
+}
+
+struct Decoder(Bytes);
+
+impl Decoder {
+    fn take_format(&mut self) -> bool {
+        if self.0.get(..4) == Some(&PROTOBUF.to_be_bytes()) {
+            self.0.advance(4);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn take(&mut self, length: usize) -> io::Result<Bytes> {
+        if self.0.len() < length {
+            return Err(invalid("short keeper message"));
+        }
+        Ok(self.0.split_to(length))
+    }
+
+    fn u8(&mut self) -> io::Result<u8> {
+        Ok(self.take(1)?.get_u8())
+    }
+
+    fn u32(&mut self) -> io::Result<u32> {
+        Ok(self.take(4)?.get_u32())
+    }
+
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(self.take(8)?.get_u64())
+    }
+
+    fn u128(&mut self) -> io::Result<u128> {
+        Ok(self.take(16)?.get_u128())
+    }
+
+    fn boolean(&mut self) -> io::Result<bool> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(invalid("invalid keeper boolean")),
+        }
+    }
+
+    fn bytes(&mut self) -> io::Result<Bytes> {
+        let count = self.u32()? as usize;
+        self.take(count)
+    }
+
+    fn count(&mut self, element_minimum: usize) -> io::Result<usize> {
+        let count = self.u32()? as usize;
+        if count > self.0.len() / element_minimum {
+            return Err(invalid("short keeper collection"));
+        }
+        Ok(count)
+    }
+
+    fn finish(self) -> io::Result<()> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(invalid("trailing keeper message bytes"))
+        }
     }
 }

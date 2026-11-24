@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-use bytes::Bytes;
 
 use super::{
     Limits,
@@ -24,7 +23,7 @@ impl Memory {
     pub(crate) fn call(
         &mut self,
         keeper: KeeperId,
-        principal: &Bytes,
+        identity: &Identity,
         request: Request,
         limits: &Limits,
     ) -> Reply {
@@ -35,7 +34,7 @@ impl Memory {
             stream,
             keeper,
             &request,
-            principal,
+            identity,
             true,
             limits,
             &mut reader,
@@ -47,7 +46,7 @@ impl Memory {
                 .streams
                 .entry(id)
                 .or_default()
-                .apply(keeper, request, principal.clone())
+                .apply(keeper, request, Some(identity.clone()))
                 .unwrap(),
             Decision::Page { through } => {
                 let (Request::Read { from, max, .. } | Request::Recover { from, max, .. }) =

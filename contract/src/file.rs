@@ -1,6 +1,6 @@
 use crate::{
-    Epoch, Identity, Journal, Limits, Lsn, StreamId,
-    reference::Engine,
+    Epoch, Identity, Journal, Lsn, StreamId,
+    reference::{Engine, Limits},
     state::{Mutation, State},
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -45,7 +45,7 @@ const MAGIC: &[u8; 8] = b"JKREF\0\0\x01";
 const FILE_HEADER_LEN: usize = 24;
 const FRAME_HEADER_LEN: u64 = 20;
 const STREAM_MUTATION_LEN: u64 = 17; // tag and stream
-const APPEND_MUTATION_LEN: u64 = 49; // tag, stream, epoch, identity and LSN
+const APPEND_MUTATION_LEN: u64 = 37; // tag, stream, epoch, URI length and LSN
 
 impl Storage {
     fn open(path: &Path, limits: Limits) -> io::Result<(Self, State)> {
@@ -81,7 +81,9 @@ impl Storage {
             let complement = u64::from_le_bytes(frame[8..16].try_into().unwrap());
             if complement != !len
                 || len < STREAM_MUTATION_LEN
-                || len > (limits.max_record_bytes as u64).saturating_add(APPEND_MUTATION_LEN)
+                || len
+                    > (limits.max_record_bytes as u64)
+                        .saturating_add(APPEND_MUTATION_LEN + u64::from(u32::MAX))
             {
                 return Err(invalid("invalid journal frame length"));
             }
@@ -132,15 +134,15 @@ impl Storage {
         let mut body = &mut prefix[..];
         let tag = match mutation {
             Mutation::Create => 0,
-            Mutation::Seal { .. } => 1,
-            Mutation::Append { .. } => 2,
-            Mutation::Trim { .. } => 3,
+            Mutation::Seal { .. } => 5,
+            Mutation::Append { .. } => 6,
+            Mutation::Trim { .. } => 7,
             Mutation::Delete => 4,
         };
         body.put_u8(tag);
         body.put_u128_le(stream.0);
 
-        match mutation {
+        let identity = match mutation {
             Mutation::Seal { epoch, identity }
             | Mutation::Append {
                 epoch, identity, ..
@@ -149,10 +151,16 @@ impl Storage {
                 epoch, identity, ..
             } => {
                 body.put_u64_le(epoch.0);
-                body.put_u128_le(identity.0);
+                let uri = identity.as_str().as_bytes();
+                body.put_u32_le(
+                    uri.len()
+                        .try_into()
+                        .map_err(|_| invalid("identity too large"))?,
+                );
+                uri
             }
-            Mutation::Create | Mutation::Delete => {}
-        }
+            Mutation::Create | Mutation::Delete => &[],
+        };
         let payload = match mutation {
             Mutation::Append { at, payload, .. } => {
                 body.put_u64_le(at.0);
@@ -168,14 +176,18 @@ impl Storage {
         let prefix_len = APPEND_MUTATION_LEN as usize - body.len();
         let body = &prefix[..prefix_len];
         let len = (body.len() as u64)
-            .checked_add(payload.len() as u64)
+            .checked_add(identity.len() as u64)
+            .and_then(|len| len.checked_add(payload.len() as u64))
             .ok_or_else(|| invalid("journal frame length overflow"))?;
         let mut frame = [0; FRAME_HEADER_LEN as usize];
         frame[..8].copy_from_slice(&len.to_le_bytes());
         frame[8..16].copy_from_slice(&(!len).to_le_bytes());
-        frame[16..].copy_from_slice(&crc32(&[body, payload]).to_le_bytes());
+        let (prefix, suffix) = body.split_at(body.len() - if matches!(tag, 6 | 7) { 8 } else { 0 });
+        frame[16..].copy_from_slice(&crc32(&[prefix, identity, suffix, payload]).to_le_bytes());
         self.file.write_all(&frame)?;
-        self.file.write_all(body)?;
+        self.file.write_all(prefix)?;
+        self.file.write_all(identity)?;
+        self.file.write_all(suffix)?;
         self.file.write_all(payload)?;
         #[cfg(test)]
         let sync = self.sync;
@@ -190,12 +202,21 @@ fn decode(mut body: Bytes) -> Option<(StreamId, Mutation)> {
     let stream = StreamId(body.try_get_u128_le().ok()?);
     let mutation = match tag {
         0 => Mutation::Create,
-        1..=3 => {
+        1..=3 | 5..=7 => {
             let epoch = Epoch(body.try_get_u64_le().ok()?);
-            let identity = Identity(body.try_get_u128_le().ok()?);
+            let identity = if tag < 5 {
+                let id = body.try_get_u128_le().ok()?;
+                Identity::from(format!("urn:logkeeper:client:{id}"))
+            } else {
+                let len = body.try_get_u32_le().ok()? as usize;
+                if len > body.len() {
+                    return None;
+                }
+                Identity::from(std::str::from_utf8(&body.split_to(len)).ok()?)
+            };
             match tag {
-                1 => Mutation::Seal { epoch, identity },
-                2 => {
+                1 | 5 => Mutation::Seal { epoch, identity },
+                2 | 6 => {
                     let at = Lsn(body.try_get_u64_le().ok()?);
                     let payload = std::mem::take(&mut body);
                     Mutation::Append {
@@ -205,7 +226,7 @@ fn decode(mut body: Bytes) -> Option<(StreamId, Mutation)> {
                         payload,
                     }
                 }
-                3 => {
+                3 | 7 => {
                     let through = Lsn(body.try_get_u64_le().ok()?);
                     Mutation::Trim {
                         epoch,

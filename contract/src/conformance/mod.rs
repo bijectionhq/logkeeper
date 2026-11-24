@@ -5,11 +5,11 @@
 //! async and uses the caller's executor. It panics with the failed check's name.
 //!
 //! A consumer taking over a stream must apply records through the committed
-//! end returned by seal before it serves requests.
+//! head returned by seal before it serves requests.
 
 mod history;
 
-use crate::{Epoch, Identity, Journal, JournalError::*, Limits, Lsn, Page, StreamId, timer::Sleep};
+use crate::{Epoch, Identity, Journal, JournalError::*, reference::Limits, Lsn, Page, StreamId, timer::Sleep};
 use bytes::Bytes;
 use history::{History, Op, Value};
 use std::{
@@ -32,19 +32,19 @@ pub const LIMITS: Limits = Limits {
 
 const SEQUENCE: &str = "committed sequence";
 const EXACT_READ: &str = "exact committed read";
-const SEAL_END: &str = "seal reports committed end";
+const SEAL_END: &str = "seal reports head";
 const SAME_SEAL: &str = "same identity reseal";
 const EQUAL_EPOCH: &str = "equal epoch fencing";
 const STALE_EPOCH: &str = "stale epoch fencing";
 const APPEND_IDENTITY: &str = "append caller fencing";
-const HEAD: &str = "head observes committed end";
+const HEAD: &str = "head observes head";
 const RETRY: &str = "identical retry";
 const CONFLICT: &str = "conflicting payload";
 const GAP: &str = "conditional append";
 const TRIM_RACE: &str = "trim and read linearizability";
 const TRIM_FENCE: &str = "trim caller fencing";
-const TRIM_END: &str = "trim bounded by committed end";
-const POLL_PENDING: &str = "long poll waits at end";
+const TRIM_END: &str = "trim bounded by head";
+const POLL_PENDING: &str = "long poll waits at head";
 const POLL_WAKE: &str = "append wakes long polls";
 const POLL_TIMEOUT: &str = "long poll deadline";
 const MISSING: &str = "missing stream";
@@ -95,7 +95,7 @@ struct Clients([Arc<dyn Journal>; 3]);
 
 impl Clients {
     fn identity(index: usize) -> Identity {
-        Identity(index as u128 + 1)
+        Identity::from(format!("urn:logkeeper:client:{}", index + 1))
     }
 }
 
@@ -119,14 +119,14 @@ async fn within<F: Future>(check: &str, duration: Duration, future: F) -> F::Out
     .await
 }
 
-fn page(floor: u64, end: u64, entries: &[(u64, &'static [u8])]) -> crate::Result<Page> {
+fn page(floor: u64, head: u64, entries: &[(u64, &'static [u8])]) -> crate::Result<Page> {
     Ok(Page {
         floor: Lsn(floor),
         records: entries
             .iter()
             .map(|&(at, bytes)| (Lsn(at), Bytes::from_static(bytes)))
             .collect(),
-        end: Lsn(end),
+        head: Lsn(head),
     })
 }
 
@@ -186,7 +186,7 @@ async fn fencing(clients: &Clients) {
         .unwrap();
 
     let replies = History::new(stream)
-        .wave(
+        .round(
             clients,
             [
                 (1, Op::Seal(Epoch(2))),
@@ -204,7 +204,7 @@ async fn fencing(clients: &Clients) {
         (Err(Fenced { current: Epoch(2) }), Ok(Value::Position(_))) => 2,
         _ => panic!("{EQUAL_EPOCH}: {replies:?}"),
     };
-    let end = match replies[2] {
+    let head = match replies[2] {
         Ok(Value::Position(Lsn(2))) => Lsn(2),
         Err(Fenced { current: Epoch(2) }) => Lsn(1),
         _ => panic!("{STALE_EPOCH}: {replies:?}"),
@@ -212,11 +212,11 @@ async fn fencing(clients: &Clients) {
     expect(
         SEAL_END,
         replies[winner - 1].clone(),
-        Ok(Value::Position(end)),
+        Ok(Value::Position(head)),
     );
     let loser = &clients.0[3 - winner];
     let owner = &clients.0[winner];
-    expect(SAME_SEAL, owner.seal(stream, Epoch(2)).await, Ok(end));
+    expect(SAME_SEAL, owner.seal(stream, Epoch(2)).await, Ok(head));
     expect(
         EQUAL_EPOCH,
         loser.seal(stream, Epoch(2)).await,
@@ -227,7 +227,7 @@ async fn fencing(clients: &Clients) {
         a.seal(stream, Epoch(1)).await,
         Err(Fenced { current: Epoch(2) }),
     );
-    let next = Lsn(end.0 + 1);
+    let next = Lsn(head.0 + 1);
     expect(
         STALE_EPOCH,
         a.append(stream, Epoch(1), next, Bytes::from_static(b"stale"))
@@ -241,7 +241,7 @@ async fn fencing(clients: &Clients) {
             .await,
         Err(Fenced { current: Epoch(2) }),
     );
-    expect(HEAD, owner.head(stream).await, Ok(end));
+    expect(HEAD, owner.head(stream).await, Ok(head));
 }
 
 async fn retries(clients: &Clients) {
@@ -262,7 +262,7 @@ async fn retries(clients: &Clients) {
         Ok(Lsn(1)),
     );
     let conflict = Err(Conflict {
-        committed_end: Lsn(2),
+        head: Lsn(2),
     });
     expect(
         CONFLICT,
@@ -294,7 +294,7 @@ async fn trimming(clients: &Clients) {
         Op::Append(Epoch(1), Lsn(2), Bytes::from_static(b"b")),
         Op::Append(Epoch(1), Lsn(3), Bytes::from_static(b"c")),
     ] {
-        history.wave(clients, [(0, operation)], &mut schedule).await[0]
+        history.round(clients, [(0, operation)], &mut schedule).await[0]
             .as_ref()
             .unwrap();
     }
@@ -307,11 +307,11 @@ async fn trimming(clients: &Clients) {
         TRIM_END,
         a.trim(stream, Epoch(1), Lsn(4)).await,
         Err(Conflict {
-            committed_end: Lsn(3),
+            head: Lsn(3),
         }),
     );
     history
-        .wave(
+        .round(
             clients,
             [
                 (0, Op::Trim(Epoch(1), Lsn(2))),
@@ -323,10 +323,10 @@ async fn trimming(clients: &Clients) {
         )
         .await;
     history
-        .wave(clients, [(0, Op::Trim(Epoch(1), Lsn(1)))], &mut schedule)
+        .round(clients, [(0, Op::Trim(Epoch(1), Lsn(1)))], &mut schedule)
         .await;
     history
-        .wave(
+        .round(
             clients,
             [(1, Op::Read(Lsn(1), 2)), (2, Op::Read(Lsn(3), 2))],
             &mut schedule,
@@ -487,14 +487,14 @@ async fn seeded(clients: &Clients, seed: u64) -> History {
     let mut history = History::new(StreamId(FIRST_SEED_STREAM + u128::from(seed)));
     let mut schedule = Schedule(seed);
     let mut owner = 0;
-    let mut end = Lsn(1);
+    let mut head = Lsn(1);
     for operation in [
         Op::Create,
         Op::Seal(Epoch(1)),
-        Op::Append(Epoch(1), end, Bytes::from_static(b"start")),
+        Op::Append(Epoch(1), head, Bytes::from_static(b"start")),
     ] {
         history
-            .wave(clients, [(owner, operation)], &mut schedule)
+            .round(clients, [(owner, operation)], &mut schedule)
             .await;
     }
     for phase in 1..=PHASES {
@@ -502,9 +502,9 @@ async fn seeded(clients: &Clients, seed: u64) -> History {
         let mut challengers = [(owner + 1) % 3, (owner + 2) % 3];
         schedule.shuffle(&mut challengers);
         let [first, second] = challengers;
-        let next = Lsn(end.0 + 1);
+        let next = Lsn(head.0 + 1);
         let sealed = history
-            .wave(
+            .round(
                 clients,
                 [
                     (first, Op::Seal(epoch)),
@@ -514,7 +514,7 @@ async fn seeded(clients: &Clients, seed: u64) -> History {
                         Op::Append(Epoch(phase), next, Bytes::from_static(b"old")),
                     ),
                     (first, Op::Head),
-                    (second, Op::Read(end, 2)),
+                    (second, Op::Read(head, 2)),
                 ],
                 &mut schedule,
             )
@@ -526,25 +526,25 @@ async fn seeded(clients: &Clients, seed: u64) -> History {
         };
         owner = winner;
         if sealed[2] == Ok(Value::Position(next)) {
-            end = next;
+            head = next;
         }
-        let next = Lsn(end.0 + 1);
+        let next = Lsn(head.0 + 1);
         let payload = Bytes::from(vec![seed as u8, phase as u8]);
         let retry = if schedule.next() % 2 == 0 {
             payload.clone()
         } else {
             Bytes::from_static(b"other")
         };
-        let from = Lsn(1 + schedule.next() % end.0);
+        let from = Lsn(1 + schedule.next() % head.0);
         let max = (schedule.next() % 3) as usize + 1;
         let appended = history
-            .wave(
+            .round(
                 clients,
                 [
                     (owner, Op::Append(epoch, next, payload.clone())),
                     (owner, Op::Append(epoch, next, retry)),
                     (loser, Op::Append(epoch, next, payload)),
-                    (owner, Op::Trim(epoch, end)),
+                    (owner, Op::Trim(epoch, head)),
                     (loser, Op::Read(from, max)),
                     (owner, Op::Read(next, 2)),
                     (loser, Op::Head),
@@ -553,13 +553,13 @@ async fn seeded(clients: &Clients, seed: u64) -> History {
             )
             .await;
         if appended[..2].contains(&Ok(Value::Position(next))) {
-            end = next;
+            head = next;
         }
     }
     history
-        .wave(
+        .round(
             clients,
-            [(1, Op::Head), (2, Op::Read(end, 2))],
+            [(1, Op::Head), (2, Op::Read(head, 2))],
             &mut schedule,
         )
         .await;

@@ -1,5 +1,5 @@
 use crate::{
-    BoxFuture, Epoch, Identity, Journal, JournalError, Limits, Lsn, Page, Result, StreamId,
+    BoxFuture, Epoch, Identity, Journal, JournalError, Lsn, Page, Result, StreamId,
     file::Storage,
     state::{Mutation, State},
     timer::Sleep,
@@ -13,6 +13,26 @@ use std::{
     task::{Poll, Waker},
     time::Duration,
 };
+
+pub use crate::file::FileJournal;
+
+/// Static payload limits for every stream in a reference journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum size in bytes of a single record.
+    pub max_record_bytes: usize,
+    /// Maximum total payload bytes retained by a stream.
+    pub stream_quota_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_record_bytes: 32 * 1024 * 1024,
+            stream_quota_bytes: 8 * 1024 * 1024 * 1024,
+        }
+    }
+}
 
 /// An in-process reference journal shared by all handles created from it.
 #[derive(Clone)]
@@ -108,7 +128,7 @@ impl Engine {
     fn head(&self, stream: StreamId) -> Result<Lsn> {
         let inner = self.0.lock().unwrap();
         inner.available()?;
-        Ok(inner.state.live(stream)?.end)
+        Ok(inner.state.live(stream)?.head)
     }
 
     async fn read(&self, stream: StreamId, from: Lsn, max: usize, wait: Duration) -> Result<Page> {
@@ -125,10 +145,10 @@ impl Engine {
             if from < live.floor {
                 return Poll::Ready(Err(JournalError::Trimmed { floor: live.floor }));
             }
-            if from <= live.end || timeout.as_mut().poll(cx).is_ready() {
+            if from <= live.head || timeout.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(Ok(live.page(from, max)));
             }
-            // Check the current end and register under the same lock as append.
+            // Check the current head and register under the same lock as append.
             let id = *reader.id.get_or_insert_with(|| {
                 let id = inner.next_reader;
                 inner.next_reader += 1;
@@ -181,7 +201,7 @@ impl Journal for Handle {
                 stream,
                 Mutation::Seal {
                     epoch,
-                    identity: self.identity,
+                    identity: self.identity.clone(),
                 },
             )
         })
@@ -199,7 +219,7 @@ impl Journal for Handle {
                 stream,
                 Mutation::Append {
                     epoch,
-                    identity: self.identity,
+                    identity: self.identity.clone(),
                     at,
                     payload,
                 },
@@ -228,7 +248,7 @@ impl Journal for Handle {
                     stream,
                     Mutation::Trim {
                         epoch,
-                        identity: self.identity,
+                        identity: self.identity.clone(),
                         through,
                     },
                 )

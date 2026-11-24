@@ -4,9 +4,9 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::{future::join_all, poll};
-use journal_contract::{Epoch, Journal, JournalError, Lsn, StreamId};
+use journal_contract::{Epoch, Identity, Journal, JournalError, Lsn, StreamId};
 
-use super::{Holder, SealPolicy, Writer};
+use super::{SealPolicy, Writer};
 use keeper::{Fault, Gate, KEEPERS, Kind, Network};
 
 const STREAM: StreamId = StreamId(42);
@@ -16,7 +16,7 @@ const E3: Epoch = Epoch(3);
 const WAIT: Duration = Duration::from_secs(2);
 
 fn writer(network: &Arc<Network>, holder: u128) -> Writer {
-    Writer::new(network.client(holder), Holder(holder), KEEPERS).unwrap()
+    Writer::new(network.client(holder), KEEPERS).unwrap()
 }
 
 async fn started() -> (Arc<Network>, Writer) {
@@ -103,7 +103,6 @@ async fn head_and_reseal_accept_the_winning_holder_amid_a_split_promise() {
                 stream: STREAM,
                 ensemble,
                 epoch: E2,
-                holder: Holder(90),
             },
         )
         .await
@@ -139,7 +138,7 @@ async fn recovery_discards_a_longer_tail_from_a_lower_synced_epoch() {
         .until(|| {
             KEEPERS[..3]
                 .iter()
-                .all(|&id| network.view(id, STREAM).unwrap().end == Lsn(1))
+                .all(|&id| network.view(id, STREAM).unwrap().tail == Lsn(1))
         })
         .await;
     network.down(KEEPERS[0], true);
@@ -149,7 +148,7 @@ async fn recovery_discards_a_longer_tail_from_a_lower_synced_epoch() {
         Err(JournalError::Unavailable)
     );
     network
-        .until(|| network.view(KEEPERS[2], STREAM).unwrap().end == Lsn(2))
+        .until(|| network.view(KEEPERS[2], STREAM).unwrap().tail == Lsn(2))
         .await;
     network.down(KEEPERS[0], false);
     network.down(KEEPERS[1], false);
@@ -160,7 +159,7 @@ async fn recovery_discards_a_longer_tail_from_a_lower_synced_epoch() {
     network.down(KEEPERS[2], false);
     let third = writer(&network, 3);
     assert_eq!(third.seal(STREAM, E3).await, Ok(Lsn(1)));
-    assert_eq!(network.view(KEEPERS[2], STREAM).unwrap().end, Lsn(1));
+    assert_eq!(network.view(KEEPERS[2], STREAM).unwrap().tail, Lsn(1));
     third
         .append(STREAM, E3, Lsn(2), record("replacement"))
         .await
@@ -184,7 +183,7 @@ async fn recovery_fetches_a_durable_tail_before_any_keeper_advertises_commit() {
         .until(|| {
             KEEPERS[..2]
                 .iter()
-                .all(|&id| network.view(id, STREAM).unwrap().end == Lsn(1))
+                .all(|&id| network.view(id, STREAM).unwrap().tail == Lsn(1))
         })
         .await;
     assert_eq!(
@@ -223,7 +222,7 @@ async fn append_retry_after_lost_replies_is_exact() {
     assert_eq!(
         writer.append(STREAM, E1, Lsn(1), record("changed")).await,
         Err(JournalError::Conflict {
-            committed_end: Lsn(0)
+            head: Lsn(0)
         })
     );
     assert_eq!(
@@ -237,13 +236,13 @@ async fn append_retry_after_lost_replies_is_exact() {
     assert_eq!(
         writer.append(STREAM, E1, Lsn(1), record("changed")).await,
         Err(JournalError::Conflict {
-            committed_end: Lsn(1)
+            head: Lsn(1)
         })
     );
     assert_eq!(
         writer.append(STREAM, E1, Lsn(3), record("gap")).await,
         Err(JournalError::Conflict {
-            committed_end: Lsn(1)
+            head: Lsn(1)
         })
     );
 }
@@ -280,11 +279,11 @@ async fn one_keeper_down_requires_both_survivors_to_acknowledge() {
     assert!(poll!(&mut pending).is_pending());
     gate.reached().await;
     network
-        .until(|| network.view(KEEPERS[0], STREAM).unwrap().end == Lsn(1))
+        .until(|| network.view(KEEPERS[0], STREAM).unwrap().tail == Lsn(1))
         .await;
     assert!(
         poll!(&mut pending).is_pending(),
-        "one acknowledgement cannot commit"
+        "one acknowledgement cannot head"
     );
     gate.release();
     assert_eq!(pending.await, Ok(Lsn(1)));
@@ -311,10 +310,10 @@ async fn append_pipeline_advances_without_waiting_for_a_slow_third_keeper() {
         (Ok(Lsn(1)), Ok(Lsn(2)))
     );
     gate.reached().await;
-    assert_eq!(network.view(KEEPERS[2], STREAM).unwrap().end, Lsn(1));
+    assert_eq!(network.view(KEEPERS[2], STREAM).unwrap().tail, Lsn(1));
     gate.release();
     network
-        .until(|| network.view(KEEPERS[2], STREAM).unwrap().end == Lsn(2))
+        .until(|| network.view(KEEPERS[2], STREAM).unwrap().tail == Lsn(2))
         .await;
 }
 
@@ -380,7 +379,7 @@ async fn observer_head_requires_quorum_commit_coverage() {
         .until(|| {
             KEEPERS[..2]
                 .iter()
-                .all(|&id| network.view(id, STREAM).unwrap().commit == Lsn(1))
+                .all(|&id| network.view(id, STREAM).unwrap().head == Lsn(1))
         })
         .await;
     assert_eq!(observer.head(STREAM).await, Ok(Lsn(1)));
@@ -403,11 +402,11 @@ async fn read_long_poll_wakes_on_the_final_commit_and_uses_the_quorum_floor() {
         .unwrap()
         .unwrap();
     assert_eq!(page.records, [(Lsn(1), record("wake"))]);
-    assert_eq!((page.floor, page.end), (Lsn(1), Lsn(1)));
+    assert_eq!((page.floor, page.head), (Lsn(1), Lsn(1)));
     assert_eq!(
         writer.trim(STREAM, E1, Lsn(2)).await,
         Err(JournalError::Conflict {
-            committed_end: Lsn(1)
+            head: Lsn(1)
         })
     );
     writer.trim(STREAM, E1, Lsn(1)).await.unwrap();
@@ -422,7 +421,7 @@ async fn read_long_poll_wakes_on_the_final_commit_and_uses_the_quorum_floor() {
         .await
         .unwrap();
     assert_eq!(
-        (empty.floor, empty.end, empty.records),
+        (empty.floor, empty.head, empty.records),
         (Lsn(2), Lsn(1), vec![])
     );
 }
@@ -442,7 +441,7 @@ async fn read_floor_intersects_a_completed_trim() {
         .unwrap();
     let [first, second, third] = KEEPERS[..3].try_into().unwrap();
     network
-        .until(|| network.view(third, STREAM).unwrap().commit == Lsn(2))
+        .until(|| network.view(third, STREAM).unwrap().head == Lsn(2))
         .await;
     network.down(third, true);
     writer.trim(STREAM, E1, Lsn(1)).await.unwrap();
@@ -467,7 +466,7 @@ async fn read_floor_intersects_a_completed_trim() {
         Reply::Records {
             floor: Lsn(1),
             records: vec![(Lsn(1), record("discard"))],
-            commit: Lsn(2),
+            head: Lsn(2),
         },
         "the third keeper still serves its local floor"
     );
@@ -508,7 +507,6 @@ async fn a_stale_route_cannot_read_below_a_replacement_ensemble_trim() {
         survivors: [first, second],
         learner,
         epoch: E2,
-        holder: Holder(2),
     };
     let result = sweep_idle(&*network.client(2), [plan]).await;
     assert!(result[0].1.is_ok(), "{result:?}");
@@ -553,7 +551,7 @@ async fn an_append_reply_waits_for_quorum_commit_visibility() {
     gate.reached().await;
     assert!(
         poll!(&mut append).is_pending(),
-        "append reply requires quorum commit visibility"
+        "append reply requires quorum head visibility"
     );
     gate.release();
     assert_eq!(append.await, Ok(Lsn(1)));
@@ -576,11 +574,11 @@ async fn head_and_trim_wait_for_a_sampled_append_to_be_visible() {
     let quiet = Duration::from_millis(25);
     assert!(
         tokio::time::timeout(quiet, &mut head).await.is_err(),
-        "head must wait for quorum commit visibility"
+        "head must wait for quorum head visibility"
     );
     assert!(
         tokio::time::timeout(quiet, &mut trim).await.is_err(),
-        "trim must wait for quorum commit visibility"
+        "trim must wait for quorum head visibility"
     );
     gate.release();
     assert_eq!(head.await, Ok(Lsn(1)));
@@ -626,7 +624,7 @@ async fn a_fenced_publication_leaves_a_chosen_append_outcome_unknown() {
 async fn create_uses_url_order_or_explicit_ensemble_and_delete_is_terminal() {
     let network = Arc::new(Network::default());
     let order = [KEEPERS[3], KEEPERS[1], KEEPERS[2], KEEPERS[0]];
-    let writer = Writer::new(network.client(1), Holder(1), order).unwrap();
+    let writer = Writer::new(network.client(1), order).unwrap();
     let explicit = StreamId(43);
     writer.create(STREAM).await.unwrap();
     writer.create(STREAM).await.unwrap();
@@ -648,7 +646,7 @@ async fn create_uses_url_order_or_explicit_ensemble_and_delete_is_terminal() {
         Err(JournalError::Deleted)
     );
     assert_eq!(writer.head(explicit).await, Err(JournalError::Deleted));
-    assert!(Writer::new(network.client(2), Holder(2), [KEEPERS[0]; 3]).is_err());
+    assert!(Writer::new(network.client(2), [KEEPERS[0]; 3]).is_err());
 }
 
 #[tokio::test]
@@ -686,7 +684,7 @@ async fn limits_refuse_without_consuming_a_position_and_trim_frees_capacity() {
 async fn seal_policy_refuses_before_sending_a_seal() {
     struct Deny;
     impl SealPolicy for Deny {
-        fn authorize(&self, _: StreamId, _: Epoch, _: Holder) -> journal_contract::Result<()> {
+        fn authorize(&self, _: StreamId, _: Epoch, _: &Identity) -> journal_contract::Result<()> {
             Err(JournalError::Unavailable)
         }
     }
@@ -763,7 +761,7 @@ async fn lagging_keeper_can_rejoin_after_a_committed_trim() {
         Ok(Lsn(2))
     );
     let view = network.view(KEEPERS[2], STREAM).unwrap();
-    assert_eq!((view.floor, view.end), (Lsn(2), Lsn(2)));
+    assert_eq!((view.floor, view.tail), (Lsn(2), Lsn(2)));
 }
 
 #[tokio::test]
@@ -788,8 +786,7 @@ async fn journal_contract_conformance() {
     run(|identity| {
         Arc::new(
             Writer::new(
-                network.client(identity.0),
-                Holder(identity.0),
+                network.connect(identity),
                 KEEPERS[..3].iter().copied(),
             )
             .unwrap(),
@@ -802,7 +799,7 @@ async fn journal_contract_conformance() {
 async fn read_assembles_a_page_across_keeper_frames() {
     let size = 32 * 1024 * 1024;
     let network = Arc::new(Network::new(3, size, 2 * u64::from(size)));
-    let writer = Writer::new(network.client(1), Holder(1), KEEPERS[..3].iter().copied()).unwrap();
+    let writer = Writer::new(network.client(1), KEEPERS[..3].iter().copied()).unwrap();
     writer.create(STREAM).await.unwrap();
     writer.seal(STREAM, E1).await.unwrap();
     let payload = Bytes::from(vec![7; size as usize]);
@@ -816,6 +813,6 @@ async fn read_assembles_a_page_across_keeper_frames() {
         .read(STREAM, Lsn(1), 2, Duration::ZERO)
         .await
         .expect("complete page across keeper frames");
-    assert_eq!(page.end, Lsn(2));
+    assert_eq!(page.head, Lsn(2));
     assert_eq!(page.records, [(Lsn(1), payload.clone()), (Lsn(2), payload)]);
 }

@@ -2,8 +2,7 @@
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use bytes::Bytes;
-use journal_contract::{BoxFuture, StreamId};
+use journal_contract::{BoxFuture, Identity, StreamId};
 use parking_lot::Mutex;
 use tokio::sync::{Semaphore, watch};
 
@@ -92,7 +91,7 @@ struct State {
 
 pub(super) struct Client {
     network: Arc<Network>,
-    principal: Bytes,
+    identity: Identity,
 }
 
 impl Default for Network {
@@ -119,10 +118,14 @@ impl Network {
         }
     }
 
-    pub(super) fn client(self: &Arc<Self>, holder: u128) -> Arc<Client> {
+    pub(super) fn client(self: &Arc<Self>, id: u128) -> Arc<Client> {
+        self.connect(Identity::from(format!("urn:logkeeper:client:{id}")))
+    }
+
+    pub(super) fn connect(self: &Arc<Self>, identity: Identity) -> Arc<Client> {
         Arc::new(Client {
             network: self.clone(),
-            principal: Bytes::from(format!("urn:logkeeper:client:{holder}")),
+            identity,
         })
     }
 
@@ -162,6 +165,8 @@ impl Network {
 }
 
 impl Transport for Client {
+    fn identity(&self) -> &Identity { &self.identity }
+
     fn call(
         &self,
         keeper: KeeperId,
@@ -174,7 +179,7 @@ impl Transport for Client {
             let apply = |state: &mut State| {
                 state.keepers[slot(keeper)].call(
                     keeper,
-                    &self.principal,
+                    &self.identity,
                     request.clone(),
                     &network.limits,
                 )
@@ -194,7 +199,7 @@ impl Transport for Client {
                 if wait_ms > 0 && max != 0 {
                     let deadline =
                         tokio::time::Instant::now() + Duration::from_millis(wait_ms.into());
-                    while matches!(reply, Reply::Records { commit, .. } if commit < from) {
+                    while matches!(reply, Reply::Records { head, .. } if head < from) {
                         let woke = tokio::time::timeout_at(deadline, change.changed())
                             .await
                             .is_ok();
