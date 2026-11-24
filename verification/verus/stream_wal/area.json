@@ -1,13 +1,17 @@
 {
-  "summary": "Verify the shipped frame length, checksum comparison and shared extent layout checks.",
+  "summary": "Verify the shipped WAL and checkpoint bytes, frame bounds, and pack extent correspondence.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
-    "production",
+    "wal_layout",
     "--verify-module",
-    "laws"
+    "wal_bytes",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "checkpoint_bytes"
   ],
-  "min_verified_functions": 7,
+  "min_verified_functions": 87,
   "controls": {
     "ignore-frame-limit": {
       "defect": "ignore frame limit",
@@ -25,7 +29,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 6
+      "min_verified_functions": 86
     },
     "ignore-segment-end": {
       "defect": "ignore segment end",
@@ -43,7 +47,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 6
+      "min_verified_functions": 86
     },
     "accept-mismatched-crc": {
       "defect": "accept mismatched crc",
@@ -61,7 +65,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 6
+      "min_verified_functions": 86
     },
     "allow-future-pack": {
       "defect": "allow future pack",
@@ -79,7 +83,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 6
+      "min_verified_functions": 86
     },
     "allow-oversized-extent": {
       "defect": "allow oversized extent",
@@ -97,7 +101,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 6
+      "min_verified_functions": 86
     },
     "allow-extent-past-pack": {
       "defect": "allow extent past pack",
@@ -115,7 +119,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 6
+      "min_verified_functions": 86
     },
     "overlap-packed-extents": {
       "defect": "overlap packed extents",
@@ -133,7 +137,151 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 6
+      "min_verified_functions": 86
+    },
+    "write-wrong-frame-crc": {
+      "defect": "write wrong frame crc",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_bytes.rs",
+          "find": "Some(frame_header(len, checksum(prefix, body)))",
+          "replace": "Some(frame_header(len, checksum(&[], body)))"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_bytes.rs",
+          "function": "encode_frame",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 86
+    },
+    "advance-past-torn-frame": {
+      "defect": "advance past torn frame",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_bytes.rs",
+          "find": "frame_body_fits(remaining, len, max)",
+          "replace": "frame_body_fits(remaining.saturating_add(1), len, max)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_bytes.rs",
+          "function": "decode_frame_header",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 86
+    },
+    "read-frame-without-crc": {
+      "defect": "read frame without crc",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_bytes.rs",
+          "find": "body.len() == len as usize && checksum_matches(crc, checksum(&[], body))",
+          "replace": "body.len() == len as usize"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_bytes.rs",
+          "function": "decode_frame_body",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 86
+    },
+    "allow-alternate-index-flag": {
+      "defect": "allow alternate index flag",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/checkpoint_bytes.rs",
+          "find": "    flag <= 1",
+          "replace": "    flag <= 2"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/checkpoint_bytes.rs",
+          "function": "valid_flag",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 86
+    },
+    "skip-index-header-crc": {
+      "defect": "skip index header crc",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/checkpoint_bytes.rs",
+          "find": "        || !checksum_matches(decode_u32(crc), checksum(&[], &fields))",
+          "replace": "        || (!checksum_matches(decode_u32(crc), checksum(&[], &fields)) && false)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/checkpoint_bytes.rs",
+          "function": "decode_index_header",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 86
+    },
+    "misaddress-pack-write": {
+      "defect": "misaddress pack write",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/checkpoint_bytes.rs",
+          "find": "Some((offset, end, len, checksum(&[], payload)))",
+          "replace": "Some((end, end, len, checksum(&[], payload)))"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/checkpoint_bytes.rs",
+          "function": "describe_extent",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 86
+    },
+    "read-extent-without-crc": {
+      "defect": "read extent without crc",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/checkpoint_bytes.rs",
+          "find": "    checksum_matches(crc, checksum(&[], payload))",
+          "replace": "    !checksum_matches(crc, checksum(&[], payload))"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/checkpoint_bytes.rs",
+          "function": "check_extent",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 86
+    },
+    "lose-wal-stream-id": {
+      "defect": "replace the decoded stream ID with zero",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/wal_bytes.rs",
+          "find": "let stream = decode_u128(stream);",
+          "replace": "let stream = 0u128;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/wal_bytes.rs",
+          "function": "decode_fragment",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 86
     }
   }
 }

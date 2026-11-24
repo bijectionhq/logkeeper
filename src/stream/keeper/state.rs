@@ -4,8 +4,8 @@ use bytes::Bytes;
 use tokio::sync::watch;
 
 use super::{
+    checkpoint_bytes::check_extent,
     rules::{self, Decision, Limits},
-    wal_layout::checksum_matches,
 };
 use crate::stream::{
     codec::{PAGE_BYTES, invalid},
@@ -76,7 +76,7 @@ impl Payload {
             } => {
                 let mut bytes = vec![0; *len as usize];
                 read_at(reader.file(extent)?, &mut bytes, *offset)?;
-                if !checksum_matches(*crc, crc32fast::hash(&bytes)) {
+                if !check_extent(*crc, &bytes) {
                     return Err(invalid("stream extent checksum mismatch"));
                 }
                 Ok(Bytes::from(bytes))

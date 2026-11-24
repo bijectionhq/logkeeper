@@ -9,21 +9,22 @@ use std::{
     sync::Arc,
 };
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 
 use super::{
+    checkpoint_bytes::{
+        self, EXTENT_BYTES, INDEX_HEADER_BYTES, Location, StagedIndex, StreamIndex,
+    },
     durability::{sync_directory, sync_file},
     state::{Extent, ExtentReader, Payload, Record, Staging, Stream},
-    wal::{Decoder, SEGMENT_BYTES, atomic_file, put_bytes, put_count, read_frame, sequence},
-    wal_layout::{extent_fits, place_extent},
+    wal::{SEGMENT_BYTES, atomic_file, read_frame, sequence},
+    wal_bytes::{self, FRAME_HEADER_BYTES},
+    wal_layout::{extent_fits, stored_length},
 };
 use crate::stream::{
     codec::{self, MAX_FRAME_BYTES, invalid},
     wire::{Epoch, Lsn, StreamId},
 };
-
-const MAGIC: &[u8; 8] = b"LKPACK01";
-const RECORD_BYTES: usize = 32;
 
 #[derive(Default)]
 pub(super) struct Checkpoint {
@@ -52,19 +53,31 @@ impl Indexed {
 
     fn write(&mut self, pack: &mut Pack) -> io::Result<()> {
         self.packs.clear();
-        let mut body = BytesMut::new();
         let snapshot = &self.snapshot;
-        body.put_u128(snapshot.stream.0);
-        body.put_u8(u8::from(snapshot.deleted));
-        put_bytes(&mut body, &codec::encode_checkpoint_view(&snapshot.view)?)?;
-        self.bytes = pack.index(&mut body, &mut self.packs, &snapshot.records)?;
-        body.put_u8(u8::from(snapshot.staged.is_some()));
-        if let Some((from, floor, records)) = &snapshot.staged {
-            body.put_u64(from.0);
-            body.put_u64(floor.0);
-            self.bytes += pack.index(&mut body, &mut self.packs, records)?;
-        }
-        self.body = body.freeze();
+        let view = codec::encode_checkpoint_view(&snapshot.view)?;
+        let (retained, retained_bytes) = pack.index(&mut self.packs, &snapshot.records)?;
+        let (staged, staged_bytes) = match &snapshot.staged {
+            Some((_, _, records)) => pack.index(&mut self.packs, records)?,
+            None => (Vec::new(), 0),
+        };
+        self.bytes = retained_bytes + staged_bytes;
+        self.body = Bytes::from(
+            checkpoint_bytes::encode_stream_index(StreamIndex {
+                stream: snapshot.stream.0,
+                deleted: snapshot.deleted,
+                view: &view,
+                retained: &retained,
+                staged: snapshot
+                    .staged
+                    .as_ref()
+                    .map(|(from, floor, _)| StagedIndex {
+                        from: from.0,
+                        floor: floor.0,
+                        rows: &staged,
+                    }),
+            })
+            .ok_or_else(|| invalid("invalid stream index"))?,
+        );
         Ok(())
     }
 }
@@ -104,23 +117,17 @@ struct Pack {
     moved: Vec<(Record, Location)>,
 }
 
-#[derive(Clone, Copy)]
-struct Location {
-    seq: u64,
-    offset: u64,
-    len: u32,
-    crc: u32,
-}
-
 impl Pack {
     fn index(
         &mut self,
-        out: &mut BytesMut,
         packs: &mut HashSet<u64>,
         records: &VecDeque<Record>,
-    ) -> io::Result<u64> {
+    ) -> io::Result<(Vec<u8>, u64)> {
         let mut bytes = 0;
-        put_count(out, records.len())?;
+        let capacity = stored_length(records.len())
+            .and_then(|count| (count as usize).checked_mul(EXTENT_BYTES))
+            .ok_or_else(|| invalid("too many indexed records"))?;
+        let mut rows = Vec::with_capacity(capacity);
         for record in records {
             let existing = match &*record.payload.read() {
                 Payload::Extent {
@@ -140,8 +147,9 @@ impl Pack {
                 location
             } else {
                 let payload = record.read(&mut self.reader)?;
-                let (len, end) = place_extent(self.offset, payload.len())
-                    .ok_or_else(|| invalid("keeper pack extent is too large"))?;
+                let (offset, end, len, crc) =
+                    checkpoint_bytes::describe_extent(self.offset, &payload)
+                        .ok_or_else(|| invalid("keeper pack extent is too large"))?;
                 if self.output.is_none() {
                     self.output = Some(BufWriter::new(
                         File::options()
@@ -156,23 +164,19 @@ impl Pack {
                     .write_all(&payload)?;
                 let location = Location {
                     seq: self.extent.sequence,
-                    offset: self.offset,
+                    offset,
                     len,
-                    crc: crc32fast::hash(&payload),
+                    crc,
                 };
                 self.offset = end;
                 self.moved.push((record.clone(), location));
                 location
             };
-            out.put_u64(record.epoch.0);
-            out.put_u64(location.seq);
-            out.put_u64(location.offset);
-            out.put_u32(location.len);
-            out.put_u32(location.crc);
+            rows.extend_from_slice(&checkpoint_bytes::encode_extent(record.epoch.0, location));
             packs.insert(location.seq);
             bytes += u64::from(location.len);
         }
-        Ok(bytes)
+        Ok((rows, bytes))
     }
 
     fn sync(&mut self, root: &Path) -> io::Result<()> {
@@ -236,26 +240,16 @@ impl Checkpoint {
         }
         pack.sync(root)?;
         atomic_file(&root.join("INDEX"), |file| {
-            file.write_all(MAGIC)?;
-            file.write_all(&next.to_be_bytes())?;
             let count: u32 = self
                 .streams
                 .len()
                 .try_into()
                 .map_err(|_| invalid("too many indexed streams"))?;
-            file.write_all(&count.to_be_bytes())?;
-            let mut crc = crc32fast::Hasher::new();
-            crc.update(&next.to_be_bytes());
-            crc.update(&count.to_be_bytes());
-            file.write_all(&crc.finalize().to_be_bytes())?;
+            file.write_all(&checkpoint_bytes::encode_index_header(next, count))?;
             for stream in self.streams.values() {
-                let len: u32 = stream
-                    .body
-                    .len()
-                    .try_into()
-                    .map_err(|_| invalid("stream index too large"))?;
-                file.write_all(&len.to_be_bytes())?;
-                file.write_all(&crc32fast::hash(&stream.body).to_be_bytes())?;
+                let header = wal_bytes::encode_frame(&[], &stream.body)
+                    .ok_or_else(|| invalid("stream index too large"))?;
+                file.write_all(&header)?;
                 file.write_all(&stream.body)?;
             }
             Ok(())
@@ -327,33 +321,23 @@ impl Checkpoint {
         };
         let length = file.metadata()?.len();
         let mut file = BufReader::new(file);
-        let mut magic = [0; 8];
-        let mut next = [0; 8];
-        let mut count = [0; 4];
-        let mut crc = [0; 4];
-        file.read_exact(&mut magic)?;
-        file.read_exact(&mut next)?;
-        file.read_exact(&mut count)?;
-        file.read_exact(&mut crc)?;
-        let mut hash = crc32fast::Hasher::new();
-        hash.update(&next);
-        hash.update(&count);
-        if &magic != MAGIC || hash.finalize() != u32::from_be_bytes(crc) {
-            return Err(invalid("damaged keeper index header"));
-        }
-        let next = u64::from_be_bytes(next);
-        let mut remaining = length - 24;
+        let mut header = [0; INDEX_HEADER_BYTES];
+        file.read_exact(&mut header)?;
+        let (next, count) = checkpoint_bytes::decode_index_header(&header)
+            .ok_or_else(|| invalid("damaged keeper index header"))?;
+        let mut remaining = length - INDEX_HEADER_BYTES as u64;
         let mut packs = HashMap::new();
         let mut states = HashMap::new();
         let mut index = Self::default();
-        for _ in 0..u32::from_be_bytes(count) {
+        for _ in 0..count {
             let body = read_frame(&mut file, remaining, u32::MAX as usize)?
                 .ok_or_else(|| invalid("damaged keeper index stream"))?;
-            remaining -= 8 + body.len() as u64;
-            let mut decoder = Decoder(body.clone());
-            let stream = StreamId(decoder.u128()?);
-            let deleted = decoder.boolean()?;
-            let view = codec::decode_checkpoint_view(decoder.bytes()?)?;
+            remaining -= FRAME_HEADER_BYTES as u64 + body.len() as u64;
+            let row = checkpoint_bytes::decode_stream_index(&body)
+                .ok_or_else(|| invalid("invalid keeper index stream"))?;
+            let stream = StreamId(row.stream);
+            let deleted = row.deleted;
+            let view = codec::decode_checkpoint_view(body.slice_ref(row.view))?;
             let mut live = HashSet::new();
             let mut records = PackReader {
                 root,
@@ -361,22 +345,17 @@ impl Checkpoint {
                 known: &mut packs,
                 live: &mut live,
             };
-            let retained = records.read(&mut decoder)?;
-            let staging = if decoder.boolean()? {
-                let from = Lsn(decoder.u64()?);
-                let floor = Lsn(decoder.u64()?);
-                if from.0 == 0 {
-                    return Err(invalid("invalid staged stream history"));
-                }
-                Some(Staging {
-                    from,
-                    floor,
-                    records: records.read(&mut decoder)?,
+            let retained = records.read(row.retained)?;
+            let staging = row
+                .staged
+                .map(|staged| -> io::Result<_> {
+                    Ok(Staging {
+                        from: Lsn(staged.from),
+                        floor: Lsn(staged.floor),
+                        records: records.read(staged.rows)?,
+                    })
                 })
-            } else {
-                None
-            };
-            decoder.finish()?;
+                .transpose()?;
             if view
                 .tail
                 .0
@@ -434,14 +413,20 @@ struct PackReader<'a> {
 }
 
 impl PackReader<'_> {
-    fn read(&mut self, input: &mut Decoder) -> io::Result<VecDeque<Record>> {
-        (0..input.count(RECORD_BYTES)?)
-            .map(|_| {
-                let epoch = Epoch(input.u64()?);
-                let seq = input.u64()?;
-                let offset = input.u64()?;
-                let len = input.u32()?;
-                let crc = input.u32()?;
+    fn read(&mut self, rows: &[u8]) -> io::Result<VecDeque<Record>> {
+        rows.chunks_exact(EXTENT_BYTES)
+            .map(|row| {
+                let (
+                    epoch,
+                    Location {
+                        seq,
+                        offset,
+                        len,
+                        crc,
+                    },
+                    _,
+                ) = checkpoint_bytes::decode_extent(row)
+                    .ok_or_else(|| invalid("short keeper index extent"))?;
                 let (extent, size) = match self.known.entry(seq) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -461,7 +446,7 @@ impl PackReader<'_> {
                 }
                 self.live.insert(seq);
                 Ok(Record::new(
-                    epoch,
+                    Epoch(epoch),
                     Payload::Extent {
                         extent: Arc::clone(extent),
                         offset,

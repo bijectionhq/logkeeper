@@ -80,8 +80,8 @@ CONTROLS = [
     ),
     (
         "ignore-wal-crc", "keeper/wal.rs",
-        "Ok(checksum_matches(crc, crc32fast::hash(&bytes)).then(|| Bytes::from(bytes)))",
-        "let _ = crc;\n    Ok(Some(Bytes::from(bytes)))",
+        "if wal_bytes::decode_frame(&frame, max).is_none() {",
+        "if wal_bytes::decode_frame(&frame, max).is_none() && false {",
         KEEPER_TEST + "recovery_cuts_interleaved_torn_tail_and_keeps_the_other_stream", "torn record was replayed",
     ),
     (
@@ -97,9 +97,22 @@ CONTROLS = [
     ),
     (
         "ignore-extent-crc", "keeper/state.rs",
-        "if !checksum_matches(*crc, crc32fast::hash(&bytes)) {",
-        "if !checksum_matches(*crc, crc32fast::hash(&bytes)) && false {",
+        "if !check_extent(*crc, &bytes) {",
+        "if !check_extent(*crc, &bytes) && false {",
         KEEPER_TEST + "corrupt_extent_cannot_supply_a_read", "called `Result::unwrap_err()` on an `Ok` value",
+    ),
+    (
+        "change-packed-bytes", "keeper/checkpoint.rs",
+        ".write_all(&payload)?;",
+        ".write_all(&if self.rewrite { bytes::Bytes::from(payload.repeat(2)) } else { payload.clone() })?;",
+        KEEPER_TEST + "checkpoint_pack_writes_and_reopens_exact_extents",
+        "pack write changed the payload bytes",
+    ),
+    (
+        "accept-trailing-index-bytes", "keeper/checkpoint.rs",
+        "if remaining != 0 {", "if remaining != 0 && false {",
+        KEEPER_TEST + "checkpoint_index_requires_every_byte",
+        "index opened with trailing bytes",
     ),
     (
         "per-stream-checkpoint-sync", "keeper/checkpoint.rs",
@@ -155,8 +168,8 @@ CONTROLS = [
     ),
     (
         "discard-continuation", "keeper/wal.rs",
-        "if flags == CONTINUED && id == StreamId(0) && frame.0 == &[0][..] {\n                continue;",
-        "if flags == CONTINUED && id == StreamId(0) && frame.0 == &[0][..] {\n                fragments.clear();\n                continue;",
+        "if flags == CONTINUED {\n            if at_start {\n                continue;",
+        "if flags == CONTINUED {\n            if at_start {\n                fragments.clear();\n                continue;",
         KEEPER_TEST + "segment_rollover_caps_files_and_keeps_interleaved_fragments",
         "cross-segment fragment was lost",
     ),

@@ -99,9 +99,19 @@ installation's ensemble and learner fields. The ensemble check also links
 the three concrete keeper IDs to nonzero, distinct model IDs. The inventory
 records the remaining projection work for the keeper's native state.
 
-The WAL links cover frame length bounds, CRC equality, extent bounds and checked
-offset placement. The runner also extracts the fallible calls involved in checkpoint
-publication from `new_segment`, `start_rotation`, `Pack::sync`, `Checkpoint::write`
-and `atomic_file`. Lean validates the resulting sequence against the WAL publication
-model. The extractor covers these call sites and the model treats successful file
-and directory syncs and atomic rename as its filesystem boundary.
+The WAL links cover the shipped frame encoder and acceptance predicate, the
+four-byte big-endian word codec, and the fragment, index header, stream row, and
+extent field order. `linked_wal_replays` feeds frames produced by the generated
+encoder into the byte decoder and the recovery scan. `StreamWAL.lean` proves
+that every proper frame prefix is rejected and that a torn newest frame
+preserves the completed entries. The semantic classifier consumes the exact
+decoded fragment bodies. The Rust proofs cover the fragment and index
+parsers, the bounded reads, and the exact extent bytes. The protobuf fields
+are opaque byte slices at this boundary.
+
+The publication extractor covers the fallible calls in
+`new_segment`, `start_rotation`, `Pack::sync`, `Checkpoint::write`, and
+`atomic_file`. Lean checks their sequence against the WAL publication model.
+The [storage qualification matrix](../target-journal.md#storage-premises-and-deployment-qualification)
+records the premises for file sync, directory sync, and atomic rename, and
+the CRC-32 dependency premise.

@@ -1,5 +1,6 @@
 //! A durable keeper for many streams. The keeper serializes decisions and WAL rounds.
 mod checkpoint;
+mod checkpoint_bytes;
 mod durability;
 #[cfg(test)]
 pub(super) mod memory;
@@ -8,6 +9,7 @@ mod state;
 mod sweep;
 
 mod wal;
+mod wal_bytes;
 mod wal_layout;
 
 pub use rules::Limits;
@@ -21,7 +23,7 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use self::{
@@ -329,7 +331,7 @@ impl Engine {
     /// Decide and buffer in arrival order per stream. Other streams can advance while a
     /// large mutation is fragmented. A round publishes all its results after one sync.
     fn round(&mut self, pending: &mut VecDeque<Work>, backlogged: bool) -> io::Result<()> {
-        let mut buffer = BytesMut::new();
+        let mut buffer = Vec::new();
         let mut charged = HashMap::<StreamId, usize>::new();
         let mut blocked = HashSet::new();
         let mut changed = HashSet::new();

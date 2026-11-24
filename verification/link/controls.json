@@ -338,5 +338,69 @@
         "replace": "                    retire_segments(&segment_dir, next)?;\n                    index.write(&root, next, snapshots, rewrite)?;"
       }
     ]
+  },
+  {
+    "name": "stream-wal-frame-checksums-length",
+    "area": "stream_wal",
+    "theorem": "link_frame_wire",
+    "file": "src/stream/keeper/wal_bytes.rs",
+    "find": "word(crc(body)) + body",
+    "replace": "word(crc(seq![])) + body"
+  },
+  {
+    "name": "stream-wal-fragment-loses-stream",
+    "area": "stream_wal",
+    "theorem": "link_fragment_wire",
+    "file": "src/stream/keeper/wal_bytes.rs",
+    "find": "stream + seq![flags]",
+    "replace": "seq![flags] + stream"
+  },
+  {
+    "name": "stream-wal-index-checksums-magic",
+    "area": "stream_wal",
+    "theorem": "link_index_wire",
+    "file": "src/stream/keeper/checkpoint_bytes.rs",
+    "find": "word(crc(next + count))",
+    "replace": "word(crc(magic + next + count))"
+  },
+  {
+    "name": "stream-wal-extent-swaps-offset-length",
+    "area": "stream_wal",
+    "theorem": "link_extent_wire",
+    "file": "src/stream/keeper/checkpoint_bytes.rs",
+    "find": "epoch + sequence + offset + length + crc",
+    "replace": "epoch + sequence + length + offset + crc"
+  },
+  {
+    "name": "stream-wal-stream-index-swaps-view-and-retained",
+    "area": "stream_wal",
+    "theorem": "link_stream_index_wire",
+    "file": "src/stream/keeper/checkpoint_bytes.rs",
+    "find": "stream + seq![deleted] + view_length + view + retained + staged",
+    "replace": "stream + seq![deleted] + view_length + retained + view + staged"
+  },
+  {
+    "name": "stream-wal-frame-decode-inverts-checksum",
+    "area": "stream_wal",
+    "theorem": "link_frame_decode_wire",
+    "file": "src/stream/keeper/wal_bytes.rs",
+    "find": "body == bytes.skip(8) && stored == actual",
+    "replace": "body == bytes.skip(8) && stored != actual"
+  },
+  {
+    "name": "stream-wal-encode-word32-swaps-first-byte",
+    "area": "stream_wal",
+    "theorem": "link_encode_word32",
+    "file": "src/stream/keeper/wal_bytes.rs",
+    "find": "        ((value >> 24) & 0xff) as u8,\n        ((value >> 16) & 0xff) as u8,\n        ((value >> 8) & 0xff) as u8,\n        (value & 0xff) as u8,\n    ]\n}",
+    "replace": "        ((value >> 16) & 0xff) as u8,\n        ((value >> 24) & 0xff) as u8,\n        ((value >> 8) & 0xff) as u8,\n        (value & 0xff) as u8,\n    ]\n}"
+  },
+  {
+    "name": "stream-wal-decode-word32-reads-first-as-second",
+    "area": "stream_wal",
+    "theorem": "link_decode_word32",
+    "file": "src/stream/keeper/wal_bytes.rs",
+    "find": "pub(super) open spec fn read_be32(bytes: Seq<u8>) -> u32 {\n    ((bytes[0] as u32) << 24)",
+    "replace": "pub(super) open spec fn read_be32(bytes: Seq<u8>) -> u32 {\n    ((bytes[1] as u32) << 24)"
   }
 ]

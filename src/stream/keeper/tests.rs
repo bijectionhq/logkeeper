@@ -822,7 +822,7 @@ fn recovery_cuts_interleaved_torn_tail_and_keeps_the_other_stream() {
     let segment = test.segment();
     let a = wal::entry(&append(A, 1, 2, &[b"a2"], 2), None).unwrap();
     let b = wal::entry(&append(B, 1, 2, &[b"b2"], 2), None).unwrap();
-    let mut tail = BytesMut::new();
+    let mut tail = Vec::new();
     wal::fragment(&mut tail, A, true, false, &a[..30]);
     wal::fragment(&mut tail, B, true, true, &b);
     let last = tail.len();
@@ -1254,6 +1254,117 @@ fn checkpoint_boundary_controls_wal_replay() {
     assert_eq!(reopened.send(read(B, 1)), page(1, 1, &[(1, b"b1")]));
     reopened.engine.drain_checkpoints().unwrap();
     assert!(!old.exists());
+}
+
+#[test]
+fn wal_and_checkpoint_headers_match_the_existing_format() {
+    let mut encoded = Vec::new();
+    let stream = u128::from_be_bytes(core::array::from_fn(|index| index as u8));
+    assert!(wal_bytes::encode_fragment(
+        &mut encoded,
+        stream,
+        3,
+        &[0, 255]
+    ));
+    let frame = b"\x00\x00\x00\x13\x2f\xb7\xbc\xe9\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x03\x00\xff";
+    assert_eq!(encoded.as_slice(), frame, "WAL frame bytes changed");
+    let (body, rest) = wal_bytes::decode_frame(frame, 64).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(
+        wal_bytes::decode_fragment(body),
+        Some((stream, 3, &[0, 255][..]))
+    );
+    for cut in 0..frame.len() {
+        assert!(
+            wal_bytes::decode_frame(&frame[..cut], 64).is_none(),
+            "accepted a torn frame at {cut}"
+        );
+    }
+    let mut corrupt = *frame;
+    corrupt[4] ^= 1;
+    assert!(
+        wal_bytes::decode_frame(&corrupt, 64).is_none(),
+        "accepted a corrupted frame CRC"
+    );
+
+    let next = 0x0102_0304_0506_0708;
+    let expected = b"LKPACK01\x01\x02\x03\x04\x05\x06\x07\x08\x00\x00\x00\x02\xe6\x8c\xf8\xc5";
+    assert_eq!(
+        &checkpoint_bytes::encode_index_header(next, 2),
+        expected,
+        "index header bytes changed"
+    );
+    assert_eq!(
+        checkpoint_bytes::decode_index_header(expected),
+        Some((next, 2))
+    );
+    for cut in 0..expected.len() {
+        assert!(
+            checkpoint_bytes::decode_index_header(&expected[..cut]).is_none(),
+            "accepted a torn index header at {cut}"
+        );
+    }
+    let mut corrupt = *expected;
+    corrupt[20] ^= 1;
+    assert!(
+        checkpoint_bytes::decode_index_header(&corrupt).is_none(),
+        "accepted a corrupted index CRC"
+    );
+}
+
+#[test]
+fn checkpoint_index_requires_every_byte() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"retained"], 1));
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+    let path = test.dir.path().join("INDEX");
+    let bytes = fs::read(&path).unwrap();
+    let opens = || checkpoint::Checkpoint::load(test.dir.path()).is_ok_and(|index| index.is_some());
+
+    assert!(opens(), "valid index must open");
+    for cut in 0..bytes.len() {
+        fs::write(&path, &bytes[..cut]).unwrap();
+        assert!(!opens(), "index opened after truncation at byte {cut}");
+    }
+
+    let mut trailing = bytes;
+    trailing.push(0);
+    fs::write(&path, trailing).unwrap();
+    assert!(!opens(), "index opened with trailing bytes");
+}
+
+#[test]
+fn checkpoint_pack_writes_and_reopens_exact_extents() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.writer(B);
+    test.batch([
+        append(A, 1, 1, &[b"first", b"", b"third-longer"], 3),
+        append(B, 1, 1, &[b"old"], 1),
+    ]);
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+    // Deleting B makes the next checkpoint repack A's already packed records.
+    test.send(delete(B));
+    let mut paths = pack_files(test.dir.path());
+    assert_eq!(paths.len(), 1);
+    assert_eq!(
+        fs::read(paths.pop().unwrap()).unwrap(),
+        b"firstthird-longer",
+        "pack write changed the payload bytes"
+    );
+
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let mut reopened = Harness {
+        engine: Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap(),
+        dir,
+    };
+    assert_eq!(
+        reopened.send(read(A, 1)),
+        page(1, 3, &[(1, b"first"), (2, b""), (3, b"third-longer")]),
+        "packed payloads changed on reopen",
+    );
 }
 
 #[test]

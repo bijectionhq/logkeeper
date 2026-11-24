@@ -378,6 +378,34 @@ the module named in each Verus area's README.
 | `src/stream/keeper/wal_layout.rs` | `checksum_matches` | `Logkeeper.StreamWAL.ChecksumMatches` | Equivalence |
 | `src/stream/keeper/wal_layout.rs` | `extent_fits` | `Logkeeper.StreamWAL.ExtentFits` | Equivalence |
 | `src/stream/keeper/wal_layout.rs` | `place_extent` | `Logkeeper.StreamWAL.PlaceExtent` | Equivalence |
+| `src/stream/keeper/wal_bytes.rs` | `frame_decode_wire` | `Logkeeper.StreamWAL.FrameDecodeWire` | Equivalence |
+| `src/stream/keeper/wal_bytes.rs` | `frame_wire` | `Logkeeper.StreamWAL.FrameWire` | Equivalence |
+| `src/stream/keeper/wal_bytes.rs` | `fragment_wire` | `Logkeeper.StreamWAL.FragmentWire` | Equivalence |
+| `src/stream/keeper/checkpoint_bytes.rs` | `index_wire` | `Logkeeper.StreamWAL.IndexWire` | Equivalence |
+| `src/stream/keeper/checkpoint_bytes.rs` | `extent_wire` | `Logkeeper.StreamWAL.ExtentWire` | Equivalence |
+| `src/stream/keeper/checkpoint_bytes.rs` | `stream_index_wire` | `Logkeeper.StreamWAL.StreamIndexWire` | Equivalence |
 | `verification/verus/stream_wal/laws.rs` | `frame_never_reads_past_segment` | `Logkeeper.StreamWAL.FrameBodyFits` | Arithmetic consequence |
 | `verification/verus/stream_wal/laws.rs` | `extent_stays_in_its_pack` | `Logkeeper.StreamWAL.ExtentFits` | Arithmetic consequence |
 | `verification/verus/stream_wal/laws.rs` | `new_extents_are_adjacent` | `Logkeeper.StreamWAL.PlaceExtent` | Arithmetic consequence |
+| `verification/verus/stream_wal/laws.rs` | `frame_head` | `Logkeeper.StreamWAL.FrameWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `frame_decodes_its_encoding` | `Logkeeper.StreamWAL.encoded_frame_decodes` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `accepted_frame_reencodes_exactly` | `Logkeeper.StreamWAL.FrameWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `every_frame_truncation_is_rejected` | `Logkeeper.StreamWAL.encoded_frame_truncation` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `corrupted_frame_crc_is_rejected` | `Logkeeper.StreamWAL.mismatched_frame_crc_is_rejected` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `pack_write_read_correspondence` | `Logkeeper.StreamWAL.ExtentWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `corrupted_extent_crc_is_rejected` | `Logkeeper.StreamWAL.ChecksumMatches` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `accepted_stream_index_reencodes_exactly` | `Logkeeper.StreamWAL.StreamIndexWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `stream_index_decodes_its_encoding` | `Logkeeper.StreamWAL.StreamIndexWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `index_header_fields` | `Logkeeper.StreamWAL.IndexWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `index_header_round_trip` | `Logkeeper.StreamWAL.IndexWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `accepted_index_header_reencodes_exactly` | `Logkeeper.StreamWAL.IndexWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `every_index_header_truncation_is_rejected` | `Logkeeper.StreamWAL.IndexWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `corrupted_index_header_crc_is_rejected` | `Logkeeper.StreamWAL.IndexWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `extent_fields` | `Logkeeper.StreamWAL.ExtentWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `extent_round_trip` | `Logkeeper.StreamWAL.ExtentWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `accepted_extent_reencodes_exactly` | `Logkeeper.StreamWAL.ExtentWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `wal_entry_round_trip` | `Logkeeper.StreamWAL.FrameWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `accepted_wal_entry_reencodes_exactly` | `Logkeeper.StreamWAL.FrameWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `fragment_round_trip` | `Logkeeper.StreamWAL.FragmentWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `accepted_fragment_reencodes_exactly` | `Logkeeper.StreamWAL.FragmentWire` | Verus byte law |
+| `verification/verus/stream_wal/laws.rs` | `framed_checkpoint_row_round_trip` | `Logkeeper.StreamWAL.StreamIndexWire` | Composed Verus byte law |

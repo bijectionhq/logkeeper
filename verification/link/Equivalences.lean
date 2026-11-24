@@ -995,6 +995,63 @@ open StreamWAL
 
 theorem link_publication : PublicationOrder publication := by decide
 
+theorem link_frame_wire (word : Nat → Bytes) (crc : Bytes → Nat) (body : Bytes) :
+    frame_wire word crc body = FrameWire word crc body := by
+  unfold frame_wire FrameWire
+  have cast : clipUnsigned 32 (body.length : Int) = body.length % 2 ^ 32 := by
+    change ((body.length : Int) % ((2 ^ 32 : Nat) : Int)).toNat = _
+    rw [← Int.natCast_emod]
+    rfl
+  rw [cast, List.append_assoc]
+
+theorem link_frame_decode_wire (bytes body : Bytes) (declared stored actual limit : Nat) :
+    frame_decode_wire bytes body declared stored actual limit ↔
+      FrameDecodeWire bytes body declared stored actual limit := by
+  have afterHeader (size : bytes.length = 8 + declared) : seqDrop bytes 8 = bytes.drop 8 := by
+    have before : (8 : Int) ≤ (bytes.length : Int) := by omega
+    have length : ((bytes.length : Int) - 8).toNat = bytes.length - 8 := by omega
+    simp [seqDrop, seqSubrange, before, length]
+    exact List.take_of_length_le (by simp)
+  constructor
+  · rintro ⟨⟨⟨size, fits⟩, payload⟩, checked⟩
+    exact ⟨size, fits, payload.trans (afterHeader size), checked⟩
+  · rintro ⟨size, fits, payload, checked⟩
+    exact ⟨⟨⟨size, fits⟩, payload.trans (afterHeader size).symm⟩, checked⟩
+
+theorem link_fragment_wire (stream : Bytes) (flags : UInt8) :
+    fragment_wire stream flags = FragmentWire stream flags := by rfl
+
+theorem link_index_wire (magic next count : Bytes) (word : Nat → Bytes) (crc : Bytes → Nat) :
+    index_wire magic next count word crc = IndexWire magic next count word crc := by
+  simp only [index_wire, IndexWire, List.append_assoc]
+
+theorem link_extent_wire (epoch sequence offset length crc : Bytes) :
+    extent_wire epoch sequence offset length crc = ExtentWire epoch sequence offset length crc := by rfl
+
+theorem link_stream_index_wire (stream : Bytes) (deleted : UInt8)
+    (length view retained staged : Bytes) :
+    stream_index_wire stream deleted length view retained staged =
+      StreamIndexWire stream deleted length view retained staged := by rfl
+
+theorem link_encode_word32 (n : Nat) : encode_word32 n = EncodeWord32 n := by rfl
+
+theorem link_decode_word32 (bytes : Bytes) : decode_word32 bytes = DecodeWord32 bytes := by
+  simp only [decode_word32, DecodeWord32]
+
+theorem linked_wal_replays {Stream Image : Type} [DecidableEq Stream]
+    (crc : Bytes → Nat) (limit : Nat) (classify : Bytes → Frame Stream Image) (bodies : List Bytes)
+    (bounded : ∀ body ∈ bodies, body.length < 2 ^ 32 ∧ body.length ≤ limit ∧ crc body < 2 ^ 32)
+    (newest continued : Bool) (pending : Stream → Bool) :
+    let word : WordCodec :=
+      ⟨encode_word32, decode_word32, fun n => by rw [link_encode_word32]; rfl,
+        fun n h => by rw [link_encode_word32, link_decode_word32]; exact word32_round_trip n h⟩
+    scanSegment newest continued pending
+      ((bodies.map (frame_wire word.encode crc)).map (byteFrame word crc limit classify)) =
+    scanSegment newest continued pending (bodies.map classify) := by
+  intro word
+  rw [funext (link_frame_wire word.encode crc)]
+  exact encoded_frame_replays word crc limit classify bodies bounded newest continued pending
+
 theorem link_frame_body_fits (remaining len max : Nat) :
     frame_body_fits remaining len max ↔ FrameBodyFits remaining len max := by
   unfold frame_body_fits FrameBodyFits

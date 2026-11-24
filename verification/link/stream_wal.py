@@ -72,3 +72,39 @@ def publication : List Logkeeper.StreamWAL.PublishEvent := [{events}]
 
 end stream_wal
 """
+
+
+def generated_words(read):
+    """Extract byte positions and shifts from the verified u32 word specs."""
+    source = read("src/stream/keeper/wal_bytes.rs")
+    encode = function(source, "pub(super) open spec fn be32(").strip()
+    # The low byte has no shift and is spelled (value & 0xff).
+    pattern = r"(?:\(\(value >> (\d+)\) & 0xff\)|\(value & 0xff\)) as u8"
+    match = re.fullmatch(r"seq!\[\s*" + (pattern + r",\s*") * 4 + r"\]", encode)
+    if match is None:
+        raise ValueError("stream WAL projection: unsupported BE32 encoder")
+    shifts = [int(shift or 0) for shift in match.groups()]
+    encode_fields = ", ".join(f"UInt8.ofBitVec (word.extractLsb' {shift} 8)" for shift in shifts)
+
+    decode = function(source, "pub(super) open spec fn read_be32(").strip()
+    pattern = r"\(\(bytes\[(\d+)\] as u32\) << (\d+)\)"
+    match = re.fullmatch((pattern + r"\s*\|\s*") * 3 + r"\(bytes\[(\d+)\] as u32\)", decode)
+    if match is None:
+        raise ValueError("stream WAL projection: unsupported BE32 decoder")
+    fields = list(map(int, match.groups()))
+    read_fields = " ||| ".join(
+        f"(byte {at} <<< {shift})" for at, shift in zip(fields[:-1:2], fields[1::2], strict=True)
+    )
+    return f"""
+namespace stream_wal
+
+def encode_word32 (n : Nat) : List UInt8 :=
+  let word := BitVec.ofNat 32 n
+  [{encode_fields}]
+
+def decode_word32 (bytes : List UInt8) : Nat :=
+  let byte := fun (index : Nat) => bytes[index]!.toBitVec.zeroExtend 32
+  ({read_fields} ||| byte {fields[-1]}).toNat
+
+end stream_wal
+"""

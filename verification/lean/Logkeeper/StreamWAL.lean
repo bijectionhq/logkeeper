@@ -1,8 +1,7 @@
 import Logkeeper.StreamJournal
 
-/-! The keeper WAL boundary. Frames have passed length, CRC and body validation.
-A completed entry supplies the durable image after applying the entry, including
-both retained and staged records. -/
+/-! The keeper WAL byte and publication boundary. A completed entry supplies
+the durable image after applying the entry, including retained and staged records. -/
 
 namespace Logkeeper.StreamWAL
 
@@ -26,6 +25,144 @@ def PlaceExtent (offset length : Nat) : Option (Nat × Nat) :=
   if length ≤ 4294967295 ∧ offset + length ≤ 18446744073709551615 then
     some (length, offset + length)
   else none
+
+abbrev Bytes := List UInt8
+
+def FrameWire (word : Nat → Bytes) (crc : Bytes → Nat) (body : Bytes) : Bytes :=
+  word (body.length % 2 ^ 32) ++ word (crc body) ++ body
+
+def FragmentWire (stream : Bytes) (flags : UInt8) : Bytes :=
+  stream ++ [flags]
+
+def IndexWire (magic next count : Bytes) (word : Nat → Bytes) (crc : Bytes → Nat) : Bytes :=
+  magic ++ (next ++ count) ++ word (crc (next ++ count))
+
+def ExtentWire (epoch sequence offset length crc : Bytes) : Bytes :=
+  epoch ++ sequence ++ offset ++ length ++ crc
+
+def StreamIndexWire (stream : Bytes) (deleted : UInt8) (size view retained staged : Bytes) : Bytes :=
+  stream ++ [deleted] ++ size ++ view ++ retained ++ staged
+
+/-- The word codec is instantiated by the verified four-byte big-endian codec.
+    The CRC parameter is the deterministic checksum of the exact body. -/
+structure WordCodec where
+  encode : Nat → Bytes
+  decode : Bytes → Nat
+  width : ∀ n, (encode n).length = 4
+  roundTrip : ∀ n, n < 2 ^ 32 → decode (encode n) = n
+
+def EncodeWord32 (n : Nat) : Bytes :=
+  let word := BitVec.ofNat 32 n
+  [UInt8.ofBitVec (word.extractLsb' 24 8), UInt8.ofBitVec (word.extractLsb' 16 8),
+   UInt8.ofBitVec (word.extractLsb' 8 8), UInt8.ofBitVec (word.extractLsb' 0 8)]
+
+def DecodeWord32 (bytes : Bytes) : Nat :=
+  let byte := fun (index : Nat) => bytes[index]!.toBitVec.zeroExtend 32
+  ((byte 0 <<< 24) ||| (byte 1 <<< 16) ||| (byte 2 <<< 8) ||| byte 3).toNat
+
+theorem word32_round_trip (n : Nat) (bounded : n < 2 ^ 32) :
+    DecodeWord32 (EncodeWord32 n) = n := by
+  have merged (bits : BitVec 32) :
+      ((bits.extractLsb' 24 8).zeroExtend 32 <<< 24) |||
+        ((bits.extractLsb' 16 8).zeroExtend 32 <<< 16) |||
+        ((bits.extractLsb' 8 8).zeroExtend 32 <<< 8) |||
+        (bits.extractLsb' 0 8).zeroExtend 32 = bits := by
+    apply BitVec.eq_of_getLsbD_eq_iff.mpr
+    intro i inside
+    have lane (start : Nat) :
+        (((bits.extractLsb' start 8).zeroExtend 32) <<< start).getLsbD i =
+          if start ≤ i ∧ i < start + 8 then bits.getLsbD i else false := by
+      by_cases before : i < start
+      · simp [before, show ¬ start ≤ i by omega]
+      · have lower : start ≤ i := by omega
+        have add : start + (i - start) = i := by omega
+        by_cases within : i < start + 8
+        · have offset : i - start < 8 := by omega
+          simp [inside, before, lower, within, offset, add]
+        · have offset : ¬ i - start < 8 := by omega
+          simp [inside, before, lower, within, offset]
+    have low : ((bits.extractLsb' 0 8).zeroExtend 32).getLsbD i =
+        if i < 8 then bits.getLsbD i else false := by simpa using lane 0
+    simp only [BitVec.getLsbD_or, lane, low]
+    by_cases a : i < 8
+    · simp [a, show ¬ 8 ≤ i by omega, show ¬ 16 ≤ i by omega, show ¬ 24 ≤ i by omega]
+    by_cases b : i < 16
+    · simp [a, b, show 8 ≤ i by omega, show ¬ 16 ≤ i by omega, show ¬ 24 ≤ i by omega]
+    by_cases c : i < 24
+    · simp [a, b, c, show 16 ≤ i by omega, show ¬ 24 ≤ i by omega]
+    simp [a, b, c, inside, show 24 ≤ i by omega]
+  simp [EncodeWord32, DecodeWord32, merged, Nat.mod_eq_of_lt bounded]
+
+def word32 : WordCodec :=
+  ⟨EncodeWord32, DecodeWord32, fun _ => rfl, word32_round_trip⟩
+
+def FrameDecodeWire (bytes body : Bytes) (declared stored actual limit : Nat) : Prop :=
+  bytes.length = 8 + declared ∧ declared ≤ limit ∧ body = bytes.drop 8 ∧ stored = actual
+
+instance (bytes body : Bytes) (declared stored actual limit : Nat) :
+    Decidable (FrameDecodeWire bytes body declared stored actual limit) :=
+  inferInstanceAs (Decidable (_ ∧ _ ∧ _ ∧ _))
+
+def decodeFrame (word : WordCodec) (crc : Bytes → Nat) (limit : Nat) (bytes : Bytes) :
+    Option Bytes :=
+  let length := word.decode (bytes.take 4)
+  let body := bytes.drop 8
+  if FrameDecodeWire bytes body length (word.decode ((bytes.drop 4).take 4)) (crc body) limit
+      ∧ length < 2 ^ 32 then some body else none
+
+private theorem encoded_frame_fields (word : WordCodec) (len stored : Nat) (body : Bytes) :
+    let bytes := word.encode len ++ word.encode stored ++ body
+    bytes.take 4 = word.encode len ∧ (bytes.drop 4).take 4 = word.encode stored ∧
+      bytes.drop 8 = body ∧ bytes.length = 8 + body.length := by
+  dsimp
+  have first : (word.encode len).length = 4 := word.width len
+  have second : (word.encode stored).length = 4 := word.width stored
+  constructor
+  · rw [List.append_assoc, ← first, List.take_left]
+  constructor
+  · have drop : (word.encode len ++ (word.encode stored ++ body)).drop 4 =
+        word.encode stored ++ body := by rw [← first, List.drop_left]
+    rw [List.append_assoc, drop, ← second, List.take_left]
+  constructor
+  · have both : (word.encode len ++ word.encode stored).length = 8 := by simp [first, second]
+    rw [← both, List.drop_left]
+  · simp [first, second]
+    omega
+
+theorem encoded_frame_decodes (word : WordCodec) (crc : Bytes → Nat) (body : Bytes) (limit : Nat)
+    (bounded : body.length < 2 ^ 32) (fits : body.length ≤ limit)
+    (checksumBound : crc body < 2 ^ 32) :
+    decodeFrame word crc limit (FrameWire word.encode crc body) = some body := by
+  have fields := encoded_frame_fields word body.length (crc body) body
+  simp only [FrameWire, Nat.mod_eq_of_lt bounded, decodeFrame, FrameDecodeWire]
+  rw [fields.1, fields.2.1, fields.2.2.1, fields.2.2.2, word.roundTrip _ bounded]
+  simp [fits, bounded, word.roundTrip _ checksumBound]
+
+theorem encoded_frame_truncation (word : WordCodec) (crc : Bytes → Nat) (body : Bytes)
+    (limit cut : Nat) (bounded : body.length < 2 ^ 32) (cutInside : cut < 8 + body.length) :
+    decodeFrame word crc limit ((FrameWire word.encode crc body).take cut) = none := by
+  have fields := encoded_frame_fields word body.length (crc body) body
+  have total : (FrameWire word.encode crc body).length = 8 + body.length := by
+    simpa [FrameWire, Nat.mod_eq_of_lt bounded, List.append_assoc] using fields.2.2.2
+  by_cases short : cut < 4
+  · simp [decodeFrame, FrameDecodeWire, List.length_take, total, Nat.min_eq_left (by omega : cut ≤ 8 + body.length)]
+    omega
+  · have head : ((FrameWire word.encode crc body).take cut).take 4 = word.encode body.length := by
+      rw [List.take_take, Nat.min_eq_left (by omega : 4 ≤ cut)]
+      simpa [FrameWire, Nat.mod_eq_of_lt bounded, List.append_assoc] using fields.1
+    simp [decodeFrame, FrameDecodeWire, head, word.roundTrip _ bounded, List.length_take, total,
+      Nat.min_eq_left (by omega : cut ≤ 8 + body.length), Nat.ne_of_lt cutInside]
+
+theorem mismatched_frame_crc_is_rejected (word : WordCodec) (crc : Bytes → Nat)
+    (body : Bytes) (stored limit : Nat) (bounded : body.length < 2 ^ 32)
+    (storedBound : stored < 2 ^ 32)
+    (different : stored ≠ crc body) :
+    decodeFrame word crc limit (word.encode body.length ++ word.encode stored ++ body) = none := by
+  have fields := encoded_frame_fields word body.length stored body
+  simp only [decodeFrame, FrameDecodeWire]
+  rw [fields.1, fields.2.1, fields.2.2.1, fields.2.2.2,
+    word.roundTrip _ bounded, word.roundTrip _ storedBound]
+  simp [different]
 
 inductive Frame (Stream Image : Type) where
   | start (stream : Stream)
@@ -93,6 +230,40 @@ theorem continued_fragments_finish_after_rollover (a b : Stream) (x y : Image) (
 theorem fresh_segment_discards_incomplete_entries (stream : Stream) (image : Image) :
     scanSegment true false (fun _ => true) [.finish (stream, image)] = none := by
   rfl
+
+/-- Each input chunk is the physical range selected by the bounded frame reader.
+    The classifier represents reassembly and semantic validation of the exact body. -/
+def byteFrame (word : WordCodec) (crc : Bytes → Nat) (limit : Nat)
+    (classify : Bytes → Frame Stream Image) (bytes : Bytes) : Frame Stream Image :=
+  match decodeFrame word crc limit bytes with
+  | none => .torn
+  | some body => classify body
+
+theorem encoded_frame_replays (word : WordCodec) (crc : Bytes → Nat) (limit : Nat)
+    (classify : Bytes → Frame Stream Image) (bodies : List Bytes)
+    (bounded : ∀ body ∈ bodies, body.length < 2 ^ 32 ∧ body.length ≤ limit ∧ crc body < 2 ^ 32)
+    (newest continued : Bool) (pending : Stream → Bool) :
+    scanSegment newest continued pending
+      ((bodies.map (FrameWire word.encode crc)).map (byteFrame word crc limit classify)) =
+    scanSegment newest continued pending (bodies.map classify) := by
+  have decoded : (bodies.map (FrameWire word.encode crc)).map (byteFrame word crc limit classify) =
+      bodies.map classify := by
+    rw [List.map_map]
+    apply List.map_congr_left
+    intro body member
+    have ⟨size, fits, checksumBound⟩ := bounded body member
+    simp [byteFrame, encoded_frame_decodes word crc body limit size fits checksumBound]
+  rw [decoded]
+
+theorem torn_encoded_frame_keeps_complete_entries (word : WordCodec) (crc : Bytes → Nat)
+    (limit cut : Nat) (classify : Bytes → Frame Stream Image) (body : Bytes)
+    (bounded : body.length < 2 ^ 32) (truncated : cut < 8 + body.length)
+    (pending : Stream → Bool) (frames : List (Frame Stream Image)) :
+    scan true pending
+      (frames ++ [byteFrame word crc limit classify ((FrameWire word.encode crc body).take cut)]) =
+    scan true pending frames := by
+  simpa [byteFrame, encoded_frame_truncation word crc body limit cut bounded truncated] using
+    torn_tail_keeps_complete_entries pending frames
 
 def replay (stream : Stream) (before : Image) (entries : List (Entry Stream Image)) : Image :=
   entries.foldl (fun image entry => if entry.1 = stream then entry.2 else image) before
@@ -341,6 +512,12 @@ theorem rename_crash_witness :
   have step3 : PublicationReached indexed := .step step2 (.syncIndexFile rfl)
   exact ⟨renamed, .step step3 (.renameIndex rfl), rfl, rfl⟩
 
+#print axioms word32_round_trip
+#print axioms encoded_frame_decodes
+#print axioms encoded_frame_truncation
+#print axioms mismatched_frame_crc_is_rejected
+#print axioms encoded_frame_replays
+#print axioms torn_encoded_frame_keeps_complete_entries
 #print axioms torn_tail_keeps_complete_entries
 #print axioms torn_closed_segment_fails
 #print axioms incomplete_entry_is_discarded

@@ -14,7 +14,7 @@ use super::{
     checkpoint::{Checkpoint, Snapshot},
     durability::{sync_directory, sync_file},
     state::{ExtentReader, Stream},
-    wal_layout::{checksum_matches, frame_body_fits},
+    wal_bytes::{self, FRAME_HEADER_BYTES},
 };
 use crate::stream::{
     codec::{self, MAX_FRAME_BYTES, invalid},
@@ -23,7 +23,7 @@ use crate::stream::{
 
 pub(super) const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const MAX_WAL_SUFFIX_BYTES: u64 = 4 * SEGMENT_BYTES;
-pub(super) const FRAME_OVERHEAD: usize = 8 + 16 + 1;
+pub(super) use wal_bytes::FRAME_OVERHEAD;
 pub(super) const MAX_IDENTITY_BYTES: usize = 4096;
 const MAX_ENTRY_BYTES: usize = MAX_FRAME_BYTES + 4 + MAX_IDENTITY_BYTES;
 const START: u8 = 1;
@@ -57,54 +57,33 @@ pub(super) struct Wal {
 }
 
 pub(super) fn entry(request: &Request, identity: Option<&Identity>) -> io::Result<Bytes> {
-    let body = codec::encode_request(request)?;
+    let request = codec::encode_request(request)?;
     let identity = identity.map_or("", Identity::as_str).as_bytes();
-    let mut entry = BytesMut::with_capacity(4 + identity.len() + body.len());
-    put_bytes(&mut entry, identity)?;
-    entry.put_slice(&body);
-    Ok(entry.freeze())
+    wal_bytes::encode_entry(identity, &request)
+        .map(Bytes::from)
+        .ok_or_else(|| invalid("oversized WAL entry"))
 }
 
-pub(super) fn put_count(out: &mut BytesMut, len: usize) -> io::Result<()> {
-    out.put_u32(
-        len.try_into()
-            .map_err(|_| invalid("keeper collection too large"))?,
-    );
-    Ok(())
-}
-
-pub(super) fn put_bytes(out: &mut BytesMut, bytes: &[u8]) -> io::Result<()> {
-    put_count(out, bytes.len())?;
-    out.put_slice(bytes);
-    Ok(())
-}
-
-fn decode_identity(uri: Bytes) -> io::Result<Option<Identity>> {
+fn decode_identity(uri: &[u8]) -> io::Result<Option<Identity>> {
     if uri.is_empty() {
         return Ok(None);
     }
     if uri.len() > MAX_IDENTITY_BYTES {
         return Err(invalid("oversized WAL identity"));
     }
-    let uri = std::str::from_utf8(&uri).map_err(|_| invalid("invalid WAL identity"))?;
+    let uri = std::str::from_utf8(uri).map_err(|_| invalid("invalid WAL identity"))?;
     Ok(Some(Identity::from(uri)))
 }
 
 pub(super) fn fragment(
-    buffer: &mut BytesMut,
+    buffer: &mut Vec<u8>,
     stream: StreamId,
     first: bool,
     last: bool,
     bytes: &[u8],
 ) {
-    let at = buffer.len();
-    buffer.put_u32((FRAME_OVERHEAD - 8 + bytes.len()) as u32);
-    buffer.put_u32(0);
-    buffer.put_u128(stream.0);
-    buffer.put_u8(u8::from(first) * START | u8::from(last) * END);
-    buffer.put_slice(bytes);
-    let crc = crc32fast::hash(&buffer[at + 8..]);
-    buffer[at + 4..at + 8].copy_from_slice(&crc.to_be_bytes());
+    let flags = u8::from(first) * START | u8::from(last) * END;
+    assert!(wal_bytes::encode_fragment(buffer, stream.0, flags, bytes));
 }
 
 pub(super) fn read_frame(
@@ -112,20 +91,24 @@ pub(super) fn read_frame(
     remaining: u64,
     max: usize,
 ) -> io::Result<Option<Bytes>> {
-    if remaining < 8 {
+    if remaining < FRAME_HEADER_BYTES as u64 {
         return Ok(None);
     }
-    let mut header = [0; 8];
+    let mut header = [0; FRAME_HEADER_BYTES];
     reader.read_exact(&mut header)?;
-    let mut header = &header[..];
-    let len = header.get_u32();
-    let crc = header.get_u32();
-    if !frame_body_fits(remaining, len, max) {
+    let Some((len, _)) = wal_bytes::decode_frame_header(&header, remaining, max) else {
+        return Ok(None);
+    };
+    let mut frame = vec![0; FRAME_HEADER_BYTES + len as usize];
+    frame[..FRAME_HEADER_BYTES].copy_from_slice(&header);
+    reader.read_exact(&mut frame[FRAME_HEADER_BYTES..])?;
+    if wal_bytes::decode_frame(&frame, max).is_none() {
         return Ok(None);
     }
-    let mut bytes = vec![0; len as usize];
-    reader.read_exact(&mut bytes)?;
-    Ok(checksum_matches(crc, crc32fast::hash(&bytes)).then(|| Bytes::from(bytes)))
+    let mut bytes = Bytes::from(frame);
+    bytes.advance(FRAME_HEADER_BYTES);
+    debug_assert_eq!(bytes.len(), len as usize);
+    Ok(Some(bytes))
 }
 
 pub(super) fn atomic_file(
@@ -184,12 +167,9 @@ fn new_segment(dir: &Path, sequence: u64, continuation: bool) -> io::Result<(Fil
         .create_new(true)
         .append(true)
         .open(segment_path(dir, sequence))?;
-    let mut marker = BytesMut::new();
+    let mut marker = Vec::new();
     if continuation {
-        fragment(&mut marker, StreamId(0), false, false, &[0]);
-        marker[FRAME_OVERHEAD - 1] = CONTINUED;
-        let crc = crc32fast::hash(&marker[8..]);
-        marker[4..8].copy_from_slice(&crc.to_be_bytes());
+        assert!(wal_bytes::encode_fragment(&mut marker, 0, CONTINUED, &[0]));
         file.write_all(&marker)?;
     }
     sync_file(&file)?;
@@ -497,27 +477,29 @@ fn replay(
         length - position,
         MAX_ENTRY_BYTES + FRAME_OVERHEAD,
     )? {
-        position += 8 + body.len() as u64;
-        let mut frame = Decoder(body);
-        let id = StreamId(frame.u128()?);
-        let flags = frame.u8()?;
-        if position == FRAME_OVERHEAD as u64 + frame.0.len() as u64 {
-            if flags == CONTINUED && id == StreamId(0) && frame.0 == &[0][..] {
+        let at_start = position == 0;
+        position += FRAME_HEADER_BYTES as u64 + body.len() as u64;
+        let (stream, flags, payload) = wal_bytes::decode_fragment(&body)
+            .ok_or_else(|| invalid("invalid keeper WAL fragment"))?;
+        let id = StreamId(stream);
+        let payload = body.slice_ref(payload);
+        if flags == CONTINUED {
+            if at_start {
                 continue;
             }
-            fragments.clear();
-        }
-        if flags > START | END || frame.0.is_empty() {
             return Err(invalid("invalid keeper WAL fragment"));
+        }
+        if at_start {
+            fragments.clear();
         }
         let body = if flags == START | END {
             if fragments.contains_key(&id) {
                 return Err(invalid("overlapping keeper WAL entries"));
             }
-            frame.0
+            payload
         } else if flags == START {
             if fragments
-                .insert(id, BytesMut::from(frame.0.as_ref()))
+                .insert(id, BytesMut::from(payload.as_ref()))
                 .is_some()
             {
                 return Err(invalid("overlapping keeper WAL entries"));
@@ -527,18 +509,19 @@ fn replay(
             let fragment = fragments
                 .get_mut(&id)
                 .ok_or_else(|| invalid("keeper WAL fragment without start"))?;
-            if fragment.len() + frame.0.len() > MAX_ENTRY_BYTES {
+            if fragment.len() + payload.len() > MAX_ENTRY_BYTES {
                 return Err(invalid("oversized keeper WAL entry"));
             }
-            fragment.put_slice(&frame.0);
+            fragment.put_slice(&payload);
             if flags != END {
                 continue;
             }
             fragments.remove(&id).expect("finished entry").freeze()
         };
-        let mut entry = Decoder(body);
-        let identity = decode_identity(entry.bytes()?)?;
-        let request = codec::decode_request(entry.0)?;
+        let (identity, request) =
+            wal_bytes::decode_field(&body).ok_or_else(|| invalid("short keeper WAL entry"))?;
+        let identity = decode_identity(identity)?;
+        let request = codec::decode_request(body.slice_ref(request))?;
         if codec::stream(&request) != id
             || identity.is_some() != matches!(request, Request::Seal { .. })
         {
@@ -559,60 +542,4 @@ fn replay(
         sync_file(&file)?;
     }
     Ok(position)
-}
-
-pub(super) struct Decoder(pub Bytes);
-
-impl Decoder {
-    pub(super) fn take(&mut self, length: usize) -> io::Result<Bytes> {
-        if self.0.len() < length {
-            return Err(invalid("short keeper message"));
-        }
-        Ok(self.0.split_to(length))
-    }
-
-    pub(super) fn u8(&mut self) -> io::Result<u8> {
-        Ok(self.take(1)?.get_u8())
-    }
-
-    pub(super) fn u32(&mut self) -> io::Result<u32> {
-        Ok(self.take(4)?.get_u32())
-    }
-
-    pub(super) fn u64(&mut self) -> io::Result<u64> {
-        Ok(self.take(8)?.get_u64())
-    }
-
-    pub(super) fn u128(&mut self) -> io::Result<u128> {
-        Ok(self.take(16)?.get_u128())
-    }
-
-    pub(super) fn boolean(&mut self) -> io::Result<bool> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(invalid("invalid keeper boolean")),
-        }
-    }
-
-    pub(super) fn bytes(&mut self) -> io::Result<Bytes> {
-        let count = self.u32()? as usize;
-        self.take(count)
-    }
-
-    pub(super) fn count(&mut self, element_minimum: usize) -> io::Result<usize> {
-        let count = self.u32()? as usize;
-        if count > self.0.len() / element_minimum {
-            return Err(invalid("short keeper collection"));
-        }
-        Ok(count)
-    }
-
-    pub(super) fn finish(self) -> io::Result<()> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            Err(invalid("trailing keeper message bytes"))
-        }
-    }
 }

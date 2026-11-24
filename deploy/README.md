@@ -109,4 +109,9 @@ Before a production rollout, qualify the default `i8g.large` on arm64 and every 
 
 Run a crash-and-recovery test with an independent observer that durably records each acknowledged append. Exercise process kill, abrupt host reset on the same disk, and torn writes around record and segment boundaries. After every recovery reconcile acknowledged records, their bytes and the reported floor with the observer. A graceful shutdown or a throughput benchmark cannot qualify power-loss behavior. Use AWS's documented persistence behavior as part of the evidence and obtain a failure-injection test or platform evidence covering device flush and abrupt power loss. Record any untested condition with the qualification result.
 
+Apply the [storage qualification matrix](../verification/target-journal.md#storage-premises-and-deployment-qualification)
+at its named file sync, directory sync, and rename cut points. Capture the
+keeper's directory listing and compare every selected file against the
+observer before allowing background cleanup to run.
+
 As a negative control, run the same fault and recovery check on each stack with a keeper test build that replies before sync. Inject a fault after an acknowledgement and before persistence and require the acknowledged-record reconciliation to fail. Test whole-disk loss separately with the learner procedure, including refusal to count the new UUID before sync. Retain fault settings, the acknowledgement trace, recovery results and the failing control with the qualification record. [EC2 NVMe instance store](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ssd-instance-store.html)

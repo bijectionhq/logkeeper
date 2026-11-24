@@ -278,6 +278,28 @@ Keeper configuration (JSON, `logkeeper keeper --config FILE`):
   "limits": { "stream_quota_bytes": 8589934592, "max_record_bytes": 33554432, "round_bytes_per_stream": 4194304, "round_requests": 64 } }
 ```
 
+### Storage premises and deployment qualification
+
+Qualify these premises on each deployed filesystem, mount, kernel, and device
+combination. Cut power or use an abrupt reset with equivalent storage fault
+semantics on the same device, reopen the keeper, and record the surviving names
+and exact bytes. The [deployment qualification](../deploy/README.md#qualify-fsync)
+defines the observer, fault controls, and evidence to retain.
+
+| Premise | Qualification test |
+| --- | --- |
+| A successful file sync preserves the file's written bytes and length, including a truncation. | Reset after acknowledged rounds and at the WAL, pack, index temporary file, and recovery truncation sync boundaries. Compare retained bytes and lengths against the observer. The reply-before-sync build must fail acknowledged-record reconciliation. |
+| A successful directory sync preserves preceding creations, renames, and removals in that directory. | Reset after the segment-name, pack-name, index-name, and retirement directory syncs. Verify that the recovery boundary and every referenced pack exist, that the selected index opens, and that durably retired names stay absent. |
+| Same-directory rename atomically replaces the index. Between rename and directory sync, recovery may see either complete index. | Reset around the temporary index file sync, rename, and parent directory sync. Before rename the old index must open. After rename and before directory sync either complete index may open, with its referenced storage intact. After directory sync only the new index may open. Compare both paths against the same observer history. |
+
+The keeper's byte proofs use a single checksum premise. The shipped
+`crc32fast` backend computes the IEEE CRC-32 defined in
+[RFC 1952 §8](https://www.rfc-editor.org/rfc/rfc1952#section-8) over the
+input octets in order, including when supplied in multiple
+[`Hasher::update` calls](https://docs.rs/crc32fast/1.5.0/crc32fast/struct.Hasher.html).
+The proofs reject a checksum that differs from the checksum of the received
+bytes. Different bodies can share a CRC.
+
 ## 6. Verification
 
 - **Lean.** The per-stream keeper and writer protocol refines `PrefixAgreement` and `DurableAcceptor`. The ledger maps directly:

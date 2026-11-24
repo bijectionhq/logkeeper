@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 from mappings import ENUMS, SHAPES
-from stream_wal import generated_publication
+from stream_wal import generated_publication, generated_words
 from translate import Emitter, Parser, Unsupported, declarations, postcondition
 
 
@@ -74,7 +74,11 @@ def generate(replacements=None):
             except Unsupported as error:
                 raise Unsupported(f"{path}:{spec.line}: {spec.name}: {error}") from error
         out.append(f"end {area}\n")
-    out.append(generated_publication(lambda path: source(path, replacements)))
+    def read(path):
+        return source(path, replacements)
+
+    out.append(generated_publication(read))
+    out.append(generated_words(read))
     out.append("end\nend Logkeeper.Generated\n")
     return "\n".join(out)
 
@@ -138,9 +142,16 @@ def audit_module():
         proof = f"Logkeeper.Generated.{area}.link_{name}"
         generated = f"Logkeeper.Generated.{area}.{name}"
         lines.append(f"run_cmd checkLink ``{proof} ``{generated} ``{reference}")
-    lines.append("run_cmd checkLink ``Logkeeper.Generated.stream_wal.link_publication "
-                 "``Logkeeper.Generated.stream_wal.publication ``Logkeeper.StreamWAL.PublicationOrder")
-    count += 1
+    for generated, reference in (
+        ("publication", "PublicationOrder"),
+        ("encode_word32", "EncodeWord32"),
+        ("decode_word32", "DecodeWord32"),
+    ):
+        lines.append(f"run_cmd checkLink ``Logkeeper.Generated.stream_wal.link_{generated} "
+                     f"``Logkeeper.Generated.stream_wal.{generated} ``Logkeeper.StreamWAL.{reference}")
+        count += 1
+    lines.append("run_cmd checkLink ``Logkeeper.Generated.stream_wal.linked_wal_replays "
+                 "``Logkeeper.Generated.stream_wal.frame_wire ``Logkeeper.StreamWAL.byteFrame")
     return "\n".join(lines) + "\n", count
 
 
@@ -183,6 +194,7 @@ def reject_at(lake, package, area, theorem, equivalences):
             not all(Path(m["fileName"]).name == "Equivalences.lean" and
                     start <= m["pos"]["line"] < stop and
                     m["data"].startswith(("unsolved goals", "Tactic `", "Type mismatch",
+                                               "Application type mismatch",
                                                "'change' tactic failed", "omega could not prove the goal"))
                     for m in errors)):
         raise ValueError(f"expected rejection only at {area}.{theorem}\n{result.stdout}{result.stderr}")

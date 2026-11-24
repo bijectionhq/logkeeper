@@ -220,6 +220,16 @@
       "checksum_matches": "Logkeeper.StreamWAL.ChecksumMatches",
       "extent_fits": "Logkeeper.StreamWAL.ExtentFits",
       "place_extent": "Logkeeper.StreamWAL.PlaceExtent"
+    },
+    "src/stream/keeper/wal_bytes.rs": {
+      "frame_wire": "Logkeeper.StreamWAL.FrameWire",
+      "fragment_wire": "Logkeeper.StreamWAL.FragmentWire",
+      "frame_decode_wire": "Logkeeper.StreamWAL.FrameDecodeWire"
+    },
+    "src/stream/keeper/checkpoint_bytes.rs": {
+      "index_wire": "Logkeeper.StreamWAL.IndexWire",
+      "extent_wire": "Logkeeper.StreamWAL.ExtentWire",
+      "stream_index_wire": "Logkeeper.StreamWAL.StreamIndexWire"
     }
   }
 }
