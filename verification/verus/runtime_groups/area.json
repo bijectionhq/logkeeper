@@ -1,0 +1,59 @@
+{
+  "summary": "Check the installed-group compare and persist-before-serve guards.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 5,
+  "controls": {
+    "accept-conflicting-definition": {
+      "defect": "A conflicting definition is treated as a successful reinstall.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/install_decision.rs",
+          "find": "Some(false) => InstallDecision::Refuse,",
+          "replace": "Some(false) => InstallDecision::AlreadyInstalled,"
+        },
+        {
+          "file": "src/ordered/daemon/install_decision.rs",
+          "find": "Some(same) => if same { out is AlreadyInstalled } else { out is Refuse },",
+          "replace": "Some(_) => out is AlreadyInstalled,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/runtime_groups/laws.rs",
+          "function": "conflicting_definition_is_refused",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "serve-unpersisted-group": {
+      "defect": "The application serving gate disregards whether the group was persisted.",
+      "mutate": [
+        {
+          "file": "src/ordered/daemon/install_decision.rs",
+          "find": "    persisted && !retired\n",
+          "replace": "    let _ = persisted;\n    !retired\n"
+        },
+        {
+          "file": "src/ordered/daemon/install_decision.rs",
+          "find": "ensures out == (persisted && !retired),",
+          "replace": "ensures out == !retired,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/runtime_groups/laws.rs",
+          "function": "unpersisted_group_is_never_served",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    }
+  }
+}

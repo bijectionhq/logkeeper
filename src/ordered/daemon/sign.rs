@@ -411,7 +411,7 @@ mod tests {
                     voter: Uuid::new_v4(),
                     zone: format!("zone-{index}"),
                     endpoint: Endpoint {
-                        address: ([127, 0, 0, 1], index as u16).into(),
+                        address: std::net::SocketAddr::from(([127, 0, 0, 1], index as u16)).into(),
                         server_name: "localhost".into(),
                         certificate: [index; 32],
                     },

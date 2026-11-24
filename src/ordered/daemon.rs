@@ -1,13 +1,18 @@
 //! Installed-group daemon with separate mutually authenticated voter and
 //! application protocols.
 
+mod install_decision;
+mod management;
 mod receipt_keys;
 mod repair;
 mod sign;
 mod tls;
 
+pub use management::{
+    DaemonClient, ManagementReply, ManagementRequest, PublishedRoute, RouteBinding,
+};
 pub use sign::BarrierVerifier;
-pub use tls::{Credentials, Endpoint};
+pub use tls::{Credentials, Endpoint, EndpointAddress};
 
 use crate::ordered::{
     Checkpoint, Command, Enrollment, Fingerprint, Limits, Outcome, Placement, Principal, Refusal,
@@ -35,7 +40,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use tls::{APPLICATION, TlsPeers, VOTER, invalid};
+use tls::{APPLICATION, MANAGEMENT, TlsPeers, VOTER, invalid};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -57,15 +62,20 @@ pub struct Manifest {
     pub barrier_key: PathBuf,
     pub maximum_connections: usize,
     pub exchange_ms: u64,
+    #[serde(default)]
     pub groups: Vec<InstalledGroup>,
+    #[serde(default)]
+    pub management: Vec<ClientPin>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstalledGroup {
     pub placement: Placement,
+    #[serde(with = "LimitsDocument")]
     pub limits: Limits,
     pub initial_checkpoint: Checkpoint,
+    #[serde(with = "WindowDocument")]
     pub initial_window: Window,
     pub maximum_prefix_bytes: usize,
     pub maximum_application_frame: usize,
@@ -81,7 +91,27 @@ pub struct InstalledGroup {
     pub retained_barrier_keys: Vec<[u8; 32]>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(remote = "Limits")]
+struct LimitsDocument {
+    enrolled_workers: usize,
+    replay_holds: usize,
+    retry_positions: u64,
+    retained_data_bytes: u64,
+    maintenance_bytes: u64,
+    serving_lease: u64,
+    clock_drift: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(remote = "Window")]
+struct WindowDocument {
+    allocation: Uuid,
+    serial: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VoterRoute {
     pub voter: Uuid,
@@ -90,14 +120,14 @@ pub struct VoterRoute {
     pub receipt_key: [u8; 32],
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientPin {
     pub certificate: Fingerprint,
     pub role: ClientRole,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientRole {
     Administrator,
@@ -168,7 +198,7 @@ impl InstalledGroup {
         for route in self.voters {
             if route.zone.is_empty()
                 || !zones.insert(route.zone.clone())
-                || !addresses.insert(route.endpoint.address)
+                || !addresses.insert(route.endpoint.authority())
                 || !voters.insert(route.endpoint.certificate)
                 || !unique_keys.insert(route.receipt_key)
                 || members.insert(route.voter, route.endpoint).is_some()
@@ -299,47 +329,14 @@ impl Manifest {
         let acceptor = manifest.credentials.server()?;
         let connector = manifest.credentials.client(VOTER)?;
         let issuer = Arc::new(sign::Issuer::load(&manifest.barrier_key)?);
-        if groups
-            .values()
-            .any(|config| config.keys.active.get(&manifest.voter) != Some(&issuer.public_key()))
-        {
-            return Err(invalid("the configured receipt signer is not the installed voter").into());
-        }
         let listen = manifest.listen;
         let admission = Arc::new(Admission::new(manifest.maximum_connections));
-        let rooms = tokio::task::spawn_blocking(move || -> Result<_, Failure> {
-            let mut ready = BTreeMap::new();
-            for (digest, config) in groups {
-                let directory = manifest.directory.join(group_directory(digest));
-                let voter =
-                    DurableVoter::recover(config.group.clone(), manifest.voter, &directory)?;
-                let members = Arc::new(config.members);
-                let tls = TlsPeers {
-                    connector: connector.clone(),
-                    group: digest,
-                    members: Arc::clone(&members),
-                };
-                let peers = members
-                    .keys()
-                    .map(|peer| RemoteVoter::new(&config.group, *peer, tls.clone(), deadline))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let placement = config.group.placement();
-                let coordinator = Coordinator::new(config.group, peers);
-                ready.insert(
-                    digest,
-                    Room {
-                        placement,
-                        voter,
-                        coordinator,
-                        voters: config.voters,
-                        clients: config.clients,
-                        max_frame: config.max_frame,
-                    },
-                );
-            }
-            Ok(Arc::new(ready))
+        let public_key = issuer.public_key();
+        let registry = tokio::task::spawn_blocking(move || {
+            management::Registry::recover(manifest, groups, connector, public_key)
         })
         .await??;
+        let registry = Arc::new(registry);
         let listener = TcpListener::bind(listen).await?;
         let tasks = TaskTracker::new();
         let result = loop {
@@ -352,14 +349,14 @@ impl Manifest {
                     };
                     let Ok(permit) = Arc::clone(&admission.handshakes).try_acquire_owned() else { continue };
                     let acceptor = acceptor.clone();
-                    let rooms = Arc::clone(&rooms);
+                    let registry = Arc::clone(&registry);
                     let admission = Arc::clone(&admission);
                     let issuer = Arc::clone(&issuer);
                     let stopping = cancelled.clone();
                     tasks.spawn(async move {
                         tokio::select! {
                             _ = stopping.cancelled() => {}
-                            _ = timeout(deadline, dispatch(&rooms, acceptor, socket, &admission, permit, &issuer, deadline)) => {}
+                            _ = timeout(deadline, dispatch(&registry, acceptor, socket, &admission, permit, &issuer, deadline)) => {}
                         }
                     });
                 }
@@ -376,7 +373,6 @@ impl Manifest {
         if self.voter.is_nil()
             || self.exchange_ms == 0
             || !(1..=Semaphore::MAX_PERMITS).contains(&self.maximum_connections)
-            || self.groups.is_empty()
         {
             return Err(invalid("incomplete ordered installation"));
         }
@@ -400,7 +396,7 @@ impl Manifest {
 }
 
 async fn dispatch(
-    rooms: &BTreeMap<Fingerprint, Room>,
+    registry: &Arc<management::Registry>,
     acceptor: TlsAcceptor,
     socket: TcpStream,
     admission: &Admission,
@@ -418,10 +414,17 @@ async fn dispatch(
         .to_vec();
     let mut digest = [0; 32];
     channel.read_exact(&mut digest).await?;
-    let room = rooms
-        .get(&digest)
-        .ok_or_else(|| invalid("unknown installed group"))?;
     drop(handshake);
+    if protocol == MANAGEMENT {
+        let _permit = admission.applications.try_acquire()?;
+        if digest != [0; 32] {
+            return Err(invalid("invalid ordered management scope").into());
+        }
+        return registry.exchange(channel, certificate).await;
+    }
+    let room = registry
+        .room(&digest, protocol == APPLICATION)
+        .ok_or_else(|| invalid("unknown installed group"))?;
     match protocol.as_slice() {
         VOTER if room.voters.contains(&certificate) => {
             let _permit = admission.voters.try_acquire()?;
@@ -467,7 +470,7 @@ pub struct Client {
     barriers: BarrierVerifier,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApplicationRoute {
     pub group: Fingerprint,
@@ -481,7 +484,7 @@ pub struct ApplicationRoute {
     pub successors: Vec<SuccessorRoute>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SuccessorRoute {
     pub predecessor: Fingerprint,

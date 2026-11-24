@@ -73,6 +73,20 @@ Use the same trusted destination manifest for the seal, reservation, installatio
 Old public keys verify issued receipts offline. A verified receipt still needs a live hold and its protected basis to serve a read.
 Retire old private keys once their cohort and repair signing are finished. Retaining the public keys is sufficient for offline verification.
 
+A voter initialized with an empty `groups` array can persist runtime groups.
+Its `management` pins authorize the management protocol over mutual TLS.
+Only an administrator can install a group, publish its route or retire it.
+`InstallGroup` with `expected_absent: true` can create an absent group.
+An identical definition returns the installed route on retry.
+A changed definition or a retired deployment is refused.
+The daemon syncs the group definition and two voter slots before it publishes the room.
+A separate durable `PublishRoute` binds a deployment to its name and organization.
+Discover `ApplicationRoute` by deployment UUID or by name using a pinned management credential.
+Callers making cell-wide installation or discovery decisions require matching replies from a strict majority of their pinned voters.
+`RetireGroup` requires an exact selected checkpoint at the head, a vacant writer, no remaining holds and no checkpoint preparation.
+It orders a terminal seal in the next decision slot, then persists a local tombstone that excludes the group from application discovery and service.
+The daemon retains sealed voter media for retirement reconciliation.
+
 The ordered implementation can compact an accepted prefix into a bounded recovery base.
 Provisioning reserves two durable slots per voter and group.
 To select a new slot the voter syncs its body and checksummed generation header together while the prior selected slot stays intact.

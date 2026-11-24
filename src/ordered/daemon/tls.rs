@@ -25,8 +25,9 @@ use uuid::Uuid;
 
 pub(super) const VOTER: &[u8] = b"logkeeper-voter/1";
 pub(super) const APPLICATION: &[u8] = b"logkeeper-application/1";
+pub(super) const MANAGEMENT: &[u8] = b"logkeeper-management/1";
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Credentials {
     pub certificate: PathBuf,
@@ -34,12 +35,41 @@ pub struct Credentials {
     pub roots: PathBuf,
 }
 
-#[derive(Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
-    pub address: SocketAddr,
+    pub address: EndpointAddress,
     pub server_name: String,
     pub certificate: Fingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(untagged)]
+pub enum EndpointAddress {
+    Socket(SocketAddr),
+    Host(String),
+}
+
+impl From<SocketAddr> for EndpointAddress {
+    fn from(address: SocketAddr) -> Self {
+        Self::Socket(address)
+    }
+}
+
+impl Endpoint {
+    pub(super) fn authority(&self) -> String {
+        match &self.address {
+            EndpointAddress::Socket(address) => address.to_string(),
+            EndpointAddress::Host(host) => host.to_ascii_lowercase(),
+        }
+    }
+
+    pub async fn connect(&self) -> io::Result<TcpStream> {
+        match &self.address {
+            EndpointAddress::Socket(address) => TcpStream::connect(address).await,
+            EndpointAddress::Host(host) => TcpStream::connect(host.as_str()).await,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -94,12 +124,12 @@ impl Credentials {
             .with_client_cert_verifier(verifier)
             .with_single_cert(certificates(&self.certificate)?, self.private_key()?)
             .map_err(invalid)?;
-        config.alpn_protocols = vec![VOTER.to_vec(), APPLICATION.to_vec()];
+        config.alpn_protocols = vec![VOTER.to_vec(), APPLICATION.to_vec(), MANAGEMENT.to_vec()];
         config.send_tls13_tickets = 0;
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
-    pub(super) fn certificate_pin(&self) -> io::Result<Fingerprint> {
+    pub fn certificate_pin(&self) -> io::Result<Fingerprint> {
         let certificates = certificates(&self.certificate)?;
         pin(Some(&certificates))
     }
@@ -124,7 +154,7 @@ pub(super) async fn open(
     group: Fingerprint,
 ) -> io::Result<TlsStream<TcpStream>> {
     let name = ServerName::try_from(endpoint.server_name.clone()).map_err(invalid)?;
-    let socket = TcpStream::connect(endpoint.address).await?;
+    let socket = endpoint.connect().await?;
     socket.set_nodelay(true)?;
     let mut channel = connector.connect(name, socket).await?;
     let (_, peer) = channel.get_ref();

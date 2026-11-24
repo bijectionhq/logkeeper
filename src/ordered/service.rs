@@ -167,6 +167,90 @@ impl<R: Replica> Coordinator<R> {
             .await
     }
 
+    #[cfg(feature = "ordered-daemon")]
+    pub(in crate::ordered) async fn seal_for_retirement(
+        &self,
+        checkpoint: Checkpoint,
+    ) -> Result<bool, Error> {
+        use sha2::{Digest, Sha256};
+
+        let mut hash = Sha256::new();
+        hash.update(b"logkeeper.retired-group.v1");
+        hash.update(self.group.identity());
+        hash.update(checkpoint.cut.next_lsn.to_be_bytes());
+        hash.update(checkpoint.cut.history);
+        hash.update(checkpoint.root);
+        hash.update(checkpoint.manifest);
+        hash.update(checkpoint.custody.allocation.as_bytes());
+        hash.update(checkpoint.custody.revision.to_be_bytes());
+        hash.update(checkpoint.custody.provider);
+        let terminal = hash.finalize().into();
+
+        let state = self
+            .ordered(|round| self.group.recover(&self.peers, round))
+            .await?;
+        if let Some(successor) = state.successor {
+            return Ok(successor == terminal && state.checkpoint() == checkpoint);
+        }
+        if state.checkpoint() != checkpoint
+            || state.head() != checkpoint.cut
+            || state.writer_state().grant.is_some()
+            || !state.holds.is_empty()
+            || state.preparing.is_some()
+        {
+            return Ok(false);
+        }
+
+        // A concurrent decision expires the seal, including when its original
+        // proposer missed the acknowledgement and this ballot recovers it.
+        let nonce = uuid::Uuid::new_v4();
+        let expires_at = state.position().checked_add(2).ok_or(Refusal::Capacity)?;
+        let request = Request {
+            placement: state.placement(),
+            principal: Principal::Administrator,
+            id: RequestId { nonce, expires_at },
+            command: Command::SealCohort {
+                expected: self.group.identity(),
+                successor: terminal,
+            },
+        };
+        match self
+            .ordered(|round| self.group.choose(&self.peers, round, request.clone()))
+            .await
+        {
+            Ok(chosen) if chosen.receipt().outcome == Ok(Outcome::CohortSealed(terminal)) => {
+                Ok(true)
+            }
+            Ok(_) | Err(Error::Journal(replication::Error::Sealed)) => {
+                let state = self
+                    .ordered(|round| self.group.recover(&self.peers, round))
+                    .await?;
+                Ok(state.successor == Some(terminal) && state.checkpoint() == checkpoint)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(feature = "ordered-daemon")]
+    pub(in crate::ordered) async fn retirement_checkpoint(&self) -> Result<Checkpoint, Error> {
+        let state = self
+            .ordered(|round| self.group.recover(&self.peers, round))
+            .await?;
+        Ok(state.checkpoint())
+    }
+
+    #[cfg(feature = "ordered-daemon")]
+    pub(in crate::ordered) async fn enrollment(
+        &self,
+        worker: uuid::Uuid,
+    ) -> Result<Option<Enrollment>, Error> {
+        let placement = self.group.placement();
+        let state = self
+            .recover(Session::authenticated(placement, Principal::Administrator))
+            .await?;
+        Ok(state.roster.get(&worker).copied())
+    }
+
     /// Returns the current writer binding and exact recovery coordinates
     /// from the installed group. Routing callers can treat discovery as a hint.
     pub async fn route(&self, session: Session) -> Result<Route, Error> {
