@@ -82,7 +82,7 @@ mod implementation {
     };
     use bytes::Bytes;
 
-    /// All configured byte limits are per stream.
+    /// Byte limits are per stream. The request limit bounds each round queue.
     #[derive(Clone, Copy, Debug)]
     #[cfg_attr(
         feature = "stream",
@@ -93,6 +93,12 @@ mod implementation {
         pub stream_quota_bytes: u64,
         pub max_record_bytes: u32,
         pub round_bytes_per_stream: usize,
+        #[cfg_attr(feature = "stream", serde(default = "default_round_requests"))]
+        pub round_requests: usize,
+    }
+
+    const fn default_round_requests() -> usize {
+        64
     }
 
     impl Default for Limits {
@@ -101,6 +107,7 @@ mod implementation {
                 stream_quota_bytes: 8 * 1024 * 1024 * 1024,
                 max_record_bytes: 32 * 1024 * 1024,
                 round_bytes_per_stream: 4 * 1024 * 1024,
+                round_requests: default_round_requests(),
             }
         }
     }
@@ -129,7 +136,10 @@ mod implementation {
 
     fn fenced(state: &wire::StreamView) -> Decision {
         refuse(Refusal::Fenced {
-            promised: state.promised.as_ref().map_or(Epoch(0), |(epoch, _)| *epoch),
+            promised: state
+                .promised
+                .as_ref()
+                .map_or(Epoch(0), |(epoch, _)| *epoch),
         })
     }
 
@@ -186,9 +196,7 @@ mod implementation {
     }
 
     pub(crate) fn sync_start(state: &wire::StreamView, from: Lsn, floor: Lsn) -> Lsn {
-        from.max(state.floor)
-            .max(floor)
-            .max(Lsn(state.head.0 + 1))
+        from.max(state.floor).max(floor).max(Lsn(state.head.0 + 1))
     }
 
     pub(crate) fn installs_floor(state: &wire::StreamView, request: &Request) -> bool {
@@ -200,7 +208,10 @@ mod implementation {
     }
 
     pub(crate) fn promised(state: &wire::StreamView, epoch: Epoch, identity: &Identity) -> bool {
-        state.promised.as_ref().is_some_and(|(current, owner)| *current == epoch && owner == identity)
+        state
+            .promised
+            .as_ref()
+            .is_some_and(|(current, owner)| *current == epoch && owner == identity)
     }
 
     pub(crate) fn decide(view: &StreamView<'_>, request: &Request, limits: &Limits) -> Decision {
@@ -241,9 +252,7 @@ mod implementation {
 
         match request {
             Request::Seal {
-                epoch,
-                ensemble,
-                ..
+                epoch, ensemble, ..
             } => {
                 if !view.seal_allowed {
                     return refuse(Refusal::Unauthorized);
@@ -291,9 +300,7 @@ mod implementation {
                     return refuse(Refusal::BelowFloor { floor: state.floor });
                 }
                 if !sync_head_valid(state.head.0, head.0, tail.0, floor.0) {
-                    return refuse(Refusal::AboveHead {
-                        head: state.head,
-                    });
+                    return refuse(Refusal::AboveHead { head: state.head });
                 }
                 if *from > Lsn(state.tail.0 + 1) && from != floor {
                     return refuse(Refusal::Gap { head: state.head });
@@ -359,9 +366,7 @@ mod implementation {
                 }
                 let tail = state.tail.max(last);
                 if *head > tail {
-                    return refuse(Refusal::AboveHead {
-                        head: state.head,
-                    });
+                    return refuse(Refusal::AboveHead { head: state.head });
                 }
                 if *at < next || records.is_empty() {
                     return if *head > state.head {
@@ -373,11 +378,7 @@ mod implementation {
                 capacity(records, view.retained_bytes, state.floor, limits)
                     .unwrap_or(Decision::Persist)
             }
-            Request::Trim {
-                epoch,
-                through,
-                ..
-            } => {
+            Request::Trim { epoch, through, .. } => {
                 if !promised(*epoch) {
                     return fenced(state);
                 }
@@ -385,9 +386,7 @@ mod implementation {
                     return refuse(Refusal::NotSynced);
                 }
                 if !may_trim(through.0, state.head.0) {
-                    return refuse(Refusal::AboveHead {
-                        head: state.head,
-                    });
+                    return refuse(Refusal::AboveHead { head: state.head });
                 }
                 if *through < state.floor {
                     Decision::Reply(Reply::Trimmed { floor: state.floor })
@@ -406,24 +405,19 @@ mod implementation {
             Request::Read { .. } => Decision::Page {
                 through: Lsn(read_head(state.head.0, state.tail.0)),
             },
-            Request::Recover {
-                epoch,
-                from,
-                ..
-            } => {
+            Request::Recover { epoch, from, .. } => {
                 if !promised(*epoch) {
                     return fenced(state);
                 }
                 if !may_read(state.floor.0, from.0) {
                     return refuse(Refusal::BelowFloor { floor: state.floor });
                 }
-                Decision::Page { through: state.tail }
+                Decision::Page {
+                    through: state.tail,
+                }
             }
             Request::Replace {
-                epoch,
-                from,
-                to,
-                ..
+                epoch, from, to, ..
             } => {
                 if !promised(*epoch) {
                     return fenced(state);

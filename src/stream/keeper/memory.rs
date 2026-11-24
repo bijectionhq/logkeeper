@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 
-
 use super::{
     Limits,
     rules::Decision,

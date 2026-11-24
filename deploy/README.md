@@ -57,6 +57,7 @@ module "logkeeper" {
     stream_quota_bytes     = 8589934592
     max_record_bytes       = 33554432
     round_bytes_per_stream = 4194304
+    round_requests         = 64
   }
 }
 ```

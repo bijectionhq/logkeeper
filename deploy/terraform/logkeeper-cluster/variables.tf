@@ -102,11 +102,12 @@ variable "pki" {
 }
 
 variable "limits" {
-  description = "Keeper limits in bytes, common to all three keepers."
+  description = "Keeper limits common to all three keepers."
   type = object({
     stream_quota_bytes     = number
     max_record_bytes       = number
     round_bytes_per_stream = number
+    round_requests         = optional(number, 64)
   })
   default = {
     stream_quota_bytes     = 8589934592
@@ -116,9 +117,9 @@ variable "limits" {
 
   validation {
     condition = (
-      alltrue([for bytes in values(var.limits) : bytes > 0 && floor(bytes) == bytes && bytes <= 9007199254740991]) &&
+      alltrue([for limit in values(var.limits) : limit > 0 && floor(limit) == limit && limit <= 9007199254740991]) &&
       var.limits.max_record_bytes <= min(var.limits.stream_quota_bytes, 4294967295)
     )
-    error_message = "Limits must be positive, exactly representable integer bytes. A record must fit its stream quota and the wire's u32 limit."
+    error_message = "Limits must be positive, exactly representable integers. A record must fit its stream quota and the wire's u32 limit."
   }
 }

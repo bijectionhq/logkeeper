@@ -240,7 +240,13 @@ impl Sweep {
             reply = self.call(transport, keeper, seal(next)).await?;
         }
         match reply {
-            Reply::Sealed(view) if view.promised.as_ref().is_some_and(|(epoch, identity)| *epoch == self.epoch && identity == transport.identity()) => Ok(view),
+            Reply::Sealed(view)
+                if view.promised.as_ref().is_some_and(|(epoch, identity)| {
+                    *epoch == self.epoch && identity == transport.identity()
+                }) =>
+            {
+                Ok(view)
+            }
             _ => Err(SweepError::Reply { keeper, reply }),
         }
     }

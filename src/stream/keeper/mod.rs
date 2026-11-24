@@ -29,9 +29,6 @@ use self::{
 };
 use super::{codec, wire::*};
 
-const ROUND_BYTES: usize = 16 * 1024 * 1024;
-const WAVE_BYTES: usize = 64 * 1024 * 1024;
-const WAVE_REQUESTS: usize = 64;
 type CallResult = Result<Reply, TransportError>;
 
 /// Optional policy for the authenticated certificate identity.
@@ -72,24 +69,22 @@ impl Keeper {
         policy: Arc<dyn SealPolicy>,
     ) -> io::Result<Self> {
         let mut engine = Engine::open(path, keeper, limits, policy)?;
-        let (work, mut incoming) = mpsc::channel::<Work>(WAVE_REQUESTS);
+        let (work, mut incoming) = mpsc::channel::<Work>(limits.round_requests);
         std::thread::Builder::new()
             .name("stream-keeper-wal".into())
             .spawn(move || {
                 while let Some(first) = incoming.blocking_recv() {
-                    let mut bytes = first.estimated_bytes();
-                    let mut wave = VecDeque::from([first]);
-                    if wave.front().is_some_and(|work| work.is_mutation()) {
+                    if first.is_mutation() {
                         std::thread::sleep(Duration::from_micros(200));
                     }
-                    while wave.len() < WAVE_REQUESTS && bytes < WAVE_BYTES {
+                    let mut pending = VecDeque::from([first]);
+                    while pending.len() < limits.round_requests {
                         let Ok(work) = incoming.try_recv() else {
                             break;
                         };
-                        bytes += work.estimated_bytes();
-                        wave.push_back(work);
+                        pending.push_back(work);
                     }
-                    if let Err(error) = engine.process(wave) {
+                    if let Err(error) = engine.process(pending) {
                         eprintln!("stream keeper WAL stopped: {error}");
                         return;
                     }
@@ -158,19 +153,6 @@ impl Work {
             Request::Check { .. } | Request::Read { .. } | Request::Recover { .. }
         )
     }
-
-    fn estimated_bytes(&self) -> usize {
-        128 + self.identity.as_str().len()
-            + match &self.request {
-                Request::Append { records, .. } => {
-                    records.iter().map(|record| 4 + record.len()).sum()
-                }
-                Request::Sync { records, runs, .. } => {
-                    runs.len() * 24 + records.iter().map(|record| 4 + record.len()).sum::<usize>()
-                }
-                _ => 0,
-            }
-    }
 }
 
 struct Engine {
@@ -190,6 +172,7 @@ impl Engine {
     ) -> io::Result<Self> {
         if keeper.0 == 0
             || limits.round_bytes_per_stream <= FRAME_OVERHEAD
+            || !(1..=tokio::sync::Semaphore::MAX_PERMITS).contains(&limits.round_requests)
             || !rules::valid_limits(&limits)
         {
             return Err(io::Error::new(
@@ -207,10 +190,10 @@ impl Engine {
         })
     }
 
-    fn process(&mut self, mut wave: VecDeque<Work>) -> io::Result<()> {
+    fn process(&mut self, mut pending: VecDeque<Work>) -> io::Result<()> {
         let mut deletions = Vec::new();
-        while !wave.is_empty() {
-            self.round(&mut wave, &mut deletions)?;
+        while !pending.is_empty() {
+            self.round(&mut pending, &mut deletions)?;
         }
         if !deletions.is_empty() || self.wal.bytes >= wal::SEGMENT_BYTES {
             self.wal.rotate(&mut self.streams)?;
@@ -223,16 +206,16 @@ impl Engine {
 
     /// Decide and buffer in arrival order per stream. Other streams can advance while a
     /// large mutation is fragmented. A round publishes all its results after one sync.
-    fn round(&mut self, wave: &mut VecDeque<Work>, deletions: &mut Vec<Done>) -> io::Result<()> {
+    fn round(&mut self, pending: &mut VecDeque<Work>, deletions: &mut Vec<Done>) -> io::Result<()> {
         let mut buffer = BytesMut::new();
         let mut charged = HashMap::<StreamId, usize>::new();
         let mut blocked = HashSet::new();
         let mut changed = HashSet::new();
         let mut replies = Vec::new();
-        for mut work in std::mem::take(wave) {
+        for mut work in std::mem::take(pending) {
             let id = codec::stream(&work.request);
             if blocked.contains(&id) {
-                wave.push_back(work);
+                pending.push_back(work);
                 continue;
             }
             if work.pending.is_none() {
@@ -280,11 +263,10 @@ impl Engine {
             }
 
             let charge = charged.entry(id).or_default();
-            let budget =
-                (self.limits.round_bytes_per_stream - *charge).min(ROUND_BYTES - buffer.len());
+            let budget = self.limits.round_bytes_per_stream - *charge;
             if budget <= FRAME_OVERHEAD {
                 blocked.insert(id);
-                wave.push_back(work);
+                pending.push_back(work);
                 continue;
             }
             if work.pending.is_none() {
@@ -301,23 +283,23 @@ impl Engine {
                 }
             }
             let (entry, offset) = work.pending.as_mut().expect("mutation encoded");
-            let end = (*offset + budget - FRAME_OVERHEAD).min(entry.len());
+            let end = *offset + (budget - FRAME_OVERHEAD).min(entry.len() - *offset);
             let last = end == entry.len();
             wal::fragment(&mut buffer, id, *offset == 0, last, &entry[*offset..end]);
             *charge += FRAME_OVERHEAD + end - *offset;
             *offset = end;
             if !last {
                 blocked.insert(id);
-                wave.push_back(work);
+                pending.push_back(work);
                 continue;
             }
 
             let identity = work.seal_identity().cloned();
-            let reply = self.streams.entry(id).or_default().apply(
-                self.keeper,
-                work.request,
-                identity,
-            )?;
+            let reply =
+                self.streams
+                    .entry(id)
+                    .or_default()
+                    .apply(self.keeper, work.request, identity)?;
             self.wal.dirty.insert(id);
             changed.insert(id);
             if reply == Reply::Deleted {
