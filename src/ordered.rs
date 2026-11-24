@@ -1080,6 +1080,9 @@ impl State {
                 {
                     return Err(Refusal::Stale);
                 }
+                if self.preparing.is_some_and(|pending| pending.erasure) {
+                    return Err(Refusal::Unavailable);
+                }
                 self.install_grant(principal, id, candidate, self.authority.key_generation)
             }
             Command::PublishAndRotate { grant, checkpoint } => {
@@ -1112,6 +1115,9 @@ impl State {
                 references,
             } => {
                 self.writer(principal, grant)?;
+                if self.preparing.is_some_and(|pending| pending.erasure) {
+                    return Err(Refusal::Unavailable);
+                }
                 let next_lsn = writer::append_next(self.head.next_lsn, expected_next)?;
                 self.admit_object_references(references.as_deref())?;
                 let bytes = record_charge(payload.len(), references.as_deref())?;
@@ -1417,6 +1423,9 @@ impl State {
             }
             Command::Vacate { grant } => {
                 self.writer(principal, grant)?;
+                if self.preparing.is_some_and(|pending| pending.erasure) {
+                    return Err(Refusal::Unavailable);
+                }
                 self.authority.vacate();
                 Ok(Outcome::Vacated)
             }
