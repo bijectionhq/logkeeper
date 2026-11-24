@@ -1,19 +1,25 @@
 {
-  "summary": "Logkeeper selects the complete retained slice and requires the original in-range replay cursor.",
+  "summary": "Logkeeper selects the complete retained slice, requires the original in-range replay cursor and checks the exact successor and byte charge for head preparation and page delivery.",
   "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
-  "min_verified_functions": 4,
+  "min_verified_functions": 6,
   "controls": {
     "lose_last_record": {
       "defect": "Interpret the terminal cut as one record earlier.",
       "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "(through - floor) as usize))", "replace": "(through - floor).saturating_sub(1) as usize))"}],
       "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "retained_indices", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 3
+      "min_verified_functions": 5
     },
     "substitute_cursor_history": {
       "defect": "Resume from a numerically admissible cursor from a different history.",
       "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "!exact_cut || from < start", "replace": "from < start"}],
       "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "cursor_offset", "category": "postcondition not satisfied"}],
-      "min_verified_functions": 3
+      "min_verified_functions": 5
+    },
+    "deliver_later_record": {
+      "defect": "Report a later record as the next value in a replay interval.",
+      "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "from.checked_add(1) != Some(record_cut)", "replace": "from >= record_cut"}],
+      "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "replay_record_charge", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 5
     }
   }
 }
