@@ -624,6 +624,28 @@ mod tests {
     }
 
     #[test]
+    fn referenced_append_round_trip_requires_increasing_names() {
+        let mut command = request(Command::Append {
+            class: AppendClass::Data,
+            grant: Grant {
+                enrollment: Enrollment { worker: Uuid::from_u128(5), serial: 1 },
+                epoch: 1,
+                key_generation: 1,
+            },
+            expected_next: 0,
+            timestamp: 0,
+            payload: Bytes::from_static(b"opaque"),
+            references: Some(vec![[2; 32], [1; 32]]),
+        });
+        assert_eq!(Request::decode(command.encode()), Err(Refusal::Invalid));
+        let Command::Append { references: Some(names), .. } = &mut command.command else {
+            unreachable!();
+        };
+        names.reverse();
+        assert_eq!(Request::decode(command.encode()), Ok(command));
+    }
+
+    #[test]
     fn append_payload_uses_all_remaining_command_and_decision_bytes() {
         let append = |payload: &'static [u8]| {
             let enrollment = Enrollment {

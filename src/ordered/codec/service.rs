@@ -427,3 +427,24 @@ impl Input {
         self.0.is_empty().then_some(value).ok_or(Refusal::Invalid)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn withdrawn_worker_reply_round_trip_requires_bounded_page() {
+        let worker = WithdrawnWorker {
+            enrollment: crate::ordered::Enrollment {
+                worker: uuid::Uuid::from_u128(1),
+                serial: 1,
+            },
+            eligible_at: Some(9),
+        };
+        let bounded = Reply::WithdrawnWorkers(vec![worker; MAX_WITHDRAWN_WORKERS]);
+        let encoded = bounded.encode();
+        assert_eq!(Reply::decode(encoded.clone()).unwrap().encode(), encoded);
+        let over_limit = Reply::WithdrawnWorkers(vec![worker; MAX_WITHDRAWN_WORKERS + 1]);
+        assert!(matches!(Reply::decode(over_limit.encode()), Err(Refusal::Invalid)));
+    }
+}

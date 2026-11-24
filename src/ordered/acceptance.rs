@@ -1797,3 +1797,46 @@ fn exact_snapshot_hold_pins_an_older_checkpoint_and_its_suffix() {
         Ok(Outcome::CheckpointClosed(older)));
     assert_eq!(apply(&mut replacement, worker, command).outcome, Err(Refusal::Unavailable));
 }
+
+#[test]
+fn compact_image_accepts_receipts_that_overfill_the_retry_book_after_apply() {
+    let initial = codec_initial_state();
+    let mut state = initial.clone();
+    enroll(&mut state);
+    let canonical = state.encode_base();
+    let cap = state.limits.retry_positions as usize
+        + state.limits.replay_holds
+        + ACTIVATION_HOLD_SLOTS;
+
+    // Every copied row passes the per-row horizon and key checks. The distinct
+    // requests all claim the same chosen position, which apply cannot produce.
+    let original = state.outcomes.values().next().unwrap().clone();
+    state.outcomes.clear();
+    for index in 1..=cap {
+        let mut retained = original.clone();
+        retained.receipt.request.nonce = Uuid::from_u128(index as u128);
+        let request = retained.receipt.request;
+        state.outcomes.insert((retained.receipt.principal, request), retained);
+    }
+    let mut clean = State::decode_base(&initial, canonical).unwrap();
+    let mut decoded = State::decode_base(&initial, state.encode_base()).unwrap();
+    assert_eq!(decoded.outcomes.len(), cap);
+    assert!(decoded.outcomes.values().all(|row| row.receipt.position == 1));
+
+    // A new retained refusal needs another slot, and none of the copied
+    // receipts expires at position two.
+    let command = Command::Enroll {
+        worker: Uuid::from_u128(100),
+        expected: None,
+    };
+    assert_eq!(apply(&mut clean, Principal::Administrator, command.clone()).outcome,
+        Err(Refusal::Capacity));
+    assert_eq!(apply(&mut decoded, Principal::Administrator, command).outcome,
+        Err(Refusal::Capacity));
+    assert_eq!(decoded.outcomes.len(), cap + 1);
+    assert!(State::decode_base(&initial, clean.encode_base()).is_ok());
+    assert!(matches!(
+        State::decode_base(&initial, decoded.encode_base()),
+        Err(Refusal::Invalid)
+    ));
+}
