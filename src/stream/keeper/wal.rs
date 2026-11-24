@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, IoSlice, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -57,11 +57,14 @@ pub(super) struct Wal {
 }
 
 pub(super) fn entry(request: &Request, identity: Option<&Identity>) -> io::Result<Bytes> {
-    let request = codec::encode_request(request)?;
     let identity = identity.map_or("", Identity::as_str).as_bytes();
-    wal_bytes::encode_entry(identity, &request)
-        .map(Bytes::from)
-        .ok_or_else(|| invalid("oversized WAL entry"))
+    codec::encode_request_after(request, |request_len| {
+        if identity.len() > MAX_IDENTITY_BYTES {
+            return Err(invalid("oversized WAL identity"));
+        }
+        let capacity = 4 + identity.len() + request_len;
+        wal_bytes::encode_entry_prefix(identity, capacity).ok_or_else(|| invalid("oversized WAL entry"))
+    })
 }
 
 fn decode_identity(uri: &[u8]) -> io::Result<Option<Identity>> {
@@ -75,6 +78,7 @@ fn decode_identity(uri: &[u8]) -> io::Result<Option<Identity>> {
     Ok(Some(Identity::from(uri)))
 }
 
+#[cfg(test)]
 pub(super) fn fragment(
     buffer: &mut Vec<u8>,
     stream: StreamId,
@@ -84,6 +88,61 @@ pub(super) fn fragment(
 ) {
     let flags = u8::from(first) * START | u8::from(last) * END;
     assert!(wal_bytes::encode_fragment(buffer, stream.0, flags, bytes));
+}
+
+struct Fragment {
+    frame: [u8; FRAME_HEADER_BYTES],
+    prefix: [u8; FRAME_OVERHEAD - FRAME_HEADER_BYTES],
+    payload: Bytes,
+}
+
+/// The exact bytes of a sync group. Fragment payloads lend their encoded entry.
+#[derive(Default)]
+pub(super) struct Round {
+    fragments: Vec<Fragment>,
+    bytes: usize,
+}
+
+impl Round {
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+
+    pub fn push(&mut self, stream: StreamId, first: bool, last: bool, payload: Bytes) {
+        let flags = u8::from(first) * START | u8::from(last) * END;
+        let prefix = wal_bytes::encode_fragment_prefix(stream.0, flags);
+        let frame = wal_bytes::encode_frame(&prefix, &payload).expect("admitted WAL fragment");
+        self.bytes += FRAME_OVERHEAD + payload.len();
+        self.fragments.push(Fragment {
+            frame,
+            prefix,
+            payload,
+        });
+    }
+
+    pub(super) fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
+        // Bound scatter/gather descriptors independently of the number of queued streams.
+        const FRAGMENTS_PER_WRITE: usize = 32;
+        for batch in self.fragments.chunks(FRAGMENTS_PER_WRITE) {
+            let mut buffers: [IoSlice<'_>; FRAGMENTS_PER_WRITE * 3] =
+                std::array::from_fn(|_| IoSlice::new(&[]));
+            for (slots, fragment) in buffers.chunks_exact_mut(3).zip(batch) {
+                slots[0] = IoSlice::new(&fragment.frame);
+                slots[1] = IoSlice::new(&fragment.prefix);
+                slots[2] = IoSlice::new(&fragment.payload);
+            }
+            let mut remaining = &mut buffers[..batch.len() * 3];
+            while !remaining.is_empty() {
+                match writer.write_vectored(remaining) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(written) => IoSlice::advance_slices(&mut remaining, written),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(super) fn read_frame(
@@ -290,12 +349,12 @@ impl Wal {
         self.open_next_segment(true).map(|_| ())
     }
 
-    pub fn write_round(&mut self, buffer: &[u8]) -> io::Result<()> {
-        if buffer.is_empty() {
+    pub fn write_round(&mut self, buffer: &Round) -> io::Result<()> {
+        if buffer.len() == 0 {
             return Ok(());
         }
         debug_assert!(buffer.len() <= self.remaining());
-        self.file.write_all(buffer)?;
+        buffer.write_to(&mut self.file)?;
         #[cfg(test)]
         if let Some(retain) = self.retain_unsynced.take() {
             let retained = retain.min(buffer.len() - 1);

@@ -31,7 +31,7 @@ CONTROLS = [
     (
         "one-sync-per-request", "keeper/mod.rs",
         "            let identity = work.seal_identity().cloned();",
-        "            self.wal.write_round(&buffer)?;\n            buffer.clear();\n"
+        "            self.wal.write_round(&buffer)?;\n            buffer = Round::default();\n"
         "            let identity = work.seal_identity().cloned();",
         KEEPER_TEST + "group_commit_covers_multiple_streams_in_one_sync", "two streams must share one covering sync",
     ),

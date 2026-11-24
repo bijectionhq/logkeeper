@@ -59,10 +59,24 @@ pub(super) fn stream(request: &Request) -> StreamId {
 }
 
 pub fn encode_request(request: &Request) -> io::Result<Bytes> {
+    encode_request_after(request, |bytes| Ok(Vec::with_capacity(bytes)))
+}
+
+pub(super) fn encode_request_after(
+    request: &Request,
+    prefix: impl FnOnce(usize) -> io::Result<Vec<u8>>,
+) -> io::Result<Bytes> {
     if !well_formed_batch(request) {
         return Err(invalid("empty or nested keeper batch"));
     }
-    encode(&RequestFrame::from(request), MAX_FRAME_BYTES)
+    let message = RequestFrame::from(request);
+    let len = message.encoded_len();
+    if len > MAX_FRAME_BYTES {
+        return Err(invalid("keeper message too large"));
+    }
+    let mut body = prefix(len)?;
+    message.encode(&mut body).map_err(io::Error::other)?;
+    Ok(Bytes::from(body))
 }
 
 /// A batch carries at least one request and never another batch.
