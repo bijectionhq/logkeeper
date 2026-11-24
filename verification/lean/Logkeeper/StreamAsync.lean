@@ -68,7 +68,7 @@ theorem staged_sync_keeps_the_view {writer : Writer Payload} {before after : Kee
     (live : before.live) (promised : before.promised = epoch) (owns : writer.owns before epoch)
     (awaiting : before.synced ≠ epoch) (admitted : SyncAdmitted before floor start)
     (staged : after = { before with staging := some (before.syncFloor floor,
-      syncImage before (writer.seed epoch) start records) }) :
+      syncImage before (writer.seed epoch) floor start records) }) :
     Step writer before after ∧ after.latest = before.latest ∧ after.head = before.head ∧
       after.floor = before.floor ∧ after.promised = before.promised := by
   subst after

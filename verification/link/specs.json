@@ -197,7 +197,13 @@
     "src/stream/writer/decision.rs": {
       "covers": "Logkeeper.StreamJournal.Covers",
       "acknowledged": "Logkeeper.StreamJournal.QuorumAccepted",
-      "outranks": "Logkeeper.StreamJournal.RecoveryLE"
+      "outranks": "Logkeeper.StreamJournal.RecoveryLE",
+      "matches_epoch": "Logkeeper.StreamWriter.MatchesEpoch",
+      "can_sync_from": "Logkeeper.StreamWriter.SyncStart",
+      "append_head": "Logkeeper.StreamWriter.AppendHead",
+      "accepted_tail": "Logkeeper.StreamWriter.AcceptedTail",
+      "fresh_sample": "Logkeeper.StreamHead.FreshSample",
+      "sample_index": "Logkeeper.StreamHead.SampleIndex"
     }
   }
 }

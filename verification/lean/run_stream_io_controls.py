@@ -9,10 +9,10 @@ import tempfile
 
 
 HERE = Path(__file__).resolve().parent
-SOURCE = HERE / "Logkeeper/StreamIO.lean"
+MODULES = HERE / "Logkeeper"
 
 # name: (original text, weakened text, theorem whose proof must fail first)
-CONTROLS = {
+IO_CONTROLS = {
     "stage-from-another-identity": (
         "  | .stage e floor start _ => k.live ∧ k.promised = e ∧ k.identity = caller ∧ k.synced ≠ e ∧",
         "  | .stage e floor start _ => k.live ∧ k.promised = e ∧ True ∧ k.synced ≠ e ∧",
@@ -24,8 +24,8 @@ CONTROLS = {
         "deliver_refines",
     ),
     "sync-without-agreement": (
-        "      records = (w.seed e).drop (start - 1) ∧ Agrees k e (w.seed e) start ∧",
-        "      records = (w.seed e).drop (start - 1) ∧ True ∧",
+        "      records = (w.seed e).drop (start - 1) ∧ Agrees k e (w.seed e) floor start ∧",
+        "      records = (w.seed e).drop (start - 1) ∧ floor = floor ∧",
         "deliver_refines",
     ),
     "append-anywhere": (
@@ -82,18 +82,60 @@ CONTROLS = {
 }
 
 
+WRITER_CONTROLS = {
+    "compare-another-epoch": (
+        "(rightAt : right[i]? = some b) (same : a.epoch = b.epoch)",
+        "(rightAt : right[i]? = some b) (same : a.epoch = a.epoch)",
+        "same_epoch_agrees",
+    ),
+    "extend-page-past-first-head": (
+        "start + copied + count ≤ first.length",
+        "start + copied ≤ first.length",
+        "assemble_read_chunk",
+    ),
+    "delete-minority": (
+        "(durable : JournalRefinement.Majority ensemble deleted)",
+        "(durable : deleted 0 = true)",
+        "delete_quorum_blocks_live_quorum",
+    ),
+}
+
+HEAD_CONTROLS = {
+    "sample-before-opening": (
+        "round.opened ≤ sent k ∧ sent k ≤ round.sampled k ∧ round.sampled k ≤ call.replied",
+        "sent k ≤ sent k ∧ sent k ≤ round.sampled k ∧ round.sampled k ≤ call.replied",
+        "Samples.confirmed",
+    ),
+    "return-below-sampled-tails": (
+        "{result prior : Nat} (covers : SamplesCovered round result)",
+        "{result prior : Nat} (covers : result = result)",
+        "head_linearizable",
+    ),
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lake", default=str(Path.home() / ".elan/bin/lake"))
     args = parser.parse_args()
-    subprocess.run([args.lake, "build", "Logkeeper.StreamIOWitness"], cwd=HERE, check=True,
+    subprocess.run([args.lake, "build", "Logkeeper.StreamIOWitness",
+                    "Logkeeper.StreamWriter", "Logkeeper.StreamHead"], cwd=HERE, check=True,
                    capture_output=True)
     directory = HERE / ".results"
     directory.mkdir(exist_ok=True)
     evidence = Path(tempfile.mkdtemp(prefix="stream-io-controls-", dir=directory))
     print(f"Evidence: {evidence}", flush=True)
-    original = SOURCE.read_text()
-    for name, (old, new, law) in CONTROLS.items():
+    modules = {
+        "StreamIO": IO_CONTROLS,
+        "StreamWriter": WRITER_CONTROLS,
+        "StreamHead": HEAD_CONTROLS,
+    }
+    for (module, cases) in modules.items():
+        check_controls(args.lake, (MODULES / f"{module}.lean").read_text(), cases, evidence)
+
+
+def check_controls(lake, original, cases, evidence):
+    for name, (old, new, law) in cases.items():
         if original.count(old) != 1:
             raise RuntimeError(f"{name}: mutation site changed")
         mutated = original.replace(old, new)
@@ -102,7 +144,7 @@ def main():
         lines = mutated.splitlines()
         start = next(i for i, line in enumerate(lines, 1) if line.startswith(f"theorem {law} "))
         end = next(i for i, line in enumerate(lines, 1) if i > start and not line)
-        result = subprocess.run([args.lake, "env", "lean", str(path)], cwd=HERE, text=True,
+        result = subprocess.run([lake, "env", "lean", str(path)], cwd=HERE, text=True,
                                 capture_output=True)
         output = result.stdout + result.stderr
         path.with_suffix(".log").write_text(output)

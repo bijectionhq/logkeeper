@@ -126,7 +126,7 @@ def effect (w : Writer Payload) (caller : Nat) (k : Keeper Payload) : Request Pa
   | .create => { k with created := true }
   | .promise e => sealKeeper k e caller
   | .stage e floor start records =>
-      { k with staging := some (k.syncFloor floor, syncImage k (w.seed e) start records) }
+      { k with staging := some (k.syncFloor floor, syncImage k (w.seed e) floor start records) }
   | .sync e floor _ _ head =>
       { accept k e (w.seed e) with head, floor := max k.floor (k.syncFloor floor) }
   | .installFloor e head =>
@@ -159,8 +159,8 @@ inductive Packet (Payload : Type) where
 /-- The keeper's image below `start` agrees with the seed. The writer establishes it by
     comparing epoch runs in a Seal reply. It stays true while the keeper is promised to the
     epoch and unsynced, because staging leaves the view unchanged. -/
-def Agrees (k : Keeper Payload) (e : Nat) (seed : History Payload) (start : Nat) : Prop :=
-  k.promised = e → k.synced ≠ e → start ≤ k.image.length + 1 →
+def Agrees (k : Keeper Payload) (e : Nat) (seed : History Payload) (floor start : Nat) : Prop :=
+  k.promised = e → k.synced ≠ e → start ≤ k.image.length + 1 → start ≠ k.syncFloor floor →
     k.image.take (start - 1) = seed.take (start - 1)
 
 def Elected (w : Writer Payload) (e identity : Nat) : Prop :=
@@ -170,10 +170,10 @@ def Elected (w : Writer Payload) (e identity : Nat) : Prop :=
 def Sendable (w : Writer Payload) (k : Keeper Payload) (identity : Nat) : Request Payload → Prop
   | .create | .observe | .delete => True
   | .promise e => 0 < e
-  | .stage e _ start records => Elected w e identity ∧ e ≤ k.promised ∧
-      records <+: (w.seed e).drop (start - 1) ∧ Agrees k e (w.seed e) start
-  | .sync e _ start records head => Elected w e identity ∧ e ≤ k.promised ∧
-      records = (w.seed e).drop (start - 1) ∧ Agrees k e (w.seed e) start ∧
+  | .stage e floor start records => Elected w e identity ∧ e ≤ k.promised ∧
+      records <+: (w.seed e).drop (start - 1) ∧ Agrees k e (w.seed e) floor start
+  | .sync e floor start records head => Elected w e identity ∧ e ≤ k.promised ∧
+      records = (w.seed e).drop (start - 1) ∧ Agrees k e (w.seed e) floor start ∧
       head ≤ (w.seed e).length ∧ w.advertised ((w.seed e).take head)
   | .installFloor e head => Elected w e identity ∧ head ≤ (w.issued e).length ∧
       w.advertised ((w.issued e).take head)
@@ -325,10 +325,10 @@ theorem deliver_refines {w : Writer Payload} {k : Keeper Payload} {i : Nat} {req
       unfold syncImage
       rw [exact]
       split
-      · rename_i fits
-        rw [agrees promised awaiting fits]
-        exact List.take_append_drop _ _
       · exact List.take_append_drop _ _
+      · rename_i kept
+        rw [agrees promised awaiting (sync.2.2.2.2.resolve_right kept) kept]
+        exact List.take_append_drop _ _
   | installFloor e head =>
       obtain ⟨live, synced, identity, floor⟩ := admitted
       obtain ⟨⟨r, round, owner⟩, within, advertised⟩ := sendable
@@ -457,38 +457,39 @@ theorem latest_some {w : Writer Payload} {k : Keeper Payload} (reached : StreamJ
 
 /-- A staged history and its agreement with the seed. -/
 theorem staged_image_is_seed_prefix {k : Keeper Payload} {seed records : History Payload}
-    {e start : Nat} (promised : k.promised = e) (unsynced : k.synced ≠ e)
-    (agrees : Agrees k e seed start) (slice : records <+: seed.drop (start - 1)) :
-    syncImage k seed start records <+: seed := by
+    {e floor start : Nat} (promised : k.promised = e) (unsynced : k.synced ≠ e)
+    (agrees : Agrees k e seed floor start) (valid : SyncAdmitted k floor start)
+    (slice : records <+: seed.drop (start - 1)) :
+    syncImage k seed floor start records <+: seed := by
   have joined : seed.take (start - 1) ++ records <+: seed := by
     obtain ⟨rest, eq⟩ := slice
     exact ⟨rest, by rw [List.append_assoc, eq, List.take_append_drop]⟩
   unfold syncImage
   split
-  · rename_i fits
-    rw [agrees promised unsynced fits]
-    exact joined
   · exact joined
+  · rename_i kept
+    rw [agrees promised unsynced (valid.2.2.2.2.resolve_right kept) kept]
+    exact joined
 
 /-- Agreement below `start` holds for any seed prefix. -/
-theorem agrees_of_prefix {k : Keeper Payload} {e start : Nat} {seed : History Payload}
-    (prefixed : k.image <+: seed) : Agrees k e seed start := by
-  intro _ _ fits
+theorem agrees_of_prefix {k : Keeper Payload} {e floor start : Nat} {seed : History Payload}
+    (prefixed : k.image <+: seed) : Agrees k e seed floor start := by
+  intro _ _ fits _
   exact take_of_prefix prefixed (by omega)
 
 /-- An in-flight Sync's agreement survives every reference step of its keeper. -/
-theorem agrees_persists {w : Writer Payload} {k k' : Keeper Payload} {e start : Nat}
+theorem agrees_persists {w : Writer Payload} {k k' : Keeper Payload} {e floor start : Nat}
     {seed : History Payload} (step : Step w k k' ∨ k' = k) (atLeast : e ≤ k.promised)
     (stagedPrefix : ∀ f img, k'.promised = e → k'.synced ≠ e → k'.staging = some (f, img) → img <+: seed)
-    (agrees : Agrees k e seed start) : Agrees k' e seed start := by
-  intro promised unsynced fits
+    (agrees : Agrees k e seed floor start) : Agrees k' e seed floor start := by
+  intro promised unsynced fits kept
   rcases step with step | rfl
   · cases staging : k'.staging with
     | some staged =>
         obtain ⟨f, img⟩ := staged
         have prefixed := stagedPrefix f img promised unsynced staging
         have image : k'.image = img := by simp [Keeper.image, staging]
-        exact agrees_of_prefix (image ▸ prefixed) promised unsynced fits
+        exact agrees_of_prefix (image ▸ prefixed) promised unsynced fits kept
     | none =>
         obtain ⟨before, latest, unchanged⟩ := quiet_step step atLeast promised unsynced
         have stays : k.staging = none := by
@@ -500,7 +501,8 @@ theorem agrees_persists {w : Writer Payload} {k k' : Keeper Payload} {e start : 
         have image : k'.image = k.image := by simp [Keeper.image, staging, stays, history]
         rw [image] at fits ⊢
         exact agrees before (synced ▸ unsynced) fits
-  · exact agrees promised unsynced fits
+          (by simpa [Keeper.syncFloor, staging, stays] using kept)
+  · exact agrees promised unsynced fits kept
 
 def StagedPrefix (w : Writer Payload) (k : Keeper Payload) : Prop :=
   ∀ e r f img, k.promised = e → w.round e = some r → k.synced ≠ e → k.staging = some (f, img) →
@@ -532,7 +534,7 @@ theorem sendable_persists {w w' : Writer Payload} (grows : Grows w w') {k k' : K
       have ⟨r, round, _⟩ := own
       obtain ⟨own', seed⟩ := elected own
       show Elected w' e i ∧ e ≤ k'.promised ∧ records <+: (w'.seed e).drop (start - 1) ∧
-        Agrees k' e (w'.seed e) start
+        Agrees k' e (w'.seed e) floor start
       rw [seed]
       exact ⟨own', Nat.le_trans atLeast promised, slice,
         agrees_persists step atLeast (prefixes round) agrees⟩
@@ -541,7 +543,7 @@ theorem sendable_persists {w w' : Writer Payload} (grows : Grows w w') {k k' : K
       have ⟨r, round, _⟩ := own
       obtain ⟨own', seed⟩ := elected own
       show Elected w' e i ∧ e ≤ k'.promised ∧ records = (w'.seed e).drop (start - 1) ∧
-        Agrees k' e (w'.seed e) start ∧ head ≤ (w'.seed e).length ∧
+        Agrees k' e (w'.seed e) floor start ∧ head ≤ (w'.seed e).length ∧
         w'.advertised ((w'.seed e).take head)
       rw [seed]
       exact ⟨own', Nat.le_trans atLeast promised, exact,
@@ -662,17 +664,17 @@ theorem deliver_local {w : Writer Payload} {K : Keeper Payload} {i : Nat} {req :
         simp [present]
         rfl
   | stage e floor start records =>
-      obtain ⟨_, promised, _, unsynced, _⟩ := admitted
+      obtain ⟨_, promised, _, unsynced, valid⟩ := admitted
       obtain ⟨⟨r, round, _⟩, _, slice, agrees⟩ := sendable
       refine ⟨quiet, fun _ _ _ => ⟨r, promised ▸ round⟩, ?_⟩
       intro e' r' f img promised' _ _ staged
       change K.promised = e' at promised'
-      change some (K.syncFloor floor, syncImage K (w.seed e) start records) = some (f, img) at staged
+      change some (K.syncFloor floor, syncImage K (w.seed e) floor start records) = some (f, img) at staged
       have := (Prod.mk.inj (Option.some.inj staged)).2
       subst this
       have same : e = e' := promised.symm.trans promised'
       subst same
-      exact staged_image_is_seed_prefix promised unsynced agrees slice
+      exact staged_image_is_seed_prefix promised unsynced agrees valid slice
   | sync e =>
       obtain ⟨_, promised, _, _, _, _, _⟩ := admitted
       obtain ⟨⟨r, round, _⟩, _⟩ := sendable

@@ -66,9 +66,9 @@ def Keeper.syncFloor (k : Keeper Payload) (floor : Nat) : Nat :=
 
 /-- A transfer replaces the image from `start`. A start at the floor can skip trimmed positions,
     whose ghost records come from the writer's seed. -/
-def syncImage (k : Keeper Payload) (seed : History Payload) (start : Nat)
+def syncImage (k : Keeper Payload) (seed : History Payload) (floor start : Nat)
     (records : History Payload) : History Payload :=
-  (if start ≤ k.image.length + 1 then k.image.take (start - 1) else seed.take (start - 1)) ++ records
+  (if start = k.syncFloor floor then seed.take (start - 1) else k.image.take (start - 1)) ++ records
 
 /-- The keeper-side admission of a Sync chunk, shared by incomplete and complete chunks. -/
 def SyncAdmitted (k : Keeper Payload) (floor start : Nat) : Prop :=
@@ -136,10 +136,10 @@ inductive Step (w : Writer Payload) : Keeper Payload → Keeper Payload → Prop
   | syncPart {k epoch floor start records} : k.live → k.promised = epoch → w.owns k epoch →
       k.synced ≠ epoch → SyncAdmitted k floor start →
       Step w k { k with staging := some (k.syncFloor floor,
-        syncImage k (w.seed epoch) start records) }
+        syncImage k (w.seed epoch) floor start records) }
   | sync {k epoch floor start records head} : k.live → k.promised = epoch → w.owns k epoch →
       SyncAdmitted k floor start →
-      syncImage k (w.seed epoch) start records = w.seed epoch →
+      syncImage k (w.seed epoch) floor start records = w.seed epoch →
       (k.synced = epoch → k.history = w.seed epoch) → w.seed epoch <+: w.issued epoch →
       k.head ≤ head → head ≤ (w.seed epoch).length → k.syncFloor floor ≤ head + 1 →
       w.advertised ((w.seed epoch).take head) →

@@ -18,8 +18,8 @@
   {
     "name": "lean-reverses-fence-key-order",
     "file": "verification/lean/Logkeeper/CompactImage.lean",
-    "find": "0 < position ∧ position ≤ lastPosition ∧ time ≤ lastTime ∧ keyIncreases = true",
-    "replace": "0 < position ∧ position ≤ lastPosition ∧ time ≤ lastTime ∧ keyIncreases = false",
+    "find": "0 < position \u2227 position \u2264 lastPosition \u2227 time \u2264 lastTime \u2227 keyIncreases = true",
+    "replace": "0 < position \u2227 position \u2264 lastPosition \u2227 time \u2264 lastTime \u2227 keyIncreases = false",
     "area": "compact_image",
     "theorem": "link_fenceRowValid"
   },
@@ -60,8 +60,8 @@
     "area": "stream_writer",
     "theorem": "link_covers",
     "file": "verification/lean/Logkeeper/StreamJournal.lean",
-    "find": "vote.ballot = epoch ∧ history <+: vote.history",
-    "replace": "vote.ballot = epoch ∧ history = vote.history"
+    "find": "vote.ballot = epoch \u2227 history <+: vote.history",
+    "replace": "vote.ballot = epoch \u2227 history = vote.history"
   },
   {
     "name": "verus-stream-ranks-by-length",
@@ -78,5 +78,61 @@
     "file": "src/stream/writer/decision.rs",
     "find": "ensures out == (\n        ((a matches Some((ae, an)) && ae == epoch && an >= at)\n            && (b matches Some((be, bn)) && be == epoch && bn >= at))\n        || ((a matches Some((ae, an)) && ae == epoch && an >= at)\n            && (c matches Some((ce, cn)) && ce == epoch && cn >= at))\n        || ((b matches Some((be, bn)) && be == epoch && bn >= at)\n            && (c matches Some((ce, cn)) && ce == epoch && cn >= at))\n    )",
     "replace": "ensures out == (a matches Some((ae, an)) && ae == epoch && an >= at)"
+  },
+  {
+    "name": "stream-fallback-epoch",
+    "file": "src/stream/writer/decision.rs",
+    "area": "stream_writer",
+    "theorem": "link_matches_epoch",
+    "find": "if checked.is_some() { checked == Some(expected) } else { false }",
+    "replace": "if checked.is_some() { true } else { false }"
+  },
+  {
+    "name": "stream-sync-start",
+    "file": "src/stream/writer/decision.rs",
+    "area": "stream_writer",
+    "theorem": "link_can_sync_from",
+    "find": "ensures out == (floor <= start && head < start && (floor == start || matched))",
+    "replace": "ensures out == (floor <= start && head <= start && (floor == start || matched))"
+  },
+  {
+    "name": "stream-append-head",
+    "file": "src/stream/writer/decision.rs",
+    "area": "stream_writer",
+    "theorem": "link_append_head",
+    "find": "if head < last { head } else { last }",
+    "replace": "if head < last { last } else { head }"
+  },
+  {
+    "name": "stream-append-tail",
+    "file": "src/stream/writer/decision.rs",
+    "area": "stream_writer",
+    "theorem": "link_accepted_tail",
+    "find": "else if tail < issued { tail }\n        else { issued }",
+    "replace": "else if tail < issued { issued }\n        else { tail }"
+  },
+  {
+    "name": "stream-head-fresh",
+    "file": "src/stream/writer/decision.rs",
+    "area": "stream_writer",
+    "theorem": "link_fresh_sample",
+    "find": "ensures out == (opened < sent)",
+    "replace": "ensures out == (opened <= sent)"
+  },
+  {
+    "name": "stream-head-index",
+    "file": "src/stream/writer/decision.rs",
+    "area": "stream_writer",
+    "theorem": "link_sample_index",
+    "find": "if a < b { b } else { a }",
+    "replace": "if a < b { a } else { b }"
+  },
+  {
+    "name": "stream-sync-prefix",
+    "file": "src/stream/writer/decision.rs",
+    "area": "stream_writer",
+    "theorem": "link_can_sync_from",
+    "find": "ensures out == (floor <= start && head < start && (floor == start || matched))",
+    "replace": "ensures out == (floor <= start && head < start)"
   }
 ]

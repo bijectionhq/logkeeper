@@ -30,3 +30,4 @@ import Logkeeper.StreamTrace
 import Logkeeper.StreamIO
 import Logkeeper.StreamIOWitness
 import Logkeeper.StreamWriter
+import Logkeeper.StreamHead

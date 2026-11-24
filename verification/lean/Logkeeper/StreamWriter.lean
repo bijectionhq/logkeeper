@@ -20,7 +20,7 @@ theorem Origins.prefix {w : Writer Payload} {short long : History Payload}
   intro i record atShort
   have bound := (List.getElem?_eq_some_iff.mp atShort).1
   obtain ⟨length, agreement⟩ := origins i record (by
-    obtain ⟨suffix, rfl⟩  := included
+    obtain ⟨suffix, rfl⟩ := included
     rwa [List.getElem?_append_left bound])
   exact ⟨length, (take_of_prefix included (by omega)).trans agreement⟩
 
@@ -106,6 +106,104 @@ theorem same_epoch_agrees {w : Writer Payload} {left right : History Payload}
     (rightAt : right[i]? = some b) (same : a.epoch = b.epoch) :
     left.take (i + 1) = right.take (i + 1) := by
   rw [(leftOrigins i a leftAt).2, (rightOrigins i b rightAt).2, same]
+
+
+def MatchesEpoch (observed : Option Nat) (expected : Nat) : Prop := observed = some expected
+
+def SyncStart (floor head start : Nat) (matched : Bool) : Prop :=
+  floor ≤ start ∧ head < start ∧ (floor = start ∨ matched = true)
+
+def AppendHead (head last : Nat) : Nat := min head last
+
+def AcceptedTail (tail issued last : Nat) : Nat := max (min tail issued) last
+
+/-- Recovery selects the floor or verifies the record immediately below its first chunk. -/
+theorem recovery_agrees {s : State Payload} (reached : StreamIO.Reachable s) (keeper : KeeperId)
+    {epoch floor start : Nat} {matched : Bool}
+    (unstaged : (s.keeper keeper).staging = none)
+    (decision : SyncStart floor (s.keeper keeper).head start matched)
+    (boundary : matched = true → ∃ target seed : Record Payload,
+      1 < start ∧ (s.keeper keeper).history[start - 2]? = some target ∧
+      (s.writer.seed epoch)[start - 2]? = some seed ∧ MatchesEpoch (some target.epoch) seed.epoch) :
+    Agrees (s.keeper keeper) epoch (s.writer.seed epoch) floor start := by
+  intro _ _ _ above
+  rcases decision.2.2 with atFloor | matched
+  · exact False.elim (above (by simpa [Keeper.syncFloor, unstaged] using atFloor.symm))
+  · obtain ⟨target, seed, positive, targetAt, seedAt, equal⟩ := boundary matched
+    have same : target.epoch = seed.epoch := Option.some.inj equal
+    have agrees := same_epoch_agrees (keeper_origins reached keeper) (seed_origins reached epoch)
+      targetAt seedAt same
+    have offset : start - 2 + 1 = start - 1 := by omega
+    simpa [Keeper.image, unstaged, offset] using agrees
+
+/-- A fallback at the seed's record epoch supplies that exact record. -/
+theorem recovery_record {w : Writer Payload} {left right : History Payload}
+    (leftOrigins : Origins w left) (rightOrigins : Origins w right)
+    {i : Nat} {a b : Record Payload} (leftAt : left[i]? = some a)
+    (rightAt : right[i]? = some b) (same : MatchesEpoch (some a.epoch) b.epoch) :
+    a = b := by
+  have agrees := same_epoch_agrees leftOrigins rightOrigins leftAt rightAt (Option.some.inj same)
+  have atPosition := congrArg (fun (h : History Payload) => h[i]?) agrees
+  simpa [List.getElem?_take, leftAt, rightAt] using atPosition
+
+theorem sendable_stage {w : Writer Payload} {keeper : Keeper Payload}
+    {identity epoch floor start : Nat} {records : History Payload}
+    (elected : Elected w epoch identity) (promised : epoch ≤ keeper.promised)
+    (agrees : Agrees keeper epoch (w.seed epoch) floor start)
+    (recordsFromSeed : records <+: (w.seed epoch).drop (start - 1)) :
+    Sendable w keeper identity (.stage epoch floor start records) :=
+  ⟨elected, promised, recordsFromSeed, agrees⟩
+
+theorem sendable_sync {w : Writer Payload} {keeper : Keeper Payload}
+    {identity epoch floor start head : Nat}
+    (elected : Elected w epoch identity) (promised : epoch ≤ keeper.promised)
+    (agrees : Agrees keeper epoch (w.seed epoch) floor start)
+    (within : head ≤ (w.seed epoch).length)
+    (certified : w.advertised ((w.seed epoch).take head)) :
+    Sendable w keeper identity (.sync epoch floor start ((w.seed epoch).drop (start - 1)) head) :=
+  ⟨elected, promised, rfl, agrees, within, certified⟩
+
+/-- One lane's contiguous assigned run and certified publication yield a sendable Append. -/
+theorem sendable_append {w : Writer Payload} {keeper : Keeper Payload}
+    {identity epoch start head : Nat} {payloads : List Payload}
+    (elected : Elected w epoch identity)
+    (within : start - 1 + payloads.length ≤ (w.issued epoch).length)
+    (assigned : stamp epoch payloads = ((w.issued epoch).drop (start - 1)).take payloads.length)
+    (certified : w.advertised ((w.issued epoch).take (AppendHead head (start - 1 + payloads.length)))) :
+    Sendable w keeper identity (.append epoch start payloads (AppendHead head (start - 1 + payloads.length))) :=
+  ⟨elected, within, assigned, Nat.le_trans (Nat.min_le_right ..) within, certified⟩
+
+
+/-- The next chunk uses the same keeper and remains bounded by the first head.
+    A later snapshot can extend that prefix, and the assembled slice stays unchanged. -/
+theorem assemble_read_chunk {first current : History Payload} {start copied count : Nat}
+    (included : first <+: current) (within : start + copied + count ≤ first.length) :
+    (first.drop start).take copied ++ (current.drop (start + copied)).take count =
+      (first.drop start).take (copied + count) := by
+  have fixed : (current.drop (start + copied)).take count =
+      (first.drop (start + copied)).take count := by
+    rw [List.take_drop, List.take_drop, take_of_prefix included within]
+  rw [fixed, ← List.drop_drop, ← List.take_add]
+
+/-- Two durable tombstones exclude any future live mutation quorum on this roster. -/
+theorem delete_quorum_blocks_live_quorum {deleted live : KeeperId → Bool}
+    (durable : JournalRefinement.Majority ensemble deleted)
+    (terminal : ∀ k ∈ ensemble, deleted k = true → live k = false) :
+    ¬ JournalRefinement.Majority ensemble live := by
+  intro quorum
+  obtain ⟨k, member, tombstoned, voting⟩ :=
+    JournalRefinement.majorities_overlap ensemble deleted live durable quorum
+  rw [terminal k member tombstoned] at voting
+  contradiction
+
+#print axioms assemble_read_chunk
+#print axioms delete_quorum_blocks_live_quorum
+
+#print axioms recovery_agrees
+#print axioms recovery_record
+#print axioms sendable_stage
+#print axioms sendable_sync
+#print axioms sendable_append
 
 #print axioms issued_origins
 #print axioms keeper_origins

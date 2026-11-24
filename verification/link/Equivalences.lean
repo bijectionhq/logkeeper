@@ -1011,6 +1011,79 @@ theorem link_outranks {P : Type} (left right : Option Nat) (old new : History P)
     outranks left old.length right new.length ↔ ¬ RecoveryLE (rankVote right new) (rankVote left old) := by
   cases left <;> cases right <;> simp [outranks, RecoveryLE, recoveryEpoch, rankVote] <;> omega
 
+theorem link_matches_epoch (checked : Option Nat) (expected : Nat) :
+    matches_epoch checked expected ↔ StreamWriter.MatchesEpoch checked expected := by
+  cases checked <;> simp [matches_epoch, StreamWriter.MatchesEpoch, optionSome]
+
+theorem link_can_sync_from (floor head start : Nat) (matched : Bool) :
+    can_sync_from floor head start matched ↔ StreamWriter.SyncStart floor head start matched := by
+  simp [can_sync_from, StreamWriter.SyncStart, and_assoc]
+
+theorem link_append_head (head last : Nat) :
+    append_head head last = StreamWriter.AppendHead head last := by
+  simp only [append_head, StreamWriter.AppendHead]
+  split <;> omega
+
+theorem link_accepted_tail (tail issued last : Nat) :
+    accepted_tail tail issued last = StreamWriter.AcceptedTail tail issued last := by
+  simp only [accepted_tail, StreamWriter.AcceptedTail]
+  by_cases belowIssued : issued < last
+  · rw [ite_eq_left belowIssued, Nat.max_eq_right (by omega)]
+  · rw [ite_eq_right belowIssued]
+    by_cases belowTail : tail < last
+    · rw [ite_eq_left belowTail, Nat.max_eq_right (by omega)]
+    · rw [ite_eq_right belowTail]
+      split <;> omega
+
+theorem link_fresh_sample (opened sent : Nat) :
+    fresh_sample opened sent ↔ StreamHead.FreshSample opened sent := by
+  simp [fresh_sample, StreamHead.FreshSample]
+
+theorem link_sample_index (a b : Nat) :
+    sample_index a b = StreamHead.SampleIndex a b := by
+  simp only [sample_index, StreamHead.SampleIndex]
+  split <;> omega
+
+/-- The generated recovery-start decision supplies the writer's agreement premise. -/
+theorem recovery_start_agrees {P : Type} {s : StreamIO.State P}
+    (reached : StreamIO.Reachable s) (keeper : KeeperId)
+    {epoch floor start : Nat} {matched : Bool}
+    (unstaged : (s.keeper keeper).staging = none)
+    (allowed : can_sync_from floor (s.keeper keeper).head start matched)
+    (observed : matched = true → ∃ a b : Record P, 1 < start ∧
+      (s.keeper keeper).history[start - 2]? = some a ∧
+      (s.writer.seed epoch)[start - 2]? = some b ∧ matches_epoch (some a.epoch) b.epoch) :
+    StreamIO.Agrees (s.keeper keeper) epoch (s.writer.seed epoch) floor start := by
+  apply StreamWriter.recovery_agrees reached keeper unstaged ((link_can_sync_from ..).mp allowed)
+  intro compared
+  obtain ⟨target, seed, positive, targetAt, seedAt, same⟩ := observed compared
+  exact ⟨target, seed, positive, targetAt, seedAt, (link_matches_epoch ..).mp same⟩
+
+theorem recovery_fallback_record {P : Type} {w : Writer P} {left right : History P}
+    (leftOrigins : StreamWriter.Origins w left) (rightOrigins : StreamWriter.Origins w right)
+    {i : Nat} {a b : Record P} (leftAt : left[i]? = some a)
+    (rightAt : right[i]? = some b) (same : matches_epoch (some a.epoch) b.epoch) :
+    a = b :=
+  StreamWriter.recovery_record leftOrigins rightOrigins leftAt rightAt ((link_matches_epoch ..).mp same)
+
+theorem append_head_sendable {P : Type} {w : Writer P} {keeper : Keeper P}
+    {identity epoch start head : Nat} {payloads : List P}
+    (elected : StreamIO.Elected w epoch identity)
+    (within : start - 1 + payloads.length ≤ (w.issued epoch).length)
+    (assigned : stamp epoch payloads = ((w.issued epoch).drop (start - 1)).take payloads.length)
+    (certified : w.advertised ((w.issued epoch).take (append_head head (start - 1 + payloads.length)))) :
+    StreamIO.Sendable w keeper identity (.append epoch start payloads (append_head head (start - 1 + payloads.length))) := by
+  rw [link_append_head] at certified ⊢
+  exact StreamWriter.sendable_append elected within assigned certified
+
+theorem reused_sample_is_fresh (opened sent received : Nat) (eligible : fresh_sample opened sent)
+    (inFlight : sent ≤ received) : opened ≤ received :=
+  Nat.le_trans (Nat.le_of_lt ((link_fresh_sample ..).mp eligible)) inFlight
+
+theorem sample_index_covers_both (a b : Nat) : a ≤ sample_index a b ∧ b ≤ sample_index a b := by
+  rw [link_sample_index]
+  exact StreamHead.sample_bounds a b
+
 end stream_writer
 
 end Logkeeper.Generated
