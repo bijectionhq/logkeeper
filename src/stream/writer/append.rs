@@ -220,7 +220,12 @@ impl Active {
                     break Some(wait);
                 }
                 if pending.waiters.is_empty() {
-                    return Err(conflict);
+                    // A prior attempt may have accepted these bytes without deciding
+                    // the position. Only a chosen record can resolve the conflict.
+                    return Err(match state.impossible(at) {
+                        Some(error @ JournalError::Fenced { .. }) => error,
+                        _ => JournalError::Unavailable,
+                    });
                 }
             }
             // A competing live append can choose this position. Wait for that

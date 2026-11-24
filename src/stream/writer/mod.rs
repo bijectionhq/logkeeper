@@ -165,10 +165,11 @@ impl Writer {
             Err(error) => return Err(self.authority(stream, epoch, error).await),
         };
         let head = active.head();
-        if through > head || through.0 == u64::MAX {
-            return Err(JournalError::Conflict { head: head });
+        if through <= head {
+            active.published(through).await?;
         }
-        active.published(through).await?;
+        // Trim replies establish the current fence and cover the requested
+        // head even if the local snapshot is behind.
         let floor = quorum(FuturesUnordered::from_iter(stream.ensemble.map(
             |keeper| async move {
                 match self
@@ -188,7 +189,11 @@ impl Writer {
                 }
             },
         )))
-        .await?
+        .await
+        .map_err(|error| match error {
+            JournalError::Conflict { .. } if through > head => JournalError::Conflict { head },
+            error => error,
+        })?
         .into_iter()
         .max()
         .unwrap();

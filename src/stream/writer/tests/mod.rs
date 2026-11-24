@@ -46,6 +46,68 @@ fn record(value: &'static str) -> Bytes {
 }
 
 #[tokio::test(start_paused = true)]
+async fn different_payload_after_uncertain_append_has_no_decided_conflict() {
+    let (network, writer) = started().await;
+    let [survivor, second, third] = KEEPERS[..3].try_into().unwrap();
+    network.down(second, true);
+    network.down(third, true);
+
+    assert_eq!(
+        writer.append(STREAM, E1, Lsn(1), record("first")).await,
+        Err(JournalError::Unavailable)
+    );
+    network
+        .until(|| network.view(survivor, STREAM).unwrap().tail == Lsn(1))
+        .await;
+    assert_eq!(network.view(survivor, STREAM).unwrap().head, Lsn(0));
+    assert_eq!(
+        writer.append(STREAM, E1, Lsn(1), record("different")).await,
+        Err(JournalError::Unavailable),
+        "an unresolved append cannot report a decided conflict"
+    );
+
+    network.down(second, false);
+    network.down(third, false);
+    assert_eq!(
+        writer.append(STREAM, E1, Lsn(1), record("first")).await,
+        Ok(Lsn(1))
+    );
+    assert_eq!(
+        writer.append(STREAM, E1, Lsn(1), record("different")).await,
+        Err(JournalError::Conflict { head: Lsn(1) })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_trim_checks_the_fence_before_reporting_a_local_head_conflict() {
+    let (network, stale) = started().await;
+    let successor = writer(&network, 2);
+    assert_eq!(successor.seal(STREAM, E2).await, Ok(Lsn(0)));
+    assert_eq!(
+        successor.append(STREAM, E2, Lsn(1), record("first")).await,
+        Ok(Lsn(1))
+    );
+    assert_eq!(
+        stale.trim(STREAM, E1, Lsn(1)).await,
+        Err(JournalError::Fenced { current: E2 }),
+        "a stale writer cannot report a conflict at its old head"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn trim_conflict_uses_writer_authorization() {
+    let (network, writer) = started().await;
+    assert_eq!(
+        writer.trim(STREAM, E1, Lsn(1)).await,
+        Err(JournalError::Conflict { head: Lsn(0) })
+    );
+    assert!(
+        network.calls(Kind::Check).is_empty(),
+        "a trim bound must not require client authorization"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn zombie_writer_is_fenced_and_recovery_contains_the_prior_commit() {
     let (network, zombie) = started().await;
     assert_eq!(
@@ -221,7 +283,7 @@ async fn append_retry_after_lost_replies_is_exact() {
     );
     assert_eq!(
         writer.append(STREAM, E1, Lsn(1), record("changed")).await,
-        Err(JournalError::Conflict { head: Lsn(0) })
+        Err(JournalError::Unavailable)
     );
     assert_eq!(
         writer.append(STREAM, E1, Lsn(1), record("once")).await,
