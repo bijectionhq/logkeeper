@@ -1,7 +1,7 @@
 use vstd::prelude::*;
 
 #[path = "../../../src/ordered/admission.rs"]
-mod admission;
+pub(crate) mod admission;
 use admission::matches_fingerprint;
 #[path = "../../../src/ordered/codec/frame.rs"]
 mod frame;

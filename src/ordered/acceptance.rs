@@ -1804,7 +1804,6 @@ fn exact_snapshot_hold_pins_an_older_checkpoint_and_its_suffix() {
 }
 
 #[test]
-fn compact_image_accepts_receipts_that_overfill_the_retry_book_after_apply() {
 fn compact_image_rejects_distinct_retry_keys_at_one_position() {
     let initial = codec_initial_state();
     let mut state = initial.clone();
