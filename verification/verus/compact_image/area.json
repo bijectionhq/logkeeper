@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 10,
+  "min_verified_functions": 13,
   "controls": {
     "allow-zero-generation": {
       "defect": "A vacant state may decode with generation zero.",
@@ -121,6 +121,29 @@
         }
       ],
       "min_verified_functions": 9
+    },
+    "skip-checks-for-a-single-row": {
+      "defect": "A compact image containing only one hold or withdrawal receipt ignores its required matching row.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "ensures out == allSnapshotRowsValid(rows@.values(), passing@),",
+          "replace": "ensures out == (rows@.len() == 1 || allSnapshotRowsValid(rows@.values(), passing@)),"
+        },
+        {
+          "file": "src/ordered/codec/snapshot_checks.rs",
+          "find": "    let mut values = rows.values();",
+          "replace": "    if rows.len() == 1 {\n        return true;\n    }\n    let mut values = rows.values();"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/compact_image/laws.rs",
+          "function": "one_invalid_hold_prevents_recovery",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 12
     }
   }
 }

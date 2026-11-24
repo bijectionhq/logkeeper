@@ -25,3 +25,13 @@ The native tests also reject a retained hold with a missing or wrong-kind admiss
 
 The [manifest](area.json) records six source mutations and their expected diagnostics.
 The pinned baseline verified ten items and all six mutations failed at their declared obligations.
+
+## Reducer collection invariant
+
+`allSnapshotRowsValid` in [Logkeeper.CompactImage](../../lean/Logkeeper/CompactImage.lean) maps to the production `all_snapshot_rows` traversal. The verifier checks every value in the actual ordered map. The decoder calls it to check the hold-to-receipt join and the withdrawal-receipt-to-fence join. The Rust closures supply exact key and row equality, outcome-kind matching, and the positions. Verus checks the traversal and the separate hold-position guard. The new control bypasses one-row checks and fails `one_invalid_hold_prevents_recovery`.
+
+`reducerInvariant` is the reusable specification on `ReducerImage`. Lean lists and Verus sequences use the same projections. Ordered maps contribute their key sequences in iteration order. Composite keys and names use order-preserving integer representations. Bounds come from the decoder configuration and admission limits. Leases contribute exact enrollment membership and end time. Root membership, reference coverage, object-control bytes, and withdrawal receipt equality come from the corresponding state queries. A hold contributes its exact matched receipt position, or no position when the join fails. The [writer area](../ordered_writer/README.md) separately checks that the shipped vacancy transition preserves the stored generation.
+
+The decoder accepts multiple distinct receipt keys with the same decision position. A native test fills the retry book to its decode bound with those rows, applies one decision, and observes that the resulting encoding fails to decode. The reference invariant requires unique receipt positions, as an applied decision records at most one receipt. Whole-image acceptance does not imply this invariant on the shipped decoder. Establishing that implication requires a compatibility decision about rejecting those images, plus proofs that the remaining Rust parser and state construction implement the projections above.
+
+The expanded baseline verifies 13 items. All seven source controls fail at their declared obligations.
