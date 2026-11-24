@@ -1,16 +1,21 @@
-# Ordered replay Verus execution
+# Ordered journal proof execution
 
-Source commit `bfd0e4ac2f45a0c7540d8951e844b406681a1135`.
-Verus `0.2026.11.05.31e44e6`, Darwin ARM64, Rust `1.99.1`.
-Used the installed Bijection verifier and its Z3 with `verification/verus/run.py --verus <verus> --evidence <scratch> ordered_replay` under `BIJECTION_LOCAL_EXECUTION=owner-authorized`.
+Source commit `5e12d2e5549b56056ef307277123e33fa8a5060c`. The Verus harness inputs and controls were compared byte-for-byte after rebasing.
+Verus `0.2026.11.20.9da409b`, Darwin ARM64, Rust `1.100.0` and Z3 `4.16.0`.
 
-| Case | Verified functions | Expected diagnostics |
-| --- | ---: | --- |
-| Baseline | 4 | 0 |
-| `lose_last_record` | 3 | 1 postcondition failure in `retained_indices` |
-| `substitute_cursor_history` | 3 | 1 postcondition failure in `cursor_offset` |
+| Area | Baseline verified functions | Negative controls rejected |
+| --- | ---: | ---: |
+| `ordered_replay` | 11 | 6 |
+| `ordered_lease_reducer` | 63 | 11 |
+| `prefix_agreement` | 42 | 11 |
+| `rotation_slot_evidence` | 44 | 13 |
 
-The baseline includes `laws::selected_replay_indices_cover_exact_interval` and `laws::resume_requires_exact_cut_in_original_interval`.
-The production proof checks offsets within the selected resident record sequence and the requirement for exact cursor equality.
-The installed prefix and its record sequence, checkpoint authentication, page byte transport, and RTDB decode and apply retain separate obligations.
-Production Rust was checked only where included by Verus.
+`verification/verus/run.py --verus <verus> --evidence <scratch> ordered_replay ordered_lease_reducer prefix_agreement rotation_slot_evidence` reproduces the runs.
+The replay baseline checks `laws::selected_replay_indices_cover_exact_interval`, `laws::resume_requires_exact_cut_in_original_interval`, `laws::bounded_replay_emits_original_record` and `laws::exhausted_replay_has_the_original_terminal_cut`.
+The quorum baseline checks the production vote transition, including the matching voter, ballot, candidate digest and readback flag, distinct configured membership and the strict-majority threshold.
+
+Lean 4.35.0 built the 44-job package, including `Logkeeper.Protocol.held_record_survives_trim_and_transfer`, with standard axioms. Changing its live-hold trim premise to `True` caused the retention step to fail during elaboration.
+TLC 1.7.4 checked the held replay model at five and eight positions and detected skipped delivery, substituted terminal history and early completion. The sealed replacement baseline at two records checked 35,148 states. The below-quorum successor control loses its only copy in four transitions, the direct replacement control permits a stale decision in two, and the equal-length substitution control loses the original copy in five.
+
+The checked transitions consume the supplied scoped vote or resident record. The software correspondence from accepted media and sealed repair bytes to the installed image, original hold and its RTDB consumer remains open.
+Production Rust was compiled only where included by Verus.
