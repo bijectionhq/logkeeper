@@ -908,6 +908,12 @@ async fn sweeper_restores_an_absent_survivor_from_one_durable_copy() {
         learner,
         epoch: Epoch(2),
     };
+    let keeper = transport.0.remove(&source).unwrap();
+    let unreachable = Sweep { survivors: [absent, source], ..plan };
+    let [(_, outcome)] = sweep_idle(&transport, [unreachable]).await.try_into().unwrap();
+    assert!(matches!(outcome, Err(SweepError::Transport { keeper, .. }) if keeper == source),
+        "an absent survivor must not mask an unreachable source: {outcome:?}");
+    transport.0.insert(source, keeper);
     let [(_, outcome)] = sweep_idle(&transport, [plan]).await.try_into().unwrap();
     assert!(
         outcome.is_ok(),

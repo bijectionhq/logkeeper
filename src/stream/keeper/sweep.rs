@@ -71,6 +71,7 @@ impl Sweep {
                 self.create(transport, first).await?;
                 (self.seal(transport, first, next).await?, right)
             }
+            (Err(left), Err(right)) if left.not_found() => return Err(right),
             (left, right) => (left?, right?),
         };
         if left.learner || right.learner {

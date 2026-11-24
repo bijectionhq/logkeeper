@@ -648,7 +648,7 @@ pub async fn replace(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
                     result => {
-                        result?;
+                        result.map_err(|error| format!("stream {id}: {error}"))?;
                         return Ok::<_, BenchError>(start.elapsed());
                     }
                 }
