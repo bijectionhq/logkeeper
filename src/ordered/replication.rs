@@ -286,10 +286,10 @@ impl Group {
         {
             return Err(Error::Group);
         }
-        let mut state = self.recover(peers, round).await?;
-        if !rules::sealed_for(state.successor.as_ref(), &destination.identity) {
-            return Err(Error::Sealed);
-        }
+        let state = self.recover(peers, round).await?;
+        let selected_seal = state.successor;
+        let mut state = rules::seal_image(selected_seal.as_ref(), &destination.identity, state)
+            .ok_or(Error::Sealed)?;
         state.voter_scope = destination.identity;
         state.successor = None;
         let seed = RepairSeed {

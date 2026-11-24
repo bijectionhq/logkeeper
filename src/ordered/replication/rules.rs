@@ -86,6 +86,18 @@ pub(super) fn sealed_for(selected_seal: Option<&[u8; 32]>, destination: &[u8; 32
     }
 }
 
+pub(super) fn seal_image<T>(
+    selected_seal: Option<&[u8; 32]>,
+    destination: &[u8; 32],
+    selected: T,
+) -> Option<T> {
+    if sealed_for(selected_seal, destination) {
+        Some(selected)
+    } else {
+        None
+    }
+}
+
 pub(super) fn install_image<T>(
     predecessor: Option<&[u8; 32]>,
     destination: &[u8; 32],
