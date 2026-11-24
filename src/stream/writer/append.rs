@@ -141,23 +141,8 @@ impl Active {
         }
         let mut change = self.change.subscribe();
         loop {
-            {
-                let state = self.state.lock();
-                if let Some(error) = &state.closed {
-                    return Err(error.clone());
-                }
-                if state
-                    .lanes
-                    .iter()
-                    .filter(|lane| lane.published.is_some_and(|at| at >= tail))
-                    .count()
-                    >= QUORUM
-                {
-                    return Ok(());
-                }
-                if let Some(error) = state.impossible(Lsn(tail.0 + 1)) {
-                    return Err(error);
-                }
+            if let Some(result) = self.state.lock().publication(tail) {
+                return result;
             }
             change
                 .changed()
@@ -444,13 +429,29 @@ impl State {
     }
 
     fn impossible(&self, at: Lsn) -> Option<JournalError> {
+        self.failed(|_, failure| failure.at <= at)
+    }
+
+    fn publication(&self, tail: Lsn) -> Option<Result<()>> {
+        if let Some(error) = &self.closed {
+            return Some(Err(error.clone()));
+        }
+        let covered = |lane: &Lane| lane.published.is_some_and(|head| head >= tail);
+        if self.lanes.iter().filter(|lane| covered(lane)).count() >= QUORUM {
+            return Some(Ok(()));
+        }
+        // A failed later append can block a lane before it publishes this head.
+        self.failed(|lane, _| !covered(lane)).map(Err)
+    }
+
+    fn failed(&self, blocked: impl Fn(&Lane, &Failure) -> bool) -> Option<JournalError> {
         let errors: Vec<_> = self
             .lanes
             .iter()
             .filter_map(|lane| {
                 lane.failure
                     .as_ref()
-                    .filter(|f| f.revision == self.revision && f.at <= at)
+                    .filter(|failure| failure.revision == self.revision && blocked(lane, failure))
                     .map(|f| f.error.clone())
             })
             .collect();
@@ -515,6 +516,56 @@ impl State {
             };
             notify(self.pending.get_mut(&at).unwrap(), Err(error));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_detects_a_lane_blocked_by_a_later_append() {
+        let mut state = State {
+            enabled: true,
+            closed: None,
+            head: Lsn(3),
+            floor: Lsn(1),
+            pending: BTreeMap::new(),
+            lanes: [
+                Lane {
+                    accepted: Some(Lsn(4)),
+                    published: Some(Lsn(2)),
+                    failure: Some(Failure {
+                        revision: 1,
+                        at: Lsn(5),
+                        error: JournalError::Unavailable,
+                    }),
+                    ..Lane::default()
+                },
+                Lane {
+                    accepted: Some(Lsn(3)),
+                    published: Some(Lsn(3)),
+                    ..Lane::default()
+                },
+                Lane {
+                    failure: Some(Failure {
+                        revision: 1,
+                        at: Lsn(1),
+                        error: JournalError::Unavailable,
+                    }),
+                    ..Lane::default()
+                },
+            ],
+            revision: 1,
+            serial: 0,
+        };
+        assert_eq!(
+            state.publication(Lsn(3)),
+            Some(Err(JournalError::Unavailable)),
+            "pending publication must finish when both uncovered lanes are blocked"
+        );
+        state.revision += 1;
+        assert_eq!(state.publication(Lsn(3)), None);
     }
 }
 
