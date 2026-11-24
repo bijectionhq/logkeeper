@@ -1450,7 +1450,8 @@ fn exact_withdrawal_orders_against_the_retained_tail_preparation_and_held_root()
             custodian,
             Command::SettleCheckpoint {
                 checkpoint: first,
-                disposition: [9; 32]
+                disposition: [9; 32],
+                erasure_floor: 0,
             }
         )
         .outcome,

@@ -95,10 +95,12 @@ impl Request {
             Command::SettleCheckpoint {
                 checkpoint: root,
                 disposition,
+                erasure_floor,
             } => {
                 output.put_u8(17);
                 checkpoint(&mut output, *root);
                 output.put_slice(disposition);
+                output.put_u64(*erasure_floor);
             }
             Command::DisposeWorker {
                 enrollment: worker,
@@ -276,6 +278,7 @@ impl Request {
             17 => Command::SettleCheckpoint {
                 checkpoint: input.checkpoint()?,
                 disposition: input.take()?,
+                erasure_floor: input.u64()?,
             },
             18 => Command::DisposeWorker {
                 enrollment: input.enrollment()?,

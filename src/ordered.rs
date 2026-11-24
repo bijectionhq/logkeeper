@@ -251,6 +251,7 @@ pub enum Command {
     SettleCheckpoint {
         checkpoint: Checkpoint,
         disposition: Fingerprint,
+        erasure_floor: u64,
     },
     /// The administrator attests that this withdrawn worker's original
     /// running processes and delivery scope are permanently closed.
@@ -1256,11 +1257,12 @@ impl State {
             Command::SettleCheckpoint {
                 checkpoint,
                 disposition,
+                erasure_floor,
             } => {
                 if principal != Principal::Custodian {
                     return Err(Refusal::Unauthorized);
                 }
-                if disposition == [0; 32]
+                if erasure_floor != self.erasure_floor || disposition == [0; 32]
                     || self
                         .old_roots
                         .get(&checkpoint.custody.revision)
