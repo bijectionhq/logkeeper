@@ -7,6 +7,9 @@
 use bytes::Bytes;
 use std::{fmt, future::Future, pin::Pin, time::Duration};
 
+#[cfg(feature = "conformance")]
+pub mod conformance;
+
 mod file;
 mod reference;
 mod state;

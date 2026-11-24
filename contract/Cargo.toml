@@ -7,5 +7,8 @@ license = "MPL-2.0"
 publish = false
 description = "The ordered, fenced stream journal contract: the whole interface a journal consumer sees"
 
+[features]
+conformance = []
+
 [dependencies]
 bytes = "1"
