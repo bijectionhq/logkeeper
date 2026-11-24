@@ -6,3 +6,4 @@ pub mod keeper;
 #[cfg(feature = "stream")]
 pub mod transport;
 pub mod wire;
+pub mod writer;

@@ -241,3 +241,114 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
     stop.cancel();
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn writer_round_trips_through_three_tls_keepers() {
+    use journal_contract::{Journal, JournalError};
+
+    use crate::stream::writer::Writer;
+
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let roots = dir.join("ca.pem");
+    let root = ca(&roots);
+    let writer_credentials = credentials(
+        dir,
+        "writer",
+        CLIENT,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &root,
+        &roots,
+    );
+    let reader_credentials = credentials(
+        dir,
+        "reader",
+        READ_ONLY,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &root,
+        &roots,
+    );
+    let stop = CancellationToken::new();
+    let mut routes = Vec::new();
+    let mut tasks = Vec::new();
+    for zone in 0..3 {
+        let keeper = uuid::Uuid::new_v4();
+        let name = format!("keeper-{zone}");
+        let tls = credentials(
+            dir,
+            &name,
+            &format!("{KEEPER_URI}{keeper}"),
+            ExtendedKeyUsagePurpose::ServerAuth,
+            &root,
+            &roots,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let config = Config {
+            keeper,
+            listen,
+            data: dir.join(name),
+            zone: format!("test-zone-{zone}"),
+            tls,
+            clients: vec![CLIENT.into(), READ_ONLY.into()],
+            writers: vec![CLIENT.into()],
+            limits: Limits::default(),
+        };
+        tasks.push(tokio::spawn(config.serve(listener, stop.clone())));
+        routes.push((KeeperId(keeper.as_u128()), listen.to_string()));
+    }
+
+    let open = |credentials: &Credentials, holder| {
+        let transport =
+            TcpTransport::new(credentials, routes.clone(), Duration::from_secs(3)).unwrap();
+        Writer::new(
+            Arc::new(transport),
+            Holder(holder),
+            routes.iter().map(|route| route.0),
+        )
+        .unwrap()
+    };
+    let writer = open(&writer_credentials, 1);
+    let successor = open(&writer_credentials, 2);
+    let reader = open(&reader_credentials, 3);
+    let stream = StreamId(12);
+    writer.create(stream).await.unwrap();
+    assert_eq!(writer.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
+    let payload = Bytes::from_static(b"over TLS");
+    assert_eq!(
+        writer
+            .append(stream, Epoch(1), Lsn(1), payload.clone())
+            .await,
+        Ok(Lsn(1))
+    );
+    assert_eq!(successor.seal(stream, Epoch(2)).await, Ok(Lsn(1)));
+    assert_eq!(reader.head(stream).await, Ok(Lsn(1)));
+    assert_eq!(
+        reader
+            .read(stream, Lsn(1), 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        [(Lsn(1), payload)]
+    );
+    assert_eq!(
+        reader.seal(stream, Epoch(3)).await,
+        Err(JournalError::Unavailable)
+    );
+    assert_eq!(
+        writer.append(stream, Epoch(1), Lsn(2), Bytes::new()).await,
+        Err(JournalError::Fenced { current: Epoch(2) })
+    );
+    successor.trim(stream, Epoch(2), Lsn(1)).await.unwrap();
+    assert_eq!(
+        reader.read(stream, Lsn(1), 1, Duration::ZERO).await,
+        Err(JournalError::Trimmed { floor: Lsn(2) })
+    );
+    successor.delete(stream).await.unwrap();
+    assert_eq!(reader.head(stream).await, Err(JournalError::Deleted));
+
+    stop.cancel();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+}

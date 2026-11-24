@@ -3,7 +3,7 @@ use std::{collections::VecDeque, fs::File, io, path::PathBuf, sync::Arc};
 use bytes::Bytes;
 use tokio::sync::watch;
 
-use super::rules::{self, charge};
+use super::rules::{self, Decision, Limits, charge};
 use crate::stream::{
     codec::{PAGE_BYTES, invalid},
     wire::{self, *},
@@ -97,6 +97,31 @@ pub(super) struct Stream {
     pub changed: watch::Sender<()>,
 }
 
+pub(super) fn decide(
+    state: Option<&Stream>,
+    keeper: KeeperId,
+    request: &Request,
+    principal: &[u8],
+    seal_allowed: bool,
+    limits: &Limits,
+    reader: &mut ExtentReader,
+) -> io::Result<Decision> {
+    let (identical, retained_bytes) = state
+        .map(|state| state.facts(request, principal, reader))
+        .transpose()?
+        .unwrap_or((false, 0));
+    let view = rules::StreamView {
+        keeper,
+        durable: state.map(|state| &state.view),
+        deleted: state.is_some_and(|state| state.deleted),
+        same_principal: state.is_some_and(|state| state.principal == principal),
+        seal_allowed,
+        identical,
+        retained_bytes,
+    };
+    Ok(rules::decide(&view, request, limits))
+}
+
 impl Default for Stream {
     fn default() -> Self {
         Self {
@@ -153,7 +178,7 @@ impl Stream {
     }
 
     /// Compare the retained overlap and calculate the charge of the prefix that a Sync will keep.
-    pub fn facts(
+    fn facts(
         &self,
         request: &Request,
         principal: &[u8],
@@ -302,6 +327,14 @@ impl Stream {
         request: Request,
         principal: Bytes,
     ) -> io::Result<Reply> {
+        if rules::installs_floor(&self.view, &request)
+            && let Request::Sync { floor, commit, .. } = request
+        {
+            self.discard_before(floor);
+            self.view.end = self.view.end.max(commit);
+            self.view.commit = self.view.commit.max(commit);
+            return Ok(Reply::Synced { end: self.view.end });
+        }
         match request {
             Request::Create { ensemble, .. } => {
                 self.view.ensemble = ensemble;

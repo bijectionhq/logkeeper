@@ -1,5 +1,7 @@
 //! A durable keeper for many streams. The keeper serializes decisions and WAL rounds.
 mod durability;
+#[cfg(test)]
+pub(super) mod memory;
 mod rules;
 mod state;
 mod sweep;
@@ -21,7 +23,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use self::{
-    rules::{Decision, StreamView},
+    rules::Decision,
     state::Stream,
     wal::{FRAME_OVERHEAD, MAX_PRINCIPAL, Wal},
 };
@@ -232,11 +234,6 @@ impl Engine {
             }
             if work.pending.is_none() {
                 let state = self.streams.get(&id);
-                let (identical, retained_bytes) = state
-                    .map(|state| state.facts(&work.request, &work.principal, &mut self.wal.reader))
-                    .transpose()?
-                    .unwrap_or((false, 0));
-                let same_principal = state.is_some_and(|state| state.principal == work.principal);
                 let seal_allowed = match work.request {
                     Request::Seal { epoch, holder, .. } => self.policy.allow(
                         std::str::from_utf8(&work.principal).expect("principal is UTF-8"),
@@ -246,16 +243,15 @@ impl Engine {
                     ),
                     _ => true,
                 };
-                let view = StreamView {
-                    keeper: self.keeper,
-                    durable: state.map(|state| &state.view),
-                    deleted: state.is_some_and(|state| state.deleted),
-                    same_principal,
+                match state::decide(
+                    state,
+                    self.keeper,
+                    &work.request,
+                    &work.principal,
                     seal_allowed,
-                    identical,
-                    retained_bytes,
-                };
-                match rules::decide(&view, &work.request, &self.limits) {
+                    &self.limits,
+                    &mut self.wal.reader,
+                )? {
                     Decision::Reply(Reply::Deleted)
                         if changed.contains(&id) || !deletions.is_empty() =>
                     {

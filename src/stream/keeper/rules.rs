@@ -69,7 +69,9 @@ pub(crate) fn may_replace(current: bool, synced: bool, member: bool, changed: us
 #[cfg(not(verus_keep_ghost))]
 pub use implementation::Limits;
 #[cfg(not(verus_keep_ghost))]
-pub(super) use implementation::{Decision, StreamView, charge, decide, sync_start, valid_limits};
+pub(super) use implementation::{
+    Decision, StreamView, charge, decide, installs_floor, sync_start, valid_limits,
+};
 
 #[cfg(not(verus_keep_ghost))]
 mod implementation {
@@ -189,6 +191,14 @@ mod implementation {
             .max(Lsn(state.commit.0 + 1))
     }
 
+    pub(crate) fn installs_floor(state: &wire::StreamView, request: &Request) -> bool {
+        matches!(request, Request::Sync {
+            epoch, floor, from, records, runs, commit, complete: false, ..
+        } if state.synced == Some(*epoch)
+            && floor == from && floor.0.checked_sub(1) == Some(commit.0)
+            && records.is_empty() && runs.is_empty())
+    }
+
     pub(crate) fn decide(view: &StreamView<'_>, request: &Request, limits: &Limits) -> Decision {
         if let Request::Delete { ensemble, .. } = request {
             if let Some(state) = view.durable {
@@ -264,6 +274,15 @@ mod implementation {
                 if !promised(*epoch, *holder) {
                     return fenced(state);
                 }
+                // A synced replica can skip a prefix that the writer has already trimmed.
+                // This Sync form never replaces the retained suffix or lowers the commit.
+                if installs_floor(state, request) {
+                    return if *floor > state.floor {
+                        Decision::Persist
+                    } else {
+                        Decision::Reply(Reply::Synced { end: state.end })
+                    };
+                }
                 let Some(end) = last(*from, records.len()) else {
                     return refuse(Refusal::Gap { end: state.end });
                 };
@@ -333,6 +352,7 @@ mod implementation {
                     return refuse(Refusal::Gap { end: state.end });
                 }
                 if *at < next
+                    && !records.is_empty()
                     && !append_retry(!records.is_empty(), last.0, state.end.0, view.identical)
                 {
                     return refuse(Refusal::Conflict { end: state.end });

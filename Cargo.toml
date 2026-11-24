@@ -39,6 +39,7 @@ x509-parser = { version = "0.18", optional = true }
 libc = "0.2"
 
 [dev-dependencies]
+journal-contract = { path = "contract", features = ["conformance"] }
 rcgen = "0.14"
 tempfile = "3"
 

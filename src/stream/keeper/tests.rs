@@ -365,6 +365,68 @@ fn append_requires_current_sync_next_position_or_an_identical_retry() {
 }
 
 #[test]
+fn commit_only_append_preserves_a_later_accepted_record() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"first", b"later"], 0));
+    assert_eq!(
+        test.send(append(A, 1, 2, &[], 1)),
+        Reply::Appended { end: Lsn(2) },
+        "commit publication inside the accepted prefix"
+    );
+    assert_eq!(test.send(read(A, 1)), page(1, 1, &[(1, b"first")]));
+    assert_eq!(
+        test.send(recover(A, 1, 1)),
+        page(1, 1, &[(1, b"first"), (2, b"later")])
+    );
+    assert_eq!(
+        test.send(append(A, 1, 2, &[], 3)),
+        Reply::Refused(Refusal::AboveCommit { commit: Lsn(1) })
+    );
+}
+
+#[test]
+fn synced_floor_catch_up_preserves_the_retained_suffix() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"retired", b"committed", b"accepted"], 2));
+    let floor = |epoch| Request::Sync {
+        stream: A,
+        epoch: Epoch(epoch),
+        holder: HOLDER,
+        floor: Lsn(2),
+        from: Lsn(2),
+        records: vec![],
+        runs: vec![],
+        commit: Lsn(1),
+        complete: false,
+    };
+    assert_eq!(
+        test.send(floor(0)),
+        Reply::Refused(Refusal::Fenced { promised: Epoch(1) }),
+        "floor catch-up requires the current promise"
+    );
+    assert_eq!(
+        test.send(floor(1)),
+        Reply::Synced { end: Lsn(3) },
+        "floor catch-up preserves accepted end"
+    );
+    assert_eq!(
+        test.send(recover(A, 1, 2)),
+        page(2, 2, &[(2, b"committed"), (3, b"accepted")])
+    );
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let engine = Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
+    let mut test = Harness { engine, dir };
+    assert_eq!(
+        test.send(recover(A, 1, 2)),
+        page(2, 2, &[(2, b"committed"), (3, b"accepted")]),
+        "floor catch-up survives WAL replay"
+    );
+}
+
+#[test]
 fn trim_is_monotone_committed_and_frees_quota() {
     let mut test = Harness::new(Limits {
         stream_quota_bytes: 1,
