@@ -77,8 +77,10 @@ certificate for that seed in the new execution.
 
 [StreamWAL.lean](../lean/Logkeeper/StreamWAL.lean) models arbitrary streams and
 decoded image entries within one checkpoint boundary. It verifies per-stream
-fragment completion, torn-tail replay, and per-stream checkpoints while newer
-entries keep arriving. Stream images can contain any retained and staged state.
+fragment completion, continuation across physical segments, and torn-tail replay.
+It models publishing the keeper-wide index after the extent pack is durable, then
+retiring the old files while newer entries keep arriving. Stream images can contain
+any retained and staged state.
 
 ## TLC model and bounds
 
@@ -149,9 +151,9 @@ designated theorem or invariant.
 The keeper's shared index changes the file-level representation of the
 durable WAL prefix. The model's durable image and the WAL bridge's
 per-stream projection still describe the same keeper effects. Study 119's
-WAL actions model record and reply durability. The pack sync, index rename,
-directory sync and covered-file unlink boundaries are exercised in the Rust
-keeper regressions. Read and recovery bounds after replacement are unchanged.
+WAL actions model record and reply durability. The Lean WAL projection models
+pack durability, index publication and retirement. The Rust keeper regressions
+exercise the file syncs, directory syncs, rename and unlink.
 
 An isolated append still accepts before publishing. In the bounded schedule
 of three original keepers, two epochs and one position, epoch 1 delivers

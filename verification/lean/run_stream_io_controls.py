@@ -132,13 +132,13 @@ REPLACEMENT_CONTROLS = {
 
 WAL_CONTROLS = {
     "torn-tail-loses-complete-entries": (
-        "  | .torn :: _ => if newest then some [] else none",
+        "  | .torn :: _ => if newest then some ([], pending) else none",
         "  | .torn :: _ => none",
         "torn_tail_keeps_complete_entries",
     ),
     "torn-closed-segment-is-accepted": (
-        "  | .torn :: _ => if newest then some [] else none",
-        "  | .torn :: _ => some []",
+        "  | .torn :: _ => if newest then some ([], pending) else none",
+        "  | .torn :: _ => some ([], pending)",
         "torn_closed_segment_fails",
     ),
     "partial-entry-prevents-reopening": (
@@ -151,21 +151,34 @@ WAL_CONTROLS = {
         "      if true then\n        (scan newest",
         "fragments_are_demultiplexed",
     ),
+    "rollover-drops-pending-fragments": (
+        "  scan newest (if continued then pending else fun _ => false) frames",
+        "  let _ := (continued, pending)\n  scan newest (fun _ => false) frames",
+        "continued_fragments_finish_after_rollover",
+    ),
+    "fresh-segment-keeps-pending-fragments": (
+        "  scan newest (if continued then pending else fun _ => false) frames",
+        "  let _ := continued\n  scan newest pending frames",
+        "fresh_segment_discards_incomplete_entries",
+    ),
     "checkpoint-captures-newer-entries": (
-        "        checkpoints := update r.checkpoints stream (some (boundary base old stream)) }",
-        "        checkpoints := update r.checkpoints stream\n"
-        "          (some (replay stream (boundary base old stream) r.newer)) }",
+        "      Next base old r { r with index := some (boundary base old) }",
+        "      Next base old r { r with index := some (fun s => replay s (boundary base old s) r.newer) }",
         "next_sound",
     ),
-    "retire-before-durable-checkpoints": (
-        "  | retire {r} : (∀ stream, Dirty old stream →\n"
-        "      r.checkpoints stream = some (boundary base old stream)) →",
+    "publish-before-pack-sync": (
+        "  | publish {r} : r.packDurable = true →",
+        "  | publish {r} : True →",
+        "next_sound",
+    ),
+    "retire-before-durable-index": (
+        "  | retire {r} : r.index.isSome = true →",
         "  | retire {r} : True →",
         "next_sound",
     ),
     "reopen-drops-newer-entries": (
-        "  replay stream ((rotation.checkpoints stream).getD prior) rotation.newer",
-        "  replay stream ((rotation.checkpoints stream).getD prior) []",
+        "      if r.packDurable then some (replay stream (images stream) r.newer) else none",
+        "      if r.packDurable then some (images stream) else none",
         "reopen_recovers_each_stream",
     ),
 }

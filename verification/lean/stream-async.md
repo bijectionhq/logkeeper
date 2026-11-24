@@ -78,7 +78,7 @@ A crashed or cancelled writer simply takes no further action; its packets stay i
 contract theorems applies. [`automaton_witness`](Logkeeper/StreamIOWitness.lean) is a
 reachable 36-action run: two keepers sync at epoch 1, one accepts a record, epoch 2 elects
 both, completes Sync on one, stages and then completes on the other, certifies the
-inherited record and publishes head 1 on a keeper that holds no epoch-2 record. The 14
+inherited record and publishes head 1 on a keeper that holds no epoch-2 record. The 15
 automaton reports and the witness use only `propext`, `Classical.choice` and `Quot.sound`.
 
 Each automaton guard has a control. `run_stream_io_controls.py` weakens it and requires
@@ -100,11 +100,11 @@ and refusals and observations must not change it.
 
 | Corpus | Effects |
 | --- | ---: |
-| 10,000 seeds | 992,095 |
-| Stutters (observations, retries, reopens and other refusals) | 598,297 |
+| 10,000 seeds | 991,916 |
+| Stutters (observations, retries, reopens and other refusals) | 598,123 |
 | Create · Seal · Delete | 30,909 · 62,727 · 30,000 |
-| Staged Sync · complete Sync · floor installation | 4,359 · 62,727 · 47 |
-| Append · publication · Trim | 82,018 · 82,877 · 29,953 |
+| Staged Sync · complete Sync · floor installation | 4,373 · 62,727 · 52 |
+| Append · publication · Trim | 82,004 · 82,872 · 29,948 |
 | Disk loss · survivor installation · learner installation | 909 · 1,818 · 909 |
 | WrongEnsemble | 4,545 |
 
@@ -167,10 +167,11 @@ transfer in their bounded schedules.
 [Replacement projection](Logkeeper/StreamReplacement.lean) · [Study 119](../119-stream-journal/README.md)
 
 The WAL projection treats complete decoded entries as stream-local images. It proves
-that a torn newest frame leaves complete entries intact, fragment assembly is per stream,
-and each stream recovers its captured checkpoint plus later entries. Retirement requires
-durable checkpoints for every dirty stream. A reachable two-stream run publishes one
-checkpoint while the next segment takes entries and then reopens after retirement.
+that a torn newest frame leaves complete entries intact and the continuation marker
+carries only per-stream pending fragments. Recovery uses the old WAL until the
+keeper-wide index is published above durable extent packs. Retirement follows index
+publication. A reachable two-stream run appends during checkpointing and reopens both
+before publication and after retirement.
 [WAL projection](Logkeeper/StreamWAL.lean)
 
 ## Boundaries
@@ -185,7 +186,7 @@ checkpoint while the next segment takes entries and then reopens after retiremen
   lane slots. The model's issued history grows monotonically. The Rust writer can
   clear a pending suffix after all three keepers reply `Full` or `TooLarge`,
   and the automaton has no transition for reassigning that definitively refused suffix.
-- **Keeper decisions.** Verus and the link runner cover the Replace decision over
+- **Keeper decisions.** Verus and the link runner cover the Sync head bounds and the Replace decision over
   projected inputs, the valid-ensemble predicate and installation's ensemble and
   learner fields. Full refinement of `decide` and `apply`, including construction
   of the payload and capacity facts and projection of native state, remains open.
@@ -215,8 +216,9 @@ checkpoint while the next segment takes entries and then reopens after retiremen
   [Sweeper](../../src/stream/keeper/sweep.rs)
 - **WAL and transport.** Reopen rows show the reopened image equals the durable image for
   every recorded reopen, and Study 117's bridge covers reply survival. The WAL proof
-  starts at validated framing and durable image publication. CRC collision behavior,
-  extents, rename and directory sync are outside that projection. A `Batch` envelope
+  starts at validated framing and models pack and index durability events.
+  CRC collision behavior, extent offsets, renames and directory sync are outside
+  that projection. A `Batch` envelope
   is transport framing that the keeper splits into single requests before deciding.
 - **Payload bytes.** The replay checks positions and record epochs. The conformance
   history checker compares payload bytes.

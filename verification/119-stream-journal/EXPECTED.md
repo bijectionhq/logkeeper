@@ -6,10 +6,10 @@ lengths count transitions after the initial state.
 
 ## Lean
 
-The Lake package builds. The 21 stream-journal reports, nine replacement
-reports, seven WAL reports and one Study 117 bridge report contain only
-standard axioms. The reports include the two-keeper commit, split install
-and background checkpoint witnesses.
+The Lake package builds. The 21 stream-journal reports, 16 I/O automaton
+reports, nine replacement reports, nine WAL reports and one Study 117
+bridge report contain only standard axioms. The reports include the
+two-keeper commit, split install and background checkpoint witnesses.
 
 | Control | Failing check |
 | --- | --- |
