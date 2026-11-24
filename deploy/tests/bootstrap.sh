@@ -158,10 +158,15 @@ mv "$fixture/replacement/keeper" "$fixture/disconnected"
 expect_failure "Instance store has data without a keeper identity" boot "$fixture/replacement" "$replacement"
 
 probe_mount() {
+    local devices
+    devices=$(jq -cn --arg model "$1" --argjson extra "${5:-0}" '
+        [{name: "/dev/nvme0n1", type: "disk", model: "Amazon Elastic Block Store"}]
+        + [range(1; 2 + $extra) | {name: "/dev/nvme\(.)n1", type: "disk", model: $model}]
+        | {blockdevices: .}')
     bash -c '
         source "$1/keeper.sh"
         udevadm() { :; }
-        test_model=$2 test_device=$3 test_mounted=$4 test_signature=$5
+        test_devices=$2 test_device=$3 test_mounted=$4 test_signature=$5
         findmnt() {
             case "$1" in
                 --source) return 1 ;;
@@ -171,9 +176,7 @@ probe_mount() {
         }
         lsblk() {
             case "$1" in
-                --json)
-                    jq -n --arg model "$test_model" "{blockdevices: [{name: \"/dev/nvme0n1\", type: \"disk\", model: \$model}]}"
-                    ;;
+                --json) printf "%s\n" "$test_devices" ;;
                 --noheadings)
                     [[ $4 != TYPE ]] || printf "disk\n"
                     ;;
@@ -181,27 +184,28 @@ probe_mount() {
         }
         wipefs() { printf "%s\n" "$test_signature"; }
         mkfs.xfs() {
-            [[ $* == "-q -L logkeeper /dev/nvme0n1" ]] || return 1
+            [[ $* == "-q -L logkeeper /dev/nvme1n1" ]] || return 1
             touch "$fixture/formatted"
         }
         blkid() { printf "logkeeper\n"; }
         mount() {
-            [[ $* == "-t xfs -o nodev,nosuid,noexec /dev/nvme0n1 $fixture/mount" ]] || return 1
+            [[ $* == "-t xfs -o nodev,nosuid,noexec /dev/nvme1n1 $fixture/mount" ]] || return 1
             test_mounted=yes
         }
         mount_instance_store "$fixture/mount"
-    ' bash "$module" "$1" "$2" "${3:-yes}" "${4:-}"
+    ' bash "$module" "$devices" "$2" "${3:-yes}" "${4:-}"
 }
 
-probe_mount "Amazon EC2 NVMe Instance Storage" /dev/nvme0n1
-echo "Mounted local NVMe is accepted"
+probe_mount "Amazon EC2 NVMe Instance Storage" /dev/nvme1n1
+echo "Mounted local NVMe is accepted alongside an EBS root disk"
 expect_failure "Expected exactly one EC2 NVMe instance-store disk" probe_mount "Amazon Elastic Block Store" /dev/nvme0n1
-expect_failure "Journal path is not the local XFS instance store" probe_mount "Amazon EC2 NVMe Instance Storage" /dev/other
-probe_mount "Amazon EC2 NVMe Instance Storage" /dev/nvme0n1 no
+expect_failure "Expected exactly one EC2 NVMe instance-store disk" probe_mount "Amazon EC2 NVMe Instance Storage" /dev/nvme1n1 yes '' 1
+expect_failure "Journal path is not the local XFS instance store" probe_mount "Amazon EC2 NVMe Instance Storage" /dev/nvme0n1
+probe_mount "Amazon EC2 NVMe Instance Storage" /dev/nvme1n1 no
 [[ -f "$fixture/formatted" ]]
 echo "A blank local NVMe disk is formatted and mounted"
 rm "$fixture/formatted"
-expect_failure "Instance store has existing signatures" probe_mount "Amazon EC2 NVMe Instance Storage" /dev/nvme0n1 no gpt
+expect_failure "Instance store has existing signatures" probe_mount "Amazon EC2 NVMe Instance Storage" /dev/nvme1n1 no gpt
 [[ ! -e "$fixture/formatted" ]]
 
 jq -n --rawfile ca "$fixture/ca.pem" '{

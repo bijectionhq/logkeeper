@@ -8,25 +8,34 @@ logkeeper+tls://keeper-1.journal.example.internal:5448,keeper-2.journal.example.
 
 ## Build the image
 
-From the repository root, build the release with the keeper subcommand for Linux amd64. The scratch image expects a statically linked musl executable. Use an x86_64 Linux builder with Rust's musl target, a musl C toolchain and the approved guarded Cargo entry point. Set `GUARDED_CARGO` to the guarded Cargo executable on that builder.
+Build the release with Rust's `aarch64-unknown-linux-musl` and `x86_64-unknown-linux-musl` targets, a musl C toolchain for each target, and the approved guarded Cargo entry point. For a cross-build, configure Cargo's linker and the C compiler that builds `ring` for each target. The example assumes the cross-compilers are in `PATH`.
 
 ```sh
-"$GUARDED_CARGO" logkeeper \
-  build --locked --release --all-features --bin logkeeper \
-  --target x86_64-unknown-linux-musl --target-dir "$PWD/target/image-build"
-binary=target/image-build/x86_64-unknown-linux-musl/release/logkeeper
-file "$binary"
-mkdir -p target/keeper-image
-cp "$binary" target/keeper-image/logkeeper
-docker build --platform linux/amd64 -f deploy/Dockerfile -t "$RELEASE_IMAGE" target/keeper-image
+export GUARDED_CARGO=/path/to/guarded-cargo.py
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+export CC_aarch64_unknown_linux_musl="$CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER"
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc
+export CC_x86_64_unknown_linux_musl="$CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
+deploy/build-binaries.sh
+deploy/tests/image.sh
 ```
 
-Verify that the executable is static and that the release accepts `logkeeper keeper --config FILE` before publishing it. Push the image to Logkeeper's private ECR repository in the module's region and account. Record the manifest digest from the registry. The container runs as UID and GID 10001 with the configuration at `/etc/logkeeper/keeper.json` and journal data at `/var/lib/logkeeper`. The configuration uses the JSON schema in [the stream journal spec](../verification/target-journal.md#formats-shared-by-the-keeper-writer-and-deployment).
+The build stages both binaries in `target/keeper-image/`. The test builds and loads the two-platform scratch image locally, checks each executable and runs it. Use a Docker image store with multi-platform support and a Docker host that can run both architectures, using emulation if needed. [Docker multi-platform builds](https://docs.docker.com/build/building/multi-platform/)
+
+After both variants pass, set `RELEASE_IMAGE` to the tagged image in Logkeeper's private ECR repository in the module's region and account, and authenticate Docker to that registry.
+
+```sh
+docker buildx build --platform linux/arm64,linux/amd64 \
+  -f deploy/Dockerfile -t "$RELEASE_IMAGE" --push target/keeper-image
+docker buildx imagetools inspect "$RELEASE_IMAGE"
+```
+
+Verify the index lists `linux/arm64` and `linux/amd64`. Use the top-level `Digest` from `imagetools inspect` for `image_digests` so each host can pull its variant. The container runs as UID and GID 10001 with the configuration at `/etc/logkeeper/keeper.json` and journal data at `/var/lib/logkeeper`. The configuration uses the JSON schema in [the stream journal spec](../verification/target-journal.md#formats-shared-by-the-keeper-writer-and-deployment).
 
 ## Bootstrap
 
 1. Select three routed private subnets in a DNS-enabled VPC with three distinct AZ IDs. The journal clients and sweeper must resolve the private zone and reach TCP 5448 from the allowed security groups. Provide HTTPS egress to the AL2023 package repositories, ECR and its layer storage, SSM and its session channels, Secrets Manager and AWS Private CA. Use Session Manager for systemd and storage checks. Grant session access only to journal operators.
-2. Select a qualified x86_64 Amazon Linux 2023 AMI with cloud-init and SSM Agent 3.3.40.0 or newer, and a Nitro instance type with exactly one local NVMe SSD. The default is `i4i.large`. Follow the [storage qualification](#qualify-fsync) before admitting production writes. [AWS Session Manager message endpoints](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-setting-up-messageAPIs.html)
+2. Select a qualified Amazon Linux 2023 AMI with cloud-init and SSM Agent 3.3.40.0 or newer. The default `i8g.large` uses arm64 Graviton4 and has one 468 GB third-generation Nitro NVMe SSD. Its two vCPUs, 16 GiB of memory and disk capacity match the former default's sizing. AWS lists I8g in Stockholm (`eu-north-1`). Confirm the chosen size is offered in all three selected AZs. For an x86_64 deployment, explicitly set a qualified single-NVMe Nitro type such as `i4i.large` and supply a matching x86_64 AMI. The Terraform runner needs `ec2:DescribeImages` to check the AMI architecture. Complete [storage qualification](#qualify-fsync) before admitting production writes. [AWS I8g specifications](https://aws.amazon.com/ec2/instance-types/i8g/) · [AWS I4i specifications](https://aws.amazon.com/ec2/instance-types/i4i/) · [Stockholm availability](https://aws.amazon.com/about-aws/whats-new/2025/11/amazon-ec2-i8g-instances-additional-aws-regions/) · [AWS Session Manager message endpoints](https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-setting-up-messageAPIs.html)
 3. Use an active AWS Private CA dedicated to this journal in the module's region. Supply its CA ARN, a matching signing algorithm such as `SHA256WITHRSA` for an RSA CA, and the PEM trust bundle containing its root. If the issuer is subordinate, test the full chain on both TLS peers. The keeper role can issue server-auth leaves and the client issuer role can issue client-auth leaves. Both templates take their SANs from the CSR. Control access to both issuing roles and keep the issuing CA dedicated to this cluster. [AWS Private CA certificate templates](https://docs.aws.amazon.com/privateca/latest/userguide/template-definitions.html)
 4. Instantiate the module from a Terraform root. Fix the subnet order at bootstrap. Use the same initial image digest in all three entries and provide the client and writer names and byte limits. List an identity in both sets when it needs reads and mutations. Review the plan before provisioning. An example module call follows.
 
@@ -37,8 +46,7 @@ module "logkeeper" {
   vpc_id                    = var.vpc_id
   private_subnet_ids        = var.private_subnet_ids
   client_security_group_ids = var.journal_client_security_group_ids
-  instance_type             = "i4i.large"
-  ami_id                    = var.qualified_ami_id
+  ami_id                    = var.qualified_arm64_ami_id
   dns_zone_name             = "journal.example.internal"
   image_repository_name     = "logkeeper"
   image_digests             = [var.image_digest, var.image_digest, var.image_digest]
@@ -76,6 +84,8 @@ Local NVMe survives an EC2 reboot. EC2 stop, hibernation, termination and disk l
 
 Use the three endpoint slots in their original order. Add capacity by provisioning a separate three-keeper cluster and assigning new streams to its journal URL, or qualify a larger single-NVMe type and replace one keeper at a time. Use the learner procedure for each instance-type, AMI or subnet replacement. Relocating a live stream to another cluster requires a stream migration procedure.
 
+For an existing x86_64 cluster that relied on the previous default, set `instance_type = "i4i.large"` before planning with this module. To migrate to Graviton, first stage the multi-platform image on the running cluster. After qualifying Graviton, change `instance_type` and `ami_id` together and replace one keeper at a time through the learner procedure. Confirm stream repair before replacing the next keeper.
+
 For a software upgrade, change one `image_digests` entry, review that Terraform updates only that endpoint's SSM image parameter, and restart `logkeeper.service` on the selected host. Keep the EC2 instance running. Verify that the UUID is unchanged, the expected digest is running, the journal replays and the keeper serves its existing ensembles. Check sync latency, the stream canary and errors before changing the next entry. Restore the previous digest and restart the same service for rollback if the WAL format remains compatible.
 
 Changes to bootstrap data, including the allowlists and limits, replace the affected EC2 instances. Stage them by targeting a single DNS record and its instance per operation, using the learner procedure between operations. Review the plan for exactly one instance replacement before proceeding. For certificate renewal, restart each healthy keeper in turn during the last 30 days of its 90-day certificate and verify that the UUID is unchanged and the new expiry has advanced. Retain the old image digest until the rollout passes.
@@ -94,8 +104,8 @@ Collect the keeper's release-specific telemetry and service logs. Qualify the fo
 
 ## Qualify fsync
 
-Before a production rollout, qualify the exact instance type, disk firmware, AMI and kernel, XFS mount options and keeper release. Verify the test path is on the instance store. Keep normal filesystem flush semantics and verify that the keeper replies only after the covering sync succeeds. Measure the sync latency distribution at expected load, including segment rotation, reclaim and near-capacity conditions.
+Before a production rollout, qualify the default `i8g.large` on arm64 and every alternative instance type you intend to operate. Record the CPU architecture, instance type and AZ, NVMe model and firmware, AMI and kernel, XFS mount options, and the release index and platform manifest digests. Verify that `findmnt --mountpoint /mnt/logkeeper` shows XFS and that the source is the single `Amazon EC2 NVMe Instance Storage` device reported by `lsblk`. Keep normal filesystem flush semantics and verify that the keeper replies only after the covering sync succeeds. Measure the sync latency distribution at expected load, including segment rotation, reclaim and near-capacity conditions.
 
 Run a crash-and-recovery test with an independent observer that durably records each acknowledged append. Exercise process kill, abrupt host reset on the same disk, and torn writes around record and segment boundaries. After every recovery reconcile acknowledged records, their bytes and the reported floor with the observer. A graceful shutdown or a throughput benchmark cannot qualify power-loss behavior. Use AWS's documented persistence behavior as part of the evidence and obtain a failure-injection test or platform evidence covering device flush and abrupt power loss. Record any untested condition with the qualification result.
 
-As a negative control, run the same fault and recovery check with a keeper test build that replies before sync. Inject a fault after an acknowledgement and before persistence and require the acknowledged-record reconciliation to fail. Test whole-disk loss separately with the learner procedure, including refusal to count the new UUID before sync. Retain fault settings, the acknowledgement trace, recovery results and the failing control with the qualification record. [EC2 NVMe instance store](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ssd-instance-store.html)
+As a negative control, run the same fault and recovery check on each stack with a keeper test build that replies before sync. Inject a fault after an acknowledgement and before persistence and require the acknowledged-record reconciliation to fail. Test whole-disk loss separately with the learner procedure, including refusal to count the new UUID before sync. Retain fault settings, the acknowledgement trace, recovery results and the failing control with the qualification record. [EC2 NVMe instance store](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ssd-instance-store.html)

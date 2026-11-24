@@ -6,6 +6,15 @@ data "aws_ec2_instance_type" "keeper" {
   instance_type = var.instance_type
 }
 
+data "aws_ami" "keeper" {
+  include_deprecated = true
+
+  filter {
+    name   = "image-id"
+    values = [var.ami_id]
+  }
+}
+
 data "aws_subnet" "keeper" {
   for_each = local.slots
   id       = each.value.subnet_id
@@ -131,11 +140,19 @@ resource "aws_instance" "keeper" {
   lifecycle {
     precondition {
       condition = (
-        contains(data.aws_ec2_instance_type.keeper.supported_architectures, "x86_64") &&
-        data.aws_ec2_instance_type.keeper.hypervisor == "nitro" &&
-        try(one(data.aws_ec2_instance_type.keeper.instance_disks).count == 1 && one(data.aws_ec2_instance_type.keeper.instance_disks).type == "ssd", false)
+        contains(["arm64", "x86_64"], data.aws_ami.keeper.architecture) &&
+        contains(data.aws_ec2_instance_type.keeper.supported_architectures, data.aws_ami.keeper.architecture)
       )
-      error_message = "Keepers require x86_64 Nitro instances with a single local NVMe SSD."
+      error_message = "The keeper AMI must use arm64 or x86_64 and match the instance type."
+    }
+    precondition {
+      # Nitro exposes instance store as NVMe. instance_disks excludes EBS.
+      condition = (
+        data.aws_ec2_instance_type.keeper.hypervisor == "nitro" &&
+        length(data.aws_ec2_instance_type.keeper.instance_disks) == 1 &&
+        alltrue([for disk in data.aws_ec2_instance_type.keeper.instance_disks : disk.count == 1 && disk.type == "ssd"])
+      )
+      error_message = "Keepers require Nitro instances with a single local NVMe SSD."
     }
   }
 }

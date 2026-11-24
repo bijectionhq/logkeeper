@@ -12,10 +12,13 @@ mock_provider "aws" {
   }
   mock_data "aws_ec2_instance_type" {
     defaults = {
-      supported_architectures = ["x86_64"]
+      supported_architectures = ["arm64"]
       hypervisor              = "nitro"
       instance_disks          = [{ count = 1, size = 468, type = "ssd" }]
     }
+  }
+  mock_data "aws_ami" {
+    defaults = { architecture = "arm64" }
   }
   mock_data "aws_subnet" {
     defaults = { vpc_id = "vpc-fixture", map_public_ip_on_launch = false }
@@ -122,6 +125,11 @@ run "three_private_endpoints" {
   }
 
   assert {
+    condition     = alltrue([for keeper in aws_instance.keeper : keeper.instance_type == "i8g.large"])
+    error_message = "Every keeper must default to i8g.large Graviton."
+  }
+
+  assert {
     condition     = output.journal_url == "logkeeper+tls://keeper-1.fixture.internal:5448,keeper-2.fixture.internal:5448,keeper-3.fixture.internal:5448"
     error_message = "The journal URL must list the three stable endpoints in subnet order."
   }
@@ -186,6 +194,64 @@ run "three_private_endpoints" {
   }
 }
 
+run "x86_64_override_is_accepted" {
+  command = plan
+
+  variables {
+    instance_type = "i4i.large"
+  }
+
+  override_data {
+    target = data.aws_ec2_instance_type.keeper
+    values = {
+      supported_architectures = ["x86_64"]
+      hypervisor              = "nitro"
+      instance_disks          = [{ count = 1, size = 468, type = "ssd" }]
+    }
+  }
+
+  override_data {
+    target = data.aws_ami.keeper
+    values = { architecture = "x86_64" }
+  }
+
+  assert {
+    condition     = alltrue([for keeper in aws_instance.keeper : keeper.instance_type == "i4i.large"])
+    error_message = "A matching x86_64 instance type override must be used for all keepers."
+  }
+}
+
+run "mismatched_ami_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.aws_ami.keeper
+    values = { architecture = "x86_64" }
+  }
+
+  expect_failures = [aws_instance.keeper]
+}
+
+run "unsupported_architecture_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.keeper
+    values = {
+      supported_architectures = ["arm64_mac"]
+      hypervisor              = "nitro"
+      instance_disks          = [{ count = 1, size = 468, type = "ssd" }]
+    }
+  }
+
+  override_data {
+    target = data.aws_ami.keeper
+    values = { architecture = "arm64_mac" }
+  }
+
+  expect_failures = [aws_instance.keeper]
+}
+
 run "duplicate_az_is_refused" {
   command = plan
 
@@ -223,9 +289,54 @@ run "ebs_only_is_refused" {
   override_data {
     target = data.aws_ec2_instance_type.keeper
     values = {
-      supported_architectures = ["x86_64"]
+      supported_architectures = ["arm64"]
       hypervisor              = "nitro"
       instance_disks          = []
+    }
+  }
+
+  expect_failures = [aws_instance.keeper]
+}
+
+run "multiple_disks_are_refused" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.keeper
+    values = {
+      supported_architectures = ["arm64"]
+      hypervisor              = "nitro"
+      instance_disks          = [{ count = 2, size = 3750, type = "ssd" }]
+    }
+  }
+
+  expect_failures = [aws_instance.keeper]
+}
+
+run "hard_disk_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.keeper
+    values = {
+      supported_architectures = ["arm64"]
+      hypervisor              = "nitro"
+      instance_disks          = [{ count = 1, size = 468, type = "hdd" }]
+    }
+  }
+
+  expect_failures = [aws_instance.keeper]
+}
+
+run "non_nitro_is_refused" {
+  command = plan
+
+  override_data {
+    target = data.aws_ec2_instance_type.keeper
+    values = {
+      supported_architectures = ["arm64"]
+      hypervisor              = "xen"
+      instance_disks          = [{ count = 1, size = 468, type = "ssd" }]
     }
   }
 

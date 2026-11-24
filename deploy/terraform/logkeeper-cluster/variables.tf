@@ -34,13 +34,13 @@ variable "client_security_group_ids" {
 }
 
 variable "instance_type" {
-  description = "Qualified x86_64 Nitro EC2 type with exactly one local NVMe SSD."
+  description = "Qualified arm64 or x86_64 Nitro EC2 type with exactly one local NVMe SSD."
   type        = string
-  default     = "i4i.large"
+  default     = "i8g.large"
 }
 
 variable "ami_id" {
-  description = "Qualified x86_64 Amazon Linux 2023 AMI with cloud-init."
+  description = "Qualified Amazon Linux 2023 AMI with cloud-init, matching the instance type architecture."
   type        = string
 }
 
@@ -63,7 +63,7 @@ variable "image_repository_name" {
 }
 
 variable "image_digests" {
-  description = "Logkeeper image digests for endpoints 1, 2 and 3. Change one entry at a time."
+  description = "Logkeeper multi-platform image index digests for endpoints 1, 2 and 3. Change one entry at a time."
   type        = tuple([string, string, string])
 
   validation {
