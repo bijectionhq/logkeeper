@@ -50,7 +50,9 @@ The first 100,000-stream replacement attempt reached the sweeper, which stopped 
 | 1 ms | 1.61 ms | 4.23 ms | 31.32 ms |
 | 2 ms | 3.04 ms | 3.26 ms | 8.82 ms |
 
-The 1 ms profile covers all six workload families. The 2 ms profile repeats head and the commit matrix through 1,000 streams, plus batch size 1 at 10,000 streams.## Commit
+The 1 ms profile covers all six workload families. The 2 ms profile repeats head and the commit matrix through 1,000 streams, plus batch size 1 at 10,000 streams.
+
+## Commit
 
 Latencies are `p50 / p99 / p99.9` in ms. Queue is the producer queue p99, also in ms. Throughput includes the queue and all acknowledgements.
 
