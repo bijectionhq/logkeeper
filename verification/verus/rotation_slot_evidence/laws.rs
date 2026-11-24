@@ -89,6 +89,7 @@ fn recording_a_rotation_vote_preserves_exact_configured_rows(
         && 2 * evidence.voters@.len() > roster@.len()
         && exact_rows(evidence.voters@, roster@, evidence.ballot, evidence.prefix@, replies@)
         && (receipt.outcome matches Ok(Outcome::Granted { grant, recovery })
+            && recovery.id == receipt.request && recovery.owner == grant.enrollment
             && evidence.checkpoint == recovery.checkpoint
             && recovery.start == evidence.checkpoint.cut && recovery.through == evidence.checkpoint.cut
             && evidence.key_generation == grant.key_generation && evidence.position >= receipt.position),

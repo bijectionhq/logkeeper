@@ -21,6 +21,7 @@ path certifies the prefix re-accepted at the new ballot. That prefix can
 cover a later position, while keeping the exact checkpoint and successor
 generation of the rotation receipt. The receipt guard checks the invocation,
 exact held recovery cut and successor generation.
+The recovery hold must carry the original rotation request ID and the successor grant’s enrollment, even when the cut and generation match.
 
 The checked encoder preserves the fields of `RotationSlots` and writes
 every row in order. Each row consists of the UUID, selected index, A's

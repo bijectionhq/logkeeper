@@ -57,7 +57,7 @@ pub struct Vote {
 }
 
 #[cfg_attr(not(verus_keep_ghost), derive(Debug, PartialEq, Eq))]
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct VoterSlots {
     pub voter: Uuid,
     pub slots: SlotPair,
@@ -199,6 +199,8 @@ impl RotationSlots {
             && !matches_fingerprint(&self.prefix, &zero)
             && receipt.position != 0
             && self.position >= receipt.position
+            && recovery.id == receipt.request
+            && recovery.owner == grant.enrollment
             && self.checkpoint == recovery.checkpoint
             && recovery.admitted_at == receipt.position
             && recovery.start == self.checkpoint.cut
