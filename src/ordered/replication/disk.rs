@@ -8,12 +8,12 @@ use super::slot_header::{
     DESCRIPTOR_BYTES, HEADER, decode_header, encode_descriptor, encode_header, matches_slot,
 };
 use crate::server::durability::sync_directory;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use fs2::FileExt;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -29,6 +29,7 @@ const SLOTS: [&str; 2] = ["ordered.slot-a", "ordered.slot-b"];
 const LOCK: &str = "ordered.lock";
 const RESERVATION: &str = "ordered.reserve";
 const MAX_HEADER_BYTES: usize = 256;
+const BALLOT_BYTES: usize = 25;
 
 #[derive(Clone)]
 pub struct DurableVoter {
@@ -545,28 +546,32 @@ fn persist(
     previous: usize,
     size: usize,
 ) -> Result<(usize, Fingerprint), Error> {
-    let mut body = BytesMut::new();
-    put_ballot(&mut body, selected.state.promised);
-    match &selected.state.accepted {
-        Some(accepted) => {
-            put_ballot(&mut body, Some(accepted.ballot));
-            accepted.prefix.encode_into(&mut body);
-        }
-        None => put_ballot(&mut body, None),
-    }
-    if body.len() > size - HEADER {
-        return Err(Error::Capacity);
+    let accepted = selected.state.accepted.as_ref();
+    let prefix = accepted.map(|accepted| &accepted.prefix);
+    let mut framing = [0; 2 * BALLOT_BYTES + 1];
+    let mut framing_len = put_ballot(&mut framing, selected.state.promised);
+    framing_len += put_ballot(&mut framing[framing_len..], accepted.map(|vote| vote.ballot));
+    // The stored prefix length already includes the base tag and length words.
+    let length = framing_len
+        .checked_add(prefix.map_or(0, |prefix| prefix.bytes))
+        .filter(|&length| length <= size - HEADER)
+        .ok_or(Error::Capacity)?;
+    if let Some(prefix) = prefix {
+        framing[framing_len] = prefix.base_tag();
+        framing_len += 1;
     }
     let descriptor =
-        encode_descriptor(&group, voter.as_bytes(), selected.generation, body.len() as u64);
-    let digest = slot_digest(&descriptor, &body);
-    let header = encode_header(&descriptor, &digest);
+        encode_descriptor(&group, voter.as_bytes(), selected.generation, length as u64);
+    let mut hash = Sha256::new();
+    hash.update(descriptor);
 
     // The header digest covers the whole body, so a crash between these
     // writes can only expose a complete image or leave the prior slot in use.
     file.seek(SeekFrom::Start(HEADER as u64))?;
-    file.write_all(&body)?;
-    let mut old = previous.saturating_sub(body.len());
+    write_slot_body(file, &mut hash, &framing[..framing_len], prefix)?;
+    let digest = hash.finalize().into();
+    let header = encode_header(&descriptor, &digest);
+    let mut old = previous.saturating_sub(length);
     let zeros = [0; 8192];
     while old > 0 {
         let count = old.min(zeros.len());
@@ -576,7 +581,50 @@ fn persist(
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&header)?;
     file.sync_all()?;
-    Ok((body.len(), digest))
+    Ok((length, digest))
+}
+
+fn write_slot_body(
+    file: &mut File,
+    hash: &mut Sha256,
+    mut framing: &[u8],
+    prefix: Option<&Prefix>,
+) -> io::Result<()> {
+    // Keep scatter/gather scratch bounded independently of the prefix size.
+    const PAYLOADS_PER_WRITE: usize = 32;
+    let mut payloads = prefix
+        .into_iter()
+        .flat_map(Prefix::framed_payloads)
+        .peekable();
+    while !framing.is_empty() || payloads.peek().is_some() {
+        let batch: [_; PAYLOADS_PER_WRITE] = std::array::from_fn(|_| payloads.next());
+        let mut spans: [IoSlice<'_>; 1 + 2 * PAYLOADS_PER_WRITE] =
+            std::array::from_fn(|_| IoSlice::new(&[]));
+        let mut count = 0;
+        if !framing.is_empty() {
+            spans[count] = IoSlice::new(framing);
+            count += 1;
+            framing = &[];
+        }
+        for (length, payload) in batch.iter().map_while(Option::as_ref) {
+            spans[count] = IoSlice::new(length);
+            spans[count + 1] = IoSlice::new(payload);
+            count += 2;
+        }
+        let mut remaining = &mut spans[..count];
+        for span in remaining.iter() {
+            hash.update(&**span);
+        }
+        while !remaining.is_empty() {
+            match file.write_vectored(remaining) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => IoSlice::advance_slices(&mut remaining, written),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_slot_header(file: &mut File) -> Result<[u8; HEADER], Error> {
@@ -622,11 +670,14 @@ fn load_state(group: &Group, body: Vec<u8>) -> Result<VoterState, Error> {
     Ok(VoterState { promised, accepted })
 }
 
-fn put_ballot(output: &mut BytesMut, ballot: Option<Ballot>) {
-    output.put_u8(u8::from(ballot.is_some()));
+fn put_ballot(output: &mut [u8], ballot: Option<Ballot>) -> usize {
+    output[0] = u8::from(ballot.is_some());
     if let Some(ballot) = ballot {
-        output.put_u64(ballot.round);
-        output.put_slice(ballot.nonce.as_bytes());
+        output[1..9].copy_from_slice(&ballot.round.to_be_bytes());
+        output[9..BALLOT_BYTES].copy_from_slice(ballot.nonce.as_bytes());
+        BALLOT_BYTES
+    } else {
+        1
     }
 }
 
@@ -655,6 +706,62 @@ mod tests {
         Checkpoint, Command, Custody, Cut, Limits, Outcome, Placement, Principal, Request,
         RequestId, Window,
     };
+
+    #[test]
+    fn vectored_slot_preserves_prefix_bytes_and_old_tail_clearing() {
+        let group = [7; 32];
+        let voter = Uuid::from_u128(11);
+        let ballot = Ballot {
+            round: 17,
+            nonce: Uuid::from_u128(13),
+        };
+        let mut prefix = Prefix::from_base(Bytes::from_static(b"base"), 4096).unwrap();
+        let mut expected_prefix = [vec![1], 4u64.to_be_bytes().to_vec(), b"base".to_vec()].concat();
+        for frame in 0..70u8 {
+            let payload = vec![frame; usize::from(frame % 6)];
+            expected_prefix.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            expected_prefix.extend_from_slice(&payload);
+            prefix.append(Bytes::from(payload), 4096).unwrap();
+        }
+        let ballot_image = [
+            [1u8].as_slice(),
+            &ballot.round.to_be_bytes(),
+            ballot.nonce.as_bytes(),
+        ]
+        .concat();
+        let cases = [
+            (VoterState::default(), vec![0, 0]),
+            (
+                VoterState { promised: Some(ballot), accepted: None },
+                [ballot_image.as_slice(), &[0]].concat(),
+            ),
+            (
+                VoterState {
+                    promised: Some(ballot),
+                    accepted: Some(Accepted { ballot, prefix }),
+                },
+                [ballot_image.as_slice(), &ballot_image, &expected_prefix].concat(),
+            ),
+        ];
+        for (state, expected) in cases {
+            let selected = Selected { index: 0, generation: 19, state };
+            let previous = 4096;
+            let size = HEADER + previous;
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&vec![0xaa; size]).unwrap();
+            let (size_written, digest) =
+                persist(&mut file, group, voter, &selected, previous, size).unwrap();
+            assert_eq!(size_written, expected.len());
+            let descriptor = encode_descriptor(&group, voter.as_bytes(), 19, expected.len() as u64);
+            assert_eq!(digest, slot_digest(&descriptor, &expected));
+            file.rewind().unwrap();
+            assert_eq!(read_slot_header(&mut file).unwrap(), encode_header(&descriptor, &digest));
+            let mut body = vec![0; previous];
+            file.read_exact(&mut body).unwrap();
+            assert_eq!(&body[..size_written], expected.as_slice());
+            assert!(body[size_written..].iter().all(|byte| *byte == 0));
+        }
+    }
 
     #[tokio::test]
     async fn surviving_voters_recover_the_exact_receipt_after_slot_tears() {
