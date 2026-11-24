@@ -1,7 +1,8 @@
 //! Packets use virtual time. A crash discards the engine and reopens the shipped WAL.
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs, io,
+    fs,
+    io::{self, Write},
     sync::Arc,
     time::Duration,
 };
@@ -63,6 +64,7 @@ struct State {
     sent: u64,
     newest: u64,
     coverage: Coverage,
+    trace: Option<Vec<String>>,
 }
 
 struct Client {
@@ -84,6 +86,7 @@ impl Network {
                 sent: 0,
                 newest: 0,
                 coverage: Coverage::new(),
+                trace: None,
             }),
         };
         let [first, second, third] = ENSEMBLE.map(|keeper| Some(network.open(keeper)));
@@ -152,6 +155,18 @@ impl Network {
         self.state.lock().coverage.clone()
     }
 
+    pub(super) fn record_trace(&self) {
+        self.state.lock().trace = Some(Vec::new());
+    }
+
+    pub(super) fn write_trace(&self, seed: u64, out: &mut impl Write) -> io::Result<()> {
+        writeln!(out, "seed {seed}")?;
+        for row in self.state.lock().trace.take().unwrap() {
+            writeln!(out, "{row}")?;
+        }
+        Ok(())
+    }
+
     /// Read the payload from the actual keeper state or extent, even before its
     /// commit watermark has been published. Never send these probes to a writer.
     pub(super) fn copies(
@@ -205,6 +220,7 @@ impl Network {
         if state.isolated == Some(*keeper) || state.lost == Some(*keeper) {
             return Err(TransportError::Unreachable);
         }
+        let tracing = state.trace.is_some() && traceable(request);
         let node = &mut state.nodes[slot(*keeper)];
         if matches!(fault, Some(Fault::CrashBefore)) {
             *node = None;
@@ -214,6 +230,10 @@ impl Network {
         let Some(engine) = node else {
             return Err(TransportError::Unreachable);
         };
+        let stream = crate::stream::codec::stream(request);
+        let before = tracing
+            .then(|| engine.streams.get(&stream).map(|stream| stream.view.clone()))
+            .flatten();
         engine.wal.retain_unsynced = match fault {
             Some(Fault::LoseUnsynced) => Some(0),
             Some(Fault::Tear) => Some(packet.cut),
@@ -236,6 +256,12 @@ impl Network {
             }
             Ok(()) => {
                 let reply = result.try_recv().expect("keeper must finish work").0;
+                if let Some(before) = before {
+                    let after = &engine.streams[&stream].view;
+                    if let Some(row) = trace_effect(packet, &reply, &before, after) {
+                        state.trace.as_mut().unwrap().push(row);
+                    }
+                }
                 if matches!(request, Request::Append { head, .. } if head.0 != 0)
                     && matches!(reply, Ok(Reply::Appended { .. }))
                 {
@@ -274,6 +300,58 @@ struct Packet {
     identity: Identity,
     fault: Option<Fault>,
     cut: usize,
+}
+
+fn traceable(request: &Request) -> bool {
+    matches!(request, Request::Append { records, .. } if records.is_empty())
+        || matches!(request, Request::Sync { complete: false, .. })
+}
+
+fn trace_effect(
+    packet: &Packet,
+    reply: &CallResult,
+    before: &StreamView,
+    after: &StreamView,
+) -> Option<String> {
+    use std::fmt::Write;
+
+    let (verb, epoch) = match (&packet.request, reply) {
+        (Request::Append { epoch, .. }, Ok(Reply::Appended { .. })) => ("publish", epoch),
+        (Request::Sync { epoch, .. }, Ok(Reply::Synced { .. })) => ("sync-part", epoch),
+        _ => return None,
+    };
+    let (promised, owner) = before.promised.as_ref().unwrap();
+    let synced = |view: &StreamView| view.synced.map_or(0, |epoch| u128::from(epoch.0) + 1);
+    let mut row = format!(
+        "{verb} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        packet.serial,
+        packet.keeper.0,
+        epoch.0,
+        promised.0,
+        u8::from(owner == &packet.identity),
+        u8::from(before.learner),
+        synced(before),
+        before.floor.0,
+        before.tail.0,
+        before.head.0,
+        synced(after),
+        after.floor.0,
+        after.tail.0,
+        after.head.0,
+    );
+    match &packet.request {
+        Request::Append { at, head, .. } => {
+            write!(row, " {} {}", at.0, head.0).unwrap();
+            for run in &before.runs {
+                write!(row, " {} {} {}", run.epoch.0, run.first.0, run.last.0).unwrap();
+            }
+        }
+        Request::Sync { from, floor, head, records, .. } => {
+            write!(row, " {} {} {} {}", from.0, floor.0, head.0, records.len()).unwrap();
+        }
+        _ => unreachable!(),
+    }
+    Some(row)
 }
 
 impl Transport for Client {

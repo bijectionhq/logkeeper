@@ -1,7 +1,13 @@
 mod guards;
 mod network;
 
-use std::{env, sync::Arc, time::Duration};
+use std::{
+    env,
+    fs::File,
+    io::{BufWriter, Write},
+    sync::Arc,
+    time::Duration,
+};
 
 use bytes::Bytes;
 use journal_contract::{
@@ -129,7 +135,7 @@ fn payload(seed: u64, tag: u8) -> Bytes {
     Bytes::from(bytes)
 }
 
-async fn seed_run(seed: u64) -> Coverage {
+async fn seed_run(seed: u64, trace: Option<&mut BufWriter<File>>) -> Coverage {
     let mut rng = seed;
     let target = ENSEMBLE[(random(&mut rng) % 3) as usize];
     let profile = seed % (FAULTS.len() as u64 + 2);
@@ -144,6 +150,9 @@ async fn seed_run(seed: u64) -> Coverage {
             ..Limits::default()
         },
     );
+    if trace.is_some() {
+        network.record_trace();
+    }
     let history = History::new(&network);
     let old = writer(&network, &OLD, ENSEMBLE);
     let mut ensemble = ENSEMBLE;
@@ -340,6 +349,9 @@ async fn seed_run(seed: u64) -> Coverage {
     history.check(seed);
     // Let detached copies of a final quorum request finish before the next seed.
     sleep(20).await;
+    if let Some(trace) = trace {
+        network.write_trace(seed, trace).unwrap();
+    }
     network.coverage()
 }
 
@@ -350,13 +362,19 @@ async fn seeded_stream_journal() {
     let count = env::var("LOGKEEPER_SIM_SEEDS").map_or(44, |value| value.parse::<u64>().unwrap());
     assert!(count > 0);
     let mut coverage = Coverage::new();
+    let mut trace = env::var_os("LOGKEEPER_SIM_PUBLICATION_TRACE")
+        .map(|path| BufWriter::new(File::create(path).unwrap()));
     for seed in first..first + count {
-        let observed = tokio::time::timeout(Duration::from_secs(90), seed_run(seed))
-            .await
-            .unwrap_or_else(|_| panic!("executor did not quiesce in seed {seed}"));
+        let observed =
+            tokio::time::timeout(Duration::from_secs(90), seed_run(seed, trace.as_mut()))
+                .await
+                .unwrap_or_else(|_| panic!("executor did not quiesce in seed {seed}"));
         for (event, count) in observed {
             *coverage.entry(event).or_default() += count;
         }
+    }
+    if let Some(mut trace) = trace {
+        trace.flush().unwrap();
     }
     if first == 0 && count >= 11 {
         for event in FAULTS.map(Fault::name).into_iter().chain([
