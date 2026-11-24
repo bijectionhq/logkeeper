@@ -42,6 +42,7 @@ In a paired 1,000-stream, batch-1 probe with all producers admitted, the pre-fix
 A fully simultaneous 10,000-stream, batch-1 burst still ran at 824 records/s and 23.26 s p99 with 145,363 transport errors. A separate batch-32 run with 256 producers stopped writing WAL records and still had pending calls when it was stopped. The blocked-publication regression isolates a case where a later append failure stopped a lane before it published an earlier chosen head. The original benchmark did not record enough state to attribute all of its stalls to that condition. The host also exhausted ephemeral loopback ports under concurrent test and benchmark load.
 
 The first 100,000-stream replacement attempt reached the sweeper, which stopped on `NotFound` from one survivor. A create quorum can include the lost keeper. Replacement now rebuilds a missing survivor when the other survivor confirms the stream. A second run exposed a retry gap. When one keeper reports absence and the other is unreachable, the latter error now reaches the sweeper caller so it can retry. The final run deliberately gives each parked stream a single surviving copy.
+
 ## Delay calibration
 
 | RTT target | One-byte echo p50 | p99 | p99.9 |
