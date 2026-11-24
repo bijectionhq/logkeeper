@@ -488,8 +488,7 @@ impl Stream {
                 Ok(Reply::Deleted)
             }
             Request::Replace { to, .. } => {
-                self.view.ensemble = to;
-                self.view.learner = false;
+                (self.view.ensemble, self.view.learner) = rules::install_ensemble(to);
                 Ok(Reply::Replaced)
             }
             _ => Err(invalid("nonmutation in stream WAL")),

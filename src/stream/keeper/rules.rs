@@ -66,6 +66,60 @@ pub(crate) fn may_replace(current: bool, synced: bool, member: bool, changed: us
     current && synced && member && changed == 1
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (first != 0 && second != 0 && third != 0
+        && first != second && first != third && second != third)
+))]
+pub(crate) fn valid_ensemble_ids(first: u128, second: u128, third: u128) -> bool {
+    first != 0 && second != 0 && third != 0 && first != second && first != third && second != third
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out == (to, false)))]
+pub(crate) fn install_ensemble<T>(to: T) -> (T, bool) {
+    (to, false)
+}
+
+pub(crate) enum ReplaceDecision {
+    Fenced,
+    NotSynced,
+    Replaced,
+    WrongEnsemble,
+    Unauthorized,
+    Persist,
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures out ==
+    if !promised { ReplaceDecision::Fenced }
+    else if !synced { ReplaceDecision::NotSynced }
+    else if installed { ReplaceDecision::Replaced }
+    else if !current { ReplaceDecision::WrongEnsemble }
+    else if valid && member && changed == 1 { ReplaceDecision::Persist }
+    else { ReplaceDecision::Unauthorized }
+))]
+pub(crate) fn decide_replace(
+    promised: bool,
+    synced: bool,
+    installed: bool,
+    current: bool,
+    valid: bool,
+    member: bool,
+    changed: usize,
+) -> ReplaceDecision {
+    if !promised {
+        ReplaceDecision::Fenced
+    } else if !synced {
+        ReplaceDecision::NotSynced
+    } else if installed {
+        ReplaceDecision::Replaced
+    } else if !current {
+        ReplaceDecision::WrongEnsemble
+    } else if valid && may_replace(current, synced, member, changed) {
+        ReplaceDecision::Persist
+    } else {
+        ReplaceDecision::Unauthorized
+    }
+}
+
 #[cfg(not(verus_keep_ghost))]
 pub use implementation::Limits;
 #[cfg(not(verus_keep_ghost))]
@@ -152,10 +206,8 @@ mod implementation {
     }
 
     fn valid_ensemble(ensemble: &[KeeperId; 3]) -> bool {
-        !ensemble.contains(&KeeperId(0))
-            && ensemble[0] != ensemble[1]
-            && ensemble[0] != ensemble[2]
-            && ensemble[1] != ensemble[2]
+        let [KeeperId(first), KeeperId(second), KeeperId(third)] = *ensemble;
+        valid_ensemble_ids(first, second, third)
     }
 
     // Reserve one LSN to represent the floor of a fully trimmed stream.
@@ -424,30 +476,23 @@ mod implementation {
             Request::Replace {
                 epoch, from, to, ..
             } => {
-                if !promised(*epoch) {
-                    return fenced(state);
-                }
-                if state.synced != Some(*epoch) {
-                    return refuse(Refusal::NotSynced);
-                }
-                if state.ensemble == *to {
-                    return Decision::Reply(Reply::Replaced);
-                }
-                if state.ensemble != *from {
-                    return wrong_ensemble(state);
-                }
                 let changed = from.iter().zip(to).filter(|(a, b)| a != b).count();
-                if !valid_ensemble(to)
-                    || !may_replace(
-                        state.ensemble == *from,
-                        state.synced == Some(*epoch),
-                        to.contains(&view.keeper),
-                        changed,
-                    )
-                {
-                    return refuse(Refusal::Unauthorized);
+                match decide_replace(
+                    promised(*epoch),
+                    state.synced == Some(*epoch),
+                    state.ensemble == *to,
+                    state.ensemble == *from,
+                    valid_ensemble(to),
+                    to.contains(&view.keeper),
+                    changed,
+                ) {
+                    ReplaceDecision::Fenced => fenced(state),
+                    ReplaceDecision::NotSynced => refuse(Refusal::NotSynced),
+                    ReplaceDecision::Replaced => Decision::Reply(Reply::Replaced),
+                    ReplaceDecision::WrongEnsemble => wrong_ensemble(state),
+                    ReplaceDecision::Unauthorized => refuse(Refusal::Unauthorized),
+                    ReplaceDecision::Persist => Decision::Persist,
                 }
-                Decision::Persist
             }
             // `Keeper::call` splits envelopes before any per-stream decision.
             Request::Batch(_) => refuse(Refusal::Unauthorized),

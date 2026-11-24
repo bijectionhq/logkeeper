@@ -19,8 +19,10 @@ write, a torn write, crash after sync, disk loss and replacement, and normal
 delivery. Packet delivery and response delays are independently jittered
 in every profile. The loss profiles discard packets and the duplication
 profile delivers a second copy after the original response. A replacement
-run starts with exactly two copies, destroys one of those disks and checks
-that repair restores the records to both survivors before use of the new
+run starts with exactly two copies and destroys one of those disks. It
+interrupts the sweep after the first survivor installs, checks that this
+survivor refuses a stale route, reopens both survivors, and resumes the same
+sweep. It checks both repaired copies and the learner before using the new
 ensemble. A competing seal runs in a subset of the other schedules.
 
 The writer runs on a current-thread Tokio executor with paused time. The

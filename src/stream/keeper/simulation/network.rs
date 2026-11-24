@@ -138,10 +138,15 @@ impl Network {
             state.lost.replace(keeper).is_none(),
             "one disk loss per run"
         );
-        state.nodes[slot(keeper)] = None;
+        let lost = state.nodes[slot(keeper)].take().expect("lost keeper was running");
         if let Some(trace) = &mut state.trace {
+            let absent = trace_image(None, &mut Vec::new());
+            for before in trace.images(&lost).values() {
+                trace.rows.push(format!("lose 0 {} 0 {before} {absent}", keeper.0));
+            }
             trace.durable[slot(keeper)] = None;
         }
+        drop(lost);
         fs::remove_dir_all(self.root.path().join(keeper.0.to_string())).unwrap();
         state.nodes[slot(LEARNER)] = Some(self.open(LEARNER));
         state.hit("disk loss");
@@ -486,6 +491,9 @@ fn trace_row(
         None => row.push_str(" 10"),
         Some(Err(_)) => row.push_str(" 11"),
         Some(Ok(reply)) => match reply {
+            Reply::Refused(Refusal::WrongEnsemble { ensemble: current }) => {
+                write!(row, " 12 {}", ensemble(current)).unwrap();
+            }
             Reply::Refused(_) => row.push_str(" 0"),
             Reply::Created => row.push_str(" 1"),
             Reply::Sealed(view) => {

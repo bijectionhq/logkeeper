@@ -88,6 +88,11 @@ SHAPES["ReducerImage"] = ("Logkeeper.CompactImage.ReducerImage", (), {
 
 
 ENUMS = {
+    "ReplaceDecision": ("Logkeeper.StreamReplacement.ReplaceDecision", (), {
+        "Fenced": (".fenced", ()), "NotSynced": (".notSynced", ()),
+        "Replaced": (".replaced", ()), "WrongEnsemble": (".wrongEnsemble", ()),
+        "Unauthorized": (".unauthorized", ()), "Persist": (".persist", ()),
+    }),
     "ResponseKind": ("Logkeeper.VoterTransport.ResponseKind", (), {
         "Expected": (".expected", ()), "Deposed": (".deposed", ()),
         "Rejected": (".rejected", ()), "Invalid": (".invalid", ()),

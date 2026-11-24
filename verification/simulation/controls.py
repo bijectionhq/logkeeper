@@ -111,8 +111,8 @@ def controls():
         ("sync-promise", RULES, "if !promised(*epoch) {\n                    return fenced(state);\n                }\n                // A synced",
          "if !promised(*epoch) && false {\n                    return fenced(state);\n                }\n                // A synced",
          "sync ignored the promised identity"),
-        ("sync-incomplete", STATE, "if complete {\n                    self.view.synced",
-         "if complete || !complete {\n                    self.view.synced",
+        ("sync-incomplete", STATE, "if complete {\n                    self.install(staging, head);",
+         "if complete || !complete {\n                    self.install(staging, head);",
          "incomplete sync enabled an append"),
         ("append-promise", RULES, "    promised && synced\n", "    let _ = promised;\n    synced\n",
          "stale epoch admitted an append"),
@@ -133,8 +133,8 @@ def controls():
         ("learner-votes", RULES, "state.synced == Some(*epoch) && !state.learner,",
          "state.synced == Some(*epoch),", "synced learner voted before replacement"),
         ("replace-without-sync", RULES,
-         "if state.synced != Some(*epoch) {\n                    return refuse(Refusal::NotSynced);\n                }\n                if state.ensemble == *to",
-         "if false {\n                    return refuse(Refusal::NotSynced);\n                }\n                if state.ensemble == *to",
+         "    } else if !synced {\n        ReplaceDecision::NotSynced",
+         "    } else if false {\n        ReplaceDecision::NotSynced",
          "unsynced keeper installed a replacement"),
         ("replace-multiple-slots", RULES, "current && synced && member && changed == 1\n",
          "current && synced && member && changed > 0\n",
@@ -189,7 +189,7 @@ def controls():
         "replacement-stale-route",
         [edit(RULES, "if *ensemble != state.ensemble {\n                    return wrong_ensemble(state);\n                }\n                let current",
               "if *ensemble != state.ensemble && false {\n                    return wrong_ensemble(state);\n                }\n                let current")],
-        SEEDED, "replacement: a keeper promised an epoch on the stale ensemble", 9,
+        SEEDED, "replacement: split install admitted a stale seal", 9,
     )
     sweep = ROOT / "src/stream/keeper/sweep.rs"
     line = sweep.read_text()

@@ -68,9 +68,21 @@ reply-survival theorem to stream keeper images. A covered frame survives
 in the correct stream's recovered projection. The runner compiles Study
 117's source into Study 119's results directory.
 
+[StreamReplacement.lean](../lean/Logkeeper/StreamReplacement.lean) models one
+lost identity, two surviving identities, and one fresh learner. It proves fresh
+Seal quorum exclusion across both split orders, and preservation of an arbitrary
+acknowledged history when both survivors and the learner acquire the recovery
+seed. Composing the old and new fixed-ensemble executions requires a quorum
+certificate for that seed in the new execution.
+
+[StreamWAL.lean](../lean/Logkeeper/StreamWAL.lean) models arbitrary streams and
+decoded image entries within one checkpoint boundary. It verifies per-stream
+fragment completion, torn-tail replay, and per-stream checkpoints while newer
+entries keep arriving. Stream images can contain any retained and staged state.
+
 ## TLC model and bounds
 
-[StreamJournal.tla](StreamJournal.tla) uses a shared keeper reducer in six
+[StreamJournal.tla](StreamJournal.tla) uses a shared keeper reducer in seven
 scenarios. TLC explores each bounded program and its permitted interleavings.
 
 | Scenario | Bounds |
@@ -81,6 +93,7 @@ scenarios. TLC explores each bounded program and its permitted interleavings.
 | `wal` | One keeper, two streams, at most four abstract frames and at most one pending frame per stream. A shared covering sync, replies and tears can interleave. |
 | `handoff` | One stream, two epochs, three keepers and one record. The newer writer syncs the inherited suffix to two keepers before the older writer's delayed accept reaches the third. |
 | `retention` | One stream, one epoch and three keepers. Two keepers trim the committed record. The third retains it and has one further accepted record. A read chooses one keeper and one of the two LSNs. |
+| `replacement` | One stream, three original identities, one learner, a permanent disk loss and three epochs. Two survivor installs can finish in either order. The model exercises stale Seal, a same-epoch retry on the installed route, delayed old Append, learner promotion, a second disk loss probe, and a new write and read. |
 
 The protocol tear occurs at the keeper that later holds the only live copy
 of the first choice after AZ loss. The later tail has a frame for each

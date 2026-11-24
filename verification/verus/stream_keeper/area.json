@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 24,
+  "min_verified_functions": 27,
   "controls": {
     "reuse-deleted-stream": {
       "defect": "Create passes a tombstone.",
@@ -30,7 +30,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "seal-equal-other-identity": {
       "defect": "An equal epoch may switch identities.",
@@ -53,7 +53,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "sync-overwrite-head": {
       "defect": "Sync can replace an unequal committed record.",
@@ -76,7 +76,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "sync-regress-head": {
       "defect": "Sync can move the local head backwards.",
@@ -99,7 +99,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "append-before-sync": {
       "defect": "A promise alone can authorize an append.",
@@ -122,7 +122,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "append-conflicting-retry": {
       "defect": "A different payload can count as a retry.",
@@ -145,7 +145,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "trim-uncommitted": {
       "defect": "Trim can discard uncommitted records.",
@@ -168,7 +168,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "check-invent-tail": {
       "defect": "Check returns a request field as the durable tail.",
@@ -191,7 +191,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "read-accepted-tail": {
       "defect": "Read exposes the accepted tail.",
@@ -214,7 +214,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "read-below-floor": {
       "defect": "Read accepts a position below the retained floor.",
@@ -237,7 +237,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "delete-clears-tombstone": {
       "defect": "A later operation can clear the tombstone.",
@@ -260,7 +260,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
     },
     "replace-without-sync": {
       "defect": "A keeper can enter a new ensemble before completing the chosen history.",
@@ -283,7 +283,187 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 23
+      "min_verified_functions": 26
+    },
+    "replace-without-promise": {
+      "defect": "Replace accepts a different epoch or caller.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    if !promised {\n        ReplaceDecision::Fenced",
+          "replace": "    if false {\n        ReplaceDecision::Fenced"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "decide_replace",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "replace-unsynced-retry": {
+      "defect": "An installed route bypasses the sync check.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    } else if !synced {\n        ReplaceDecision::NotSynced",
+          "replace": "    } else if !synced && !installed {\n        ReplaceDecision::NotSynced"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "decide_replace",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "replace-misroutes-retry": {
+      "defect": "An idempotent install requires the old ensemble.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    } else if installed {\n        ReplaceDecision::Replaced",
+          "replace": "    } else if installed && current {\n        ReplaceDecision::Replaced"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "decide_replace",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "replace-from-stale-route": {
+      "defect": "Replace on a stale route does not return WrongEnsemble.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    } else if !current {\n        ReplaceDecision::WrongEnsemble",
+          "replace": "    } else if false {\n        ReplaceDecision::WrongEnsemble"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "decide_replace",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "replace-invalid-ensemble": {
+      "defect": "Replace accepts an invalid destination ensemble.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    } else if valid && may_replace(current, synced, member, changed) {",
+          "replace": "    } else if may_replace(current, synced, member, changed) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "decide_replace",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "replace-excludes-keeper": {
+      "defect": "Replace installs a destination that excludes the keeper.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    } else if valid && may_replace(current, synced, member, changed) {",
+          "replace": "    } else if valid && may_replace(current, synced, true, changed) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "decide_replace",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "replace-changes-multiple-slots": {
+      "defect": "Replace admits a destination differing by more than one keeper.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    } else if valid && may_replace(current, synced, member, changed) {",
+          "replace": "    } else if valid && may_replace(current, synced, member, 1) {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "decide_replace",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "ensemble-with-zero-id": {
+      "defect": "An ensemble can include a zero keeper identity.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    first != 0 && second != 0 && third != 0 && first != second && first != third && second != third\n",
+          "replace": "    first != 0 && second != 0 && first != second && first != third && second != third\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "valid_ensemble_ids",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "ensemble-with-duplicate-id": {
+      "defect": "An ensemble can repeat a keeper identity.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    first != 0 && second != 0 && third != 0 && first != second && first != third && second != third\n",
+          "replace": "    first != 0 && second != 0 && third != 0 && first != second && first != third\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "valid_ensemble_ids",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
+    },
+    "install-keeps-learner": {
+      "defect": "A completed install leaves the replacement as a learner.",
+      "mutate": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "find": "    (to, false)\n",
+          "replace": "    (to, true)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/keeper/rules.rs",
+          "function": "install_ensemble",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 26
     }
   }
 }

@@ -945,6 +945,25 @@ theorem link_may_read {P : Type} (k : Keeper P) (start max : Nat) :
   simp only [may_read, readPage]
   split <;> simp_all <;> omega
 
+theorem link_may_replace (current synced member : Bool) (changed : Nat) :
+    may_replace current synced member changed ↔
+      StreamReplacement.ReplaceAllowed current synced member changed := by
+  simp [may_replace, StreamReplacement.ReplaceAllowed, and_assoc]
+
+theorem link_decide_replace (promised synced installed current valid member : Bool) (changed : Nat) :
+    decide_replace promised synced installed current valid member changed =
+      StreamReplacement.replaceDecision promised synced installed current valid member changed := by
+  cases promised <;> cases synced <;> cases installed <;> cases current <;>
+    simp [decide_replace, StreamReplacement.replaceDecision, and_assoc]
+
+theorem link_valid_ensemble_ids (first second third : Nat) :
+    valid_ensemble_ids first second third ↔ StreamReplacement.ValidEnsemble first second third := by
+  simp [valid_ensemble_ids, StreamReplacement.ValidEnsemble, ne_comm, and_assoc]
+
+theorem link_install_ensemble {T : Type} [Nonempty T] (to : T) :
+    install_ensemble to = StreamReplacement.installEnsemble to := by
+  simp [install_ensemble, StreamReplacement.installEnsemble]
+
 end stream_keeper
 
 namespace stream_writer

@@ -1,9 +1,8 @@
 # Asynchronous stream journal refinement
 
-The shipped keeper is an exact refinement of Study 119's keeper step. Every keeper effect
-in the 10,000-seed simulator corpus replays as a reference step or a stutter. An I/O
-automaton of the shipped writer and keeper proves that every action is a step or stutter,
-and that Study 119's contract holds in every reachable state.
+Every keeper effect in the 10,000-seed simulator corpus replays against Study 119.
+For a fixed ensemble, an I/O automaton of the writer and keeper proves that every
+action is a step or stutter, and that Study 119's contract holds in every reachable state.
 [Study 119](Logkeeper/StreamJournal.lean) · [Automaton](Logkeeper/StreamIO.lean) ·
 [Replay](Logkeeper/StreamTrace.lean)
 
@@ -101,17 +100,20 @@ and refusals and observations must not change it.
 
 | Corpus | Effects |
 | --- | ---: |
-| 10,000 seeds | 981,233 |
-| Stutters (refusals, observations, retries, reopens, Replace) | 595,649 |
+| 10,000 seeds | 992,095 |
+| Stutters (observations, retries, reopens and other refusals) | 598,297 |
 | Create · Seal · Delete | 30,909 · 62,727 · 30,000 |
-| Staged Sync · complete Sync · floor installation | 4,358 · 62,727 · 55 |
-| Append · publication · Trim | 82,022 · 82,841 · 29,945 |
+| Staged Sync · complete Sync · floor installation | 4,359 · 62,727 · 47 |
+| Append · publication · Trim | 82,018 · 82,877 · 29,953 |
+| Disk loss · survivor installation · learner installation | 909 · 1,818 · 909 |
+| WrongEnsemble | 4,545 |
 
-The runner mutates real rows into 42 controls, one per admission or effect check. These
+The runner mutates real rows into 45 controls. These
 include the former visible incomplete Sync, a Seal that reports staged records, a Seal or
 complete Sync that keeps staging, a stale promise or another identity on each request, an
 unsynced or learner append or trim, gaps, wrong record epochs, uncertified publication, a
-read beyond the head and a reopen that loses state.
+read beyond the head, a reopen that loses state, and learner promotion before both
+survivors install the destination ensemble.
 
 ```sh
 python3 verification/lean/run_stream_traces.py
@@ -154,6 +156,23 @@ arbitrary payloads and natural-number event indices. Verus checks the numeric
 decisions over Rust's representable integers. [Head cuts](Logkeeper/StreamHead.lean) ·
 [Head rounds](../../src/stream/writer/head.rs) · [Verus links](../link/README.md#stream-journal)
 
+## Replacement and WAL
+
+The replacement projection follows one permanent disk loss, both survivor repairs, two
+independent installs, and learner promotion. Neither route can form a fresh Seal quorum
+during a split. Once promoted, any further single disk loss leaves two copies of the
+transferred history. The proof composes the ranked recovery and later-seal theorems through
+the transferred quorum certificate. Study 119 and the seeded simulation exercise that
+transfer in their bounded schedules.
+[Replacement projection](Logkeeper/StreamReplacement.lean) · [Study 119](../119-stream-journal/README.md)
+
+The WAL projection treats complete decoded entries as stream-local images. It proves
+that a torn newest frame leaves complete entries intact, fragment assembly is per stream,
+and each stream recovers its captured checkpoint plus later entries. Retirement requires
+durable checkpoints for every dirty stream. A reachable two-stream run publishes one
+checkpoint while the next segment takes entries and then reopens after retirement.
+[WAL projection](Logkeeper/StreamWAL.lean)
+
 ## Boundaries
 
 - **Writer send refinement.** The linked decisions prove when a verified predecessor
@@ -166,9 +185,11 @@ decisions over Rust's representable integers. [Head cuts](Logkeeper/StreamHead.l
   lane slots. The model's issued history grows monotonically. The Rust writer can
   clear a pending suffix after all three keepers reply `Full` or `TooLarge`,
   and the automaton has no transition for reassigning that definitively refused suffix.
-- **Keeper decisions.** `Admitted` and `effect` are checked against the shipped
-  `decide` and `apply` by the replay of the corpus and, for local laws, by Verus and the
-  link runner. No theorem covers every input. [Keeper decisions](../../src/stream/keeper/rules.rs)
+- **Keeper decisions.** Verus and the link runner cover the Replace decision over
+  projected inputs, the valid-ensemble predicate and installation's ensemble and
+  learner fields. Full refinement of `decide` and `apply`, including construction
+  of the payload and capacity facts and projection of native state, remains open.
+  [Keeper decisions](../../src/stream/keeper/rules.rs)
 - **Head round projection.** The cut proof consumes the queue-open event, per-keeper
   send and durable-sample events, and the exact keeper view at each sample. Verus and
   the link cover serial freshness, epoch eligibility, the maximum sample and the quorum
@@ -186,17 +207,17 @@ decisions over Rust's representable integers. [Head cuts](Logkeeper/StreamHead.l
   cut. For Delete the writer broadcasts to three distinct keepers and counts two
   durable tombstone replies. The async projection of the Trim publication wait and
   both operations' reply collection into quorum evidence remains open.
-- **Replacement and authority.** Study 119 has one fixed roster, so Replace is a stutter
-  and learners are outside the model. Recovery after one disk loss, by the sweeper copying
-  the chosen history to both survivors before promoting a learner, and authority across
-  split installs, retries and stale routes remain open.
+- **Replacement and authority.** The Lean authority projection assumes one move and
+  a permanently lost identity. The fixed-ensemble I/O automaton still needs a simulation
+  relation that constructs the later execution's imported certificate from actual sweep
+  RPCs. Arbitrary concurrent moves and the contract's full head-round proof across the
+  switch remain open.
   [Sweeper](../../src/stream/keeper/sweep.rs)
 - **WAL and transport.** Reopen rows show the reopened image equals the durable image for
-  every crash in the corpus, and Study 117's bridge covers reply survival. Torn frames,
-  shared-pack checkpoints of staged and retained records, and the authenticated byte
-  exchange are not modeled in Lean. A `Batch` envelope is transport framing that the
-  keeper splits into single requests before deciding; the simulator and the replay use
-  single requests.
+  every recorded reopen, and Study 117's bridge covers reply survival. The WAL proof
+  starts at validated framing and durable image publication. CRC collision behavior,
+  extents, rename and directory sync are outside that projection. A `Batch` envelope
+  is transport framing that the keeper splits into single requests before deciding.
 - **Payload bytes.** The replay checks positions and record epochs. The conformance
   history checker compares payload bytes.
 

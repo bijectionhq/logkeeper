@@ -31,3 +31,5 @@ import Logkeeper.StreamIO
 import Logkeeper.StreamIOWitness
 import Logkeeper.StreamWriter
 import Logkeeper.StreamHead
+import Logkeeper.StreamReplacement
+import Logkeeper.StreamWAL

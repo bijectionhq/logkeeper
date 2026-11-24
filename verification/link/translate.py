@@ -371,6 +371,7 @@ def postcondition(tokens, offset, path):
     signature = Parser(tokens[offset:], path)
     signature.need("fn")
     name = signature.identifier()
+    params = signature.separated(signature.identifier, ">") if signature.accept("<") else ()
     signature.need("(")
     inputs = dict(signature.separated(signature.binder, ")"))
     signature.need("->")
@@ -394,7 +395,7 @@ def postcondition(tokens, offset, path):
         contract.need(")")
     if contract.peek() != "<eof>" or signature.peek() != "{":
         contract.fail("expected one unconditional result postcondition")
-    return Definition(name, (), inputs, (), output, body, None, tokens[start].line)
+    return Definition(name, params, inputs, (), output, body, None, tokens[start].line)
 
 
 def parenthesize(value):

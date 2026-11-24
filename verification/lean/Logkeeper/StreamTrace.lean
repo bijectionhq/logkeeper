@@ -1,4 +1,4 @@
-import Logkeeper.StreamAsync
+import Logkeeper.StreamReplacement
 
 /-! Replay of every keeper effect in the simulator corpus against Study 119's keeper step.
 
@@ -97,7 +97,8 @@ def View.bounded (view : View) : Bool :=
     covers view.runs view.floor view.tail
 
 inductive Reply where
-  | refused | created | sealed (view : View) | synced (tail : Nat) | appended (tail : Nat)
+  | refused | wrongEnsemble (ensemble : List Nat)
+  | created | sealed (view : View) | synced (tail : Nat) | appended (tail : Nat)
   | trimmed (floor : Nat) | checked (view : View)
   | records (floor head : Nat) (positions : List Nat)
   | deleted | replaced
@@ -120,22 +121,26 @@ structure Row where
 /-- Which Study 119 step an effect refines. -/
 inductive Projection where
   | stutter | create | seal | syncPart | sync | installFloor | append | publish | trim | delete
+  | replace | promote | wrongEnsemble | lose
   deriving BEq, Repr
 
 def Projection.name : Projection → String
   | .stutter => "stutter" | .create => "create" | .seal => "seal" | .syncPart => "staged sync"
   | .sync => "complete sync" | .installFloor => "floor installation" | .append => "append"
   | .publish => "publication" | .trim => "trim" | .delete => "delete"
+  | .replace => "survivor install" | .promote => "learner install"
+  | .wrongEnsemble => "WrongEnsemble" | .lose => "disk loss"
 
 def Projection.all : List Projection :=
-  [.stutter, .create, .seal, .syncPart, .sync, .installFloor, .append, .publish, .trim, .delete]
+  [.stutter, .create, .seal, .syncPart, .sync, .installFloor, .append, .publish, .trim, .delete,
+    .replace, .promote, .wrongEnsemble, .lose]
 
 private def unchanged (row : Row) : Except String Projection := do
   check (row.after == row.before) "stutter changed the image"
   return .stutter
 
 private def accepted : Reply → Bool
-  | .refused | .failed => false
+  | .refused | .wrongEnsemble _ | .failed => false
   | _ => true
 
 private def promisedTo (row : Row) (epoch : Nat) : Bool :=
@@ -244,13 +249,26 @@ def trimEffect (row : Row) (epoch through : Nat) : Except String Projection := d
 def replaceEffect (row : Row) (epoch : Nat) (origin to : List Nat) : Except String Projection := do
   let before := row.before.view
   check (promisedTo row epoch && before.synced == epoch + 1) "replace requires a synced promise"
-  if before.ensemble == to then return ← unchanged row
-  check (before.ensemble == origin && to.contains row.keeper &&
-    (List.zip origin to).countP (fun pair => pair.1 != pair.2) == 1) "replace ensemble"
-  check (row.after == { row.before with view := { before with ensemble := to, learner := false } })
+  let decision := StreamReplacement.replaceDecision (promisedTo row epoch)
+    (before.synced == epoch + 1) (before.ensemble == to) (before.ensemble == origin)
+    (!to.contains 0 && to.Nodup) (to.contains row.keeper)
+    ((List.zip origin to).countP (fun pair => pair.1 != pair.2))
+  if decision == .replaced then return ← unchanged row
+  check (decision == .persist) "replace ensemble"
+  let (ensemble, learner) := StreamReplacement.installEnsemble to
+  check (row.after == { row.before with view := { before with ensemble, learner } })
     "replace effect"
-  -- Study 119 has a fixed roster. Membership is the authority model's concern.
-  return .stutter
+  return if before.learner then .promote else .replace
+
+def wrongEnsembleEffect (row : Row) (reported : List Nat) : Except String Projection := do
+  let requested ← match row.verb, row.fields with
+    | "seal", [_, a, b, c] | "replace", [_, a, b, c, _, _, _]
+    | "delete", [a, b, c] => pure [a, b, c]
+    | _, _ => throw "WrongEnsemble request"
+  check (row.before.present && row.before.view.ensemble == reported &&
+    requested != reported) "WrongEnsemble reports current ensemble"
+  let _ ← unchanged row
+  return .wrongEnsemble
 
 def observe (row : Row) (verb : String) (fields : List Nat) : Except String Projection := do
   let before := row.before.view
@@ -270,6 +288,12 @@ def step (row : Row) : Except String Projection := do
   if row.verb == "reopen" then
     check (row.after == row.before) "reopen restores the durable image"
     return .stutter
+  if row.verb == "lose" then
+    check (row.before.present && !row.after.present && !row.after.deleted &&
+      row.after.staged.isNone) "disk loss clears the image"
+    return .lose
+  if let .wrongEnsemble ensemble := row.reply then
+    return ← wrongEnsembleEffect row ensemble
   if !accepted row.reply then return ← unchanged row
   if row.verb == "delete" then
     check (row.after.present && row.after.deleted) "delete installs a tombstone"
@@ -289,6 +313,32 @@ def step (row : Row) : Except String Projection := do
   | "replace", [epoch, a, b, c, d, e, f] => replaceEffect row epoch [a, b, c] [d, e, f]
   | "check", _ | "read", _ | "recover", _ => observe row row.verb row.fields
   | _, _ => throw "event fields"
+
+/-- Replay the simulation's single replacement plan per seed. Local keeper effects
+    above do not know which other keepers have installed their ensemble. -/
+structure SweepProgress where
+  lost : Option Nat := none
+  installed : List (Nat × List Nat) := []
+
+def SweepProgress.advance (sweep : SweepProgress) (row : Row) :
+    Projection → Except String SweepProgress
+  | .lose => do
+      check sweep.lost.isNone "multiple disk losses in one simulation seed"
+      return { sweep with lost := some row.keeper }
+  | .replace => do
+      let old := row.before.view.ensemble
+      let next := row.after.view.ensemble
+      check (old.contains row.keeper && sweep.lost.any (fun lost =>
+        old.contains lost && !next.contains lost)) "survivor replaced the lost member"
+      return { sweep with installed := (row.keeper, next) :: sweep.installed }
+  | .promote => do
+      let old := row.before.view.ensemble
+      let next := row.after.view.ensemble
+      let survivors := old.filter next.contains
+      check (survivors.length == 2 && survivors.all (fun id =>
+        sweep.installed.contains (id, next))) "learner installs after both survivors"
+      return sweep
+  | _ => pure sweep
 
 /-! Parsing. Lists are prefixed by their length. -/
 
@@ -343,6 +393,7 @@ private def reply : Parser Reply := do
   | 9 => return .replaced
   | 10 => return .lost
   | 11 => return .failed
+  | 12 => return .wrongEnsemble [← next, ← next, ← next]
   | _ => throw "unknown reply"
 
 private def request (verb : String) : Parser (List Nat × List Run) := do
@@ -364,8 +415,8 @@ def parse (line : String) : Except String Row := do
     let caller ← next
     let before ← image
     let after ← image
-    let (fields, runs) ← if verb == "reopen" then pure ([], []) else request verb
-    let reply ← if verb == "reopen" then pure Reply.lost else reply
+    let (fields, runs) ← if verb == "reopen" || verb == "lose" then pure ([], []) else request verb
+    let reply ← if verb == "reopen" || verb == "lose" then pure Reply.lost else reply
     return ⟨verb, serial, keeper, caller, before, after, fields, runs, reply⟩
   let (row, rest) ← parser.run numbers
   check rest.isEmpty "trailing fields"

@@ -332,7 +332,10 @@ the module named in each Verus area's README.
 | `src/stream/keeper/rules.rs` | `sync_head_valid` | — | The Lean Sync step retains head and does not transfer a floor. |
 | `src/stream/keeper/rules.rs` | `append_retry` | `Logkeeper.StreamJournal.appendAt` | Equivalence |
 | `src/stream/keeper/rules.rs` | `may_read` | `Logkeeper.StreamJournal.readPage` | Equivalence |
-| `src/stream/keeper/rules.rs` | `may_replace` | — | Study 119 models keeper replacement in TLA+, with a fixed ensemble in Lean. |
+| `src/stream/keeper/rules.rs` | `may_replace` | `Logkeeper.StreamReplacement.ReplaceAllowed` | Equivalence |
+| `src/stream/keeper/rules.rs` | `decide_replace` | `Logkeeper.StreamReplacement.replaceDecision` | Equivalence |
+| `src/stream/keeper/rules.rs` | `valid_ensemble_ids` | `Logkeeper.StreamReplacement.ValidEnsemble` | Equivalence |
+| `src/stream/keeper/rules.rs` | `install_ensemble` | `Logkeeper.StreamReplacement.installEnsemble` | Equivalence |
 | `src/stream/writer/decision.rs` | `covers` | `Logkeeper.StreamJournal.Covers` | Equivalence |
 | `src/stream/writer/decision.rs` | `acknowledged` | `Logkeeper.StreamJournal.QuorumAccepted` | Equivalence |
 | `src/stream/writer/decision.rs` | `outranks` | `Logkeeper.StreamJournal.RecoveryLE` | Equivalence |

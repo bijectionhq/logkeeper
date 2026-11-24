@@ -217,7 +217,8 @@ def main():
     equivalences = (LINK / "Equivalences.lean").read_text()
     with tempfile.TemporaryDirectory(prefix="logkeeper-link-") as tmp:
         package = Path(tmp) / "lean"
-        shutil.copytree(ROOT / "verification/lean", package, ignore=shutil.ignore_patterns(".lake", "__pycache__"))
+        shutil.copytree(ROOT / "verification/lean", package,
+                        ignore=shutil.ignore_patterns(".lake", ".results", "__pycache__"))
         module = package / GENERATED
         module.mkdir(exist_ok=True)
         shutil.copyfile(LINK / "Bridge.lean", module / "Bridge.lean")

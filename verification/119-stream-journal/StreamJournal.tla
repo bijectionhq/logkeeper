@@ -5,6 +5,9 @@ CONSTANT Scenario, Fault
 Streams == {"a", "b"}
 Keepers == 1..4
 Originals == 1..3
+OldEnsemble == <<1,2,3>>
+NewEnsemble == <<4,2,3>>
+Members(ensemble) == {ensemble[i] : i \in 1..Len(ensemble)}
 Stream == "a"
 Null == "none"
 History(epoch, payload) == [epoch |-> epoch, payload |-> payload]
@@ -13,7 +16,7 @@ Y == <<History(2, "y")>>
 XY == X \o Y
 Empty == [created |-> FALSE, deleted |-> FALSE, promised |-> 0,
           identity |-> 0, synced |-> 0, history |-> <<>>, head |-> 0, floor |-> 1,
-          stage |-> <<>>, staging |-> FALSE]
+          stage |-> <<>>, staging |-> FALSE, ensemble |-> OldEnsemble, learner |-> FALSE]
 Live(k) == k.created /\ ~k.deleted
 Prefix(a,b) == Len(a) <= Len(b) /\ a = SubSeq(b,1,Len(a))
 Cut(k) == SubSeq(k.history,1,k.head)
@@ -21,10 +24,15 @@ EpochOK(k,e) == k.promised = e /\ k.synced = e
 \* The identity comes from the authenticated transport envelope.
 Request(verb,e,h,pos,records,c,complete) ==
     [verb |-> verb, epoch |-> e, identity |-> h, pos |-> pos,
-     records |-> records, head |-> c, max |-> 0, complete |-> complete]
+     records |-> records, head |-> c, max |-> 0, complete |-> complete,
+     origin |-> OldEnsemble, to |-> OldEnsemble]
 Simple(v) == Request(v,0,0,0,<<>>,0,FALSE)
 Seal(e,h) == Request("seal",e,h,0,<<>>,0,FALSE)
+SealAt(e,h,ensemble) == [Seal(e,h) EXCEPT !.origin = ensemble]
+ReplaceTo(e,origin,to) ==
+    [Request("replace",e,e,0,<<>>,0,FALSE) EXCEPT !.origin = origin, !.to = to]
 Sync(e,pos,records,complete) == Request("sync",e,e,pos,records,0,complete)
+SyncThrough(e,pos,records,head) == [Sync(e,pos,records,TRUE) EXCEPT !.head = head]
 AppendTo(e,pos,records,c) == Request("append",e,e,pos,records,c,FALSE)
 Trim(e,pos) == Request("trim",e,e,pos,<<>>,0,FALSE)
 Check(e) == Request("check",e,0,0,<<>>,0,FALSE)
@@ -43,14 +51,19 @@ Refuse(k) == [ok |-> FALSE, image |-> k, value |-> Null]
 Reply(k,v) == [ok |-> TRUE, image |-> k, value |-> v]
 Stay(k) == Reply(k,Null)
 
-Decide(k,r) ==
+Decide(id,k,r) ==
     LET e == r.epoch IN
     CASE r.verb = "create" ->
         IF ~k.deleted \/ Fault = "recreate"
-        THEN Stay([k EXCEPT !.created = TRUE, !.deleted = FALSE]) ELSE Refuse(k)
+        THEN IF Live(k) THEN Stay(k)
+             ELSE Stay([k EXCEPT !.created = TRUE, !.deleted = FALSE,
+                                 !.ensemble = r.origin, !.learner = id \notin Members(r.origin)])
+        ELSE Refuse(k)
       [] ~Live(k) -> Refuse(k)
       [] r.verb = "seal" ->
-        IF e > k.promised \/ (e = k.promised /\ (r.identity = k.identity \/ Fault = "seal-tie"))
+        IF r.origin # k.ensemble /\ Fault # "stale-route"
+        THEN [Refuse(k) EXCEPT !.value = k.ensemble]
+        ELSE IF e > k.promised \/ (e = k.promised /\ (r.identity = k.identity \/ Fault = "seal-tie"))
            \/ Fault = "seal-lower"
         THEN Reply(IF e = k.promised /\ r.identity = k.identity THEN k
                    ELSE [k EXCEPT !.promised = e, !.identity = r.identity, !.staging = FALSE], k)
@@ -61,13 +74,16 @@ Decide(k,r) ==
            /\ r.pos \in 1..(Len(SyncBase(k))+1)
            /\ (Prefix(Cut(k),h) \/ Fault = "sync-truncate")
            /\ (~r.complete \/ e # k.synced \/ k.history = h)
+           /\ r.head <= Len(h)
         THEN Stay(IF r.complete \/ Fault = "sync-incomplete"
-                  THEN [k EXCEPT !.history = h, !.synced = e, !.staging = FALSE]
+                  THEN [k EXCEPT !.history = h, !.synced = e, !.staging = FALSE,
+                                 !.head = Max(@,r.head)]
                   ELSE [k EXCEPT !.stage = h, !.staging = TRUE])
         ELSE Refuse(k)
       [] r.verb = "append" ->
         IF /\ (k.promised = e \/ Fault = "append-promise")
            /\ (k.synced = e \/ Fault = "append-unsynced")
+           /\ (~k.learner \/ Fault = "learner-append")
            /\ (NextPosition(k,r) \/ Identical(k,r)
                 \/ Fault = "append-gap" \/ (Fault = "append-conflict" /\ r.pos \in k.floor..Len(k.history)))
            /\ r.head <= Max(Len(k.history),r.pos)
@@ -88,6 +104,15 @@ Decide(k,r) ==
         IF r.pos >= k.floor \/ Fault = "read-below"
         THEN Reply(k,Page(k,r,IF Fault = "read-uncommitted" THEN Len(k.history) ELSE k.head))
         ELSE Refuse(k)
+      [] r.verb = "replace" ->
+        IF ~EpochOK(k,e) \/ k.identity # r.identity THEN Refuse(k)
+        ELSE IF k.ensemble = r.to THEN Stay(k)
+        ELSE IF k.ensemble # r.origin THEN [Refuse(k) EXCEPT !.value = k.ensemble]
+        ELSE IF /\ Len(r.to) = 3 /\ Cardinality(Members(r.to)) = 3
+                /\ Members(r.to) \subseteq Keepers /\ id \in Members(r.to)
+                /\ Cardinality({i \in 1..3 : r.origin[i] # r.to[i]}) = 1
+             THEN Stay([k EXCEPT !.ensemble = r.to, !.learner = FALSE])
+             ELSE Refuse(k)
       [] r.verb = "delete" ->
         Stay(IF Fault = "delete-forgets" THEN Empty ELSE [k EXCEPT !.deleted = TRUE])
 
@@ -113,7 +138,7 @@ Init ==
 
 Observe(k,s,r) ==
     LET before == store[k][s]
-        result == Decide(before,r)
+        result == Decide(k,before,r)
     IN /\ store' = [store EXCEPT ![k][s] = result.image]
        /\ event' = [before |-> before, request |-> r, result |-> result]
 
@@ -178,8 +203,8 @@ FirstAppend ==
     /\ LET k == pc-9
            before == store[k][Stream]
            request == AppendTo(1,1,X,IF Fault = "uncommitted-watermark" THEN 1 ELSE 0)
-           result == Decide(before,request)
-           other == Decide(store[2]["b"],Simple("create")).image
+           result == Decide(k,before,request)
+           other == Decide(2,store[2]["b"],Simple("create")).image
        IN /\ result.ok
           /\ event' = [before |-> before, request |-> request, result |-> result]
           /\ IF pc = 10 THEN
@@ -211,7 +236,7 @@ LoseAZ ==
     /\ writer' = [writer EXCEPT !.live = {2,3}, !.voters = {2,3}]
     /\ pc' = 14
     /\ IF Fault = "empty-rejoin"
-       THEN store' = [store EXCEPT ![2][Stream] = Decide(Empty,Simple("create")).image]
+       THEN store' = [store EXCEPT ![2][Stream] = Decide(2,Empty,Simple("create")).image]
        ELSE UNCHANGED store
     /\ UNCHANGED <<event,wal,head>>
 
@@ -241,7 +266,7 @@ Elect ==
          /\ UNCHANGED <<wal,head>>
       [] OTHER -> FALSE
 
-wasAccepted(k,r) == Decide(store[k][Stream],r).ok
+wasAccepted(k,r) == Decide(k,store[k][Stream],r).ok
 
 Zombie ==
     /\ pc \in 17..28
@@ -258,7 +283,10 @@ Replacement ==
       [] pc = 22 ->
          /\ writer' = [writer EXCEPT !.voters = {2,3,4}, !.learner = FALSE]
          /\ pc' = 23
-         /\ UNCHANGED <<store,event,wal,head>>
+         /\ LET replace == ReplaceTo(2,OldEnsemble,NewEnsemble) IN
+              store' = [k \in Keepers |-> IF k = 1 THEN store[k]
+                  ELSE [store[k] EXCEPT ![Stream] = Decide(k,store[k][Stream],replace).image]]
+         /\ UNCHANGED <<event,wal,head>>
       [] OTHER -> FALSE
 
 SecondAppend ==
@@ -298,7 +326,7 @@ Sample ==
     /\ head.opened > 0
     /\ head.finish = 0
     /\ \E k \in (writer.live \cap writer.voters) \ head.answered :
-        LET checked == Decide(store[k][Stream], Check(head.epoch))
+        LET checked == Decide(k,store[k][Stream], Check(head.epoch))
             image == checked.value
         IN /\ checked.ok
            /\ EpochOK(image,head.epoch)
@@ -324,7 +352,7 @@ FinishHead ==
 \* Queued frames contain already-decided images. One barrier covers both.
 WalWrite(k,s,r) ==
     /\ ~\E i \in 1..Len(wal.pending) : wal.pending[i].stream = s
-    /\ LET result == Decide(store[k][s],r) IN
+    /\ LET result == Decide(k,store[k][s],r) IN
         /\ result.ok
         /\ wal' = [wal EXCEPT !.pending = Append(@,Frame(s,result.image))]
     /\ UNCHANGED <<store,pc,event,writer,head>>
@@ -377,6 +405,121 @@ Protocol ==
     Zombie \/ Replacement \/ SecondAppend \/ StartHead \/ OpenRound \/ Sample \/
     FinishHead \/ ProtocolWal
 
+\* One disk is permanently lost. Both surviving members publish the adopted tail,
+\* then install independently. Requests and a retry can observe the split.
+Survivors == {2,3}
+OnRoute(route) == {k \in writer.live \cap Members(route) :
+    LET image == store[k][Stream] IN
+      Live(image) /\ ~image.learner /\ (image.ensemble = route \/ Fault = "count-wrong-route")}
+Installed == OnRoute(NewEnsemble) \cap Survivors
+PreparedCount == Cardinality({k \in writer.live :
+    Prefix(X,store[k][Stream].history) /\ store[k][Stream].head >= 1})
+Copies(history) == {k \in writer.live : Prefix(history,store[k][Stream].history)}
+
+ReplacementLoss ==
+    /\ pc = 13
+    /\ pc' = 14
+    /\ writer' = [writer EXCEPT !.live = Survivors, !.voters = Survivors]
+    /\ store' = [store EXCEPT ![1][Stream] = Empty]
+    /\ UNCHANGED <<event,wal,head>>
+
+ReplacementPrepare ==
+    CASE pc \in 14..15 -> Do(pc-12,Stream,Seal(2,2))
+      [] pc = 16 ->
+         LET choice == Pick(store[2][Stream],store[3][Stream]).history IN
+         /\ Observe(2,Stream,Sync(2,1,choice,TRUE))
+         /\ writer' = [writer EXCEPT !.seed = choice]
+         /\ pc' = 17
+         /\ UNCHANGED <<head,wal>>
+      [] pc = 17 -> Do(3,Stream,Sync(2,1,IF Fault = "skip-repair" THEN <<>> ELSE writer.seed,TRUE))
+      [] pc = 18 -> Do(2,Stream,AppendTo(2,2,<<>>,1))
+      [] pc = 19 -> Do(3,Stream,AppendTo(2,Len(store[3][Stream].history)+1,<<>>,
+                                                     Len(store[3][Stream].history)))
+      [] pc = 20 -> Do(4,Stream,Simple("create"))
+      [] pc = 21 -> Do(4,Stream,Seal(2,2))
+      [] pc = 22 -> Do(4,Stream,SyncThrough(2,1,writer.seed,Len(writer.seed)))
+      [] OTHER -> FALSE
+
+InstallSurvivor ==
+    /\ pc \in 23..24
+    /\ \E k \in Survivors \ Installed :
+         Do(k,Stream,ReplaceTo(2,OldEnsemble,NewEnsemble))
+
+SplitProbe ==
+    /\ pc = 24
+    /\ ~writer.tried
+    /\ \E k \in Installed :
+         /\ Observe(k,Stream,SealAt(3,3,OldEnsemble))
+         /\ writer' = [writer EXCEPT !.tried = TRUE]
+    /\ UNCHANGED <<pc,wal,head>>
+
+ResumeInstall ==
+    /\ pc = 24
+    /\ writer.tried
+    /\ ~writer.zombie
+    /\ \E k \in Installed :
+         /\ Observe(k,Stream,SealAt(2,2,NewEnsemble))
+         /\ writer' = [writer EXCEPT !.zombie = TRUE]
+    /\ UNCHANGED <<pc,wal,head>>
+
+LearnerProbe ==
+    /\ pc \in 23..24
+    /\ Observe(4,Stream,AppendTo(2,2,Y,1))
+    /\ UNCHANGED <<pc,wal,head,writer>>
+
+DelayedOldAppend ==
+    /\ pc = 16
+    /\ \E k \in Survivors : Observe(k,Stream,AppendTo(1,2,<<History(1,"z")>>,1))
+    /\ UNCHANGED <<pc,wal,head,writer>>
+
+BeforePublicationRead ==
+    /\ pc = 31
+    /\ Observe(2,Stream,Read(1,2))
+    /\ UNCHANGED <<pc,wal,head,writer>>
+
+InstallLearner ==
+    /\ pc \in 23..25
+    /\ Installed = Survivors \/ Fault = "early-learner-install"
+    /\ Observe(4,Stream,ReplaceTo(2,OldEnsemble,NewEnsemble))
+    /\ writer' = [writer EXCEPT !.live = Members(NewEnsemble), !.repaired = TRUE]
+    /\ pc' = 26
+    /\ UNCHANGED <<wal,head>>
+
+ReplacementSecondLoss ==
+    /\ pc = 26
+    /\ \E k \in writer.live :
+         /\ store' = [store EXCEPT ![k][Stream] = Empty]
+         /\ writer' = [writer EXCEPT !.live = @ \ {k}]
+    /\ pc' = 36
+    /\ UNCHANGED <<event,wal,head>>
+
+AfterReplacement ==
+    LET suffix == <<History(3,"y")>>
+        history == X \o suffix
+    IN CASE pc = 26 -> Do(2,Stream,SealAt(3,3,NewEnsemble))
+         [] pc = 27 -> Do(4,Stream,SealAt(3,3,NewEnsemble))
+         [] pc = 28 -> Do(2,Stream,SyncThrough(3,2,<<>>,1))
+         [] pc = 29 -> Do(4,Stream,SyncThrough(3,2,<<>>,1))
+         [] pc = 30 -> Do(2,Stream,AppendTo(3,2,suffix,1))
+         [] pc = 31 ->
+              /\ Observe(4,Stream,AppendTo(3,2,suffix,1))
+              /\ writer' = RecordChoice([writer EXCEPT !.epoch = 3], history)
+              /\ pc' = 32
+              /\ UNCHANGED <<wal,head>>
+         [] pc = 32 -> Do(2,Stream,AppendTo(3,3,<<>>,2))
+         [] pc = 33 ->
+              /\ Observe(4,Stream,AppendTo(3,3,<<>>,2))
+              /\ writer' = [writer EXCEPT !.acknowledged = 2]
+              /\ pc' = 34
+              /\ UNCHANGED <<wal,head>>
+         [] pc = 34 -> \E k \in writer.live : Do(k,Stream,Read(1,2))
+         [] OTHER -> FALSE
+
+ChangingEnsemble ==
+    StartupStep \/ FirstAppend \/ Retry \/ ReplacementLoss \/ ReplacementPrepare \/
+    InstallSurvivor \/ SplitProbe \/ ResumeInstall \/ LearnerProbe \/ InstallLearner \/
+    DelayedOldAppend \/ ReplacementSecondLoss \/ AfterReplacement \/ BeforePublicationRead
+
 \* A lower writer already has keeper 1's accept. Keeper 3 can still accept
 \* that delayed append after the new writer has synced keepers 1 and 2.
 Handoff ==
@@ -419,6 +562,7 @@ Next ==
     CASE Scenario = "rules" -> Rules
       [] Scenario = "rank" -> StartupStep \/ RankProbe
       [] Scenario = "protocol" -> Protocol
+      [] Scenario = "replacement" -> ChangingEnsemble
       [] Scenario = "handoff" -> StartupStep \/ Handoff
       [] Scenario = "retention" -> StartupStep \/ TrimRead
       [] Scenario = "wal" -> WalWriteNext \/ WalFlush \/ WalReply \/ WalTear(1)
@@ -494,4 +638,34 @@ NoProtocolWitness == ~(writer.epoch = 2 /\ writer.lost /\ writer.retried /\ writ
     /\ wal.torn = Streams /\ writer.repaired /\ 4 \in writer.voters /\ writer.committed = XY /\ head.returned = 2)
 NoNonWriterWitness == ~(head.mode = "non-writer" /\ head.returned = 2)
 NoWalWitness == ~(wal.batched /\ wal.torn = Streams /\ Cardinality(wal.replies) = 2)
+
+StaleRouteRefused ==
+    (event.request.verb = "seal" /\ Live(event.before) /\
+        event.request.origin # event.before.ensemble) =>
+    ~event.result.ok /\ event.result.image = event.before /\ event.result.value = event.before.ensemble
+OneEnsembleAuthority ==
+    ~(Cardinality(OnRoute(OldEnsemble)) >= 2 /\ Cardinality(OnRoute(NewEnsemble)) >= 2)
+LearnerAfterSurvivors == (pc = 26 /\ writer.repaired) => Installed = Survivors
+LearnerCannotAppend == CheckRule("append") => ~event.before.learner
+PublishedOnSurvivors == pc \in 20..25 => PreparedCount >= 2
+ReplacementDurability ==
+    writer.acknowledged > 0 =>
+    Cardinality(Copies(SubSeq(writer.committed,1,writer.acknowledged))) >=
+      (IF pc = 13 \/ pc \in 20..35 THEN 2 ELSE 1)
+ReplacementCommittedPrefix == \A k \in writer.live :
+    Prefix(Cut(store[k][Stream]),writer.committed)
+ReplacementFencesOldAppends == pc = 16 => ~CheckRule("append")
+ReplacementReadExact == CheckRule("read") =>
+    LET page == event.result.value IN
+      page.records = SubSeq(writer.committed,1,page.head)
+NoSplitInstallWitness ==
+    ~(pc = 24 /\ Cardinality(Installed) = 1 /\ writer.tried /\ writer.zombie /\
+        Cardinality(OnRoute(OldEnsemble)) < 2 /\ Cardinality(OnRoute(NewEnsemble)) < 2)
+NoReplacementRecoveryWitness ==
+    ~(pc = 26 /\ writer.repaired /\ writer.tried /\ writer.zombie /\
+        Cardinality(OnRoute(NewEnsemble)) = 3 /\ Cardinality(Copies(X)) = 3)
+NoSecondLossWitness == ~(pc = 36 /\ writer.repaired /\ Cardinality(Copies(X)) = 2)
+NoNewEnsembleWriteWitness ==
+    ~(pc = 35 /\ writer.acknowledged = 2 /\ writer.tried /\ writer.zombie /\
+        CheckRule("read") /\ event.result.value.head = 2)
 =============================================================================

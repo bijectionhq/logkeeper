@@ -9,6 +9,7 @@ def checkTrace (path : System.FilePath) : IO UInt32 := do
   let mut events := 0
   let mut counts : List (Projection × Nat) := Projection.all.map (·, 0)
   let mut line := 0
+  let mut sweep : SweepProgress := {}
   repeat
     let row ← file.getLine
     if row.isEmpty then break
@@ -20,13 +21,19 @@ def checkTrace (path : System.FilePath) : IO UInt32 := do
         unless index == previous + 1 do throw (IO.userError s!"line {line}: nonconsecutive seed")
       seed := some index
       seeds := seeds + 1
+      sweep := {}
     else
       if seed.isNone then throw (IO.userError s!"line {line}: missing seed")
-      match parse row >>= step with
+      let result := do
+        let row ← parse row
+        let projection ← step row
+        return (projection, ← sweep.advance row projection)
+      match result with
       | .error message =>
           IO.eprintln s!"line {line}: {message}"
           return 1
-      | .ok projection =>
+      | .ok (projection, next) =>
+          sweep := next
           events := events + 1
           counts := counts.map fun (kind, count) => (kind, if kind == projection then count + 1 else count)
   let summary := ", ".intercalate (counts.map fun (kind, count) => s!"{count} {kind.name}")

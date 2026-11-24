@@ -39,6 +39,10 @@ BASELINES = {
     "wal": WAL,
     "handoff": (*RULES, "DelayedAppendAlreadyCommitted"),
     "retention": (*RULES, "KeeperBounds", "RetentionReadCommitted"),
+    "replacement": (*RULES, "KeeperBounds", "StaleRouteRefused", "OneEnsembleAuthority",
+                    "LearnerAfterSurvivors", "LearnerCannotAppend", "PublishedOnSurvivors",
+                    "ReplacementDurability", "ReplacementCommittedPrefix",
+                    "ReplacementFencesOldAppends", "ReplacementReadExact"),
 }
 WITNESSES = (
     ("protocol", "NoProtocolWitness"),
@@ -46,6 +50,10 @@ WITNESSES = (
     ("wal", "NoWalWitness"),
     ("handoff", "NoDelayedAppendWitness"),
     ("retention", "NoTrimReadWitness"),
+    ("replacement", "NoSplitInstallWitness"),
+    ("replacement", "NoReplacementRecoveryWitness"),
+    ("replacement", "NoSecondLossWitness"),
+    ("replacement", "NoNewEnsembleWriteWitness"),
 )
 CONTROLS = (
     ("rules", "recreate", "CreateGuard"),
@@ -78,6 +86,13 @@ CONTROLS = (
     ("wal", "cross-frontier", "ReplyDurable"),
     ("wal", "wrong-stream", "ExactDemux"),
     ("retention", "read-uncommitted", "RetentionReadCommitted"),
+    ("replacement", "stale-route", "StaleRouteRefused"),
+    ("replacement", "count-wrong-route", "OneEnsembleAuthority"),
+    ("replacement", "early-learner-install", "LearnerAfterSurvivors"),
+    ("replacement", "learner-append", "LearnerCannotAppend"),
+    ("replacement", "skip-repair", "PublishedOnSurvivors"),
+    ("replacement", "append-promise", "ReplacementFencesOldAppends"),
+    ("replacement", "read-uncommitted", "ReplacementReadExact"),
 )
 GAPS = (
     ("protocol", "writer-known-only", "HeadLinearizable"),
@@ -123,6 +138,9 @@ def verify_lean(shared_wal):
     command = [str(LAKE), f"+{toolchain}", "-d", str(LEAN), "env", "lean"]
     source = LEAN / "Logkeeper/StreamJournal.lean"
     check_lean_theorems(ROOT, command, source, count=21)
+    for model, count in (("StreamReplacement", 9), ("StreamWAL", 7)):
+        check_lean_theorems(ROOT, command, LEAN / f"Logkeeper/{model}.lean",
+                            count=count, case=f"lean-{model}")
 
     controls = (
         ("append-unsynced",

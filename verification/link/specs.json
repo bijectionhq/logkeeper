@@ -190,7 +190,10 @@
       "sync_head_valid": null,
       "append_retry": "Logkeeper.StreamJournal.appendAt",
       "may_read": "Logkeeper.StreamJournal.readPage",
-      "may_replace": null
+      "may_replace": "Logkeeper.StreamReplacement.ReplaceAllowed",
+      "decide_replace": "Logkeeper.StreamReplacement.replaceDecision",
+      "valid_ensemble_ids": "Logkeeper.StreamReplacement.ValidEnsemble",
+      "install_ensemble": "Logkeeper.StreamReplacement.installEnsemble"
     }
   },
   "stream_writer": {

@@ -18,7 +18,7 @@ LAKE = Path.home() / ".elan/bin/lake"
 CARGO = ROOT.parent / "codesign-agents/guarded-cargo.py"
 
 FIXED = {"create": 3, "delete": 3, "seal": 4, "sync": 6, "append": 4, "trim": 2,
-         "check": 1, "read": 2, "recover": 3, "replace": 7, "reopen": 0}
+         "check": 1, "read": 2, "recover": 3, "replace": 7}
 VIEW = ["promised", "owner", "synced", "floor", "tail", "head", "learner", "e0", "e1", "e2"]
 
 
@@ -47,7 +47,7 @@ def image(tokens):
     return result
 
 
-REPLIES = {0: 0, 1: 0, 3: 1, 4: 1, 5: 1, 8: 0, 9: 0, 10: 0, 11: 0}
+REPLIES = {0: 0, 1: 0, 3: 1, 4: 1, 5: 1, 8: 0, 9: 0, 10: 0, 11: 0, 12: 3}
 
 
 def parse(line):
@@ -55,7 +55,7 @@ def parse(line):
     tokens = Tokens(values)
     row = {"verb": verb, "serial": tokens.next(), "keeper": tokens.next(),
            "caller": tokens.next(), "before": image(tokens), "after": image(tokens)}
-    if verb == "reopen":
+    if verb not in FIXED:
         return row
     row["fields"] = [tokens.next() for _ in range(FIXED[verb])]
     row["runs"] = tokens.runs() if verb == "sync" else []
@@ -92,7 +92,7 @@ def image_text(fields):
 def text(row):
     words = [row["verb"], str(row["serial"]), str(row["keeper"]), str(row["caller"])]
     words += image_text(row["before"]) + image_text(row["after"])
-    if row["verb"] != "reopen":
+    if row["verb"] in FIXED:
         words += [str(value) for value in row["fields"]]
         if row["verb"] == "sync":
             words += runs_text(row["runs"])
@@ -132,7 +132,7 @@ def first(trace, predicate):
 
 
 def accepted(row):
-    return row["verb"] == "reopen" or row["reply"][0] not in (0, 11)
+    return row["verb"] not in FIXED or row["reply"][0] not in (0, 11, 12)
 
 
 def kind(verb, test=lambda row: True):
@@ -262,6 +262,10 @@ CONTROLS = [
      lambda r: (r["fields"].__setitem__(4, 97), r["fields"].__setitem__(5, 98)), "replace ensemble"),
     ("replace-keeps-learner", kind("replace", lambda r: r["after"] != r["before"]),
      lambda r: r["after"]["view"].update(learner=1), "replace effect"),
+    ("wrong-ensemble-reports-stale-route", lambda r: r.get("reply", [0])[0] == 12,
+     lambda r: r["reply"].__setitem__(1, 97), "WrongEnsemble reports current ensemble"),
+    ("disk-loss-keeps-image", kind("lose"), lambda r: r.__setitem__("after", r["before"]),
+     "disk loss clears the image"),
     ("append-stale-promise", kind("append"), lambda r: both("promised", lambda r: r["fields"][0] + 2)(r),
      "append promise"),
     ("append-unsynced", kind("append"), lambda r: both("synced", lambda r: 0)(r), "append requires a synced voter"),
@@ -307,6 +311,11 @@ def controls(trace, evidence):
         path = evidence / f"{name}.trace"
         path.write_text(f"seed {seed}\n{mutated}\n")
         check_trace(path, error=error)
+    seed, row = first(trace, kind("replace", lambda r: r["before"]["view"]["learner"] and
+                                 not r["after"]["view"]["learner"]))
+    path = evidence / "learner-without-survivor-installs.trace"
+    path.write_text(f"seed {seed}\n{text(row)}\n")
+    check_trace(path, error="learner installs after both survivors")
     seed, row = first(trace, kind("append", inherited))
     print(f"inherited publication: seed {seed}, RPC {row['serial']}, keeper {row['keeper']} "
           "is a Study 119 publication step", flush=True)

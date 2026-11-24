@@ -150,5 +150,37 @@
     "theorem": "link_head_quorum",
     "find": "ensures out == (count >= 2)",
     "replace": "ensures out == (count >= 1)"
+  },
+  {
+    "name": "verus-replace-skips-member",
+    "area": "stream_keeper",
+    "theorem": "link_may_replace",
+    "file": "src/stream/keeper/rules.rs",
+    "find": "out == (current && synced && member && changed == 1)",
+    "replace": "out == (current && synced && changed == 1)"
+  },
+  {
+    "name": "verus-replace-rejects-retry",
+    "area": "stream_keeper",
+    "theorem": "link_decide_replace",
+    "file": "src/stream/keeper/rules.rs",
+    "find": "else if installed { ReplaceDecision::Replaced }",
+    "replace": "else if installed { ReplaceDecision::WrongEnsemble }"
+  },
+  {
+    "name": "verus-install-keeps-learner",
+    "area": "stream_keeper",
+    "theorem": "link_install_ensemble",
+    "file": "src/stream/keeper/rules.rs",
+    "find": "ensures out == (to, false)",
+    "replace": "ensures out == (to, true)"
+  },
+  {
+    "name": "verus-ensemble-allows-duplicate",
+    "area": "stream_keeper",
+    "theorem": "link_valid_ensemble_ids",
+    "file": "src/stream/keeper/rules.rs",
+    "find": "&& first != second && first != third && second != third)",
+    "replace": "&& first != second && first != third)"
   }
 ]

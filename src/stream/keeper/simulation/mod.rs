@@ -16,6 +16,7 @@ use journal_contract::{
     reference::Limits as ContractLimits,
 };
 use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 use super::{Limits, Sweep, sweep_idle};
 use crate::stream::{wire::*, writer::Writer};
@@ -45,6 +46,39 @@ const FAULTS: [Fault; 9] = [
 ];
 
 type Outcome = journal_contract::Result<Value>;
+
+struct SplitInstall<'a> {
+    transport: &'a dyn Transport,
+    survivors: [KeeperId; 2],
+    installed: Notify,
+}
+
+impl Transport for SplitInstall<'_> {
+    fn identity(&self) -> &Identity {
+        self.transport.identity()
+    }
+
+    fn call(
+        &self,
+        keeper: KeeperId,
+        request: Request,
+    ) -> journal_contract::BoxFuture<'_, Result<Reply, TransportError>> {
+        Box::pin(async move {
+            if !matches!(request, Request::Replace { .. }) {
+                return self.transport.call(keeper, request).await;
+            }
+            if keeper == self.survivors[1] {
+                self.installed.notified().await;
+                return Err(TransportError::Unreachable);
+            }
+            assert_eq!(keeper, self.survivors[0], "learner installed before both survivors");
+            let reply = self.transport.call(keeper, request).await;
+            assert_eq!(reply, Ok(Reply::Replaced));
+            self.installed.notify_one();
+            reply
+        })
+    }
+}
 
 struct History<'a> {
     network: &'a Network,
@@ -192,17 +226,39 @@ async fn seed_run(seed: u64, trace: Option<&mut BufWriter<File>>) -> Coverage {
             1,
             "disk loss witness must begin repair with one copy (seed {seed})"
         );
-        let results = sweep_idle(
-            &*network.client(&NEW),
-            [Sweep::new(
-                STREAM,
-                ENSEMBLE,
-                survivors.clone().try_into().unwrap(),
-                LEARNER,
-                E2,
-            )],
-        )
-        .await;
+        let survivors: [KeeperId; 2] = survivors.try_into().unwrap();
+        let plan = Sweep::new(STREAM, ENSEMBLE, survivors, LEARNER, E2);
+        let next = ENSEMBLE.map(|id| if id == target { LEARNER } else { id });
+        let transport = network.client(&NEW);
+        let split = SplitInstall {
+            transport: &*transport,
+            survivors,
+            installed: Notify::new(),
+        };
+        let mut outcomes = sweep_idle(&split, [plan]).await;
+        let outcome = outcomes.pop().unwrap().1;
+        assert!(
+            matches!(
+                outcome,
+                Err(super::SweepError::Transport { keeper, error: TransportError::Unreachable })
+                    if keeper == survivors[1]
+            ),
+            "replacement did not repair both survivors before splitting (seed {seed}): {outcome:?}"
+        );
+        let stale_seal = Request::Seal {
+            stream: STREAM,
+            ensemble: ENSEMBLE,
+            epoch: Epoch(9),
+            proposal: None,
+        };
+        assert_eq!(
+            network.client(&OLD).call(survivors[0], stale_seal.clone()).await.unwrap(),
+            Reply::Refused(Refusal::WrongEnsemble { ensemble: next }),
+            "replacement: split install admitted a stale seal (seed {seed})"
+        );
+        network.hit("split install");
+        network.restart_survivors();
+        let results = sweep_idle(&*transport, [plan]).await;
         results
             .into_iter()
             .next()
@@ -222,21 +278,13 @@ async fn seed_run(seed: u64, trace: Option<&mut BufWriter<File>>) -> Coverage {
             1,
             "durability: replacement must install the record (seed {seed})"
         );
-        ensemble = ENSEMBLE.map(|id| if id == target { LEARNER } else { id });
+        ensemble = next;
         new = writer(&network, &NEW, ensemble);
         reader = writer(&network, &READER, ensemble);
         assert_eq!(
             network
                 .client(&OLD)
-                .call(
-                    survivors[0],
-                    Request::Seal {
-                        stream: STREAM,
-                        ensemble: ENSEMBLE,
-                        epoch: Epoch(9),
-                        proposal: None,
-                    }
-                )
+                .call(survivors[0], stale_seal)
                 .await
                 .unwrap(),
             Reply::Refused(Refusal::WrongEnsemble { ensemble }),
@@ -384,6 +432,7 @@ async fn seeded_stream_journal() {
             "reopened WAL",
             "disk loss",
             "keeper replacement",
+            "split install",
         ]) {
             assert!(
                 coverage.contains_key(event),

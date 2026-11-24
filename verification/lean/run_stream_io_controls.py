@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Weaken each guard of the stream I/O automaton and check that its proof fails."""
+"""Weaken stream I/O, replacement and WAL guards and check their named proofs."""
 
 import argparse
 from pathlib import Path
@@ -81,6 +81,85 @@ IO_CONTROLS = {
     ),
 }
 
+REPLACEMENT_CONTROLS = {
+    "promote-before-both-installs": (
+        "def mayInstallLearner (first second : Bool) : Bool := first && second",
+        "def mayInstallLearner (first second : Bool) : Bool := first || second",
+        "learner_install_requires_both",
+    ),
+    "allow-learner-during-split": (
+        "  | .installing first _, .first => some (if first then .new else .old)",
+        "  | .installing true false, .learner => some .new\n"
+        "  | .installing first _, .first => some (if first then .new else .old)",
+        "split_install_has_no_quorum",
+    ),
+    "count-a-seal-on-both-routes": (
+        "  voter phase node == some route",
+        "  let _ := route\n  (voter phase node).isSome",
+        "exclusive_ensemble_authority",
+    ),
+    "repair-uses-a-lost-signer": (
+        "(survivingSigners : round.first ≠ lost ∧ round.second ≠ lost)",
+        "(survivingSigners : round.first ≠ lost)",
+        "surviving_copy_and_adopted_seed",
+    ),
+    "replace-without-survivor-repair": (
+        "  | .intact | .lost => original\n  | .repaired | .installing .. | .promoted => seed",
+        "  | .intact | .lost | .repaired => original\n  | .installing .. | .promoted => seed",
+        "repaired_survivors_cover",
+    ),
+    "promote-without-learner-history": (
+        "  | .installing .. | .promoted => some seed",
+        "  | .installing .. => some seed",
+        "promoted_cut_survives_any_one_loss",
+    ),
+    "import-shortened-repair-cut": (
+        "(installed : QuorumAccepted after.keeper repair moved.winner.history)",
+        "(installed : QuorumAccepted after.keeper repair [])",
+        "seal_after_replacement_covers_acknowledged",
+    ),
+}
+
+WAL_CONTROLS = {
+    "torn-tail-loses-complete-entries": (
+        "  | .torn :: _ => if newest then some [] else none",
+        "  | .torn :: _ => none",
+        "torn_tail_keeps_complete_entries",
+    ),
+    "torn-closed-segment-is-accepted": (
+        "  | .torn :: _ => if newest then some [] else none",
+        "  | .torn :: _ => some []",
+        "torn_closed_segment_fails",
+    ),
+    "partial-entry-prevents-reopening": (
+        "      if pending stream then scan newest pending frames else none",
+        "      if pending stream then none else scan newest pending frames",
+        "incomplete_entry_is_discarded",
+    ),
+    "finish-without-start": (
+        "      if pending entry.1 then\n        (scan newest",
+        "      if true then\n        (scan newest",
+        "fragments_are_demultiplexed",
+    ),
+    "checkpoint-captures-newer-entries": (
+        "        checkpoints := update r.checkpoints stream (some (boundary base old stream)) }",
+        "        checkpoints := update r.checkpoints stream\n"
+        "          (some (replay stream (boundary base old stream) r.newer)) }",
+        "next_sound",
+    ),
+    "retire-before-durable-checkpoints": (
+        "  | retire {r} : (∀ stream, Dirty old stream →\n"
+        "      r.checkpoints stream = some (boundary base old stream)) →",
+        "  | retire {r} : True →",
+        "next_sound",
+    ),
+    "reopen-drops-newer-entries": (
+        "  replay stream ((rotation.checkpoints stream).getD prior) rotation.newer",
+        "  replay stream ((rotation.checkpoints stream).getD prior) []",
+        "reopen_recovers_each_stream",
+    ),
+}
+
 
 WRITER_CONTROLS = {
     "compare-another-epoch": (
@@ -119,7 +198,8 @@ def main():
     parser.add_argument("--lake", default=str(Path.home() / ".elan/bin/lake"))
     args = parser.parse_args()
     subprocess.run([args.lake, "build", "Logkeeper.StreamIOWitness",
-                    "Logkeeper.StreamWriter", "Logkeeper.StreamHead"], cwd=HERE, check=True,
+                    "Logkeeper.StreamWriter", "Logkeeper.StreamHead",
+                    "Logkeeper.StreamReplacement", "Logkeeper.StreamWAL"], cwd=HERE, check=True,
                    capture_output=True)
     directory = HERE / ".results"
     directory.mkdir(exist_ok=True)
@@ -129,6 +209,8 @@ def main():
         "StreamIO": IO_CONTROLS,
         "StreamWriter": WRITER_CONTROLS,
         "StreamHead": HEAD_CONTROLS,
+        "StreamReplacement": REPLACEMENT_CONTROLS,
+        "StreamWAL": WAL_CONTROLS,
     }
     for (module, cases) in modules.items():
         check_controls(args.lake, (MODULES / f"{module}.lean").read_text(), cases, evidence)
@@ -142,7 +224,7 @@ def check_controls(lake, original, cases, evidence):
         path = evidence / f"{name}.lean"
         path.write_text(mutated)
         lines = mutated.splitlines()
-        start = next(i for i, line in enumerate(lines, 1) if line.startswith(f"theorem {law} "))
+        start = next(i for i, line in enumerate(lines, 1) if re.match(rf"^theorem {law}\b", line))
         end = next(i for i, line in enumerate(lines, 1) if i > start and not line)
         result = subprocess.run([lake, "env", "lean", str(path)], cwd=HERE, text=True,
                                 capture_output=True)
