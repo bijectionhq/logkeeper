@@ -225,7 +225,7 @@ async fn head_and_reseal_accept_the_winning_identity_amid_a_split_promise() {
                 stream: STREAM,
                 ensemble,
                 epoch: E2,
-                proposal: None,
+                proposal: 1,
             },
         )
         .await

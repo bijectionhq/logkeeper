@@ -190,7 +190,7 @@ mod implementation {
             promised: state
                 .promised
                 .as_ref()
-                .map_or(Epoch(0), |(epoch, _)| *epoch),
+                .map_or(Epoch(0), |(epoch, ..)| *epoch),
         })
     }
 
@@ -260,7 +260,7 @@ mod implementation {
         state
             .promised
             .as_ref()
-            .is_some_and(|(current, owner)| *current == epoch && owner == identity)
+            .is_some_and(|(current, owner, _)| *current == epoch && owner == identity)
     }
 
     pub(crate) fn decide(view: &StreamView<'_>, request: &Request, limits: &Limits) -> Decision {
@@ -301,7 +301,10 @@ mod implementation {
 
         match request {
             Request::Seal {
-                epoch, ensemble, proposal, ..
+                epoch,
+                ensemble,
+                proposal,
+                ..
             } => {
                 if !view.seal_allowed {
                     return refuse(Refusal::Unauthorized);
@@ -309,8 +312,10 @@ mod implementation {
                 if *ensemble != state.ensemble {
                     return wrong_ensemble(state);
                 }
-                let current = state.promised.as_ref().map_or(0, |(current, _)| current.0);
-                let identical = promised(*epoch) && state.proposal == *proposal;
+                let current = state.promised.as_ref().map_or(0, |(current, ..)| current.0);
+                let identical = state.promised.as_ref().is_some_and(|(current, owner, id)| {
+                    current == epoch && owner == view.identity && id == proposal
+                });
                 if !may_seal(state.promised.is_some(), current, epoch.0, identical) {
                     return fenced(state);
                 }

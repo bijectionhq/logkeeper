@@ -131,7 +131,7 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
     let seal = Request::Seal {
         stream,
         epoch,
-        proposal: None,
+        proposal: 1,
         ensemble,
     };
     let Reply::Sealed(view) = transport.call(id, seal).await.unwrap() else {
@@ -139,7 +139,7 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
     };
     assert_eq!(
         view.promised,
-        Some((epoch, Identity::from(CLIENT))),
+        Some((epoch, Identity::from(CLIENT), 1)),
         "the promise must contain the authenticated certificate URI"
     );
     assert_eq!(
@@ -193,7 +193,7 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
         Request::Seal {
             stream,
             epoch: Epoch(2),
-            proposal: None,
+            proposal: 1,
             ensemble,
         },
         Request::Delete { stream, ensemble },
@@ -495,7 +495,7 @@ async fn concurrent_calls_share_one_connection_and_batches_authorize_each_reques
                         stream,
                         ensemble,
                         epoch: Epoch(1),
-                        proposal: None,
+                        proposal: 1,
                     },
                     Request::Read {
                         stream,
@@ -510,7 +510,6 @@ async fn concurrent_calls_share_one_connection_and_batches_authorize_each_reques
         Reply::Batch(vec![
             Reply::Checked(StreamView {
                 promised: None,
-                proposal: None,
                 synced: None,
                 tail: Lsn(0),
                 head: Lsn(0),

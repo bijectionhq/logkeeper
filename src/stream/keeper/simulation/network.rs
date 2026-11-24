@@ -387,7 +387,7 @@ fn trace_runs(row: &mut String, runs: &[EpochRun]) {
 
 fn trace_view(row: &mut String, view: &StreamView, identities: &mut Vec<Identity>) {
     use std::fmt::Write;
-    let (promised, owner) = view.promised.as_ref().map_or((0, 0), |(epoch, owner)| {
+    let (promised, owner) = view.promised.as_ref().map_or((0, 0), |(epoch, owner, _)| {
         let index = match identities.iter().position(|known| known == owner) {
             Some(index) => index + 1,
             None => {

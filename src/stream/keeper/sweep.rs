@@ -270,7 +270,7 @@ impl Sweep {
             stream: self.stream,
             ensemble,
             epoch: self.epoch,
-            proposal: Some(self.proposal),
+            proposal: self.proposal,
         };
         let mut reply = self.call(transport, keeper, seal(self.ensemble)).await?;
         // A crash can leave one survivor on each ensemble. Resume the same move.
@@ -279,9 +279,14 @@ impl Sweep {
         }
         match reply {
             Reply::Sealed(view)
-                if view.promised.as_ref().is_some_and(|(epoch, identity)| {
-                    *epoch == self.epoch && identity == transport.identity()
-                }) && view.proposal == Some(self.proposal) =>
+                if view
+                    .promised
+                    .as_ref()
+                    .is_some_and(|(epoch, identity, proposal)| {
+                        *epoch == self.epoch
+                            && identity == transport.identity()
+                            && *proposal == self.proposal
+                    }) =>
             {
                 Ok(view)
             }

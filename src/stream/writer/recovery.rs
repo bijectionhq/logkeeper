@@ -270,15 +270,20 @@ async fn seal(
                 stream,
                 ensemble,
                 epoch,
-                proposal: Some(io.proposal),
+                proposal: io.proposal,
             },
         )
         .await?
     {
         Reply::Sealed(view)
-            if view.promised.as_ref().is_some_and(|(current, identity)| {
-                *current == epoch && identity == io.transport.identity()
-            }) && view.proposal == Some(io.proposal)
+            if view
+                .promised
+                .as_ref()
+                .is_some_and(|(current, identity, proposal)| {
+                    *current == epoch
+                        && identity == io.transport.identity()
+                        && *proposal == io.proposal
+                })
                 && view.head <= view.tail
                 && view.floor.0 != 0
                 && view.floor.0 - 1 <= view.head.0

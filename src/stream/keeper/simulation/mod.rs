@@ -252,7 +252,7 @@ async fn seed_run(seed: u64, trace: Option<&mut BufWriter<File>>) -> Coverage {
             stream: STREAM,
             ensemble: ENSEMBLE,
             epoch: Epoch(9),
-            proposal: None,
+            proposal: 1,
         };
         assert_eq!(
             network

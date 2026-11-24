@@ -27,7 +27,7 @@ fn seal_at(stream: StreamId, epoch: u64, ensemble: [KeeperId; 3]) -> Request {
     Request::Seal {
         stream,
         epoch: Epoch(epoch),
-        proposal: None,
+        proposal: 1,
         ensemble,
     }
 }
@@ -220,10 +220,12 @@ fn a_checkpoint_retains_the_seal_proposal() {
         stream: A,
         ensemble: MEMBERS,
         epoch: Epoch(1),
-        proposal: Some(proposal),
+        proposal,
     };
     let promised = test.send(seal(1));
-    assert!(matches!(&promised, Reply::Sealed(view) if view.proposal == Some(1)));
+    assert!(
+        matches!(&promised, Reply::Sealed(view) if view.promised == Some((Epoch(1), CLIENT.clone(), 1)))
+    );
     let Harness { mut engine, dir } = test;
     engine.wal.rotate(&engine.streams).unwrap();
     engine.drain_checkpoints().unwrap();
@@ -634,7 +636,7 @@ fn check_reports_the_durable_view_without_writing() {
     assert_eq!(
         (view.promised, view.synced, view.tail, view.head),
         (
-            Some((Epoch(1), CLIENT.clone())),
+            Some((Epoch(1), CLIENT.clone(), 1)),
             Some(Epoch(1)),
             Lsn(2),
             Lsn(1)
@@ -1332,7 +1334,7 @@ fn replacement_ensemble_survives_wal_recovery() {
     assert_eq!(view.ensemble, new, "replay must preserve the new ensemble");
     assert_eq!(
         view.promised,
-        Some((Epoch(1), CLIENT.clone())),
+        Some((Epoch(1), CLIENT.clone(), 1)),
         "replay must preserve the authenticated certificate identity"
     );
     assert_eq!(

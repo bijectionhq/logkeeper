@@ -27,7 +27,7 @@ pub enum Request {
         stream: StreamId,
         ensemble: [KeeperId; 3],
         epoch: Epoch,
-        proposal: Option<u128>,
+        proposal: u128,
     },
     /// Install a range from the chosen history. `runs` covers exactly `records`;
     /// `floor` and `head` describe the prefix installed by this chunk.
@@ -91,9 +91,8 @@ pub enum Request {
 /// A keeper's durable view of one stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamView {
-    pub promised: Option<(Epoch, Identity)>,
-    /// The proposal ID bound to the promise, when supplied by its proposer.
-    pub proposal: Option<u128>,
+    /// The epoch, authenticated identity and proposal ID of the current promise.
+    pub promised: Option<(Epoch, Identity, u128)>,
     pub synced: Option<Epoch>,
     pub tail: Lsn,
     pub head: Lsn,

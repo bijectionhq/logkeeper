@@ -173,11 +173,14 @@ fn decode_runs(runs: Vec<Run>) -> Vec<EpochRun> {
 
 fn encode_view(view: &StreamView) -> View {
     View {
-        promised: view.promised.as_ref().map(|(epoch, identity)| Promise {
-            epoch: epoch.0,
-            identity: identity.as_str().to_owned(),
-            proposal: view.proposal.map(encode_id),
-        }),
+        promised: view
+            .promised
+            .as_ref()
+            .map(|(epoch, identity, proposal)| Promise {
+                epoch: epoch.0,
+                identity: identity.as_str().to_owned(),
+                proposal: encode_id(*proposal),
+            }),
         synced: view.synced.map(|epoch| epoch.0),
         tail: view.tail.0,
         head: view.head.0,
@@ -190,15 +193,18 @@ fn encode_view(view: &StreamView) -> View {
 
 fn decode_view(view: View) -> io::Result<StreamView> {
     Ok(StreamView {
-        proposal: view
-            .promised
-            .as_ref()
-            .and_then(|promise| promise.proposal.as_ref())
-            .map(|id| decode_id(id))
-            .transpose()?,
         promised: view
             .promised
-            .map(|promise| (Epoch(promise.epoch), Identity::from(promise.identity))),
+            .map(|promise| {
+                decode_id(&promise.proposal).map(|proposal| {
+                    (
+                        Epoch(promise.epoch),
+                        Identity::from(promise.identity),
+                        proposal,
+                    )
+                })
+            })
+            .transpose()?,
         synced: view.synced.map(Epoch),
         tail: Lsn(view.tail),
         head: Lsn(view.head),
@@ -236,8 +242,8 @@ struct Promise {
     epoch: u64,
     #[prost(string, tag = "2")]
     identity: String,
-    #[prost(bytes = "bytes", optional, tag = "3")]
-    proposal: Option<Bytes>,
+    #[prost(bytes = "bytes", tag = "3")]
+    proposal: Bytes,
 }
 
 #[derive(Clone, Message)]
@@ -352,11 +358,11 @@ macro_rules! request_field {
     (encode ensemble, $value:expr) => {
         encode_ensemble($value)
     };
-    (encode proposal, $value:expr) => {
-        $value.map(encode_id)
+    (encode id, $value:expr) => {
+        encode_id(*$value)
     };
-    (decode proposal, $value:expr) => {
-        $value.as_ref().map(|id| decode_id(id)).transpose()?
+    (decode id, $value:expr) => {
+        decode_id(&$value)?
     };
     (encode runs, $value:expr) => {
         encode_runs($value)
@@ -391,8 +397,8 @@ request_messages! {
         ensemble: Vec<Bytes> => ensemble,
         #[prost(fixed64, tag = "2")]
         epoch: u64 => epoch,
-        #[prost(bytes = "bytes", optional, tag = "3")]
-        proposal: Option<Bytes> => proposal,
+        #[prost(bytes = "bytes", tag = "3")]
+        proposal: Bytes => id,
     },
     Sync = "4" {
         #[prost(fixed64, tag = "1")]
@@ -729,7 +735,7 @@ mod tests {
             Request::Seal {
                 stream,
                 epoch,
-                proposal: Some(17),
+                proposal: 17,
                 ensemble,
             },
             Request::Sync {
@@ -781,8 +787,7 @@ mod tests {
         }
 
         let view = StreamView {
-            promised: Some((epoch, Identity::from_static("urn:logkeeper:client:1"))),
-            proposal: Some(17),
+            promised: Some((epoch, Identity::from_static("urn:logkeeper:client:1"), 17)),
             synced: Some(epoch),
             tail: Lsn(2),
             floor: Lsn(1),
@@ -832,6 +837,48 @@ mod tests {
             decode_reply(Bytes::from_static(&[0, 0])).is_err(),
             "accepted trailing reply bytes"
         );
+    }
+
+    #[test]
+    fn requires_a_proposal_id_on_seal_and_in_a_promise() {
+        let ensemble = [KeeperId(1), KeeperId(2), KeeperId(3)];
+        for proposal in [Bytes::new(), Bytes::from_static(b"short")] {
+            let frame = RequestFrame {
+                stream: encode_id(6),
+                body: Some(RequestBody::Seal(request::Seal {
+                    ensemble: encode_ensemble(&ensemble),
+                    epoch: 2,
+                    proposal: proposal.clone(),
+                })),
+                batch: Vec::new(),
+            };
+            let view = View {
+                promised: Some(Promise {
+                    epoch: 2,
+                    identity: "urn:logkeeper:client:1".to_owned(),
+                    proposal,
+                }),
+                floor: 1,
+                ensemble: encode_ensemble(&ensemble),
+                ..View::default()
+            };
+            assert!(
+                decode_request(encode(&frame, MAX_FRAME_BYTES).unwrap()).is_err(),
+                "decoded a Seal without a valid proposal ID"
+            );
+            let reply = ReplyFrame {
+                body: Some(ReplyBody::Sealed(view.clone())),
+                batch: Vec::new(),
+            };
+            assert!(
+                decode_reply(encode(&reply, MAX_FRAME_BYTES).unwrap()).is_err(),
+                "decoded a reply promise without a valid proposal ID"
+            );
+            assert!(
+                decode_checkpoint_view(encode(&view, MAX_FRAME_BYTES).unwrap()).is_err(),
+                "decoded a checkpoint promise without a valid proposal ID"
+            );
+        }
     }
 
     #[test]

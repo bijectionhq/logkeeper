@@ -244,7 +244,7 @@ impl Writer {
         while let Some(reply) = calls.next().await {
             match reply {
                 Ok(Reply::Checked(view)) => {
-                    if let Some((current, identity)) = view.promised {
+                    if let Some((current, identity, _)) = view.promised {
                         if current > epoch
                             || (current == epoch && &identity != self.io.transport.identity())
                         {

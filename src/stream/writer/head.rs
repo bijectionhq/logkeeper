@@ -72,15 +72,15 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
             }
             let view = check_keeper(io, stream, keeper, active.epoch).await?;
             match view.promised {
-                Some((current, identity))
+                Some((current, identity, proposal))
                     if current > active.epoch
                         || (current == active.epoch
                             && (&identity != io.transport.identity()
-                                || view.proposal != Some(io.proposal))) =>
+                                || proposal != io.proposal)) =>
                 {
                     Err(JournalError::Fenced { current })
                 }
-                Some((epoch, _)) if epoch == active.epoch && view.synced == Some(epoch) => {
+                Some((epoch, ..)) if epoch == active.epoch && view.synced == Some(epoch) => {
                     Ok(view.tail)
                 }
                 _ => Err(JournalError::Unavailable),
@@ -194,7 +194,7 @@ fn eligible<'a>(
             view.promised.as_ref().map(|p| (p.0).0),
             view.synced.map(|epoch| epoch.0),
             epoch.map(|epoch| epoch.0),
-            view.promised == candidate.promised && view.proposal == candidate.proposal,
+            view.promised == candidate.promised,
         )
     })
 }
