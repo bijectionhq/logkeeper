@@ -19,7 +19,9 @@ IO_CONTROLS = {
         "complete_sync_head_within_request",
     ),
     "complete-sync-installs-ghost-seed": (
+        "  | .sync e floor start records head =>\n"
         "      { accept k e (syncImage k (w.seed e) floor start records) with\n",
+        "  | .sync e floor _ _ head =>\n"
         "      { accept k e (w.seed e) with\n",
         "complete_sync_uses_request_records",
     ),

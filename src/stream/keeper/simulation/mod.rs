@@ -71,7 +71,10 @@ impl Transport for SplitInstall<'_> {
                 self.installed.notified().await;
                 return Err(TransportError::Unreachable);
             }
-            assert_eq!(keeper, self.survivors[0], "learner installed before both survivors");
+            assert_eq!(
+                keeper, self.survivors[0],
+                "learner installed before both survivors"
+            );
             let reply = self.transport.call(keeper, request).await;
             assert_eq!(reply, Ok(Reply::Replaced));
             self.installed.notify_one();
@@ -252,7 +255,11 @@ async fn seed_run(seed: u64, trace: Option<&mut BufWriter<File>>) -> Coverage {
             proposal: None,
         };
         assert_eq!(
-            network.client(&OLD).call(survivors[0], stale_seal.clone()).await.unwrap(),
+            network
+                .client(&OLD)
+                .call(survivors[0], stale_seal.clone())
+                .await
+                .unwrap(),
             Reply::Refused(Refusal::WrongEnsemble { ensemble: next }),
             "replacement: split install admitted a stale seal (seed {seed})"
         );
