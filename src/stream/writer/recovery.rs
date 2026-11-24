@@ -4,7 +4,11 @@ use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
 use journal_contract::{Epoch, JournalError, Lsn, Result, StreamId};
 
-use super::{Io, KeeperId, Reply, Request, Stream, decision::outranks, quorum};
+use super::{
+    Io, KeeperId, Reply, Request, Stream,
+    decision::{can_sync_from, matches_epoch, outranks},
+    quorum,
+};
 
 use crate::stream::wire::{EpochRun, StreamView};
 
@@ -84,9 +88,14 @@ impl Recovery {
             return Ok(self.tail());
         }
 
-        let floor = floor.max(target.floor);
+        // Install the elected seed first. A trim beyond the seed is an issued
+        // cut and can advance the floor only after the keeper has joined the epoch.
+        let requested_floor = floor;
+        let floor = floor.min(Lsn(self.tail().0 + 1)).max(target.floor);
         let head = target.head.max(Lsn(floor.0 - 1));
-        let expected_end = self.tail().max(head);
+        if head > self.tail() {
+            return Err(JournalError::Unavailable);
+        }
         let mut from = divergence(&target, &self.history, floor).unwrap_or_else(|| {
             Lsn(target
                 .tail
@@ -95,7 +104,13 @@ impl Recovery {
                 .saturating_add(1)
                 .max(floor.0))
         });
-        if from <= target.head {
+        let same_prefix = from > floor && {
+            let previous = Lsn(from.0 - 1);
+            epoch_at(&self.history, previous).is_some_and(|epoch| {
+                matches_epoch(epoch_at(&target, previous).map(|e| e.0), epoch.0)
+            })
+        };
+        if !can_sync_from(floor.0, target.head.0, from.0, same_prefix) {
             return Err(JournalError::Unavailable);
         }
         while from <= self.tail() {
@@ -121,8 +136,11 @@ impl Recovery {
             from = Lsn(from.0 + 1);
         }
         let tail = send_sync(io, keeper, id, self.epoch, floor, from, None, head, true).await?;
-        if tail != expected_end {
+        if tail != self.tail() {
             return Err(JournalError::Unavailable);
+        }
+        if requested_floor > floor {
+            return install_floor(io, keeper, id, self.epoch, requested_floor).await;
         }
         Ok(tail)
     }
@@ -143,7 +161,7 @@ impl Recovery {
             FuturesUnordered::from_iter(ensemble.into_iter().filter(|id| *id != self.source).map(
                 |keeper| async move {
                     let view = seal(io, keeper, stream, ensemble, self.epoch).await?;
-                    if epoch_at(&view, from) != Some(epoch) {
+                    if !matches_epoch(epoch_at(&view, from).map(|epoch| epoch.0), epoch.0) {
                         return Err(JournalError::Unavailable);
                     }
                     fetch(io, keeper, stream, self.epoch, from).await

@@ -13,7 +13,7 @@ use tokio::sync::{oneshot, watch};
 
 use super::{
     Io, KeeperId, QUORUM, Reply, Request, Stream,
-    decision::acknowledged,
+    decision::{accepted_tail, acknowledged, append_head, fresh_sample},
     quorum,
     recovery::{self, Recovery},
     refusal,
@@ -249,8 +249,8 @@ impl Active {
     }
 
     async fn retry_committed(&self, at: Lsn, payload: Bytes) -> Result<Lsn> {
-        // On a keeper that lacks this position, Append would install the caller's
-        // bytes instead of comparing them. Only the replication lanes may fill gaps.
+        // Check retained bytes before publishing. Caller-supplied bytes are never
+        // sent in a lane Append until the writer has assigned them a position.
         let accepted = {
             let state = self.state.lock();
             std::array::from_fn::<_, 3, _>(|index| {
@@ -261,10 +261,17 @@ impl Active {
             })
         };
         quorum(FuturesUnordered::from_iter(
-            accepted
-                .into_iter()
-                .flatten()
-                .map(|keeper| self.send_append(keeper, at, vec![payload.clone()], at)),
+            accepted.into_iter().flatten().map(|keeper| {
+                let payload = &payload;
+                async move {
+                    let retained =
+                        recovery::fetch(&self.io, keeper, self.stream, self.epoch, at).await?;
+                    if retained != *payload {
+                        return Err(JournalError::Conflict { head: self.head() });
+                    }
+                    self.io.publish(keeper, self.stream, self.epoch, at).await
+                }
+            }),
         ))
         .await
         .map(|_| at)
@@ -286,7 +293,7 @@ impl Active {
         self.state.lock().lanes[lane]
             .observation
             .as_ref()
-            .filter(|(serial, _)| *serial > after)
+            .filter(|(serial, _)| fresh_sample(after, *serial))
             .map(|(_, result)| result.clone())
     }
 
@@ -341,7 +348,10 @@ impl Active {
                         // The fetched run is committed. Lane bookkeeping keeps the lower
                         // `head` from the work item, which costs at most an extra publish.
                         let last = Lsn(at.0 + run.len() as u64 - 1);
-                        (run, self.state.lock().head.min(last).max(head))
+                        (
+                            run,
+                            Lsn(append_head(self.state.lock().head.0, last.0)).max(head),
+                        )
                     }
                 };
                 let last = Lsn(at.0 + payloads.len() as u64 - 1);
@@ -358,7 +368,7 @@ impl Active {
                         .last_key_value()
                         .map_or(state.head, |(at, _)| *at)
                 };
-                result.map(|tail| Some(tail.min(known).max(last)))
+                result.map(|tail| Some(Lsn(accepted_tail(tail.0, known.0, last.0))))
             }
             Work::Publish(head) => {
                 let observed = self.observe(index);
@@ -464,7 +474,7 @@ impl State {
                 at,
                 payloads,
                 limit,
-                head: self.head.min(last),
+                head: Lsn(append_head(self.head.0, last.0)),
             });
         }
         if lane.published.is_none_or(|published| published < self.head) {

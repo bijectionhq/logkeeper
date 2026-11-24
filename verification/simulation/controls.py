@@ -49,6 +49,35 @@ def controls():
         yield name, [keeper[name]["mutate"][0]], WIRE, check, 0
 
     yield (
+        "reuse-sweep-proposal",
+        [edit("src/stream/keeper/sweep.rs", "proposal: uuid::Uuid::new_v4().as_u128(),", "proposal: 1,")],
+        "stream::keeper::tests::sweeper_uses_two_survivors_and_activates_the_trimmed_learner",
+        "another sweep plan re-elected the same epoch", 0,
+    )
+    yield (
+        "send-unassigned-retry",
+        [edit(WRITER + "append.rs", "                    let retained =\n",
+              "                    if keeper.0 != 0 {\n"
+              "                        return self.send_append(keeper, at, vec![payload.clone()], at).await;\n"
+              "                    }\n"
+              "                    let retained =\n")],
+        "stream::writer::tests::committed_retry_does_not_send_unassigned_bytes",
+        "committed retry sent unassigned bytes", 0,
+    )
+    yield (
+        "ignore-seal-proposal",
+        [edit(RULES, "promised(*epoch) && state.proposal == *proposal", "promised(*epoch)")],
+        "stream::keeper::tests::a_checkpoint_retains_the_seal_proposal",
+        "reopened keeper accepted a different proposal", 0,
+    )
+    yield (
+        "sync-past-seed",
+        [edit(WRITER + "recovery.rs", "floor.min(Lsn(self.tail().0 + 1)).max(target.floor)",
+              "floor.max(target.floor)")],
+        "stream::writer::tests::unsynced_keeper_installs_the_seed_before_advancing_past_it",
+        "lagging keeper must join after the floor passes the seed", 0,
+    )
+    yield (
         "reuse-seal-proposal",
         [edit(WRITER + "mod.rs", "proposal: uuid::Uuid::new_v4().as_u128(),", "proposal: 1,")],
         "stream::writer::tests::a_new_writer_with_the_same_identity_cannot_reseal",
@@ -140,8 +169,8 @@ def controls():
     )
     yield (
         "observer-no-head-quorum",
-        [edit(WRITER + "head.rs", ".count()\n                >= QUORUM)",
-              ".count()\n                >= 1)")],
+        [edit(WRITER + "head.rs", ".filter(|view| view.head >= index)\n            .count()\n            >= QUORUM)",
+              ".filter(|view| view.head >= index)\n            .count()\n            >= 1)")],
         SIM + "guards::head_covers_acknowledged_appends_with_a_lagging_keeper",
         "observer head missed an acknowledged append", 0,
     )

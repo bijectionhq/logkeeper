@@ -175,10 +175,10 @@ requests require writer authorization.
   ranks the routes by connection time, independently of ensemble order.
   Explicit routes use their supplied order.
 - **Replacement.** A new keeper has a new identity and starts as a
-  non-voting learner. The sweeper seals the two survivors and selects and
-  publishes their adopted history, syncs the learner, then replaces the
-  lost member on both survivors before installing the new ensemble on the
-  learner. A stale writer cannot use an old ensemble to obtain a write
+  non-voting learner. A sweep plan retains its proposal ID across retries.
+  The sweeper seals the two survivors and selects and publishes their adopted
+  history, syncs the learner, then replaces the lost member on both survivors
+  before installing the new ensemble on the learner. A stale writer cannot use an old ensemble to obtain a write
   quorum.
 - **Transport.** `Transport::identity()` is the authenticated caller.
   `read_order(ensemble)` supplies member preference, defaulting to ensemble

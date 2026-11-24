@@ -204,7 +204,9 @@ async fn a_new_writer_with_the_same_identity_cannot_reseal() {
     );
     assert_eq!(restarted.seal(STREAM, E2).await, Ok(Lsn(0)));
     assert_eq!(
-        restarted.append(STREAM, E2, Lsn(1), record("new epoch")).await,
+        restarted
+            .append(STREAM, E2, Lsn(1), record("new epoch"))
+            .await,
         Ok(Lsn(1))
     );
 }
@@ -359,6 +361,32 @@ async fn append_retry_after_lost_replies_is_exact() {
     assert_eq!(
         writer.append(STREAM, E1, Lsn(3), record("gap")).await,
         Err(JournalError::Conflict { head: Lsn(1) })
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn committed_retry_does_not_send_unassigned_bytes() {
+    let (network, writer) = started().await;
+    assert_eq!(
+        writer.append(STREAM, E1, Lsn(1), record("chosen")).await,
+        Ok(Lsn(1))
+    );
+    network
+        .until(|| {
+            KEEPERS[..3]
+                .iter()
+                .all(|&keeper| network.view(keeper, STREAM).unwrap().tail == Lsn(1))
+        })
+        .await;
+    let sent = network.calls(Kind::Append);
+    assert_eq!(
+        writer.append(STREAM, E1, Lsn(1), record("different")).await,
+        Err(JournalError::Conflict { head: Lsn(1) })
+    );
+    assert_eq!(
+        network.calls(Kind::Append),
+        sent,
+        "committed retry sent unassigned bytes"
     );
 }
 
@@ -653,13 +681,7 @@ async fn stale_routes_can_read_committed_records_after_a_replacement_trim() {
     let [first, second, retired, learner] = KEEPERS;
     let old = [first, second, retired];
     let new = [first, second, learner];
-    let plan = Sweep {
-        stream: STREAM,
-        ensemble: old,
-        survivors: [first, second],
-        learner,
-        epoch: E2,
-    };
+    let plan = Sweep::new(STREAM, old, [first, second], learner, E2);
     let result = sweep_idle(&*network.client(2), [plan]).await;
     assert!(result[0].1.is_ok(), "{result:?}");
 
@@ -924,6 +946,36 @@ async fn lagging_keeper_can_rejoin_after_a_committed_trim() {
     );
     let view = network.view(KEEPERS[2], STREAM).unwrap();
     assert_eq!((view.floor, view.tail), (Lsn(2), Lsn(2)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn unsynced_keeper_installs_the_seed_before_advancing_past_it() {
+    let (network, _) = started().await;
+    let [first, second, lagging] = KEEPERS[..3].try_into().unwrap();
+    network.down(lagging, true);
+    let next = writer(&network, 2);
+    assert_eq!(next.seal(STREAM, E2).await, Ok(Lsn(0)));
+    assert_eq!(
+        next.append(STREAM, E2, Lsn(1), record("trimmed")).await,
+        Ok(Lsn(1))
+    );
+    next.trim(STREAM, E2, Lsn(1)).await.unwrap();
+    assert_eq!(network.view(lagging, STREAM).unwrap().synced, Some(E1));
+
+    network.down(lagging, false);
+    network.down(first, true);
+    assert_eq!(
+        next.append(STREAM, E2, Lsn(2), record("retained")).await,
+        Ok(Lsn(2)),
+        "lagging keeper must join after the floor passes the seed"
+    );
+    for keeper in [second, lagging] {
+        let view = network.view(keeper, STREAM).unwrap();
+        assert_eq!(
+            (view.synced, view.floor, view.head),
+            (Some(E2), Lsn(2), Lsn(2))
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]

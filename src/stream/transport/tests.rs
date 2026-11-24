@@ -332,8 +332,12 @@ async fn writer_round_trips_through_three_tls_keepers() {
         Err(JournalError::Fenced { current: Epoch(1) }),
         "a different certificate identity must be fenced at the same epoch"
     );
-    let resumed = open(&writer_credentials).await;
-    assert_eq!(resumed.seal(stream, Epoch(1)).await, Ok(Lsn(1)));
+    assert_eq!(writer.clone().seal(stream, Epoch(1)).await, Ok(Lsn(1)));
+    let restarted = open(&writer_credentials).await;
+    assert_eq!(
+        restarted.seal(stream, Epoch(1)).await,
+        Err(JournalError::Fenced { current: Epoch(1) })
+    );
     assert_eq!(successor.seal(stream, Epoch(2)).await, Ok(Lsn(1)));
     assert_eq!(reader.head(stream).await, Ok(Lsn(1)));
     assert_eq!(

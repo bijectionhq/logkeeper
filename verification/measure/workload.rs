@@ -678,20 +678,23 @@ pub async fn replace(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
     cluster.add(binary, LEARNER, rtt, CAP).await?;
     eprintln!("Installing a learner for {streams} streams");
     let transport = Measured::connect(&cluster, &cluster.successor)?;
-    let plan = |id: u64| Sweep {
-        stream: StreamId(id.into()),
-        ensemble: ENSEMBLE,
-        survivors: [ENSEMBLE[1], ENSEMBLE[2]],
-        learner: LEARNER,
-        epoch: NEXT,
+    let plan = |id: u64| {
+        Sweep::new(
+            StreamId(id.into()),
+            ENSEMBLE,
+            [ENSEMBLE[1], ENSEMBLE[2]],
+            LEARNER,
+            NEXT,
+        )
     };
     let start = Instant::now();
     let sweep = |id| {
         let transport = &transport;
         async move {
             let started = Instant::now();
+            let plan = plan(id);
             loop {
-                match sweep_idle(transport.as_ref(), [plan(id)])
+                match sweep_idle(transport.as_ref(), [plan])
                     .await
                     .pop()
                     .unwrap()

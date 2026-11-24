@@ -213,6 +213,33 @@ fn create_is_durable_and_idempotent() {
 }
 
 #[test]
+fn a_checkpoint_retains_the_seal_proposal() {
+    let mut test = Harness::new(Limits::default());
+    assert_eq!(test.send(create(A)), Reply::Created);
+    let seal = |proposal| Request::Seal {
+        stream: A,
+        ensemble: MEMBERS,
+        epoch: Epoch(1),
+        proposal: Some(proposal),
+    };
+    let promised = test.send(seal(1));
+    assert!(matches!(&promised, Reply::Sealed(view) if view.proposal == Some(1)));
+    let Harness { mut engine, dir } = test;
+    engine.wal.rotate(&engine.streams).unwrap();
+    engine.drain_checkpoints().unwrap();
+    drop(engine);
+
+    let engine = Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap();
+    let mut reopened = Harness { engine, dir };
+    assert_eq!(
+        reopened.send(seal(2)),
+        Reply::Refused(Refusal::Fenced { promised: Epoch(1) }),
+        "reopened keeper accepted a different proposal"
+    );
+    assert_eq!(reopened.send(seal(1)), promised);
+}
+
+#[test]
 fn seal_fences_lower_epochs_and_equal_epochs_from_other_identities() {
     let mut test = Harness::new(Limits::default());
     test.writer(A);
@@ -984,13 +1011,7 @@ async fn sweeper_uses_two_survivors_and_activates_the_trimmed_learner() {
         panic!("bad check")
     };
     assert!(view.learner);
-    let plan = Sweep {
-        stream: A,
-        ensemble: MEMBERS,
-        survivors: [first, second],
-        learner: replacement,
-        epoch: Epoch(3),
-    };
+    let plan = Sweep::new(A, MEMBERS, [first, second], replacement, Epoch(3));
     let missing = transport.0.remove(&second).unwrap();
     let outcome = sweep_idle(&transport, [plan]).await.pop().unwrap().1;
     assert!(matches!(outcome, Err(SweepError::Transport { keeper, .. }) if keeper == second));
@@ -1025,6 +1046,21 @@ async fn sweeper_uses_two_survivors_and_activates_the_trimmed_learner() {
         .unwrap()
         .1
         .unwrap();
+    let restarted = Sweep::new(A, MEMBERS, [first, second], replacement, Epoch(3));
+    let [(_, outcome)] = sweep_idle(&transport, [restarted])
+        .await
+        .try_into()
+        .unwrap();
+    assert!(
+        matches!(
+            outcome,
+            Err(SweepError::Reply {
+                reply: Reply::Refused(Refusal::Fenced { promised: Epoch(3) }),
+                ..
+            })
+        ),
+        "another sweep plan re-elected the same epoch"
+    );
 }
 
 #[tokio::test]
@@ -1058,18 +1094,9 @@ async fn sweeper_restores_an_absent_survivor_from_one_durable_copy() {
         transport.call(absent, check(A)).await.unwrap(),
         Reply::Refused(Refusal::NotFound)
     );
-    let plan = Sweep {
-        stream: A,
-        ensemble: MEMBERS,
-        survivors: [source, absent],
-        learner,
-        epoch: Epoch(2),
-    };
+    let plan = Sweep::new(A, MEMBERS, [source, absent], learner, Epoch(2));
     let keeper = transport.0.remove(&source).unwrap();
-    let unreachable = Sweep {
-        survivors: [absent, source],
-        ..plan
-    };
+    let unreachable = Sweep::new(A, MEMBERS, [absent, source], learner, Epoch(2));
     let [(_, outcome)] = sweep_idle(&transport, [unreachable])
         .await
         .try_into()
@@ -1090,7 +1117,7 @@ async fn sweeper_restores_an_absent_survivor_from_one_durable_copy() {
             page(1, 1, &[(1, b"chosen")])
         );
     }
-    let unknown = Sweep { stream: B, ..plan };
+    let unknown = Sweep::new(B, MEMBERS, [source, absent], learner, Epoch(2));
     let [(_, outcome)] = sweep_idle(&transport, [unknown]).await.try_into().unwrap();
     assert!(
         matches!(
@@ -1208,13 +1235,7 @@ async fn replacement_fences_stale_routes_and_resumes_a_split_install() {
             transport.call(id, request).await.unwrap();
         }
     }
-    let plan = Sweep {
-        stream: A,
-        ensemble: MEMBERS,
-        survivors: [MEMBERS[0], MEMBERS[1]],
-        learner,
-        epoch: Epoch(2),
-    };
+    let plan = Sweep::new(A, MEMBERS, [MEMBERS[0], MEMBERS[1]], learner, Epoch(2));
     let split = SplitReplacement {
         transport: &transport,
         first_installed: Notify::new(),

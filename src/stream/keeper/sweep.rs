@@ -7,11 +7,12 @@ use crate::stream::{codec::MAX_FRAME_BYTES, wire::*};
 /// The caller nominates an idle stream and reserves an epoch for this sweep.
 #[derive(Clone, Copy, Debug)]
 pub struct Sweep {
-    pub stream: StreamId,
-    pub ensemble: [KeeperId; 3],
-    pub survivors: [KeeperId; 2],
-    pub learner: KeeperId,
-    pub epoch: Epoch,
+    stream: StreamId,
+    ensemble: [KeeperId; 3],
+    survivors: [KeeperId; 2],
+    learner: KeeperId,
+    epoch: Epoch,
+    proposal: u128,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +42,24 @@ pub async fn sweep_idle(
 }
 
 impl Sweep {
+    /// Keep the plan to retry this proposal after an uncertain result.
+    pub fn new(
+        stream: StreamId,
+        ensemble: [KeeperId; 3],
+        survivors: [KeeperId; 2],
+        learner: KeeperId,
+        epoch: Epoch,
+    ) -> Self {
+        Self {
+            stream,
+            ensemble,
+            survivors,
+            learner,
+            epoch,
+            proposal: uuid::Uuid::new_v4().as_u128(),
+        }
+    }
+
     async fn install(&self, transport: &dyn Transport) -> Result<(), SweepError> {
         let [first, second] = self.survivors;
         if first == second
@@ -251,7 +270,7 @@ impl Sweep {
             stream: self.stream,
             ensemble,
             epoch: self.epoch,
-            proposal: None,
+            proposal: Some(self.proposal),
         };
         let mut reply = self.call(transport, keeper, seal(self.ensemble)).await?;
         // A crash can leave one survivor on each ensemble. Resume the same move.
@@ -262,7 +281,7 @@ impl Sweep {
             Reply::Sealed(view)
                 if view.promised.as_ref().is_some_and(|(epoch, identity)| {
                     *epoch == self.epoch && identity == transport.identity()
-                }) =>
+                }) && view.proposal == Some(self.proposal) =>
             {
                 Ok(view)
             }

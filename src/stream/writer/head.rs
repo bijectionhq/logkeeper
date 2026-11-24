@@ -6,7 +6,9 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use journal_contract::{Epoch, JournalError, Lsn, Result};
 use tokio::sync::oneshot;
 
-use super::{Io, KeeperId, QUORUM, Reply, Request, Stream, append::Active, refusal};
+use super::{
+    Io, KeeperId, QUORUM, Reply, Request, Stream, append::Active, decision::sample_index, refusal,
+};
 use crate::stream::wire::StreamView;
 
 const RETRY: Duration = Duration::from_millis(1);
@@ -69,7 +71,9 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
             match view.promised {
                 Some((current, identity))
                     if current > active.epoch
-                        || (current == active.epoch && &identity != io.transport.identity()) =>
+                        || (current == active.epoch
+                            && (&identity != io.transport.identity()
+                                || view.proposal != Some(io.proposal))) =>
                 {
                     Err(JournalError::Fenced { current })
                 }
@@ -87,7 +91,7 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
         match reply {
             Ok(tail) => {
                 count += 1;
-                sample = sample.max(tail);
+                sample = Lsn(sample_index(sample.0, tail.0));
                 if count == QUORUM {
                     let head = active.cover(sample).await?;
                     active.published(head).await?;
@@ -184,6 +188,7 @@ fn eligible<'a>(
         .max();
     views.iter().filter(move |view| {
         view.promised == candidate.promised
+            && view.proposal == candidate.proposal
             && view.synced == epoch
             && view.promised.as_ref().map(|p| p.0) == epoch
     })

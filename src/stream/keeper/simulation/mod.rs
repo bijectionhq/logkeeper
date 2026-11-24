@@ -194,13 +194,13 @@ async fn seed_run(seed: u64, trace: Option<&mut BufWriter<File>>) -> Coverage {
         );
         let results = sweep_idle(
             &*network.client(&NEW),
-            [Sweep {
-                stream: STREAM,
-                ensemble: ENSEMBLE,
-                survivors: survivors.clone().try_into().unwrap(),
-                learner: LEARNER,
-                epoch: E2,
-            }],
+            [Sweep::new(
+                STREAM,
+                ENSEMBLE,
+                survivors.clone().try_into().unwrap(),
+                LEARNER,
+                E2,
+            )],
         )
         .await;
         results
