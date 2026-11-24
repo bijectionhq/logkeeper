@@ -15,6 +15,8 @@ the module named in each Verus area's README.
 
 | Rust source | Symbol | Lean counterpart | Coverage |
 | --- | --- | --- | --- |
+| `src/stream/proposer/ticket.rs` | `matches_ticket` | `Logkeeper.StreamProposer.MatchesTicket` | Equivalence |
+| `src/stream/proposer/ticket.rs` | `next_ticket` | `Logkeeper.StreamProposer.NextTicket` | Equivalence |
 | `src/ordered/codec/frame.rs` | `bodyLengthBounded` | `Logkeeper.Codec.bodyLengthBounded` | Equivalence |
 | `src/ordered/codec/frame.rs` | `commandVersion` | `Logkeeper.Codec.commandVersion` | Equivalence |
 | `src/ordered/codec/frame.rs` | `decisionHeader` | `Logkeeper.Codec.decisionHeader` | Equivalence |

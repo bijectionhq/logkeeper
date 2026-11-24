@@ -1,0 +1,41 @@
+{
+  "summary": "Allocate fresh proposer tickets and match outcomes to them.",
+  "flags": ["--no-external-by-default", "--verify-module", "production"],
+  "min_verified_functions": 2,
+  "controls": {
+    "reuse-issued-ticket": {
+      "mutate": [
+        {
+          "file": "src/stream/proposer/ticket.rs",
+          "find": "        Some(previous + 1)\n",
+          "replace": "        Some(previous)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/proposer/ticket.rs",
+          "function": "next_ticket",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    },
+    "match-other-ticket": {
+      "mutate": [
+        {
+          "file": "src/stream/proposer/ticket.rs",
+          "find": "    issued == received\n",
+          "replace": "    issued <= received\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/proposer/ticket.rs",
+          "function": "matches_ticket",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 1
+    }
+  }
+}

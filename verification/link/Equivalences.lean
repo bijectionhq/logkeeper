@@ -1078,6 +1078,24 @@ theorem link_place_extent (offset len : Nat) :
 
 end stream_wal
 
+namespace stream_proposer
+
+theorem link_matches_ticket (issued received : Nat) :
+    matches_ticket issued received ↔ StreamProposer.MatchesTicket issued received := by
+  rfl
+
+theorem link_next_ticket (previous : Nat) (width : previous < 2^64) :
+    next_ticket previous = StreamProposer.NextTicket previous := by
+  by_cases terminal : previous = 2^64 - 1
+  · simp [next_ticket, StreamProposer.NextTicket, terminal]
+  · have within : previous + 1 < 2^64 := by omega
+    simp only [next_ticket, StreamProposer.NextTicket]
+    change (if previous = 2^64 - 1 then none else some (clipUnsigned 64 ((previous : Int) + 1))) = _
+    have castAdd : (previous : Int) + 1 = ((previous + 1 : Nat) : Int) := by omega
+    rw [ite_eq_right terminal, ite_eq_right terminal, castAdd, clipUnsigned_nat 64 _ within]
+
+end stream_proposer
+
 namespace stream_writer
 
 open StreamJournal PrefixAgreement JournalRefinement

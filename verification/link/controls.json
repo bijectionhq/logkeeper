@@ -1,5 +1,19 @@
 [
   {
+    "name": "stream-proposer-reuse-issued-ticket",
+    "file": "src/stream/proposer/ticket.rs",
+    "area": "stream_proposer",
+    "theorem": "link_next_ticket",
+    "edits": [{"find": "Some((previous + 1) as u64)", "replace": "Some(previous)"}]
+  },
+  {
+    "name": "stream-proposer-match-other-ticket",
+    "file": "src/stream/proposer/ticket.rs",
+    "area": "stream_proposer",
+    "theorem": "link_matches_ticket",
+    "edits": [{"find": "ensures out == (issued == received)", "replace": "ensures out == (issued <= received)"}]
+  },
+  {
     "name": "verus-permits-empty-pin",
     "file": "verification/verus/ordered_admission/laws.rs",
     "find": "    start < end && start < floor",

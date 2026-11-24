@@ -185,9 +185,9 @@ the reply receive on the same three-keeper timeline. For `head`, queue drain
 precedes the round, each slot carries its keeper's exact Check or Append sample,
 and the writer supplies two publication completions. The observer can use a
 later confirmation round. The two completion theorems derive the logical
-linearization cut from those exchanges. The Rust queue and lane serials determine
-which replies to include. A lane's observation sender is local to the Append
-future that fills it.
+linearization cut from those exchanges. The writer batches queued callers before opening a round. The lane serial
+marks when its Append is issued, and the observation channel belongs to that
+Append. The observer uses the proposer driver for its own Check rounds.
 
 For Trim, both counted exchanges return floors strictly above the request. The
 model uses the local publication wait when the writer knows the cut and the
@@ -225,30 +225,57 @@ late poll replies, and counting the same keeper twice for Trim or Delete.
 [Exchange proofs](Logkeeper/StreamRpc.lean) · [Read proofs](Logkeeper/StreamRead.lean) ·
 [Recovery proofs](Logkeeper/StreamRecovery.lean)
 
+## Proposer transitions
+
+The proposer dispatches Read, observer Head, election and recovery Sync,
+Create, Trim, Delete, and sweep. The driver executes Send and Sleep effects
+and returns ticketed transport outcomes and timer expiries. Request futures
+own their keeper and ticket. Create and Delete dispatch all three futures
+as tasks, so completion can leave the last already-issued request running.
+Recovery fallback can cancel outstanding waits while preserving possible
+effects of requests that have reached a keeper.
+
+The lane state assigns append positions, decides what each lane needs,
+updates acceptance and publication, and completes new append calls after
+publication. The async adapter still owns the lane tasks, mutation lock,
+Append observation channels and head caller batching.
+
+- [Proposer step](../../src/stream/proposer/mod.rs)
+- [Effect interpreter](../../src/stream/proposer/driver.rs)
+- [Append state](../../src/stream/proposer/append.rs)
+- [Election and Sync](../../src/stream/proposer/recovery.rs)
+- [Replacement](../../src/stream/proposer/sweep.rs)
+
+`StreamProposer.Schedule` checks one slot of the interpreter's order. A
+matching outcome consumes its send, and a stale outcome leaves the slot
+unchanged. A four-event witness issues, cancels, reissues, and receives in
+one slot. The proof uses arbitrary natural-number tickets. The Rust allocation
+and matching functions are verified over all `u64` inputs. The Lean link
+checks their result specifications within that width. Separate mutations
+reuse an issued ticket and accept an outcome with a different ticket.
+[Slot schedule](Logkeeper/StreamProposer.lean)
+
 ## Boundaries
 
-- **Writer send refinement.** The executable construction of run and byte
-  evidence and the induction that produces `Dispatch` at every Rust send
-  remain open. The model separates pending assignments from issued history.
-  `issue` freezes a pending prefix before possible durable acceptance, and
-  `discard` requires three current capacity refusals and coverage of the
-  unanswered-append bound. The capacity witness discards two assignments and
-  reassigns their first position. The model takes lane completion and the
-  capacity outcome as inputs. The revised transport contract makes a reported
-  capacity refusal terminal for its call, and the Rust control delays a
-  timed-out request across trim.
+- **Proposer refinement.** The ticket theorem establishes local ordering.
+  Proving every shipped send `Sendable` still requires an induction relating
+  the actual lane assignments, selected recovery runs and transferred bytes
+  to `StreamIO`'s issued history. `Dispatch` remains a premise of
+  `dispatch_sendable`. The fixed-ensemble `Sendable` datatype also has no
+  `Replace` constructor.
+- **Completion provenance.** A matched ticket identifies the operation
+  and slot. The Lean completion theorems need the exact keeper decision and
+  delivery index, including the first read chunk, each continuation and each
+  sampled or publishing lane. The driver and typed replies do not supply a
+  checked mapping of transport outcomes to these `StreamRpc.Exchange`
+  witnesses. The active writer's watch-channel observations and its local
+  publication gate also need that mapping.
 - **Keeper decisions.** Verus and the link runner cover proposal equality, per-run
   bounds, record charge, Sync head bounds, the projected Replace decision, valid
   ensembles, and installation's ensemble and learner fields. Full refinement of
   `decide` and `apply` still needs the wire request projection, retained bytes and
   run lookup, quota accumulation and the native retained and staged transitions.
   [Keeper decisions](../../src/stream/keeper/rules.rs)
-- **Async Rust binding.** The completion theorems use exchanges tagged with
-  their exact request and durable decision. A mechanized correspondence from
-  Tokio queue, watch and transport events to those exchanges remains open,
-  including the local publication wait, read timers, and construction of the
-  wire reply's exact byte and epoch image. Tests exercise the shipped paths and
-  the Verus links check the corresponding pure decision functions.
 - **Replacement and authority.** The repeatable transfer theorem starts from two
   projected publication deliveries and preserved survivor states. It assumes that
   the next roster supplies a reachable automaton state. The raw Seal, Recover, Sync
@@ -265,33 +292,7 @@ late poll replies, and counting the same keeper twice for Trim or Delete.
 - **Payload bytes.** The replay checks positions and record epochs. The conformance
   history checker compares payload bytes.
 
-## Await sites
-
-These sites identify the action or completion boundary an I/O automaton needs
-to represent. Wrapper futures share the action of the delegated future.
-
-| Path | Await sites and effects |
-| --- | --- |
-| Stream entry points | [Placement delegates to Create](../../src/stream/writer/mod.rs#L103), [Create locks the stream](../../src/stream/writer/mod.rs#L275) and [collects a quorum](../../src/stream/writer/mod.rs#L285), [Seal delegates to the election](../../src/stream/writer/mod.rs#L290), [Append waits for its active lane result](../../src/stream/writer/mod.rs#L303) or probes authority on [a local conflict or trim](../../src/stream/writer/mod.rs#L305) or [a missing active epoch](../../src/stream/writer/mod.rs#L309), and the [Read](../../src/stream/writer/mod.rs#L321), [Head](../../src/stream/writer/mod.rs#L325) and [Trim](../../src/stream/writer/mod.rs#L329) wrappers delegate to their respective state. |
-| Mutation coordination | [Acquire election lock](../../src/stream/writer/mod.rs#L115), [complete same-epoch head check](../../src/stream/writer/mod.rs#L127), [choose the recovery history](../../src/stream/writer/mod.rs#L136), [await ready lanes](../../src/stream/writer/mod.rs#L141), [await adopted head publication](../../src/stream/writer/mod.rs#L143), [acquire trim lock](../../src/stream/writer/mod.rs#L162), [probe trim authority](../../src/stream/writer/mod.rs#L165), [await known head coverage](../../src/stream/writer/mod.rs#L169), [receive Trim reply](../../src/stream/writer/mod.rs#L185) and [finish Trim quorum](../../src/stream/writer/mod.rs#L192), then the independent Delete path [acquires its lock](../../src/stream/writer/mod.rs#L335) and [finishes its broadcast quorum](../../src/stream/writer/mod.rs#L345). |
-| RPC and quorum collection | [Receive an authority reply](../../src/stream/writer/mod.rs#L227), [receive an RPC or timeout](../../src/stream/writer/mod.rs#L361), [receive a broadcast lane reply](../../src/stream/writer/mod.rs#L379), [join the spawned lane](../../src/stream/writer/mod.rs#L387), [finish broadcast quorum](../../src/stream/writer/mod.rs#L389), [receive empty Append publication](../../src/stream/writer/mod.rs#L411) and [collect the next quorum reply](../../src/stream/writer/mod.rs#L425). |
-| Election and recovery | [Receive a Seal reply](../../src/stream/writer/recovery.rs#L32) and [select from the quorum](../../src/stream/writer/recovery.rs#L36). Each lane [seals its target](../../src/stream/writer/recovery.rs#L73), may [install a newer floor](../../src/stream/writer/recovery.rs#L82), and otherwise [fetches a record](../../src/stream/writer/recovery.rs#L103), [installs a chunk](../../src/stream/writer/recovery.rs#L120) and [completes Sync](../../src/stream/writer/recovery.rs#L123). |
-| Recovery RPCs | [Fetch from the selected keeper](../../src/stream/writer/recovery.rs#L139), or [seal a fallback](../../src/stream/writer/recovery.rs#L145), [fetch its record](../../src/stream/writer/recovery.rs#L149) and [choose an eligible reply](../../src/stream/writer/recovery.rs#L152). The wrappers await [floor installation](../../src/stream/writer/recovery.rs#L172), [Recover](../../src/stream/writer/recovery.rs#L196), [Seal](../../src/stream/writer/recovery.rs#L221) and [Sync](../../src/stream/writer/recovery.rs#L265). |
-| Append progress | Wake [ready](../../src/stream/writer/append.rs#L129), [published](../../src/stream/writer/append.rs#L164) and [competing payload](../../src/stream/writer/append.rs#L235) waiters on lane changes. Receive [the chosen position](../../src/stream/writer/append.rs#L240), then [await head publication](../../src/stream/writer/append.rs#L243), or [retry a committed position](../../src/stream/writer/append.rs#L247) and [check its reply quorum](../../src/stream/writer/append.rs#L269). [Wake a head round that needs to cover a sample](../../src/stream/writer/append.rs#L313). |
-| Append lanes | [Sync a lane](../../src/stream/writer/append.rs#L324), [install a floor](../../src/stream/writer/append.rs#L328), [fetch committed bytes](../../src/stream/writer/append.rs#L334), [complete an Append call](../../src/stream/writer/append.rs#L337) or [complete publication](../../src/stream/writer/append.rs#L343). The fetcher [collects the next Recover reply](../../src/stream/writer/append.rs#L376) and sender [receives an Append reply](../../src/stream/writer/append.rs#L403). The lane [wakes on new work](../../src/stream/writer/append.rs#L539) and [returns the work result to the lane state](../../src/stream/writer/append.rs#L550). |
-| Head caller and round | [Yield to batch callers](../../src/stream/writer/head.rs#L22), [complete a check](../../src/stream/writer/head.rs#L25), [complete fallback observation](../../src/stream/writer/head.rs#L29) and [return the result to a caller](../../src/stream/writer/head.rs#L40). The check delegates to [writer](../../src/stream/writer/head.rs#L45) or [observer](../../src/stream/writer/head.rs#L47) sampling. |
-| Head sampling | The writer [yields after opening](../../src/stream/writer/head.rs#L54), awaits [a fresh lane observation](../../src/stream/writer/head.rs#L58) or [Check](../../src/stream/writer/head.rs#L66), [collects samples](../../src/stream/writer/head.rs#L84), [covers the selected tail](../../src/stream/writer/head.rs#L90) and [confirms publication](../../src/stream/writer/head.rs#L91). The observer [completes a round](../../src/stream/writer/head.rs#L109), [retries after a delay](../../src/stream/writer/head.rs#L113) and [collects the next Check](../../src/stream/writer/head.rs#L125). The shared Check wrapper [awaits the wire reply](../../src/stream/writer/head.rs#L176). |
-| Reads | [Try one keeper](../../src/stream/writer/read.rs#L23), [sample the first chunk](../../src/stream/writer/read.rs#L69) and [fetch subsequent chunks](../../src/stream/writer/read.rs#L97). The keeper [enqueues the request](../../src/stream/keeper/mod.rs#L115), [waits for the WAL worker's result](../../src/stream/keeper/mod.rs#L117) and [wakes or times out a long poll](../../src/stream/keeper/mod.rs#L121). |
-| Replacement coordination | [Complete a sweep plan](../../src/stream/keeper/sweep.rs#L38), [seal both survivors](../../src/stream/keeper/sweep.rs#L59), [copy to the other survivor](../../src/stream/keeper/sweep.rs#L87), [complete Sync on the source](../../src/stream/keeper/sweep.rs#L99), [publish on both survivors](../../src/stream/keeper/sweep.rs#L103), [create the learner](../../src/stream/keeper/sweep.rs#L116), [seal the learner](../../src/stream/keeper/sweep.rs#L117), [copy to the learner](../../src/stream/keeper/sweep.rs#L130), [install both survivors](../../src/stream/keeper/sweep.rs#L131) and [promote the learner](../../src/stream/keeper/sweep.rs#L135). |
-| Replacement RPCs | [Recover a chunk](../../src/stream/keeper/sweep.rs#L163), [install it](../../src/stream/keeper/sweep.rs#L207) or [complete an empty copy](../../src/stream/keeper/sweep.rs#L223). [Seal the old roster](../../src/stream/keeper/sweep.rs#L237) and [retry the new roster](../../src/stream/keeper/sweep.rs#L240) on a split installation. [Await Replace](../../src/stream/keeper/sweep.rs#L271), [await Sync](../../src/stream/keeper/sweep.rs#L301), [await publication](../../src/stream/keeper/sweep.rs#L322), [check the expected reply](../../src/stream/keeper/sweep.rs#L332) and [receive the transport reply](../../src/stream/keeper/sweep.rs#L348). |
-
-
-The storage change preserves the automaton's durable image. Physical WAL
-rollover can split an entry across segments, and the shared checkpoint worker
-publishes the complete boundary before removing covered files. Rust
-regressions exercise cross-segment recovery and the pre-publication and
-post-publication crash states. The trace checker still projects each keeper
-effect and reopen to the same state. An isolated append continues to require
-quorum acceptance before publication. The first-accept control reaches a
-single local acceptance and checks that a read cannot expose it before a
-takeover that adopts an empty history.
+The trace checker projects recorded keeper effects and reopens to the same
+durable state. The first-accept control reaches one durable acceptance and
+checks that a read cannot expose it before a takeover adopting an empty
+history.

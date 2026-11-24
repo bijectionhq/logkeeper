@@ -214,6 +214,12 @@
       "head_quorum": "Logkeeper.StreamHead.HeadQuorum"
     }
   },
+  "stream_proposer": {
+    "src/stream/proposer/ticket.rs": {
+      "matches_ticket": "Logkeeper.StreamProposer.MatchesTicket",
+      "next_ticket": "Logkeeper.StreamProposer.NextTicket"
+    }
+  },
   "stream_wal": {
     "src/stream/keeper/wal_layout.rs": {
       "frame_body_fits": "Logkeeper.StreamWAL.FrameBodyFits",

@@ -36,3 +36,4 @@ import Logkeeper.StreamWAL
 import Logkeeper.StreamRpc
 import Logkeeper.StreamRead
 import Logkeeper.StreamRecovery
+import Logkeeper.StreamProposer
