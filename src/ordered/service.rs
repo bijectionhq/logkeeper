@@ -351,6 +351,7 @@ impl<R: Replica> Coordinator<R> {
         let (replay, skip) = replay_from(&state, session, hold, from)?;
         replay_page(
             replay.checkpoint(),
+            from,
             replay.through(),
             replay.records().skip(skip),
             maximum_bytes,
@@ -401,11 +402,15 @@ impl<R: Replica> Coordinator<R> {
     ) -> Result<Option<ReplayHead>, Error> {
         let state = self.recover(session).await?;
         let (replay, skip) = replay_from(&state, session, hold, from)?;
-        Ok(replay.records().nth(skip).map(|entry| ReplayHead {
+        let Some(entry) = replay.records().nth(skip) else {
+            return if from == replay.through() { Ok(None) } else { Err(Refusal::Invalid.into()) };
+        };
+        let record_bytes = record_charge(from.next_lsn, replay.through().next_lsn, entry)?;
+        Ok(Some(ReplayHead {
             next: entry.result.cut,
             timestamp: entry.timestamp,
             payload_bytes: entry.payload.len() as u64,
-            record_bytes: entry.result.byte_end - entry.result.byte_start,
+            record_bytes,
         }))
     }
 
@@ -478,6 +483,7 @@ fn checkpoint_records(
     .ok_or(Refusal::Invalid)?;
     replay_page(
         base,
+        from,
         through,
         state.records.range(first..end),
         maximum_bytes,
@@ -486,28 +492,40 @@ fn checkpoint_records(
 
 fn replay_page<'a>(
     checkpoint: Checkpoint,
+    from: Cut,
     through: Cut,
     records: impl Iterator<Item = &'a Record>,
     mut remaining: usize,
 ) -> Result<ReplayPage, Error> {
     let mut page = Vec::new();
+    let mut cursor = from;
     for record in records {
-        let size = usize::try_from(record.result.byte_end - record.result.byte_start)
+        let size = usize::try_from(record_charge(cursor.next_lsn, through.next_lsn, record)?)
             .map_err(|_| Refusal::Capacity)?;
         let Some(next) = remaining.checked_sub(size) else {
             if page.is_empty() {
                 return Err(Refusal::Capacity.into());
             }
-            break;
+            return Ok(ReplayPage { checkpoint, through, records: page });
         };
         remaining = next;
+        cursor = record.result.cut;
         page.push(record.clone());
+    }
+    if cursor != through {
+        return Err(Refusal::Invalid.into());
     }
     Ok(ReplayPage {
         checkpoint,
         through,
         records: page,
     })
+}
+
+fn record_charge(from: u64, through: u64, record: &Record) -> Result<u64, Error> {
+    super::replay_bounds::replay_record_charge(
+        from, record.result.cut.next_lsn, through, record.result.byte_start, record.result.byte_end,
+    ).ok_or_else(|| Refusal::Invalid.into())
 }
 
 fn replay_from(

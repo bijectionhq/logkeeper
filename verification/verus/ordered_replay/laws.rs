@@ -1,4 +1,4 @@
-use crate::production::{cursor_offset, retained_indices};
+use crate::production::{cursor_offset, replay_record_charge, retained_indices};
 use vstd::prelude::*;
 
 verus! {
@@ -35,6 +35,15 @@ pub fn resume_requires_exact_cut_in_original_interval(
         !exact_cut ==> skip is None,
 {
     cursor_offset(start, from, through, exact_cut)
+}
+
+pub fn replay_head_and_page_charge_the_exact_successor(
+    from: u64, record_cut: u64, through: u64, byte_start: u64, byte_end: u64,
+) -> (charge: Option<u64>)
+    ensures charge matches Some(bytes) ==> from as int + 1 == record_cut
+        && record_cut <= through && byte_start as int + bytes == byte_end,
+{
+    replay_record_charge(from, record_cut, through, byte_start, byte_end)
 }
 
 }

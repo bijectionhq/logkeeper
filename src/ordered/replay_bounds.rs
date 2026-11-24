@@ -35,3 +35,16 @@ pub(super) fn cursor_offset(start: u64, from: u64, through: u64, exact_cut: bool
     }
     Some(offset as usize)
 }
+
+#[cfg_attr(verus_keep_ghost, verus_spec(charge => ensures
+    (charge is Some) == (from as int + 1 == record_cut && record_cut <= through && byte_start <= byte_end),
+    charge matches Some(bytes) ==> bytes as int == byte_end as int - byte_start as int,
+))]
+pub(super) fn replay_record_charge(
+    from: u64, record_cut: u64, through: u64, byte_start: u64, byte_end: u64,
+) -> Option<u64> {
+    if from.checked_add(1) != Some(record_cut) || record_cut > through {
+        return None;
+    }
+    byte_end.checked_sub(byte_start)
+}
