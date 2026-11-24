@@ -16,7 +16,7 @@ use journal_contract::{BoxFuture, Epoch, Identity, Journal, JournalError, Lsn, S
 use logkeeper::stream::{
     keeper::{Sweep, SweepError, sweep_idle},
     transport::{Credentials, TcpTransport},
-    wire::{KeeperId, Reply, Request, Transport, TransportError},
+    wire::{EpochRun, KeeperId, Reply, Request, Transport, TransportError},
     writer::Writer,
 };
 use serde_json::{Value, json};
@@ -524,13 +524,103 @@ pub async fn partition(binary: &Path, rtt: Duration, streams: u64) -> Result<()>
     fault_results("partition", rtt, start, claimed)
 }
 
+async fn park(io: &Measured, id: u64) -> Result<()> {
+    let stream = StreamId(id.into());
+    // Seed exactly two durable copies, including one on the keeper we will lose.
+    // Alternate survivors so both positions in the sweep see missing metadata.
+    let survivor = ENSEMBLE[1 + id as usize % 2];
+    try_join_all(
+        [ENSEMBLE[0], survivor]
+            .into_iter()
+            .map(|keeper| async move {
+                let requests = [
+                    Request::Create {
+                        stream,
+                        ensemble: ENSEMBLE,
+                    },
+                    Request::Seal {
+                        stream,
+                        ensemble: ENSEMBLE,
+                        epoch: CURRENT,
+                    },
+                    Request::Sync {
+                        stream,
+                        epoch: CURRENT,
+                        floor: Lsn(1),
+                        from: Lsn(1),
+                        records: vec![record()],
+                        runs: vec![EpochRun {
+                            epoch: CURRENT,
+                            first: Lsn(1),
+                            last: Lsn(1),
+                        }],
+                        head: Lsn(1),
+                        complete: true,
+                    },
+                ];
+                for (step, request) in requests.into_iter().enumerate() {
+                    retry(|| async {
+                        let reply = io.call(keeper, request.clone()).await;
+                        match (step, reply) {
+                            (0, Ok(Reply::Created))
+                            | (1, Ok(Reply::Sealed(_)))
+                            | (2, Ok(Reply::Synced { tail: Lsn(1) })) => Ok(()),
+                            _ => Err(JournalError::Unavailable),
+                        }
+                    })
+                    .await?;
+                }
+                Ok::<_, BenchError>(())
+            }),
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn replace(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
     assert!(streams >= 100 && streams % 100 == 0);
     let mut cluster = Cluster::start(binary, [rtt; 3], CAP).await?;
-    let writer = Measured::connect(&cluster, &cluster.writer)?.writer()?;
+    let io = Measured::connect(&cluster, &cluster.writer)?;
+    let writer = io.writer()?;
     eprintln!("Preparing {streams} replacement streams");
-    prepare(&writer, streams).await?;
-    seed(&writer, 1..=streams).await?;
+    // The active cohort keeps its writer after the fault. Start that cohort with
+    // metadata on both survivors, so it can keep writing as idle streams move.
+    let count = streams / 100;
+    stream::iter(1..=count)
+        .map(|id| {
+            let io = &io;
+            async move {
+                for keeper in ENSEMBLE {
+                    retry(|| async {
+                        match io
+                            .call(
+                                keeper,
+                                Request::Create {
+                                    stream: StreamId(id.into()),
+                                    ensemble: ENSEMBLE,
+                                },
+                            )
+                            .await
+                        {
+                            Ok(Reply::Created) => Ok(()),
+                            _ => Err(JournalError::Unavailable),
+                        }
+                    })
+                    .await?;
+                }
+                Ok::<_, BenchError>(())
+            }
+        })
+        .buffer_unordered(PARALLEL)
+        .try_collect::<Vec<_>>()
+        .await?;
+    prepare(&writer, count).await?;
+    seed(&writer, 1..=count).await?;
+    stream::iter(count + 1..=streams)
+        .map(|id| park(&io, id))
+        .buffer_unordered(PARALLEL)
+        .try_collect::<Vec<_>>()
+        .await?;
     cluster.keepers[0].kill()?;
     cluster.add(binary, LEARNER, rtt, CAP).await?;
     eprintln!("Installing a learner for {streams} streams");
@@ -542,7 +632,6 @@ pub async fn replace(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
         learner: LEARNER,
         epoch: NEXT,
     };
-    let count = streams / 100;
     let start = Instant::now();
     let sweep = |id| {
         let transport = &transport;
