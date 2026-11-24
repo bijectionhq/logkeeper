@@ -21,3 +21,5 @@ import Logkeeper.VoterTransport
 import Logkeeper.CodecDomains
 import Logkeeper.RuntimeGroups
 import Logkeeper.Reducer
+import Logkeeper.AsyncGroup
+import Logkeeper.AsyncGroupWitness

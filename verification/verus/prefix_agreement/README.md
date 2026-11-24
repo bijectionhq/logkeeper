@@ -38,4 +38,4 @@ Both controls require the named rejection at the exact injected event.
 The local proofs use the authenticated endpoint and digest-binding contracts.
 Each `Replica` instance represents one configured voter with a stable UUID throughout a round.
 Trace validation covers the recorded executions, including one lost accept and a warm restart after a newer prefix reached only one voter.
-A universal refinement of the asynchronous group, wire, full journal reducer and snapshot codecs, and the voter media I/O and crash model remains open.
+The [asynchronous group model](../../lean/async-group.md) projects each modeled action to these reference definitions. It describes the remaining Rust action boundaries, including executor cancellation, the Promise and image projections, and filesystem effects. The native trace runner can also generate seeded fault schedules.
