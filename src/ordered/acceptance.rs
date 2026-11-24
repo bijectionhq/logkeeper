@@ -1116,15 +1116,8 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
         Err(Refusal::Unauthorized)
     );
     let mut advanced = state.clone();
-    assert!(matches!(
-        append(&mut advanced, old),
-        Ok(Outcome::Appended(_))
-    ));
-    assert_eq!(
-        apply(&mut advanced, custodian, rotate.clone()).outcome,
-        Err(Refusal::Stale)
-    );
-
+    assert_eq!(append(&mut advanced, old), Err(Refusal::Unavailable));
+    assert_eq!(advanced.head, state.head);
     assert_eq!(advanced.checkpoint(), initial.checkpoint());
 
     let request = Request {
