@@ -37,13 +37,14 @@ BASELINES = {
     "protocol": (*RULES, *PROTOCOL),
     "wal": WAL,
     "handoff": (*RULES, "DelayedAppendAlreadyCommitted"),
-    "retention": (*RULES, "KeeperBounds"),
+    "retention": (*RULES, "KeeperBounds", "QuorumTrimReadFloor"),
 }
 WITNESSES = (
     ("protocol", "NoProtocolWitness"),
     ("protocol", "NoNonWriterWitness"),
     ("wal", "NoWalWitness"),
     ("handoff", "NoDelayedAppendWitness"),
+    ("retention", "NoTrimReadWitness"),
 )
 CONTROLS = (
     ("rules", "recreate", "CreateGuard"),
@@ -75,12 +76,12 @@ CONTROLS = (
     ("wal", "early-wal-reply", "ReplyDurable"),
     ("wal", "cross-frontier", "ReplyDurable"),
     ("wal", "wrong-stream", "ExactDemux"),
+    ("retention", "single-read-floor", "QuorumTrimReadFloor"),
 )
 GAPS = (
     ("protocol", "writer-known-only", "HeadLinearizable"),
     ("protocol", "none", "BothSurvivorsAfterLoss"),
     ("handoff", "seal-observed-only", "DelayedAppendAlreadyCommitted"),
-    ("retention", "none", "QuorumTrimReadFloor"),
 )
 
 

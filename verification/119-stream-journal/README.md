@@ -73,7 +73,7 @@ scenarios. TLC explores each bounded program and its permitted interleavings.
 | `protocol` | Two streams, three zones and one replacement identity. Two writer epochs, two records, one lost Append reply, one permanent AZ loss, one learner promotion, one delayed zombie request and one head invocation. The second append's voting pair, zombie recipient, invocation, round, samples, finish and optional shared-tail tear can vary. |
 | `wal` | One keeper, two streams, at most four abstract frames and at most one pending frame per stream. A shared covering sync, replies and tears can interleave. |
 | `handoff` | One stream, two epochs, three keepers and one record. The newer writer syncs the inherited suffix to two keepers before the older writer's delayed accept reaches the third. |
-| `retention` | One stream, one epoch, three keepers and one record. Two keepers trim before a read from the third. |
+| `retention` | One stream, one epoch, three keepers and one record. Two keepers trim before the read samples any pair at either the old or new floor. |
 
 The protocol tear occurs at the keeper that later holds the only live copy
 of the first choice after AZ loss. The later tail has a frame for each
@@ -99,10 +99,13 @@ liveness and long-poll deadlines are outside these bounds.
   count as committed when seal returns. Reporting only the old advertised
   watermark can let a delayed lower-epoch accept extend the committed cut
   after the seal.
-- **Trim and read routing.** A single keeper's Read can return a page below
-  an acknowledged quorum trim. The proof covers reads at the keeper's
-  advertised floor. The distributed read path needs a floor publication
-  or validation rule.
+- **Trim and read routing.** The writer checks a fresh quorum of members of
+  the routed ensemble and uses the greatest reported floor. The read quorum
+  intersects every completed trim quorum, so a stale keeper cannot lower the
+  returned floor. The retention scenario checks both a below-floor refusal
+  and a page at the new floor. Its single-keeper control reproduces the
+  original 18-transition counterexample. The runtime regression exercises
+  this route with the real keeper reducer.
 
 Open details include below-floor retries after the comparison bytes are
 discarded, propagation of floor and tombstones across keeper changes, and

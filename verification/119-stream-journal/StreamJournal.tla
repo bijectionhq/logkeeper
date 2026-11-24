@@ -401,12 +401,25 @@ Handoff ==
          /\ UNCHANGED <<wal,head>>
       [] OTHER -> FALSE
 
-\* Directly using an arbitrary keeper's page can expose a trimmed record.
+ContractRead(left,right,pos) ==
+    LET a == store[left][Stream]
+        b == store[right][Stream]
+        floor == Max(a.floor,b.floor)
+        source == IF a.commit >= b.commit THEN a ELSE b
+        page == [Page(source,Read(pos,1),source.commit) EXCEPT !.floor = floor]
+    IN /\ event' = [before |-> b, request |-> Request("contract-read",0,0,pos,<<>>,1,FALSE),
+                    result |-> [ok |-> pos >= floor, image |-> b, value |-> page]]
+       /\ pc' = pc+1
+       /\ UNCHANGED <<store,writer,wal,head>>
+
 TrimRead ==
     CASE pc \in 10..12 -> Do(pc-9,Stream,AppendTo(1,1,X,0))
       [] pc \in 13..15 -> Do(pc-12,Stream,AppendTo(1,1,X,1))
       [] pc \in 16..17 -> Do(pc-15,Stream,Trim(1,1))
-      [] pc = 18 -> Do(3,Stream,Read(1,1))
+      [] pc = 18 ->
+           IF Fault = "single-read-floor" THEN Do(3,Stream,Read(1,1))
+           ELSE \E left,right \in Originals, pos \in 1..2 :
+                  left < right /\ ContractRead(left,right,pos)
       [] OTHER -> FALSE
 
 Next ==
@@ -472,8 +485,11 @@ BothSurvivorsAfterRepair == writer.repaired =>
     \A k \in {2,3} : Prefix(X,store[k][Stream].history)
 DelayedAppendAlreadyCommitted == (Scenario = "handoff" /\ writer.tried) =>
     Len(writer.committed) <= writer.sealedEnd
-QuorumTrimReadFloor == (Scenario = "retention" /\ pc = 19 /\ event.result.ok) =>
-    event.result.value.floor >= 2
+QuorumTrimReadFloor == (Scenario = "retention" /\ pc = 19) =>
+    /\ event.result.value.floor >= 2
+    /\ event.result.ok = (event.request.pos >= event.result.value.floor)
+NoTrimReadWitness == ~(Scenario = "retention" /\ pc = 19 /\ event.before.floor = 1
+    /\ event.request.pos = 1 /\ ~event.result.ok /\ event.result.value.floor = 2)
 NoDelayedAppendWitness == ~(writer.tried /\ writer.epoch = 2 /\ writer.committed = X
     /\ store[3][Stream].promised = 1 /\ event.result.ok)
 NoProtocolWitness == ~(writer.epoch = 2 /\ writer.lost /\ writer.retried /\ writer.tried

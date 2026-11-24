@@ -27,7 +27,7 @@ two-keeper commit witness is part of the 21 stream-journal reports.
 | protocol | 20,289 |
 | wal | 544 |
 | handoff | 17 |
-| retention | 19 |
+| retention | 22 |
 
 ## Reachable TLC executions
 
@@ -40,6 +40,7 @@ that state is reachable with the baseline guards.
 | `NoNonWriterWitness` | A non-writer returns 2 with fresh Check and commit coverage. | 31 |
 | `NoWalWitness` | One barrier covers both streams, both reply and a later tail from both streams tears. | 8 |
 | `NoDelayedAppendWitness` | The original writer's delayed second accept succeeds at the unfenced third keeper after the new seal publishes the same record. | 16 |
+| `NoTrimReadWitness` | The read quorum includes a stale keeper and refuses a read below the completed trim's floor. | 18 |
 
 ## TLC controls
 
@@ -74,6 +75,7 @@ that state is reachable with the baseline guards.
 | early-wal-reply | `ReplyDurable` | 2 |
 | cross-frontier | `ReplyDurable` | 5 |
 | wrong-stream | `ExactDemux` | 4 |
+| single-read-floor | `QuorumTrimReadFloor` | 18 |
 
 ## TLC specification probes
 
@@ -82,4 +84,3 @@ that state is reachable with the baseline guards.
 | Immediate D03 with two acknowledgements | `BothSurvivorsAfterLoss` | 13 |
 | Writer answers with its locally known cut after a lost reply | `HeadLinearizable` | 16 |
 | Seal returns only the advertised commit watermark | `DelayedAppendAlreadyCommitted` | 16 |
-| Contract Read takes any one keeper's floor after quorum Trim | `QuorumTrimReadFloor` | 18 |

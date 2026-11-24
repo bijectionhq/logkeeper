@@ -1,0 +1,42 @@
+{
+  "summary": "The shipped append-acknowledgement quorum and recovery ranking decisions.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 10,
+  "controls": {
+    "one-keeper": {
+      "mutate": [
+        {"file": "src/stream/writer/decision.rs", "find": "(a && b) || (a && c) || (b && c)", "replace": "a || (b && c)"}
+      ],
+      "expect": [{"file": "src/stream/writer/decision.rs", "function": "acknowledged", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 9
+    },
+    "ignore-epoch": {
+      "mutate": [
+        {"file": "src/stream/writer/decision.rs", "find": "Some((accepted_epoch, end)) => accepted_epoch == epoch && end >= at,\n        None => false,\n    }\n}", "replace": "Some((_accepted_epoch, end)) => end >= at,\n        None => false,\n    }\n}"}
+      ],
+      "expect": [{"file": "src/stream/writer/decision.rs", "function": "covers", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 9
+    },
+    "ignore-end": {
+      "mutate": [
+        {"file": "src/stream/writer/decision.rs", "find": "Some((accepted_epoch, end)) => accepted_epoch == epoch && end >= at,\n        None => false,\n    }\n}", "replace": "Some((accepted_epoch, _end)) => accepted_epoch == epoch,\n        None => false,\n    }\n}"}
+      ],
+      "expect": [{"file": "src/stream/writer/decision.rs", "function": "covers", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 9
+    },
+    "prefer-longer-over-newer": {
+      "mutate": [
+        {"file": "src/stream/writer/decision.rs", "find": "(Some(a), Some(b)) => b > a || (b == a && right_end > left_end),\n        (None, Some(_)) => true,\n        (None, None) => right_end > left_end,\n        (Some(_), None) => false,\n    }\n}", "replace": "(Some(a), Some(b)) => right_end > left_end || (right_end == left_end && b > a),\n        (None, Some(_)) => true,\n        (None, None) => right_end > left_end,\n        (Some(_), None) => false,\n    }\n}"}
+      ],
+      "expect": [{"file": "src/stream/writer/decision.rs", "function": "outranks", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 9
+    },
+    "ignore-tie-break": {
+      "mutate": [
+        {"file": "src/stream/writer/decision.rs", "find": "(Some(a), Some(b)) => b > a || (b == a && right_end > left_end),\n        (None, Some(_)) => true,\n        (None, None) => right_end > left_end,\n        (Some(_), None) => false,\n    }\n}", "replace": "(Some(a), Some(b)) => b > a,\n        (None, Some(_)) => true,\n        (None, None) => right_end > left_end,\n        (Some(_), None) => false,\n    }\n}"}
+      ],
+      "expect": [{"file": "src/stream/writer/decision.rs", "function": "outranks", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 9
+    }
+  }
+}
