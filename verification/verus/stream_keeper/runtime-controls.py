@@ -49,11 +49,18 @@ CONTROLS = [
         "a different certificate identity must be fenced at the same epoch",
     ),
     (
-        "drop-legacy-identity", "keeper/wal.rs",
+        "drop-wal-identity", "keeper/wal.rs",
         "Ok(Some(Identity::from(uri)))",
         'Ok(Some(Identity::from("urn:logkeeper:client:wrong")))',
-        KEEPER_TEST + "replay_uses_the_legacy_certificate_identity",
+        KEEPER_TEST + "replacement_ensemble_survives_wal_recovery",
         "replay must preserve the authenticated certificate identity",
+    ),
+    (
+        "drop-wal-replacement", "keeper/wal.rs",
+        "        states\n            .entry(id)",
+        "        if matches!(request, Request::Replace { .. }) { continue; }\n        states\n            .entry(id)",
+        KEEPER_TEST + "replacement_ensemble_survives_wal_recovery",
+        "replay must preserve the new ensemble",
     ),
     (
         "ignore-wal-crc", "keeper/wal.rs",

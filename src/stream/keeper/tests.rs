@@ -1,6 +1,6 @@
 use std::{fs, fs::OpenOptions, io::Write, path::PathBuf};
 
-use bytes::{Buf, BufMut};
+use bytes::Buf;
 use journal_contract::BoxFuture;
 use tempfile::{TempDir, tempdir};
 
@@ -236,43 +236,6 @@ fn seal_fences_lower_epochs_and_equal_epochs_from_other_identities() {
     test.engine.process(VecDeque::from([work])).unwrap();
     assert_eq!(result.try_recv().unwrap().0.unwrap(), fenced);
     assert_eq!(test.engine.wal.rounds.len(), synced_rounds);
-}
-
-#[test]
-fn replay_uses_the_legacy_certificate_identity() {
-    let mut test = Harness::new(Limits::default());
-    assert_eq!(test.send(create(A)), Reply::Created);
-
-    let uri = CLIENT.as_str().as_bytes();
-    let mut old = BytesMut::new();
-    old.put_u32(uri.len() as u32);
-    old.put_slice(uri);
-    old.put_u8(1); // Legacy Seal.
-    old.put_u128(A.0);
-    old.put_u64(1);
-    old.put_u128(7); // Legacy claimed holder.
-    for member in MEMBERS {
-        old.put_u128(member.0);
-    }
-    let mut round = BytesMut::new();
-    wal::fragment(&mut round, A, true, true, &old);
-    test.engine.wal.write_round(&round).unwrap();
-
-    let Harness { engine, dir } = test;
-    drop(engine);
-    let mut test = Harness {
-        engine: Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap(),
-        dir,
-    };
-    let Reply::Checked(view) = test.send(check(A)) else {
-        panic!("the legacy seal did not replay");
-    };
-    assert_eq!(
-        view.promised,
-        Some((Epoch(1), CLIENT.clone())),
-        "replay must preserve the authenticated certificate identity"
-    );
-    assert!(matches!(test.send(seal(A, 1)), Reply::Sealed(_)));
 }
 
 #[test]
@@ -1108,6 +1071,15 @@ fn replacement_ensemble_survives_wal_recovery() {
         engine: Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap(),
         dir,
     };
+    let Reply::Checked(view) = reopened.send(check(A)) else {
+        panic!("the replaced stream did not replay");
+    };
+    assert_eq!(view.ensemble, new, "replay must preserve the new ensemble");
+    assert_eq!(
+        view.promised,
+        Some((Epoch(1), CLIENT.clone())),
+        "replay must preserve the authenticated certificate identity"
+    );
     assert_eq!(
         reopened.send(seal(A, 2)),
         Reply::Refused(Refusal::WrongEnsemble { ensemble: new })

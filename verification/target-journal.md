@@ -179,7 +179,6 @@ frame, discards incomplete entries and demultiplexes by stream. Segment
 rotation copies changed retained records to per-stream extents, persists
 checkpoints and retires old segments. Delete forces rotation. Each stream
 has a static quota. Trim can advance the floor without available quota.
-The WAL and checkpoint reader also accepts the prior on-disk format.
 
 ## 4. What the consumer (RTDB) owns, for reference
 

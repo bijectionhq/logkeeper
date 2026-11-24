@@ -19,17 +19,13 @@ use super::{
 };
 use crate::stream::{
     codec::{self, MAX_FRAME_BYTES, invalid},
-    wire::{Epoch, Identity, KeeperId, Lsn, Request, StreamId, StreamView},
+    wire::{Epoch, Identity, KeeperId, Lsn, Request, StreamId},
 };
-
-mod legacy;
 
 pub(super) const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const FRAME_OVERHEAD: usize = 8 + 16 + 1;
 pub(super) const MAX_IDENTITY_BYTES: usize = 4096;
-const MAX_ENTRY_BYTES: usize = MAX_FRAME_BYTES + 8 + MAX_IDENTITY_BYTES;
-// The legacy format starts with a bounded identity length at these offsets.
-const PROTOBUF: u32 = u32::MAX;
+const MAX_ENTRY_BYTES: usize = MAX_FRAME_BYTES + 4 + MAX_IDENTITY_BYTES;
 const START: u8 = 1;
 const END: u8 = 2;
 
@@ -51,8 +47,7 @@ pub(super) struct Wal {
 pub(super) fn entry(request: &Request, identity: Option<&Identity>) -> io::Result<Bytes> {
     let body = codec::encode_request(request)?;
     let identity = identity.map_or("", Identity::as_str).as_bytes();
-    let mut entry = BytesMut::with_capacity(8 + identity.len() + body.len());
-    entry.put_u32(PROTOBUF);
+    let mut entry = BytesMut::with_capacity(4 + identity.len() + body.len());
     put_bytes(&mut entry, identity)?;
     entry.put_slice(&body);
     Ok(entry.freeze())
@@ -363,13 +358,8 @@ fn replay(
             fragments.remove(&id).expect("finished entry").freeze()
         };
         let mut entry = Decoder(body);
-        let protobuf = entry.take_format();
         let identity = decode_identity(entry.bytes()?)?;
-        let request = if protobuf {
-            codec::decode_request(entry.0)?
-        } else {
-            entry.legacy_request()?
-        };
+        let request = codec::decode_request(entry.0)?;
         if codec::stream(&request) != id
             || identity.is_some() != matches!(request, Request::Seal { .. })
         {
@@ -454,7 +444,6 @@ fn checkpoint(dir: &Path, sequence: u64, state: &mut Stream) -> io::Result<()> {
     let mut body = BytesMut::new();
     body.put_u64(sequence);
     body.put_u8(u8::from(state.deleted));
-    body.put_u32(PROTOBUF);
     put_bytes(&mut body, &codec::encode_checkpoint_view(&state.view)?)?;
     put_count(&mut body, spans.len())?;
     for span in &spans {
@@ -520,12 +509,7 @@ fn load_streams(root: &Path) -> io::Result<HashMap<StreamId, Stream>> {
         let mut input = Decoder(body);
         let checkpoint = Some(input.u64()?);
         let deleted = input.boolean()?;
-        let view = if input.take_format() {
-            codec::decode_checkpoint_view(input.bytes()?)?
-        } else {
-            let identity = decode_identity(input.bytes()?)?;
-            input.legacy_view(identity)?
-        };
+        let view = codec::decode_checkpoint_view(input.bytes()?)?;
         let mut state = Stream {
             checkpoint,
             deleted,
@@ -618,15 +602,6 @@ fn charge_len(len: u32) -> u64 {
 struct Decoder(Bytes);
 
 impl Decoder {
-    fn take_format(&mut self) -> bool {
-        if self.0.get(..4) == Some(&PROTOBUF.to_be_bytes()) {
-            self.0.advance(4);
-            true
-        } else {
-            false
-        }
-    }
-
     fn take(&mut self, length: usize) -> io::Result<Bytes> {
         if self.0.len() < length {
             return Err(invalid("short keeper message"));
