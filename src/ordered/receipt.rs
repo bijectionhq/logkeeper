@@ -25,17 +25,28 @@ pub(super) type ReceiptBook<P, I, K, A> = BTreeMap<(I, K), RetainedOutcome<Recei
 #[cfg(verus_keep_ghost)]
 use vstd::laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq};
 #[cfg(verus_keep_ghost)]
+use vstd::laws_eq::obeys_concrete_eq;
+#[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 use vstd::std_specs::btree::btree_map_inv;
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires obeys_concrete_eq::<P>(),
+    ensures out == if original == installed { Ok(()) } else { Err(Refusal::WrongPlacement) },
+))]
 pub(super) fn require_original_placement<P: Eq>(original: P, installed: P) -> Result<(), Refusal> {
+    #[cfg(verus_keep_ghost)]
+    proof! { reveal(obeys_concrete_eq); }
     if original != installed {
         return Err(Refusal::WrongPlacement);
     }
     Ok(())
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (expires_at <= position),
+))]
 pub(super) fn fresh_request_expired(position: u64, expires_at: u64) -> bool {
     expires_at <= position
 }

@@ -1,0 +1,105 @@
+{
+  "summary": "Exact checkpoint custody and ordered admission and closure.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 8,
+  "controls": {
+    "ignore-publication-custody": {
+      "defect": "A publication may change custody with the same cut and logical root.",
+      "mutate": [
+        {
+          "file": "src/ordered/checkpoint_guards.rs",
+          "find": "    prepared == published",
+          "replace": "    true"
+        },
+        {
+          "file": "src/ordered/checkpoint_guards.rs",
+          "find": "ensures out == (prepared == published)",
+          "replace": "ensures out"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_checkpoint/laws.rs",
+          "function": "publication_keeps_prepared_custody",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "reuse-preparation-revision": {
+      "defect": "A preparation may reuse the current revision.",
+      "mutate": [
+        {
+          "file": "src/ordered/checkpoint_guards.rs",
+          "find": "    Some(offered) == current.checked_add(1)",
+          "replace": "    offered == current || Some(offered) == current.checked_add(1)"
+        },
+        {
+          "file": "src/ordered/checkpoint_guards.rs",
+          "find": "ensures out == (offered as int == current as int + 1)",
+          "replace": "ensures out == (offered == current || offered as int == current as int + 1)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_checkpoint/laws.rs",
+          "function": "preparation_revision_advances",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "close-despite-hold": {
+      "defect": "The exact old root can close while a journal hold pins it.",
+      "mutate": [
+        {
+          "file": "src/ordered/checkpoint_guards.rs",
+          "find": "    !source_of_preparation && !held()",
+          "replace": "    !source_of_preparation"
+        },
+        {
+          "file": "src/ordered/checkpoint_guards.rs",
+          "find": "ensures out == (!source_of_preparation && !pinned@)",
+          "replace": "ensures out == !source_of_preparation"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_checkpoint/laws.rs",
+          "function": "a_held_checkpoint_cannot_close",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "admit-closed-root": {
+      "defect": "A delayed new acquisition can use an old root after it closes.",
+      "mutate": [
+        {
+          "file": "src/ordered/checkpoint_guards.rs",
+          "find": "    above_erasure_floor && retained() && !closed()",
+          "replace": "    above_erasure_floor && retained()"
+        },
+        {
+          "file": "src/ordered/checkpoint_guards.rs",
+          "find": "ensures out == (above_erasure_floor && is_retained@ && !is_closed@)",
+          "replace": "ensures out == (above_erasure_floor && is_retained@)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_checkpoint/laws.rs",
+          "function": "a_closed_checkpoint_refuses_new_acquisition",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    }
+  }
+}

@@ -1,10 +1,12 @@
 use crate::admission::retains_receipt as retain_at_position;
 use crate::production::{
     Receipt, ReceiptBook, RetainedOutcome, record_after_apply as insert_applied, remove_expired,
-    replay as reissue, replay_mutation as reissue_mutation,
+    fresh_request_expired as request_expired, replay as reissue,
+    replay_mutation as reissue_mutation, require_original_placement,
 };
 use std::collections::BTreeMap;
 use vstd::laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq};
+use vstd::laws_eq::obeys_concrete_eq;
 use vstd::prelude::*;
 use vstd::std_specs::btree::btree_map_inv;
 
@@ -64,6 +66,28 @@ pub fn mutation_retry_exact<R: Copy>(stored: &[u8], offered: &[u8], original: R)
     let lookup = reissue_mutation(stored, offered, original);
     assert(apply == replay(false, stored@, offered@, original)
         && lookup == replay_mutation(stored@, offered@, original));
+}
+
+// Logkeeper.Protocol.Ordered.original_placement_matches
+pub open spec fn original_placement_matches<P>(original: P, installed: P) -> bool {
+    original == installed
+}
+
+pub fn reconciliation_requires_original_placement<P: Eq>(original: P, installed: P)
+    requires obeys_concrete_eq::<P>(),
+{
+    let checked = require_original_placement(original, installed);
+    assert((checked is Ok) == original_placement_matches(original, installed));
+}
+
+// Logkeeper.Protocol.Ordered.fresh_request_expired
+pub open spec fn fresh_request_expired(position: int, expires_at: int) -> bool {
+    expires_at <= position
+}
+
+pub fn expired_request_cannot_admit_fresh_work(position: u64, expires_at: u64) {
+    let expired = request_expired(position, expires_at);
+    assert(expired == fresh_request_expired(position as int, expires_at as int));
 }
 
 pub fn mutation_receipt_within_horizon<R: Copy>(

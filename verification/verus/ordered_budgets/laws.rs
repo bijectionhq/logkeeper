@@ -45,6 +45,22 @@ pub fn admitted_ordinary_append_preserves_funding(
     }
 }
 
+// Logkeeper.OrderedBudgets.funded_window_implies_retained_room.
+pub fn funded_window_implies_retained_room(
+    spent: u64, ordinary: u64, maintenance: u64, window: u64,
+    capacity: u64, reserve: u64, charge: u64,
+)
+    requires fundedBudget(spent as int, ordinary as int, maintenance as int, window as int,
+        capacity as int, reserve as int),
+        spent as int + charge as int <= window as int,
+{
+    assert(ordinary as int + charge as int <= capacity as int);
+    let admitted = append_debit(
+        AppendClass::Data, charge, spent, window, ordinary, capacity, maintenance, reserve,
+    );
+    assert(admitted is Some);
+}
+
 // LAW MAINTENANCE-APPEND-USES-ONLY-RESERVE.
 pub fn maintenance_funding_is_independent(
     payload: usize, references: Option<usize>, window: u64,

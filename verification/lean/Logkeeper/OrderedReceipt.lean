@@ -36,6 +36,19 @@ def retain_applied {Outcome Refusal : Type} (barrier : Bool)
     (applied : Except Refusal Outcome) : Option (Except Refusal Outcome) :=
   if record_after_apply barrier applied then some applied else none
 
+def original_placement_matches {Placement : Type} (original installed : Placement) : Prop :=
+  original = installed
+
+theorem foreign_original_cannot_reconcile {Placement : Type} {original installed : Placement}
+    (different : original ≠ installed) : ¬ original_placement_matches original installed :=
+  different
+
+def fresh_request_expired (position expiresAt : Nat) : Prop := expiresAt ≤ position
+
+theorem expired_request_cannot_admit_fresh_work {position expiresAt : Nat}
+    (expired : fresh_request_expired position expiresAt) : ¬ position < expiresAt :=
+  Nat.not_lt_of_ge expired
+
 theorem barriers_never_replay {Fingerprint Receipt : Type} [DecidableEq Fingerprint]
     (stored presented : Fingerprint) (original : Receipt) :
     replay true stored presented original = none := by
@@ -86,6 +99,20 @@ example : ∃ receipt : Except Nat Nat, retain_applied false (.ok 3) = some rece
     retains_receipt 1 2 false = true ∧ replay false 7 7 receipt = some receipt := by
   exact ⟨.ok 3, rfl, rfl, rfl⟩
 
+-- Keep the exact request match while omitting the original placement check.
+example : replay false 7 7 3 = some 3 ∧ ¬ original_placement_matches 1 2 := by
+  simp [replay, replay_mutation, original_placement_matches]
+
+-- A previous success is available, but recording it for the refused attempt
+-- would break positive_receipt_is_applied.
+example : retain_applied false (.ok 3 : Except Nat Nat) = some (.ok 3) ∧
+    retain_applied false (.error 2 : Except Nat Nat) ≠ some (.ok 3) := by
+  simp [retain_applied, record_after_apply]
+
+-- The weakened strict expiry predicate would let this identity submit anew.
+example : ¬ (7 : Nat) < 7 ∧ fresh_request_expired 7 7 := by
+  simp [fresh_request_expired]
+
 #print axioms barriers_never_replay
 #print axioms mutation_retry_exact
 #print axioms mutation_receipt_within_horizon
@@ -93,5 +120,7 @@ example : ∃ receipt : Except Nat Nat, retain_applied false (.ok 3) = some rece
 #print axioms positive_receipt_is_applied
 #print axioms refused_barrier_leaves_no_receipt
 #print axioms reissued_append_identifies_chosen_append
+#print axioms foreign_original_cannot_reconcile
+#print axioms expired_request_cannot_admit_fresh_work
 
 end Logkeeper.Protocol.Ordered

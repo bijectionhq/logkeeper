@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 15,
+  "min_verified_functions": 17,
   "controls": {
     "ignore-grant-epoch": {
       "defect": "The same enrolled holder can append under a grant from an earlier epoch.",
@@ -30,7 +30,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
     },
     "skip-lsn": {
       "defect": "Accept an append ahead of the current frontier.",
@@ -58,7 +58,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 13
+      "min_verified_functions": 15
     },
     "reuse-epoch": {
       "defect": "Install a grant using the previous writer epoch.",
@@ -81,7 +81,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
     },
     "keep-grant-on-withdrawal": {
       "defect": "Withdrawing the holder leaves its grant active.",
@@ -104,7 +104,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
     },
     "preserve-vacated-grant": {
       "defect": "Vacating the current grant leaves it installed.",
@@ -137,7 +137,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 13
+      "min_verified_functions": 15
     },
     "prepend-record": {
       "defect": "An append inserts before the existing records.",
@@ -160,7 +160,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
     },
     "trim-extra-record": {
       "defect": "Trim also drops the newest retained record, even if the deque and remaining-charge contracts permit it.",
@@ -188,7 +188,81 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 14
+      "min_verified_functions": 16
+    },
+    "reuse-occupied-lsn": {
+      "defect": "An append addressed below the current frontier may reuse an occupied LSN.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "    if head != expected_next {",
+          "replace": "    if head < expected_next {"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "ensures out == if head != expected_next",
+          "replace": "ensures out == if head < expected_next"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "append_only_by_current_grant_at_next_lsn",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "applied_append_extends_history",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 15
+    },
+    "ignore-authenticated-principal": {
+      "defect": "A caller can use the exact installed grant without authenticating as its holder.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "    if principal != Some(presented.0) {\n        return Err(Refusal::Unauthorized);\n    }\n",
+          "replace": ""
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "ensures out == if principal != Some(presented.0) { Err(Refusal::Unauthorized) }\n        else if current",
+          "replace": "ensures out == if current"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "append_only_by_current_grant_at_next_lsn",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
+    },
+    "match-worker-without-enrollment": {
+      "defect": "Replay range admission treats an old enrollment as current when the same worker ID has been re-enrolled.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "    current == Some(presented)\n",
+          "replace": "    current.is_some()\n"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "ensures out == (current == Some(presented))",
+          "replace": "ensures out == (current is Some)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_writer/laws.rs",
+          "function": "a_displaced_enrollment_cannot_acquire_replay",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 16
     }
   }
 }

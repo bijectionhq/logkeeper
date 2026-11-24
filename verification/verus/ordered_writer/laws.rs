@@ -1,4 +1,6 @@
-use crate::production::{Authority, Cut, append_next, authorize, commit_append, next_epoch};
+use crate::production::{
+    Authority, Cut, append_next, authorize, commit_append, is_current_enrollment as current, next_epoch,
+};
 use crate::retention::{trim_records, trimCredit, well_formed_debits};
 use crate::AppendClass;
 use std::collections::VecDeque;
@@ -12,6 +14,18 @@ pub open spec fn authorize_writer<E>(
     principal: Option<E>, current: Option<(E, u64, u64)>, presented: (E, u64, u64),
 ) -> bool {
     principal == Some(presented.0) && current == Some(presented)
+}
+
+// Logkeeper.Kernel.Ordered.is_current_enrollment
+pub open spec fn is_current_enrollment<E>(installed: Option<E>, presented: E) -> bool {
+    installed == Some(presented)
+}
+
+pub fn a_displaced_enrollment_cannot_acquire_replay<E: Eq>(installed: Option<E>, presented: E)
+    requires obeys_concrete_eq::<E>(),
+{
+    let admit = current(installed, presented);
+    assert(admit == is_current_enrollment(installed, presented));
 }
 
 // Logkeeper.Kernel.Ordered.append_next_lsn

@@ -54,7 +54,17 @@ pub(super) fn authorize<E: Eq + Copy>(
     Ok(())
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires obeys_concrete_eq::<E>(),
+    ensures out == (current == Some(presented)),
+))]
 pub(super) fn is_current_enrollment<E: Eq>(current: Option<E>, presented: E) -> bool {
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        broadcast use vstd::laws_eq::lemma_option_obeys_concrete_eq;
+        assert(obeys_concrete_eq::<Option<E>>());
+        reveal(obeys_concrete_eq);
+    }
     current == Some(presented)
 }
 

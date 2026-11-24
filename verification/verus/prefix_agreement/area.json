@@ -5,6 +5,8 @@
     "--verify-module",
     "production",
     "--verify-module",
+    "cohort",
+    "--verify-module",
     "rotation_support::evidence",
     "--verify-module",
     "laws"

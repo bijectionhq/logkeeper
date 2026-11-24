@@ -4,6 +4,22 @@ set_option warningAsError true
 
 namespace Logkeeper.Kernel.Ordered
 
+def is_current_enrollment {Enrollment : Type} (installed : Option Enrollment)
+    (presented : Enrollment) : Prop := installed = some presented
+
+theorem a_displaced_enrollment_cannot_acquire_replay {Enrollment : Type}
+    {installed presented : Enrollment} (displaced : installed ≠ presented) :
+    ¬ is_current_enrollment (some installed) presented :=
+  fun admitted => displaced (Option.some.inj admitted)
+
+-- Worker 3 is enrolled again at serial 2. Worker-ID-only admission
+-- would accept the delayed acquisition from serial 1.
+example : (some ((3 : Nat), (2 : Nat))).isSome = true ∧
+    ¬ is_current_enrollment (some (3, 2)) (3, 1) := by
+  simp [is_current_enrollment]
+
+#print axioms a_displaced_enrollment_cannot_acquire_replay
+
 def authorize_writer {Enrollment : Type} [DecidableEq Enrollment] (principal : Option Enrollment)
     (current : Option (Enrollment × Nat × Nat)) (presented : Enrollment × Nat × Nat) : Bool :=
   decide (principal = some presented.1 ∧ current = some presented)

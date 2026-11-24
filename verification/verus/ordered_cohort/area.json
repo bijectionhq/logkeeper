@@ -1,0 +1,128 @@
+{
+  "summary": "Count matching acceptances and require a chosen predecessor seal.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 8,
+  "controls": {
+    "acknowledge-one-accept": {
+      "defect": "A single matching durable acceptance can confirm a prefix.",
+      "mutate": [
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "    accepted >= members / 2 + 1",
+          "replace": "    accepted >= 1"
+        },
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "((members as int) < 2 * accepted as int)",
+          "replace": "(accepted >= 1)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_cohort/laws.rs",
+          "function": "accept_quorum_is_majority",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "allow-fresh-command-after-seal": {
+      "defect": "A sealed predecessor can apply new commands.",
+      "mutate": [
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "    successor.is_none()",
+          "replace": "    true"
+        },
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "ensures out == (successor is None)",
+          "replace": "ensures out"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_cohort/laws.rs",
+          "function": "sealed_cohort_refuses_new_decisions",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "seed-from-unsealed-predecessor": {
+      "defect": "An ordinary predecessor sample can seed the destination.",
+      "mutate": [
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "        None => false,",
+          "replace": "        None => true,"
+        },
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "ensures out == (successor matches Some(target) && target@ == destination@)",
+          "replace": "ensures out == (successor is None || (successor matches Some(target) && target@ == destination@))"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_cohort/laws.rs",
+          "function": "repair_requires_the_chosen_destination",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "seed-a-different-successor": {
+      "defect": "A chosen seal for another destination authorizes this repair.",
+      "mutate": [
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "        Some(target) => matches_fingerprint(target, destination),",
+          "replace": "        Some(_) => true,"
+        },
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "ensures out == (successor matches Some(target) && target@ == destination@)",
+          "replace": "ensures out == (successor is Some)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_cohort/laws.rs",
+          "function": "repair_requires_the_chosen_destination",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "seal-with-one-paid-ticket": {
+      "defect": "One valid, exact successor ticket can satisfy the seal gate even when the configured quorum is larger.",
+      "mutate": [
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "    paid >= quorum",
+          "replace": "    paid >= 1"
+        },
+        {
+          "file": "src/ordered/cohort.rs",
+          "find": "ensures out == (paid >= quorum)",
+          "replace": "ensures out == (paid >= 1)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_cohort/laws.rs",
+          "function": "seal_requires_paid_successor_quorum",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 7
+    }
+  }
+}

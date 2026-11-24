@@ -9,7 +9,7 @@
     "--verify-module",
     "admission"
   ],
-  "min_verified_functions": 17,
+  "min_verified_functions": 21,
   "controls": {
     "replay-barrier": {
       "defect": "Return the original receipt for a barrier with the same fingerprint.",
@@ -32,7 +32,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 16
+      "min_verified_functions": 20
     },
     "compare-fingerprint-length": {
       "defect": "A same-length changed request reuses the old receipt.",
@@ -60,7 +60,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 16
+      "min_verified_functions": 20
     },
     "expiry-requires-hold": {
       "defect": "Evict an unheld receipt inside its retry window.",
@@ -93,7 +93,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 15
+      "min_verified_functions": 19
     },
     "keep-expired-receipt": {
       "defect": "Keep an unheld receipt at its expiry position.",
@@ -126,7 +126,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 15
+      "min_verified_functions": 19
     },
     "record-refused-barrier": {
       "defect": "Insert a refused barrier into the receipt map.",
@@ -149,7 +149,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 16
+      "min_verified_functions": 20
     },
     "omit-outcome-insertion": {
       "defect": "Report that the receipt was recorded without inserting it.",
@@ -172,7 +172,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 16
+      "min_verified_functions": 20
     },
     "expire-live-hold": {
       "defect": "Evict the receipt used as provenance by a still-live hold.",
@@ -195,7 +195,71 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 16
+      "min_verified_functions": 20
+    },
+    "accept-foreign-original": {
+      "defect": "A fully matched original append in another placement can enter reconciliation.",
+      "mutate": [
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "    if original != installed {\n        return Err(Refusal::WrongPlacement);\n    }\n",
+          "replace": ""
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "ensures out == if original == installed { Ok(()) } else { Err(Refusal::WrongPlacement) }",
+          "replace": "ensures out == Ok(())"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "reconciliation_requires_original_placement",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 20
+    },
+    "use-success-for-refused-mutation": {
+      "defect": "Record a positive outcome for a refused mutation by substituting an earlier success.",
+      "mutate": [
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "    outcomes.insert(\n        (receipt.principal, receipt.request),",
+          "replace": "    let outcome = if !reading && receipt.outcome.is_err() {\n        match outcomes.iter().next() {\n            Some((_, earlier)) if earlier.receipt.outcome.is_ok() => earlier.receipt.outcome,\n            _ => receipt.outcome,\n        }\n    } else {\n        receipt.outcome\n    };\n    let receipt = Receipt { outcome, ..receipt };\n    outcomes.insert(\n        (receipt.principal, receipt.request),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/receipt.rs",
+          "function": "record_after_apply",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 20
+    },
+    "admit-at-expiry": {
+      "defect": "A delayed request can be admitted anew at its exclusive expiry position.",
+      "mutate": [
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "    expires_at <= position\n",
+          "replace": "    expires_at < position\n"
+        },
+        {
+          "file": "src/ordered/receipt.rs",
+          "find": "ensures out == (expires_at <= position)",
+          "replace": "ensures out == (expires_at < position)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_receipt/laws.rs",
+          "function": "expired_request_cannot_admit_fresh_work",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 20
     }
   }
 }

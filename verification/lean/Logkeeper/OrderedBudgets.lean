@@ -41,6 +41,17 @@ def admitsAppend (budget : Budget) (lane : ChargeClass) (charge : Nat)
       admitsDebit budget.ordinary charge ordinaryCapacity
   | .maintenance => admitsDebit budget.maintenance charge reserve
 
+theorem funded_window_implies_retained_room {budget : Budget} {window capacity reserve charge : Nat}
+    (funded : fundedBudget budget window capacity reserve)
+    (fits : admitsDebit budget.spent charge window) :
+    admitsDebit budget.ordinary charge capacity := by
+  simp only [fundedBudget, admitsDebit] at *
+  omega
+
+theorem window_room_without_funding_does_not_imply_retained_room :
+    admitsDebit 0 1 1 ∧ ¬ admitsDebit 1 1 1 := by
+  simp [admitsDebit]
+
 theorem admitted_append_preserves_funding {budget : Budget} {window capacity reserve : Nat}
     (funded : fundedBudget budget window capacity reserve) {lane : ChargeClass}
     {payload : Nat} {references : Option Nat}
@@ -126,6 +137,7 @@ theorem ordinary_limit_cannot_fund_maintenance :
   simp [recordCharge, referenceCharge, admitsAppend, admitsDebit]
 
 #print axioms admitted_append_preserves_funding
+#print axioms funded_window_implies_retained_room
 #print axioms funding_new_window
 #print axioms trim_preserves_funding
 #print axioms trace_preserves_funding

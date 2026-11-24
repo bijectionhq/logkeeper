@@ -20,6 +20,8 @@ The verifier uses the standard Verus model for
 | `retains_receipt` | `retains_receipt` uses the applied decision position and the invocation's exclusive expiry, with the live-hold exception. |
 | `recording_uses_the_applied_outcome` | `positive_receipt_is_applied` and `refused_barrier_leaves_no_receipt`. |
 | `mutation_retry_exact` | `mutation_retry_exact`. The Lean theorem `reissued_append_identifies_chosen_append` composes this rule with `Protocol.same_chosen_append` under its chosen-prefix premises. |
+| `reconciliation_requires_original_placement` | `original_placement_matches` compares the original append placement to the installed reducer placement. |
+| `expired_request_cannot_admit_fresh_work` | `fresh_request_expired` uses the exclusive expiry after the exact retained-receipt path. |
 
 The book projection preserves the authenticated scope, exact original applied
 position, and returned outcome. Deployment and incarnation encode
@@ -49,3 +51,7 @@ too early or too late, lose live-hold provenance, insert a refused barrier, and
 skip an applied insertion. The shared
 [correspondence check](../../lean/run_ordered_correspondence.py) compares Lean
 evaluation with Verus specs on retry and recording cases.
+
+`use-success-for-refused-mutation` changes only the recorded outcome, substituting an earlier success for a refusal. It fails the exact insertion postcondition of `record_after_apply`.
+`accept-foreign-original` drops only the original placement check in `State::reconcile_append`.
+`admit-at-expiry` lets a fresh decision use an identity exactly at expiry, where the remaining retry-horizon arithmetic still fits.

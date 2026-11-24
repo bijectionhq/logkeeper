@@ -9,7 +9,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 15,
+  "min_verified_functions": 16,
   "controls": {
     "omit_reference_charge": {
       "defect": "Appends no longer pay for a declared reference list.",
@@ -32,7 +32,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 14
+      "min_verified_functions": 15
     },
     "omit_window_limit": {
       "defect": "An ordinary append can spend above its active funded window.",
@@ -50,7 +50,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 14
+      "min_verified_functions": 15
     },
     "spend_ordinary_capacity_for_maintenance": {
       "defect": "Maintenance spends against the ordinary capacity instead of its own reserve.",
@@ -73,7 +73,25 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 14
+      "min_verified_functions": 15
+    },
+    "omit_retained_limit": {
+      "defect": "An ordinary append can exceed retained capacity while remaining within the active window.",
+      "mutate": [
+        {
+          "file": "src/ordered/budget.rs",
+          "find": "let retained = debit(ordinary, charge, ordinary_capacity)?;",
+          "replace": "let retained = debit(ordinary, charge, u64::MAX)?;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/budget.rs",
+          "function": "append_debit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 15
     }
   }
 }
