@@ -491,6 +491,57 @@ async fn read_floor_intersects_a_completed_trim() {
 }
 
 #[tokio::test]
+async fn a_stale_route_cannot_read_below_a_replacement_ensemble_trim() {
+    use crate::stream::keeper::{Sweep, sweep_idle};
+
+    let (network, old_writer) = started().await;
+    old_writer
+        .append(STREAM, E1, Lsn(1), record("discard"))
+        .await
+        .unwrap();
+    let [first, second, retired, learner] = KEEPERS;
+    let old = [first, second, retired];
+    let new = [first, second, learner];
+    let plan = Sweep {
+        stream: STREAM,
+        ensemble: old,
+        survivors: [first, second],
+        learner,
+        epoch: E2,
+        holder: Holder(2),
+    };
+    let result = sweep_idle(&*network.client(2), [plan]).await;
+    assert!(result[0].1.is_ok(), "{result:?}");
+
+    let new_writer = writer(&network, 3);
+    new_writer.bind_ensemble(STREAM, new).unwrap();
+    assert_eq!(new_writer.seal(STREAM, E3).await, Ok(Lsn(1)));
+    network
+        .until(|| network.view(learner, STREAM).unwrap().synced == Some(E3))
+        .await;
+    network.down(second, true);
+    new_writer.trim(STREAM, E3, Lsn(1)).await.unwrap();
+    network.down(first, true);
+    network.down(second, false);
+    assert_eq!(network.view(second, STREAM).unwrap().floor, Lsn(1));
+    assert_eq!(network.view(retired, STREAM).unwrap().floor, Lsn(1));
+
+    assert_eq!(
+        writer(&network, 4)
+            .read(STREAM, Lsn(1), 1, Duration::ZERO)
+            .await,
+        Err(JournalError::Unavailable),
+        "stale routes cannot furnish the current read quorum"
+    );
+    let reader = writer(&network, 5);
+    reader.bind_ensemble(STREAM, new).unwrap();
+    assert_eq!(
+        reader.read(STREAM, Lsn(1), 1, Duration::ZERO).await,
+        Err(JournalError::Trimmed { floor: Lsn(2) })
+    );
+}
+
+#[tokio::test]
 async fn an_append_reply_waits_for_quorum_commit_visibility() {
     let (network, writer) = started().await;
     network.down(KEEPERS[2], true);

@@ -295,22 +295,20 @@ async fn writer_round_trips_through_three_tls_keepers() {
             limits: Limits::default(),
         };
         tasks.push(tokio::spawn(config.serve(listener, stop.clone())));
-        routes.push((KeeperId(keeper.as_u128()), listen.to_string()));
+        routes.push(listen.to_string());
     }
 
-    let open = |credentials: &Credentials, holder| {
-        let transport =
-            TcpTransport::new(credentials, routes.clone(), Duration::from_secs(3)).unwrap();
-        Writer::new(
-            Arc::new(transport),
-            Holder(holder),
-            routes.iter().map(|route| route.0),
-        )
-        .unwrap()
+    let url = format!("logkeeper+tls://{}", routes.join(","));
+    let open = async |credentials: &Credentials, holder| {
+        let (transport, ensemble) =
+            TcpTransport::discover(&url, credentials, Duration::from_secs(3))
+                .await
+                .unwrap();
+        Writer::new(Arc::new(transport), Holder(holder), ensemble).unwrap()
     };
-    let writer = open(&writer_credentials, 1);
-    let successor = open(&writer_credentials, 2);
-    let reader = open(&reader_credentials, 3);
+    let writer = open(&writer_credentials, 1).await;
+    let successor = open(&writer_credentials, 2).await;
+    let reader = open(&reader_credentials, 3).await;
     let stream = StreamId(12);
     writer.create(stream).await.unwrap();
     assert_eq!(writer.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
