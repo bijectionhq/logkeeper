@@ -27,6 +27,7 @@ fn seal_at(stream: StreamId, epoch: u64, ensemble: [KeeperId; 3]) -> Request {
     Request::Seal {
         stream,
         epoch: Epoch(epoch),
+        proposal: None,
         ensemble,
     }
 }

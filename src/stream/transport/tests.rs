@@ -131,6 +131,7 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
     let seal = Request::Seal {
         stream,
         epoch,
+        proposal: None,
         ensemble,
     };
     let Reply::Sealed(view) = transport.call(id, seal).await.unwrap() else {
@@ -192,6 +193,7 @@ async fn loopback_mtls_checks_certificate_authority_uri_and_route() {
         Request::Seal {
             stream,
             epoch: Epoch(2),
+            proposal: None,
             ensemble,
         },
         Request::Delete { stream, ensemble },
@@ -488,7 +490,8 @@ async fn concurrent_calls_share_one_connection_and_batches_authorize_each_reques
                     Request::Seal {
                         stream,
                         ensemble,
-                        epoch: Epoch(1)
+                        epoch: Epoch(1),
+                        proposal: None,
                     },
                     Request::Read {
                         stream,
@@ -503,6 +506,7 @@ async fn concurrent_calls_share_one_connection_and_batches_authorize_each_reques
         Reply::Batch(vec![
             Reply::Checked(StreamView {
                 promised: None,
+                proposal: None,
                 synced: None,
                 tail: Lsn(0),
                 head: Lsn(0),

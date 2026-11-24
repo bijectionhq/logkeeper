@@ -251,6 +251,7 @@ impl Sweep {
             stream: self.stream,
             ensemble,
             epoch: self.epoch,
+            proposal: None,
         };
         let mut reply = self.call(transport, keeper, seal(self.ensemble)).await?;
         // A crash can leave one survivor on each ensemble. Resume the same move.

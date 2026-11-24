@@ -163,6 +163,7 @@ impl Default for Stream {
         Self {
             view: wire::StreamView {
                 promised: None,
+                proposal: None,
                 synced: None,
                 tail: Lsn(0),
                 head: Lsn(0),
@@ -397,8 +398,9 @@ impl Stream {
                 self.view.learner = !ensemble.contains(&keeper);
                 Ok(Reply::Created)
             }
-            Request::Seal { epoch, .. } => {
+            Request::Seal { epoch, proposal, .. } => {
                 self.staging = None;
+                self.view.proposal = proposal;
                 self.view.promised = Some((
                     epoch,
                     identity.ok_or_else(|| invalid("missing seal identity"))?,

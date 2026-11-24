@@ -14,6 +14,7 @@ async fn wire_guards() {
         stream: STREAM,
         ensemble: ENSEMBLE,
         epoch,
+        proposal: None,
     };
     let append = |epoch, at, records, head| Request::Append {
         stream: STREAM,

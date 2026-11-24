@@ -594,6 +594,7 @@ async fn park(io: &Measured, id: u64) -> Result<()> {
                         stream,
                         ensemble: ENSEMBLE,
                         epoch: CURRENT,
+                        proposal: None,
                     },
                     Request::Sync {
                         stream,

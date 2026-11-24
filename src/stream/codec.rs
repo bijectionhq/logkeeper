@@ -176,6 +176,7 @@ fn encode_view(view: &StreamView) -> View {
         promised: view.promised.as_ref().map(|(epoch, identity)| Promise {
             epoch: epoch.0,
             identity: identity.as_str().to_owned(),
+            proposal: view.proposal.map(encode_id),
         }),
         synced: view.synced.map(|epoch| epoch.0),
         tail: view.tail.0,
@@ -189,6 +190,12 @@ fn encode_view(view: &StreamView) -> View {
 
 fn decode_view(view: View) -> io::Result<StreamView> {
     Ok(StreamView {
+        proposal: view
+            .promised
+            .as_ref()
+            .and_then(|promise| promise.proposal.as_ref())
+            .map(|id| decode_id(id))
+            .transpose()?,
         promised: view
             .promised
             .map(|promise| (Epoch(promise.epoch), Identity::from(promise.identity))),
@@ -229,6 +236,8 @@ struct Promise {
     epoch: u64,
     #[prost(string, tag = "2")]
     identity: String,
+    #[prost(bytes = "bytes", optional, tag = "3")]
+    proposal: Option<Bytes>,
 }
 
 #[derive(Clone, Message)]
@@ -343,6 +352,12 @@ macro_rules! request_field {
     (encode ensemble, $value:expr) => {
         encode_ensemble($value)
     };
+    (encode proposal, $value:expr) => {
+        $value.map(encode_id)
+    };
+    (decode proposal, $value:expr) => {
+        $value.as_ref().map(|id| decode_id(id)).transpose()?
+    };
     (encode runs, $value:expr) => {
         encode_runs($value)
     };
@@ -376,6 +391,8 @@ request_messages! {
         ensemble: Vec<Bytes> => ensemble,
         #[prost(fixed64, tag = "2")]
         epoch: u64 => epoch,
+        #[prost(bytes = "bytes", optional, tag = "3")]
+        proposal: Option<Bytes> => proposal,
     },
     Sync = "4" {
         #[prost(fixed64, tag = "1")]
@@ -712,6 +729,7 @@ mod tests {
             Request::Seal {
                 stream,
                 epoch,
+                proposal: Some(17),
                 ensemble,
             },
             Request::Sync {
@@ -764,6 +782,7 @@ mod tests {
 
         let view = StreamView {
             promised: Some((epoch, Identity::from_static("urn:logkeeper:client:1"))),
+            proposal: Some(17),
             synced: Some(epoch),
             tail: Lsn(2),
             floor: Lsn(1),

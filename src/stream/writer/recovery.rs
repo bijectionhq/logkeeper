@@ -252,6 +252,7 @@ async fn seal(
                 stream,
                 ensemble,
                 epoch,
+                proposal: None,
             },
         )
         .await?
