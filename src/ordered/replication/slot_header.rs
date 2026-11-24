@@ -28,6 +28,32 @@ pub(super) open spec fn encodeBE(value: u64) -> Seq<u8> {
     ]
 }
 
+pub(super) proof fn big_endian_round_trips(value: u64)
+    ensures decodeBE(encodeBE(value)) == value,
+{
+    let bytes = encodeBE(value);
+    let b0 = bytes[0];
+    let b1 = bytes[1];
+    let b2 = bytes[2];
+    let b3 = bytes[3];
+    let b4 = bytes[4];
+    let b5 = bytes[5];
+    let b6 = bytes[6];
+    let b7 = bytes[7];
+    assert(
+        ((b0 as u64) << 56) | ((b1 as u64) << 48)
+        | ((b2 as u64) << 40) | ((b3 as u64) << 32)
+        | ((b4 as u64) << 24) | ((b5 as u64) << 16)
+        | ((b6 as u64) << 8) | b7 as u64 == value
+    ) by (bit_vector)
+        requires
+            b0 == (value >> 56) as u8, b1 == (value >> 48) as u8,
+            b2 == (value >> 40) as u8, b3 == (value >> 32) as u8,
+            b4 == (value >> 24) as u8, b5 == (value >> 16) as u8,
+            b6 == (value >> 8) as u8, b7 == value as u8,
+    ;
+}
+
 pub(super) open spec fn slotDescriptor(group: Seq<u8>, voter: Seq<u8>, generation: u64, length: u64)
     -> Seq<u8>
 {

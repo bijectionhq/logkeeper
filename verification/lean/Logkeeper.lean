@@ -16,3 +16,4 @@ import Logkeeper.ErasureCommit
 import Logkeeper.PrefixTrace
 import Logkeeper.OrderedGuards
 import Logkeeper.VoterSlotHeader
+import Logkeeper.VoterTransport

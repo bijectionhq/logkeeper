@@ -1,0 +1,110 @@
+{
+  "summary": "LKORPC04 fixed ballot and vote slots, exact witness mode, reply tag and scope checks.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws",
+    "--verify-module",
+    "slot_header"
+  ],
+  "min_verified_functions": 33,
+  "controls": {
+    "allow-foreign-installed-group": {
+      "defect": "The transport trusts the authorized scope without checking the voter is installed there.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "find": "group == authorized && group == installed",
+          "replace": "group == authorized"
+        },
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "find": "bytes_equal(group, authorized) && bytes_equal(group, installed)",
+          "replace": "bytes_equal(group, authorized)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/voter_transport/laws.rs",
+          "function": "scope_requires_both_groups",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 32
+    },
+    "accept-nil-ballot": {
+      "defect": "A nonzero round with a nil nonce identifies a valid ballot.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "find": "if round == 0 || bytes_equal(&nonce, &nil) {",
+          "replace": "if round == 0 {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "function": "decode_ballot",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 32
+    },
+    "copy-first-digest-into-second-slot": {
+      "defect": "Both parsed images use the A-slot digest.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "find": "digest: read_field(bytes, 49),",
+          "replace": "digest: read_field(bytes, 9),"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "function": "decode_vote_slots",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 32
+    },
+    "ignore-witness-mode": {
+      "defect": "A vote is accepted irrespective of its witness tag.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "find": "tag == requested as u8",
+          "replace": "true"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "function": "vote_read_back_matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 32
+    },
+    "treat-rejected-as-deposed": {
+      "defect": "The parser reads an extra ballot after a rejected reply.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "find": "REJECTED => ResponseKind::Rejected,",
+          "replace": "REJECTED => ResponseKind::Deposed,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/transport_fields.rs",
+          "function": "response_kind",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 32
+    }
+  }
+}

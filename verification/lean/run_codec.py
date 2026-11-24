@@ -18,9 +18,16 @@ def main():
     codec = ROOT / "Logkeeper" / "Codec.lean"
     image = ROOT / "Logkeeper" / "CompactImage.lean"
     slot = ROOT / "Logkeeper" / "VoterSlotHeader.lean"
+    transport = ROOT / "Logkeeper" / "VoterTransport.lean"
     check_lean_theorems(ROOT, command, codec, count=7, case="codec")
     check_lean_theorems(ROOT, command, image, count=8, case="compact-image")
     check_lean_theorems(ROOT, command, slot, count=4, case="voter-slot-header")
+    check_lean_theorems(ROOT, command, transport, count=4, case="voter-transport")
+    check_lean_mutation(
+        ROOT, command, transport, "transport-ignore-installed-group",
+        [("  group = authorized ∧ group = installed\n", "  group = authorized ∧ True\n")],
+        "  exact accepted",
+    )
     check_lean_mutation(
         ROOT, command, slot, "voter-slot-header-ignore-voter",
         [("header.voter = voter ∧", "True ∧")],
