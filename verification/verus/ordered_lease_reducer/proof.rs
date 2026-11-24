@@ -8,6 +8,8 @@ mod writer;
 use writer::Cut;
 #[path = "../../../src/ordered/admission.rs"]
 mod admission;
+#[path = "../../../src/ordered/checkpoint_guards.rs"]
+mod checkpoint_guards;
 #[path = "../../../src/ordered/rotation.rs"]
 mod rotation;
 #[path = "../../../src/ordered/replay_bounds.rs"]
