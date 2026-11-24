@@ -16,7 +16,7 @@ use super::{
         self, EXTENT_BYTES, INDEX_HEADER_BYTES, Location, StagedIndex, StreamIndex,
     },
     durability::{sync_directory, sync_file},
-    state::{Extent, ExtentReader, Payload, Record, Staging, Stream},
+    state::{EXTENT_COPY_BYTES, Extent, ExtentReader, Payload, Record, Staging, Stream},
     wal::{SEGMENT_BYTES, atomic_file, read_frame, sequence},
     wal_bytes::{self, FRAME_HEADER_BYTES},
     wal_layout::{extent_fits, stored_length},
@@ -114,6 +114,7 @@ struct Pack {
     offset: u64,
     rewrite: bool,
     reader: ExtentReader,
+    copy_buffer: Option<Box<[u8; EXTENT_COPY_BYTES]>>,
     moved: Vec<(Record, Location)>,
 }
 
@@ -129,48 +130,19 @@ impl Pack {
             .ok_or_else(|| invalid("too many indexed records"))?;
         let mut rows = Vec::with_capacity(capacity);
         for record in records {
-            let existing = match &*record.payload.read() {
+            let location = match &*record.payload.read() {
                 Payload::Extent {
                     extent,
                     offset,
                     len,
                     crc,
-                } if !self.rewrite => Some(Location {
+                } if !self.rewrite => Location {
                     seq: extent.sequence,
                     offset: *offset,
                     len: *len,
                     crc: *crc,
-                }),
-                _ => None,
-            };
-            let location = if let Some(location) = existing {
-                location
-            } else {
-                let payload = record.read(&mut self.reader)?;
-                let (offset, end, len, crc) =
-                    checkpoint_bytes::describe_extent(self.offset, &payload)
-                        .ok_or_else(|| invalid("keeper pack extent is too large"))?;
-                if self.output.is_none() {
-                    self.output = Some(BufWriter::new(
-                        File::options()
-                            .create_new(true)
-                            .write(true)
-                            .open(&self.extent.path)?,
-                    ));
-                }
-                self.output
-                    .as_mut()
-                    .expect("pack open")
-                    .write_all(&payload)?;
-                let location = Location {
-                    seq: self.extent.sequence,
-                    offset,
-                    len,
-                    crc,
-                };
-                self.offset = end;
-                self.moved.push((record.clone(), location));
-                location
+                },
+                payload => self.append(record, payload)?,
             };
             rows.extend_from_slice(&checkpoint_bytes::encode_extent(record.epoch.0, location));
             packs.insert(location.seq);
@@ -179,24 +151,80 @@ impl Pack {
         Ok((rows, bytes))
     }
 
+    fn append(&mut self, record: &Record, payload: &Payload) -> io::Result<Location> {
+        let (_, end, len, crc) = match payload {
+            Payload::Pending(bytes) => checkpoint_bytes::describe_extent(self.offset, bytes),
+            Payload::Extent { len, crc, .. } => self
+                .offset
+                .checked_add(u64::from(*len))
+                .map(|end| (self.offset, end, *len, *crc)),
+        }
+        .ok_or_else(|| invalid("keeper pack extent is too large"))?;
+        if self.output.is_none() {
+            self.output = Some(BufWriter::new(
+                File::options()
+                    .create_new(true)
+                    .write(true)
+                    .open(&self.extent.path)?,
+            ));
+        }
+        let output = self.output.as_mut().expect("pack open");
+        match payload {
+            Payload::Pending(bytes) => output.write_all(bytes)?,
+            Payload::Extent {
+                extent,
+                offset,
+                len,
+                crc,
+            } => {
+                let buffer = self
+                    .copy_buffer
+                    .get_or_insert_with(|| Box::new([0; EXTENT_COPY_BYTES]));
+                self.reader
+                    .copy_checked(extent, *offset, *len, *crc, buffer, output)?;
+            }
+        }
+        let location = Location {
+            seq: self.extent.sequence,
+            offset: self.offset,
+            len,
+            crc,
+        };
+        self.offset = end;
+        self.moved.push((record.clone(), location));
+        Ok(location)
+    }
+
     fn sync(&mut self, root: &Path) -> io::Result<()> {
-        if let Some(mut file) = self.output.take() {
+        if let Some(file) = self.output.as_mut() {
             file.flush()?;
             sync_file(file.get_ref())?;
             // Publish the pack name before the index can refer to it.
             sync_directory(root)?;
         }
+        // Index publication can fail after rename. Recovery resolves the synced pack then.
+        self.output = None;
         Ok(())
     }
 
-    fn install(self) {
-        for (record, location) in self.moved {
+    fn install(mut self) {
+        for (record, location) in self.moved.drain(..) {
             *record.payload.write() = Payload::Extent {
                 extent: Arc::clone(&self.extent),
                 offset: location.offset,
                 len: location.len,
                 crc: location.crc,
             };
+        }
+    }
+}
+
+impl Drop for Pack {
+    fn drop(&mut self) {
+        if let Some(file) = self.output.take() {
+            // Discard buffered bytes and close the unpublished pack before unlinking it.
+            drop(file.into_parts());
+            let _ = fs::remove_file(&self.extent.path);
         }
     }
 }
@@ -228,6 +256,7 @@ impl Checkpoint {
             offset: 0,
             rewrite,
             reader: ExtentReader::default(),
+            copy_buffer: None,
             moved: Vec::new(),
         };
         for snapshot in snapshots {
