@@ -133,3 +133,24 @@ pub(super) fn publish_selection<C, P>(
 pub(super) fn admits_history(erasure_floor: u64, from: u64) -> bool {
     from >= erasure_floor
 }
+
+pub(super) fn check_writer_open(erasure_pending: bool) -> Result<(), Refusal> {
+    if erasure_pending {
+        Err(Refusal::Unavailable)
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn check_settlement_fence(
+    current_floor: u64,
+    requested_floor: u64,
+    disposition_present: bool,
+    exact_closed_root: bool,
+) -> Result<(), Refusal> {
+    if requested_floor != current_floor || !disposition_present || !exact_closed_root {
+        Err(Refusal::Stale)
+    } else {
+        Ok(())
+    }
+}

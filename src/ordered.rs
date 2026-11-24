@@ -14,6 +14,7 @@ mod cohort;
 pub mod daemon;
 mod lease;
 mod object_names;
+mod lease_reducer;
 mod object_withdrawal;
 mod receipt;
 mod refusal;
@@ -650,24 +651,13 @@ impl State {
     /// Selects replay only while this exact hold is live in the applied image.
     /// The caller must also open the exact checkpoint through its custody owner.
     pub fn held_replay(&self, principal: Principal, hold: Hold) -> Result<HeldReplay<'_>, Refusal> {
-        if principal != Principal::Worker(hold.owner) {
-            return Err(Refusal::Unauthorized);
-        }
-        if self.holds.get(&hold.id).map(|entry| entry.hold) != Some(hold) {
-            return Err(Refusal::Unavailable);
-        }
-        // An empty interval remains usable past the replay floor.
-        let (start, end) = if hold.start == hold.through {
-            (0, 0)
-        } else {
-            replay_bounds::retained_indices(
-                self.floor.next_lsn,
-                hold.start.next_lsn,
-                hold.through.next_lsn,
-                self.records.len(),
-            )
-            .ok_or(Refusal::Unavailable)?
-        };
+        let (start, end) = lease_reducer::held_indices(
+            Self::worker_principal(principal),
+            hold.owner,
+            self.holds.get(&hold.id).map(|entry| entry.hold),
+            hold,
+            self.read_interval(hold),
+        )?;
         Ok(HeldReplay {
             checkpoint: hold.checkpoint,
             start: hold.start,
@@ -1043,13 +1033,15 @@ impl State {
                     .ok_or(Refusal::Capacity)?;
                 let enrollment = Enrollment { worker, serial };
                 self.enrollment_serial = serial;
-                self.roster.insert(worker, enrollment);
+                lease_reducer::update_roster(&mut self.roster, &worker, Some(enrollment));
                 let replaced_holder = self
                     .authority
                     .grant
                     .is_some_and(|grant| grant.enrollment.worker == worker);
                 self.authority.withdraw(replaced_holder);
-                self.prune_leases();
+                if let Some(previous) = expected {
+                    self.prune_lease(previous);
+                }
                 Ok(Outcome::Enrolled(enrollment))
             }
             Command::Withdraw { enrollment } => {
@@ -1059,13 +1051,13 @@ impl State {
                 if self.roster.get(&enrollment.worker) != Some(&enrollment) {
                     return Err(Refusal::Stale);
                 }
-                self.roster.remove(&enrollment.worker);
+                lease_reducer::update_roster(&mut self.roster, &enrollment.worker, None);
                 let withdrew_holder = self
                     .authority
                     .grant
                     .is_some_and(|grant| grant.enrollment == enrollment);
                 self.authority.withdraw(withdrew_holder);
-                self.prune_leases();
+                self.prune_lease(enrollment);
                 Ok(Outcome::Withdrawn)
             }
             Command::Grant {
@@ -1082,9 +1074,7 @@ impl State {
                 {
                     return Err(Refusal::Stale);
                 }
-                if self.preparing.is_some_and(|pending| pending.erasure) {
-                    return Err(Refusal::Unavailable);
-                }
+                rotation::check_writer_open(self.preparing.is_some_and(|pending| pending.erasure))?;
                 self.install_grant(principal, id, candidate, self.authority.key_generation)
             }
             Command::PublishAndRotate { grant, checkpoint } => {
@@ -1120,9 +1110,7 @@ impl State {
                 references,
             } => {
                 self.writer(principal, grant)?;
-                if self.preparing.is_some_and(|pending| pending.erasure) {
-                    return Err(Refusal::Unavailable);
-                }
+                rotation::check_writer_open(self.preparing.is_some_and(|pending| pending.erasure))?;
                 let next_lsn = writer::append_next(self.head.next_lsn, expected_next)?;
                 self.admit_object_references(references.as_deref())?;
                 let bytes = record_charge(payload.len(), references.as_deref())?;
@@ -1276,14 +1264,14 @@ impl State {
                 if principal != Principal::Custodian {
                     return Err(Refusal::Unauthorized);
                 }
-                if erasure_floor != self.erasure_floor || disposition == [0; 32]
-                    || self
-                        .old_roots
+                rotation::check_settlement_fence(
+                    self.erasure_floor,
+                    erasure_floor,
+                    disposition != [0; 32],
+                    self.old_roots
                         .get(&checkpoint.custody.revision)
-                        .is_none_or(|entry| entry.checkpoint != checkpoint || !entry.closed)
-                {
-                    return Err(Refusal::Stale);
-                }
+                        .is_some_and(|entry| entry.checkpoint == checkpoint && entry.closed),
+                )?;
                 if self
                     .preparing
                     .is_some_and(|pending| pending.base == checkpoint)
@@ -1316,16 +1304,22 @@ impl State {
                 Ok(Outcome::WorkerDisposed(enrollment))
             }
             Command::DisposeExpired { enrollment } => {
-                lease::check_disposal(
-                    principal == Principal::Administrator || principal == Principal::Custodian,
-                    enrollment.serial,
-                    self.enrollment_serial,
-                    self.roster.get(&enrollment.worker) == Some(&enrollment),
-                    self.time,
-                    self.lease_end(enrollment),
-                    self.limits.clock_drift,
+                let retired = lease_reducer::dispose_expired(
+                    &self.roster,
+                    &mut self.holds,
+                    &mut self.leases,
+                    &enrollment.worker,
+                    enrollment,
+                    lease_reducer::ExpiryDisposal {
+                        authorized: principal == Principal::Administrator || principal == Principal::Custodian,
+                        serial: enrollment.serial,
+                        last_serial: self.enrollment_serial,
+                        now: self.time,
+                        drift: self.limits.clock_drift,
+                    },
+                    |entry| entry.hold.owner,
                 )?;
-                self.dispose(enrollment);
+                self.remove_retired_receipts(retired);
                 Ok(Outcome::WorkerDisposed(enrollment))
             }
             Command::Lease { grant } => {
@@ -1346,16 +1340,22 @@ impl State {
                 })
             }
             Command::LeaseRead { hold } => {
-                if self.roster.get(&hold.owner.worker) != Some(&hold.owner) {
-                    return Err(Refusal::Stale);
-                }
-                self.held_replay(principal, hold)?;
-                if !self.checkpoint_open(hold.checkpoint) {
-                    return Err(Refusal::Unavailable);
-                }
-                let lease_end = self.time.checked_add(self.limits.serving_lease).ok_or(Refusal::Capacity)?;
-                let last = self.leases.entry(hold.owner).or_default();
-                *last = (*last).max(lease_end);
+                let basis = lease_reducer::ReadBasis {
+                    worker: hold.owner.worker,
+                    owner: hold.owner,
+                    stored: self.holds.get(&hold.id).map(|entry| entry.hold),
+                    requested: hold,
+                    interval: self.read_interval(hold),
+                    checkpoint: self.checkpoint_access(hold.checkpoint),
+                };
+                let lease_end = lease_reducer::issue_read(
+                    &self.roster,
+                    &mut self.leases,
+                    Self::worker_principal(principal),
+                    basis,
+                    self.time,
+                    self.limits.serving_lease,
+                )?;
                 Ok(Outcome::ReadLeased { hold, issued_at: self.time, lease_end })
             }
             Command::FundWindow { window } => {
@@ -1428,9 +1428,7 @@ impl State {
             }
             Command::Vacate { grant } => {
                 self.writer(principal, grant)?;
-                if self.preparing.is_some_and(|pending| pending.erasure) {
-                    return Err(Refusal::Unavailable);
-                }
+                rotation::check_writer_open(self.preparing.is_some_and(|pending| pending.erasure))?;
                 self.authority.vacate();
                 Ok(Outcome::Vacated)
             }
@@ -1463,8 +1461,7 @@ impl State {
                     hold.id.expires_at,
                     false,
                 );
-                self.holds.remove(&hold.id);
-                self.prune_leases();
+                self.release_hold(hold.id, hold.owner);
                 Ok(Outcome::Released)
             }
             Command::ReleaseRead { read } => {
@@ -1500,8 +1497,7 @@ impl State {
                     read.expires_at,
                     false,
                 );
-                self.holds.remove(&read);
-                self.prune_leases();
+                self.release_hold(read, entry.hold.owner);
                 Ok(Outcome::Released)
             }
             Command::Trim { selected, through } => {
@@ -1647,14 +1643,19 @@ impl State {
     /// Removes every hold the enrollment owns, with any receipt that was
     /// retained only as that hold's provenance.
     fn dispose(&mut self, enrollment: Enrollment) {
-        let retired = self
-            .holds
-            .values()
-            .filter(|entry| entry.hold.owner == enrollment)
-            .copied()
-            .collect::<Vec<_>>();
-        for entry in retired {
-            self.holds.remove(&entry.hold.id);
+        let retired = lease_reducer::dispose_owner(
+            &self.roster,
+            &mut self.holds,
+            &mut self.leases,
+            &enrollment.worker,
+            enrollment,
+            |entry| entry.hold.owner,
+        );
+        self.remove_retired_receipts(retired);
+    }
+
+    fn remove_retired_receipts(&mut self, retired: Vec<(RequestId, HeldAdmission)>) {
+        for (_, entry) in retired {
             receipt::remove_expired(
                 &mut self.outcomes,
                 (entry.origin, entry.hold.id),
@@ -1663,17 +1664,41 @@ impl State {
                 false,
             );
         }
-        self.prune_leases();
     }
 
-    /// Keeps a lease end only while its enrollment is enrolled or owns a hold.
-    fn prune_leases(&mut self) {
-        let roster = &self.roster;
-        let holds = &self.holds;
-        self.leases.retain(|enrollment, _| {
-            roster.get(&enrollment.worker) == Some(enrollment)
-                || holds.values().any(|entry| entry.hold.owner == *enrollment)
-        });
+    fn release_hold(&mut self, id: RequestId, owner: Enrollment) {
+        lease_reducer::release_hold(
+            &self.roster,
+            &mut self.holds,
+            &mut self.leases,
+            &id,
+            &owner.worker,
+            owner,
+            |entry| entry.hold.owner,
+        );
+    }
+
+    /// Rechecks the only enrollment that could have lost its roster slot or last hold.
+    fn prune_lease(&mut self, enrollment: Enrollment) {
+        lease_reducer::prune_end(
+            &self.roster,
+            &self.holds,
+            &mut self.leases,
+            &enrollment.worker,
+            enrollment,
+            |entry| entry.hold.owner,
+        );
+    }
+
+    fn read_interval(&self, hold: Hold) -> lease_reducer::ReadInterval {
+        lease_reducer::ReadInterval {
+            // An empty interval remains usable past the replay floor.
+            empty: hold.start == hold.through,
+            floor: self.floor.next_lsn,
+            from: hold.start.next_lsn,
+            through: hold.through.next_lsn,
+            retained: self.records.len(),
+        }
     }
 
     fn checkpoint_retained(&self, checkpoint: Checkpoint) -> bool {
@@ -1703,6 +1728,18 @@ impl State {
                     .is_some_and(|entry| entry.closed)
             },
         )
+    }
+
+    fn checkpoint_access(&self, checkpoint: Checkpoint) -> lease_reducer::CheckpointAccess {
+        lease_reducer::CheckpointAccess {
+            cut: checkpoint.cut.next_lsn,
+            erasure_floor: self.erasure_floor,
+            retained: self.checkpoint_retained(checkpoint),
+            closed: self
+                .old_roots
+                .get(&checkpoint.custody.revision)
+                .is_some_and(|entry| entry.closed),
+        }
     }
 
     fn next_checkpoint_retirement(&self) -> Option<RetainedCheckpoint> {
