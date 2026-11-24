@@ -86,7 +86,7 @@ pub(super) fn same_image(left: &[u8; 32], right: &[u8; 32]) -> bool {
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == configured@.contains(voter),
 ))]
-fn contains_voter(configured: &[u128], voter: u128) -> bool {
+pub(super) fn contains_voter(configured: &[u128], voter: u128) -> bool {
     let mut index = 0;
     #[cfg_attr(verus_keep_ghost, verus_spec(
         invariant index <= configured@.len(),

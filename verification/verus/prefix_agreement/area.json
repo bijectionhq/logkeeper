@@ -9,9 +9,11 @@
     "--verify-module",
     "rotation_support::evidence",
     "--verify-module",
+    "confirmation",
+    "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 40,
+  "min_verified_functions": 42,
   "controls": {
     "stale_prepare": {
       "defect": "A request below the current promise can be acknowledged.",
@@ -78,6 +80,16 @@
           "file": "verification/verus/prefix_agreement/laws.rs",
           "function": "chosen_votes_bind_ballot_voter_and_image",
           "category": "assertion failed"
+        },
+        {
+          "file": "src/ordered/replication/confirmation.rs",
+          "function": "receive_vote",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/replication/confirmation.rs",
+          "function": "receive_vote",
+          "category": "postcondition not satisfied"
         }
       ],
       "min_verified_functions": 39
@@ -234,6 +246,42 @@
         }
       ],
       "min_verified_functions": 39
+    },
+    "confirm_at_half_roster": {
+      "defect": "Return a confirmed candidate while all but a non-majority of the configured roster remain silent.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/confirmation.rs",
+          "find": "if accept_quorum(voters.len(), configured.len()) {",
+          "replace": "if voters.len() >= configured.len() / 2 {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/confirmation.rs",
+          "function": "receive_vote",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 41
+    },
+    "count_duplicate_durable_reply": {
+      "defect": "Count an authenticated response from one durable voter twice in a single ballot.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/confirmation.rs",
+          "find": "if voters[index].voter.as_u128() == voter {",
+          "replace": "if false && voters[index].voter.as_u128() == voter {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/confirmation.rs",
+          "function": "receive_vote",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 41
     }
   }
 }

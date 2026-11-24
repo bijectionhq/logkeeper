@@ -9,6 +9,7 @@ use super::{
     Fingerprint, Grant, Hold, Outcome, Placement, Principal, Receipt, Record, Refusal, Request,
     RequestId, RetainedCheckpoint, State, Window, WriterState,
     replication::{self, Group, Replica, RotationSlots},
+    replay_bounds::{ReplayCut, ReplayRecord, ReplayStep, replay_cursor},
 };
 use std::future::Future;
 use tokio::sync::Mutex;
@@ -488,17 +489,19 @@ impl<R: Replica> Coordinator<R> {
     ) -> Result<Option<ReplayHead>, Error> {
         let state = self.recover(session).await?;
         let (replay, skip) = replay_from(&state, session, hold, from)?;
-        let through = replay.through();
-        let Some(entry) = replay.records().nth(skip) else {
-            return if from == through { Ok(None) } else { Err(Refusal::Invalid.into()) };
-        };
-        let record_bytes = record_charge(from.next_lsn, through.next_lsn, entry)?;
-        Ok(Some(ReplayHead {
-            next: entry.result.cut,
-            timestamp: entry.timestamp,
-            payload_bytes: entry.payload.len() as u64,
-            record_bytes,
-        }))
+        let mut cursor = replay_cursor(replay_cut(from), replay_cut(replay.through()), u64::MAX);
+        let entry = replay.records().nth(skip);
+        match cursor.step(entry.map(replay_record)) {
+            ReplayStep::Emit(entry, record_bytes) => Ok(Some(ReplayHead {
+                next: entry.result.cut,
+                timestamp: entry.timestamp,
+                payload_bytes: entry.payload.len() as u64,
+                record_bytes,
+            })),
+            ReplayStep::Complete => Ok(None),
+            ReplayStep::Invalid => Err(Refusal::Invalid.into()),
+            ReplayStep::PageFull | ReplayStep::Capacity => Err(Refusal::Capacity.into()),
+        }
     }
 
     fn admit(&self, session: Session) -> Result<(), Error> {
@@ -581,38 +584,35 @@ fn replay_page<'a>(
     checkpoint: Checkpoint,
     from: Cut,
     through: Cut,
-    records: impl Iterator<Item = &'a Record>,
-    mut remaining: usize,
+    mut records: impl Iterator<Item = &'a Record>,
+    maximum_bytes: usize,
 ) -> Result<ReplayPage, Error> {
+    let mut cursor = replay_cursor(replay_cut(from), replay_cut(through), maximum_bytes as u64);
     let mut page = Vec::new();
-    let mut cursor = from;
-    for record in records {
-        let size = usize::try_from(record_charge(cursor.next_lsn, through.next_lsn, record)?)
-            .map_err(|_| Refusal::Capacity)?;
-        let Some(next) = remaining.checked_sub(size) else {
-            if page.is_empty() {
-                return Err(Refusal::Capacity.into());
+    loop {
+        let record = records.next();
+        match cursor.step(record.map(replay_record)) {
+            ReplayStep::Emit(record, _) => page.push(record.clone()),
+            ReplayStep::Complete | ReplayStep::PageFull => {
+                return Ok(ReplayPage { checkpoint, through, records: page });
             }
-            return Ok(ReplayPage { checkpoint, through, records: page });
-        };
-        remaining = next;
-        cursor = record.result.cut;
-        page.push(record.clone());
+            ReplayStep::Capacity => return Err(Refusal::Capacity.into()),
+            ReplayStep::Invalid => return Err(Refusal::Invalid.into()),
+        }
     }
-    if cursor != through {
-        return Err(Refusal::Invalid.into());
-    }
-    Ok(ReplayPage {
-        checkpoint,
-        through,
-        records: page,
-    })
 }
 
-fn record_charge(from: u64, through: u64, record: &Record) -> Result<u64, Error> {
-    super::replay_bounds::replay_record_charge(
-        from, record.result.cut.next_lsn, through, record.result.byte_start, record.result.byte_end,
-    ).ok_or_else(|| Refusal::Invalid.into())
+fn replay_cut(cut: Cut) -> ReplayCut {
+    (cut.next_lsn, cut.history)
+}
+
+fn replay_record(record: &Record) -> ReplayRecord<&Record> {
+    ReplayRecord {
+        cut: replay_cut(record.result.cut),
+        start: record.result.byte_start,
+        end: record.result.byte_end,
+        original: record,
+    }
 }
 
 fn replay_from(

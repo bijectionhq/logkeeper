@@ -27,6 +27,23 @@ The [brief](brief.md) defines which properties were checked and which failures a
 | A15 | `no_recovery_cap` | `RecoveryBound` | Append three records without publishing a checkpoint. Three transitions. |
 | A15 | `no_retained_cap` | `RetainedBound` | Append twice and advance publication, then append twice without advancing the retention floor. Six transitions. |
 
+## Held terminal cut
+
+The separate `ReplaySpec` lets append and trim interleave with delivery from
+a hold. Delivery advances one index at a time and can complete at the
+original terminal cut even after the journal head advances. The model
+represents different history digests at an equal numeric cut with two
+symbols. It leaves page byte accounting to the Verus replay cursor.
+
+| Control | Violated property | Shortest history |
+| --- | --- | --- |
+| `skip_record` | `ReplayContiguous` | Append twice, prepare and admit a hold, deliver its terminal record first. Five transitions. |
+| `foreign_terminal` | `ReplayOriginal` | Append, prepare and admit a hold, deliver a foreign terminal digest. Four transitions. |
+| `early_end` | `ReplayExactEnd` | Append, prepare and admit a hold, report completion without its record. Four transitions. |
+
+TLC checked 3,555 distinct states at five positions and 7,695 at eight.
+The advancing-head completion witness took six transitions.
+
 ## Acceptance programs and developer cost
 
 The caller supplies a published checkpoint receipt and the cursor's first required LSN.

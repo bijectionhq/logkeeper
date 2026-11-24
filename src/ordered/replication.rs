@@ -5,6 +5,7 @@
 //! Transport implementations supply authenticated replies from the named
 //! durable journals in the installed cohort.
 
+mod confirmation;
 mod disk;
 mod evidence;
 mod rotation;
@@ -17,14 +18,15 @@ mod transport_fields;
 
 pub use disk::DurableVoter;
 pub use evidence::{RotationSlots, SlotImage, SlotPair, Vote, VoterSlots};
-use evidence::{record_vote, register_peer, strict_majority};
+use confirmation::{Candidate, Confirmation, receive_vote};
+use evidence::{register_peer, strict_majority};
 
 use super::{
     BarrierClaim, Checkpoint, Command, Fingerprint, Limits, Outcome, Placement, Receipt, Refusal,
     Request, State, Window,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use futures::{StreamExt, stream::FuturesUnordered};
+use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -650,36 +652,38 @@ impl Group {
             round,
             nonce: Uuid::new_v4(),
         };
-        let mut prepares: FuturesUnordered<_> = peers
+        let prepares: FuturesUnordered<_> = peers
             .iter()
             .map(|peer| async move { (peer.identity(), peer.prepare(self.identity, ballot).await) })
             .collect();
         let mut voters = BTreeSet::new();
         let mut winner: Option<Accepted> = None;
         let mut refusal = None;
-        while let Some((expected, reply)) = prepares.next().await {
+        let prepared = drive_round(prepares, |(expected, reply)| {
             match reply {
                 Ok(reply) if reply.voter == expected && reply.ballot == ballot => {
                     if let Some(accepted) = reply.accepted {
                         if accepted.ballot >= ballot {
-                            return Err(Error::Prefix);
+                            return Some(Err(Error::Prefix));
                         }
-                        choose_base(&mut winner, accepted)?;
+                        if let Err(error) = choose_base(&mut winner, accepted) {
+                            return Some(Err(error));
+                        }
                     }
                     voters.insert(expected);
                     if super::cohort::accept_quorum(voters.len(), self.voters.len()) {
-                        break;
+                        return Some(Ok(()));
                     }
                 }
                 Err(Error::Deposed(newer)) => {
-                    refusal = Some(refusal.map_or(newer, |old: Ballot| old.max(newer)))
+                    refusal = Some(refusal.map_or(newer, |old: Ballot| old.max(newer)));
                 }
                 _ => {}
             }
-        }
-        if voters.len() < self.quorum() {
-            return Err(refusal.map_or(Error::Quorum, Error::Deposed));
-        }
+            None
+        })
+        .await;
+        prepared.unwrap_or_else(|| Err(refusal.map_or(Error::Quorum, Error::Deposed)))?;
         #[cfg(feature = "simulation")]
         if let Some(trace) = &self.trace {
             trace.prepared(self.identity, ballot, &voters, winner.as_ref());
@@ -712,7 +716,7 @@ impl Group {
             let state = self.replay(prefix).expect("issued prefix replays");
             trace.issued(self.identity, ballot, prefix, &state);
         }
-        let mut accepts: FuturesUnordered<_> = peers
+        let accepts: FuturesUnordered<_> = peers
             .iter()
             .filter(|peer| promised.contains(&peer.identity()))
             .map(|peer| async move {
@@ -723,34 +727,54 @@ impl Group {
             })
             .collect();
         let mut voters = Vec::with_capacity(self.quorum());
-        while let Some((expected, reply)) = accepts.next().await {
+        let configured: Vec<_> = self.voters.iter().map(Uuid::as_u128).collect();
+        let candidate = Candidate { ballot, digest, read_back };
+        let confirmed = drive_round(accepts, |(expected, reply)| {
             match reply {
                 Ok(vote) => {
-                    if record_vote(&mut voters, expected, ballot, digest, read_back, vote)
-                        && super::cohort::accept_quorum(voters.len(), self.voters.len())
+                    if let Confirmation::Confirmed =
+                        receive_vote(&configured, &mut voters, &candidate, expected, vote)
                     {
-                        voters.sort_unstable_by_key(|evidence| evidence.voter);
-                        let configured: Vec<_> = self.voters.iter().map(Uuid::as_u128).collect();
-                        let counted: Vec<_> =
-                            voters.iter().map(|evidence| evidence.voter.as_u128()).collect();
-                        if !rules::configured_majority(&configured, &counted) {
-                            return Err(Error::Group);
-                        }
-                        #[cfg(feature = "simulation")]
-                        if let Some(trace) = &self.trace {
-                            trace.choice(self.identity, ballot, prefix, &voters);
-                        }
-                        return Ok(voters);
+                        return Some(());
                     }
                 }
                 Err(Error::Deposed(newer)) => {
-                    refusal = Some(refusal.map_or(newer, |old| old.max(newer)))
+                    refusal = Some(refusal.map_or(newer, |old: Ballot| old.max(newer)));
                 }
                 _ => {}
             }
+            None
+        })
+        .await;
+        if confirmed.is_none() {
+            return Err(refusal.map_or(Error::Quorum, Error::Deposed));
         }
-        Err(refusal.map_or(Error::Quorum, Error::Deposed))
+
+        voters.sort_unstable_by_key(|evidence| evidence.voter);
+        let counted: Vec<_> = voters.iter().map(|evidence| evidence.voter.as_u128()).collect();
+        if !rules::configured_majority(&configured, &counted) {
+            return Err(Error::Group);
+        }
+        #[cfg(feature = "simulation")]
+        if let Some(trace) = &self.trace {
+            trace.choice(self.identity, ballot, prefix, &voters);
+        }
+        Ok(voters)
     }
+}
+
+/// Delivers each completed event in poll order until the decision terminates
+/// the round. Dropping this future drops the remaining reply futures.
+async fn drive_round<Event, Decision>(
+    mut replies: impl Stream<Item = Event> + Unpin,
+    mut receive: impl FnMut(Event) -> Option<Decision>,
+) -> Option<Decision> {
+    while let Some(event) = replies.next().await {
+        if let Some(decision) = receive(event) {
+            return Some(decision);
+        }
+    }
+    None
 }
 
 fn choose_base(winner: &mut Option<Accepted>, candidate: Accepted) -> Result<(), Error> {
