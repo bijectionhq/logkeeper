@@ -22,7 +22,59 @@ pub(super) enum AcceptBallot {
 pub(super) fn accept_ballot(floor: Option<BallotRank>, ballot: BallotRank) -> AcceptBallot {
     match floor {
         Some(floor) if lower_ballot(ballot, floor) => AcceptBallot::Deposed,
-        Some(floor) if floor == ballot => AcceptBallot::Promised,
+        Some(floor) if same_ballot(floor, ballot) => AcceptBallot::Promised,
         _ => AcceptBallot::Unprepared,
+    }
+}
+
+pub(super) fn same_ballot(left: BallotRank, right: BallotRank) -> bool {
+    left.0 == right.0 && left.1 == right.1
+}
+
+pub(super) fn strict_majority(configured: usize, votes: usize) -> bool {
+    votes > configured / 2
+}
+
+fn contains_voter(configured: &[u128], voter: u128) -> bool {
+    let mut index = 0;
+    while index < configured.len() {
+        if configured[index] == voter {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+// The certificate is in voter order at the point where the coordinator returns it.
+pub(super) fn configured_majority(configured: &[u128], votes: &[u128]) -> bool {
+    if !strict_majority(configured.len(), votes.len()) {
+        return false;
+    }
+    let mut index = 0;
+    while index < votes.len() {
+        if !contains_voter(configured, votes[index])
+            || (index > 0 && votes[index - 1] >= votes[index])
+        {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+pub(super) enum RecoveryChoice {
+    Keep,
+    Tie,
+    Replace,
+}
+
+pub(super) fn recovery_choice(current: BallotRank, observed: BallotRank) -> RecoveryChoice {
+    if lower_ballot(observed, current) {
+        RecoveryChoice::Keep
+    } else if same_ballot(observed, current) {
+        RecoveryChoice::Tie
+    } else {
+        RecoveryChoice::Replace
     }
 }

@@ -636,7 +636,7 @@ impl Group {
                         choose_base(&mut winner, accepted)?;
                     }
                     voters.insert(expected);
-                    if voters.len() >= self.quorum() {
+                    if rules::strict_majority(self.voters.len(), voters.len()) {
                         break;
                     }
                 }
@@ -687,9 +687,15 @@ impl Group {
             match reply {
                 Ok(vote) => {
                     if record_vote(&mut voters, expected, ballot, digest, read_back, vote)
-                        && voters.len() >= self.quorum()
+                        && rules::strict_majority(self.voters.len(), voters.len())
                     {
                         voters.sort_unstable_by_key(|evidence| evidence.voter);
+                        let configured: Vec<_> = self.voters.iter().map(Uuid::as_u128).collect();
+                        let counted: Vec<_> =
+                            voters.iter().map(|evidence| evidence.voter.as_u128()).collect();
+                        if !rules::configured_majority(&configured, &counted) {
+                            return Err(Error::Group);
+                        }
                         return Ok(voters);
                     }
                 }
@@ -705,14 +711,16 @@ impl Group {
 
 fn choose_base(winner: &mut Option<Accepted>, candidate: Accepted) -> Result<(), Error> {
     if let Some(current) = winner {
-        if candidate.ballot < current.ballot {
-            return Ok(());
-        }
-        if candidate.ballot == current.ballot {
-            if candidate.prefix != current.prefix {
-                return Err(Error::Diverged);
+        match rules::recovery_choice(current.ballot.rank(), candidate.ballot.rank()) {
+            rules::RecoveryChoice::Keep => return Ok(()),
+            rules::RecoveryChoice::Tie => {
+                return if candidate.prefix == current.prefix {
+                    Ok(())
+                } else {
+                    Err(Error::Diverged)
+                };
             }
-            return Ok(());
+            rules::RecoveryChoice::Replace => {}
         }
     }
     *winner = Some(candidate);
