@@ -1,4 +1,4 @@
-use super::frame::{decode_flag, encode_flag};
+use super::frame::{decode_flag, encode_flag, withdrawn_worker_count_bounded};
 use super::{
     Input, checkpoint, checkpoint_preparation, cut, enrollment, grant, hold_row, placement,
     principal, request_id, snapshot, uuid, window, writer_state,
@@ -314,7 +314,7 @@ impl Reply {
             7 => Self::CheckpointCut(input.cut()?),
             8 => {
                 let count = usize::from(input.read_byte()?);
-                if count > MAX_WITHDRAWN_WORKERS {
+                if !withdrawn_worker_count_bounded(count) {
                     return Err(Refusal::Invalid);
                 }
                 let mut workers = Vec::with_capacity(count);
@@ -431,6 +431,7 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ordered::service::MAX_WITHDRAWN_WORKERS;
 
     #[test]
     fn withdrawn_worker_reply_round_trip_requires_bounded_page() {

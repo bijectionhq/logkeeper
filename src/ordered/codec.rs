@@ -13,8 +13,8 @@ mod snapshot;
 mod snapshot_checks;
 
 use frame::{
-    COMMAND_VERSION, decision_header, decode_flag, encode_flag, has_command_version,
-    object_name_count, read_decision_time,
+    COMMAND_VERSION, decision_header, decision_request_parts, decode_flag, encode_flag,
+    has_command_version, object_name_count, read_fixed_field, withdrawal_identity_admissible,
 };
 
 use signed::{checkpoint, cut, enrollment, placement, request_id, uuid};
@@ -311,25 +311,20 @@ pub(in crate::ordered) fn encode_decision(time: u64, request: &Request) -> Bytes
 }
 
 pub(in crate::ordered) fn decode_decision(frame: Bytes) -> Result<(u64, Request), Refusal> {
-    let time = u64::from_be_bytes(read_decision_time(&frame).ok_or(Refusal::Invalid)?);
+    let (time, version, fields) = decision_request_parts(&frame).ok_or(Refusal::Invalid)?;
     let mut body = BytesMut::with_capacity(frame.len() - 8);
-    body.put_slice(&frame[..1]);
-    body.put_slice(&frame[9..]);
-    Ok((time, Request::decode(body.freeze())?))
+    body.put_slice(version);
+    body.put_slice(fields);
+    Ok((u64::from_be_bytes(time), Request::decode(body.freeze())?))
 }
 
 struct Input(Bytes);
 
 impl Input {
     fn take<const N: usize>(&mut self) -> Result<[u8; N], Refusal> {
-        if self.0.len() < N {
-            return Err(Refusal::Invalid);
-        }
-        self.0
-            .split_to(N)
-            .as_ref()
-            .try_into()
-            .map_err(|_| Refusal::Invalid)
+        let field = read_fixed_field(&self.0).ok_or(Refusal::Invalid)?;
+        drop(self.0.split_to(N));
+        Ok(field)
     }
 
     fn append_class(&mut self) -> Result<AppendClass, Refusal> {
@@ -554,7 +549,7 @@ impl Input {
             name: self.take()?,
             version: self.take()?,
         };
-        if item.name == [0; 32] || item.version == [0; 32] {
+        if !withdrawal_identity_admissible(&item.name, &item.version) {
             return Err(Refusal::Invalid);
         }
         Ok(item)

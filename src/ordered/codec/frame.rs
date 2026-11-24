@@ -1,3 +1,5 @@
+use crate::ordered::admission::matches_fingerprint;
+
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
@@ -30,9 +32,24 @@ pub(crate) open spec fn objectNameCountFits(declared: int, maximum: int, remaini
     declared <= maximum && 32 * declared <= remaining
 }
 
+pub(crate) open spec fn decisionRequestBytes(frame: Seq<u8>) -> Seq<u8> {
+    frame.take(1) + frame.skip(9)
+}
+
+pub(crate) open spec fn withdrawalIdentityAdmissible(name: Seq<u8>, version: Seq<u8>) -> bool {
+    name != Seq::new(32, |_i| 0u8) && version != Seq::new(32, |_i| 0u8)
+}
+
+pub(crate) open spec fn withdrawnWorkerCountBounded(count: int) -> bool { count <= 64 }
+
+pub(crate) open spec fn readFixedField(frame: Seq<u8>, width: usize) -> Option<Seq<u8>> {
+    if width <= frame.len() { Some(frame.take(width as int)) } else { None }
+}
+
 }
 
 pub(super) const COMMAND_VERSION: u8 = 9;
+pub(crate) const MAX_WITHDRAWN_WORKERS: usize = 64;
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == (version == commandVersion()),
@@ -77,6 +94,51 @@ pub(super) fn read_decision_time(frame: &[u8]) -> Option<[u8; 8]> {
     #[cfg(verus_keep_ghost)]
     proof! { assert(time@ =~= frame@.subrange(1, 9)); }
     Some(time)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures match out {
+        Some((time, version, fields)) =>
+            decisionHeaderMatches(frame@, time@)
+            && version@ == frame@.take(1) && fields@ == frame@.skip(9),
+        None => frame@.len() < 9 || frame@[0] != commandVersion(),
+    },
+))]
+pub(super) fn decision_request_parts(frame: &[u8]) -> Option<([u8; 8], &[u8], &[u8])> {
+    let time = read_decision_time(frame)?;
+    let (version, _) = frame.split_at(1);
+    let (_, fields) = frame.split_at(9);
+    Some((time, version, fields))
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures match out {
+        Some(field) => readFixedField(frame@, N) == Some(field@),
+        None => readFixedField(frame@, N) is None,
+    },
+))]
+pub(super) fn read_fixed_field<const N: usize>(frame: &[u8]) -> Option<[u8; N]> {
+    let (prefix, _) = frame.split_at_checked(N)?;
+    let mut field = [0; N];
+    field.copy_from_slice(prefix);
+    Some(field)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == withdrawalIdentityAdmissible(name@, version@),
+))]
+pub(super) fn withdrawal_identity_admissible(name: &[u8; 32], version: &[u8; 32]) -> bool {
+    let zero = [0; 32];
+    #[cfg(verus_keep_ghost)]
+    proof! { assert(zero@ =~= Seq::new(32, |_i| 0u8)); }
+    !matches_fingerprint(name, &zero) && !matches_fingerprint(version, &zero)
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == withdrawnWorkerCountBounded(count as int),
+))]
+pub(super) fn withdrawn_worker_count_bounded(count: usize) -> bool {
+    count <= MAX_WITHDRAWN_WORKERS
 }
 
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>

@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 15,
+  "min_verified_functions": 26,
   "controls": {
     "accept-future-command-version": {
       "defect": "A later command version is treated as v9.",
@@ -138,6 +138,21 @@
           "file": "verification/verus/ordered_codec/laws.rs",
           "function": "short_decision_header_is_rejected",
           "category": "assertion failed"
+        },
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "decision_request_parts",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "decision_request_parts",
+          "category": "precondition not satisfied"
+        },
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "decision_request_parts",
+          "category": "precondition not satisfied"
         }
       ],
       "min_verified_functions": 14
@@ -159,6 +174,83 @@
         }
       ],
       "min_verified_functions": 14
+    },
+    "pass-time-byte-to-command": {
+      "defect": "Decision decoding passes the final journal-time byte to the command decoder.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "let (_, fields) = frame.split_at(9);",
+          "replace": "let (_, fields) = frame.split_at(8);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "decision_request_parts",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "accept-zero-withdrawal-version": {
+      "defect": "A typed withdrawal with an empty provider version enters the command codec domain.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "!matches_fingerprint(name, &zero) && !matches_fingerprint(version, &zero)",
+          "replace": "!matches_fingerprint(name, &zero)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "withdrawal_identity_admissible",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "accept-over-limit-worker-page": {
+      "defect": "The reply decoder accepts an oversized withdrawn-worker page.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "MAX_WITHDRAWN_WORKERS: usize = 64;",
+          "replace": "MAX_WITHDRAWN_WORKERS: usize = 65;"
+        },
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "withdrawnWorkerCountBounded(count: int) -> bool { count <= 64 }",
+          "replace": "withdrawnWorkerCountBounded(count: int) -> bool { count <= 65 }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_codec/laws.rs",
+          "function": "oversized_withdrawn_worker_count_is_rejected",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 23
+    },
+    "accept-truncated-fixed-field": {
+      "defect": "A missing fixed-width field produces zero bytes rather than failing.",
+      "mutate": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "find": "    let (prefix, _) = frame.split_at_checked(N)?;",
+          "replace": "    let Some((prefix, _)) = frame.split_at_checked(N) else { return Some([0; N]); };"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/codec/frame.rs",
+          "function": "read_fixed_field",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 25
     }
   }
 }

@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 pub mod wire;
 
 const ROUND_ATTEMPTS: usize = 4;
-pub(super) const MAX_WITHDRAWN_WORKERS: usize = 64;
+pub(super) use super::codec::frame::MAX_WITHDRAWN_WORKERS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Session {
