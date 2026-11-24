@@ -12,22 +12,23 @@ X == <<History(1, "x")>>
 Y == <<History(2, "y")>>
 XY == X \o Y
 Empty == [created |-> FALSE, deleted |-> FALSE, promised |-> 0,
-          holder |-> 0, synced |-> 0, history |-> <<>>, commit |-> 0, floor |-> 1,
+          identity |-> 0, synced |-> 0, history |-> <<>>, head |-> 0, floor |-> 1,
           stage |-> <<>>, staging |-> FALSE]
 Live(k) == k.created /\ ~k.deleted
 Prefix(a,b) == Len(a) <= Len(b) /\ a = SubSeq(b,1,Len(a))
-Cut(k) == SubSeq(k.history,1,k.commit)
+Cut(k) == SubSeq(k.history,1,k.head)
 EpochOK(k,e) == k.promised = e /\ k.synced = e
+\* The identity comes from the authenticated transport envelope.
 Request(verb,e,h,pos,records,c,complete) ==
-    [verb |-> verb, epoch |-> e, holder |-> h, pos |-> pos,
-     records |-> records, commit |-> c, complete |-> complete]
+    [verb |-> verb, epoch |-> e, identity |-> h, pos |-> pos,
+     records |-> records, head |-> c, max |-> 0, complete |-> complete]
 Simple(v) == Request(v,0,0,0,<<>>,0,FALSE)
 Seal(e,h) == Request("seal",e,h,0,<<>>,0,FALSE)
 Sync(e,pos,records,complete) == Request("sync",e,e,pos,records,0,complete)
 AppendTo(e,pos,records,c) == Request("append",e,e,pos,records,c,FALSE)
 Trim(e,pos) == Request("trim",e,e,pos,<<>>,0,FALSE)
 Check(e) == Request("check",e,0,0,<<>>,0,FALSE)
-Read(pos,n) == Request("read",0,0,pos,<<>>,n,FALSE)
+Read(pos,n) == [Request("read",0,0,pos,<<>>,0,FALSE) EXCEPT !.max = n]
 Max(a,b) == IF a >= b THEN a ELSE b
 SyncBase(k) == IF k.staging THEN k.stage ELSE k.history
 SyncHistory(k,r) == SubSeq(SyncBase(k),1,r.pos-1) \o r.records
@@ -35,9 +36,9 @@ NextPosition(k,r) == r.pos = Len(k.history) + 1
 Identical(k,r) ==
     /\ r.pos \in k.floor..Len(k.history)
     /\ r.records = SubSeq(k.history,r.pos,r.pos)
-Page(k,r,end) == [floor |-> k.floor, endLsn |-> k.commit,
+Page(k,r,through) == [floor |-> k.floor, head |-> k.head,
                   records |-> SubSeq(k.history,r.pos,
-                                      IF end < r.pos+r.commit THEN end ELSE r.pos+r.commit-1)]
+                                      IF through < r.pos+r.max THEN through ELSE r.pos+r.max-1)]
 Refuse(k) == [ok |-> FALSE, image |-> k, value |-> Null]
 Reply(k,v) == [ok |-> TRUE, image |-> k, value |-> v]
 Stay(k) == Reply(k,Null)
@@ -49,10 +50,10 @@ Decide(k,r) ==
         THEN Stay([k EXCEPT !.created = TRUE, !.deleted = FALSE]) ELSE Refuse(k)
       [] ~Live(k) -> Refuse(k)
       [] r.verb = "seal" ->
-        IF e > k.promised \/ (e = k.promised /\ (r.holder = k.holder \/ Fault = "seal-tie"))
+        IF e > k.promised \/ (e = k.promised /\ (r.identity = k.identity \/ Fault = "seal-tie"))
            \/ Fault = "seal-lower"
-        THEN Reply(IF e = k.promised /\ r.holder = k.holder THEN k
-                   ELSE [k EXCEPT !.promised = e, !.holder = r.holder, !.staging = FALSE], k)
+        THEN Reply(IF e = k.promised /\ r.identity = k.identity THEN k
+                   ELSE [k EXCEPT !.promised = e, !.identity = r.identity, !.staging = FALSE], k)
         ELSE Refuse(k)
       [] r.verb = "sync" ->
         LET h == SyncHistory(k,r) IN
@@ -69,23 +70,23 @@ Decide(k,r) ==
            /\ (k.synced = e \/ Fault = "append-unsynced")
            /\ (NextPosition(k,r) \/ Identical(k,r)
                 \/ Fault = "append-gap" \/ (Fault = "append-conflict" /\ r.pos \in k.floor..Len(k.history)))
-           /\ r.commit <= Max(Len(k.history),r.pos)
+           /\ r.head <= Max(Len(k.history),r.pos)
         THEN Stay([k EXCEPT
                       !.history = IF NextPosition(k,r) \/ Fault = "append-gap"
                                   THEN @ \o r.records
                                   ELSE IF Fault = "append-conflict" THEN r.records
                                        ELSE IF Fault = "append-retry" THEN <<>> ELSE @,
-                      !.commit = Max(@,r.commit), !.staging = FALSE])
+                      !.head = Max(@,r.head), !.staging = FALSE])
         ELSE Refuse(k)
       [] r.verb = "trim" ->
         IF (EpochOK(k,e) \/ Fault = "trim-epoch") /\
-           (r.pos <= k.commit \/ Fault = "trim-above")
+           (r.pos <= k.head \/ Fault = "trim-above")
         THEN Stay([k EXCEPT !.floor = Max(@,r.pos+1)]) ELSE Refuse(k)
       [] r.verb = "check" ->
-        Reply(IF Fault = "check-mutates" THEN [k EXCEPT !.commit = Len(k.history)] ELSE k,k)
+        Reply(IF Fault = "check-mutates" THEN [k EXCEPT !.head = Len(k.history)] ELSE k,k)
       [] r.verb = "read" ->
         IF r.pos >= k.floor \/ Fault = "read-below"
-        THEN Reply(k,Page(k,r,IF Fault = "read-uncommitted" THEN Len(k.history) ELSE k.commit))
+        THEN Reply(k,Page(k,r,IF Fault = "read-uncommitted" THEN Len(k.history) ELSE k.head))
         ELSE Refuse(k)
       [] r.verb = "delete" ->
         Stay(IF Fault = "delete-forgets" THEN Empty ELSE [k EXCEPT !.deleted = TRUE])
@@ -315,7 +316,7 @@ FinishHead ==
            result == IF head.mode = "writer" THEN known ELSE end
        IN /\ ((head.mode = "writer" /\ head.epoch = writer.epoch /\
                 (known >= end \/ Fault = "writer-known-only")) \/
-                (head.mode = "non-writer" /\ Cardinality({k \in head.answered \cap writer.voters : head.samples[k].commit >= end}) >= 2))
+                (head.mode = "non-writer" /\ Cardinality({k \in head.answered \cap writer.voters : head.samples[k].head >= end}) >= 2))
           /\ head' = [head EXCEPT !.returned = result, !.finish = Len(writer.cuts)]
     /\ UNCHANGED <<store,pc,event,writer,wal>>
 
@@ -401,25 +402,17 @@ Handoff ==
          /\ UNCHANGED <<wal,head>>
       [] OTHER -> FALSE
 
-ContractRead(left,right,pos) ==
-    LET a == store[left][Stream]
-        b == store[right][Stream]
-        floor == Max(a.floor,b.floor)
-        source == IF a.commit >= b.commit THEN a ELSE b
-        page == [Page(source,Read(pos,1),source.commit) EXCEPT !.floor = floor]
-    IN /\ event' = [before |-> b, request |-> Request("contract-read",0,0,pos,<<>>,1,FALSE),
-                    result |-> [ok |-> pos >= floor, image |-> b, value |-> page]]
-       /\ pc' = pc+1
-       /\ UNCHANGED <<store,writer,wal,head>>
-
 TrimRead ==
-    CASE pc \in 10..12 -> Do(pc-9,Stream,AppendTo(1,1,X,0))
+    CASE pc \in {10,12} -> Do(pc-9,Stream,AppendTo(1,1,X,0))
+      [] pc = 11 ->
+           /\ Observe(2,Stream,AppendTo(1,1,X,0))
+           /\ writer' = RecordChoice(writer,X)
+           /\ pc' = pc+1
+           /\ UNCHANGED <<wal,head>>
       [] pc \in 13..15 -> Do(pc-12,Stream,AppendTo(1,1,X,1))
       [] pc \in 16..17 -> Do(pc-15,Stream,Trim(1,1))
-      [] pc = 18 ->
-           IF Fault = "single-read-floor" THEN Do(3,Stream,Read(1,1))
-           ELSE \E left,right \in Originals, pos \in 1..2 :
-                  left < right /\ ContractRead(left,right,pos)
+      [] pc = 18 -> Do(3,Stream,AppendTo(1,2,<<History(1,"y")>>,1))
+      [] pc = 19 -> \E source \in Originals, pos \in 1..2 : Do(source,Stream,Read(pos,2))
       [] OTHER -> FALSE
 
 Next ==
@@ -435,7 +428,7 @@ CheckRule(verb) == event.request.verb = verb /\ event.result.ok
 CreateGuard == CheckRule("create") => ~event.before.deleted
 SealOrder == CheckRule("seal") => event.before.promised <= event.request.epoch
 SealHolder == (CheckRule("seal") /\ event.before.promised = event.request.epoch)
-                => event.before.holder = event.request.holder
+                => event.before.identity = event.request.identity
 SyncPromise == CheckRule("sync") => event.before.promised = event.request.epoch
 SyncRetainsCommit == CheckRule("sync") => Prefix(Cut(event.before),event.result.image.history)
 SyncComplete == (CheckRule("sync") /\ ~event.request.complete)
@@ -448,16 +441,16 @@ AppendCondition == CheckRule("append") =>
 AppendRetry == (CheckRule("append") /\ Identical(event.before,event.request)) =>
     event.before.history = event.result.image.history
 TrimEpoch == CheckRule("trim") => EpochOK(event.before,event.request.epoch)
-TrimCommit == CheckRule("trim") => event.request.pos <= event.before.commit
+TrimCommit == CheckRule("trim") => event.request.pos <= event.before.head
 CheckPure == CheckRule("check") => event.result.image = event.before
 ReadFloor == CheckRule("read") => event.before.floor <= event.request.pos
 ReadExact == CheckRule("read") =>
-    Page(event.before,event.request,event.before.commit) = event.result.value
+    Page(event.before,event.request,event.before.head) = event.result.value
 DeleteTerminal == CheckRule("delete") => event.result.image.deleted
 WinnerRank == writer.rankOK
 LearnerExcluded == writer.learner => 4 \notin writer.voters
 KeeperBounds == \A k \in Keepers, s \in Streams :
-    LET st == store[k][s] IN st.floor \in 1..(st.commit+1) /\ st.commit <= Len(st.history)
+    LET st == store[k][s] IN st.floor \in 1..(st.head+1) /\ st.head <= Len(st.history)
 CommittedPrefix == Scenario = "protocol" =>
     /\ writer.committed \in {<<>>,X,XY}
     /\ \A k \in writer.live : Prefix(Cut(store[k][Stream]),writer.committed)
@@ -485,11 +478,16 @@ BothSurvivorsAfterRepair == writer.repaired =>
     \A k \in {2,3} : Prefix(X,store[k][Stream].history)
 DelayedAppendAlreadyCommitted == (Scenario = "handoff" /\ writer.tried) =>
     Len(writer.committed) <= writer.sealedEnd
-QuorumTrimReadFloor == (Scenario = "retention" /\ pc = 19) =>
-    /\ event.result.value.floor >= 2
-    /\ event.result.ok = (event.request.pos >= event.result.value.floor)
-NoTrimReadWitness == ~(Scenario = "retention" /\ pc = 19 /\ event.before.floor = 1
-    /\ event.request.pos = 1 /\ ~event.result.ok /\ event.result.value.floor = 2)
+RetentionReadCommitted == (Scenario = "retention" /\ pc = 20 /\ event.result.ok) =>
+    LET page == event.result.value
+        pos == event.request.pos
+        upper == pos + event.request.max - 1
+    IN /\ page.head <= Len(writer.committed)
+       /\ page.records = SubSeq(writer.committed,pos,IF upper < page.head THEN upper ELSE page.head)
+NoTrimReadWitness == ~(Scenario = "retention" /\ pc = 20
+    /\ store[1][Stream].floor = 2 /\ store[2][Stream].floor = 2
+    /\ event.before.floor = 1 /\ Len(event.before.history) = 2 /\ event.request.pos = 1
+    /\ event.result.ok /\ event.result.value.records = X)
 NoDelayedAppendWitness == ~(writer.tried /\ writer.epoch = 2 /\ writer.committed = X
     /\ store[3][Stream].promised = 1 /\ event.result.ok)
 NoProtocolWitness == ~(writer.epoch = 2 /\ writer.lost /\ writer.retried /\ writer.tried

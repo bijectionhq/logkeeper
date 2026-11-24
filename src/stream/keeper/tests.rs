@@ -684,10 +684,10 @@ fn recovery_cuts_interleaved_torn_tail_and_keeps_the_other_stream() {
     let mut tail = BytesMut::new();
     wal::fragment(&mut tail, A, true, false, &a[..30]);
     wal::fragment(&mut tail, B, true, true, &b);
+    let last = tail.len();
     wal::fragment(&mut tail, A, false, true, &a[30..]);
-    // A checksum-invalid last frame, with B's complete operation in between A's fragments.
-    let last = tail.len() - 1;
-    tail[last] ^= 1;
+    // Damage the checksum so this specifically exercises the CRC guard.
+    tail[last + 4] ^= 1;
     OpenOptions::new()
         .append(true)
         .open(&segment)

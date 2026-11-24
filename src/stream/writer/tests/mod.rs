@@ -15,8 +15,8 @@ const E2: Epoch = Epoch(2);
 const E3: Epoch = Epoch(3);
 const WAIT: Duration = Duration::from_secs(2);
 
-fn writer(network: &Arc<Network>, holder: u128) -> Writer {
-    Writer::new(network.client(holder), KEEPERS).unwrap()
+fn writer(network: &Arc<Network>, identity: u128) -> Writer {
+    Writer::new(network.client(identity), KEEPERS).unwrap()
 }
 
 async fn started() -> (Arc<Network>, Writer) {
@@ -68,7 +68,7 @@ async fn zombie_writer_is_fenced_and_recovery_contains_the_prior_commit() {
 }
 
 #[tokio::test]
-async fn two_holders_at_the_same_epoch_cannot_both_seal() {
+async fn two_identities_at_the_same_epoch_cannot_both_seal() {
     let (network, _) = started().await;
     let a = writer(&network, 2);
     let b = writer(&network, 3);
@@ -76,7 +76,7 @@ async fn two_holders_at_the_same_epoch_cannot_both_seal() {
     assert_ne!(
         a_seal.is_ok(),
         b_seal.is_ok(),
-        "one holder must win the seal race"
+        "one identity must win the seal race"
     );
     let (winner, loser) = if a_seal.is_ok() { (&a, &b) } else { (&b, &a) };
     assert_eq!(
@@ -90,7 +90,7 @@ async fn two_holders_at_the_same_epoch_cannot_both_seal() {
 }
 
 #[tokio::test]
-async fn head_and_reseal_accept_the_winning_holder_amid_a_split_promise() {
+async fn head_and_reseal_accept_the_winning_identity_amid_a_split_promise() {
     use crate::stream::wire::{Reply, Request, Transport};
 
     let (network, _) = started().await;
@@ -118,7 +118,7 @@ async fn head_and_reseal_accept_the_winning_holder_amid_a_split_promise() {
     assert_eq!(
         observer.head(STREAM).await,
         Ok(Lsn(1)),
-        "a minority promise must not mask the winning holder"
+        "a minority promise must not mask the winning identity"
     );
     assert_eq!(
         winner.seal(STREAM, E2).await,
@@ -221,9 +221,7 @@ async fn append_retry_after_lost_replies_is_exact() {
     );
     assert_eq!(
         writer.append(STREAM, E1, Lsn(1), record("changed")).await,
-        Err(JournalError::Conflict {
-            head: Lsn(0)
-        })
+        Err(JournalError::Conflict { head: Lsn(0) })
     );
     assert_eq!(
         writer.append(STREAM, E1, Lsn(1), record("once")).await,
@@ -235,15 +233,11 @@ async fn append_retry_after_lost_replies_is_exact() {
     );
     assert_eq!(
         writer.append(STREAM, E1, Lsn(1), record("changed")).await,
-        Err(JournalError::Conflict {
-            head: Lsn(1)
-        })
+        Err(JournalError::Conflict { head: Lsn(1) })
     );
     assert_eq!(
         writer.append(STREAM, E1, Lsn(3), record("gap")).await,
-        Err(JournalError::Conflict {
-            head: Lsn(1)
-        })
+        Err(JournalError::Conflict { head: Lsn(1) })
     );
 }
 
@@ -386,7 +380,7 @@ async fn observer_head_requires_quorum_commit_coverage() {
 }
 
 #[tokio::test]
-async fn read_long_poll_wakes_on_the_final_commit_and_uses_the_quorum_floor() {
+async fn read_long_poll_wakes_when_the_keeper_publishes_head() {
     let (network, writer) = started().await;
     let reader = self::writer(&network, 9);
     network.down(KEEPERS[2], true);
@@ -405,9 +399,7 @@ async fn read_long_poll_wakes_on_the_final_commit_and_uses_the_quorum_floor() {
     assert_eq!((page.floor, page.head), (Lsn(1), Lsn(1)));
     assert_eq!(
         writer.trim(STREAM, E1, Lsn(2)).await,
-        Err(JournalError::Conflict {
-            head: Lsn(1)
-        })
+        Err(JournalError::Conflict { head: Lsn(1) })
     );
     writer.trim(STREAM, E1, Lsn(1)).await.unwrap();
     network.down(KEEPERS[0], true);
@@ -427,70 +419,70 @@ async fn read_long_poll_wakes_on_the_final_commit_and_uses_the_quorum_floor() {
 }
 
 #[tokio::test]
-async fn read_floor_intersects_a_completed_trim() {
-    use crate::stream::wire::{Reply, Request, Transport};
-
+async fn single_keeper_read_serves_committed_records_below_a_remote_floor() {
     let (network, writer) = started().await;
     writer
-        .append(STREAM, E1, Lsn(1), record("discard"))
-        .await
-        .unwrap();
-    writer
-        .append(STREAM, E1, Lsn(2), record("retain"))
+        .append(STREAM, E1, Lsn(1), record("retained"))
         .await
         .unwrap();
     let [first, second, third] = KEEPERS[..3].try_into().unwrap();
     network
-        .until(|| network.view(third, STREAM).unwrap().head == Lsn(2))
+        .until(|| {
+            [first, second, third]
+                .into_iter()
+                .all(|keeper| network.view(keeper, STREAM).unwrap().head == Lsn(1))
+        })
         .await;
+    let reader = self::writer(&network, 9);
+    let reads = network.calls(Kind::Read).len();
+    assert_eq!(
+        reader
+            .read(STREAM, Lsn(1), 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .head,
+        Lsn(1)
+    );
+    assert_eq!(
+        &network.calls(Kind::Read)[reads..],
+        &[first],
+        "read must prefer the nearest keeper"
+    );
     network.down(third, true);
     writer.trim(STREAM, E1, Lsn(1)).await.unwrap();
     network.down(first, true);
     network.down(third, false);
 
-    let local = network
-        .client(9)
-        .call(
-            third,
-            Request::Read {
-                stream: STREAM,
-                from: Lsn(1),
-                max: 1,
-                wait_ms: 0,
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        local,
-        Reply::Records {
-            floor: Lsn(1),
-            records: vec![(Lsn(1), record("discard"))],
-            head: Lsn(2),
-        },
-        "the third keeper still serves its local floor"
-    );
+    let checks = network.calls(Kind::Check);
     assert_eq!(network.view(second, STREAM).unwrap().floor, Lsn(2));
-
-    let reader = self::writer(&network, 9);
+    let page = reader
+        .read(STREAM, Lsn(1), 1, Duration::ZERO)
+        .await
+        .expect("a reachable keeper still retains the committed record");
     assert_eq!(
-        reader.read(STREAM, Lsn(1), 1, Duration::ZERO).await,
-        Err(JournalError::Trimmed { floor: Lsn(2) }),
-        "stream-wide read floor"
+        (page.floor, page.head, page.records),
+        (Lsn(1), Lsn(1), vec![(Lsn(1), record("retained"))])
     );
+    assert_eq!(
+        network.calls(Kind::Check),
+        checks,
+        "read performed a quorum check"
+    );
+
+    network.down(second, true);
     assert_eq!(
         reader
-            .read(STREAM, Lsn(2), 1, Duration::ZERO)
+            .read(STREAM, Lsn(1), 1, Duration::ZERO)
             .await
             .unwrap()
-            .floor,
-        Lsn(2),
-        "stream-wide page floor"
+            .head,
+        Lsn(1),
     );
+    assert_eq!(reader.head(STREAM).await, Err(JournalError::Unavailable));
 }
 
 #[tokio::test]
-async fn a_stale_route_cannot_read_below_a_replacement_ensemble_trim() {
+async fn stale_routes_can_read_committed_records_after_a_replacement_trim() {
     use crate::stream::keeper::{Sweep, sweep_idle};
 
     let (network, old_writer) = started().await;
@@ -527,15 +519,25 @@ async fn a_stale_route_cannot_read_below_a_replacement_ensemble_trim() {
     assert_eq!(
         writer(&network, 4)
             .read(STREAM, Lsn(1), 1, Duration::ZERO)
-            .await,
-        Err(JournalError::Unavailable),
-        "stale routes cannot furnish the current read quorum"
+            .await
+            .unwrap()
+            .records,
+        [(Lsn(1), record("discard"))],
     );
     let reader = writer(&network, 5);
     reader.bind_ensemble(STREAM, new).unwrap();
     assert_eq!(
+        reader
+            .read(STREAM, Lsn(1), 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        [(Lsn(1), record("discard"))],
+    );
+    network.down(second, true);
+    assert_eq!(
         reader.read(STREAM, Lsn(1), 1, Duration::ZERO).await,
-        Err(JournalError::Trimmed { floor: Lsn(2) })
+        Err(JournalError::Trimmed { floor: Lsn(2) }),
     );
 }
 
@@ -784,13 +786,7 @@ async fn journal_contract_conformance() {
         LIMITS.stream_quota_bytes,
     ));
     run(|identity| {
-        Arc::new(
-            Writer::new(
-                network.connect(identity),
-                KEEPERS[..3].iter().copied(),
-            )
-            .unwrap(),
-        )
+        Arc::new(Writer::new(network.connect(identity), KEEPERS[..3].iter().copied()).unwrap())
     })
     .await;
 }

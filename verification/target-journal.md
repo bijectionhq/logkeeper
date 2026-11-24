@@ -15,93 +15,171 @@ A journal is a set of **streams**. A stream is a totally ordered, durable, fence
 
 ## 2. The contract (`journal-contract`)
 
-The contract is the whole interface a consumer sees. RTDB depends on it and never on Logkeeper's internals. The trait, types and errors are already defined in `contract/src/lib.rs`. This section gives their semantics.
+The consumer depends on the `Journal` trait in `contract/src/lib.rs`. Each call
+returns a boxed, sendable future yielding a `Result<T, JournalError>`.
+`StreamId(u128)` names a stream, `Epoch(u64)` is its writer fence, and `Lsn(u64)`
+is its record position. `Identity` is the caller's authenticated client
+certificate URI SAN. A handle carries the identity. The first record is at
+LSN 1. The **head** is the last committed LSN, or 0 for an empty stream. A
+**floor** is the first retained LSN. A `Page` contains `floor: Lsn`,
+`records: Vec<(Lsn, Bytes)>` and `head: Lsn`, all from one keeper's view.
 
-| Verb | Semantics |
-| --- | --- |
-| `create(stream)` | The stream exists, empty: end 0, floor 1, no epoch. Idempotent. Refused with `Deleted` after `delete`. |
-| `seal(stream, epoch)` | Fence. Afterwards no append under an epoch below `epoch` commits. Returns the committed end, which contains every append acknowledged before the seal took effect. Sealing twice at the same epoch from the same identity is idempotent. A different identity at an equal or lower epoch gets `Fenced`. |
-| `append(stream, epoch, at, payload)` | Commits `payload` as the record at LSN `at` iff `epoch` is the stream's sealed epoch, the caller sealed it, and `at == end + 1`. Returns `at`. Retrying an identical `(epoch, at, payload)` returns `at` even if the first reply was lost. A different payload at a committed `at` returns `Conflict`. |
-| `read(stream, from, max, wait)` | Committed records in `[from, from + max)`. If `from` is past the committed end, waits up to `wait` for new commits (long-poll). Returns the floor and the committed end seen. `from < floor` returns `Trimmed`. |
-| `head(stream)` | A linearizable committed end: an LSN that was committed at some instant inside the call and is at least every LSN acknowledged before the call started. No clock appears in its safety. |
-| `trim(stream, epoch, through)` | Discards records up to and including `through`, where `through` is at most the committed end. Only the sealed epoch may trim. The floor is monotone. |
-| `delete(stream)` | Terminal and permanent; the stream ID is never reused. |
-
-**Errors:**
-- `Fenced { current }`
-- `Conflict { committed_end }`
-- `Trimmed { floor }`
-- `TooLarge { max }`
-- `Full { floor }` (the stream's byte quota is exhausted; `trim` frees space and never needs space)
-- `NotFound`
-- `Deleted`
-- `Unavailable` (retry; the outcome of a mutation may be unknown)
-
-**Contract properties**, which the conformance suite checks on every implementation:
-1. Committed records are contiguous from the floor to the end, and irrevocable until trimmed.
-2. After `seal(e)` returns `n`, no append under an epoch below `e` commits, and every append acknowledged before the seal is at or below `n`.
-3. `head()` is linearizable as defined above.
-4. `append` is idempotent for identical retries and conditional on `at`.
-5. Reads return exactly the committed records.
-
-**Durability (D03):** an acknowledged record is on two durable copies in two zones. With one zone lost, both survivors must hold it.
-
-**Authorization (S07, owner decision 2026-11-24):**
-- An mTLS identity in the cluster's `clients` list may `read` and `head`.
-- Only identities in the cluster's `writers` list may `create`, `seal`, `append`, `trim` and `delete`.
-- The journal decides nothing about *who should* seal. Fencing makes any seal safe, and the takeover policy belongs to the consumer (section 4).
-- Logkeeper keeps the safety half of S07 for its own moves: a stream moved between keeper ensembles, including keeper replacement, admits writes at at most one authority, across crashes and stale routes.
-- The `SealPolicy` hook stays as an extension point. It defaults to allow, and no policy is shipped.
-
-## 3. The implementation: writer-driven quorum per stream
-
-**Keepers.** Each cluster has keepers, normally three, one per zone, each on a local disk. Each stream has an **ensemble** of three keepers. Keepers never talk to each other on the hot path.
-
-**Writer.** The consumer process that seals a stream is its writer, and it runs Logkeeper's client library (`src/stream/writer`), which is the proposer. The epoch is the ballot.
-
-**Per-stream keeper state:** `promised: (epoch, holder)`, `synced: epoch`, `end`, `commit`, `floor`, `deleted`. It is durable in the keeper's shared log.
-
-**Keeper rules** (wire types in `src/stream/wire.rs`):
-
-| Request | Keeper rule | Durable before the reply |
+| Call | Result | Semantics |
 | --- | --- | --- |
-| `Create { stream, ensemble }` | Absent and not tombstoned; idempotent | yes |
-| `Seal { stream, epoch, holder }` | `epoch > promised.epoch`, or equal with the same holder. Reply: `synced`, `end`, `floor`, `commit`, and the epoch runs needed to rank histories | yes |
-| `Sync { stream, epoch, from, records, complete }` | `epoch == promised.epoch`. Truncates only above `commit`. `complete` sets `synced = epoch` | yes |
-| `Append { stream, epoch, at, records, commit }` | `promised.epoch == epoch == synced`, `at == end + 1`, or an identical record already at `at` | yes |
-| `Trim { stream, epoch, through }` | Same epoch check; `through <= commit` | yes |
-| `Check { stream, epoch }` | Returns `promised`, `synced`, `end`, `commit`. No state change | no |
-| `Read { stream, from, max, wait }` | Records up to `commit`, long-polling | no |
-| `Delete { stream }` | Permanent tombstone; data removed at the next segment rotation | yes |
+| `create(stream: StreamId)` | `()` | Create an empty stream with head 0, floor 1 and no epoch. Idempotent. A deleted ID cannot be reused. |
+| `seal(stream: StreamId, epoch: Epoch)` | `Lsn` | Fence lower epochs and return the head, which covers every earlier acknowledged append. An equal-epoch retry from the same identity is idempotent. A different identity at the same epoch is fenced. |
+| `append(stream: StreamId, epoch: Epoch, at: Lsn, payload: Bytes)` | `Lsn` | Commit at `at == head + 1` under the sealed epoch and identity. An identical retained retry returns `at`. A different payload at a committed position returns `Conflict`. |
+| `read(stream: StreamId, from: Lsn, max: usize, wait: Duration)` | `Page` | Read the contiguous committed slice in `[from, from + max)` through the serving keeper's head. Wait up to `wait` for records when `from` exceeds the observed head. Try another keeper if the first cannot supply the requested records. Return `Trimmed` only if the requested start is unavailable and is below an observed floor. A page can lag `head()`, include records another keeper trimmed, or include retained records until the serving keeper observes a deletion. |
+| `head(stream: StreamId)` | `Lsn` | Return a head that existed during the call and covers every LSN acknowledged before the call began. |
+| `trim(stream: StreamId, epoch: Epoch, through: Lsn)` | `()` | Advance the floor through `through + 1` under the sealed epoch and identity. `through` cannot exceed the head. The floor never decreases. |
+| `delete(stream: StreamId)` | `()` | Permanently tombstone the stream ID. A keeper with a tombstone refuses subsequent reads and mutations other than an idempotent delete. |
 
-**Writer protocol:**
-- **seal(e).** Send `Seal` to the ensemble. On a quorum of two promises, adopt the highest history ranked by `(synced, end)`, never by the epoch of the last entry (see `src/client/recovery.rs:3-5`). `Sync` that history to a quorum with `complete`, then serve.
-- **append.** Pipelined. A record commits once two keepers acknowledge it at the writer's epoch. `commit` is piggybacked on later appends.
-- **Fresh reads, `head`.** Study 29's read index: a `Check` round opened after the invocation, answered by a quorum at the current epoch. If a higher epoch is seen, refuse or retry at the new writer. The writer answers with its commit index. A non-writer answers with the maximum reported end once a quorum reports `commit` at or above it. Batch every waiting `head` into one round per stream per tick, and ride on append acknowledgements when appends are flowing. No lease: no clock appears in any safety argument.
+| Error | Meaning |
+| --- | --- |
+| `Fenced { current: Epoch }` | A higher epoch has sealed, or a different identity sealed this epoch. |
+| `Conflict { head: Lsn }` | The requested position or payload conflicts with the journal. |
+| `Trimmed { floor: Lsn }` | A requested position below an observed floor is unavailable. |
+| `TooLarge { max: usize }` | The payload exceeds the record limit. |
+| `Full { floor: Lsn }` | The stream's byte quota is exhausted. Trim frees quota and needs no space. |
+| `NotFound` | The stream does not exist at the responding authority. |
+| `Deleted` | The stream was deleted. |
+| `Unavailable` | Retry. A mutation's outcome may be unknown. |
 
-**Shared write-ahead log.** Each keeper keeps one append-only segmented log for every stream:
-- records are framed with length and CRC;
-- group commit: one write and one sync per round across all streams, with a per-stream byte cap per round;
-- a reply follows the covering sync;
-- recovery cuts a torn final record and demultiplexes per stream;
-- compaction never rewrites every stream: retained data moves to per-stream extents so segments are short-lived, and `delete` forces rotation.
+Committed records are contiguous and immutable. Seal covers acknowledged
+appends and prevents lower epochs from committing new records. Head is
+linearizable. Append is conditional and supports retained identical retries.
+The conformance history checker compares a read's exact payloads and bounds
+with committed history, including prefixes retained below another keeper's
+floor. Writes and head use quorum confirmation.
 
-Start from the classic `src/server/journal.rs`, which already has the shared-segment and group-commit shape. Study 117 (`/Users/sachaichbiah/code/logkeeper-k5/verification/117-shared-wal/`) models the shared log.
+An acknowledged record has two durable copies in different zones. If one
+zone fails, the surviving copy is sufficient for recovery, which copies the
+record to both survivors.
 
-**Keeper replacement.** A replacement keeper gets a new identity. It is a non-voting learner for each stream until a writer or a background sweeper syncs that stream to it. Until then, the stream's quorum is its two surviving members. A blank keeper must never rejoin under an old identity (Study 117 `EmptyRejoin`).
+An mTLS identity listed in `clients` may read and check head. Only identities
+listed in `writers` may create, seal, append, trim or delete. The optional
+`SealPolicy` defaults to allow. No policy is shipped. The consumer owns the
+takeover policy and applies records through the head returned by seal before
+serving. A stream moved between ensembles admits writes through at most one
+authority across crashes and stale routes.
 
-**Capacity.** Each stream has a static byte quota, and `append` returns `Full`. `trim` needs no space. There is no maintenance lane.
+## 3. The keeper protocol
 
-**What is gone, compared with `src/ordered`:**
-- grants, enrollments and principal kinds;
-- receipts, the retry book and the expiry index;
-- holds, barriers, `ReleaseRead` and leases;
-- checkpoint preparation, publication, close and settle;
-- object references and withdrawal;
-- `PublishAndRotate` and key generations;
-- funded windows and append classes;
-- worker disposal;
-- the two-slot whole-image voter media, and per-command prepare and accept over the whole prefix.
+A stream's **ensemble** is its ordered array of three `KeeperId(u128)` values,
+normally one per zone. The writer drives the protocol and the keepers never
+coordinate with each other on the hot path. The authenticated transport
+supplies the caller `Identity`. Mutating messages carry no claimed identity.
+One proposer drives a given epoch. The proposer uses its certificate
+identity and shares one writer state among its handles. A takeover elects a
+fresh epoch. A reconnect at the same epoch retries the existing election.
+
+A keeper's **tail** is the last durable LSN, which can include accepted,
+uncommitted records. The keeper's **head** is the last LSN it knows to be
+committed. `StreamView` contains `promised: Option<(Epoch, Identity)>`,
+`synced: Option<Epoch>`, `tail: Lsn`, `head: Lsn`, `floor: Lsn`,
+`runs: Vec<EpochRun>`, `ensemble: [KeeperId; 3]` and `learner: bool`.
+Each `EpochRun { epoch: Epoch, first: Lsn, last: Lsn }` covers an inclusive
+range of records from one epoch. The keeper also persists its deletion
+tombstone.
+
+### Requests
+
+All successful mutations are durable before their replies. Idempotent
+replies can use existing durable state. `Check`, `Read` and `Recover` only
+observe state. `Check` and `Read` require client authorization. All other
+requests require writer authorization.
+
+| Request | Keeper rule |
+| --- | --- |
+| `Create { stream: StreamId, ensemble: [KeeperId; 3] }` | Create if absent and the ensemble contains three distinct nonzero IDs. A keeper outside the ensemble starts as a learner. |
+| `Seal { stream: StreamId, ensemble: [KeeperId; 3], epoch: Epoch }` | Require the current ensemble, policy approval and a higher epoch or the same epoch and authenticated identity. Reply with the keeper view. |
+| `Sync { stream: StreamId, epoch: Epoch, floor: Lsn, from: Lsn, records: Vec<Bytes>, runs: Vec<EpochRun>, head: Lsn, complete: bool }` | Require the promise. Install the selected history with its exact epoch runs and preserve the prefix through the keeper's head. A complete install sets `synced`. An empty, incomplete Sync can advance a synced keeper's floor over a discarded prefix. |
+| `Append { stream: StreamId, epoch: Epoch, at: Lsn, records: Vec<Bytes>, head: Lsn }` | Require the promise and a synced voting member. Extend at `tail + 1` or verify the entire retry range. An empty append can publish the head without adding a record. The published head must fit the resulting tail. |
+| `Trim { stream: StreamId, epoch: Epoch, through: Lsn }` | Require the promise and a synced voting member. Discard through the requested position at or below the local head. |
+| `Check { stream: StreamId, epoch: Epoch }` | Return the durable view. The caller uses the requested epoch to identify eligible replies. |
+| `Recover { stream: StreamId, epoch: Epoch, from: Lsn, max: u32 }` | Require the promise. Read retained accepted records, including records above the local head, with no wait. |
+| `Read { stream: StreamId, from: Lsn, max: u32, wait_ms: u32 }` | Read retained committed records up to the local head. A page can stop early at the wire byte limit. When the start is past the head and `max` is positive, wait up to `wait_ms`. |
+| `Delete { stream: StreamId, ensemble: [KeeperId; 3] }` | Require the current ensemble and membership. Install a permanent tombstone and rotate the WAL before replying. |
+| `Replace { stream: StreamId, epoch: Epoch, from: [KeeperId; 3], to: [KeeperId; 3] }` | Require the promise and a completed Sync. Install a valid ensemble differing in one slot, with the keeper a member of the new ensemble. The proposer installs both survivors before installing the learner. |
+
+### Replies
+
+| Reply | Meaning |
+| --- | --- |
+| `Created` | The stream exists. |
+| `Sealed(StreamView)` | The authenticated promise is durable and the view describes the keeper's history. |
+| `Synced { tail: Lsn }` | The keeper has durably installed the requested range. |
+| `Appended { tail: Lsn }` | The keeper has durably accepted the append or already held the same range. |
+| `Trimmed { floor: Lsn }` | The keeper has durably advanced its floor through the requested position. |
+| `Checked(StreamView)` | The keeper's durable view. |
+| `Records { floor: Lsn, records: Vec<(Lsn, Bytes)>, head: Lsn }` | One keeper's retained slice. For `Read`, every position is at or below `head`. For `Recover`, the slice can reach the tail. |
+| `Deleted` | The stream has a durable tombstone. |
+| `Replaced` | The keeper has installed the new ensemble. |
+| `Refused(Refusal)` | The keeper refused the request. |
+
+### Refusals
+
+| Refusal | Meaning |
+| --- | --- |
+| `Fenced { promised: Epoch }` | The request lacks the current epoch and identity promise. |
+| `NotSynced` | The requested epoch has not synced, or the operation requires a voting member. |
+| `Gap { head: Lsn }` | The requested range would leave a gap. |
+| `Conflict { head: Lsn }` | The requested range conflicts with the keeper's history. |
+| `BelowFloor { floor: Lsn }` | The start is below the keeper's floor. |
+| `AboveHead { head: Lsn }` | A requested bound exceeds the keeper's head or would publish beyond its resulting tail. |
+| `Full { floor: Lsn }` | The stream has exhausted its quota. |
+| `TooLarge { max: u32 }` | A record exceeds the configured record size limit. |
+| `NotFound` | The stream is absent. |
+| `Deleted` | The stream has a tombstone. |
+| `Unauthorized` | The request failed authorization, policy or ensemble validation. |
+| `WrongEnsemble { ensemble: [KeeperId; 3] }` | The supplied ensemble differs from the keeper's ensemble. |
+
+### Writer and transport
+
+- **Seal.** From two durable promises, choose the history with the highest
+  `(synced, tail)`. Fetch accepted records with `Recover` and install that
+  history with complete `Sync` on a quorum. Publish the adopted head to a
+  quorum before returning it. Retry the selected history at the same epoch
+  after an uncertain result.
+- **Append.** Pipeline independent keeper lanes. Two durable acceptances at
+  the writer's epoch choose the record. Publish the head to a quorum before
+  acknowledging the append, using the head on subsequent or empty appends.
+- **Head.** Open a fresh `Check` round after the invocation and batch callers
+  waiting when it opens. A writer can use append replies from requests sent
+  after the round opened. It covers the sampled tails with a chosen head and
+  confirms publication. An observer takes the maximum tail in an eligible
+  set at the same promise and synced epoch and requires quorum head coverage
+  for that position. The freshness and quorum rules use no leases.
+- **Read.** Try the nearest keeper first. Each successful page comes from
+  one keeper, with the first reply's head bounding any subsequent chunks.
+  Fall back if the keeper cannot supply the requested records. TCP discovery
+  ranks the routes by connection time, independently of ensemble order.
+  Explicit routes use their supplied order.
+- **Replacement.** A new keeper has a new identity and starts as a
+  non-voting learner. The sweeper seals the two survivors and selects and
+  publishes their adopted history, syncs the learner, then replaces the
+  lost member on both survivors before installing the new ensemble on the
+  learner. A stale writer cannot use an old ensemble to obtain a write
+  quorum.
+- **Transport.** `Transport::identity()` is the authenticated caller.
+  `read_order(ensemble)` supplies member preference, defaulting to ensemble
+  order. `call(keeper, request)` returns a boxed future for a reply or
+  `TransportError` (`Unreachable`, `TimedOut`, or `Protocol(String)`).
+  TLS uses `logkeeper-stream/2`. A big-endian u32 length prefixes each
+  protobuf request or reply. The payload limit for a frame is 64 MiB.
+
+### Keeper storage
+
+One append-only segmented WAL per keeper carries all streams. A frame records
+length, CRC, stream and fragment boundaries. Each round processes up to
+`round_requests` queued requests and uses at most `round_bytes_per_stream`
+WAL bytes per stream. Both limits are configured. Large entries span rounds.
+One write and sync cover the round's mutations. Recovery cuts a torn final
+frame, discards incomplete entries and demultiplexes by stream. Segment
+rotation copies changed retained records to per-stream extents, persists
+checkpoints and retires old segments. Delete forces rotation. Each stream
+has a static quota. Trim can advance the floor without available quota.
+The WAL and checkpoint reader also accepts the prior on-disk format.
 
 ## 4. What the consumer (RTDB) owns, for reference
 
@@ -114,7 +192,7 @@ These are not Logkeeper's job, but the journal must not prevent them:
   - A writer is replaced only after its lease record in the stream has lapsed (plus drift), or after it released the stream with a `Lease{until: now}` record. Reachability failure alone triggers no seal.
   - The writer appends a lease record only while idle, since commits prove it is alive. Parked databases need none.
   - A candidate reads the stream through `head` before sealing.
-- **Catch-up before serving:** after `seal` returns end `n`, a new writer applies through `n` before serving. The conformance suite states this as a consumer obligation.
+- **Catch-up before serving:** after `seal` returns head `n`, a new writer applies through `n` before serving. The conformance suite states this as a consumer obligation.
 - **Erasure** is completed by key destruction (D02 extension) in the key authority, after closing outstanding key grants.
 
 ## 5. Deployment
@@ -132,7 +210,7 @@ Keeper configuration (JSON, `logkeeper keeper --config FILE`):
   "tls": { "certificate": "PATH", "private_key": "PATH", "ca": "PATH" },
   "clients": ["urn:logkeeper:client:NAME"],
   "writers": ["urn:logkeeper:client:NAME"],
-  "limits": { "stream_quota_bytes": 8589934592, "max_record_bytes": 33554432, "round_bytes_per_stream": 4194304 } }
+  "limits": { "stream_quota_bytes": 8589934592, "max_record_bytes": 33554432, "round_bytes_per_stream": 4194304, "round_requests": 64 } }
 ```
 
 ## 6. Verification
@@ -141,7 +219,7 @@ Keeper configuration (JSON, `logkeeper keeper --config FILE`):
   - ballot = epoch;
   - `prepared` = sealed;
   - `report` = the seal reply;
-  - `RankLE` = the `(synced, end)` winner key.
+  - `RankLE` = the `(synced, tail)` winner key.
 
   Prove the five contract properties, with Study 29's read index for `head`.
 - **TLA+.** The writer-driven protocol with a zombie writer, AZ loss, keeper replacement, torn tails, a shared log and lost replies, with a reachability witness and a negative control for every guard.

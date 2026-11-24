@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    BoxFuture, Result, reference::{FileJournal, MemoryJournal},
+    BoxFuture, Result,
+    reference::{FileJournal, MemoryJournal},
     test_support::{Scratch, block_on, panics_at},
 };
 use std::task::Context;
@@ -56,7 +57,10 @@ struct Broken {
 
 impl Broken {
     async fn bypass_fence(&self, stream: StreamId, at: Lsn, payload: Bytes) -> Result<Lsn> {
-        for identity in [Identity::from_static("urn:logkeeper:client:2"), Identity::from_static("urn:logkeeper:client:3")] {
+        for identity in [
+            Identity::from_static("urn:logkeeper:client:2"),
+            Identity::from_static("urn:logkeeper:client:3"),
+        ] {
             let result = self
                 .journal
                 .handle(identity)
@@ -121,9 +125,7 @@ impl Journal for Broken {
                 (Fault::ForgetRetry, RETRY_STREAM, Lsn(1), b"original")
                     if self.inner.head(stream).await == Ok(Lsn(2)) =>
                 {
-                    return Err(Conflict {
-                        head: Lsn(2),
-                    });
+                    return Err(Conflict { head: Lsn(2) });
                 }
                 (Fault::AcceptConflict, RETRY_STREAM, Lsn(1), b"other")
                 | (Fault::AcceptGap, RETRY_STREAM, Lsn(4), b"")
@@ -176,7 +178,9 @@ impl Journal for Broken {
         Box::pin(async move {
             let result = self.inner.head(stream).await;
             match self.fault {
-                Fault::FutureHead if stream == SEQUENCE_STREAM => result.map(|head| Lsn(head.0 + 1)),
+                Fault::FutureHead if stream == SEQUENCE_STREAM => {
+                    result.map(|head| Lsn(head.0 + 1))
+                }
                 Fault::MissingAsEmpty if stream == LIMITS_STREAM && result == Err(NotFound) => {
                     Ok(Lsn(0))
                 }
@@ -193,8 +197,13 @@ impl Journal for Broken {
         Box::pin(async move {
             if stream == TRIM_STREAM
                 && match self.fault {
-                    Fault::ForgetTrim => through == Lsn(2) && self.identity == Identity::from_static("urn:logkeeper:client:1"),
-                    Fault::WrongTrimCaller => self.identity == Identity::from_static("urn:logkeeper:client:2"),
+                    Fault::ForgetTrim => {
+                        through == Lsn(2)
+                            && self.identity == Identity::from_static("urn:logkeeper:client:1")
+                    }
+                    Fault::WrongTrimCaller => {
+                        self.identity == Identity::from_static("urn:logkeeper:client:2")
+                    }
                     Fault::TrimBeyondEnd => through == Lsn(4),
                     _ => false,
                 }
@@ -242,7 +251,7 @@ macro_rules! controls {
 controls! {
     rejects_lost_record => LoseRecord, SEQUENCE;
     rejects_wrong_page => WrongPage, EXACT_READ;
-    rejects_wrong_seal_end => SealEnd, SEAL_END;
+    rejects_wrong_seal_end => SealEnd, SEAL_HEAD;
     rejects_failed_reseal => RejectReseal, SAME_SEAL;
     rejects_seal_tie => SealTie, EQUAL_EPOCH;
     rejects_stale_append => StaleAppend, STALE_EPOCH;
@@ -253,7 +262,7 @@ controls! {
     rejects_accepted_gap => AcceptGap, GAP;
     rejects_forgotten_trim => ForgetTrim, TRIM_RACE;
     rejects_wrong_trim_caller => WrongTrimCaller, TRIM_FENCE;
-    rejects_trim_beyond_end => TrimBeyondEnd, TRIM_END;
+    rejects_trim_beyond_end => TrimBeyondEnd, TRIM_HEAD;
     rejects_early_poll => PollEarly, POLL_PENDING;
     rejects_lost_wake => LoseWake, POLL_WAKE;
     rejects_early_timeout => TimeoutEarly, POLL_TIMEOUT;

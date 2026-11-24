@@ -65,9 +65,9 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
             }
             let view = check_keeper(io, stream, keeper, active.epoch).await?;
             match view.promised {
-                Some((current, holder))
+                Some((current, identity))
                     if current > active.epoch
-                        || (current == active.epoch && &holder != io.transport.identity()) =>
+                        || (current == active.epoch && &identity != io.transport.identity()) =>
                 {
                     Err(JournalError::Fenced { current })
                 }

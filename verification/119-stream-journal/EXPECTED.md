@@ -13,9 +13,10 @@ two-keeper commit witness is part of the 21 stream-journal reports.
 | Control | Failing check |
 | --- | --- |
 | Append without complete Sync | `append_requires_sync` |
-| Two holders at the same promised epoch | `seal_tie_has_same_holder` |
-| Rank by the last record's epoch | `recovery_rank_is_synced_then_end` |
-| Trim beyond the local commit | `trim_below_commit` |
+| Two identities at the same promised epoch | `seal_tie_has_same_identity` |
+| Rank by the last record's epoch | `recovery_rank_is_synced_then_tail` |
+| Trim beyond the local head | `trim_below_head` |
+| Read through the accepted tail | `read_returns_exact_committed_records` |
 | Reuse a round from before invocation | `confirmed_round_is_fresh` |
 
 ## Passing TLC baselines
@@ -27,7 +28,7 @@ two-keeper commit witness is part of the 21 stream-journal reports.
 | protocol | 20,289 |
 | wal | 544 |
 | handoff | 17 |
-| retention | 22 |
+| retention | 23 |
 
 ## Reachable TLC executions
 
@@ -40,7 +41,7 @@ that state is reachable with the baseline guards.
 | `NoNonWriterWitness` | A non-writer returns 2 with fresh Check and commit coverage. | 31 |
 | `NoWalWitness` | One barrier covers both streams, both reply and a later tail from both streams tears. | 8 |
 | `NoDelayedAppendWitness` | The original writer's delayed second accept succeeds at the unfenced third keeper after the new seal publishes the same record. | 16 |
-| `NoTrimReadWitness` | The read quorum includes a stale keeper and refuses a read below the completed trim's floor. | 18 |
+| `NoTrimReadWitness` | One keeper returns the committed record below the completed trim's floor and hides its accepted tail. | 19 |
 
 ## TLC controls
 
@@ -75,7 +76,7 @@ that state is reachable with the baseline guards.
 | early-wal-reply | `ReplyDurable` | 2 |
 | cross-frontier | `ReplyDurable` | 5 |
 | wrong-stream | `ExactDemux` | 4 |
-| single-read-floor | `QuorumTrimReadFloor` | 18 |
+| read-uncommitted (retention) | `RetentionReadCommitted` | 19 |
 
 ## TLC specification probes
 

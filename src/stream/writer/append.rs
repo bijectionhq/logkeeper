@@ -200,9 +200,7 @@ impl Active {
                     .pending
                     .last_key_value()
                     .map_or(state.head, |(at, _)| *at);
-                let conflict = JournalError::Conflict {
-                    head: state.head,
-                };
+                let conflict = JournalError::Conflict { head: state.head };
                 if at.0 == u64::MAX || at.0 > last.0 + 1 {
                     return Err(conflict);
                 }
@@ -249,9 +247,7 @@ impl Active {
         .await
         .map(|_| at)
         .map_err(|error| match error {
-            JournalError::Conflict { .. } => JournalError::Conflict {
-                head: self.head(),
-            },
+            JournalError::Conflict { .. } => JournalError::Conflict { head: self.head() },
             error => error,
         })
     }
@@ -310,11 +306,7 @@ impl Active {
                     .await
                     .map(Some)
             }
-            Work::Append {
-                at,
-                payload,
-                head,
-            } => {
+            Work::Append { at, payload, head } => {
                 let payload = match payload {
                     Some(payload) => payload,
                     None => self.fetch_committed(at, index).await?,
@@ -326,10 +318,7 @@ impl Active {
             }
             Work::Publish(head) => {
                 let observed = self.observe(index);
-                let result = self
-                    .io
-                    .publish(keeper, self.stream, self.epoch, head)
-                    .await;
+                let result = self.io.publish(keeper, self.stream, self.epoch, head).await;
                 observed.send_replace(Some(result.clone()));
                 result.map(|_| None)
             }
@@ -426,10 +415,7 @@ impl State {
                 head: self.head.min(at),
             });
         }
-        if lane
-            .published
-            .is_none_or(|published| published < self.head)
-        {
+        if lane.published.is_none_or(|published| published < self.head) {
             return Some(Work::Publish(self.head));
         }
         None
@@ -502,9 +488,7 @@ impl State {
             .collect();
         for (at, error) in failed {
             let error = match error {
-                JournalError::Conflict { .. } => JournalError::Conflict {
-                    head: self.head,
-                },
+                JournalError::Conflict { .. } => JournalError::Conflict { head: self.head },
                 error => error,
             };
             notify(self.pending.get_mut(&at).unwrap(), Err(error));

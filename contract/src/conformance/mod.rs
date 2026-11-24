@@ -4,12 +4,14 @@
 //! namespace. The factory must return handles to the same journal. The suite is
 //! async and uses the caller's executor. It panics with the failed check's name.
 //!
-//! A consumer taking over a stream must apply records through the committed
-//! head returned by seal before it serves requests.
+//! A consumer taking over a stream must apply records through the head returned
+//! by seal before it serves requests.
 
 mod history;
 
-use crate::{Epoch, Identity, Journal, JournalError::*, reference::Limits, Lsn, Page, StreamId, timer::Sleep};
+use crate::{
+    Epoch, Identity, Journal, JournalError::*, Lsn, Page, StreamId, reference::Limits, timer::Sleep,
+};
 use bytes::Bytes;
 use history::{History, Op, Value};
 use std::{
@@ -32,18 +34,18 @@ pub const LIMITS: Limits = Limits {
 
 const SEQUENCE: &str = "committed sequence";
 const EXACT_READ: &str = "exact committed read";
-const SEAL_END: &str = "seal reports head";
+const SEAL_HEAD: &str = "seal reports head";
 const SAME_SEAL: &str = "same identity reseal";
 const EQUAL_EPOCH: &str = "equal epoch fencing";
 const STALE_EPOCH: &str = "stale epoch fencing";
 const APPEND_IDENTITY: &str = "append caller fencing";
-const HEAD: &str = "head observes head";
+const HEAD: &str = "fresh head";
 const RETRY: &str = "identical retry";
 const CONFLICT: &str = "conflicting payload";
 const GAP: &str = "conditional append";
-const TRIM_RACE: &str = "trim and read linearizability";
+const TRIM_RACE: &str = "trim order and committed read snapshots";
 const TRIM_FENCE: &str = "trim caller fencing";
-const TRIM_END: &str = "trim bounded by head";
+const TRIM_HEAD: &str = "trim bounded by head";
 const POLL_PENDING: &str = "long poll waits at head";
 const POLL_WAKE: &str = "append wakes long polls";
 const POLL_TIMEOUT: &str = "long poll deadline";
@@ -130,6 +132,27 @@ fn page(floor: u64, head: u64, entries: &[(u64, &'static [u8])]) -> crate::Resul
     })
 }
 
+// The healthy fixture must eventually make each append visible on the read path.
+async fn read_through(
+    journal: &dyn Journal,
+    check: &str,
+    stream: StreamId,
+    from: Lsn,
+    max: usize,
+    head: Lsn,
+) -> crate::Result<Page> {
+    within(check, WAKE_DEADLINE, async {
+        loop {
+            let reply = journal.read(stream, from, max, Duration::ZERO).await;
+            if !matches!(&reply, Ok(page) if page.head < head) {
+                return reply;
+            }
+            Sleep::new(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+}
+
 async fn sequence(clients: &Clients) {
     let [a, b, _] = &clients.0;
     let stream = SEQUENCE_STREAM;
@@ -155,22 +178,22 @@ async fn sequence(clients: &Clients) {
     );
     expect(
         SEQUENCE,
-        b.read(stream, Lsn(1), 2, Duration::ZERO).await,
+        read_through(b.as_ref(), SEQUENCE, stream, Lsn(1), 2, Lsn(2)).await,
         page(1, 2, &[(1, b"one"), (2, b"two")]),
     );
     expect(
         EXACT_READ,
-        b.read(stream, Lsn(1), 1, Duration::ZERO).await,
+        read_through(b.as_ref(), EXACT_READ, stream, Lsn(1), 1, Lsn(2)).await,
         page(1, 2, &[(1, b"one")]),
     );
     expect(
         EXACT_READ,
-        b.read(stream, Lsn(2), 2, Duration::ZERO).await,
+        read_through(b.as_ref(), EXACT_READ, stream, Lsn(2), 2, Lsn(2)).await,
         page(1, 2, &[(2, b"two")]),
     );
     expect(
         EXACT_READ,
-        b.read(stream, Lsn(3), 2, Duration::ZERO).await,
+        read_through(b.as_ref(), EXACT_READ, stream, Lsn(3), 2, Lsn(2)).await,
         page(1, 2, &[]),
     );
     expect(HEAD, b.head(stream).await, Ok(Lsn(2)));
@@ -210,7 +233,7 @@ async fn fencing(clients: &Clients) {
         _ => panic!("{STALE_EPOCH}: {replies:?}"),
     };
     expect(
-        SEAL_END,
+        SEAL_HEAD,
         replies[winner - 1].clone(),
         Ok(Value::Position(head)),
     );
@@ -261,9 +284,7 @@ async fn retries(clients: &Clients) {
         a.append(stream, Epoch(1), Lsn(1), payload).await,
         Ok(Lsn(1)),
     );
-    let conflict = Err(Conflict {
-        head: Lsn(2),
-    });
+    let conflict = Err(Conflict { head: Lsn(2) });
     expect(
         CONFLICT,
         a.append(stream, Epoch(1), Lsn(1), Bytes::from_static(b"other"))
@@ -294,7 +315,9 @@ async fn trimming(clients: &Clients) {
         Op::Append(Epoch(1), Lsn(2), Bytes::from_static(b"b")),
         Op::Append(Epoch(1), Lsn(3), Bytes::from_static(b"c")),
     ] {
-        history.round(clients, [(0, operation)], &mut schedule).await[0]
+        history
+            .round(clients, [(0, operation)], &mut schedule)
+            .await[0]
             .as_ref()
             .unwrap();
     }
@@ -304,11 +327,9 @@ async fn trimming(clients: &Clients) {
         Err(Fenced { current: Epoch(1) }),
     );
     expect(
-        TRIM_END,
+        TRIM_HEAD,
         a.trim(stream, Epoch(1), Lsn(4)).await,
-        Err(Conflict {
-            head: Lsn(3),
-        }),
+        Err(Conflict { head: Lsn(3) }),
     );
     history
         .round(
@@ -329,6 +350,13 @@ async fn trimming(clients: &Clients) {
         .round(
             clients,
             [(1, Op::Read(Lsn(1), 2)), (2, Op::Read(Lsn(3), 2))],
+            &mut schedule,
+        )
+        .await;
+    history
+        .round(
+            clients,
+            [(0, Op::Append(Epoch(1), Lsn(2), Bytes::from_static(b"b")))],
             &mut schedule,
         )
         .await;
@@ -372,7 +400,11 @@ async fn long_polls(clients: &Clients) {
         b.read(stream, Lsn(3), 2, QUIET),
     )
     .await;
-    expect(POLL_TIMEOUT, result, page(1, 2, &[]));
+    let result = result.unwrap_or_else(|error| panic!("{POLL_TIMEOUT}: {error}"));
+    assert!(
+        result.head <= Lsn(2) && result.floor == Lsn(1) && result.records.is_empty(),
+        "{POLL_TIMEOUT}: invalid empty page {result:?}"
+    );
     assert!(
         start.elapsed() >= QUIET,
         "{POLL_TIMEOUT}: returned before the deadline"

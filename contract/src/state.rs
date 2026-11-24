@@ -1,4 +1,4 @@
-use crate::{Epoch, Identity, JournalError, reference::Limits, Lsn, Page, Result, StreamId};
+use crate::{Epoch, Identity, JournalError, Lsn, Page, Result, StreamId, reference::Limits};
 use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 
@@ -198,7 +198,11 @@ impl State {
 
 impl Live {
     fn check_seal(&self, epoch: Epoch, identity: &Identity) -> Result<()> {
-        if self.sealed.as_ref().is_some_and(|(current, owner)| *current == epoch && owner == identity) {
+        if self
+            .sealed
+            .as_ref()
+            .is_some_and(|(current, owner)| *current == epoch && owner == identity)
+        {
             return Ok(());
         }
         Err(JournalError::Fenced {
@@ -207,9 +211,7 @@ impl Live {
     }
 
     fn conflict(&self) -> JournalError {
-        JournalError::Conflict {
-            head: self.head,
-        }
+        JournalError::Conflict { head: self.head }
     }
 
     pub(crate) fn page(&self, from: Lsn, max: usize) -> Page {

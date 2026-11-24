@@ -189,7 +189,7 @@ impl Search<'_> {
                 continue;
             }
             let mut next = key.1.clone();
-            if next.step(&call.identity, &call.op) == call.result && self.visit(placed | bit, next) {
+            if next.matches(call) && self.visit(placed | bit, next) {
                 return true;
             }
         }
@@ -205,11 +205,46 @@ enum Model {
         sealed: Option<(Epoch, Identity)>,
         head: Lsn,
         floor: Lsn,
-        retained: BTreeMap<Lsn, (Epoch, Bytes)>,
+        committed: BTreeMap<Lsn, (Epoch, Bytes)>,
     },
 }
 
 impl Model {
+    fn matches(&mut self, call: &Call) -> bool {
+        use JournalError::*;
+        let Op::Read(from, max) = call.op else {
+            return self.step(&call.identity, &call.op) == call.result;
+        };
+        match self {
+            Self::Absent => call.result == Err(NotFound),
+            Self::Created {
+                head,
+                floor,
+                committed,
+                ..
+            } => match &call.result {
+                Ok(Value::Page(page)) => {
+                    page.head <= *head
+                        && page.floor <= *floor
+                        && page.floor <= from
+                        && page.floor.0 > 0
+                        && page.floor.0 - 1 <= page.head.0
+                        && page
+                            .records
+                            .iter()
+                            .map(|(lsn, payload)| (*lsn, payload))
+                            .eq(committed
+                                .range(from..)
+                                .take_while(|(lsn, _)| **lsn <= page.head)
+                                .take(max)
+                                .map(|(&lsn, (_, payload))| (lsn, payload)))
+                }
+                Err(Trimmed { floor: observed }) => from < *observed && *observed <= *floor,
+                _ => false,
+            },
+        }
+    }
+
     fn step(&mut self, caller: &Identity, op: &Op) -> Result<Value> {
         use JournalError::*;
         if matches!(op, Op::Create) {
@@ -218,7 +253,7 @@ impl Model {
                     sealed: None,
                     head: Lsn(0),
                     floor: Lsn(1),
-                    retained: BTreeMap::new(),
+                    committed: BTreeMap::new(),
                 };
             }
             return Ok(Value::Unit);
@@ -227,7 +262,7 @@ impl Model {
             sealed,
             head,
             floor,
-            retained,
+            committed,
         } = self
         else {
             return Err(NotFound);
@@ -235,9 +270,7 @@ impl Model {
         let fence = Fenced {
             current: sealed.as_ref().map_or(Epoch(0), |(epoch, _)| *epoch),
         };
-        let conflict = Conflict {
-            head: *head,
-        };
+        let conflict = Conflict { head: *head };
         match op {
             Op::Create => unreachable!(),
             Op::Seal(epoch) => {
@@ -250,7 +283,10 @@ impl Model {
                 Ok(Value::Position(*head))
             }
             Op::Append(epoch, at, payload) => {
-                if !sealed.as_ref().is_some_and(|(current, owner)| current == epoch && owner == caller) {
+                if !sealed
+                    .as_ref()
+                    .is_some_and(|(current, owner)| current == epoch && owner == caller)
+                {
                     return Err(fence);
                 }
                 if at < floor {
@@ -262,38 +298,27 @@ impl Model {
                             max: LIMITS.max_record_bytes,
                         });
                     }
-                    let bytes = retained
-                        .values()
-                        .map(|(_, record)| record.len() as u64)
+                    let bytes = committed
+                        .range(*floor..)
+                        .map(|(_, (_, record))| record.len() as u64)
                         .sum::<u64>();
                     if bytes + payload.len() as u64 > LIMITS.stream_quota_bytes {
                         return Err(Full { floor: *floor });
                     }
-                    retained.insert(*at, (*epoch, payload.clone()));
+                    committed.insert(*at, (*epoch, payload.clone()));
                     *head = *at;
-                } else if retained.get(at) != Some(&(*epoch, payload.clone())) {
+                } else if committed.get(at) != Some(&(*epoch, payload.clone())) {
                     return Err(conflict);
                 }
                 Ok(Value::Position(*at))
             }
-            Op::Read(from, max) => {
-                if from < floor {
-                    return Err(Trimmed { floor: *floor });
-                }
-                let records = retained
-                    .range(*from..)
-                    .take(*max)
-                    .map(|(&at, (_, payload))| (at, payload.clone()))
-                    .collect();
-                Ok(Value::Page(Page {
-                    floor: *floor,
-                    records,
-                    head: *head,
-                }))
-            }
+            Op::Read(..) => unreachable!("reads use a keeper snapshot"),
             Op::Head => Ok(Value::Position(*head)),
             Op::Trim(epoch, through) => {
-                if !sealed.as_ref().is_some_and(|(current, owner)| current == epoch && owner == caller) {
+                if !sealed
+                    .as_ref()
+                    .is_some_and(|(current, owner)| current == epoch && owner == caller)
+                {
                     return Err(fence);
                 }
                 if through > head {
@@ -301,7 +326,6 @@ impl Model {
                 }
                 if through >= floor {
                     *floor = Lsn(through.0 + 1);
-                    *retained = retained.split_off(floor);
                 }
                 Ok(Value::Unit)
             }
@@ -319,8 +343,20 @@ mod tests {
         let new = Identity::from_static("urn:logkeeper:client:2");
         let mut calls: Vec<_> = [
             (old.clone(), Op::Create, 0, 1, Ok(Value::Unit)),
-            (old.clone(), Op::Seal(Epoch(1)), 2, 3, Ok(Value::Position(Lsn(0)))),
-            (new.clone(), Op::Seal(Epoch(2)), 4, 7, Ok(Value::Position(Lsn(1)))),
+            (
+                old.clone(),
+                Op::Seal(Epoch(1)),
+                2,
+                3,
+                Ok(Value::Position(Lsn(0))),
+            ),
+            (
+                new.clone(),
+                Op::Seal(Epoch(2)),
+                4,
+                7,
+                Ok(Value::Position(Lsn(1))),
+            ),
             (
                 old,
                 Op::Append(Epoch(1), Lsn(1), Bytes::from_static(b"a")),

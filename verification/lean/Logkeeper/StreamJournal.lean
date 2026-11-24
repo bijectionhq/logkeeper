@@ -26,10 +26,10 @@ theorem boot_reachable : DurableAcceptor.Reachable (boot : DurableAcceptor.State
 
 structure Keeper (Payload : Type) where
   durable : DurableAcceptor.State (Record Payload)
-  holder : Nat
+  identity : Nat
   created : Bool
   deleted : Bool
-  commit : Nat
+  head : Nat
   floor : Nat
   staging : Option (History Payload)
 
@@ -39,11 +39,11 @@ def Keeper.promised (k : Keeper Payload) : Nat := k.durable.promised
 def Keeper.latest (k : Keeper Payload) : Vote (Record Payload) := k.durable.latest.getD empty
 def Keeper.synced (k : Keeper Payload) : Nat := k.latest.ballot
 def Keeper.history (k : Keeper Payload) : History Payload := k.latest.history
-def Keeper.endLsn (k : Keeper Payload) : Nat := k.history.length
+def Keeper.tail (k : Keeper Payload) : Nat := k.history.length
 def Keeper.live (k : Keeper Payload) : Prop := k.created = true ∧ k.deleted = false
 
-def SealAllowed (k : Keeper Payload) (epoch holder : Nat) : Prop :=
-  k.promised < epoch ∨ (k.promised = epoch ∧ k.holder = holder)
+def SealAllowed (k : Keeper Payload) (epoch identity : Nat) : Prop :=
+  k.promised < epoch ∨ (k.promised = epoch ∧ k.identity = identity)
 
 def Synced (k : Keeper Payload) (epoch : Nat) : Prop :=
   k.promised = epoch ∧ k.synced = epoch
@@ -51,25 +51,25 @@ def Synced (k : Keeper Payload) (epoch : Nat) : Prop :=
 def MayAppend (k : Keeper Payload) (epoch : Nat) : Prop := Synced k epoch
 
 def MayTrim (k : Keeper Payload) (epoch through : Nat) : Prop :=
-  Synced k epoch ∧ through ≤ k.commit
+  Synced k epoch ∧ through ≤ k.head
 
 def SameCommitted (k : Keeper Payload) (history : History Payload) : Prop :=
-  k.commit ≤ history.length ∧ history.take k.commit = k.history.take k.commit
+  k.head ≤ history.length ∧ history.take k.head = k.history.take k.head
 
 /-- An incomplete transfer stages a suffix. Completing installs the writer's exact seed.
     A delayed same-epoch transfer may neither truncate nor replace an append. -/
 def syncImage (k : Keeper Payload) (start : Nat) (records : History Payload) : History Payload :=
   (k.staging.getD k.history).take (start - 1) ++ records
 
-def sealKeeper (k : Keeper Payload) (epoch holder : Nat) : Keeper Payload :=
+def sealKeeper (k : Keeper Payload) (epoch identity : Nat) : Keeper Payload :=
   if k.promised = epoch then k
-  else { k with durable := DurableAcceptor.promise k.durable epoch, holder, staging := none }
+  else { k with durable := DurableAcceptor.promise k.durable epoch, identity, staging := none }
 
 def accept (k : Keeper Payload) (epoch : Nat) (history : History Payload) : Keeper Payload :=
   { k with durable := DurableAcceptor.acceptVote k.durable ⟨epoch, history⟩, staging := none }
 
 structure Round (Payload : Type) where
-  holder : Nat
+  identity : Nat
   first : KeeperId
   second : KeeperId
   distinct : first ≠ second
@@ -87,7 +87,7 @@ def RecoveryLE (left right : Vote (Record Payload)) : Prop :=
 instance (left right : Vote (Record Payload)) : Decidable (RecoveryLE left right) :=
   inferInstanceAs (Decidable (_ ≤ _ ∧ (_ = _ → _ ≤ _)))
 
-theorem recovery_rank_is_synced_then_end (left right : Vote (Record Payload)) :
+theorem recovery_rank_is_synced_then_tail (left right : Vote (Record Payload)) :
     RecoveryLE left right ↔ RankLE left right := by
   rfl -- recovery key
 
@@ -105,12 +105,12 @@ def Writer.seed (w : Writer Payload) (epoch : Nat) : History Payload :=
   ((w.round epoch).map Round.winner).elim [] Vote.history
 
 def Writer.owns (w : Writer Payload) (k : Keeper Payload) (epoch : Nat) : Prop :=
-  ∃ r, w.round epoch = some r ∧ r.holder = k.holder
+  ∃ r, w.round epoch = some r ∧ r.identity = k.identity
 
 inductive Step (w : Writer Payload) : Keeper Payload → Keeper Payload → Prop
   | create {k} : k.deleted = false → Step w k { k with created := true }
-  | sealKeeper {k epoch holder} : k.live → SealAllowed k epoch holder →
-      Step w k (sealKeeper k epoch holder)
+  | sealKeeper {k epoch identity} : k.live → SealAllowed k epoch identity →
+      Step w k (sealKeeper k epoch identity)
   | syncPart {k epoch start records} : k.live → k.promised = epoch → w.owns k epoch →
       start ∈ List.range' 1 ((k.staging.getD k.history).length + 1) →
       SameCommitted k (syncImage k start records) →
@@ -120,16 +120,16 @@ inductive Step (w : Writer Payload) : Keeper Payload → Keeper Payload → Prop
       syncImage k start records = w.seed epoch → SameCommitted k (w.seed epoch) →
       (k.synced = epoch → k.history = w.seed epoch) → w.seed epoch <+: w.issued epoch →
       Step w k (accept k epoch (w.seed epoch))
-  | append {k epoch lsn payload commit} : k.live → MayAppend k epoch → w.owns k epoch →
-      lsn = k.endLsn + 1 →
+  | append {k epoch lsn payload head} : k.live → MayAppend k epoch → w.owns k epoch →
+      lsn = k.tail + 1 →
       w.seed epoch <+: k.history → k.history ++ [Record.mk epoch payload] <+: w.issued epoch →
-      commit ≤ k.endLsn + 1 →
-      w.advertised ((k.history ++ [Record.mk epoch payload]).take commit) →
-      Step w k { accept k epoch (k.history ++ [Record.mk epoch payload]) with commit := max k.commit commit }
-  | retry {k epoch lsn payload commit} : k.live → MayAppend k epoch → w.owns k epoch →
-      k.floor ≤ lsn → k.history[lsn - 1]? = some ⟨epoch, payload⟩ → commit ≤ k.endLsn →
-      w.advertised (k.history.take commit) →
-      Step w k { k with commit := max k.commit commit }
+      head ≤ k.tail + 1 →
+      w.advertised ((k.history ++ [Record.mk epoch payload]).take head) →
+      Step w k { accept k epoch (k.history ++ [Record.mk epoch payload]) with head := max k.head head }
+  | retry {k epoch lsn payload head} : k.live → MayAppend k epoch → w.owns k epoch →
+      k.floor ≤ lsn → k.history[lsn - 1]? = some ⟨epoch, payload⟩ → head ≤ k.tail →
+      w.advertised (k.history.take head) →
+      Step w k { k with head := max k.head head }
   | trim {k epoch through} : k.live → w.owns k epoch → MayTrim k epoch through →
       Step w k { k with floor := max k.floor (through + 1) }
   | check {k} : k.live → Step w k k
@@ -144,15 +144,15 @@ theorem append_requires_sync {k : Keeper Payload} {epoch : Nat}
     (admitted : MayAppend k epoch) : k.synced = epoch := by
   exact admitted.2 -- synced guard
 
-theorem seal_tie_has_same_holder {k : Keeper Payload} {epoch holder : Nat}
-    (admitted : SealAllowed k epoch holder) (same : k.promised = epoch) :
-    k.holder = holder := by
+theorem seal_tie_has_same_identity {k : Keeper Payload} {epoch identity : Nat}
+    (admitted : SealAllowed k epoch identity) (same : k.promised = epoch) :
+    k.identity = identity := by
   rcases admitted with higher | tied
   · omega
-  · exact tied.2 -- holder guard
+  · exact tied.2 -- identity guard
 
-theorem trim_below_commit {k : Keeper Payload} {epoch through : Nat}
-    (admitted : MayTrim k epoch through) : through ≤ k.commit := by
+theorem trim_below_head {k : Keeper Payload} {epoch through : Nat}
+    (admitted : MayTrim k epoch through) : through ≤ k.head := by
   exact admitted.2 -- trim guard
 
 theorem keeper_step_refines_durable_acceptor {w : Writer Payload} {k next : Keeper Payload}
@@ -194,7 +194,7 @@ theorem reachable_keeper_refines_durable_acceptor {w : Writer Payload} {k : Keep
         (DurableAcceptor.reachable_replies_cover_every_lower_vote prior) step)
 
 theorem keeper_bounds {w : Writer Payload} {k : Keeper Payload} (reached : Reachable w k) :
-    k.commit ≤ k.endLsn ∧ 1 ≤ k.floor ∧ k.floor ≤ k.commit + 1 := by
+    k.head ≤ k.tail ∧ 1 ≤ k.floor ∧ k.floor ≤ k.head + 1 := by
   induction reached with
   | initial => exact ⟨Nat.zero_le _, Nat.le_refl _, Nat.le_refl _⟩
   | @extend before _ _ step ih =>
@@ -203,12 +203,12 @@ theorem keeper_bounds {w : Writer Payload} {k : Keeper Payload} (reached : Reach
           unfold sealKeeper
           split <;> exact ih
       | sync _ _ _ _ _ same _ _ => exact ⟨same.1, ih.2⟩
-      | @append epoch _ payload commit _ _ _ _ _ _ bounded _ =>
+      | @append epoch _ payload head _ _ _ _ _ _ bounded _ =>
           refine ⟨?_, ih.2.1, ?_⟩
-          · change max before.commit commit ≤ (before.history ++ [Record.mk epoch payload]).length
+          · change max before.head head ≤ (before.history ++ [Record.mk epoch payload]).length
             simp only [List.length_append, List.length_cons, List.length_nil]
             exact Nat.max_le_of_le_of_le (Nat.le_trans ih.1 (Nat.le_succ _)) bounded
-          · have increases := Nat.le_max_left before.commit commit
+          · have increases := Nat.le_max_left before.head head
             change before.floor ≤ max _ _ + 1
             omega
       | retry _ _ _ _ _ bounded _ =>
@@ -216,7 +216,7 @@ theorem keeper_bounds {w : Writer Payload} {k : Keeper Payload} (reached : Reach
             Nat.le_trans ih.2.2 (Nat.add_le_add_right (Nat.le_max_left _ _) 1)⟩
       | trim _ _ bounded =>
           exact ⟨ih.1, Nat.le_trans ih.2.1 (Nat.le_max_left _ _),
-            Nat.max_le_of_le_of_le ih.2.2 (Nat.add_le_add_right (trim_below_commit bounded) 1)⟩
+            Nat.max_le_of_le_of_le ih.2.2 (Nat.add_le_add_right (trim_below_head bounded) 1)⟩
       | _ => exact ih
 
 theorem two_of_three_is_majority (a b : KeeperId) (distinct : a ≠ b) :
@@ -239,12 +239,12 @@ theorem seal_winner_dominates (r : Round Payload) (k : KeeperId) (signed : r.sea
   split
   · rename_i ranked
     rcases signed with rfl | rfl
-    · exact (recovery_rank_is_synced_then_end _ _).mp ranked
+    · exact (recovery_rank_is_synced_then_tail _ _).mp ranked
     · exact rank_refl _
   · rename_i ranked
     rcases signed with rfl | rfl
     · exact rank_refl _
-    · exact comparable (fun le => ranked ((recovery_rank_is_synced_then_end _ _).mpr le))
+    · exact comparable (fun le => ranked ((recovery_rank_is_synced_then_tail _ _).mpr le))
 
 def QuorumAccepted (keepers : KeeperId → Keeper Payload) (epoch : Nat)
     (history : History Payload) : Prop :=
@@ -253,7 +253,7 @@ def QuorumAccepted (keepers : KeeperId → Keeper Payload) (epoch : Nat)
       ∃ held, (keepers k).durable.votes ⟨epoch, held⟩ ∧ history <+: held
 
 /-- A completed election records the first durable Seal snapshots from its two signers.
-    The retry of an already elected holder does not replace a snapshot. -/
+    The retry of an already elected identity does not replace a snapshot. -/
 structure Execution (Payload : Type) where
   writer : Writer Payload
   keeper : KeeperId → Keeper Payload
@@ -409,16 +409,16 @@ theorem seal_fences_and_covers_acknowledged_appends (x : Execution Payload)
   simpa [PrefixAgreement.seed, Execution.ledger, elected] using inherited
 
 theorem late_lower_epoch_cannot_extend_after_seal (x : Execution Payload)
-    {oldEpoch epoch committedEnd : Nat} {r : Round Payload} {history : History Payload}
+    {oldEpoch epoch head : Nat} {r : Round Payload} {history : History Payload}
     (elected : x.writer.round epoch = some r) (lower : oldEpoch < epoch)
-    (sealReturned : r.winner.history.length ≤ committedEnd)
+    (sealReturned : r.winner.history.length ≤ head)
     (lateAck : Acknowledged x oldEpoch history) :
-    history.length ≤ committedEnd :=
+    history.length ≤ head :=
   Nat.le_trans (seal_fences_and_covers_acknowledged_appends x elected lower lateAck).length_le sealReturned
 
-private theorem keeper_commit_was_advertised {w : Writer Payload} {k : Keeper Payload}
+private theorem keeper_head_was_advertised {w : Writer Payload} {k : Keeper Payload}
     (emptyAdvertised : w.advertised []) (reached : Reachable w k) :
-    w.advertised (k.history.take k.commit) := by
+    w.advertised (k.history.take k.head) := by
   induction reached with
   | initial => exact emptyAdvertised
   | @extend before _ prior step ih =>
@@ -428,87 +428,90 @@ private theorem keeper_commit_was_advertised {w : Writer Payload} {k : Keeper Pa
           split <;> exact ih
       | sync _ _ _ _ _ same _ _ =>
           exact same.2.symm ▸ ih
-      | @append epoch _ payload commit _ _ _ _ _ _ _ advertised =>
-          change w.advertised ((before.history ++ [Record.mk epoch payload]).take (max before.commit commit))
-          by_cases newer : before.commit ≤ commit
+      | @append epoch _ payload head _ _ _ _ _ _ _ advertised =>
+          change w.advertised ((before.history ++ [Record.mk epoch payload]).take (max before.head head))
+          by_cases newer : before.head ≤ head
           · rw [Nat.max_eq_right newer]
             exact advertised
           · rw [Nat.max_eq_left (Nat.le_of_lt (Nat.lt_of_not_ge newer)),
                 List.take_append_of_le_length (keeper_bounds prior).1]
             exact ih
-      | @retry _ _ _ commit _ _ _ _ _ _ advertised =>
-          change w.advertised (before.history.take (max before.commit commit))
-          by_cases newer : before.commit ≤ commit
+      | @retry _ _ _ head _ _ _ _ _ _ advertised =>
+          change w.advertised (before.history.take (max before.head head))
+          by_cases newer : before.head ≤ head
           · rw [Nat.max_eq_right newer]
             exact advertised
           · rw [Nat.max_eq_left (Nat.le_of_lt (Nat.lt_of_not_ge newer))]
             exact ih
       | _ => exact ih
 
-theorem reachable_keeper_commit_is_chosen (x : Execution Payload) (k : KeeperId) :
+theorem reachable_keeper_head_is_chosen (x : Execution Payload) (k : KeeperId) :
     let view := x.keeper k
-    ∃ epoch, Chosen x.ledger epoch (view.history.take view.commit) := by
+    ∃ epoch, Chosen x.ledger epoch (view.history.take view.head) := by
   obtain ⟨epoch, certified⟩ := x.advertisedChosen _
-    (keeper_commit_was_advertised x.emptyAdvertised (x.reached k))
+    (keeper_head_was_advertised x.emptyAdvertised (x.reached k))
   exact ⟨epoch, quorum_acknowledgements_choose x certified⟩
 
 structure Page (Payload : Type) where
   floor : Nat
-  endLsn : Nat
+  head : Nat
   records : History Payload
 
 def readPage (k : Keeper Payload) (start maxRecords : Nat) : Option (Page Payload) :=
   if start < k.floor then none
-  else some ⟨k.floor, k.commit, ((k.history.take k.commit).drop (start - 1)).take maxRecords⟩
+  else some ⟨k.floor, k.head, ((k.history.take k.head).drop (start - 1)).take maxRecords⟩
 
+/-- A single keeper's retained floor suffices, even when another keeper has trimmed further. -/
 theorem read_returns_exact_committed_records (x : Execution Payload)
     (keeper : KeeperId) {epoch start maxRecords : Nat} {current : History Payload}
-    (committed : Chosen x.ledger epoch current) (known : (x.keeper keeper).commit ≤ current.length)
+    (committed : Chosen x.ledger epoch current) (known : (x.keeper keeper).head ≤ current.length)
     (retainedFrom : (x.keeper keeper).floor ≤ start) :
     let k := x.keeper keeper
     readPage k start maxRecords = some
-      ⟨k.floor, k.commit, ((current.take k.commit).drop (start - 1)).take maxRecords⟩ := by
+      ⟨k.floor, k.head, ((current.take k.head).drop (start - 1)).take maxRecords⟩ := by
   let k := x.keeper keeper
   have bounded := (keeper_bounds (x.reached keeper)).1
-  obtain ⟨e, certified⟩ := reachable_keeper_commit_is_chosen x keeper
-  have length : (k.history.take k.commit).length = k.commit := by
-    simp [Nat.min_eq_left (show k.commit ≤ k.history.length from bounded)]
+  obtain ⟨e, certified⟩ := reachable_keeper_head_is_chosen x keeper
+  have length : (k.history.take k.head).length = k.head := by
+    simp [Nat.min_eq_left (show k.head ≤ k.history.length from bounded)]
   have agrees := every_chosen_prefix_agrees (execution_refines_prefix_agreement x) certified committed
-  have retainedCut : k.history.take k.commit <+: current := by
+  have retainedCut : k.history.take k.head <+: current := by
     rcases agrees with forward | backward
     · exact forward
     · exact (backward.eq_of_length_le (length.symm ▸ known)) ▸ List.prefix_rfl
-  have cut : current.take k.commit = k.history.take k.commit := by
+  have cut : current.take k.head = k.history.take k.head := by
     obtain ⟨tail, exactCut⟩ := retainedCut
     exact exactCut ▸ List.take_left' length
   change readPage k start maxRecords = some
-    ⟨k.floor, k.commit, ((current.take k.commit).drop (start - 1)).take maxRecords⟩
-  rw [readPage, ite_eq_right (Nat.not_lt_of_ge retainedFrom), cut]
+    ⟨k.floor, k.head, ((current.take k.head).drop (start - 1)).take maxRecords⟩
+  rw [cut]
+  unfold readPage
+  exact ite_eq_right (Nat.not_lt_of_ge retainedFrom) -- read uses head
 
 inductive AppendResult where
   | append | retry | conflict | trimmed | fenced
   deriving DecidableEq
 
-def appendAt [DecidableEq Payload] (history : History Payload) (floor holder epoch caller request lsn : Nat)
+def appendAt [DecidableEq Payload] (history : History Payload) (floor identity epoch caller request lsn : Nat)
     (payload : Payload) : AppendResult :=
-  if request ≠ epoch ∨ caller ≠ holder then .fenced
+  if request ≠ epoch ∨ caller ≠ identity then .fenced
   else if lsn < floor then .trimmed
   else if lsn = history.length + 1 then .append
   else if history[lsn - 1]? = some ⟨request, payload⟩ then .retry
   else .conflict
 
 theorem append_is_conditional_and_idempotent [DecidableEq Payload] (history : History Payload)
-    {floor holder epoch caller request lsn : Nat} {payload : Payload} :
-    (appendAt history floor holder epoch caller request lsn payload = .append ↔
-      request = epoch ∧ caller = holder ∧ floor ≤ lsn ∧ lsn = history.length + 1) ∧
-    (appendAt history floor holder epoch caller request lsn payload = .retry ↔
-      request = epoch ∧ caller = holder ∧ floor ≤ lsn ∧
+    {floor identity epoch caller request lsn : Nat} {payload : Payload} :
+    (appendAt history floor identity epoch caller request lsn payload = .append ↔
+      request = epoch ∧ caller = identity ∧ floor ≤ lsn ∧ lsn = history.length + 1) ∧
+    (appendAt history floor identity epoch caller request lsn payload = .retry ↔
+      request = epoch ∧ caller = identity ∧ floor ≤ lsn ∧
       history[lsn - 1]? = some ⟨request, payload⟩) := by
   have noNext : lsn = history.length + 1 → history[lsn - 1]? ≠ some ⟨request, payload⟩ := by
     intro equal
     simp [equal]
   unfold appendAt
-  by_cases e : request = epoch <;> by_cases h : caller = holder <;>
+  by_cases e : request = epoch <;> by_cases h : caller = identity <;>
     by_cases f : lsn < floor <;> by_cases n : lsn = history.length + 1 <;>
     by_cases r : history[lsn - 1]? = some ⟨request, payload⟩ <;>
     simp_all [Nat.not_lt, Nat.not_lt_of_ge]
@@ -517,10 +520,10 @@ theorem append_is_conditional_and_idempotent [DecidableEq Payload] (history : Hi
 structure CheckView where
   promised : Nat
   synced : Nat
-  endLsn : Nat
-  commit : Nat
+  tail : Nat
+  head : Nat
 
-def check (k : Keeper Payload) : CheckView := ⟨k.promised, k.synced, k.endLsn, k.commit⟩
+def check (k : Keeper Payload) : CheckView := ⟨k.promised, k.synced, k.tail, k.head⟩
 
 structure Invocation where
   started : Nat
@@ -548,24 +551,24 @@ theorem confirmed_round_is_fresh {call : Invocation} {round : CheckRound}
     (confirmed : Confirmed call round) : call.started ≤ round.opened := by
   exact confirmed.fresh -- fresh round guard
 
-/-- The commit cuts of a logical record-by-record execution. Times are event indices. -/
-structure CommitTrace where
-  endAt : Nat → Nat
-  monotone : ∀ earlier later, earlier ≤ later → endAt earlier ≤ endAt later
-  unit : ∀ time, endAt (time + 1) ≤ endAt time + 1
+/-- The head cuts of a logical record-by-record execution. Times are event indices. -/
+structure HeadTrace where
+  headAt : Nat → Nat
+  monotone : ∀ earlier later, earlier ≤ later → headAt earlier ≤ headAt later
+  unit : ∀ time, headAt (time + 1) ≤ headAt time + 1
 
 /-- Study 29's read-index cut argument, specialized to LSNs. -/
-private theorem commit_cut_in_window (trace : CommitTrace) {first last result : Nat}
-    (ordered : first ≤ last) (lower : trace.endAt first ≤ result)
-    (upper : result ≤ trace.endAt last) :
-    ∃ point, first ≤ point ∧ point ≤ last ∧ trace.endAt point = result := by
+private theorem commit_cut_in_window (trace : HeadTrace) {first last result : Nat}
+    (ordered : first ≤ last) (lower : trace.headAt first ≤ result)
+    (upper : result ≤ trace.headAt last) :
+    ∃ point, first ≤ point ∧ point ≤ last ∧ trace.headAt point = result := by
   induction last with
   | zero =>
       have equal : first = 0 := by omega
       subst first
       exact ⟨0, Nat.le_refl _, Nat.le_refl _, Nat.le_antisymm lower upper⟩
   | succ previous prior =>
-      by_cases earlier : first ≤ previous ∧ result ≤ trace.endAt previous
+      by_cases earlier : first ≤ previous ∧ result ≤ trace.headAt previous
       · obtain ⟨point, within, before, cut⟩ := prior earlier.1 earlier.2
         exact ⟨point, within, Nat.le_trans before (Nat.le_succ _), cut⟩
       · refine ⟨previous + 1, ordered, Nat.le_refl _, ?_⟩
@@ -574,18 +577,18 @@ private theorem commit_cut_in_window (trace : CommitTrace) {first last result : 
         · have atEnd : first = previous + 1 := by omega
           subst first
           omega
-        · have tooShort : trace.endAt previous < result := by omega
+        · have tooShort : trace.headAt previous < result := by omega
           omega
 
 /-- A ready writer has installed the opening cut on a quorum at its epoch.
     That prefix remains present at later eligible checks in the same epoch. -/
-def OpeningCut (trace : CommitTrace) (round : CheckRound) : Prop :=
+def OpeningCut (trace : HeadTrace) (round : CheckRound) : Prop :=
   ∃ copies, Majority ensemble copies ∧
     ∀ k ∈ ensemble, copies k = true → round.answered k = true →
-      trace.endAt round.opened ≤ (round.view k).endLsn
+      trace.headAt round.opened ≤ (round.view k).tail
 
 /-- Keeper timelines use protocol steps or idle events. Check replies name their
-    exact event, and the opening commit has a durable ballot-specific quorum. -/
+    exact event, and the opening head has a durable ballot-specific quorum. -/
 structure KeeperTrace (writer : Writer Payload) where
   image : Nat → KeeperId → Keeper Payload
   reached : ∀ time keeper, Reachable writer (image time keeper)
@@ -620,14 +623,14 @@ private theorem votes_persist {writer : Writer Payload} (stores : KeeperTrace wr
         exact equal ▸ voted
 
 theorem opening_cut_from_durable_copies {writer : Writer Payload} (stores : KeeperTrace writer)
-    (trace : CommitTrace) {call : Invocation} {round : CheckRound}
+    (trace : HeadTrace) {call : Invocation} {round : CheckRound}
     (confirmed : Confirmed call round)
     (observes : ∀ k ∈ ensemble, round.answered k = true →
       round.view k = check (stores.image (round.sampled k) k))
     (openingQuorum : ∃ copies, Majority ensemble copies ∧
       ∀ k ∈ ensemble, copies k = true → ∃ held : History Payload,
         (stores.image round.opened k).durable.votes ⟨round.epoch, held⟩ ∧
-        trace.endAt round.opened ≤ held.length) :
+        trace.headAt round.opened ≤ held.length) :
     OpeningCut trace round := by
   obtain ⟨copies, quorum, basis⟩ := openingQuorum
   refine ⟨copies, quorum, ?_⟩
@@ -647,20 +650,20 @@ theorem opening_cut_from_durable_copies {writer : Writer Payload} (stores : Keep
     rw [latest] at synced
     exact synced.symm
   rw [exactView]
-  change trace.endAt round.opened ≤ sample.latest.history.length
+  change trace.headAt round.opened ≤ sample.latest.history.length
   rw [latest]
   exact Nat.le_trans openingEnd (ranked.2 same)
 
 def SamplesCovered (round : CheckRound) (lsn : Nat) : Prop :=
-  ∀ k ∈ ensemble, round.answered k = true → (round.view k).endLsn ≤ lsn
+  ∀ k ∈ ensemble, round.answered k = true → (round.view k).tail ≤ lsn
 
-theorem head_linearizable (trace : CommitTrace) {call : Invocation} {round : CheckRound}
+theorem head_linearizable (trace : HeadTrace) {call : Invocation} {round : CheckRound}
     {result priorAck : Nat} (confirmed : Confirmed call round)
     (durable : OpeningCut trace round) (covers : SamplesCovered round result)
-    (chosen : result ≤ trace.endAt call.replied)
-    (acknowledged : priorAck ≤ trace.endAt call.started) :
+    (chosen : result ≤ trace.headAt call.replied)
+    (acknowledged : priorAck ≤ trace.headAt call.started) :
     priorAck ≤ result ∧ ∃ point,
-      call.started ≤ point ∧ point ≤ call.replied ∧ trace.endAt point = result := by
+      call.started ≤ point ∧ point ≤ call.replied ∧ trace.headAt point = result := by
   obtain ⟨copies, enough, installed⟩ := durable
   obtain ⟨k, member, copy, answered⟩ :=
     majorities_overlap ensemble copies round.answered enough confirmed.quorum
@@ -671,19 +674,19 @@ theorem head_linearizable (trace : CommitTrace) {call : Invocation} {round : Che
   exact ⟨Nat.le_trans (Nat.le_trans acknowledged (trace.monotone _ _ fresh)) lower,
     point, Nat.le_trans fresh afterOpen, beforeReply, exactCut⟩
 
-theorem non_writer_head_linearizable (trace : CommitTrace)
+theorem non_writer_head_linearizable (trace : HeadTrace)
     {call : Invocation} {round : CheckRound} {result priorAck : Nat}
     (confirmed : Confirmed call round) (durable : OpeningCut trace round)
     (maximum : SamplesCovered round result)
-    (commitQuorum : Majority ensemble (fun k => round.answered k && decide (result ≤ (round.view k).commit)))
+    (commitQuorum : Majority ensemble (fun k => round.answered k && decide (result ≤ (round.view k).head)))
     (sound : ∀ k ∈ ensemble, round.answered k = true →
-      (round.view k).commit ≤ trace.endAt (round.sampled k))
-    (acknowledged : priorAck ≤ trace.endAt call.started) :
+      (round.view k).head ≤ trace.headAt (round.sampled k))
+    (acknowledged : priorAck ≤ trace.headAt call.started) :
     priorAck ≤ result ∧ ∃ point,
-      call.started ≤ point ∧ point ≤ call.replied ∧ trace.endAt point = result := by
+      call.started ≤ point ∧ point ≤ call.replied ∧ trace.headAt point = result := by
   obtain ⟨k, member, heard, committed⟩ := majorities_overlap ensemble round.answered
-    (fun k => round.answered k && decide (result ≤ (round.view k).commit)) confirmed.quorum commitQuorum
-  have localCommit : result ≤ (round.view k).commit := by simpa [heard] using committed
+    (fun k => round.answered k && decide (result ≤ (round.view k).head)) confirmed.quorum commitQuorum
+  have localCommit : result ≤ (round.view k).head := by simpa [heard] using committed
   have beforeReply := (confirmed.samples k member heard).2.1
   have upper := Nat.le_trans localCommit
     (Nat.le_trans (sound k member heard) (trace.monotone _ _ beforeReply))
@@ -708,7 +711,7 @@ private def exampleCreated : Keeper Nat := { initial with created := true }
 private def exampleSealed : Keeper Nat := sealKeeper exampleCreated 1 0
 private def exampleSynced : Keeper Nat := accept exampleSealed 1 []
 private def exampleAccepted : Keeper Nat :=
-  { accept exampleSynced 1 [⟨1, 7⟩] with commit := 0 }
+  { accept exampleSynced 1 [⟨1, 7⟩] with head := 0 }
 
 private theorem example_reached : Reachable exampleWriter exampleAccepted := by
   have created : Reachable exampleWriter exampleCreated := .extend .initial (.create rfl)
@@ -760,7 +763,7 @@ private def exampleExecution : Execution Nat where
 
 theorem reachable_two_keeper_commit :
     ∃ x : Execution Nat, Acknowledged x 1 [⟨1, 7⟩] ∧
-      (x.keeper 2).endLsn = 0 := by
+      (x.keeper 2).tail = 0 := by
   refine ⟨exampleExecution, ?_, rfl⟩
   refine ⟨exampleRound.sealed, two_of_three_is_majority 0 1 (by decide), ?_⟩
   intro k _ voted
@@ -773,18 +776,18 @@ theorem reachable_two_keeper_commit :
   exact Or.inr rfl
 
 #print axioms append_requires_sync
-#print axioms seal_tie_has_same_holder
-#print axioms trim_below_commit
+#print axioms seal_tie_has_same_identity
+#print axioms trim_below_head
 #print axioms keeper_bounds
 #print axioms reachable_keeper_refines_durable_acceptor
-#print axioms recovery_rank_is_synced_then_end
+#print axioms recovery_rank_is_synced_then_tail
 #print axioms seal_winner_dominates
 #print axioms execution_refines_prefix_agreement
 #print axioms quorum_acknowledgements_choose
 #print axioms committed_contiguous_and_irrevocable
 #print axioms seal_fences_and_covers_acknowledged_appends
 #print axioms late_lower_epoch_cannot_extend_after_seal
-#print axioms reachable_keeper_commit_is_chosen
+#print axioms reachable_keeper_head_is_chosen
 #print axioms read_returns_exact_committed_records
 #print axioms append_is_conditional_and_idempotent
 #print axioms confirmed_round_is_fresh

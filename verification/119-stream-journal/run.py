@@ -8,6 +8,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT.parent))
+from check_journal_wire import main as check_wire
 from study_tools import (
     check_lean_mutation,
     check_lean_theorems,
@@ -37,7 +38,7 @@ BASELINES = {
     "protocol": (*RULES, *PROTOCOL),
     "wal": WAL,
     "handoff": (*RULES, "DelayedAppendAlreadyCommitted"),
-    "retention": (*RULES, "KeeperBounds", "QuorumTrimReadFloor"),
+    "retention": (*RULES, "KeeperBounds", "RetentionReadCommitted"),
 }
 WITNESSES = (
     ("protocol", "NoProtocolWitness"),
@@ -76,7 +77,7 @@ CONTROLS = (
     ("wal", "early-wal-reply", "ReplyDurable"),
     ("wal", "cross-frontier", "ReplyDurable"),
     ("wal", "wrong-stream", "ExactDemux"),
-    ("retention", "single-read-floor", "QuorumTrimReadFloor"),
+    ("retention", "read-uncommitted", "RetentionReadCommitted"),
 )
 GAPS = (
     ("protocol", "writer-known-only", "HeadLinearizable"),
@@ -129,18 +130,22 @@ def verify_lean(shared_wal):
          "def MayAppend (k : Keeper Payload) (epoch : Nat) : Prop := k.promised = epoch ∧ True",
          "exact admitted.2 -- synced guard"),
         ("seal-tie",
-         "k.promised = epoch ∧ k.holder = holder",
-         "k.promised = epoch ∧ holder = holder",
-         "exact tied.2 -- holder guard"),
+         "k.promised = epoch ∧ k.identity = identity",
+         "k.promised = epoch ∧ identity = identity",
+         "exact tied.2 -- identity guard"),
         ("last-entry",
          "def recoveryEpoch (vote : Vote (Record Payload)) : Nat := vote.ballot",
          "def recoveryEpoch (vote : Vote (Record Payload)) : Nat := "
          "(vote.history.getLast?.map Record.epoch).getD 0",
          "rfl -- recovery key"),
         ("trim-above",
-         "Synced k epoch ∧ through ≤ k.commit",
+         "Synced k epoch ∧ through ≤ k.head",
          "Synced k epoch ∧ through = through",
          "exact admitted.2 -- trim guard"),
+        ("read-uncommitted",
+         "else some ⟨k.floor, k.head, ((k.history.take k.head).drop (start - 1)).take maxRecords⟩",
+         "else some ⟨k.floor, k.head, ((k.history.take k.tail).drop (start - 1)).take maxRecords⟩",
+         "exact ite_eq_right (Nat.not_lt_of_ge retainedFrom) -- read uses head"),
         ("stale-round",
          "def Fresh (call : Invocation) (round : CheckRound) : Prop :=\n  call.started ≤ round.opened",
          "def Fresh (_call : Invocation) (_round : CheckRound) : Prop := True",
@@ -171,6 +176,7 @@ def main():
     if args.lean_only and args.scenario:
         parser.error("--lean-only and --scenario cannot be combined")
     if not args.scenario:
+        check_wire()
         verify_lean(args.shared_wal.resolve())
     if not args.lean_only:
         verify_tla(args.scenario)

@@ -87,8 +87,14 @@ impl Recovery {
         let floor = floor.max(target.floor);
         let head = target.head.max(Lsn(floor.0 - 1));
         let expected_end = self.tail().max(head);
-        let mut from = divergence(&target, &self.history, floor)
-            .unwrap_or_else(|| Lsn(target.tail.min(self.tail()).0.saturating_add(1).max(floor.0)));
+        let mut from = divergence(&target, &self.history, floor).unwrap_or_else(|| {
+            Lsn(target
+                .tail
+                .min(self.tail())
+                .0
+                .saturating_add(1)
+                .max(floor.0))
+        });
         if from <= target.head {
             return Err(JournalError::Unavailable);
         }
@@ -215,8 +221,9 @@ async fn seal(
         .await?
     {
         Reply::Sealed(view)
-            if view.promised.as_ref().is_some_and(|(current, identity)| *current == epoch && identity == io.transport.identity())
-                && view.head <= view.tail
+            if view.promised.as_ref().is_some_and(|(current, identity)| {
+                *current == epoch && identity == io.transport.identity()
+            }) && view.head <= view.tail
                 && view.floor.0 != 0
                 && view.floor.0 - 1 <= view.head.0
                 && view.ensemble == ensemble

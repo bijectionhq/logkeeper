@@ -10,12 +10,14 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
-use journal_contract::{BoxFuture, Epoch, Identity, Journal, JournalError, Lsn, Page, Result, StreamId};
+use journal_contract::{
+    BoxFuture, Epoch, Identity, Journal, JournalError, Lsn, Page, Result, StreamId,
+};
 use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use self::{append::Active, recovery::Recovery};
-use super::wire::{ KeeperId, Refusal, Reply, Request, Transport};
+use super::wire::{KeeperId, Refusal, Reply, Request, Transport};
 
 const QUORUM: usize = 2;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,7 +54,7 @@ impl Writer {
     /// authenticates the writer identity. Clone the writer to share its per-stream state.
     pub fn new(
         transport: Arc<dyn Transport>,
-            keepers: impl IntoIterator<Item = KeeperId>,
+        keepers: impl IntoIterator<Item = KeeperId>,
     ) -> Result<Self> {
         let keepers: Arc<[KeeperId]> = keepers.into_iter().collect();
         if keepers.len() < 3
@@ -164,9 +166,7 @@ impl Writer {
         };
         let head = active.head();
         if through > head || through.0 == u64::MAX {
-            return Err(JournalError::Conflict {
-                head: head,
-            });
+            return Err(JournalError::Conflict { head: head });
         }
         active.published(through).await?;
         let floor = quorum(FuturesUnordered::from_iter(stream.ensemble.map(
@@ -222,8 +222,10 @@ impl Writer {
         while let Some(reply) = calls.next().await {
             match reply {
                 Ok(Reply::Checked(view)) => {
-                    if let Some((current, holder)) = view.promised {
-                        if current > epoch || (current == epoch && &holder != self.io.transport.identity()) {
+                    if let Some((current, identity)) = view.promised {
+                        if current > epoch
+                            || (current == epoch && &identity != self.io.transport.identity())
+                        {
                             errors.push(JournalError::Fenced { current });
                         }
                     }
@@ -432,7 +434,9 @@ where
 fn map_refusal(refusal: Refusal) -> JournalError {
     match refusal {
         Refusal::Fenced { promised } => JournalError::Fenced { current: promised },
-        Refusal::Gap { head } | Refusal::Conflict { head } | Refusal::AboveHead { head } => JournalError::Conflict { head },
+        Refusal::Gap { head } | Refusal::Conflict { head } | Refusal::AboveHead { head } => {
+            JournalError::Conflict { head }
+        }
         Refusal::BelowFloor { floor } => JournalError::Trimmed { floor },
         Refusal::Full { floor } => JournalError::Full { floor },
         Refusal::TooLarge { max } => JournalError::TooLarge { max: max as usize },

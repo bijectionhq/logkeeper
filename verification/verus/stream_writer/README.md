@@ -10,7 +10,7 @@ keeper by the writer. A slot covers a requested LSN only when the request's epoc
 matches and the keeper has acknowledged at least that LSN. The harness checks
 that a single keeper, an acknowledgement at another epoch, and an
 acknowledgement for a shorter prefix each fail to commit. Every pair of survivors
-can commit. Recovery compares synced epoch first and end second, with a synced
+can commit. Recovery compares synced epoch first and tail second, with a synced
 epoch of zero ordered above an absent synced epoch.
 
 The five controls mutate the production functions and must fail the named

@@ -5,7 +5,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use journal_contract::BoxFuture;
@@ -252,15 +252,20 @@ impl TcpTransport {
         let mut transport = Self::new(credentials, [], deadline)?;
         let connections = timeout(
             deadline,
-            futures::future::try_join_all(
-                addresses
-                    .iter()
-                    .map(|address| connect(&transport.tls, address)),
-            ),
+            futures::future::try_join_all(addresses.iter().map(|address| {
+                let tls = &transport.tls;
+                async move {
+                    let start = Instant::now();
+                    let (id, channel) = connect(tls, address).await?;
+                    Ok::<_, io::Error>((start.elapsed(), id, channel))
+                }
+            })),
         )
         .await??;
         let mut ensemble = [KeeperId(0); 3];
-        for (index, (address, (id, channel))) in addresses.into_iter().zip(connections).enumerate()
+        let mut proximity = Vec::with_capacity(ensemble.len());
+        for (index, (address, (elapsed, id, channel))) in
+            addresses.into_iter().zip(connections).enumerate()
         {
             let route = Route {
                 address: address.into(),
@@ -269,9 +274,13 @@ impl TcpTransport {
             if transport.routes.insert(id, route).is_some() {
                 return Err(invalid("duplicate keeper identity"));
             }
-            transport.read_order.push(id);
+            proximity.push((elapsed, id));
             ensemble[index] = id;
         }
+        proximity.sort_by_key(|(elapsed, _)| *elapsed);
+        transport
+            .read_order
+            .extend(proximity.into_iter().map(|(_, id)| id));
         Ok((transport, ensemble))
     }
 
@@ -315,7 +324,12 @@ impl Transport for TcpTransport {
     }
 
     fn read_order(&self, mut ensemble: [KeeperId; 3]) -> [KeeperId; 3] {
-        ensemble.sort_by_key(|keeper| self.read_order.iter().position(|id| id == keeper).unwrap_or(usize::MAX));
+        ensemble.sort_by_key(|keeper| {
+            self.read_order
+                .iter()
+                .position(|id| id == keeper)
+                .unwrap_or(usize::MAX)
+        });
         ensemble
     }
 

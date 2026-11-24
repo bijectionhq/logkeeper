@@ -165,7 +165,9 @@ impl Network {
 }
 
 impl Transport for Client {
-    fn identity(&self) -> &Identity { &self.identity }
+    fn identity(&self) -> &Identity {
+        &self.identity
+    }
 
     fn call(
         &self,

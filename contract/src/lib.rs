@@ -56,11 +56,11 @@ pub struct Lsn(pub u64);
 /// A page of committed records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Page {
-    /// The first retained LSN.
+    /// The first LSN retained at the source of this page.
     pub floor: Lsn,
     /// Committed records, in LSN order, contiguous from the requested start.
     pub records: Vec<(Lsn, Bytes)>,
-    /// The head the journal observed while serving the read.
+    /// The committed position observed at the source of this page.
     pub head: Lsn,
 }
 
@@ -71,7 +71,7 @@ pub enum JournalError {
     Fenced { current: Epoch },
     /// `at` is not the next LSN, or a different record is committed at `at`.
     Conflict { head: Lsn },
-    /// `from` is below the retained floor.
+    /// The requested start is unavailable and is below an observed retained floor.
     Trimmed { floor: Lsn },
     /// The payload exceeds the per-record limit.
     TooLarge { max: usize },
@@ -104,9 +104,23 @@ pub trait Journal: Send + Sync {
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, Result<Lsn>>;
     /// Commits `payload` at `at` iff `epoch` is sealed by this caller and `at` is the next LSN.
     /// An identical retry returns `at`.
-    fn append(&self, stream: StreamId, epoch: Epoch, at: Lsn, payload: Bytes) -> BoxFuture<'_, Result<Lsn>>;
-    /// Committed records in `[from, from + max)`, waiting up to `wait` at the head.
-    fn read(&self, stream: StreamId, from: Lsn, max: usize, wait: Duration) -> BoxFuture<'_, Result<Page>>;
+    fn append(
+        &self,
+        stream: StreamId,
+        epoch: Epoch,
+        at: Lsn,
+        payload: Bytes,
+    ) -> BoxFuture<'_, Result<Lsn>>;
+    /// Reads committed records from one snapshot in `[from, from + max)`, waiting
+    /// up to `wait` when `from` exceeds the observed head. The page can lag
+    /// `head()` and can include records already trimmed elsewhere.
+    fn read(
+        &self,
+        stream: StreamId,
+        from: Lsn,
+        max: usize,
+        wait: Duration,
+    ) -> BoxFuture<'_, Result<Page>>;
     /// A linearizable head.
     fn head(&self, stream: StreamId) -> BoxFuture<'_, Result<Lsn>>;
     /// Discards records up to and including `through`. Only the sealed epoch may trim.

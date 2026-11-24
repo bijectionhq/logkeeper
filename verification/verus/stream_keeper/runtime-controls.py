@@ -16,9 +16,9 @@ TLS_TEST = "stream::transport::tests::loopback_mtls_checks_certificate_authority
 CONTROLS = [
     (
         "one-sync-per-request", "keeper/mod.rs",
-        "            let reply = self.streams.entry(id).or_default().apply(",
+        "            let identity = work.seal_identity().cloned();",
         "            self.wal.write_round(&buffer)?;\n            buffer.clear();\n"
-        "            let reply = self.streams.entry(id).or_default().apply(",
+        "            let identity = work.seal_identity().cloned();",
         KEEPER_TEST + "group_commit_covers_multiple_streams_in_one_sync", "two streams must share one covering sync",
     ),
     (
@@ -30,9 +30,30 @@ CONTROLS = [
     ),
     (
         "uncapped-stream", "keeper/mod.rs",
-        "(self.limits.round_bytes_per_stream - *charge).min(ROUND_BYTES - buffer.len())",
-        "ROUND_BYTES - buffer.len()",
+        "self.limits.round_bytes_per_stream - *charge",
+        "codec::MAX_FRAME_BYTES",
         KEEPER_TEST + "round_cap_is_enforced_even_for_a_record_larger_than_the_cap", "a stream exceeded its byte cap",
+    ),
+    (
+        "stop-at-first-trimmed", "writer/read.rs",
+        "            Err(error @ JournalError::Deleted) => return Err(error),",
+        "            Err(error @ (JournalError::Deleted | JournalError::Trimmed { .. })) => return Err(error),",
+        "stream::writer::tests::single_keeper_read_serves_committed_records_below_a_remote_floor",
+        "a reachable keeper still retains the committed record",
+    ),
+    (
+        "ignore-authenticated-identity", "keeper/rules.rs",
+        ".is_some_and(|(current, owner)| *current == epoch && owner == identity)",
+        ".is_some_and(|(current, _)| *current == epoch)",
+        "stream::transport::tests::writer_round_trips_through_three_tls_keepers",
+        "a different certificate identity must be fenced at the same epoch",
+    ),
+    (
+        "drop-legacy-identity", "keeper/wal.rs",
+        "Ok(Some(Identity::from(uri)))",
+        'Ok(Some(Identity::from("urn:logkeeper:client:wrong")))',
+        KEEPER_TEST + "replay_uses_the_legacy_certificate_identity",
+        "replay must preserve the authenticated certificate identity",
     ),
     (
         "ignore-wal-crc", "keeper/wal.rs",
@@ -148,7 +169,7 @@ def main():
         parser.error(f"unknown controls: {', '.join(sorted(unknown))}")
     # Testing one mutation at a time requires exclusive use of this worktree's source.
     if subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "src/stream"], cwd=ROOT).returncode:
-        parser.error("head the keeper source before running the controls")
+        parser.error("commit the keeper source before running the controls")
     results = ROOT / "verification/verus/.results"
     results.mkdir(exist_ok=True)
     evidence = Path(tempfile.mkdtemp(prefix="keeper-runtime-", dir=results))
