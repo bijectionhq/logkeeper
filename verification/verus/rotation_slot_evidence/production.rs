@@ -66,10 +66,12 @@ impl PartialEq for Checkpoint {
 }
 
 #[derive(Clone, Copy)]
-pub struct Grant { pub key_generation: u64 }
+pub struct Grant { pub enrollment: u64, pub key_generation: u64 }
 
 #[derive(Clone, Copy)]
 pub struct Recovery {
+    pub id: u64,
+    pub owner: u64,
     pub checkpoint: Checkpoint,
     pub admitted_at: u64,
     pub start: Cut,
@@ -188,6 +190,7 @@ pub open spec fn covers_rotation(evidence: &RotationSlots, receipt: Receipt) -> 
             evidence.group@ != zeros() && evidence.ballot.round != 0
             && evidence.ballot.nonce.0 != 0 && evidence.prefix@ != zeros()
             && receipt.position != 0 && evidence.position >= receipt.position
+            && recovery.id == receipt.request && recovery.owner == grant.enrollment
             && evidence.checkpoint == recovery.checkpoint && recovery.admitted_at == receipt.position
             && recovery.start == evidence.checkpoint.cut && recovery.through == evidence.checkpoint.cut
             && evidence.key_generation == grant.key_generation && evidence.key_generation > 1

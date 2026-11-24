@@ -9,6 +9,42 @@
   ],
   "min_verified_functions": 44,
   "controls": {
+    "accept-foreign-recovery-owner": {
+      "defect": "A matching checkpoint can certify a recovery hold for a different successor enrollment.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "            && recovery.owner == grant.enrollment\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "covers",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
+    "accept-foreign-recovery-request": {
+      "defect": "A matching checkpoint can certify a recovery hold from a different rotation request.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "find": "            && recovery.id == receipt.request\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/evidence.rs",
+          "function": "covers",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 43
+    },
     "count-half-as-majority": {
       "defect": "The rotation receipt can certify a half quorum.",
       "mutate": [

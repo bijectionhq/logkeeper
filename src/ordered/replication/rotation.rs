@@ -3,7 +3,7 @@
 use super::{Chosen, Command, Request, RotationSlots};
 
 #[cfg(verus_keep_ghost)]
-use super::{agrees_with_rotation, suffix_matches};
+use super::{agrees_with_rotation, covers_rotation, suffix_matches};
 #[cfg(verus_keep_ghost)]
 use vstd::prelude::*;
 
@@ -37,6 +37,11 @@ impl Chosen {
             voters: self.images.clone(),
         };
         if evidence.covers(self.receipt) {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                assert(evidence.voters@ =~= self.images@);
+                assert(covers_rotation(&evidence, self.receipt));
+            }
             Some(evidence)
         } else {
             None
