@@ -5,9 +5,11 @@
     "--verify-module",
     "production",
     "--verify-module",
-    "laws"
+    "laws",
+    "--verify-module",
+    "layout"
   ],
-  "min_verified_functions": 23,
+  "min_verified_functions": 25,
   "controls": {
     "allow-zero-generation": {
       "defect": "A vacant state may decode with generation zero.",

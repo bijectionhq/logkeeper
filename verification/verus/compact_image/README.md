@@ -1,37 +1,64 @@
-# Compact image row admission
+# Compact-image recovery
 
-This area imports [the shipped guards](../../../src/ordered/codec/snapshot_checks.rs) called by the [LKBASE08 decoder](../../../src/ordered/codec/snapshot.rs).
+This area imports the [shipped row checks and insertions](../../../src/ordered/codec/snapshot_checks.rs)
+used by the [LKBASE08 decoder](../../../src/ordered/codec/snapshot.rs).
+The Lean reference is in [CompactImage](../../lean/Logkeeper/CompactImage.lean)
+and [CodecDomains](../../lean/Logkeeper/CodecDomains.lean).
 
-| Lean definition in [Logkeeper.CompactImage](../../lean/Logkeeper/CompactImage.lean) | Verus obligation and projection |
+| Lean definition | Checked Verus boundary |
 | --- | --- |
-| `generationInRange` | `generation_in_range` bounds the stored generation independently of whether a grant is present. |
-| `holdReceiptMatches` | `hold_receipt_matches` requires a receipt at the exact admission position. The caller supplies a position only when the retained outcome at the hold's origin and request ID has the right kind and contains the exact hold. |
-| `leaseRowValid` | `lease_row_valid` requires a bounded nonzero enrollment serial, a retained owner, lease-end bounds and a key greater than the previously retained key. The caller supplies membership and key comparison. |
-| `fenceRowValid` | `fence_row_valid` requires a nonzero position within the image position, a time within the image time, and a key greater than the previously retained key. The caller supplies the key comparison. |
-| `rootReferenceRowValid` | `root_reference_row_valid` requires a known root and a revision greater than the previous revision. The caller resolves the revision against the selected, preparing and retained roots. |
+| `generationInRange` | `generation_in_range` checks the stored generation independently of grant occupancy. |
+| `oldRootKeyIncreases` | `old_root_key_increases` requires the candidate revision to exceed the largest previously retained revision. |
+| `objectControlTrailerCanonical` | `object_control_trailer_canonical` requires the presence bit inferred from remaining input to agree with the encoder's condition for emitting the two counts and rows. |
+| `leaseRowValid` | `lease_row_valid` requires a bounded positive enrollment serial, a retained owner, lease-end bounds, and an increasing key. Saturation of the Rust time sum gives the same comparison for a representable lease end. |
+| `fenceRowValid` | `fence_row_valid` requires bounded position and time and an increasing object name. |
+| `rootReferenceRowValid` | `root_reference_row_valid` requires known root membership and an increasing revision. |
+| `holdReceiptMatches`, `allSnapshotRowsValid` | `hold_receipt_matches` checks the exact admission position. `all_snapshot_rows` traverses every map value for the hold-to-receipt and withdrawal-receipt-to-fence joins. The Rust closures supply the exact origin, request ID, outcome kind and value equality checks. |
+| `receiptPositionFresh`, `receiptRowValid`, `receiptPartition`, `receiptExpiryPartition` | `insert_snapshot_receipt` derives the exact retry key from the typed receipt, checks order, horizon and liveness, and uses the matching decision position as the uniqueness key. It preserves a bijection between retained retry keys and seen positions. The deadline index contains exactly the retained keys whose deadline is future. Verus takes the deadline as a projection of the request identifier and live-hold ownership as an input to the row check. |
+| `boundedMap`, `reducerInvariant` | `insert_snapshot_row` inserts at the supplied key and preserves the predicate on all other map entries. The decoder supplies a worker UUID, checkpoint revision, hold request ID, enrollment, root revision or object name. The function under proof is generic over those key and value types. |
 
-For machine-representable lease ends, the Rust comparison against a saturating sum is equivalent to comparison against the mathematical sum used by Lean.
-The Lean law `every_checked_hold_has_a_matching_receipt` composes the row checks over an arbitrary finite list.
-The Lean law `strictly_increasing_keys_are_unique` gives uniqueness when a list is strictly ascending.
-The Rust collection traversals, membership and comparisons on composite keys, and the coverage and aggregate budget of object references still require production refinement.
-The [ordered codec area](../ordered_codec/README.md) verifies the count and byte extent of the object names in each reference list.
-The Lean vacancy model carries its generation independently of the holder. Native acceptance exercises rotation, vacancy, `LKBASE08` recovery and a replacement grant with that generation.
+The [manifest](area.json) includes mutations that accept a repeated decision position,
+an explicit empty object-control trailer, or an out-of-order old-root revision.
+Native acceptance tests derive usable compact images from reducer decisions and then
+exercise each of these changes to the image. They also check the unchanged spelling,
+including decode and re-encode of the old-root fixture. The image tag stays `LKBASE08`.
 
-Two reachable snapshot fixtures exhibit accepted encodings that differ from the encoder output.
-A snapshot without object controls also decodes with two appended zero counts.
-Two distinct retained old-root rows can be reversed and decode to the same ordered map.
-A duplicate old-root revision is rejected.
-The native tests also reject a retained hold with a missing or wrong-kind admission receipt.
+## Round-trip statements
 
-The [manifest](area.json) records six source mutations and their expected diagnostics.
-The pinned baseline verified ten items and all six mutations failed at their declared obligations.
+`compactImageBytesAdmissible` is the layout projection of the accepted-byte domain.
+`accepted_compact_image_bytes_reencode_exactly` proves the layout identity for every
+finite input with that projection. It uses an exact consumed-byte decomposition and
+the correspondence between old-root rows and map entries as hypotheses. The Lean
+model orders the rows by revision. The Verus law uses the actual ordered BTreeMap
+iterator to recover their order from the same revision/row pairs. The layout models
+the rest of the accepted frame by its consumed bytes. Equality between those bytes
+and the bytes produced from each typed field remains a parser and encoder refinement
+obligation.
 
-## Reducer collection invariant
+`compactImageAdmissible` is a typed-domain specification over `ReducerImage` and
+the remaining parser and reconstruction checks. Encode from a state belonging to
+the same fresh installation passed to `decode_base`. Placement, limits, initial
+window/checkpoint, voter scope, and the object-control budget come from that
+installation. The state must pass the decoder's coordinate, collection, reference,
+lease, hold and receipt checks. The retained records must form the checked history
+and carry the matching fingerprints, byte charges and window coordinates.
+Map keys, receipt placement, the expiry index and retained-byte totals must agree
+with what the decoder derives from the serialized values. The genesis state at
+position zero is outside this compact-image domain.
 
-`allSnapshotRowsValid` in [Logkeeper.CompactImage](../../lean/Logkeeper/CompactImage.lean) maps to the production `all_snapshot_rows` traversal. The verifier checks every value in the actual ordered map. The decoder calls it to check the hold-to-receipt join and the withdrawal-receipt-to-fence join. The Rust closures supply exact key and row equality, outcome-kind matching, and the positions. Verus checks the traversal and the separate hold-position guard. The new control bypasses one-row checks and fails `one_invalid_hold_prevents_recovery`.
+## Remaining refinement
 
 `reducerInvariant` is the reusable specification on `ReducerImage`. Lean lists and Verus sequences use the same projections. Ordered maps contribute their key sequences in iteration order. Composite keys and names use order-preserving integer representations. Bounds come from the decoder configuration and admission limits. Leases contribute exact enrollment membership and end time. Root membership, reference coverage, object-control bytes, and withdrawal receipt equality come from the corresponding state queries. A hold contributes its exact matched receipt position, or no position when the join fails. The [writer area](../ordered_writer/README.md) separately checks that the shipped vacancy transition preserves the stored generation.
 
 The decoder accepts multiple distinct receipt keys with the same decision position. A native test fills the retry book to its decode bound with those rows, applies one decision, and observes that the resulting encoding fails to decode. The reference invariant requires unique receipt positions, as an applied decision records at most one receipt. F4 calls for rejecting this image and the two accepted aliases above under the existing format tag. The decoder change is tracked in PL3c. Whole-image acceptance still needs a proof that the Rust parser and state construction implement the projections above.
 
 The expanded baseline verifies 13 items. All seven source controls fail at their declared obligations.
+The whole Rust parser still needs a proof connecting byte consumption, every tag
+and field, the typed map projections and the encoder traversal to these contracts.
+The current checks establish the insertion algebra and receipt partition. They take
+the other per-row guards, composite key orders and membership queries from the
+decoder. Closing the implication to the full `reducerInvariant` also requires
+proving the roster and old-root coordinate checks, the hold partition and cut
+coverage, the exact joins to receipt outcomes, record history and liveness accounting,
+and global reference coverage and aggregate budget. The [writer area](../ordered_writer/README.md)
+checks generation preservation through vacancy.

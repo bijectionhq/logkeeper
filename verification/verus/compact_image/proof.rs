@@ -10,6 +10,7 @@ mod ordered {
 #[path = "../../../src/ordered/codec/snapshot_checks.rs"]
 mod production;
 
+mod layout;
 mod laws;
 
 fn main() {}

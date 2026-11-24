@@ -16,10 +16,12 @@ def main():
     subprocess.run([lake, "build"], cwd=ROOT, check=True)
     command = [lake, "env", "lean"]
     codec = ROOT / "Logkeeper" / "Codec.lean"
+    domains = ROOT / "Logkeeper" / "CodecDomains.lean"
     image = ROOT / "Logkeeper" / "CompactImage.lean"
     slot = ROOT / "Logkeeper" / "VoterSlotHeader.lean"
     transport = ROOT / "Logkeeper" / "VoterTransport.lean"
     check_lean_theorems(ROOT, command, codec, count=7, case="codec")
+    check_lean_theorems(ROOT, command, domains, count=11, case="codec-domains")
     check_lean_theorems(ROOT, command, image, count=12, case="compact-image")
     check_lean_theorems(ROOT, command, slot, count=4, case="voter-slot-header")
     check_lean_theorems(ROOT, command, transport, count=4, case="voter-transport")
@@ -68,6 +70,57 @@ def main():
         [("receiptPosition = some admittedAt", "receiptPosition = some admittedAt ∨ receiptPosition = none")],
         "  exact ⟨row.1, checked row member, rfl⟩",
     )
+    for name, original, weakened, law in [
+        (
+            "fixed-field-consume-suffix-byte",
+            "then some (frame.take width) else none",
+            "then some (frame.take (width + 1)) else none",
+            "    readFixedField (field ++ suffix) field.length = some field := by",
+        ),
+        (
+            "decision-keep-last-time-byte",
+            "frame.take 1 ++ frame.drop 9",
+            "frame.take 1 ++ frame.drop 8",
+            "  simpa [decisionRequestBytes, decisionHeader, List.drop_append, width]",
+        ),
+        (
+            "service-allow-count-truncation",
+            "count : Nat) : Prop := count ≤ 64",
+            "count : Nat) : Prop := count ≤ 256",
+            "  have fits : count < 256 := by omega",
+        ),
+        (
+            "service-allow-barrier-with-rotation",
+            "hasBarrier = false ∧ coversReceipt = true",
+            "hasBarrier = true ∧ coversReceipt = true",
+            "  exact Bool.noConfusion good.1",
+        ),
+        (
+            "compact-image-allow-unsorted-old-roots",
+            "layout.oldRoots.Pairwise (fun a b => oldRootKeyIncreases b.1 (some a.1))",
+            "layout.oldRoots.Pairwise (fun a b => a.1 ≠ b.1)",
+            "    accepted.1.imp",
+        ),
+        (
+            "compact-image-allow-explicit-empty-trailer",
+            "present = true ↔ roots ≠ 0 ∨ fences ≠ 0",
+            "present = true ↔ True",
+            "  exact accepted.mp rfl",
+        ),
+        (
+            "compact-image-drop-receipt-position-freshness",
+            "  position ∉ positions",
+            "  True",
+            "    fun member => fresh",
+        ),
+        (
+            "compact-image-ignore-retry-horizon",
+            "expiresAt - decisionPosition ≤ retryHorizon ∧",
+            "True ∧",
+            "  exact ⟨positive, past, by omega⟩",
+        ),
+    ]:
+        check_lean_mutation(ROOT, command, domains, name, [(original, weakened)], law)
 
 
 if __name__ == "__main__":

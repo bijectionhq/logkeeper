@@ -8,8 +8,14 @@ use crate::production::{
 use vstd::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use crate::receipt::Receipt;
+use crate::layout::{
+    CompactImageLayout, OldRootBytes, canonicalCompactImageLayout, compactImageBytesAdmissible,
+    compactImageLayoutBytes, oldRootsInOrder, strictly_ordered_old_roots_have_unique_iteration,
+};
 use vstd::laws_cmp::{obeys_cmp, obeys_cmp_concrete_eq};
 use vstd::std_specs::btree::*;
+use vstd::std_specs::cmp::OrdSpec;
+use vstd::std_specs::iter::IteratorSpec;
 
 verus! {
 
@@ -66,6 +72,30 @@ fn accepted_object_control_trailer_matches_encoder_presence(
 ) {
     let accepted = object_control_trailer_canonical(present, roots, fences);
     assert(accepted ==> present == (roots > 0 || fences > 0));
+}
+
+fn accepted_compact_image_bytes_reencode_exactly(
+    old_roots: &BTreeMap<u64, Seq<u8>>,
+    Ghost(layout): Ghost<CompactImageLayout>, Ghost(bytes): Ghost<Seq<u8>>,
+)
+    requires
+        btree_map_wf(old_roots),
+        old_roots@.kv_pairs() == layout.old_roots.to_set(),
+        compactImageBytesAdmissible(layout),
+        compactImageLayoutBytes(layout) == bytes,
+{
+    let rows = old_roots.iter();
+    let ghost keys = rows.remaining().map_values(|row: (&u64, &Seq<u8>)| *row.0);
+    let ghost ordered = into_iter(rows);
+    assert forall|i: int, j: int| 0 <= i < j < ordered.len()
+        implies (#[trigger] ordered[i]).0 < (#[trigger] ordered[j]).0 by {
+        assert(ordered[i].0 == keys[i] && ordered[j].0 == keys[j]);
+        assert(keys[i].cmp_spec(&keys[j]) is Less);
+    }
+    assert(oldRootsInOrder(ordered));
+    proof { strictly_ordered_old_roots_have_unique_iteration(ordered, layout.old_roots); }
+    assert(canonicalCompactImageLayout(layout, ordered) == layout);
+    assert(compactImageLayoutBytes(canonicalCompactImageLayout(layout, ordered)) == bytes);
 }
 
 fn accepting_a_receipt_preserves_unique_decision_positions(
