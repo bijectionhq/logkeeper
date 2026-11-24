@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use self::{
     rules::Decision,
     state::Stream,
-    wal::{FRAME_OVERHEAD, MAX_IDENTITY_BYTES, Wal},
+    wal::{FRAME_OVERHEAD, MAX_IDENTITY_BYTES, Round, Wal},
 };
 use super::{codec, wire::*};
 
@@ -331,7 +331,7 @@ impl Engine {
     /// Decide and buffer in arrival order per stream. Other streams can advance while a
     /// large mutation is fragmented. A round publishes all its results after one sync.
     fn round(&mut self, pending: &mut VecDeque<Work>, backlogged: bool) -> io::Result<()> {
-        let mut buffer = Vec::new();
+        let mut buffer = Round::default();
         let mut charged = HashMap::<StreamId, usize>::new();
         let mut blocked = HashSet::new();
         let mut changed = HashSet::new();
@@ -421,7 +421,7 @@ impl Engine {
             let (entry, offset) = work.pending.as_mut().expect("mutation encoded");
             let end = *offset + (budget - FRAME_OVERHEAD).min(entry.len() - *offset);
             let last = end == entry.len();
-            wal::fragment(&mut buffer, id, *offset == 0, last, &entry[*offset..end]);
+            buffer.push(id, *offset == 0, last, entry.slice(*offset..end));
             *charge += FRAME_OVERHEAD + end - *offset;
             *offset = end;
             if !last {

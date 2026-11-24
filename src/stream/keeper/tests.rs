@@ -14,6 +14,68 @@ const MEMBERS: [KeeperId; 3] = [KeeperId(1), KeeperId(2), KeeperId(3)];
 static CLIENT: Identity = Identity::from_static("urn:logkeeper:client:writer-a");
 static OTHER: Identity = Identity::from_static("urn:logkeeper:client:writer-b");
 
+#[test]
+fn wal_request_is_encoded_after_the_identity_in_the_final_owner() {
+    let request = Request::Append {
+        stream: A,
+        epoch: Epoch(2),
+        at: Lsn(3),
+        records: vec![Bytes::from_static(b"first"), Bytes::from_static(b"second")],
+        head: Lsn(4),
+    };
+    let request_bytes = codec::encode_request(&request).unwrap();
+    for identity in [None, Some(&CLIENT)] {
+        let identity_bytes = identity.map_or("", Identity::as_str).as_bytes();
+        let entry = wal::entry(&request, identity).unwrap();
+        let mut expected = (identity_bytes.len() as u32).to_be_bytes().to_vec();
+        expected.extend_from_slice(identity_bytes);
+        expected.extend_from_slice(&request_bytes);
+        assert_eq!(entry.as_ref(), expected.as_slice());
+        assert_eq!(
+            codec::decode_request(entry.slice(4 + identity_bytes.len()..)).unwrap(),
+            request,
+        );
+    }
+    let oversized = Identity::from("a".repeat(wal::MAX_IDENTITY_BYTES + 1).as_str());
+    assert_eq!(
+        wal::entry(&request, Some(&oversized)).unwrap_err().to_string(),
+        "oversized WAL identity",
+    );
+}
+
+#[test]
+fn wal_round_keeps_exact_frame_bytes_across_short_vectored_writes() {
+    #[derive(Default)]
+    struct ShortWrites(Vec<u8>);
+
+    impl Write for ShortWrites {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = bytes.len().min(7);
+            self.0.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut expected = Vec::new();
+    let mut round = wal::Round::default();
+    let entry = Bytes::from_static(b"a request fragment with binary bytes\0\xff");
+    for index in 0..40 {
+        let stream = if index % 2 == 0 { A } else { B };
+        let first = index < 2;
+        let last = index >= 38;
+        wal::fragment(&mut expected, stream, first, last, &entry);
+        round.push(stream, first, last, entry.clone());
+    }
+    let mut output = ShortWrites::default();
+    round.write_to(&mut output).unwrap();
+    assert_eq!(round.len(), expected.len());
+    assert_eq!(output.0, expected);
+}
+
 fn create(stream: StreamId) -> Request {
     Request::Create {
         stream,

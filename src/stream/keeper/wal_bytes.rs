@@ -507,7 +507,24 @@ pub(super) fn encode_field(output: &mut Vec<u8>, bytes: &[u8]) -> bool {
     true
 }
 
-/// The request and identity bytes remain opaque to the storage format.
+/// Start the final entry buffer with the opaque identity and its length.
+#[cfg_attr(verus_keep_ghost, verus_spec(out => ensures
+    match out {
+        Some(bytes) => identity@.len() <= u32::MAX
+            && bytes@ == be32(identity@.len() as u32) + identity@,
+        None => identity@.len() > u32::MAX,
+    }
+))]
+pub(super) fn encode_entry_prefix(identity: &[u8], capacity: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(capacity);
+    if !encode_field(&mut bytes, identity) {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Compose the production prefix and opaque request for the byte laws.
+#[cfg(verus_keep_ghost)]
 #[cfg_attr(verus_keep_ghost, verus_spec(out => ensures
     match out {
         Some(bytes) => identity@.len() <= u32::MAX
@@ -516,10 +533,7 @@ pub(super) fn encode_field(output: &mut Vec<u8>, bytes: &[u8]) -> bool {
     }
 ))]
 pub(super) fn encode_entry(identity: &[u8], request: &[u8]) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    if !encode_field(&mut bytes, identity) {
-        return None;
-    }
+    let mut bytes = encode_entry_prefix(identity, 0)?;
     append_bytes(&mut bytes, request);
     Some(bytes)
 }
