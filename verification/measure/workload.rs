@@ -155,15 +155,17 @@ async fn retry<T, F>(mut call: impl FnMut() -> F) -> Result<T>
 where
     F: Future<Output = journal_contract::Result<T>>,
 {
-    let start = Instant::now();
-    loop {
-        match call().await {
-            Err(JournalError::Unavailable) if start.elapsed() < RETRY_LIMIT => {
-                tokio::time::sleep(Duration::from_millis(2)).await;
+    Ok(tokio::time::timeout(RETRY_LIMIT, async {
+        loop {
+            match call().await {
+                Err(JournalError::Unavailable) => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                result => return result,
             }
-            result => return Ok(result?),
         }
-    }
+    })
+    .await??)
 }
 
 async fn init(writer: &Writer, id: u64) -> Result<()> {

@@ -13,7 +13,11 @@ for rtt do
     "$measure" "$keeper" pool-check "$rtt"
     for streams in 1 100 1000 10000; do
         for batch in 1 32; do
-            "$measure" "$keeper" commit "$rtt" "$streams" "$batch"
+            if [ "$streams" -eq 10000 ] && [ "$batch" -eq 32 ]; then
+                "$measure" "$keeper" commit "$rtt" "$streams" "$batch" 1 64
+            else
+                "$measure" "$keeper" commit "$rtt" "$streams" "$batch"
+            fi
         done
     done
     "$measure" "$keeper" head "$rtt"
