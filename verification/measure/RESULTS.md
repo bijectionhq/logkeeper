@@ -31,7 +31,83 @@ verification/measure/run.sh "$out/bin/logkeeper" "$out/bin/stream-measure" 1000 
   > "$out/cases.jsonl" 2> "$out/cases.stderr"
 ```
 
-Run a single case with `stream-measure KEEPER CASE RTT_US`. `commit` accepts stream count, batch size, batches per stream, and the producer admission limit. `head`, `kill`, `partition`, `replace`, and `hot` accept an optional stream count. `pool-check` fails if a warmed 64-channel route reconnects during 24 more waves of 64 concurrent `Check` calls.
+Run a single case with `stream-measure KEEPER CASE RTT_US`. `scale-check` is the batching regression guard described under node-level batching. `commit` accepts stream count, batch size, batches per stream, and the producer admission limit. `head`, `kill`, `partition`, `replace`, and `hot` accept an optional stream count. `pool-check` fails if a warmed 64-channel route reconnects during 24 more waves of 64 concurrent `Check` calls.
+
+## Node-level batching
+
+This section compares the N7 build (`f14f65e`, "before") with the node-level batching build ("after") in back-to-back runs on the same host, at the 1 ms profile. Both builds ran the same harness: commit, head and noisy neighbour. The 10,000-stream batch-32 case ran with both 64 and 256 admitted producers. The calibrated echo was 1.57 / 1.60 / 1.73 ms before and 1.57 / 1.60 / 1.64 ms after (p50 / p99 / p99.9). The 64-channel pool check reopened no connections in either build.
+
+What changed:
+
+- **One connection per keeper.** Every writer in a process shares one long-lived mutually authenticated connection per keeper. Calls queued while a frame is written are coalesced into one `Request::Batch`, up to 4 MiB. Frames are pipelined. The keeper decides a connection's frames concurrently, so it can group them, and answers them in order. A keeper round admits whole envelopes, so a batch is decided and synced in one round. Waiting reads and requests of 1 MiB or more keep using pooled exclusive channels.
+- **Appends amortize.** Before, each lane sent one record per keeper append, so one stream's batch of 32 used 32 sequential keeper rounds on every lane. A lane now sends the contiguous run of known records in one append. Committed payloads stay in writer memory, up to 1 MiB per stream, until every lane holds them, so a lagging lane no longer issues one `Recover` and one append per record. A batched retry after a lost reply would overlap the keeper's tail and be refused as `Conflict`. A lane therefore retries one record after an uncertain result, and adopts the keeper's reported tail.
+- **Fresh observer reads.** Before, every settle round resampled the maximum eligible tail. Under continuous writes, a newly accepted record is almost always ahead of the published heads, so the call spent its 25 ms settle budget chasing it and returned `Unavailable`. The observer now pins its read index from its first quorum round and waits for quorum head coverage of that index. Any committed position at or above the index covers every append acknowledged before the call, so read-index linearizability is unchanged.
+- **Background WAL rotation.** With batching in place, 10,000 streams at batch 32 still had periodic 4 s stalls. Instrumentation showed that each full 64 MiB segment checkpointed all 10,000 dirty streams inline, taking about 3.8 s on every keeper. That is roughly five file or directory syncs per stream, and APFS serializes them, so running 16 checkpoint threads made no difference. With rotation disabled in a probe build, the same case ran at 492,000 records/s with no transport errors. Rotation now writes the checkpoints on a worker thread, as of the segment boundary, while rounds continue in the next segment. Old segments are retired only after every checkpoint is durable. Delete still rotates synchronously.
+
+### Commit
+
+Latencies are `p50 / p99 / p99.9` in ms. New connections are summed over the three keeper links.
+
+| Build | Streams | Batch | Admitted | Records | Record ack | Batch ack | Queue p99 | Records/s | Transport errors | New connections |
+| --- | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: |
+| before | 1 | 1 | 1 | 1,000 | 3.90 / 4.03 / 5.07 | 3.90 / 4.03 / 5.07 | 0.00 | 256 | 0 | 0 |
+| after | 1 | 1 | 1 | 1,000 | 3.95 / 4.09 / 6.00 | 3.95 / 4.09 / 6.00 | 0.00 | 253 | 0 | 0 |
+| before | 1 | 32 | 1 | 1,024 | 30.82 / 58.46 / 63.26 | 55.58 / 63.83 / 63.83 | 0.00 | 568 | 0 | 505 |
+| after | 1 | 32 | 1 | 1,024 | 5.85 / 6.10 / 6.36 | 5.94 / 6.45 / 6.45 | 0.00 | 5,391 | 0 | 0 |
+| before | 100 | 1 | 100 | 1,000 | 6.49 / 14.50 / 17.37 | 6.49 / 14.50 / 17.37 | 0.00 | 13,229 | 0 | 14 |
+| after | 100 | 1 | 100 | 1,000 | 3.84 / 5.76 / 5.85 | 3.84 / 5.76 / 5.85 | 0.00 | 24,530 | 0 | 0 |
+| before | 100 | 32 | 100 | 6,400 | 75.05 / 185.37 / 192.50 | 136.74 / 193.52 / 194.05 | 0.00 | 19,635 | 0 | 1,910 |
+| after | 100 | 32 | 100 | 6,400 | 8.64 / 11.77 / 12.20 | 8.65 / 11.91 / 12.23 | 0.00 | 301,582 | 0 | 0 |
+| before | 1,000 | 1 | 256 | 2,000 | 17.22 / 18.22 / 18.56 | 17.22 / 18.22 / 18.56 | 52.38 | 14,644 | 0 | 5 |
+| after | 1,000 | 1 | 256 | 2,000 | 5.44 / 8.48 / 8.92 | 5.44 / 8.48 / 8.92 | 17.66 | 43,148 | 0 | 0 |
+| before | 1,000 | 32 | 256 | 64,000 | 156.73 / 324.96 / 343.45 | 289.81 / 344.33 / 345.59 | 920.74 | 27,615 | 0 | 162 |
+| after | 1,000 | 32 | 256 | 64,000 | 8.20 / 16.84 / 19.08 | 8.23 / 16.85 / 19.09 | 31.87 | 866,278 | 0 | 0 |
+| before | 10,000 | 1 | 256 | 20,000 | 19.96 / 146.29 / 167.83 | 19.96 / 146.29 / 167.83 | 1080.19 | 10,878 | 0 | 7 |
+| after | 10,000 | 1 | 256 | 20,000 | 3.98 / 6.01 / 7.62 | 3.98 / 6.01 / 7.62 | 154.71 | 63,148 | 0 | 0 |
+| before | 10,000 | 32 | 64 | 320,000 | 70.44 / 20023.41 / 22167.59 | 160.75 / 22167.42 / 23866.91 | 275128.19 | 1,161 | 1,134,468 | 153,580 |
+| after | 10,000 | 32 | 64 | 320,000 | 4.16 / 7.09 / 11.69 | 4.21 / 7.41 / 11.75 | 685.67 | 457,401 | 0 | 0 |
+| before | 10,000 | 32 | 256 | 320,000 | 1831.04 / 17227.78 / 18702.82 | 3764.28 / 18709.56 / 19269.96 | 205196.89 | 1,542 | 811,302 | 105,559 |
+| after | 10,000 | 32 | 256 | 320,000 | 8.46 / 17.87 / 19.11 | 8.48 / 17.91 / 19.16 | 350.70 | 874,353 | 0 | 0 |
+
+Throughput scales with the stream count until the 256-producer admission limit, at about 0.87 million records/s. At 10,000 streams with batch 32, transport errors fell from about 1.1 million to zero, and new connections fell from about 150,000 to zero. On one stream, batch 32 now delivers 5,391 records/s against 253 at batch 1. The keeper cost per record falls about 21-fold, and the record median rises only from 3.95 ms to 5.85 ms. Before, batch 32 was 2.2 times batch 1 throughput and had a 7.9 times higher record median. The single-stream batch-1 cost is unchanged. It still needs an accept round and a publication round.
+
+### Head
+
+| Build | Load | Caller | OK | Unavailable | Head | RPC starts/s | Writer data and publication starts/s | Transport errors |
+| --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: |
+| before | idle | writer | 1024 | 0 | 1.76 / 7.45 / 8.01 | 37,493 | 0 | 0 |
+| after | idle | writer | 1024 | 0 | 1.67 / 1.74 / 1.74 | 57,433 | 0 | 0 |
+| before | idle | observer | 1024 | 0 | 1.73 / 6.97 / 7.56 | 40,822 | 0 | 0 |
+| after | idle | observer | 1024 | 0 | 1.68 / 3.55 / 3.56 | 55,193 | 0 | 0 |
+| before | write | writer | 748 | 276 | 5.98 / 821.46 / 1054.07 | 7,534 | 3,843 | 9,485 |
+| after | write | writer | 1024 | 0 | 4.07 / 4.37 / 4.42 | 68,573 | 47,896 | 0 |
+| before | write | observer | 735 | 289 | 9.03 / 53.13 / 142.29 | 11,409 | 17,948 | 2,250 |
+| after | write | observer | 1024 | 0 | 4.12 / 5.54 / 5.66 | 43,485 | 55,994 | 0 |
+
+Under write load, both callers now return every head. Before, the writer returned `Unavailable` on 27% of calls and the observer on 28% in this paired run. N7 recorded 7% for the observer.
+
+### Noisy neighbour
+
+| Build | Cap | Hot records | Hot MB/s | Neighbour acks | Neighbour latency in ms |
+| --- | --- | ---: | ---: | ---: | --- |
+| before | 4 MiB | 39 | 80.24 | 8,274 | 4.03 / 260.70 / 1394.68 |
+| before | 64 MiB | 4 | 8.17 | 314 | 89.29 / 3142.53 / 3803.33 |
+| after | 4 MiB | 90 | 186.29 | 24,941 | 4.01 / 15.19 / 250.66 |
+| after | 64 MiB | 77 | 159.01 | 17,374 | 4.06 / 69.06 / 376.79 |
+
+Large hot records use exclusive channels, so they never block small neighbours on the shared connection. With the 4 MiB cap, neighbour p99 fell from 260.70 ms to 15.19 ms, and the hot stream rose from 80 to 186 MB/s against the 200 MB/s offer.
+
+### Faults and regression guard
+
+On the after build at 1 ms, SIGKILL of one keeper recovered 1,000 streams in 11.95 / 12.66 / 12.66 ms, with an ack gap of 43.92 / 71.33 / 71.44 ms. The partition-and-claim case took 2037.16 / 2039.30 / 2039.30 ms, still dominated by the two-second deadline on the blackholed route. Both are no slower than N7's results.
+
+`stream-measure KEEPER scale-check RTT_US` fails when any of these conditions holds:
+
+- one stream's batch-32 throughput is below four times its batch-1 throughput;
+- 10,000 streams at batch 32 produce any transport error or new connection;
+- a head call returns `Unavailable`.
+
+`run.sh` now runs it. Of three scale checks on the after build, two passed. The first, which started right after the long before-build runs, failed: its idle observer phase got `Unavailable` 32 times. That phase recorded 960 fast-failing transport errors at 1,726 RPCs/s, so its connections failed rather than timed out. The failure did not recur in three isolated head runs or two further scale checks. The harness now records `unreachable` and `timed_out` counts so a recurrence can be attributed. The before build fails every criterion above.
 
 ## Transport regression and saturation
 
@@ -118,5 +194,7 @@ Both trials offered 200 MB/s. On the repeat, the cap improved neighbour p99 from
 Keep writer-driven, per-stream quorums provisionally for latency-sensitive workloads with admission control. The 100,000-stream sweep, including the one-copy parked histories, took 1 minute 48 seconds. This clears the brief's hours-scale replacement criterion on this host. A simple remote-leader model adds one client-to-leader round trip. The calibrated extra hop is about 1.56 ms or 2.99 ms at the two settings. That amounts to 39% or 45% of the corresponding single-stream median append latency, so the hop can matter at low load.
 
 At the saturated 10,000-stream, batch-32 operating point, the additional hop is immaterial beside 25.93 s record p99. The batch completed, but its run started over 225,000 new connections and recorded about 1.8 million transport errors and only 745 records/s. A one-group-per-cell design would win under the brief's latency criterion for that operating point. Its throughput and failover behavior still need a direct comparison. The per-stream design has no demonstrated 10,000-stream batch-32 operating budget from this run.
+
+Addendum (node-level batching): that operating point now runs with zero transport errors at 457,401 records/s and 7.09 ms record p99 with 64 producers, and 874,353 records/s and 17.87 ms p99 with 256. The per-stream logical consensus is unchanged: batching happens at the node connection and in the keeper round. The collapse was caused by per-call connections and per-record keeper rounds, not by per-stream quorums.
 
 The comparison uses the decision criteria stated in the N7 brief. The granularity deep dive's numerical thresholds were absent from the supplied Wave N report directory. The loopback setup measures one disk and one network stack across all processes, and the experiment models the remote leader's additional RTT. It supplies no cell-leader measurements or independent-AZ hardware results.

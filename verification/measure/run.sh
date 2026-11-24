@@ -11,6 +11,7 @@ fi
 for rtt do
     "$measure" "$keeper" calibrate "$rtt"
     "$measure" "$keeper" pool-check "$rtt"
+    "$measure" "$keeper" scale-check "$rtt"
     for streams in 1 100 1000 10000; do
         for batch in 1 32; do
             if [ "$streams" -eq 10000 ] && [ "$batch" -eq 32 ]; then

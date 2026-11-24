@@ -46,6 +46,8 @@ struct Count {
     checks: AtomicU64,
     appends: AtomicU64,
     publishes: AtomicU64,
+    unreachable: AtomicU64,
+    timed_out: AtomicU64,
 }
 
 struct Measured {
@@ -83,8 +85,16 @@ impl Transport for Measured {
             }
             let reply = self.tcp.call(keeper, request).await;
             self.count.returned.fetch_add(1, Relaxed);
-            if reply.is_err() {
+            if let Err(error) = &reply {
                 self.count.errors.fetch_add(1, Relaxed);
+                match error {
+                    TransportError::Unreachable => self.count.unreachable.fetch_add(1, Relaxed),
+                    TransportError::TimedOut => self.count.timed_out.fetch_add(1, Relaxed),
+                    TransportError::Protocol(message) => {
+                        eprintln!("transport protocol error: {message}");
+                        0
+                    }
+                };
             }
             reply
         })
@@ -103,7 +113,7 @@ impl Measured {
         Ok(Writer::new(self.clone(), ENSEMBLE)?)
     }
 
-    fn counters(&self) -> [u64; 6] {
+    fn counters(&self) -> [u64; 8] {
         let c = &self.count;
         [
             &c.started,
@@ -112,12 +122,23 @@ impl Measured {
             &c.checks,
             &c.appends,
             &c.publishes,
+            &c.unreachable,
+            &c.timed_out,
         ]
         .map(|v| v.load(Relaxed))
     }
 
-    fn rates(&self, before: [u64; 6], elapsed: Duration) -> Value {
-        let [started, returned, errors, checks, appends, publishes] = self
+    fn rates(&self, before: [u64; 8], elapsed: Duration) -> Value {
+        let [
+            started,
+            returned,
+            errors,
+            checks,
+            appends,
+            publishes,
+            unreachable,
+            timed_out,
+        ] = self
             .counters()
             .into_iter()
             .zip(before)
@@ -127,7 +148,7 @@ impl Measured {
             .unwrap();
         let seconds = elapsed.as_secs_f64();
         json!({"started_per_sec": started as f64 / seconds, "returned_per_sec": returned as f64 / seconds,
-               "transport_errors": errors, "check_per_sec": checks as f64 / seconds,
+               "transport_errors": errors, "unreachable": unreachable, "timed_out": timed_out, "check_per_sec": checks as f64 / seconds,
                "data_append_per_sec": appends as f64 / seconds, "publish_per_sec": publishes as f64 / seconds})
     }
 }
@@ -254,7 +275,7 @@ pub async fn commit(
     width: u64,
     batches: u64,
     in_flight: usize,
-) -> Result<()> {
+) -> Result<Value> {
     assert!(streams > 0 && width > 0 && batches > 0 && in_flight > 0);
     let in_flight = in_flight.min(streams as usize);
     let cluster = Cluster::start(binary, [rtt; 3], CAP).await?;
@@ -298,14 +319,45 @@ pub async fn commit(
         append_times.extend(append);
     }
     let elapsed = start.elapsed();
-    println!(
-        "{}",
-        json!({"case":"commit", "rtt_us":rtt.as_micros(), "streams":streams, "batch":width,
+    let result = json!({"case":"commit", "rtt_us":rtt.as_micros(), "streams":streams, "batch":width,
         "in_flight_streams":in_flight, "batches_per_stream":batches, "seconds":elapsed.as_secs_f64(),
         "records_per_sec":append_times.len() as f64 / elapsed.as_secs_f64(), "record":stats(append_times),
         "producer_queue":stats(queue_times), "batch_ack":stats(batch_times), "rpc":io.rates(before, elapsed), "new_connections":
-        cluster.links.iter().zip(connections).map(|(link, before)| link.connections()-before).collect::<Vec<_>>() })
-    );
+        cluster.links.iter().zip(connections).map(|(link, before)| link.connections()-before).collect::<Vec<_>>() });
+    println!("{result}");
+    Ok(result)
+}
+
+/// Regression guard for node-level batching. Fails unless one stream's batch-32 records
+/// cost well under a quarter of batch-1 records, 10,000 streams at batch 32 run with no
+/// transport errors or reconnections, and observers never see `Unavailable` under load.
+pub async fn scale_check(binary: &Path, rtt: Duration) -> Result<()> {
+    let single = commit(binary, rtt, 1, 1, 256, 1).await?;
+    let batched = commit(binary, rtt, 1, 32, 8, 1).await?;
+    let ratio =
+        batched["records_per_sec"].as_f64().unwrap() / single["records_per_sec"].as_f64().unwrap();
+    if ratio < 4.0 {
+        return Err(format!("batch 32 is only {ratio:.1} times batch 1 throughput").into());
+    }
+    let wide = commit(binary, rtt, 10_000, 32, 1, 256).await?;
+    let errors = wide["rpc"]["transport_errors"].as_u64().unwrap();
+    let reconnects: u64 = wide["new_connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_u64)
+        .sum();
+    if errors != 0 || reconnects != 0 {
+        return Err(format!(
+            "10,000 streams at batch 32: {errors} transport errors, {reconnects} new connections"
+        )
+        .into());
+    }
+    for row in head(binary, rtt, 32).await? {
+        if row["unavailable"].as_u64() != Some(0) {
+            return Err(format!("head returned Unavailable: {row}").into());
+        }
+    }
     Ok(())
 }
 
@@ -347,8 +399,9 @@ async fn collect_background(mut tasks: JoinSet<Result<(u64, Lsn)>>) -> Result<Ve
     Ok(heads)
 }
 
-pub async fn head(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
+pub async fn head(binary: &Path, rtt: Duration, streams: u64) -> Result<Vec<Value>> {
     assert!(streams > 0);
+    let mut rows = Vec::new();
     for loaded in [false, true] {
         let cluster = Cluster::start(binary, [rtt; 3], CAP).await?;
         let writer_io = Measured::connect(&cluster, &cluster.writer)?;
@@ -403,18 +456,17 @@ pub async fn head(binary: &Path, rtt: Duration, streams: u64) -> Result<()> {
             } else {
                 stats(times)
             };
-            println!(
-                "{}",
-                json!({"case":"head", "rtt_us":rtt.as_micros(), "streams":streams,
+            let row = json!({"case":"head", "rtt_us":rtt.as_micros(), "streams":streams,
                 "loaded":loaded, "observer":observer, "head":latency, "unavailable":errors,
                 "seconds":elapsed.as_secs_f64(), "rpc":io.rates(before, elapsed),
-                "writer_rpc":writer_io.rates(write_before, elapsed)})
-            );
+                "writer_rpc":writer_io.rates(write_before, elapsed)});
+            println!("{row}");
+            rows.push(row);
         }
         stop.cancel();
         collect_background(appends).await?;
     }
-    Ok(())
+    Ok(rows)
 }
 
 async fn seed(writer: &Writer, ids: impl IntoIterator<Item = u64>) -> Result<Vec<(u64, Instant)>> {

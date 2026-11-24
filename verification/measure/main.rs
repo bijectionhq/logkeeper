@@ -30,7 +30,10 @@ async fn main() -> Result<()> {
             let in_flight = rest.get(3).map_or(Ok(256), |v| v.parse::<usize>())?;
             workload::commit(&binary, rtt, streams, batch, batches, in_flight).await?;
         }
-        "head" => workload::head(&binary, rtt, size(32)?).await?,
+        "head" => {
+            workload::head(&binary, rtt, size(32)?).await?;
+        }
+        "scale-check" => workload::scale_check(&binary, rtt).await?,
         "kill" => workload::kill(&binary, rtt, size(1000)?).await?,
         "partition" => workload::partition(&binary, rtt, size(3000)?).await?,
         "replace" => workload::replace(&binary, rtt, size(100_000)?).await?,
