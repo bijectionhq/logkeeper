@@ -14,6 +14,7 @@ mod object_withdrawal;
 mod receipt;
 mod refusal;
 pub mod replication;
+mod replay_bounds;
 mod retention;
 pub mod service;
 mod writer;
@@ -648,21 +649,18 @@ impl State {
         if self.holds.get(&hold.id).map(|entry| entry.hold) != Some(hold) {
             return Err(Refusal::Unavailable);
         }
-        let index = |lsn: u64| {
-            let offset = lsn
-                .checked_sub(self.floor.next_lsn)
-                .ok_or(Refusal::Unavailable)?;
-            usize::try_from(offset).map_err(|_| Refusal::Unavailable)
-        };
         // An empty interval remains usable past the replay floor.
         let (start, end) = if hold.start == hold.through {
             (0, 0)
         } else {
-            (index(hold.start.next_lsn)?, index(hold.through.next_lsn)?)
+            replay_bounds::retained_indices(
+                self.floor.next_lsn,
+                hold.start.next_lsn,
+                hold.through.next_lsn,
+                self.records.len(),
+            )
+            .ok_or(Refusal::Unavailable)?
         };
-        if end < start || end > self.records.len() {
-            return Err(Refusal::Unavailable);
-        }
         Ok(HeldReplay {
             checkpoint: hold.checkpoint,
             start: hold.start,

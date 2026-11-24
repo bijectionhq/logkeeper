@@ -449,13 +449,17 @@ fn checkpoint_records(
     {
         return Err(Refusal::Invalid.into());
     }
-    let first =
-        usize::try_from(from.next_lsn - state.floor().next_lsn).map_err(|_| Refusal::Invalid)?;
-    let count = usize::try_from(through.next_lsn - from.next_lsn).map_err(|_| Refusal::Invalid)?;
+    let (first, end) = super::replay_bounds::retained_indices(
+        state.floor().next_lsn,
+        from.next_lsn,
+        through.next_lsn,
+        state.records.len(),
+    )
+    .ok_or(Refusal::Invalid)?;
     replay_page(
         base,
         through,
-        state.records.iter().skip(first).take(count),
+        state.records.range(first..end),
         maximum_bytes,
     )
 }
@@ -493,13 +497,13 @@ fn replay_from(
     from: Cut,
 ) -> Result<(super::HeldReplay<'_>, usize), Error> {
     let replay = state.held_replay(session.principal, hold)?;
-    if from.next_lsn < replay.start().next_lsn
-        || from.next_lsn > replay.through().next_lsn
-        || (from != replay.start() && state.cut(from.next_lsn) != Some(from))
-    {
-        return Err(Refusal::Invalid.into());
-    }
-    let skip =
-        usize::try_from(from.next_lsn - replay.start().next_lsn).map_err(|_| Refusal::Invalid)?;
+    let same_cut = from == replay.start() || state.cut(from.next_lsn) == Some(from);
+    let skip = super::replay_bounds::cursor_offset(
+        replay.start().next_lsn,
+        from.next_lsn,
+        replay.through().next_lsn,
+        same_cut,
+    )
+    .ok_or(Refusal::Invalid)?;
     Ok((replay, skip))
 }

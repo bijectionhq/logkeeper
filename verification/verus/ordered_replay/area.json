@@ -1,0 +1,19 @@
+{
+  "summary": "Logkeeper selects the complete retained slice and requires the original in-range replay cursor.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 4,
+  "controls": {
+    "lose_last_record": {
+      "defect": "Interpret the terminal cut as one record earlier.",
+      "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "(through - floor) as usize))", "replace": "(through - floor).saturating_sub(1) as usize))"}],
+      "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "retained_indices", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 3
+    },
+    "substitute_cursor_history": {
+      "defect": "Resume from a numerically admissible cursor from a different history.",
+      "mutate": [{"file": "src/ordered/replay_bounds.rs", "find": "!exact_cut || from < start", "replace": "from < start"}],
+      "expect": [{"file": "src/ordered/replay_bounds.rs", "function": "cursor_offset", "category": "postcondition not satisfied"}],
+      "min_verified_functions": 3
+    }
+  }
+}
