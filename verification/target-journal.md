@@ -46,7 +46,12 @@ The contract is the whole interface a consumer sees. RTDB depends on it and neve
 
 **Durability (D03):** an acknowledged record is on two durable copies in two zones. With one zone lost, both survivors must hold it.
 
-**Authorization:** an mTLS identity authorized for the cluster may call any verb on any stream it is allowed to use. Nomination policy (who should seal) is the consumer's business. This relaxes requirement S07 as written, and S07 is an **open owner decision**: implement an optional seal-policy hook (`SealPolicy`, default allow), so S07 can be enforced later without a protocol change.
+**Authorization (S07, owner decision 2026-11-24):**
+- An mTLS identity in the cluster's `clients` list may `read` and `head`.
+- Only identities in the cluster's `writers` list may `create`, `seal`, `append`, `trim` and `delete`.
+- The journal decides nothing about *who should* seal. Fencing makes any seal safe, and the takeover policy belongs to the consumer (section 4).
+- Logkeeper keeps the safety half of S07 for its own moves: a stream moved between keeper ensembles, including keeper replacement, admits writes at at most one authority, across crashes and stale routes.
+- The `SealPolicy` hook stays as an extension point. It defaults to allow, and no policy is shipped.
 
 ## 3. The implementation: writer-driven quorum per stream
 
@@ -105,6 +110,11 @@ These are not Logkeeper's job, but the journal must not prevent them:
 - **Pins** for branches, exports and long reads are ordinary records appended by the stream's writer.
 - **Object files** use never-reused, epoch-scoped keys, collected by reachability.
 - **Encryption and key generations** belong to RTDB; the journal stores ciphertext only.
+- **Writer takeover** (S07 takeover half, an RTDB requirement):
+  - A writer is replaced only after its lease record in the stream has lapsed (plus drift), or after it released the stream with a `Lease{until: now}` record. Reachability failure alone triggers no seal.
+  - The writer appends a lease record only while idle, since commits prove it is alive. Parked databases need none.
+  - A candidate reads the stream through `head` before sealing.
+- **Catch-up before serving:** after `seal` returns end `n`, a new writer applies through `n` before serving. The conformance suite states this as a consumer obligation.
 - **Erasure** is completed by key destruction (D02 extension) in the key authority, after closing outstanding key grants.
 
 ## 5. Deployment
@@ -121,6 +131,7 @@ Keeper configuration (JSON, `logkeeper keeper --config FILE`):
 { "keeper": "UUID", "listen": "0.0.0.0:5448", "data": "/var/lib/logkeeper", "zone": "eu-north-1a",
   "tls": { "certificate": "PATH", "private_key": "PATH", "ca": "PATH" },
   "clients": ["urn:logkeeper:client:NAME"],
+  "writers": ["urn:logkeeper:client:NAME"],
   "limits": { "stream_quota_bytes": 8589934592, "max_record_bytes": 33554432, "round_bytes_per_stream": 4194304 } }
 ```
 
