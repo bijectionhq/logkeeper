@@ -3,7 +3,8 @@
 use super::{Coordinator, Error, ReplayHead, ReplayPage, Route, Session, WithdrawnWorker};
 use crate::ordered::{
     AppendResult, BarrierClaim, Checkpoint, CheckpointPreparation, Command, Cut, Enrollment,
-    Fingerprint, Grant, Hold, Outcome, Placement, Receipt, Refusal, Request, append_fingerprint,
+    Fingerprint, Grant, Hold, Outcome, Placement, Principal, Receipt, Refusal, Request,
+    append_fingerprint,
     replication::{Replica, RotationSlots},
 };
 use bytes::Bytes;
