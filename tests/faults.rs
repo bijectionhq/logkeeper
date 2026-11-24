@@ -204,3 +204,76 @@ fn idle_streams_cost_the_server_no_tasks() {
     cancellation.cancel();
     server_runtime.block_on(served).unwrap().unwrap();
 }
+
+#[cfg(feature = "simulation")]
+#[path = "common/prefix_trace.rs"]
+mod prefix_trace;
+
+#[cfg(feature = "simulation")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordered_restart_recovers_the_highest_accept_and_trace_rejects_a_stale_vote() {
+    use logkeeper::ordered::Fingerprint;
+    use logkeeper::ordered::replication::{Ballot, DurableVoter, Error, Prefix, Promise, Replica, Vote};
+    use prefix_trace::{Fixture, ordered::Cohort};
+    use uuid::Uuid;
+
+    struct Peer {
+        voter: DurableVoter,
+        withhold_accept: bool,
+    }
+
+    impl Replica for Peer {
+        fn identity(&self) -> Uuid {
+            self.voter.identity()
+        }
+
+        async fn prepare(&self, group: Fingerprint, ballot: Ballot) -> Result<Promise, Error> {
+            self.voter.prepare(group, ballot).await
+        }
+
+        async fn accept(
+            &self,
+            group: Fingerprint,
+            ballot: Ballot,
+            prefix: &Prefix,
+            read_back: bool,
+        ) -> Result<Vote, Error> {
+            if self.withhold_accept {
+                return Err(Error::Stopped);
+            }
+            self.voter.accept(group, ballot, prefix, read_back).await
+        }
+    }
+
+    let trace = Fixture::new("ordered-restart");
+    let cohort = Cohort::new(&trace);
+    let [first, second, _spare] = cohort.provision();
+    let voters = [first, second];
+    let prior = cohort.group.choose_at(&voters, 1, 100, cohort.enroll()).await.unwrap();
+    assert_eq!(prior.state().position(), 1);
+
+    let [first, second] = voters;
+    let minority = [
+        Peer { voter: first, withhold_accept: false },
+        Peer { voter: second, withhold_accept: true },
+    ];
+    let retry = cohort.enroll();
+    assert!(matches!(
+        cohort.group.choose_at(&minority, 2, 101, retry.clone()).await,
+        Err(Error::Quorum)
+    ));
+
+    let [first, Peer { voter: second, .. }] = minority;
+    drop(first);
+    let restarted = DurableVoter::recover(cohort.group.clone(), cohort.ids[0], cohort.media[0].path())
+        .unwrap();
+    let surviving = [restarted, second];
+    let recovered = cohort.group.choose_at(&surviving, 3, 102, retry).await.unwrap();
+    assert_eq!(recovered.state().position(), 2);
+    assert_eq!(recovered.state().time(), 101);
+    assert!(matches!(
+        cohort.group.choose_at(&surviving, 2, 103, cohort.enroll()).await,
+        Err(Error::Deposed(_))
+    ));
+    trace.finish_with_forbidden_accept(cohort.ids[0]);
+}

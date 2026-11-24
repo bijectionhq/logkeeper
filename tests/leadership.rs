@@ -295,3 +295,31 @@ async fn a_replacement_with_the_same_history_has_no_authority_to_confirm_or_reti
     assert_eq!(reader.read_index(1).await.unwrap(), offset);
     ensemble.stop(0).await;
 }
+
+#[cfg(feature = "simulation")]
+#[path = "common/prefix_trace.rs"]
+mod prefix_trace;
+
+#[cfg(feature = "simulation")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ordered_successor_inherits_a_choice_from_the_intersecting_voter() {
+    use logkeeper::ordered::Outcome;
+    use prefix_trace::{Fixture, ordered::Cohort};
+
+    let trace = Fixture::new("ordered-leadership");
+    let cohort = Cohort::new(&trace);
+    let voters = cohort.provision();
+    let request = cohort.enroll();
+
+    let old = cohort.group.choose_at(&voters[..2], 1, 100, request.clone()).await.unwrap();
+    assert!(matches!(old.receipt().outcome, Ok(Outcome::Enrolled(_))));
+
+    let recovered = cohort.group.choose_at(&voters[1..], 2, 101, request).await.unwrap();
+    assert_eq!(old.receipt(), recovered.receipt());
+    assert_eq!(old.state().command_history(), recovered.state().command_history());
+    assert_eq!(recovered.state().position(), 1);
+
+    let next = cohort.group.choose_at(&voters[1..], 3, 102, cohort.enroll()).await.unwrap();
+    assert_eq!(next.state().position(), 2);
+    trace.finish();
+}

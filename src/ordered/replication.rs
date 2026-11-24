@@ -9,6 +9,8 @@ mod disk;
 mod evidence;
 mod rotation;
 mod rules;
+#[cfg(feature = "simulation")]
+pub mod trace;
 pub mod transport;
 
 pub use disk::DurableVoter;
@@ -45,6 +47,8 @@ pub struct Group {
     voters: BTreeSet<Uuid>,
     max_prefix_bytes: usize,
     predecessor: Option<Fingerprint>,
+    #[cfg(feature = "simulation")]
+    trace: Option<trace::Trace>,
 }
 
 pub struct RepairSeed {
@@ -255,6 +259,8 @@ impl Group {
             voters: roster,
             max_prefix_bytes,
             predecessor: None,
+            #[cfg(feature = "simulation")]
+            trace: None,
         })
     }
 
@@ -290,6 +296,8 @@ impl Group {
         let selected_seal = state.successor;
         let mut state = rules::seal_image(selected_seal.as_ref(), &destination.identity, state)
             .ok_or(Error::Sealed)?;
+        #[cfg(feature = "simulation")]
+        let selected = self.trace.as_ref().map(|_| state.clone());
         state.voter_scope = destination.identity;
         state.successor = None;
         let seed = RepairSeed {
@@ -298,6 +306,10 @@ impl Group {
             base: state.encode_base(),
         };
         destination.install_seed(&seed)?;
+        #[cfg(feature = "simulation")]
+        if let (Some(trace), Some(selected)) = (&self.trace, selected) {
+            trace.seal(self.identity, destination.identity, selected);
+        }
         Ok(seed)
     }
 
@@ -351,9 +363,15 @@ impl Group {
                 return Err(Error::Group);
             }
             let position = state.position().checked_add(1).ok_or(Error::Capacity)?;
+            #[cfg(feature = "simulation")]
+            let parent = state.command_history();
             state
                 .apply(position, time, request)
                 .map_err(|_| Error::Prefix)?;
+            #[cfg(feature = "simulation")]
+            if let Some(trace) = &self.trace {
+                trace.decision(parent, &state, frame);
+            }
         }
         Ok(state)
     }
@@ -569,9 +587,15 @@ impl Group {
             };
             let frame = super::codec::encode_decision(time, &request);
             let position = state.position().checked_add(1).ok_or(Error::Capacity)?;
+            #[cfg(feature = "simulation")]
+            let parent = state.command_history();
             let receipt = state
                 .apply(position, time, request)
                 .map_err(|_| Error::Prefix)?;
+            #[cfg(feature = "simulation")]
+            if let Some(trace) = &self.trace {
+                trace.decision(parent, &state, &frame);
+            }
             let appended = prefix.append(frame, self.max_prefix_bytes);
             if appended.is_err() || matches!(receipt.outcome, Ok(Outcome::Trimmed(_))) {
                 let compact = Prefix::from_base(state.encode_base(), self.max_prefix_bytes);
@@ -654,6 +678,10 @@ impl Group {
         if voters.len() < self.quorum() {
             return Err(refusal.map_or(Error::Quorum, Error::Deposed));
         }
+        #[cfg(feature = "simulation")]
+        if let Some(trace) = &self.trace {
+            trace.prepared(self.identity, ballot, &voters, winner.as_ref());
+        }
         Ok((
             PreparedRound {
                 ballot,
@@ -677,6 +705,11 @@ impl Group {
             voters: promised,
             newest_refusal: mut refusal,
         } = prepared;
+        #[cfg(feature = "simulation")]
+        if let Some(trace) = &self.trace {
+            let state = self.replay(prefix).expect("issued prefix replays");
+            trace.issued(self.identity, ballot, prefix, &state);
+        }
         let mut accepts: FuturesUnordered<_> = peers
             .iter()
             .filter(|peer| promised.contains(&peer.identity()))
@@ -700,6 +733,10 @@ impl Group {
                             voters.iter().map(|evidence| evidence.voter.as_u128()).collect();
                         if !rules::configured_majority(&configured, &counted) {
                             return Err(Error::Group);
+                        }
+                        #[cfg(feature = "simulation")]
+                        if let Some(trace) = &self.trace {
+                            trace.choice(self.identity, ballot, prefix, &voters);
                         }
                         return Ok(voters);
                     }

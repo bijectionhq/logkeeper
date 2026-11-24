@@ -126,7 +126,7 @@ impl DurableVoter {
             round: 1,
             nonce: Uuid::from_u128(1),
         };
-        Self::open(
+        let voter = Self::open(
             group,
             identity,
             directory,
@@ -135,12 +135,34 @@ impl DurableVoter {
                 accepted: Some(Accepted { ballot, prefix }),
             }),
             false,
-        )
+        )?;
+        #[cfg(feature = "simulation")]
+        if let Some(trace) = &voter.inner.group.trace {
+            let media = voter.inner.media.lock();
+            let selected = &media.selected.as_ref().expect("installed media").state;
+            let accepted = selected.accepted.as_ref().expect("installed prefix");
+            assert_eq!(selected.promised, Some(accepted.ballot));
+            let state = voter.inner.group.replay(&accepted.prefix).expect("installed prefix replays");
+            trace.install(voter.inner.group.identity, identity, accepted, &state);
+        }
+        Ok(voter)
     }
 
     /// Recovers the original journal record. Missing media gives no vote.
     pub fn recover(group: Group, identity: Uuid, directory: &Path) -> Result<Self, Error> {
-        Self::open(group, identity, directory, None, false)
+        let voter = Self::open(group, identity, directory, None, false)?;
+        #[cfg(feature = "simulation")]
+        if let Some(trace) = &voter.inner.group.trace {
+            let media = voter.inner.media.lock();
+            let state = &media.selected.as_ref().expect("reopened media").state;
+            trace.restart(
+                voter.inner.group.identity,
+                identity,
+                state.promised,
+                state.accepted.as_ref(),
+            );
+        }
+        Ok(voter)
     }
 
     fn open(
@@ -367,7 +389,10 @@ impl Inner {
         self.check(group, ballot)?;
         let mut media = self.media.lock();
         let current = &media.selected.as_ref().ok_or(Error::Stopped)?.state;
-        if let Some(promised) = current.promised.filter(|promised| depose_prepare(Some(promised.rank()), ballot.rank())) {
+        if let Some(promised) = current
+            .promised
+            .filter(|promised| depose_prepare(Some(promised.rank()), ballot.rank()))
+        {
             return Err(Error::Deposed(promised));
         }
         let accepted = current.accepted.clone();
@@ -378,6 +403,16 @@ impl Inner {
                 accepted: accepted.clone(),
             },
         )?;
+        #[cfg(feature = "simulation")]
+        if let Some(trace) = &self.group.trace {
+            let selected = &media.selected.as_ref().expect("promised media").state;
+            assert_eq!(selected.promised, Some(ballot));
+            assert_eq!(
+                selected.accepted.as_ref().map(|vote| (vote.ballot, &vote.prefix)),
+                accepted.as_ref().map(|vote| (vote.ballot, &vote.prefix)),
+            );
+            trace.promise(group, self.identity, ballot, accepted.as_ref());
+        }
         Ok(Promise {
             voter: self.identity,
             ballot,
@@ -419,6 +454,14 @@ impl Inner {
                 accepted: Some(Accepted { ballot, prefix }),
             },
         )?;
+        #[cfg(feature = "simulation")]
+        if let Some(trace) = &self.group.trace {
+            let selected = &media.selected.as_ref().expect("accepted media").state;
+            let accepted = selected.accepted.as_ref().expect("accepted prefix");
+            assert_eq!(selected.promised, Some(accepted.ballot));
+            let state = self.group.replay(&accepted.prefix).expect("accepted prefix replays");
+            trace.accept(group, self.identity, accepted, &state);
+        }
         if read_back {
             if let Err(error) = self.read_back(&mut media, ballot, digest, slots) {
                 media.selected = None;

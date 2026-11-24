@@ -1,3 +1,6 @@
+#[path = "common/prefix_trace.rs"]
+mod prefix_trace;
+
 use bytes::Bytes;
 use logkeeper::ordered::TrimResult;
 use logkeeper::ordered::replication::transport::{Connector, RemoteVoter, serve_voter};
@@ -61,6 +64,7 @@ async fn application_with_frame<R: Replica>(
 
 #[tokio::test]
 async fn only_the_custodian_can_page_withdrawn_hold_owners_over_the_application_wire() {
+    let trace = prefix_trace::Fixture::new("withdrawn-hold-owners");
     use logkeeper::ordered::service::WithdrawnWorker;
 
     let placement = Placement {
@@ -104,6 +108,7 @@ async fn only_the_custodian_can_page_withdrawn_hold_owners_over_the_application_
         1 << 20,
     )
     .unwrap();
+    let group = trace.observe(group);
     let media = voter_ids.map(|_| tempfile::tempdir().unwrap());
     let peers: Vec<_> = voter_ids
         .into_iter()
@@ -221,10 +226,12 @@ async fn only_the_custodian_can_page_withdrawn_hold_owners_over_the_application_
         query(custody, Some(second[0].enrollment)).await,
         wire::Reply::WithdrawnWorkers(last) if last.is_empty()
     ));
+    trace.finish();
 }
 
 #[tokio::test]
 async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_window() {
+    let trace = prefix_trace::Fixture::new("surviving-group-repair");
     let placement = Placement {
         deployment: Uuid::new_v4(),
         incarnation: Uuid::new_v4(),
@@ -260,6 +267,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
         clock_drift: 1_000,
     };
     let group = Group::new(placement, limits, seed, window, voter_ids, 1 << 20).unwrap();
+    let group = trace.observe(group);
     let directories = std::array::from_fn::<_, 3, _>(|_| tempfile::tempdir().unwrap());
     let mut peers: Vec<_> = voter_ids
         .into_iter()
@@ -767,6 +775,7 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     .unwrap()
     .successor(group.identity())
     .unwrap();
+    let repaired = trace.observe(repaired);
     let new_media = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
     let surviving_ids = [voter_ids[1], replacement_id];
     for (dir, voter) in new_media.iter().zip(surviving_ids) {
@@ -827,10 +836,12 @@ async fn a_surviving_group_recovers_the_grant_and_preserves_the_paid_append_wind
     assert_eq!(state.window(), next_window);
     assert_eq!(state.reconcile_append(&newest), Ok(result));
     assert_eq!(state.command_history(), chosen.state().command_history());
+    trace.finish();
 }
 
 #[tokio::test]
 async fn exact_object_withdrawal_survives_compaction_and_cohort_repair() {
+    let trace = prefix_trace::Fixture::new("withdrawal-compaction-repair");
     use logkeeper::ordered::ObjectWithdrawal;
 
     let placement = Placement {
@@ -868,6 +879,7 @@ async fn exact_object_withdrawal_survives_compaction_and_cohort_repair() {
     };
     let peers = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
     let group = Group::new(placement, limits, initial, window, peers, 1 << 20).unwrap();
+    let group = trace.observe(group);
     let disks = std::array::from_fn::<_, 3, _>(|_| tempfile::tempdir().unwrap());
     let voters: Vec<_> = disks
         .iter()
@@ -957,6 +969,7 @@ async fn exact_object_withdrawal_survives_compaction_and_cohort_repair() {
         .unwrap()
         .successor(group.identity())
         .unwrap();
+    let successor = trace.observe(successor);
     group
         .choose(
             &voters,
@@ -1089,4 +1102,5 @@ async fn exact_object_withdrawal_survives_compaction_and_cohort_repair() {
             assert!(matches!(reply, wire::Reply::Refused(Refusal::Capacity)));
         }
     }
+    trace.finish();
 }
