@@ -313,3 +313,45 @@ the module named in each Verus area's README.
 | `verification/verus/voter_transport/laws.rs` | `scope_requires_both_groups` | `VoterTransport.transportGroupMatches`, `scope_requires_both_groups` | Predicate link via `link_transportGroupMatches` |
 | `verification/verus/voter_transport/laws.rs` | `transport_ballot_round_trips` | `VoterTransport.ballotBytes`, `ballotValid`, `voteSlotsMatch` | Open — fixed-width word encoding and nested physical slot structures |
 | `verification/verus/voter_transport/laws.rs` | `vote_reads_the_two_physical_slots_in_order` | `VoterTransport.ballotBytes`, `ballotValid`, `voteSlotsMatch` | Open — fixed-width word encoding and nested physical slot structures |
+| `verification/verus/runtime_groups/laws.rs` | `conflicting_definition_is_refused` | — | Verus checks the executable law. |
+| `verification/verus/runtime_groups/laws.rs` | `identical_definition_is_idempotent` | — | Verus checks the executable law. |
+| `verification/verus/runtime_groups/laws.rs` | `unpersisted_group_is_never_served` | — | Verus checks the executable law. |
+
+### Stream journal
+
+| Rust source | Declaration | Lean counterpart | Coverage |
+|---|---|---|---|
+| `src/stream/keeper/rules.rs` | `live` | `Logkeeper.StreamJournal.Keeper.live` | Equivalence |
+| `src/stream/keeper/rules.rs` | `may_seal` | `Logkeeper.StreamJournal.SealAllowed` | Equivalence |
+| `src/stream/keeper/rules.rs` | `preserves_head` | `Logkeeper.StreamJournal.SameCommitted` | Equivalence |
+| `src/stream/keeper/rules.rs` | `may_append` | `Logkeeper.StreamJournal.MayAppend` | Equivalence |
+| `src/stream/keeper/rules.rs` | `may_trim` | `Logkeeper.StreamJournal.MayTrim` | Equivalence |
+| `src/stream/keeper/rules.rs` | `checked_tail` | `Logkeeper.StreamJournal.check` | Equivalence |
+| `src/stream/keeper/rules.rs` | `read_head` | `Logkeeper.StreamJournal.readPage` | Equivalence |
+| `src/stream/keeper/rules.rs` | `tombstone` | `Logkeeper.StreamJournal.deleteKeeper` | Equivalence |
+| `src/stream/keeper/rules.rs` | `sync_head_valid` | — | The Lean Sync step retains head and does not transfer a floor. |
+| `src/stream/keeper/rules.rs` | `append_retry` | `Logkeeper.StreamJournal.appendAt` | Equivalence |
+| `src/stream/keeper/rules.rs` | `may_read` | `Logkeeper.StreamJournal.readPage` | Equivalence |
+| `src/stream/keeper/rules.rs` | `may_replace` | — | Study 119 models keeper replacement in TLA+, with a fixed ensemble in Lean. |
+| `src/stream/writer/decision.rs` | `covers` | `Logkeeper.StreamJournal.Covers` | Equivalence |
+| `src/stream/writer/decision.rs` | `acknowledged` | `Logkeeper.StreamJournal.QuorumAccepted` | Equivalence |
+| `src/stream/writer/decision.rs` | `outranks` | `Logkeeper.StreamJournal.RecoveryLE` | Equivalence |
+| `verification/verus/stream_keeper/laws.rs` | `create_cannot_reuse_a_stream_id` | See `live` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `seal_requires_a_higher_epoch_or_same_identity` | See `may_seal` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `sync_cannot_replace_headted_records` | See `preserves_head` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `sync_head_is_monotone_and_bounded` | See `sync_head_valid` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `append_requires_both_current_promise_and_sync` | See `may_append` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `append_retry_must_match_the_whole_existing_range` | See `append_retry` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `trim_cannot_cross_the_head` | See `may_trim` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `check_reports_the_existing_tail` | See `checked_tail` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `read_cannot_expose_the_accepted_tail` | See `read_head` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `read_cannot_cross_the_floor` | See `may_read` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `delete_is_terminal` | See `tombstone` | Verus checks the executable law. |
+| `verification/verus/stream_keeper/laws.rs` | `replace_requires_a_synced_current_ensemble_with_one_new_member` | See `may_replace` | Verus checks the executable law. |
+| `verification/verus/stream_writer/laws.rs` | `one_keeper_cannot_head` | See `acknowledged` | Verus checks the executable law. |
+| `verification/verus/stream_writer/laws.rs` | `an_ack_in_another_epoch_cannot_head` | See `covers` | Verus checks the executable law. |
+| `verification/verus/stream_writer/laws.rs` | `an_ack_for_a_shorter_prefix_cannot_head` | See `covers` | Verus checks the executable law. |
+| `verification/verus/stream_writer/laws.rs` | `either_pair_of_survivors_can_head` | See `acknowledged` | Verus checks the executable law. |
+| `verification/verus/stream_writer/laws.rs` | `latest_synced_wins_even_if_shorter` | See `outranks` | Verus checks the executable law. |
+| `verification/verus/stream_writer/laws.rs` | `longer_history_wins_at_equal_synced` | See `outranks` | Verus checks the executable law. |
+| `verification/verus/stream_writer/laws.rs` | `synced_zero_outranks_no_synced_epoch` | See `outranks` | Verus checks the executable law. |

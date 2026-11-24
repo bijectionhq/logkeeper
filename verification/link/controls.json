@@ -22,5 +22,61 @@
     "replace": "0 < position ∧ position ≤ lastPosition ∧ time ≤ lastTime ∧ keyIncreases = false",
     "area": "compact_image",
     "theorem": "link_fenceRowValid"
+  },
+  {
+    "name": "verus-stream-clears-tombstone",
+    "area": "stream_keeper",
+    "theorem": "link_tombstone",
+    "file": "src/stream/keeper/rules.rs",
+    "find": "ensures out == (deleted || deleting)",
+    "replace": "ensures out == deleting"
+  },
+  {
+    "name": "lean-stream-clears-tombstone",
+    "area": "stream_keeper",
+    "theorem": "link_tombstone",
+    "file": "verification/lean/Logkeeper/StreamJournal.lean",
+    "find": "if deleting then { k with deleted := true } else k",
+    "replace": "if deleting then { k with deleted := true } else { k with deleted := false }"
+  },
+  {
+    "name": "verus-stream-seals-at-equal-epoch",
+    "area": "stream_keeper",
+    "theorem": "link_may_seal",
+    "file": "src/stream/keeper/rules.rs",
+    "find": "ensures out == (!has_promise || current < epoch || (current == epoch && same_identity))",
+    "replace": "ensures out == (!has_promise || current <= epoch)"
+  },
+  {
+    "name": "verus-stream-covers-short-prefix",
+    "area": "stream_writer",
+    "theorem": "link_covers",
+    "file": "src/stream/writer/decision.rs",
+    "find": "Some((accepted_epoch, tail)) => accepted_epoch == epoch && tail >= at,\n        None => false,\n    }\n))",
+    "replace": "Some((accepted_epoch, _)) => accepted_epoch == epoch,\n        None => false,\n    }\n))"
+  },
+  {
+    "name": "lean-stream-covers-only-exact-vote",
+    "area": "stream_writer",
+    "theorem": "link_covers",
+    "file": "verification/lean/Logkeeper/StreamJournal.lean",
+    "find": "vote.ballot = epoch ∧ history <+: vote.history",
+    "replace": "vote.ballot = epoch ∧ history = vote.history"
+  },
+  {
+    "name": "verus-stream-ranks-by-length",
+    "area": "stream_writer",
+    "theorem": "link_outranks",
+    "file": "src/stream/writer/decision.rs",
+    "find": "(Some(a), Some(b)) => b > a || (b == a && right_tail > left_tail),\n        (None, Some(_)) => true,\n        (None, None) => right_tail > left_tail,\n        (Some(_), None) => false,\n    }\n))",
+    "replace": "(Some(a), Some(b)) => right_tail > left_tail || (right_tail == left_tail && b > a),\n        (None, Some(_)) => true,\n        (None, None) => right_tail > left_tail,\n        (Some(_), None) => false,\n    }\n))"
+  },
+  {
+    "name": "verus-stream-one-acknowledgement",
+    "area": "stream_writer",
+    "theorem": "link_acknowledged",
+    "file": "src/stream/writer/decision.rs",
+    "find": "ensures out == (\n        ((a matches Some((ae, an)) && ae == epoch && an >= at)\n            && (b matches Some((be, bn)) && be == epoch && bn >= at))\n        || ((a matches Some((ae, an)) && ae == epoch && an >= at)\n            && (c matches Some((ce, cn)) && ce == epoch && cn >= at))\n        || ((b matches Some((be, bn)) && be == epoch && bn >= at)\n            && (c matches Some((ce, cn)) && ce == epoch && cn >= at))\n    )",
+    "replace": "ensures out == (a matches Some((ae, an)) && ae == epoch && an >= at)"
   }
 ]

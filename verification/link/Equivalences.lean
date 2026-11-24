@@ -880,4 +880,137 @@ theorem link_read_lease_end {E H : Type} [Nonempty E] [Nonempty H] [DecidableEq 
 
 end ordered_lease_reducer
 
+namespace stream_keeper
+
+open StreamJournal
+
+theorem link_live {P : Type} (k : Keeper P) (created : k.created = true) :
+    live k.deleted ↔ k.live := by
+  simp [live, Keeper.live, created]
+
+-- Model epoch zero is the initial sentinel. Real epochs, including wire epoch
+-- zero, are shifted by one in the model.
+theorem link_may_seal {P : Type} (k : Keeper P) (promise : Option Nat)
+    (epoch holder : Nat) (projected : k.promised = (promise.map (· + 1)).getD 0) :
+    may_seal promise.isSome (promise.getD 0) epoch (decide (k.identity = holder)) ↔
+      SealAllowed k (epoch + 1) holder := by
+  cases promise <;> simp [may_seal, SealAllowed, projected]
+
+theorem link_preserves_head {P : Type} [DecidableEq P] (k : Keeper P) (next : History P) (start : Nat)
+    (enough : k.head ≤ next.length) (unchanged : next.take (start - 1) = k.history.take (start - 1)) :
+    preserves_head start k.head (decide
+      (next.take k.head = k.history.take k.head)) ↔ SameCommitted k next := by
+  simp only [preserves_head, decide_eq_true_eq, SameCommitted, enough, true_and]
+  constructor
+  · rintro (beyond | same)
+    · have h : k.head ≤ start - 1 := by omega
+      have cut := congrArg (List.take k.head) unchanged
+      simpa [List.take_take, Nat.min_eq_left h] using cut
+    · exact same
+  · exact Or.inr
+
+theorem link_may_append {P : Type} (k : Keeper P) (epoch : Nat) :
+    may_append (decide (k.promised = epoch)) (decide (k.synced = epoch)) ↔ MayAppend k epoch := by
+  simp [may_append, MayAppend, Synced]
+
+theorem link_may_trim {P : Type} (k : Keeper P) (epoch through : Nat) (synced : Synced k epoch) :
+    may_trim through k.head ↔ MayTrim k epoch through := by
+  simp [may_trim, MayTrim, synced]
+
+theorem link_checked_tail {P : Type} (k : Keeper P) (requested : Nat) :
+    checked_tail k.tail requested = (check k).tail := rfl
+
+theorem link_read_head {P : Type} (k : Keeper P) (start max : Nat) (page : Page P)
+    (returned : readPage k start max = some page) :
+    read_head k.head k.tail = page.head := by
+  unfold readPage at returned
+  split at returned
+  · contradiction
+  · cases returned
+    rfl
+
+theorem link_tombstone {P : Type} (k : Keeper P) (deleting : Bool) :
+    tombstone k.deleted deleting ↔ (deleteKeeper k deleting).deleted = true := by
+  cases deleting <;> simp [tombstone, deleteKeeper]
+
+theorem link_append_retry {P : Type} [DecidableEq P] (history : History P)
+    (floor holder epoch lsn : Nat) (payload : P) (retained : floor ≤ lsn) (old : lsn ≤ history.length) :
+    append_retry true lsn history.length (decide (history[lsn - 1]? = some ⟨epoch, payload⟩)) ↔
+      appendAt history floor holder epoch holder epoch lsn payload = .retry := by
+  have notNext : lsn ≠ history.length + 1 := by omega
+  simp [append_retry, appendAt, retained, Nat.not_lt_of_ge retained, old, notNext]
+
+theorem link_may_read {P : Type} (k : Keeper P) (start max : Nat) :
+    may_read k.floor start ↔ (readPage k start max).isSome = true := by
+  simp only [may_read, readPage]
+  split <;> simp_all <;> omega
+
+end stream_keeper
+
+namespace stream_writer
+
+open StreamJournal PrefixAgreement JournalRefinement
+
+theorem link_covers {P : Type} (vote : Option (PrefixAgreement.Vote (Record P))) (epoch : Nat) (history : History P)
+    (issued : ∀ v ∈ vote, history <+: v.history ∨ v.history <+: history) :
+    covers (vote.map (fun v => (v.ballot, v.history.length))) epoch history.length ↔
+      ∃ v ∈ vote, Covers v epoch history := by
+  cases vote with
+  | none => simp [covers]
+  | some v =>
+    change (v.ballot = epoch ∧ history.length ≤ v.history.length) ↔
+      ∃ other ∈ some v, (other.ballot = epoch ∧ history <+: other.history)
+    simp only [Option.mem_def, Option.some.injEq]
+    constructor
+    · rintro ⟨sameEpoch, bound⟩
+      refine ⟨v, rfl, sameEpoch, ?_⟩
+      rcases issued v (by simp) with forward | reverse
+      · exact forward
+      · exact (reverse.eq_of_length_le bound) ▸ List.prefix_rfl
+    · rintro ⟨other, rfl, sameEpoch, contained⟩
+      exact ⟨sameEpoch, contained.length_le⟩
+
+private def slotCovers (ack : Option (Nat × Nat)) (epoch atLsn : Nat) : Prop :=
+  ∃ last, ack = some (epoch, last) ∧ atLsn ≤ last
+
+theorem link_acknowledged {P : Type} (keepers : KeeperId → Keeper P)
+    (acks : KeeperId → Option (Nat × Nat)) (epoch : Nat) (history : History P)
+    (observed : ∀ k, slotCovers (acks k) epoch history.length ↔
+      ∃ held, (keepers k).durable.votes ⟨epoch, held⟩ ∧ history <+: held) :
+    acknowledged (acks 0) (acks 1) (acks 2) epoch history.length ↔
+      QuorumAccepted keepers epoch history := by
+  classical
+  let votes : KeeperId → Bool := fun k => decide (slotCovers (acks k) epoch history.length)
+  have eligible k : votes k = true ↔ slotCovers (acks k) epoch history.length := by simp [votes]
+  have count : Majority ensemble votes ↔
+      (votes 0 = true ∧ votes 1 = true) ∨ (votes 0 = true ∧ votes 2 = true) ∨
+        (votes 1 = true ∧ votes 2 = true) := by
+    unfold Majority ensemble
+    cases h0 : votes 0 <;> cases h1 : votes 1 <;> cases h2 : votes 2 <;>
+      simp [List.countP_cons, h0, h1, h2]
+  have slots : acknowledged (acks 0) (acks 1) (acks 2) epoch history.length ↔ Majority ensemble votes := by
+    simp only [count, eligible]
+    rcases acks 0 with _ | ⟨_, _⟩ <;>
+      rcases acks 1 with _ | ⟨_, _⟩ <;>
+      rcases acks 2 with _ | ⟨_, _⟩ <;>
+      simp [acknowledged, slotCovers, or_assoc, and_assoc]
+  rw [slots]
+  constructor
+  · exact fun majority => ⟨votes, majority, fun k _ ack => (observed k).mp ((eligible k).mp ack)⟩
+  · rintro ⟨other, majority, holds⟩
+    have includes : ∀ k ∈ ensemble, other k = true → votes k = true :=
+      fun k present yes => (eligible k).mpr ((observed k).mpr (holds k present yes))
+    have bound : ensemble.countP other ≤ ensemble.countP votes := List.countP_mono_left includes
+    unfold Majority at *
+    omega
+
+private def rankVote {P : Type} (synced : Option Nat) (history : History P) : PrefixAgreement.Vote (Record P) :=
+  ⟨(synced.map (· + 1)).getD 0, history⟩
+
+theorem link_outranks {P : Type} (left right : Option Nat) (old new : History P) :
+    outranks left old.length right new.length ↔ ¬ RecoveryLE (rankVote right new) (rankVote left old) := by
+  cases left <;> cases right <;> simp [outranks, RecoveryLE, recoveryEpoch, rankVote] <;> omega
+
+end stream_writer
+
 end Logkeeper.Generated

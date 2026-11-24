@@ -68,6 +68,9 @@ def sealKeeper (k : Keeper Payload) (epoch identity : Nat) : Keeper Payload :=
 def accept (k : Keeper Payload) (epoch : Nat) (history : History Payload) : Keeper Payload :=
   { k with durable := DurableAcceptor.acceptVote k.durable ⟨epoch, history⟩, staging := none }
 
+def deleteKeeper (k : Keeper Payload) (deleting : Bool) : Keeper Payload :=
+  if deleting then { k with deleted := true } else k
+
 structure Round (Payload : Type) where
   identity : Nat
   first : KeeperId
@@ -134,7 +137,7 @@ inductive Step (w : Writer Payload) : Keeper Payload → Keeper Payload → Prop
       Step w k { k with floor := max k.floor (through + 1) }
   | check {k} : k.live → Step w k k
   | read {k} : k.live → Step w k k
-  | delete {k} : k.created = true → Step w k { k with deleted := true }
+  | delete {k} : k.created = true → Step w k (deleteKeeper k true)
 
 inductive Reachable (w : Writer Payload) : Keeper Payload → Prop
   | initial : Reachable w initial
@@ -245,6 +248,9 @@ theorem seal_winner_dominates (r : Round Payload) (k : KeeperId) (signed : r.sea
     rcases signed with rfl | rfl
     · exact rank_refl _
     · exact comparable (fun le => ranked ((recovery_rank_is_synced_then_tail _ _).mpr le))
+
+def Covers (vote : Vote (Record Payload)) (epoch : Nat) (history : History Payload) : Prop :=
+  vote.ballot = epoch ∧ history <+: vote.history
 
 def QuorumAccepted (keepers : KeeperId → Keeper Payload) (epoch : Nat)
     (history : History Payload) : Prop :=

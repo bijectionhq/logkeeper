@@ -366,6 +366,37 @@ def declarations(source):
     return tokens, result
 
 
+def postcondition(tokens, offset, path):
+    """Extract the result expression of an executable's Verus contract."""
+    signature = Parser(tokens[offset:], path)
+    signature.need("fn")
+    name = signature.identifier()
+    signature.need("(")
+    inputs = dict(signature.separated(signature.binder, ")"))
+    signature.need("->")
+    output = signature.type()
+
+    start = offset - 1
+    while start >= 0 and tokens[start].word != "#":
+        start -= 1
+    contract = Parser(tokens[max(start, 0):offset], path)
+    for word in ("#", "[", "cfg_attr", "(", "verus_keep_ghost", ",", "verus_spec", "("):
+        contract.need(word)
+    result = contract.identifier()
+    for word in ("=>", "ensures", result, "=="):
+        contract.need(word)
+    body = contract.expr()
+    contract.accept(",")
+    for word in (")", ")", "]", "pub"):
+        contract.need(word)
+    if contract.accept("("):
+        contract.identifier()
+        contract.need(")")
+    if contract.peek() != "<eof>" or signature.peek() != "{":
+        contract.fail("expected one unconditional result postcondition")
+    return Definition(name, (), inputs, (), output, body, None, tokens[start].line)
+
+
 def parenthesize(value):
     return f"({value})"
 

@@ -176,5 +176,28 @@
       "transportGroupMatches": "Logkeeper.VoterTransport.transportGroupMatches",
       "responseKind": "Logkeeper.VoterTransport.responseKind"
     }
+  },
+  "stream_keeper": {
+    "src/stream/keeper/rules.rs": {
+      "live": "Logkeeper.StreamJournal.Keeper.live",
+      "may_seal": "Logkeeper.StreamJournal.SealAllowed",
+      "preserves_head": "Logkeeper.StreamJournal.SameCommitted",
+      "may_append": "Logkeeper.StreamJournal.MayAppend",
+      "may_trim": "Logkeeper.StreamJournal.MayTrim",
+      "checked_tail": "Logkeeper.StreamJournal.check",
+      "read_head": "Logkeeper.StreamJournal.readPage",
+      "tombstone": "Logkeeper.StreamJournal.deleteKeeper",
+      "sync_head_valid": null,
+      "append_retry": "Logkeeper.StreamJournal.appendAt",
+      "may_read": "Logkeeper.StreamJournal.readPage",
+      "may_replace": null
+    }
+  },
+  "stream_writer": {
+    "src/stream/writer/decision.rs": {
+      "covers": "Logkeeper.StreamJournal.Covers",
+      "acknowledged": "Logkeeper.StreamJournal.QuorumAccepted",
+      "outranks": "Logkeeper.StreamJournal.RecoveryLE"
+    }
   }
 }

@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 from mappings import ENUMS, SHAPES
-from translate import Emitter, Parser, Unsupported, declarations
+from translate import Emitter, Parser, Unsupported, declarations, postcondition
 
 
 LINK = Path(__file__).resolve().parent
@@ -53,13 +53,15 @@ def generate(replacements=None):
         for path, names in files.items():
             tokens, found = declarations(source(path, replacements))
             for name in names:
-                if name not in found or not found[name][0]:
-                    raise Unsupported(f"{path}: missing spec fn {name}")
+                if name not in found:
+                    raise Unsupported(f"{path}: missing definition {name}")
                 if name in functions:
                     raise Unsupported(f"{area}: ambiguous spec name {name}")
-                _, offset, line = found[name]
+                is_spec, offset, line = found[name]
                 try:
-                    functions[name] = path, Parser(tokens[offset:], path).definition()
+                    spec = (Parser(tokens[offset:], path).definition() if is_spec
+                            else postcondition(tokens, offset, path))
+                    functions[name] = path, spec
                 except Unsupported as error:
                     raise Unsupported(f"{path}:{line}: {name}: {error}") from error
         emitter = Emitter({name: spec for name, (_, spec) in functions.items()}, SHAPES, ENUMS)
@@ -175,7 +177,8 @@ def reject_at(lake, package, area, theorem, equivalences):
     if (result.returncode == 0 or not errors or result.stderr or
             not all(Path(m["fileName"]).name == "Equivalences.lean" and
                     start <= m["pos"]["line"] < stop and
-                    m["data"].startswith(("unsolved goals", "Tactic `", "Type mismatch"))
+                    m["data"].startswith(("unsolved goals", "Tactic `", "Type mismatch",
+                                               "'change' tactic failed", "omega could not prove the goal"))
                     for m in errors)):
         raise ValueError(f"expected rejection only at {area}.{theorem}\n{result.stdout}{result.stderr}")
 
