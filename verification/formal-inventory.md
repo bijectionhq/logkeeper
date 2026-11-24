@@ -22,29 +22,29 @@ It builds on the [readiness matrix](readiness.md), the [mechanism independence](
 | Shared and composed reference | Lean 4.35 | `verification/lean/Logkeeper`: 25+ modules, every runner passes, standard axioms only | `verification/multi`: 27 jobs, including `AcknowledgedRecovery`, `InstalledJournalProgress`, `InstalledRead`, `NativeAppend`, `ExactReclamation`, `InstalledErasureCommit` |
 | Production refinement | Verus `0.2026.11.20.9da409b`, Z3 4.16 | 20+ areas, about 470 verified items, about 160 controls | 81 areas, including replay closure, replica admission, maintenance, directory bypass, retention, adapter, native acknowledgement, read selection, append projection, erasure commit, exact reclamation |
 | Liveness | TLC 2.19 | Studies 111–113 | `InstalledJournalProgress.tla`: 9 temporal properties, 31 stall controls |
-| Conformance | Recorded traces, native tests | `run_prefix_traces.py`: 658 events in 5 traces; 96 tests | Installed-journal and erasure tests (RTDB `main` has 28 upstream failing tests, all also failing without our changes) |
-| Verus–Lean link | `run_ordered_correspondence.py` | 52 concrete agreeing cases | README correspondence only |
+| Conformance | Recorded traces, native tests | `run_prefix_traces.py`: five fixed traces and 24 seeded fault schedules, with four trace controls | Installed-journal and erasure tests (RTDB `main` has 28 upstream failing tests, all also failing without our changes) |
+| Verus–Lean link | `verification/link/run.py`, `run_ordered_correspondence.py` | Kernel-checked equivalences for selected live Verus definitions, three link controls and 52 concrete correspondence cases | README correspondence only |
 
 ## Logkeeper
 
 | ID | Property | Status | Evidence | What remains |
 | --- | --- | --- | --- | --- |
-| L1 | Writer and history safety | Shipped-partial | `ordered_writer`, `ordered_admission` | Whole `State::apply` refinement (G1) |
-| L2 | Exact receipts | Shipped-partial | `ordered_receipt`, PM receipt scope | G1 |
-| L3 | Codec canonicality | Shipped-partial | `ordered_codec`, `object_name_codec`, `voter_slot_header`, `voter_transport`; PL3c rejects the three accepted aliases; admissible domains named in Lean and Verus | Whole-message typed left inverses; `Bytes` cursor composition; production `encode(decode(b)) = b` |
-| L4 | Decoded image satisfies the reducer invariant | Shipped-partial (was **false**, fixed by PL3c) | `compact_image`: unique receipt positions, receipt partition, expiry index | Parser-loop invariants, hold/withdrawal joins, roster and record accounting, global reference coverage |
-| L5 | Trim safety and credit | Shipped-verified | `ordered_trim` | — |
-| L6 | Budgets | Shipped-verified | `ordered_budgets`; M08 independence | Reachable funded counterexample for the retained guard alone |
-| L7 | Object withdrawal fence | Shipped-verified | `object_withdrawal`, `ObjectWithdrawal` | Physical drain is RTDB R7 |
-| L8 | Serving lease and disposal | Shipped-verified | `ordered_serving_lease`, `ordered_lease_reducer` (PL8b: `LeaseRead`, induction over every lease and hold step) | Bridge from `apply` dispatch (G1); clock-drift premise |
-| L9 | Rotation guard | Shipped-verified | `ordered_rotation`, `ordered_checkpoint` | Payload cleanliness, physical key revocation |
-| L10 | Mirrored voter media | Shipped-partial | `mirrored_voter_media` under a single-tear sync premise | Filesystem crash model (G3) |
-| L11 | Prefix agreement | Shipped-partial | `prefix_agreement` decisions; bounded trace validation | Asynchronous refinement for every execution (G2) |
-| L12 | Signatures | Shipped-verified under premise | `receipt_signatures` | Ed25519/SHA-256 premise; same-manifest premise |
-| L13 | Rotation slot evidence | Shipped-verified | `rotation_slot_evidence` | Peer authentication premise |
-| L14 | **Whole-reducer refinement** (new) | Open | — | G1 |
-| L15 | **Verus–Lean mechanical link** (new) | Open | 52 concrete cases | G4 |
-| L16 | **Decoded image is an authentic chosen history** (new) | Open | — | Projection from a compact image back to a chosen trace |
+| L1 | Writer and history safety | Shipped-partial | `ordered_writer`, `ordered_admission`, and G1's append-commit and vacancy projections in `ordered_reducer` | Connect the concrete authority and append guards, computed cut and charge, and returned receipt through `State::apply` |
+| L2 | Exact receipts | Shipped-partial | `ordered_receipt`, PM receipt scope, and G1's request admission and paired receipt/expiry updates in `ordered_reducer` | Connect position, time, placement, nonce, hash, expiry traversal, dispatch and the exact constructed receipt |
+| L3 | Codec canonicality | Shipped-partial | `ordered_codec`, `object_name_codec`, `voter_slot_header`, `voter_transport`. PL3c rejects the three compact-image aliases under the existing tag. Lean and Verus name the admissible domains. | Whole-message typed left inverses, `Bytes` cursor composition and production `encode(decode(b)) = b` |
+| L4 | Decoded image satisfies the reducer invariant | Shipped-partial (prior defect fixed by PL3c) | `compact_image` checks unique receipt positions, receipt partition and expiry index. Lean `ReducerInv` states the target semantic invariant. | Establish the complete decode projection, including parser loops, hold/withdrawal joins, roster and record accounting, and global reference coverage |
+| L5 | Trim safety and credit | Shipped-verified | `ordered_trim` checks the live-hold scan, checkpoint bound, removed prefix and credits per class | Establish the adapter's exact cut and accounting inputs from the full reducer state |
+| L6 | Budgets | Shipped-verified | `ordered_budgets`, G1's paid append and funding projections, and M08 independence | Full-state funding establishment and a reachable funded counterexample for the retained guard alone |
+| L7 | Object withdrawal fence | Shipped-verified | `object_withdrawal` checks root and record traversal and the admission and fence decisions. G1 checks paid fresh-fence insertion. Lean `ObjectWithdrawal` covers traces under an exact `Carries` premise. | Concrete reference projection, per-row membership and opaque name completeness, byte-level compaction and repair, and RTDB R7 physical drain |
+| L8 | Serving lease and disposal | Shipped-verified | `ordered_serving_lease`, `ordered_lease_reducer` (`LeaseRead` and induction over modeled lease and hold steps). A successful expiry disposal attests to the absence of custody for that identity. | Actual `State::apply` dispatch and owner-map projection, with the clock-drift premise |
+| L9 | Rotation guard | Shipped-verified | `ordered_rotation` and `ordered_checkpoint` check the exact incumbent, head and preparation, successor generation and old-history floor | Whole-arm sequencing and old-root updates, payload cleanliness and physical key revocation |
+| L10 | Mirrored voter media | Shipped-partial | `mirrored_voter_media` checks validation, selection and mirror sequencing under a single-tear sync premise | G3 filesystem crash refinement and the protocol's rank-monotonicity premise |
+| L11 | Prefix agreement | Shipped-partial | `prefix_agreement` local decisions. G2 proves the arbitrary-trace `AsyncGroup` model refines the prefix ledger and durable acceptor, with conditional exact-image repair and seeded native conformance. | Native simulation through dispatch, receive and cancellation, issue and replay, sync and reopen, and repair authority |
+| L12 | Signatures | Shipped-verified under premise | `receipt_signatures` checks exact invocation and receipt scope, transitive verification-key retention and immediate predecessor repair authority | Ed25519/SHA-256 and same-destination-manifest premises |
+| L13 | Rotation slot evidence | Shipped-verified | `rotation_slot_evidence` and the shared prefix-vote recorder check a strict majority of distinct configured voters and both exact slot attestations | Peer authentication and physical readback qualification |
+| L14 | **Whole-reducer refinement** | Shipped-partial | G1's Lean `Reducer` models all 25 command variants and proves invariant preservation and reference projections. Verus covers local projections for `Append`, `Vacate`, `FundWindow`, `LeaseRead`, `WithdrawObject` and request bookkeeping. | Zero complete `State::apply` simulations. Prove the whole-state abstraction, envelope, all dispatch and receipt projections, and invariant establishment from fresh and decoded images. |
+| L15 | **Verus–Lean mechanical link** | Shipped-partial | G4 regenerates selected predicates from live Verus sources and checks their named Lean equivalences and standard axioms. The [correspondence inventory](link/inventory.md) lists each binding. | Remaining codecs, signature and sync/media predicates, and full transition projections. The translator and representation maps are trusted. |
+| L16 | **Decoded image is an authentic chosen history** | Open | The compact-image laws check projected invariants. G2 traces reconstruct observed compacted history from recorded frames and the history commitment. | Universal projection from an accepted native image to an authenticated chosen trace, including the archived prefix and reducer invariant |
 
 ## RTDB Multi
 
@@ -84,5 +84,5 @@ Cryptographic hash and signature security; filesystem and directory sync semanti
 | --- | --- | --- |
 | F0–F3 | Toolchain, decision proofs, protocol traces, X1 | Landed |
 | F4 | L3/L4 fixes, `LeaseRead`, R5, R7, X1 read bindings, wave 3 triage | Landed 2026-11-24 |
-| G | L14 reducer, L11 async group, L10 crash model, L15 link | Running |
+| G | L14 reducer, L11 async group, L10 crash model, L15 link | G1, G2 and G4 integrated. G3 pending. |
 | H | L16, R7 defect, R8, R11, R14, X1 remaining hypotheses, X4 runtime premises, codec whole messages | Proposed |
