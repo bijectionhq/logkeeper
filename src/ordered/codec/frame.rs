@@ -4,7 +4,7 @@ use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 verus! {
 
-pub(crate) open spec fn commandVersion() -> u8 { 8 }
+pub(crate) open spec fn commandVersion() -> u8 { 9 }
 
 pub(crate) open spec fn decisionHeader(time: Seq<u8>) -> Seq<u8> {
     seq![commandVersion()] + time

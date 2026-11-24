@@ -1,6 +1,6 @@
 # Compact image row admission
 
-This area imports [the shipped guards](../../../src/ordered/codec/snapshot_checks.rs) called by the [LKBASE07 decoder](../../../src/ordered/codec/snapshot.rs).
+This area imports [the shipped guards](../../../src/ordered/codec/snapshot_checks.rs) called by the [LKBASE08 decoder](../../../src/ordered/codec/snapshot.rs).
 
 | Lean definition in [Logkeeper.CompactImage](../../lean/Logkeeper/CompactImage.lean) | Verus obligation and projection |
 | --- | --- |
@@ -15,7 +15,7 @@ The Lean law `every_checked_hold_has_a_matching_receipt` composes the row checks
 The Lean law `strictly_increasing_keys_are_unique` gives uniqueness when a list is strictly ascending.
 The Rust collection traversals, membership and comparisons on composite keys, and the coverage and aggregate budget of object references still require production refinement.
 The [ordered codec area](../ordered_codec/README.md) verifies the count and byte extent of the object names in each reference list.
-The Lean vacancy model carries its generation independently of the holder. Native acceptance exercises rotation, vacancy, `LKBASE07` recovery and a replacement grant with that generation.
+The Lean vacancy model carries its generation independently of the holder. Native acceptance exercises rotation, vacancy, `LKBASE08` recovery and a replacement grant with that generation.
 
 Two reachable snapshot fixtures exhibit accepted encodings that differ from the encoder output.
 A snapshot without object controls also decodes with two appended zero counts.

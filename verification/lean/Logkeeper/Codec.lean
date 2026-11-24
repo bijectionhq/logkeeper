@@ -4,7 +4,7 @@ namespace Logkeeper.Codec
 
 abbrev Bytes := List UInt8
 
-def commandVersion : UInt8 := 8
+def commandVersion : UInt8 := 9
 
 def decisionHeader (time : Bytes) : Bytes := commandVersion :: time
 

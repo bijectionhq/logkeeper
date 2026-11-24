@@ -1,13 +1,13 @@
 # Ordered codec framing
 
 This area imports the shipped [frame checks](../../../src/ordered/codec/frame.rs).
-The command decoder and the decision-header reader use the same v8 version check.
+The command decoder and the decision-header reader use the same v9 version check.
 The decision encoder writes the version followed by the eight big-endian journal-time bytes.
 The decision decoder recovers those bytes and leaves command decoding to `Request::decode`.
 
 | Lean definition in [Logkeeper.Codec](../../lean/Logkeeper/Codec.lean) | Verus obligation |
 | --- | --- |
-| `commandVersion` | `has_command_version` accepts exactly byte 8. |
+| `commandVersion` | `has_command_version` accepts exactly byte 9. |
 | `decisionHeader`, `decisionHeaderMatches` | `decision_header` writes the specified nine bytes and `read_decision_time` succeeds exactly on that prefix of an arbitrary slice. |
 | `flagByte`, `readFlag` | `encode_flag` and `decode_flag` round-trip the two Boolean values and reject every other spelling. |
 | `bodyLengthBounded`, `boundedBodyLength` | `bounded_body_length` accepts the inclusive bounds and returns the original declared length. |
