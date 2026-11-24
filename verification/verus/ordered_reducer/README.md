@@ -53,3 +53,6 @@ open. They must connect selected commands, passed arguments, hashing,
 position and time, expiry traversal, all changed and framed fields, and the
 receipt to a single `Reducer.spec_step`. Caller wiring and establishment of
 `ReducerInv` from initialization and recovered images remain open.
+
+The [mechanical link inventory](../../link/inventory.md) records the
+remaining equivalence obligations for these local laws.

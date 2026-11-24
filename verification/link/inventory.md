@@ -202,6 +202,12 @@ the module named in each Verus area's README.
 | `verification/verus/ordered_replay/laws.rs` | `replay_head_and_page_charge_the_exact_successor` | — | Local — ordered replay harness does not name a Lean counterpart |
 | `verification/verus/ordered_replay/laws.rs` | `resume_requires_exact_cut_in_original_interval` | — | Local — ordered replay harness does not name a Lean counterpart |
 | `verification/verus/ordered_replay/laws.rs` | `selected_replay_indices_cover_exact_interval` | — | Local — ordered replay harness does not name a Lean counterpart |
+| `verification/verus/ordered_reducer/laws.rs` | `a_funded_window_replaces_the_allocation_and_resets_spend` | `Reducer.fundWindow`, `effect` | Open — native window projection and reducer dispatch |
+| `verification/verus/ordered_reducer/laws.rs` | `a_funded_withdrawal_adds_exactly_its_fresh_fence` | `Reducer.commitWithdrawal`, `ObjectWithdrawal.Step.withdraw` | Open — native fence map and reference scan projection |
+| `verification/verus/ordered_reducer/laws.rs` | `a_paid_append_advances_history_and_charges_one_lane` | `Reducer.commitAppend`, `appendEffect` | Open — concrete record, archive, cut and budget projection |
+| `verification/verus/ordered_reducer/laws.rs` | `a_refused_read_does_not_change_the_retry_book_or_expiry` | `Reducer.recordReceipt`, `Protocol.Ordered.record_after_apply` | Open — paired receipt and expiry map projection |
+| `verification/verus/ordered_reducer/laws.rs` | `a_retained_read_conflicts_and_a_mutation_replays_its_original` | `Reducer.cachedReceipt`, `RequestStep.cached` | Open — retained outcome and request projection |
+| `verification/verus/ordered_reducer/laws.rs` | `a_successful_vacancy_keeps_its_epoch_and_generation` | `Reducer.canVacate`, `vacate`, `ErasureCommit.Step.vacate` | Open — complete authority and command projection |
 | `verification/verus/ordered_rotation/laws.rs` | `admits_history` | `ErasureCommit.admits_history` | Equivalence |
 | `verification/verus/ordered_rotation/laws.rs` | `erasure_floor` | `ErasureCommit.erasure_floor` | Equivalence |
 | `verification/verus/ordered_rotation/laws.rs` | `exact_preparation` | `ErasureCommit.exact_preparation` | Equivalence |
