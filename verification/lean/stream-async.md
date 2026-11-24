@@ -101,11 +101,11 @@ and refusals and observations must not change it.
 
 | Corpus | Effects |
 | --- | ---: |
-| 10,000 seeds | 984,747 |
-| Stutters (refusals, observations, retries, reopens, Replace) | 599,269 |
+| 10,000 seeds | 981,233 |
+| Stutters (refusals, observations, retries, reopens, Replace) | 595,649 |
 | Create · Seal · Delete | 30,909 · 62,727 · 30,000 |
-| Staged Sync · complete Sync · floor installation | 4,769 · 62,727 · 52 |
-| Append · publication · Trim | 81,595 · 82,751 · 29,948 |
+| Staged Sync · complete Sync · floor installation | 4,358 · 62,727 · 55 |
+| Append · publication · Trim | 82,022 · 82,841 · 29,945 |
 
 The runner mutates real rows into 43 controls, one per admission or effect check. These
 include the former visible incomplete Sync, a Seal that reports staged records, a Seal or
@@ -150,7 +150,10 @@ The model still assumes these facts; no proof ties them to the code.
   [Sweeper](../../src/stream/keeper/sweep.rs)
 - **WAL and transport.** Reopen rows show the reopened image equals the durable image for
   every crash in the corpus, and Study 117's bridge covers reply survival. Torn frames,
-  checkpoint selection and the authenticated byte exchange are not modeled in Lean.
+  background checkpoints of staged and retained records, and the authenticated byte
+  exchange are not modeled in Lean. A `Batch` envelope is transport framing that the
+  keeper splits into single requests before deciding; the simulator and the replay use
+  single requests.
 - **Payload bytes.** The replay checks positions and record epochs. The conformance
   history checker compares payload bytes.
 
