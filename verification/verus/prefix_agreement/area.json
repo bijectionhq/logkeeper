@@ -11,7 +11,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 25,
+  "min_verified_functions": 40,
   "controls": {
     "stale_prepare": {
       "defect": "A request below the current promise can be acknowledged.",
@@ -34,7 +34,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 39
     },
     "stale_accept": {
       "defect": "An accept may replace a vote at a lower ballot than the promise.",
@@ -57,7 +57,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 39
     },
     "mixed_ballots": {
       "defect": "A coordinator may count a reply from a different ballot.",
@@ -80,7 +80,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 39
     },
     "half_quorum": {
       "defect": "The final certificate gate also admits half of the roster, rounded down.",
@@ -108,7 +108,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 39
     },
     "repeat_voter": {
       "defect": "A repeated voter may fill a second certificate slot.",
@@ -136,7 +136,7 @@
           "category": "precondition not satisfied"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 39
     },
     "foreign_voter": {
       "defect": "An unconfigured voter may count toward a certificate.",
@@ -164,7 +164,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 39
     },
     "prefer_older_image": {
       "defect": "The recovery fold replaces its winner with an older report.",
@@ -187,7 +187,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 39
     },
     "install_wrong_predecessor": {
       "defect": "Installation accepts an image from another predecessor.",
@@ -210,7 +210,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 39
     },
     "seal_wrong_destination": {
       "defect": "Sealing releases the selected image for a destination absent from the predecessor seal.",
@@ -233,7 +233,7 @@
           "category": "assertion failed"
         }
       ],
-      "min_verified_functions": 24
+      "min_verified_functions": 39
     }
   }
 }

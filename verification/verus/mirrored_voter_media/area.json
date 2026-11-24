@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 38,
+  "min_verified_functions": 47,
   "controls": {
     "reply-after-one-sync": {
       "defect": "The caller returns a slot pair after syncing only the alternate.",
@@ -25,7 +25,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 37
+      "min_verified_functions": 46
     },
     "select-older-with-weakened-contract": {
       "defect": "Both the selector and its contract prefer the lower generation.",
@@ -48,7 +48,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 37
+      "min_verified_functions": 46
     },
     "accept-out-of-bounds-body": {
       "defect": "The header can name more body bytes than fit in the slot.",
@@ -71,7 +71,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 37
+      "min_verified_functions": 46
     },
     "accept-torn-body": {
       "defect": "A mismatched body checksum is ignored during recovery.",
@@ -89,7 +89,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 37
+      "min_verified_functions": 46
     },
     "accept-foreign-header": {
       "defect": "An authenticated image from another group can participate in recovery.",
@@ -107,7 +107,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 37
+      "min_verified_functions": 46
     },
     "read-first-slot-twice": {
       "defect": "Readback omits the second physical image.",
@@ -125,7 +125,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 37
+      "min_verified_functions": 46
     },
     "read-back-wrong-prefix": {
       "defect": "The slot can carry a different accepted prefix from the fence.",
@@ -143,7 +143,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 37
+      "min_verified_functions": 46
     },
     "discard-sole-survivor-with-weakened-contract": {
       "defect": "The selector and its contract discard valid slot B when slot A tore.",
@@ -166,7 +166,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 37
+      "min_verified_functions": 46
     }
   }
 }

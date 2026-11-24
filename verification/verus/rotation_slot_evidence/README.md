@@ -3,7 +3,9 @@
 Verus imports the shipped [voter collection checks](../../../src/ordered/replication/evidence.rs),
 [rotation assembly](../../../src/ordered/replication/rotation.rs) and
 [rotation encoder](../../../src/ordered/codec/service/rotation.rs).
-They run on the ordered choose and receipt paths. This area uses the
+They run on the ordered choose and receipt paths. The
+[prefix agreement area](../prefix_agreement/README.md) checks the same
+`record_vote` used by `Group::confirm`. This area uses the
 [media readback laws](../mirrored_voter_media/README.md) for the local disk
 side of the proof.
 

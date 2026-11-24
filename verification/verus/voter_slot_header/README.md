@@ -1,7 +1,7 @@
 # LKORV005 voter slot header
 
 The harness imports [the shipped slot header codec](../../../src/ordered/replication/slot_header.rs).
-[Persistence and recovery](../../../src/ordered/replication/disk.rs) call it to write the descriptor and read back its fields.
+[Persistence](../../../src/ordered/replication/disk.rs) uses it to write the descriptor. The [mirrored media recovery proof](../mirrored_voter_media/README.md) imports the same decoder and scope check that [recovery](../../../src/ordered/replication/disk/recover.rs) calls.
 
 The Verus sequence views correspond to byte lists in [Logkeeper.VoterSlotHeader](../../lean/Logkeeper/VoterSlotHeader.lean).
 `encodeBE` and `decodeBE` agree with the Lean bit-vector operations on eight-byte words.

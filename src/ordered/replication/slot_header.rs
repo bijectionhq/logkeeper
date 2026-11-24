@@ -6,11 +6,11 @@ use vstd::prelude::*;
 #[cfg(verus_keep_ghost)]
 verus! {
 
-pub(super) open spec fn voterSlotMagic() -> Seq<u8> {
+pub(crate) open spec fn voterSlotMagic() -> Seq<u8> {
     seq![76u8, 75, 79, 82, 86, 48, 48, 53]
 }
 
-pub(super) open spec fn decodeBE(bytes: Seq<u8>) -> u64 {
+pub(crate) open spec fn decodeBE(bytes: Seq<u8>) -> u64 {
     ((bytes[0] as u64) << 56)
         | ((bytes[1] as u64) << 48)
         | ((bytes[2] as u64) << 40)
@@ -75,7 +75,7 @@ pub(super) open spec fn slotHeaderMatches(header: SlotHeader, group: Seq<u8>, vo
 
 const MAGIC: [u8; 8] = [b'L', b'K', b'O', b'R', b'V', b'0', b'0', b'5'];
 pub(super) const DESCRIPTOR_BYTES: usize = 72;
-pub(super) const HEADER: usize = DESCRIPTOR_BYTES + 32;
+pub(crate) const HEADER: usize = DESCRIPTOR_BYTES + 32;
 
 pub(super) struct SlotDescriptor {
     pub(super) magic: [u8; 8],

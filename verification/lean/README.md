@@ -45,16 +45,26 @@ interpret a compacted image and the previous writer to interpret vacancy.
 exact mutation retry to `same_chosen_append`.
 
 Run `python3 run_ordered_reducer.py` for the ordered-model theorem and mutation
-checks. Run `python3 run_ordered_correspondence.py --verus /path/to/verus` to
+checks, including axiom audits for `Logkeeper.OrderedBudgets` and
+`Logkeeper.OrderedGuards`. Run
+`python3 run_ordered_correspondence.py --verus /path/to/verus` to
 compare the Lean decisions with the Verus specs on the shared cases.
 
 `Logkeeper.Codec` specifies the ordered decision header, canonical Boolean
 markers and declared length bounds. `Logkeeper.CompactImage` specifies the
-snapshot generation, hold receipt, lease, fence and object reference checks. Run
-`python3 run_codec.py` from this directory to check both modules, their axiom
-reports and the five negative controls. The Verus correspondence is recorded
+snapshot generation, hold receipt, lease, fence and object reference checks.
+`Logkeeper.VoterSlotHeader` and `Logkeeper.VoterTransport` specify fixed voter
+media and transport fields. Run `python3 run_codec.py` from this directory to
+audit these four modules and run their nine negative controls. The Verus correspondence is recorded
 in the [ordered codec](../verus/ordered_codec/README.md) and
-[compact image](../verus/compact_image/README.md) proof areas.
+[compact image](../verus/compact_image/README.md) proof areas and in the
+[voter header](../verus/voter_slot_header/README.md) and
+[voter transport](../verus/voter_transport/README.md) proof areas.
+
+`Logkeeper.PrefixTrace` checks recorded ordered group choices, recovery and
+cohort transfer against the prefix agreement reference. Run
+`python3 run_prefix_traces.py` to record and validate the native test traces,
+including stale-accept and substituted-base controls.
 
 `Logkeeper.DisposalLease` and `Logkeeper.ErasureCommit` specify the serving
 lease, disposal and exact rotation guards. Run

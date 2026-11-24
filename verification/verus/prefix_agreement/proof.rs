@@ -5,12 +5,14 @@ mod production;
 #[path = "../rotation_slot_evidence/production.rs"]
 mod rotation_support;
 
-pub use rotation_support::admission;
+#[path = "../../../src/ordered/admission.rs"]
+mod admission;
 #[path = "../../../src/ordered/cohort.rs"]
 pub mod cohort;
 
 mod ordered {
-    pub use crate::{admission, cohort};
+    pub use crate::cohort;
+    pub use crate::rotation_support::admission;
 }
 
 mod laws;

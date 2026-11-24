@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the ordered writer and receipt reference theorems and their controls."""
+"""Audit ordered reducer theorems and run the writer and receipt controls."""
 
 import os
 from pathlib import Path
@@ -17,8 +17,12 @@ def main():
     command = [lake, "env", "lean"]
     writer = ROOT / "Logkeeper/OrderedWriter.lean"
     receipt = ROOT / "Logkeeper/OrderedReceipt.lean"
-    check_lean_theorems(ROOT, command, writer, count=8, case="ordered-writer")
-    check_lean_theorems(ROOT, command, receipt, count=7, case="ordered-receipt")
+    check_lean_theorems(ROOT, command, writer, count=9, case="ordered-writer")
+    check_lean_theorems(ROOT, command, receipt, count=9, case="ordered-receipt")
+    check_lean_theorems(ROOT, command, ROOT / "Logkeeper/OrderedGuards.lean",
+                        count=8, case="ordered-guards")
+    check_lean_theorems(ROOT, command, ROOT / "Logkeeper/OrderedBudgets.lean",
+                        count=9, case="ordered-budgets")
     check_lean_mutation(
         ROOT, command, writer, "trim-extra-record",
         [("records := image.records.drop count", "records := image.records.drop (count + 1)")],
