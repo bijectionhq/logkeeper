@@ -134,6 +134,9 @@ pub(super) fn admits_history(erasure_floor: u64, from: u64) -> bool {
     from >= erasure_floor
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if erasure_pending { Err(Refusal::Unavailable) } else { Ok(()) },
+))]
 pub(super) fn check_writer_open(erasure_pending: bool) -> Result<(), Refusal> {
     if erasure_pending {
         Err(Refusal::Unavailable)
@@ -142,6 +145,11 @@ pub(super) fn check_writer_open(erasure_pending: bool) -> Result<(), Refusal> {
     }
 }
 
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == if requested_floor == current_floor && disposition_present && exact_closed_root {
+        Ok(())
+    } else { Err(Refusal::Stale) },
+))]
 pub(super) fn check_settlement_fence(
     current_floor: u64,
     requested_floor: u64,

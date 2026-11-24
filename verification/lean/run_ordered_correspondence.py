@@ -69,6 +69,24 @@ CASES = {
         ("withdrawn 0 2 false", "withdrawn(0, 2, false)"),
         ("withdrawn 3 2 false", "withdrawn(3, 2, false)"),
     ]),
+    "ordered_lease_reducer": ("LeaseReducer", "DisposalLease", [
+        (f"read_lease_end (some 2) (some 2) 2 (some 7) 7 true true 10 8 {MAX}",
+         "read_lease_end(Some(2u64), Some(2), 2, Some(7u64), 7, empty, selected, 10, 8)"),
+        (f"read_lease_end (some 2) (some 3) 2 (some 7) 7 true true 10 8 {MAX}",
+         "read_lease_end(Some(2u64), Some(3), 2, Some(7u64), 7, empty, selected, 10, 8)"),
+        (f"read_lease_end none (some 2) 2 (some 7) 7 true true 10 8 {MAX}",
+         "read_lease_end(None, Some(2u64), 2, Some(7u64), 7, empty, selected, 10, 8)"),
+        (f"read_lease_end (some 2) (some 2) 2 (some 8) 7 true true 10 8 {MAX}",
+         "read_lease_end(Some(2u64), Some(2), 2, Some(8u64), 7, empty, selected, 10, 8)"),
+        (f"read_lease_end (some 2) (some 2) 2 (some 7) 7 "
+         f"(interval_available false 4 3 5 2) true 10 8 {MAX}",
+         "read_lease_end(Some(2u64), Some(2), 2, Some(7u64), 7, trimmed, selected, 10, 8)"),
+        (f"read_lease_end (some 2) (some 2) 2 (some 7) 7 true "
+         f"(checkpoint_open 4 3 true false) 10 8 {MAX}",
+         "read_lease_end(Some(2u64), Some(2), 2, Some(7u64), 7, empty, obsolete, 10, 8)"),
+        (f"read_lease_end (some 2) (some 2) 2 (some 7) 7 true true {MAX} 1 {MAX}",
+         f"read_lease_end(Some(2u64), Some(2), 2, Some(7u64), 7, empty, selected, {MAX}, 1)"),
+    ]),
     "ordered_rotation": ("ErasureCommit", "ErasureCommit", [
         ("rotation_head true (some 3) 3 (8, 1) (8, 1) 10 11",
          "rotation_head(true, Some(3u64), 3, head, head, 10u64, 11)"),
@@ -130,6 +148,15 @@ def check_area(lake, verus, scratch, area, module_name, namespace, cases):
             "        assert(stored.len() == 2 && shortened.len() == 1);\n"
             + assertions
         )
+    if area == "ordered_lease_reducer":
+        assertions = (
+            "        use crate::production::{CheckpointAccess, ReadInterval};\n"
+            "        let empty = ReadInterval { empty: true, floor: 4, from: 0, through: 0, retained: 0 };\n"
+            "        let trimmed = ReadInterval { empty: false, floor: 4, from: 3, through: 5, retained: 2 };\n"
+            "        let selected = CheckpointAccess { cut: 4, erasure_floor: 4, retained: true, closed: false };\n"
+            "        let obsolete = CheckpointAccess { cut: 3, erasure_floor: 4, retained: true, closed: false };\n"
+            + assertions
+        )
     if area == "ordered_rotation":
         head_digest = ", ".join(["1u8"] * 32)
         other_digest = ", ".join(["2u8"] * 32)
@@ -177,8 +204,8 @@ def main():
         scratch = Path(scratch_path)
         sources = scratch / "src/ordered"
         sources.mkdir(parents=True)
-        for name in ("admission.rs", "budget.rs", "checkpoint_guards.rs", "lease.rs",
-                     "receipt.rs", "refusal.rs", "retention.rs", "rotation.rs", "writer.rs"):
+        for name in ("admission.rs", "budget.rs", "checkpoint_guards.rs", "lease.rs", "lease_reducer.rs",
+                     "receipt.rs", "refusal.rs", "replay_bounds.rs", "retention.rs", "rotation.rs", "writer.rs"):
             shutil.copyfile(REPO / "src/ordered" / name, sources / name)
         for area, (module_name, namespace, cases) in CASES.items():
             check_area(lake, verus, scratch, area, module_name, namespace, cases)

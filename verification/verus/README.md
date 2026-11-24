@@ -50,6 +50,7 @@ The area READMEs describe the checked production functions and Lean mappings.
 - [Ordered checkpoint custody](ordered_checkpoint/README.md)
 - [Ordered codec](ordered_codec/README.md)
 - [Ordered cohort confirmation and repair](ordered_cohort/README.md)
+- [Ordered lease reducer](ordered_lease_reducer/README.md)
 - [Ordered receipt retention and retry](ordered_receipt/README.md)
 - [Ordered replay interval and cursor](ordered_replay/area.json)
 - [Ordered rotation](ordered_rotation/README.md)

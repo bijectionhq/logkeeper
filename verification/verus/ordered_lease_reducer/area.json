@@ -1,0 +1,309 @@
+{
+  "summary": "Exact protected-basis read lease admission and ordered lease and hold updates.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "rotation",
+    "--verify-module",
+    "replay_bounds",
+    "--verify-module",
+    "writer",
+    "--verify-module",
+    "lease",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 58,
+  "controls": {
+    "wrong-worker": {
+      "defect": "Authorize read renewal from a principal other than the held enrollment.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "    ensures out == if principal != Some(owner) { Err(Refusal::Unauthorized) }\n        else if stored",
+          "replace": "    ensures out == if stored"
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "    if principal != Some(owner) {\n        return Err(Refusal::Unauthorized);\n    }\n",
+          "replace": ""
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "        else if principal != Some(basis.owner) { Err(Refusal::Unauthorized) }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "read_lease_requires_exact_protected_basis",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 57
+    },
+    "unprotected-basis": {
+      "defect": "Renew without a live and exact hold at the requested identity.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "stored != Some(requested) || !interval_available(interval)",
+          "replace": "!interval_available(interval)"
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "    if stored != Some(requested) {\n        return Err(Refusal::Unavailable);\n    }\n",
+          "replace": ""
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "basis.stored != Some(basis.requested) || !interval_available(basis.interval)",
+          "replace": "!interval_available(basis.interval)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "read_lease_requires_exact_protected_basis",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 57
+    },
+    "vacancy-bypasses-enrollment": {
+      "defect": "Use the authenticated holder alone as authority for a read lease during vacancy, omitting the exact roster match.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "    ensures out == if roster@.get(basis.worker) != Some(basis.owner) { Err(Refusal::Stale) }\n        else if principal",
+          "replace": "    ensures out == if principal"
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "    if roster.get(&basis.worker) != Some(&basis.owner) {\n        return Err(Refusal::Stale);\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "read_lease_requires_exact_protected_basis",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "vacancy_never_substitutes_for_enrollment",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 56
+    },
+    "lease-end-regression": {
+      "defect": "Replace a greater recorded lease end with the newly issued end.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "            Ok(end) => old(leases)@.insert(basis.owner,\n                super::lease::retained_end(old(leases)@.get(basis.owner), end)),",
+          "replace": "            Ok(end) => old(leases)@.insert(basis.owner, end),"
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "    let last = leases.get(&basis.owner).copied().unwrap_or(0);\n    leases.insert(basis.owner, last.max(end));",
+          "replace": "    leases.insert(basis.owner, end);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "read_lease_retains_greatest_end",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 57
+    },
+    "renew-below-erasure-floor": {
+      "defect": "Allow an otherwise retained old root to renew a read lease.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "self.erasure_floor <= self.cut && self.retained && !self.closed",
+          "replace": "self.retained && !self.closed"
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "rotation::admits_history(self.erasure_floor, self.cut) && self.retained && !self.closed",
+          "replace": "self.retained && !self.closed"
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "            || basis.checkpoint.cut < basis.checkpoint.erasure_floor\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "read_lease_requires_exact_protected_basis",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "old_root_cannot_renew",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 56
+    },
+    "ignore-outstanding-holds-on-prune": {
+      "defect": "Forget a withdrawn worker's lease while it still owns another hold.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "roster.get(worker) == Some(owner) || held_by(holds, owner, identify)",
+          "replace": "roster.get(worker) == Some(owner)"
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "        if !held {",
+          "replace": "        if !held || held {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "release_read_keeps_end_if_backed",
+          "category": "assertion failed"
+        },
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "withdrawal_preserves_pending_owners",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 56
+    },
+    "disposal-leaves-owner-held": {
+      "defect": "Acknowledge disposal without removing any held rows.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "    if row matches Some(entry) && identify(entry) == owner { None } else { row }",
+          "replace": "    row"
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "    forall|key: K, entry: H| #[trigger] retired.contains((key, entry)) <==>\n        previous.get(key) == Some(entry) && identify(entry) == owner",
+          "replace": "    retired.len() == 0"
+        },
+        {
+          "file": "src/ordered/lease_reducer.rs",
+          "find": "    let mut retired = Vec::new();",
+          "replace": "    let mut retired = Vec::new();\n    if true {\n        return retired;\n    }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "expiry_disposal_clears_owner",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 57
+    },
+    "writer-lease-end-regression": {
+      "defect": "Replace a greater recorded writer lease end with the newly issued end.",
+      "mutate": [
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "old(leases)@.insert(grant.0, retained_end(old(leases)@.get(grant.0), end))",
+          "replace": "old(leases)@.insert(grant.0, end)"
+        },
+        {
+          "file": "src/ordered/lease.rs",
+          "find": "    let last = leases.get(&grant.0).copied().unwrap_or(0);\n    leases.insert(grant.0, last.max(end));",
+          "replace": "    leases.insert(grant.0, end);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "writer_lease_does_not_regress_or_change_other_ends",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 57
+    },
+    "rotation-drops-existing-holds": {
+      "defect": "Replace the hold map when adding the clean root's recovery hold.",
+      "mutate": [
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "final(holds)@ == old(holds)@.insert(id, hold)",
+          "replace": "final(holds)@ == Map::empty().insert(id, hold)"
+        },
+        {
+          "file": "src/ordered/writer.rs",
+          "find": "    holds.insert(id, hold);",
+          "replace": "    holds.clear();\n    holds.insert(id, hold);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "rotation_adds_recovery_without_dropping_existing_holds",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 57
+    },
+    "writer-changes-during-erasure": {
+      "defect": "Let an append, grant or vacate proceed through a pending erasure preparation.",
+      "mutate": [
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "out == if erasure_pending { Err(Refusal::Unavailable) } else { Ok(()) }",
+          "replace": "out == Ok(())"
+        },
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "    if erasure_pending {\n        Err(Refusal::Unavailable)\n    } else {\n        Ok(())\n    }",
+          "replace": "    Ok(())"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "pending_erasure_blocks_writer_changes",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 57
+    },
+    "settle-at-stale-floor": {
+      "defect": "Allow checkpoint settlement with a stale erasure floor.",
+      "mutate": [
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "requested_floor == current_floor && disposition_present && exact_closed_root",
+          "replace": "disposition_present && exact_closed_root"
+        },
+        {
+          "file": "src/ordered/rotation.rs",
+          "find": "requested_floor != current_floor || !disposition_present || !exact_closed_root",
+          "replace": "!disposition_present || !exact_closed_root"
+        }
+      ],
+      "expect": [
+        {
+          "file": "verification/verus/ordered_lease_reducer/laws.rs",
+          "function": "settlement_must_match_erasure_floor",
+          "category": "assertion failed"
+        }
+      ],
+      "min_verified_functions": 57
+    }
+  }
+}

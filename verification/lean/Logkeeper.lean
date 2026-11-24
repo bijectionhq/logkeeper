@@ -11,6 +11,7 @@ import Logkeeper.Codec
 import Logkeeper.CompactImage
 import Logkeeper.OrderedBudgets
 import Logkeeper.DisposalLease
+import Logkeeper.LeaseReducer
 import Logkeeper.ErasureCommit
 
 import Logkeeper.PrefixTrace

@@ -17,9 +17,39 @@ def main():
     command = [lake, "env", "lean"]
     lease = ROOT / "Logkeeper/DisposalLease.lean"
     erasure = ROOT / "Logkeeper/ErasureCommit.lean"
+    reducer = ROOT / "Logkeeper/LeaseReducer.lean"
     check_lean_theorems(ROOT, command, lease, count=6, case="ordered-serving-lease")
     check_lean_theorems(ROOT, command, erasure, count=9, case="ordered-rotation")
+    check_lean_theorems(ROOT, command, reducer, count=13, case="ordered-lease-reducer")
     controls = [
+        (reducer, "read-lease-wrong-worker",
+         "enrolled = some owner ∧ principal = some owner ∧ stored = some requested)",
+         "enrolled = some owner ∧ principal = principal ∧ stored = some requested)",
+         "      available = true ∧ openRoot = true ∧ endTime = now + duration := by"),
+        (reducer, "read-lease-without-protected-basis",
+         "enrolled = some owner ∧ principal = some owner ∧ stored = some requested)",
+         "enrolled = some owner ∧ principal = some owner ∧ stored = stored ∧ requested = requested)",
+         "      available = true ∧ openRoot = true ∧ endTime = now + duration := by"),
+        (reducer, "read-lease-without-enrollment",
+         "enrolled = some owner ∧ principal = some owner ∧ stored = some requested)",
+         "enrolled = enrolled ∧ principal = some owner ∧ stored = some requested)",
+         "      available = true ∧ openRoot = true ∧ endTime = now + duration := by"),
+        (reducer, "read-lease-end-regression",
+         "max (previous.getD 0) issued",
+         "if previous.isSome then issued else issued",
+         "  ⟨Nat.le_max_left _ _, Nat.le_max_right _ _⟩"),
+        (reducer, "allow-old-root-renewal",
+         "decide (floor ≤ cut) && retained && !closed",
+         "decide (floor = floor ∧ cut = cut) && retained && !closed",
+         "  rw [checkpoint_open, decide_eq_false blocked]"),
+        (reducer, "allow-writer-change-during-erasure",
+         "Bool := !erasurePending",
+         "Bool := !erasurePending || erasurePending",
+         "theorem pending_erasure_blocks_writer_changes : writer_open true = false := by decide"),
+        (reducer, "settle-with-stale-erasure-floor",
+         "decide (floor = presented) && disposition && closed",
+         "decide (floor = floor ∧ presented = presented) && disposition && closed",
+         "  exact settled.1.1"),
         (lease, "decision-time-rewinds",
          "  if previous ≤ incoming then some incoming else none",
          "  if previous ≤ incoming then some incoming else some incoming",

@@ -22,9 +22,9 @@ naturals. The arithmetic bound is `u64::MAX`. An overflowing lease or
 eligibility time refuses the decision. An absent retained lease has eligibility
 time zero. Lease renewal retains the maximum end in the lease map.
 The issuance law covers `Command::Lease` for the current grant.
-`Command::LeaseRead` uses the enrolled worker's exact protected basis,
-including during writer vacancy. Its authorization and lease update remain
-separate proof obligations.
+The [ordered lease reducer area](../ordered_lease_reducer/README.md) covers
+`Command::LeaseRead` authorization, lease updates and retention across the
+reducer's lease and hold operations.
 
 The owner projection takes each real held entry's exact enrollment and its
 worker UUID. The roster is keyed by worker UUID and the query compares the
@@ -45,10 +45,10 @@ original applied lease or disposal receipt.
 The serial high-water check and the current roster determine the shipped meaning
 of `withdrawn`. A fabricated identifier with an in-range serial, no current
 roster match and no lease can receive a successful no-op disposal. The
-`absent_unleased_identity_is_disposable` law records this boundary. Historical
-enrollment authenticity, hold provenance across snapshot recovery, lease-map
-pruning, the complete reducer dispatch and the qualification of the clock and
-per-read admission remain separate obligations.
+`absent_unleased_identity_is_disposable` law records this behavior. A successful
+disposal attests only that no hold or lease remains for the exact enrollment.
+Historical enrollment authenticity across snapshot recovery, the complete
+reducer refinement and clock and per-read qualification remain open.
 
 With the pinned F0 runner, run
 `python3 verification/verus/run.py --verus /path/to/shared/tools/verus ordered_serving_lease`.

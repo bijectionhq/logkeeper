@@ -67,8 +67,11 @@ cohort transfer against the prefix agreement reference. Run
 including stale-accept and substituted-base controls.
 
 `Logkeeper.DisposalLease` and `Logkeeper.ErasureCommit` specify the serving
-lease, disposal and exact rotation guards. Run
-`python3 run_ordered_lease_rotation.py` for the theorem and mutation checks.
+lease, disposal and exact rotation guards. `Logkeeper.LeaseReducer` adds
+the independent protected-basis read lease rule and the preservation theorem
+for each enrollment projection along the chosen trace. The production links
+are recorded in the [ordered lease reducer area](../verus/ordered_lease_reducer/README.md).
+Run `python3 run_ordered_lease_rotation.py` for the theorem and mutation checks.
 
 `Logkeeper.Premises.BarrierKeys` and `SignatureScope` give the reference
 for [ordered receipt signatures and repair keys](../verus/receipt_signatures/README.md).

@@ -284,7 +284,7 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
             generation: 1,
         },
         Limits {
-            enrolled_workers: 1,
+            enrolled_workers: 2,
             replay_holds: 4,
             retry_positions: 64,
             retained_data_bytes: 1 << 16,
@@ -409,6 +409,22 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
         panic!("third read refused: {third:?}");
     };
     assert!(latest.through.next_lsn > late.through.next_lsn);
+    let reader = Principal::Worker(enroll(&mut state));
+    let Ok(Outcome::Barrier { read: follower }) = apply(&mut state, reader, Command::Barrier).outcome else {
+        panic!("a non-writer could not protect the committed head while a writer was active");
+    };
+    assert_eq!(
+        apply(&mut state, principal, Command::LeaseRead { hold: follower }).outcome,
+        Err(Refusal::Unauthorized)
+    );
+    assert!(matches!(
+        apply(&mut state, reader, Command::LeaseRead { hold: follower }).outcome,
+        Ok(Outcome::ReadLeased { hold, .. }) if hold == follower
+    ));
+    assert_eq!(
+        apply(&mut state, reader, Command::ReleaseRead { read: follower.id }).outcome,
+        Ok(Outcome::Released)
+    );
 
     assert_eq!(
         apply(&mut state, principal, Command::Vacate { grant: writer }).outcome,
@@ -426,6 +442,25 @@ fn identical_reads_are_fresh_admissions_while_identical_appends_deduplicate() {
     assert_eq!(
         apply(&mut state, Principal::RouteReader, Command::LeaseRead { hold: read }).outcome,
         Err(Refusal::Unauthorized),
+    );
+
+    let altered = Hold {
+        admitted_at: read.admitted_at + 1,
+        ..read
+    };
+    assert_eq!(
+        apply(&mut state, principal, Command::LeaseRead { hold: altered }).outcome,
+        Err(Refusal::Unavailable)
+    );
+    let retained_end = state.lease_end(worker);
+    assert_eq!(
+        apply(&mut state, principal, Command::ReleaseRead { read: read.id }).outcome,
+        Ok(Outcome::Released)
+    );
+    assert_eq!(state.lease_end(worker), retained_end);
+    assert_eq!(
+        apply(&mut state, principal, Command::LeaseRead { hold: read }).outcome,
+        Err(Refusal::Unavailable)
     );
 
     // Every live read hold keeps its own receipt as provenance.
@@ -936,6 +971,7 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
         [first]
     );
     assert_eq!(recovered.expiry_disposal_time(first), Some(1_200));
+    state = recovered;
     assert_eq!(
         at(&mut state, 1_199, Principal::Custodian, dispose.clone()),
         Err(Refusal::Unavailable)
@@ -992,6 +1028,23 @@ fn a_withdrawn_worker_is_disposed_only_after_its_lease_and_drift() {
         ),
         Ok(Outcome::WorkerDisposed(unleased))
     );
+    let absent = Enrollment {
+        worker: Uuid::new_v4(),
+        serial: unleased.serial,
+    };
+    let before_holds = state.holds.keys().copied().collect::<Vec<_>>();
+    let before_ends = state.leases.clone();
+    assert_eq!(
+        at(
+            &mut state,
+            1_300,
+            Principal::Custodian,
+            Command::DisposeExpired { enrollment: absent }
+        ),
+        Ok(Outcome::WorkerDisposed(absent))
+    );
+    assert_eq!(state.holds.keys().copied().collect::<Vec<_>>(), before_holds);
+    assert_eq!(state.leases, before_ends);
     round_trips(&state);
 }
 
@@ -1119,6 +1172,26 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     assert_eq!(append(&mut advanced, old), Err(Refusal::Unavailable));
     assert_eq!(advanced.head, state.head);
     assert_eq!(advanced.checkpoint(), initial.checkpoint());
+    let expected = advanced.writer_state();
+    assert_eq!(
+        apply(
+            &mut advanced,
+            worker,
+            Command::Grant { expected, candidate: enrollment }
+        )
+        .outcome,
+        Err(Refusal::Unavailable)
+    );
+    assert_eq!(
+        apply(&mut advanced, worker, Command::Vacate { grant: old }).outcome,
+        Err(Refusal::Unavailable)
+    );
+    assert_eq!(advanced.writer_state(), expected);
+    let Ok(Outcome::ReadLeased { lease_end, .. }) =
+        apply(&mut state, worker, Command::LeaseRead { hold: read }).outcome
+    else {
+        panic!("the currently selected root remains leaseable during preparation");
+    };
 
     let request = Request {
         placement: state.placement(),
@@ -1163,6 +1236,15 @@ fn rotation_fences_the_old_grant_and_preserves_each_record_generation_on_recover
     );
     assert_eq!(state.checkpoint(), checkpoint);
     assert_eq!(state.erasure_floor(), checkpoint.cut.next_lsn);
+    assert_eq!(state.lease_end(enrollment), Some(lease_end));
+    assert_eq!(
+        apply(&mut state, worker, Command::LeaseRead { hold: read }).outcome,
+        Err(Refusal::Unavailable)
+    );
+    assert!(matches!(
+        apply(&mut state, worker, Command::LeaseRead { hold: recovery }).outcome,
+        Ok(Outcome::ReadLeased { hold, .. }) if hold == recovery
+    ));
     assert_eq!(
         apply(
             &mut state,
@@ -1436,6 +1518,19 @@ fn exact_withdrawal_orders_against_the_retained_tail_preparation_and_held_root()
         )
         .outcome,
         Ok(Outcome::CheckpointClosed(first))
+    );
+    assert_eq!(
+        apply(
+            &mut state,
+            custodian,
+            Command::SettleCheckpoint {
+                checkpoint: first,
+                disposition: [9; 32],
+                erasure_floor: 1,
+            }
+        )
+        .outcome,
+        Err(Refusal::Stale)
     );
     assert_eq!(
         apply(
