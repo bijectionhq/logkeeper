@@ -18,6 +18,7 @@ mod lease_reducer;
 mod object_withdrawal;
 mod receipt;
 mod reducer;
+mod reducer_request;
 mod refusal;
 pub mod replication;
 mod replay_bounds;
@@ -771,35 +772,29 @@ impl State {
         }
         let key = (principal, id);
         let reading = matches!(&request.command, Command::Barrier);
-        if let Some(previous) = self.outcomes.get(&key) {
-            // A retained read receipt only proves its hold's provenance. Its
-            // identity is spent: a read is never answered by replay, and the
-            // original receipt is never overwritten.
-            return Ok(receipt::replay(
-                reading,
-                &previous.fingerprint,
-                &fingerprint,
-                previous.receipt,
-            )
-            .unwrap_or_else(|| receipt(Err(Refusal::Conflict))));
-        }
-        if receipt::fresh_request_expired(position, id.expires_at) {
-            return Ok(receipt(Err(Refusal::Expired)));
-        }
-        if !cohort::may_extend(self.successor) {
-            return Ok(receipt(Err(Refusal::CohortSealed)));
-        }
-        if id.expires_at - position > self.limits.retry_positions {
-            return Ok(receipt(Err(Refusal::Invalid)));
+        match reducer_request::admit_request(
+            &self.outcomes,
+            &key,
+            reading,
+            &fingerprint,
+            position,
+            id.expires_at,
+            self.successor,
+            self.limits.retry_positions,
+        ) {
+            Ok(Some(original)) => return Ok(original),
+            Ok(None) => {}
+            Err(refusal) => return Ok(receipt(Err(refusal))),
         }
         let receipt = receipt(self.decide(principal, id, fingerprint, request.command));
-        if !receipt::record_after_apply(&mut self.outcomes, reading, fingerprint, receipt) {
-            // A refused read holds nothing and is never replayed, so it leaves
-            // no state behind. Only an admitted read retains its receipt, as
-            // the provenance of its hold.
-            return Ok(receipt);
-        }
-        self.expiry.insert((id.expires_at, key), ());
+        reducer_request::finish_request(
+            &mut self.outcomes,
+            &mut self.expiry,
+            reading,
+            fingerprint,
+            receipt,
+            id.expires_at,
+        );
         Ok(receipt)
     }
 
