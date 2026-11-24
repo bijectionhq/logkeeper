@@ -444,6 +444,8 @@ mod implementation {
                 }
                 Decision::Persist
             }
+            // `Keeper::call` splits envelopes before any per-stream decision.
+            Request::Batch(_) => refuse(Refusal::Unauthorized),
             Request::Create { .. } | Request::Delete { .. } => unreachable!(),
         }
     }

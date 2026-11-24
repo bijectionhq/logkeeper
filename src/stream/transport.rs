@@ -8,11 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures::{StreamExt, stream::FuturesOrdered};
 use journal_contract::BoxFuture;
 use parking_lot::Mutex;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{Semaphore, mpsc},
     task::JoinSet,
     time::{Instant as TokioInstant, sleep, timeout},
 };
@@ -37,7 +38,7 @@ use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 use super::{
     codec::{
-        decode_reply, decode_request, encode_reply, encode_request, invalid, read_frame,
+        self, decode_reply, decode_request, encode_reply, encode_request, invalid, read_frame,
         write_frame,
     },
     keeper::{Keeper, Limits, SealPolicy},
@@ -53,6 +54,8 @@ const WAITING_READS: usize = 16;
 const IDLE_CHANNELS: usize = 16;
 const IDLE_GRACE: Duration = Duration::from_millis(250);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+/// Frames a keeper connection decides concurrently and answers in order.
+const SERVER_PIPELINE: usize = 64;
 
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,7 +152,7 @@ async fn serve_connection(
     keeper: Keeper,
 ) -> io::Result<()> {
     socket.set_nodelay(true)?;
-    let mut channel = timeout(FRAME_TIMEOUT, acceptor.accept(socket)).await??;
+    let channel = timeout(FRAME_TIMEOUT, acceptor.accept(socket)).await??;
     let (_, peer) = channel.get_ref();
     let leaf = leaf(peer.peer_certificates())?;
     let identity = client_identity(leaf)?;
@@ -161,33 +164,110 @@ async fn serve_connection(
             "unauthorized keeper client",
         ));
     }
-    loop {
-        let frame = timeout(FRAME_TIMEOUT, read_frame(&mut channel)).await??;
-        let request = decode_request(frame)?;
-        let allowed = match request {
-            Request::Read { .. } | Request::Check { .. } => can_read,
-            _ => can_write,
+    let access = Access {
+        keeper,
+        identity,
+        can_read,
+        can_write,
+    };
+    // Pipeline frames: decide them concurrently, so the keeper can group them into one
+    // round, and write the replies in frame order.
+    let (mut read, mut write) = tokio::io::split(channel);
+    let (queue, mut frames) = mpsc::channel(SERVER_PIPELINE);
+    let receive = async {
+        loop {
+            let frame = timeout(FRAME_TIMEOUT, read_frame(&mut read)).await??;
+            if queue.send(decode_request(frame)?).await.is_err() {
+                return Ok::<_, io::Error>(());
+            }
+        }
+    };
+    let send = async {
+        let mut running = FuturesOrdered::new();
+        let mut open = true;
+        loop {
+            tokio::select! {
+                request = frames.recv(), if open && running.len() < SERVER_PIPELINE => match request {
+                    Some(request) => running.push_back(access.answer(request)),
+                    None => open = false,
+                },
+                Some(reply) = running.next(), if !running.is_empty() => {
+                    timeout(FRAME_TIMEOUT, write_frame(&mut write, &encode_reply(&reply?)?)).await??;
+                }
+                else => return Ok::<_, io::Error>(()),
+            }
+        }
+    };
+    tokio::try_join!(receive, send)?;
+    Ok(())
+}
+
+struct Access {
+    keeper: Keeper,
+    identity: Identity,
+    can_read: bool,
+    can_write: bool,
+}
+
+impl Access {
+    fn allowed(&self, request: &Request) -> bool {
+        match request {
+            Request::Read { .. } | Request::Check { .. } => self.can_read,
+            Request::Batch(_) => false,
+            _ => self.can_write,
+        }
+    }
+
+    /// Authorize each request of a batch separately and submit the admitted ones together.
+    async fn answer(&self, request: Request) -> io::Result<Reply> {
+        let failed = |error| io::Error::other(format!("{error:?}"));
+        let Request::Batch(requests) = request else {
+            return if self.allowed(&request) {
+                self.keeper
+                    .call(&self.identity, request)
+                    .await
+                    .map_err(failed)
+            } else {
+                Ok(Reply::Refused(Refusal::Unauthorized))
+            };
         };
-        let reply = if allowed {
-            keeper
-                .call(&identity, request)
+        let mut replies = vec![Some(Reply::Refused(Refusal::Unauthorized)); requests.len()];
+        let (positions, admitted): (Vec<_>, Vec<_>) = requests
+            .into_iter()
+            .enumerate()
+            .filter(|(_, request)| self.allowed(request))
+            .unzip();
+        if !admitted.is_empty() {
+            let Reply::Batch(decided) = self
+                .keeper
+                .call(&self.identity, Request::Batch(admitted))
                 .await
-                .map_err(|error| io::Error::other(format!("{error:?}")))?
-        } else {
-            Reply::Refused(Refusal::Unauthorized)
-        };
-        timeout(
-            FRAME_TIMEOUT,
-            write_frame(&mut channel, &encode_reply(&reply)?),
-        )
-        .await??;
+                .map_err(failed)?
+            else {
+                return Err(invalid("keeper refused a batch envelope"));
+            };
+            if decided.len() != positions.len() {
+                return Err(invalid("keeper batch reply mismatch"));
+            }
+            for (position, reply) in positions.into_iter().zip(decided) {
+                replies[position] = Some(reply);
+            }
+        }
+        Ok(Reply::Batch(replies.into_iter().flatten().collect()))
     }
 }
 
 type Channel = TlsStream<TcpStream>;
 
+mod mux;
+
+/// Requests at least this large use pooled exclusive connections, so that a large
+/// record never delays the small requests coalesced on the shared connection.
+const SHARED_REQUEST_BYTES: usize = 1024 * 1024;
+
 struct Route {
     address: String,
+    shared: mux::Mux,
     idle: Arc<Mutex<Idle>>,
     connections: Semaphore,
     waiting_reads: Semaphore,
@@ -199,14 +279,12 @@ struct Idle {
 }
 
 impl Route {
-    fn new(address: String, idle: Vec<Channel>) -> Self {
+    fn new(keeper: KeeperId, address: String, tls: &TlsConnector, deadline: Duration) -> Self {
         Self {
+            shared: mux::Mux::new(keeper, address.clone(), tls.clone(), deadline),
             address,
             idle: Arc::new(Mutex::new(Idle {
-                channels: idle
-                    .into_iter()
-                    .map(|channel| (TokioInstant::now(), channel))
-                    .collect(),
+                channels: Vec::new(),
                 pruning: false,
             })),
             connections: Semaphore::new(ROUTE_CONNECTIONS),
@@ -268,7 +346,7 @@ impl TcpTransport {
             if id.0 == 0
                 || transport
                     .routes
-                    .insert(id, Route::new(address, Vec::new()))
+                    .insert(id, Route::new(id, address, &transport.tls, deadline))
                     .is_some()
             {
                 return Err(invalid("invalid or duplicate keeper route"));
@@ -315,7 +393,8 @@ impl TcpTransport {
         for (index, (address, (elapsed, id, channel))) in
             addresses.into_iter().zip(connections).enumerate()
         {
-            let route = Route::new(address.into(), vec![channel]);
+            let route = Route::new(id, address.into(), &transport.tls, deadline);
+            route.shared.adopt(channel);
             if transport.routes.insert(id, route).is_some() {
                 return Err(invalid("duplicate keeper identity"));
             }
@@ -334,6 +413,13 @@ impl TcpTransport {
             .routes
             .get(&keeper)
             .ok_or(TransportError::Unreachable)?;
+        // Waiting reads would hold the shared connection's in-order replies.
+        let exclusive = matches!(request, Request::Read { wait_ms: 1.., .. })
+            || matches!(request, Request::Batch(_))
+            || codec::batched_request_len(&request) >= SHARED_REQUEST_BYTES;
+        if !exclusive {
+            return route.shared.call(request).await;
+        }
         // Leave capacity for mutations and checks while reads wait at the keeper.
         let _read = match request {
             Request::Read { wait_ms: 1.., .. } => {

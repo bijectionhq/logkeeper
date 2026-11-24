@@ -19,7 +19,7 @@ use super::{
 };
 use crate::stream::{
     codec::{self, MAX_FRAME_BYTES, invalid},
-    wire::{Epoch, Identity, KeeperId, Lsn, Request, StreamId},
+    wire::{Epoch, Identity, KeeperId, Lsn, Request, StreamId, StreamView},
 };
 
 pub(super) const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
@@ -38,6 +38,10 @@ pub(super) struct Wal {
     pub bytes: u64,
     pub dirty: HashSet<StreamId>,
     pub reader: ExtentReader,
+    rotation: Option<Rotation>,
+    /// Holds the checkpoint worker until the test releases it.
+    #[cfg(test)]
+    pub rotation_gate: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
     pub rounds: Vec<usize>,
     #[cfg(test)]
@@ -247,6 +251,9 @@ impl Wal {
             bytes,
             dirty,
             reader: ExtentReader::default(),
+            rotation: None,
+            #[cfg(test)]
+            rotation_gate: None,
             #[cfg(test)]
             rounds: Vec::new(),
             #[cfg(test)]
@@ -283,12 +290,87 @@ impl Wal {
         Ok(())
     }
 
+    /// Checkpoint every dirty stream and retire the old segments before returning.
+    /// Delete and startup use this form.
     pub fn rotate(&mut self, states: &mut HashMap<StreamId, Stream>) -> io::Result<()> {
+        self.finish_rotation(states)?;
         self.reader = ExtentReader::default();
         for stream in std::mem::take(&mut self.dirty) {
             let state = states.get_mut(&stream).expect("dirty stream has state");
             self.checkpoint_stream(stream, state)?;
         }
+        let next = self.open_next_segment()?;
+        self.retire_segments(next)
+    }
+
+    /// Begin a rotation whose checkpoints are written off the round thread. The keeper
+    /// keeps deciding and syncing rounds in the new segment meanwhile. A checkpoint
+    /// describes its stream exactly at the segment boundary, which is what replay
+    /// requires. The old segments are retired only after every checkpoint is durable.
+    /// Writing 10,000 checkpoints inline stalled every round for about four seconds.
+    pub fn start_rotation(&mut self, states: &HashMap<StreamId, Stream>) -> io::Result<()> {
+        if self.rotation.is_some() {
+            // The segment grows past its nominal size until the current rotation ends.
+            return Ok(());
+        }
+        let sequence = self.sequence;
+        let snapshots = std::mem::take(&mut self.dirty)
+            .into_iter()
+            .map(|stream| {
+                let state = states.get(&stream).expect("dirty stream has state");
+                Snapshot::of(self.stream_dir(stream), stream, state)
+            })
+            .collect::<Vec<_>>();
+        let next = self.open_next_segment()?;
+        #[cfg(test)]
+        let gate = self.rotation_gate.clone();
+        let worker = std::thread::Builder::new()
+            .name("stream-keeper-checkpoint".into())
+            .spawn(move || {
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.wait();
+                }
+                snapshots
+                    .into_iter()
+                    .map(|snapshot| snapshot.write(sequence))
+                    .collect()
+            })?;
+        self.rotation = Some(Rotation { next, worker });
+        Ok(())
+    }
+
+    /// Install a finished background rotation, if any, without waiting for one.
+    pub fn poll_rotation(&mut self, states: &mut HashMap<StreamId, Stream>) -> io::Result<()> {
+        if self
+            .rotation
+            .as_ref()
+            .is_some_and(|rotation| rotation.worker.is_finished())
+        {
+            self.finish_rotation(states)?;
+        }
+        Ok(())
+    }
+
+    /// Wait for a background rotation, convert still-identical records to its extents,
+    /// and retire the segments it covered.
+    pub fn finish_rotation(&mut self, states: &mut HashMap<StreamId, Stream>) -> io::Result<()> {
+        let Some(Rotation { next, worker }) = self.rotation.take() else {
+            return Ok(());
+        };
+        let written = worker
+            .join()
+            .map_err(|_| io::Error::other("keeper checkpoint worker panicked"))??;
+        for checkpoint in written {
+            if let Some(state) = states.get_mut(&checkpoint.stream) {
+                checkpoint.install(state);
+            }
+        }
+        self.reader = ExtentReader::default();
+        self.retire_segments(next)
+    }
+
+    fn open_next_segment(&mut self) -> io::Result<u64> {
         let next = self
             .sequence
             .checked_add(1)
@@ -296,16 +378,202 @@ impl Wal {
         self.file = new_segment(&self.segments, next)?;
         self.sequence = next;
         self.bytes = 0;
+        Ok(next)
+    }
+
+    fn retire_segments(&self, next: u64) -> io::Result<()> {
         for (_, path) in segments(&self.segments)?.range(..next) {
             fs::remove_file(path)?;
         }
         sync_directory(&self.segments)
     }
 
+    fn stream_dir(&self, stream: StreamId) -> PathBuf {
+        self.streams.join(format!("{:032x}", stream.0))
+    }
+
     pub fn checkpoint_stream(&self, stream: StreamId, state: &mut Stream) -> io::Result<()> {
-        let dir = self.streams.join(format!("{:032x}", stream.0));
-        directories(&dir)?;
-        checkpoint(&dir, self.sequence, state)
+        Snapshot::of(self.stream_dir(stream), stream, state)
+            .write(self.sequence)?
+            .install(state);
+        Ok(())
+    }
+}
+
+impl Drop for Wal {
+    fn drop(&mut self) {
+        // Never leave a checkpoint writer running against a directory that may reopen.
+        if let Some(rotation) = self.rotation.take() {
+            let _ = rotation.worker.join();
+        }
+    }
+}
+
+struct Rotation {
+    /// The first segment written after the rotation began.
+    next: u64,
+    worker: std::thread::JoinHandle<io::Result<Vec<Written>>>,
+}
+
+/// One stream's durable state at a segment boundary: the extent spans of its retained
+/// prefix and the pending suffix that the checkpoint copies to a new extent.
+struct Snapshot {
+    dir: PathBuf,
+    stream: StreamId,
+    deleted: bool,
+    view: StreamView,
+    spans: Vec<Span>,
+    pending: Vec<(Epoch, Bytes)>,
+    /// A retained extent record follows a pending one.
+    unordered: bool,
+}
+
+/// The pending payloads a checkpoint copied into its new extent.
+struct Written {
+    stream: StreamId,
+    sequence: u64,
+    first: Lsn,
+    extent: Option<Arc<Extent>>,
+    copied: Vec<(Bytes, u64, u32, u32)>,
+}
+
+impl Snapshot {
+    fn of(dir: PathBuf, stream: StreamId, state: &Stream) -> Self {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut pending = Vec::new();
+        let mut unordered = false;
+        for (index, record) in state.records.iter().enumerate() {
+            match &record.payload {
+                Payload::Pending(payload) => pending.push((record.epoch, payload.clone())),
+                Payload::Extent { .. } if !pending.is_empty() => unordered = true,
+                Payload::Extent { extent, .. } => {
+                    extend(
+                        &mut spans,
+                        extent.sequence,
+                        Lsn(state.view.floor.0 + index as u64),
+                    );
+                }
+            }
+        }
+        Self {
+            dir,
+            stream,
+            deleted: state.deleted,
+            view: state.view.clone(),
+            spans,
+            pending,
+            unordered,
+        }
+    }
+
+    /// Copy pending records to a new extent, then publish the stream checkpoint.
+    fn write(mut self, sequence: u64) -> io::Result<Written> {
+        if self.unordered {
+            return Err(invalid("pending records are not a suffix"));
+        }
+        directories(&self.dir)?;
+        let retained: u64 = self
+            .spans
+            .iter()
+            .map(|span| span.last.0 - span.first.0 + 1)
+            .sum();
+        let first = Lsn(self.view.floor.0 + retained);
+        let mut copied = Vec::new();
+        let mut extent = None;
+        if !self.pending.is_empty() {
+            let path = extent_path(&self.dir, sequence);
+            atomic_file(&path, |file| {
+                let mut offset = 0;
+                for (index, (epoch, payload)) in self.pending.iter().enumerate() {
+                    let lsn = first.0 + index as u64;
+                    let len = payload.len() as u32;
+                    let crc = crc32fast::hash(payload);
+                    file.write_all(&lsn.to_be_bytes())?;
+                    file.write_all(&epoch.0.to_be_bytes())?;
+                    file.write_all(&len.to_be_bytes())?;
+                    file.write_all(&crc.to_be_bytes())?;
+                    file.write_all(payload)?;
+                    copied.push((payload.clone(), offset + 24, len, crc));
+                    offset += 24 + u64::from(len);
+                }
+                Ok(())
+            })?;
+            extent = Some(Arc::new(Extent { sequence, path }));
+            for index in 0..self.pending.len() {
+                extend(&mut self.spans, sequence, Lsn(first.0 + index as u64));
+            }
+        }
+        let spans = self.spans;
+        let mut body = BytesMut::new();
+        body.put_u64(sequence);
+        body.put_u8(u8::from(self.deleted));
+        put_bytes(&mut body, &codec::encode_checkpoint_view(&self.view)?)?;
+        put_count(&mut body, spans.len())?;
+        for span in &spans {
+            body.put_u64(span.sequence);
+            body.put_u64(span.first.0);
+            body.put_u64(span.last.0);
+        }
+        atomic_file(&self.dir.join("state"), |file| {
+            let length: u32 = body
+                .len()
+                .try_into()
+                .map_err(|_| invalid("stream checkpoint too large"))?;
+            file.write_all(&length.to_be_bytes())?;
+            file.write_all(&crc32fast::hash(&body).to_be_bytes())?;
+            file.write_all(&body)
+        })?;
+        clean_extents(&self.dir, &spans)?;
+        Ok(Written {
+            stream: self.stream,
+            sequence,
+            first,
+            extent,
+            copied,
+        })
+    }
+}
+
+fn extend(spans: &mut Vec<Span>, sequence: u64, lsn: Lsn) {
+    match spans.last_mut() {
+        Some(span) if span.sequence == sequence => span.last = lsn,
+        _ => spans.push(Span {
+            sequence,
+            first: lsn,
+            last: lsn,
+        }),
+    }
+}
+
+impl Written {
+    /// Point the copied records at the extent. A record trimmed since the snapshot is
+    /// skipped. The first record that a later Sync or Delete replaced ends the run, so
+    /// the remaining pending records stay a suffix for the next checkpoint.
+    fn install(self, state: &mut Stream) {
+        state.checkpoint = Some(self.sequence);
+        let Some(extent) = self.extent else { return };
+        for (index, (payload, offset, len, crc)) in self.copied.into_iter().enumerate() {
+            let lsn = self.first.0 + index as u64;
+            let Some(position) = lsn.checked_sub(state.view.floor.0) else {
+                continue;
+            };
+            let Some(record) = state.records.get_mut(position as usize) else {
+                return;
+            };
+            match &record.payload {
+                Payload::Pending(current)
+                    if current.as_ptr() == payload.as_ptr() && current.len() == payload.len() =>
+                {
+                    record.payload = Payload::Extent {
+                        extent: Arc::clone(&extent),
+                        offset,
+                        len,
+                        crc,
+                    };
+                }
+                _ => return,
+            }
+        }
     }
 }
 
@@ -397,81 +665,6 @@ struct Span {
     sequence: u64,
     first: Lsn,
     last: Lsn,
-}
-
-fn checkpoint(dir: &Path, sequence: u64, state: &mut Stream) -> io::Result<()> {
-    let mut spans: Vec<Span> = Vec::new();
-    let mut offsets = Vec::new();
-    let first = state
-        .records
-        .iter()
-        .position(|record| matches!(record.payload, Payload::Pending(_)));
-    if let Some(first) = first {
-        let path = extent_path(dir, sequence);
-        atomic_file(&path, |file| {
-            let mut offset = 0;
-            for (index, record) in state.records.iter().enumerate().skip(first) {
-                let Payload::Pending(payload) = &record.payload else {
-                    return Err(invalid("pending records are not a suffix"));
-                };
-                let lsn = state.view.floor.0 + index as u64;
-                let len = payload.len() as u32;
-                let crc = crc32fast::hash(payload);
-                file.write_all(&lsn.to_be_bytes())?;
-                file.write_all(&record.epoch.0.to_be_bytes())?;
-                file.write_all(&len.to_be_bytes())?;
-                file.write_all(&crc.to_be_bytes())?;
-                file.write_all(payload)?;
-                offsets.push((offset + 24, len, crc));
-                offset += 24 + u64::from(len);
-            }
-            Ok(())
-        })?;
-        let extent = Arc::new(Extent { sequence, path });
-        for (record, (offset, len, crc)) in state.records.iter_mut().skip(first).zip(offsets) {
-            record.payload = Payload::Extent {
-                extent: Arc::clone(&extent),
-                offset,
-                len,
-                crc,
-            };
-        }
-    }
-    for (index, record) in state.records.iter().enumerate() {
-        let Payload::Extent { extent, .. } = &record.payload else {
-            unreachable!()
-        };
-        let lsn = Lsn(state.view.floor.0 + index as u64);
-        match spans.last_mut() {
-            Some(span) if span.sequence == extent.sequence => span.last = lsn,
-            _ => spans.push(Span {
-                sequence: extent.sequence,
-                first: lsn,
-                last: lsn,
-            }),
-        }
-    }
-    let mut body = BytesMut::new();
-    body.put_u64(sequence);
-    body.put_u8(u8::from(state.deleted));
-    put_bytes(&mut body, &codec::encode_checkpoint_view(&state.view)?)?;
-    put_count(&mut body, spans.len())?;
-    for span in &spans {
-        body.put_u64(span.sequence);
-        body.put_u64(span.first.0);
-        body.put_u64(span.last.0);
-    }
-    atomic_file(&dir.join("state"), |file| {
-        let length: u32 = body
-            .len()
-            .try_into()
-            .map_err(|_| invalid("stream checkpoint too large"))?;
-        file.write_all(&length.to_be_bytes())?;
-        file.write_all(&crc32fast::hash(&body).to_be_bytes())?;
-        file.write_all(&body)
-    })?;
-    state.checkpoint = Some(sequence);
-    clean_extents(dir, &spans)
 }
 
 fn clean_extents(dir: &Path, live: &[Span]) -> io::Result<()> {

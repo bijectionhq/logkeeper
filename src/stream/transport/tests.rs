@@ -307,10 +307,9 @@ async fn writer_round_trips_through_three_tls_keepers() {
 
     let url = format!("logkeeper+tls://{}", routes.join(","));
     let open = async |credentials: &Credentials| {
-        let (transport, ensemble) =
-            TcpTransport::discover(&url, credentials, Duration::MAX)
-                .await
-                .unwrap();
+        let (transport, ensemble) = TcpTransport::discover(&url, credentials, Duration::MAX)
+            .await
+            .unwrap();
         Writer::new(Arc::new(transport), ensemble).unwrap()
     };
     let writer = open(&writer_credentials).await;
@@ -363,4 +362,164 @@ async fn writer_round_trips_through_three_tls_keepers() {
     for task in tasks {
         task.await.unwrap().unwrap();
     }
+}
+
+/// Forward TCP connections to `target` and count them.
+async fn counting_proxy(target: SocketAddr) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = accepted.clone();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::spawn(async move {
+                let mut server = TcpStream::connect(target).await?;
+                tokio::io::copy_bidirectional(&mut client, &mut server).await
+            });
+        }
+    });
+    (address, accepted)
+}
+
+#[tokio::test]
+async fn concurrent_calls_share_one_connection_and_batches_authorize_each_request() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    const CALLS: usize = 256;
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let roots = dir.join("ca.pem");
+    let root = ca(&roots);
+    let keeper = uuid::Uuid::from_u128(7);
+    let id = KeeperId(keeper.as_u128());
+    let tls = credentials(
+        dir,
+        "keeper",
+        &format!("{KEEPER_URI}{keeper}"),
+        ExtendedKeyUsagePurpose::ServerAuth,
+        &root,
+        &roots,
+    );
+    let writer = credentials(
+        dir,
+        "writer",
+        CLIENT,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &root,
+        &roots,
+    );
+    let reader = credentials(
+        dir,
+        "reader",
+        READ_ONLY,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &root,
+        &roots,
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen = listener.local_addr().unwrap();
+    let limits = Limits {
+        max_record_bytes: 4 * 1024 * 1024,
+        ..Limits::default()
+    };
+    let config = Config {
+        keeper,
+        listen,
+        data: dir.join("data"),
+        zone: "test-zone".into(),
+        tls,
+        clients: vec![CLIENT.into(), READ_ONLY.into()],
+        writers: vec![CLIENT.into()],
+        limits,
+    };
+    let stop = CancellationToken::new();
+    let task = tokio::spawn(config.serve(listener, stop.clone()));
+    let (proxy, accepted) = counting_proxy(listen).await;
+    let deadline = Duration::from_secs(30);
+    let transport = TcpTransport::new(&writer, [(id, proxy.to_string())], deadline).unwrap();
+    let ensemble = [id, KeeperId(2), KeeperId(3)];
+
+    let replies = futures::future::join_all((0..CALLS).map(|n| {
+        let stream = StreamId(1000 + n as u128);
+        transport.call(id, Request::Create { stream, ensemble })
+    }))
+    .await;
+    assert!(replies.iter().all(|reply| reply == &Ok(Reply::Created)));
+    assert_eq!(
+        accepted.load(Relaxed),
+        1,
+        "{CALLS} concurrent calls must share one keeper connection"
+    );
+
+    // Negative control: requests over the shared-connection size use exclusive channels.
+    let large = Bytes::from(vec![0; SHARED_REQUEST_BYTES]);
+    let before = accepted.load(Relaxed);
+    let replies = futures::future::join_all((0..8).map(|n| {
+        transport.call(
+            id,
+            Request::Append {
+                stream: StreamId(1000 + n),
+                epoch: Epoch(1),
+                at: Lsn(1),
+                records: vec![large.clone()],
+                head: Lsn(0),
+            },
+        )
+    }))
+    .await;
+    assert!(replies.iter().all(Result::is_ok));
+    assert!(
+        accepted.load(Relaxed) - before > 1,
+        "concurrent exclusive calls should have opened several connections"
+    );
+
+    let stream = StreamId(1000);
+    let observer = TcpTransport::new(&reader, [(id, proxy.to_string())], deadline).unwrap();
+    assert_eq!(
+        observer
+            .call(
+                id,
+                Request::Batch(vec![
+                    Request::Check {
+                        stream,
+                        epoch: Epoch(0)
+                    },
+                    Request::Seal {
+                        stream,
+                        ensemble,
+                        epoch: Epoch(1)
+                    },
+                    Request::Read {
+                        stream,
+                        from: Lsn(1),
+                        max: 1,
+                        wait_ms: 0
+                    },
+                ])
+            )
+            .await
+            .unwrap(),
+        Reply::Batch(vec![
+            Reply::Checked(StreamView {
+                promised: None,
+                synced: None,
+                tail: Lsn(0),
+                head: Lsn(0),
+                floor: Lsn(1),
+                runs: Vec::new(),
+                ensemble,
+                learner: false,
+            }),
+            Reply::Refused(Refusal::Unauthorized),
+            Reply::Records {
+                floor: Lsn(1),
+                records: Vec::new(),
+                head: Lsn(0)
+            },
+        ]),
+        "a read-only identity must be refused per request inside a batch"
+    );
+    stop.cancel();
+    task.await.unwrap().unwrap();
 }

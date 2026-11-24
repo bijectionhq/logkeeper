@@ -20,6 +20,13 @@ use super::{
 };
 
 type Sender = oneshot::Sender<Result<Lsn>>;
+
+/// Bounds on the contiguous pending records one lane sends in a single keeper append.
+/// A batch below the transport's shared-connection threshold is coalesced with other streams.
+pub(super) const APPEND_RECORDS: usize = 1024;
+const APPEND_BYTES: usize = 512 * 1024;
+/// Committed payloads kept for lanes that have not yet accepted them, per stream.
+const RETAIN_BYTES: usize = 1024 * 1024;
 type Observation = watch::Receiver<Option<Result<Lsn>>>;
 
 pub(super) struct Active {
@@ -38,6 +45,9 @@ struct State {
     head: Lsn,
     floor: Lsn,
     pending: BTreeMap<Lsn, Pending>,
+    /// Chosen payloads that some lane may still need. Bounded by `RETAIN_BYTES`.
+    committed: BTreeMap<Lsn, Bytes>,
+    committed_bytes: usize,
     lanes: [Lane; 3],
     revision: u64,
     serial: u64,
@@ -66,9 +76,12 @@ struct Pending {
 enum Work {
     Sync(Lsn),
     InstallFloor(Lsn),
+    /// `payloads` is the contiguous known run from `at`, or `None` to fetch up to
+    /// `limit` committed records that this lane lacks.
     Append {
         at: Lsn,
-        payload: Option<Bytes>,
+        payloads: Option<Vec<Bytes>>,
+        limit: usize,
         head: Lsn,
     },
     Publish(Lsn),
@@ -87,6 +100,8 @@ impl Active {
                 head: recovery.tail(),
                 floor: recovery.floor,
                 pending: BTreeMap::new(),
+                committed: BTreeMap::new(),
+                committed_bytes: 0,
                 lanes: std::array::from_fn(|_| Lane::default()),
                 revision: 0,
                 serial: 0,
@@ -249,7 +264,7 @@ impl Active {
             accepted
                 .into_iter()
                 .flatten()
-                .map(|keeper| self.send_append(keeper, at, payload.clone(), at)),
+                .map(|keeper| self.send_append(keeper, at, vec![payload.clone()], at)),
         ))
         .await
         .map(|_| at)
@@ -313,15 +328,37 @@ impl Active {
                     .await
                     .map(Some)
             }
-            Work::Append { at, payload, head } => {
-                let payload = match payload {
-                    Some(payload) => payload,
-                    None => self.fetch_committed(at, index).await?,
+            Work::Append {
+                at,
+                payloads,
+                limit,
+                head,
+            } => {
+                let (payloads, head) = match payloads {
+                    Some(payloads) => (payloads, head),
+                    None => {
+                        let run = self.fetch_committed(at, index, limit).await?;
+                        // The fetched run is committed. Lane bookkeeping keeps the lower
+                        // `head` from the work item, which costs at most an extra publish.
+                        let last = Lsn(at.0 + run.len() as u64 - 1);
+                        (run, self.state.lock().head.min(last).max(head))
+                    }
                 };
+                let last = Lsn(at.0 + payloads.len() as u64 - 1);
                 let observed = self.observe(index);
-                let result = self.send_append(keeper, at, payload, head).await;
+                let result = self.send_append(keeper, at, payloads, head).await;
                 observed.send_replace(Some(result.clone()));
-                result.map(|_| Some(at))
+                // After a lost reply the keeper can already hold more of this writer's
+                // records than the retry carried. Positions are never reassigned within
+                // an epoch, so its tail is accepted up to the highest known position.
+                let known = {
+                    let state = self.state.lock();
+                    state
+                        .pending
+                        .last_key_value()
+                        .map_or(state.head, |(at, _)| *at)
+                };
+                result.map(|tail| Some(tail.min(known).max(last)))
             }
             Work::Publish(head) => {
                 let observed = self.observe(index);
@@ -341,23 +378,25 @@ impl Active {
         send
     }
 
-    async fn fetch_committed(&self, at: Lsn, index: usize) -> Result<Bytes> {
-        let source = {
+    /// Fetch a contiguous committed run from `at`, up to the writer's head.
+    async fn fetch_committed(&self, at: Lsn, index: usize, limit: usize) -> Result<Vec<Bytes>> {
+        let (source, max) = {
             let state = self.state.lock();
             if at < state.floor {
                 return Err(JournalError::Trimmed { floor: state.floor });
             }
-            std::array::from_fn::<_, 3, _>(|i| {
+            let committed = (state.head.0 - at.0 + 1).min(limit.max(1) as u64);
+            let source = std::array::from_fn::<_, 3, _>(|i| {
                 (i != index && state.lanes[i].accepted.is_some_and(|tail| tail >= at))
-                    .then_some(self.ensemble[i])
-            })
+                    .then(|| (self.ensemble[i], state.lanes[i].accepted.unwrap()))
+            });
+            (source, committed)
         };
-        let mut fetches = FuturesUnordered::from_iter(
-            source
-                .into_iter()
-                .flatten()
-                .map(|keeper| recovery::fetch(&self.io, keeper, self.stream, self.epoch, at)),
-        );
+        let mut fetches =
+            FuturesUnordered::from_iter(source.into_iter().flatten().map(|(keeper, accepted)| {
+                let max = max.min(accepted.0 - at.0 + 1) as u32;
+                recovery::fetch_run(&self.io, keeper, self.stream, self.epoch, at, max)
+            }));
         while let Some(result) = fetches.next().await {
             if let Ok(payload) = result {
                 return Ok(payload);
@@ -370,9 +409,10 @@ impl Active {
         &self,
         keeper: KeeperId,
         at: Lsn,
-        payload: Bytes,
+        records: Vec<Bytes>,
         head: Lsn,
     ) -> Result<Lsn> {
+        let last = Lsn(at.0 + records.len() as u64 - 1);
         match self
             .io
             .call(
@@ -381,20 +421,20 @@ impl Active {
                     stream: self.stream,
                     epoch: self.epoch,
                     at,
-                    records: vec![payload],
+                    records,
                     head,
                 },
             )
             .await?
         {
-            Reply::Appended { tail } if tail >= at => Ok(tail),
+            Reply::Appended { tail } if tail >= last => Ok(tail),
             _ => Err(JournalError::Unavailable),
         }
     }
 }
 
 impl State {
-    fn work(&self, index: usize) -> Option<Work> {
+    fn work(&self, index: usize, records: usize) -> Option<Work> {
         let lane = &self.lanes[index];
         if self.closed.is_some()
             || lane
@@ -414,18 +454,64 @@ impl State {
         if lane.floor.is_none_or(|floor| floor < self.floor) {
             return Some(Work::InstallFloor(self.floor));
         }
-        let pending = self.pending.get(&at);
-        if pending.is_some() || at <= self.head {
+        if self.pending.contains_key(&at) || at <= self.head {
+            // A retry after an uncertain outcome carries one record. The keeper verifies
+            // it against its history instead of refusing a range that overlaps its tail.
+            let limit = if lane.failure.is_some() { 1 } else { records };
+            let payloads = Some(self.run_from(at, limit)).filter(|run| !run.is_empty());
+            let last = Lsn(at.0 + payloads.as_ref().map_or(1, Vec::len) as u64 - 1);
             return Some(Work::Append {
                 at,
-                payload: pending.map(|p| p.payload.clone()),
-                head: self.head.min(at),
+                payloads,
+                limit,
+                head: self.head.min(last),
             });
         }
         if lane.published.is_none_or(|published| published < self.head) {
             return Some(Work::Publish(self.head));
         }
         None
+    }
+
+    /// The contiguous retained and pending payloads from `at`, within one append's bounds.
+    fn run_from(&self, at: Lsn, records: usize) -> Vec<Bytes> {
+        let mut bytes = 0;
+        let mut next = at;
+        let mut payloads = Vec::new();
+        let known = self
+            .committed
+            .range(at..)
+            .chain(self.pending.range(at..).map(|(lsn, p)| (lsn, &p.payload)));
+        for (&lsn, payload) in known {
+            if lsn != next
+                || payloads.len() == records.max(1)
+                || (!payloads.is_empty() && bytes + payload.len() > APPEND_BYTES)
+            {
+                break;
+            }
+            bytes += payload.len();
+            payloads.push(payload.clone());
+            next = Lsn(lsn.0 + 1);
+        }
+        payloads
+    }
+
+    /// Forget committed payloads that every lane has accepted, that lie below the floor,
+    /// or that exceed the retention bound. A lane that still needs them fetches them.
+    fn release_committed(&mut self) {
+        let accepted = self
+            .lanes
+            .iter()
+            .map(|lane| lane.accepted.unwrap_or(Lsn(0)))
+            .min()
+            .unwrap();
+        while let Some((&lsn, payload)) = self.committed.first_key_value() {
+            if lsn > accepted && lsn >= self.floor && self.committed_bytes <= RETAIN_BYTES {
+                break;
+            }
+            self.committed_bytes -= payload.len();
+            self.committed.pop_first();
+        }
     }
 
     fn impossible(&self, at: Lsn) -> Option<JournalError> {
@@ -472,8 +558,12 @@ impl State {
                 break;
             }
             self.head = at;
-            notify(&mut self.pending.pop_first().unwrap().1, Ok(at));
+            let mut pending = self.pending.pop_first().unwrap().1;
+            notify(&mut pending, Ok(at));
+            self.committed_bytes += pending.payload.len();
+            self.committed.insert(at, pending.payload);
         }
+        self.release_committed();
     }
 
     fn fail_waiters(&mut self) {
@@ -531,6 +621,8 @@ mod tests {
             head: Lsn(3),
             floor: Lsn(1),
             pending: BTreeMap::new(),
+            committed: BTreeMap::new(),
+            committed_bytes: 0,
             lanes: [
                 Lane {
                     accepted: Some(Lsn(4)),
@@ -583,7 +675,7 @@ async fn replicate(active: Weak<Active>, index: usize, mut change: watch::Receiv
         };
         let (work, revision) = {
             let state = current.state.lock();
-            (state.work(index), state.revision)
+            (state.work(index, current.io.append_records), state.revision)
         };
         let Some(work) = work else {
             drop(current);

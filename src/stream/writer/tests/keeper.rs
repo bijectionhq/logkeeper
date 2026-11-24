@@ -42,6 +42,7 @@ impl Kind {
             Request::Read { wait_ms, .. } if *wait_ms > 0 => Self::Poll,
             Request::Read { .. } => Self::Read,
             Request::Delete { .. } => Self::Delete,
+            Request::Batch(_) => unreachable!("the writer issues single requests"),
         }
     }
 }

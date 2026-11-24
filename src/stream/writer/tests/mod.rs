@@ -404,7 +404,8 @@ async fn append_pipeline_advances_without_waiting_for_a_slow_third_keeper() {
         (Ok(Lsn(1)), Ok(Lsn(2)))
     );
     gate.reached().await;
-    assert_eq!(network.view(KEEPERS[2], STREAM).unwrap().tail, Lsn(1));
+    // Both pending records travel in the slow keeper's single held append.
+    assert_eq!(network.view(KEEPERS[2], STREAM).unwrap().tail, Lsn(2));
     gate.release();
     network
         .until(|| network.view(KEEPERS[2], STREAM).unwrap().tail == Lsn(2))
@@ -916,4 +917,135 @@ async fn read_assembles_a_page_across_keeper_frames() {
         .expect("complete page across keeper frames");
     assert_eq!(page.head, Lsn(2));
     assert_eq!(page.records, [(Lsn(1), payload.clone()), (Lsn(2), payload)]);
+}
+
+/// Seal a fresh stream with a writer whose lanes send at most `records` per append.
+async fn started_with_append_records(records: usize) -> (Arc<Network>, Writer) {
+    let network = Arc::new(Network::default());
+    let writer = writer(&network, 1).with_append_records(records);
+    writer.create(STREAM).await.unwrap();
+    assert_eq!(writer.seal(STREAM, E1).await, Ok(Lsn(0)));
+    (network, writer)
+}
+
+async fn data_appends_for_a_batch(records: usize) -> usize {
+    const BATCH: u64 = 32;
+    let (network, writer) = started_with_append_records(records).await;
+    let before = network.calls(Kind::Append).len();
+    let acks =
+        join_all((1..=BATCH).map(|at| writer.append(STREAM, E1, Lsn(at), record("batch")))).await;
+    assert_eq!(acks, (1..=BATCH).map(|at| Ok(Lsn(at))).collect::<Vec<_>>());
+    network.calls(Kind::Append).len() - before
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_appends_to_one_stream_share_one_keeper_append_per_lane() {
+    let shared = data_appends_for_a_batch(super::append::APPEND_RECORDS).await;
+    assert!(
+        shared <= 2 * KEEPERS[..3].len(),
+        "32 concurrent appends used {shared} data appends"
+    );
+    // Negative control: one record per keeper append costs one round per record.
+    let single = data_appends_for_a_batch(1).await;
+    assert!(
+        single >= 32 * 2,
+        "the unbatched control used only {single} data appends"
+    );
+}
+
+/// The observer's first round samples tail 1 while keeper 2's view is held. Before
+/// the next round, keepers 0 and 1 publish head 1 and accept record 2, so a new
+/// tail is always ahead of every published head, as under continuous writes.
+async fn observer_head_while_tails_lead(
+    index: super::head::Index,
+) -> journal_contract::Result<Lsn> {
+    use crate::stream::wire::{Reply, Request, Transport};
+
+    let (network, _writer) = started().await;
+    let raw = network.client(1);
+    let append = |at: u64, head: u64| Request::Append {
+        stream: STREAM,
+        epoch: E1,
+        at: Lsn(at),
+        records: vec![record("lead")],
+        head: Lsn(head),
+    };
+    for keeper in &KEEPERS[..2] {
+        assert_eq!(
+            raw.call(*keeper, append(1, 0)).await,
+            Ok(Reply::Appended { tail: Lsn(1) })
+        );
+    }
+    let gate = Gate::new();
+    network.fault(KEEPERS[2], Kind::Check, Fault::HoldReply(gate.clone()));
+    let observer = writer(&network, 9);
+    let stream = observer.stream(STREAM);
+    let head = super::head::observe(&observer.io, &stream, index);
+    tokio::pin!(head);
+    tokio::select! {
+        _ = &mut head => panic!("observer finished before its first round completed"),
+        _ = gate.reached() => {}
+    }
+    for keeper in &KEEPERS[..2] {
+        assert_eq!(
+            raw.call(*keeper, append(2, 1)).await,
+            Ok(Reply::Appended { tail: Lsn(2) })
+        );
+    }
+    gate.release();
+    head.await
+}
+
+#[tokio::test(start_paused = true)]
+async fn observer_head_pins_its_read_index_while_appends_continue() {
+    assert_eq!(
+        observer_head_while_tails_lead(super::head::Index::Pinned).await,
+        Ok(Lsn(1))
+    );
+    // Negative control: resampling the tail each round chases the newest append.
+    assert_eq!(
+        observer_head_while_tails_lead(super::head::Index::Resampled).await,
+        Err(JournalError::Unavailable)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lane_retry_after_a_lost_batched_reply_resumes_from_the_keeper_tail() {
+    use crate::stream::wire::{Refusal, Reply, Request, Transport};
+
+    let (network, writer) = started().await;
+    let [lost, down, survivor] = KEEPERS[..3].try_into().unwrap();
+    network.fault(lost, Kind::Append, Fault::LoseReply);
+    let first = join_all((1..=4).map(|at| writer.append(STREAM, E1, Lsn(at), record("one")))).await;
+    assert_eq!(first, (1..=4).map(|at| Ok(Lsn(at))).collect::<Vec<_>>());
+    network
+        .until(|| network.view(lost, STREAM).unwrap().tail == Lsn(4))
+        .await;
+
+    // Negative control: the keeper refuses a retry that overlaps its tail and extends it.
+    let raw = network.client(1);
+    let retry = |records: usize| Request::Append {
+        stream: STREAM,
+        epoch: E1,
+        at: Lsn(1),
+        records: vec![record("one"); records],
+        head: Lsn(0),
+    };
+    assert!(matches!(
+        raw.call(lost, retry(8)).await,
+        Ok(Reply::Refused(Refusal::Conflict { .. }))
+    ));
+    assert_eq!(
+        raw.call(lost, retry(1)).await,
+        Ok(Reply::Appended { tail: Lsn(4) })
+    );
+
+    // The lost keeper is now needed for a quorum. Its lane must not resend 1..=8.
+    network.down(down, true);
+    let second =
+        join_all((5..=8).map(|at| writer.append(STREAM, E1, Lsn(at), record("two")))).await;
+    assert_eq!(second, (5..=8).map(|at| Ok(Lsn(at))).collect::<Vec<_>>());
+    for keeper in [lost, survivor] {
+        assert_eq!(network.view(keeper, STREAM).unwrap().tail, Lsn(8));
+    }
 }

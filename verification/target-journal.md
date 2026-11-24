@@ -101,6 +101,7 @@ requests require writer authorization.
 | `Read { stream: StreamId, from: Lsn, max: u32, wait_ms: u32 }` | Read retained committed records up to the local head. A page can stop early at the wire byte limit. When the start is past the head and `max` is positive, wait up to `wait_ms`. |
 | `Delete { stream: StreamId, ensemble: [KeeperId; 3] }` | Require the current ensemble and membership. Install a permanent tombstone and rotate the WAL before replying. |
 | `Replace { stream: StreamId, epoch: Epoch, from: [KeeperId; 3], to: [KeeperId; 3] }` | Require the promise and a completed Sync. Install a valid ensemble differing in one slot, with the keeper a member of the new ensemble. The proposer installs both survivors before installing the learner. |
+| `Batch(Vec<Request>)` | A node-level envelope of independent single-stream requests from one client process. Authorize each request separately. Admit every authorized request to the same round, decide them in arrival order and reply after that round's single sync. Each request keeps its own rule, refusal and fence. Refuse an empty or nested batch. |
 
 ### Replies
 
@@ -116,6 +117,7 @@ requests require writer authorization.
 | `Deleted` | The stream has a durable tombstone. |
 | `Replaced` | The keeper has installed the new ensemble. |
 | `Refused(Refusal)` | The keeper refused the request. |
+| `Batch(Vec<Reply>)` | One reply for each request of a `Batch`, in request order. |
 
 ### Refusals
 
@@ -141,15 +143,24 @@ requests require writer authorization.
   history with complete `Sync` on a quorum. Publish the adopted head to a
   quorum before returning it. Retry the selected history at the same epoch
   after an uncertain result.
-- **Append.** Pipeline independent keeper lanes. Two durable acceptances at
-  the writer's epoch choose the record. Publish the head to a quorum before
-  acknowledging the append, using the head on subsequent or empty appends.
+- **Append.** Pipeline independent keeper lanes. Each lane sends the
+  contiguous run of known records from its tail in one `Append`, so
+  concurrent appends to one stream share a keeper round. The writer keeps
+  committed payloads, within a byte bound, until every lane has accepted
+  them. After an uncertain result a lane resends one record, and adopts the
+  keeper's tail up to the highest position the writer has assigned. Two
+  durable acceptances at the writer's epoch choose the record. Publish the
+  head to a quorum before acknowledging the append, using the head on
+  subsequent or empty appends.
 - **Head.** Open a fresh `Check` round after the invocation and batch callers
   waiting when it opens. A writer can use append replies from requests sent
   after the round opened. It covers the sampled tails with a chosen head and
-  confirms publication. An observer takes the maximum tail in an eligible
-  set at the same promise and synced epoch and requires quorum head coverage
-  for that position. The freshness and quorum rules use no leases.
+  confirms publication. An observer's read index is the maximum tail of an
+  eligible quorum at the same promise and synced epoch, from its first
+  complete round. It requires quorum head coverage for that position and
+  returns it. Later rounds wait for coverage of the same index and do not
+  resample it, so continuing appends cannot starve the call. The freshness
+  and quorum rules use no leases.
 - **Read.** Try the nearest keeper first. Each successful page comes from
   one keeper, with the first reply's head bounding any subsequent chunks.
   Fall back if the keeper cannot supply the requested records. TCP discovery
@@ -167,17 +178,28 @@ requests require writer authorization.
   `TransportError` (`Unreachable`, `TimedOut`, or `Protocol(String)`).
   TLS uses `logkeeper-stream/2`. A big-endian u32 length prefixes each
   protobuf request or reply. The payload limit for a frame is 64 MiB.
+  A process shares one long-lived connection per keeper among all its
+  streams. Requests queued while a frame is written are coalesced into one
+  `Batch`, up to 4 MiB, and frames are pipelined. The keeper decides a
+  connection's frames concurrently and answers them in frame order. Waiting
+  reads and requests of 1 MiB or more use separate pooled connections, so
+  they never delay the shared connection's replies.
 
 ### Keeper storage
 
 One append-only segmented WAL per keeper carries all streams. A frame records
-length, CRC, stream and fragment boundaries. Each round processes up to
-`round_requests` queued requests and uses at most `round_bytes_per_stream`
+length, CRC, stream and fragment boundaries. A round admits whole
+queued envelopes until it holds at least `round_requests` requests, so a
+batch is never split across rounds. It uses at most `round_bytes_per_stream`
 WAL bytes per stream. Both limits are configured. Large entries span rounds.
 One write and sync cover the round's mutations. Recovery cuts a torn final
 frame, discards incomplete entries and demultiplexes by stream. Segment
 rotation copies changed retained records to per-stream extents, persists
-checkpoints and retires old segments. Delete forces rotation. Each stream
+checkpoints and retires old segments. A full segment rotates in the
+background: rounds continue in the next segment while a worker writes each
+dirty stream's checkpoint as of the boundary, and the old segments are
+retired only after every checkpoint is durable. Delete forces a synchronous
+rotation. Each stream
 has a static quota. Trim can advance the floor without available quota.
 
 ## 4. What the consumer (RTDB) owns, for reference

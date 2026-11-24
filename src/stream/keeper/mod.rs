@@ -54,7 +54,8 @@ impl SealPolicy for Allow {
 
 #[derive(Clone)]
 pub struct Keeper {
-    work: mpsc::Sender<Work>,
+    /// Each item is one envelope: a single request, or every request of a batch.
+    work: mpsc::Sender<Vec<Work>>,
 }
 
 impl Keeper {
@@ -69,21 +70,15 @@ impl Keeper {
         policy: Arc<dyn SealPolicy>,
     ) -> io::Result<Self> {
         let mut engine = Engine::open(path, keeper, limits, policy)?;
-        let (work, mut incoming) = mpsc::channel::<Work>(limits.round_requests);
+        let (work, mut incoming) = mpsc::channel::<Vec<Work>>(limits.round_requests);
         std::thread::Builder::new()
             .name("stream-keeper-wal".into())
             .spawn(move || {
                 while let Some(first) = incoming.blocking_recv() {
-                    if first.is_mutation() {
+                    if first.iter().any(Work::is_mutation) {
                         std::thread::sleep(Duration::from_micros(200));
                     }
-                    let mut pending = VecDeque::from([first]);
-                    while pending.len() < limits.round_requests {
-                        let Ok(work) = incoming.try_recv() else {
-                            break;
-                        };
-                        pending.push_back(work);
-                    }
+                    let pending = admit(first, &mut incoming, limits.round_requests);
                     if let Err(error) = engine.process(pending) {
                         eprintln!("stream keeper WAL stopped: {error}");
                         return;
@@ -93,27 +88,55 @@ impl Keeper {
         Ok(Self { work })
     }
 
-    /// Process one request from an already authenticated identity.
-    pub async fn call(&self, identity: &Identity, mut request: Request) -> CallResult {
+    /// Process one request from an already authenticated identity. A `Batch` is
+    /// admitted to a single round and answered with one reply per request, in order.
+    pub async fn call(&self, identity: &Identity, request: Request) -> CallResult {
         if identity.as_str().is_empty() || identity.as_str().len() > MAX_IDENTITY_BYTES {
             return Ok(Reply::Refused(Refusal::Unauthorized));
         }
+        let Request::Batch(requests) = request else {
+            let (work, result) = Work::new(identity, request.clone());
+            self.work
+                .send(vec![work])
+                .await
+                .map_err(|_| TransportError::Unreachable)?;
+            return self.finish(identity, request, result).await;
+        };
+        if requests.is_empty() || requests.iter().any(|r| matches!(r, Request::Batch(_))) {
+            return Ok(Reply::Refused(Refusal::Unauthorized));
+        }
+        let (works, results): (Vec<_>, Vec<_>) = requests
+            .iter()
+            .map(|request| Work::new(identity, request.clone()))
+            .unzip();
+        self.work
+            .send(works)
+            .await
+            .map_err(|_| TransportError::Unreachable)?;
+        let replies = futures::future::join_all(
+            requests
+                .into_iter()
+                .zip(results)
+                .map(|(request, result)| self.finish(identity, request, result)),
+        )
+        .await;
+        Ok(Reply::Batch(replies.into_iter().collect::<Result<_, _>>()?))
+    }
+
+    /// Wait for a request's first decision. A waiting read resubmits itself alone.
+    async fn finish(
+        &self,
+        identity: &Identity,
+        mut request: Request,
+        result: oneshot::Receiver<Response>,
+    ) -> CallResult {
         let wait = match request {
             Request::Read { wait_ms, .. } => Duration::from_millis(u64::from(wait_ms)),
             _ => Duration::ZERO,
         };
         let deadline = tokio::time::Instant::now() + wait;
+        let mut result = result;
         loop {
-            let (done, result) = oneshot::channel();
-            self.work
-                .send(Work {
-                    identity: identity.clone(),
-                    request: request.clone(),
-                    done,
-                    pending: None,
-                })
-                .await
-                .map_err(|_| TransportError::Unreachable)?;
             let (reply, changed) = result.await.map_err(|_| TransportError::Unreachable)?;
             let Some(mut changed) = changed else {
                 return reply;
@@ -128,8 +151,31 @@ impl Keeper {
                     }
                 }
             }
+            let (work, next) = Work::new(identity, request.clone());
+            self.work
+                .send(vec![work])
+                .await
+                .map_err(|_| TransportError::Unreachable)?;
+            result = next;
         }
     }
+}
+
+/// A round admits whole envelopes until it holds `round_requests` requests, so every
+/// request of a batch is decided and synced in the same round.
+fn admit(
+    first: Vec<Work>,
+    incoming: &mut mpsc::Receiver<Vec<Work>>,
+    round_requests: usize,
+) -> VecDeque<Work> {
+    let mut pending = VecDeque::from(first);
+    while pending.len() < round_requests {
+        let Ok(work) = incoming.try_recv() else {
+            break;
+        };
+        pending.extend(work);
+    }
+    pending
 }
 
 type Response = (CallResult, Option<watch::Receiver<()>>);
@@ -143,6 +189,17 @@ struct Work {
 }
 
 impl Work {
+    fn new(identity: &Identity, request: Request) -> (Self, oneshot::Receiver<Response>) {
+        let (done, result) = oneshot::channel();
+        let work = Self {
+            identity: identity.clone(),
+            request,
+            done,
+            pending: None,
+        };
+        (work, result)
+    }
+
     fn seal_identity(&self) -> Option<&Identity> {
         matches!(self.request, Request::Seal { .. }).then_some(&self.identity)
     }
@@ -195,8 +252,11 @@ impl Engine {
         while !pending.is_empty() {
             self.round(&mut pending, &mut deletions)?;
         }
-        if !deletions.is_empty() || self.wal.bytes >= wal::SEGMENT_BYTES {
+        self.wal.poll_rotation(&mut self.streams)?;
+        if !deletions.is_empty() {
             self.wal.rotate(&mut self.streams)?;
+        } else if self.wal.bytes >= wal::SEGMENT_BYTES {
+            self.wal.start_rotation(&self.streams)?;
         }
         for done in deletions {
             let _ = done.send((Ok(Reply::Deleted), None));
@@ -320,6 +380,6 @@ impl Engine {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod simulation;
+#[cfg(test)]
+mod tests;

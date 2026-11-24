@@ -202,6 +202,42 @@ pub(super) async fn fetch(
     }
 }
 
+/// Fetch up to `max` contiguous retained records from `from` that the caller knows
+/// are committed, so a lagging lane can catch up with one append.
+pub(super) async fn fetch_run(
+    io: &Io,
+    keeper: KeeperId,
+    stream: StreamId,
+    epoch: Epoch,
+    from: Lsn,
+    max: u32,
+) -> Result<Vec<Bytes>> {
+    match io
+        .call(
+            keeper,
+            Request::Recover {
+                stream,
+                epoch,
+                from,
+                max,
+            },
+        )
+        .await?
+    {
+        Reply::Records { records, .. }
+            if !records.is_empty()
+                && records.len() <= max as usize
+                && records
+                    .iter()
+                    .enumerate()
+                    .all(|(i, (lsn, _))| lsn.0 == from.0 + i as u64) =>
+        {
+            Ok(records.into_iter().map(|(_, payload)| payload).collect())
+        }
+        _ => Err(JournalError::Unavailable),
+    }
+}
+
 async fn seal(
     io: &Io,
     keeper: KeeperId,

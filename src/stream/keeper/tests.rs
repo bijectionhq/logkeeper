@@ -718,8 +718,13 @@ async fn read_waits_for_commit_and_times_out_at_the_end() {
     test.send(append(A, 1, 1, &[b"x"], 0));
     let (work, mut incoming) = mpsc::channel(1);
     let keeper = Keeper { work };
-    let process_read = |test: &mut Harness, incoming: &mut mpsc::Receiver<Work>, wait_ms, check| {
-        let work = incoming.try_recv().expect(check);
+    let process_read = |test: &mut Harness,
+                        incoming: &mut mpsc::Receiver<Vec<Work>>,
+                        wait_ms,
+                        check| {
+        let mut envelope = incoming.try_recv().expect(check);
+        assert_eq!(envelope.len(), 1, "a read is resubmitted alone");
+        let work = envelope.pop().unwrap();
         assert!(matches!(work.request, Request::Read { wait_ms: actual, .. } if actual == wait_ms));
         test.engine.process(VecDeque::from([work])).unwrap();
     };
@@ -741,7 +746,12 @@ async fn read_waits_for_commit_and_times_out_at_the_end() {
         Reply::Appended { tail: Lsn(1) }
     );
     assert!(poll!(waiting.as_mut()).is_pending());
-    process_read(&mut test, &mut incoming, WAIT_MS, "read did not recheck after commit");
+    process_read(
+        &mut test,
+        &mut incoming,
+        WAIT_MS,
+        "read did not recheck after commit",
+    );
     assert_eq!(waiting.await.unwrap(), page(1, 1, &[(1, b"x")]));
 
     let mut expiring = std::pin::pin!(keeper.call(&CLIENT, read(2)));
@@ -753,7 +763,12 @@ async fn read_waits_for_commit_and_times_out_at_the_end() {
     assert!(incoming.is_empty(), "read resampled before deadline");
     tokio::time::advance(Duration::from_millis(1)).await;
     assert!(poll!(expiring.as_mut()).is_pending());
-    process_read(&mut test, &mut incoming, 0, "read did not recheck at the deadline");
+    process_read(
+        &mut test,
+        &mut incoming,
+        0,
+        "read did not recheck at the deadline",
+    );
     assert_eq!(expiring.await.unwrap(), page(1, 1, &[]));
 }
 
@@ -909,10 +924,18 @@ async fn sweeper_restores_an_absent_survivor_from_one_durable_copy() {
         epoch: Epoch(2),
     };
     let keeper = transport.0.remove(&source).unwrap();
-    let unreachable = Sweep { survivors: [absent, source], ..plan };
-    let [(_, outcome)] = sweep_idle(&transport, [unreachable]).await.try_into().unwrap();
-    assert!(matches!(outcome, Err(SweepError::Transport { keeper, .. }) if keeper == source),
-        "an absent survivor must not mask an unreachable source: {outcome:?}");
+    let unreachable = Sweep {
+        survivors: [absent, source],
+        ..plan
+    };
+    let [(_, outcome)] = sweep_idle(&transport, [unreachable])
+        .await
+        .try_into()
+        .unwrap();
+    assert!(
+        matches!(outcome, Err(SweepError::Transport { keeper, .. }) if keeper == source),
+        "an absent survivor must not mask an unreachable source: {outcome:?}"
+    );
     transport.0.insert(source, keeper);
     let [(_, outcome)] = sweep_idle(&transport, [plan]).await.try_into().unwrap();
     assert!(
@@ -1091,7 +1114,10 @@ async fn replacement_fences_stale_routes_and_resumes_a_split_install() {
     let Reply::Checked(second) = transport.call(MEMBERS[1], check(A)).await.unwrap() else {
         panic!("missing second survivor")
     };
-    assert_eq!(second.ensemble, MEMBERS, "the second survivor already moved");
+    assert_eq!(
+        second.ensemble, MEMBERS,
+        "the second survivor already moved"
+    );
     let Reply::Checked(view) = transport.call(learner, check(A)).await.unwrap() else {
         panic!("missing learner")
     };
@@ -1193,4 +1219,190 @@ fn replacement_ensemble_survives_wal_recovery() {
         reopened.send(delete(A)),
         Reply::Refused(Refusal::WrongEnsemble { ensemble: new })
     );
+}
+
+/// Feed envelopes through the WAL thread's admission and count the synced rounds.
+fn rounds_for_envelopes(batched: bool) -> usize {
+    const STREAMS: u128 = 10;
+    let limits = Limits {
+        round_requests: 4,
+        ..Limits::default()
+    };
+    let mut test = Harness::new(limits);
+    let streams: Vec<_> = (1..=STREAMS).map(|id| StreamId(100 + id)).collect();
+    for &stream in &streams {
+        test.writer(stream);
+    }
+    let before = test.engine.wal.rounds.len();
+    let (works, mut results): (Vec<_>, Vec<_>) = streams
+        .iter()
+        .map(|&stream| work(&CLIENT, append(stream, 1, 1, &[b"x"], 0)))
+        .unzip();
+    let (send, mut incoming) = mpsc::channel(STREAMS as usize);
+    if batched {
+        send.try_send(works).unwrap();
+    } else {
+        for work in works {
+            send.try_send(vec![work]).unwrap();
+        }
+    }
+    while let Ok(first) = incoming.try_recv() {
+        let pending = admit(first, &mut incoming, limits.round_requests);
+        test.engine.process(pending).unwrap();
+    }
+    for result in &mut results {
+        assert_eq!(
+            result.try_recv().unwrap().0,
+            Ok(Reply::Appended { tail: Lsn(1) })
+        );
+    }
+    test.engine.wal.rounds.len() - before
+}
+
+#[test]
+fn a_batch_envelope_is_decided_and_synced_in_one_round() {
+    assert_eq!(rounds_for_envelopes(true), 1);
+    // Negative control: the same requests as separate envelopes need one sync per
+    // `round_requests` requests.
+    assert_eq!(rounds_for_envelopes(false), 3);
+}
+
+#[tokio::test]
+async fn keeper_answers_a_batch_in_request_order_with_per_request_refusals() {
+    let dir = tempdir().unwrap();
+    let keeper = Keeper::open(dir.path(), MEMBERS[0], Limits::default()).unwrap();
+    let reply = keeper
+        .call(
+            &CLIENT,
+            Request::Batch(vec![
+                create(A),
+                seal(A, 1),
+                append(A, 1, 1, &[b"early"], 0),
+                sync(A, 1, 1, &[], 0, true),
+                append(A, 1, 1, &[b"x", b"y"], 0),
+                check(B),
+            ]),
+        )
+        .await
+        .unwrap();
+    let Reply::Batch(replies) = reply else {
+        panic!("batch answered with {reply:?}");
+    };
+    assert_eq!(replies.len(), 6);
+    assert_eq!(replies[0], Reply::Created);
+    assert!(matches!(replies[1], Reply::Sealed(_)));
+    assert_eq!(replies[2], Reply::Refused(Refusal::NotSynced));
+    assert_eq!(replies[3], Reply::Synced { tail: Lsn(0) });
+    assert_eq!(replies[4], Reply::Appended { tail: Lsn(2) });
+    assert_eq!(replies[5], Reply::Refused(Refusal::NotFound));
+    for malformed in [
+        Request::Batch(Vec::new()),
+        Request::Batch(vec![Request::Batch(vec![check(A)])]),
+    ] {
+        assert_eq!(
+            keeper.call(&CLIENT, malformed).await,
+            Ok(Reply::Refused(Refusal::Unauthorized))
+        );
+    }
+}
+
+fn segment_count(dir: &Path) -> usize {
+    fs::read_dir(dir.join("segments")).unwrap().count()
+}
+
+#[test]
+fn background_rotation_keeps_deciding_rounds_until_its_checkpoints_are_durable() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.writer(B);
+    test.batch([
+        append(A, 1, 1, &[b"a1", b"a2"], 2),
+        append(B, 1, 1, &[b"b1", b"b2"], 2),
+    ]);
+    let state = |stream: StreamId| test_state_path(test.dir.path(), stream);
+    let (a_state, b_state) = (state(A), state(B));
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    test.engine.wal.rotation_gate = Some(gate.clone());
+    test.engine
+        .wal
+        .start_rotation(&test.engine.streams)
+        .unwrap();
+
+    // The checkpoint worker is held, yet rounds are decided and synced in the new segment.
+    let rounds = test.engine.wal.rounds.len();
+    assert_eq!(
+        test.batch([append(A, 1, 3, &[b"a3"], 3), trim(B, 1, 1)]),
+        [
+            Reply::Appended { tail: Lsn(3) },
+            Reply::Trimmed { floor: Lsn(2) }
+        ]
+    );
+    assert_eq!(test.engine.wal.rounds.len(), rounds + 1);
+    assert!(!a_state.exists() && !b_state.exists());
+    assert_eq!(
+        segment_count(test.dir.path()),
+        2,
+        "old segment retired early"
+    );
+
+    gate.wait();
+    test.engine
+        .wal
+        .finish_rotation(&mut test.engine.streams)
+        .unwrap();
+    assert!(a_state.exists() && b_state.exists());
+    assert_eq!(segment_count(test.dir.path()), 1);
+    let kinds = |stream: StreamId, engine: &Engine| {
+        engine.streams[&stream]
+            .records
+            .iter()
+            .map(|record| matches!(record.payload, state::Payload::Pending(_)))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        kinds(A, &test.engine),
+        [false, false, true],
+        "a1 and a2 moved to the extent"
+    );
+    assert_eq!(
+        kinds(B, &test.engine),
+        [false],
+        "b1 was trimmed before installation"
+    );
+    assert_eq!(
+        test.send(read(A, 1)),
+        page(1, 3, &[(1, b"a1"), (2, b"a2"), (3, b"a3")])
+    );
+
+    let Harness { engine, dir } = test;
+    drop(engine);
+    let mut reopened = Harness {
+        engine: Engine::open(dir.path(), MEMBERS[0], Limits::default(), Arc::new(Allow)).unwrap(),
+        dir,
+    };
+    assert_eq!(
+        reopened.send(read(A, 1)),
+        page(1, 3, &[(1, b"a1"), (2, b"a2"), (3, b"a3")])
+    );
+    assert_eq!(reopened.send(read(B, 2)), page(2, 2, &[(2, b"b2")]));
+
+    // Negative control: a synchronous rotation does all checkpoint IO before returning,
+    // so the round loop cannot run until every dirty stream is durable.
+    reopened.send(append(A, 1, 4, &[b"a4"], 4));
+    let before = fs::read(test_state_path(reopened.dir.path(), A)).unwrap();
+    reopened
+        .engine
+        .wal
+        .rotate(&mut reopened.engine.streams)
+        .unwrap();
+    assert_ne!(
+        fs::read(test_state_path(reopened.dir.path(), A)).unwrap(),
+        before
+    );
+}
+
+fn test_state_path(dir: &Path, stream: StreamId) -> PathBuf {
+    dir.join("streams")
+        .join(format!("{:032x}", stream.0))
+        .join("state")
 }

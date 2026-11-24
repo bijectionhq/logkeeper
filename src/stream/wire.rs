@@ -82,6 +82,9 @@ pub enum Request {
         from: [KeeperId; 3],
         to: [KeeperId; 3],
     },
+    /// Node-level envelope: independent single-stream requests from one client process,
+    /// decided in arrival order in one keeper round with one sync. Never nested or empty.
+    Batch(Vec<Request>),
 }
 
 /// A keeper's durable view of one stream.
@@ -120,6 +123,8 @@ pub enum Reply {
     Deleted,
     Replaced,
     Refused(Refusal),
+    /// One reply per request of a `Request::Batch`, in request order.
+    Batch(Vec<Reply>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

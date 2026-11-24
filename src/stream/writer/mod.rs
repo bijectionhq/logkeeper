@@ -37,6 +37,8 @@ pub struct Writer {
 
 struct Io {
     transport: Arc<dyn Transport>,
+    /// Most pending records one lane sends in a single keeper append.
+    append_records: usize,
 }
 
 type Heads = Vec<oneshot::Sender<Result<Lsn>>>;
@@ -66,11 +68,24 @@ impl Writer {
             return Err(JournalError::Unavailable);
         }
         Ok(Self {
-            io: Arc::new(Io { transport }),
+            io: Arc::new(Io {
+                transport,
+                append_records: append::APPEND_RECORDS,
+            }),
             keepers,
             streams: Arc::default(),
             seal_policy: None,
         })
+    }
+
+    /// Negative control for append amortization: limit each keeper append to `records`.
+    #[cfg(test)]
+    fn with_append_records(mut self, records: usize) -> Self {
+        self.io = Arc::new(Io {
+            transport: self.io.transport.clone(),
+            append_records: records,
+        });
+        self
     }
 
     pub fn with_seal_policy(mut self, policy: Arc<dyn SealPolicy>) -> Self {

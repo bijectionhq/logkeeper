@@ -10,7 +10,9 @@ use super::{Io, KeeperId, QUORUM, Reply, Request, Stream, append::Active, refusa
 use crate::stream::wire::StreamView;
 
 const RETRY: Duration = Duration::from_millis(1);
-const SETTLE: Duration = Duration::from_millis(25);
+const MAX_RETRY: Duration = Duration::from_millis(32);
+/// How long an observer waits for its read index to be covered by published heads.
+const SETTLE: Duration = Duration::from_secs(2);
 
 pub(super) async fn head(io: Arc<Io>, stream: Arc<Stream>) -> Result<Lsn> {
     let (send, receive) = oneshot::channel();
@@ -101,20 +103,53 @@ async fn writer(io: &Io, stream: &Stream, active: &Active) -> Result<Lsn> {
     Err(refusal(&errors))
 }
 
-async fn observer(io: &Io, stream: &Stream) -> Result<Lsn> {
-    // Allow a concurrent seal or head publication to finish. Each attempt
-    // opens its own quorum round and must independently cover the result.
-    let deadline = tokio::time::Instant::now() + SETTLE;
-    loop {
-        let result = observer_round(io, stream).await;
-        if result != Err(JournalError::Unavailable) || tokio::time::Instant::now() >= deadline {
-            return result;
+/// How an observer chooses the position that later rounds must cover.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Index {
+    /// Keep the first quorum's maximum eligible tail. Later rounds wait for it.
+    Pinned,
+    /// Negative control: every round samples a new tail, which concurrent appends
+    /// can keep ahead of the published heads indefinitely.
+    #[cfg(test)]
+    Resampled,
+}
+
+impl Index {
+    fn resamples(self) -> bool {
+        match self {
+            Self::Pinned => false,
+            #[cfg(test)]
+            Self::Resampled => true,
         }
-        tokio::time::sleep(RETRY).await;
     }
 }
 
-async fn observer_round(io: &Io, stream: &Stream) -> Result<Lsn> {
+async fn observer(io: &Io, stream: &Stream) -> Result<Lsn> {
+    observe(io, stream, Index::Pinned).await
+}
+
+/// The read index is the maximum tail of an eligible quorum in the first complete round.
+/// It covers every chosen record, hence every acknowledged append, at the invocation.
+/// Any committed position at or above it is a linearizable head. Appends that keep
+/// arriving advance tails but never move the index, so they cannot starve the call.
+pub(super) async fn observe(io: &Io, stream: &Stream, index: Index) -> Result<Lsn> {
+    let deadline = tokio::time::Instant::now() + SETTLE;
+    let mut target = None;
+    let mut pause = RETRY;
+    loop {
+        let result = observer_round(io, stream, &mut target).await;
+        if result != Err(JournalError::Unavailable) || tokio::time::Instant::now() >= deadline {
+            return result;
+        }
+        if index.resamples() {
+            target = None;
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(MAX_RETRY);
+    }
+}
+
+async fn observer_round(io: &Io, stream: &Stream, target: &mut Option<Lsn>) -> Result<Lsn> {
     let mut calls = FuturesUnordered::from_iter(
         stream
             .ensemble
@@ -127,36 +162,56 @@ async fn observer_round(io: &Io, stream: &Stream) -> Result<Lsn> {
             Ok(view) => views.push(view),
             Err(error) => errors.push(error),
         }
-        if let Some(head) = observed_head(&views) {
+        if let Some(head) = observed_head(&views, *target) {
             return Ok(head);
         }
+    }
+    if target.is_none() {
+        *target = read_index(&views);
     }
     Err(refusal(&errors))
 }
 
-fn observed_head(views: &[StreamView]) -> Option<Lsn> {
+/// Views at the highest promised epoch, from a keeper synced at that epoch and with
+/// the same promise as `candidate`.
+fn eligible<'a>(
+    views: &'a [StreamView],
+    candidate: &'a StreamView,
+) -> impl Iterator<Item = &'a StreamView> + 'a {
     let epoch = views
         .iter()
         .filter_map(|view| view.promised.as_ref().map(|p| p.0))
         .max();
-    views
-        .iter()
-        .filter(|view| view.synced == epoch)
-        .find_map(|candidate| {
-            let eligible = |view: &&StreamView| {
-                view.promised == candidate.promised
-                    && view.synced == epoch
-                    && view.promised.as_ref().map(|p| p.0) == epoch
-            };
-            let tail = views.iter().filter(eligible).map(|view| view.tail).max()?;
-            (views
-                .iter()
-                .filter(eligible)
-                .filter(|view| view.head >= tail)
-                .count()
-                >= QUORUM)
-                .then_some(tail)
-        })
+    views.iter().filter(move |view| {
+        view.promised == candidate.promised
+            && view.synced == epoch
+            && view.promised.as_ref().map(|p| p.0) == epoch
+    })
+}
+
+/// The maximum tail of an eligible quorum, if the views contain one.
+fn read_index(views: &[StreamView]) -> Option<Lsn> {
+    views.iter().find_map(|candidate| {
+        (eligible(views, candidate).count() >= QUORUM)
+            .then(|| eligible(views, candidate).map(|view| view.tail).max())
+            .flatten()
+    })
+}
+
+/// Without a target, the eligible maximum tail must already be covered by a quorum of
+/// published heads. With a pinned target, a quorum of eligible heads must reach it.
+pub(super) fn observed_head(views: &[StreamView], target: Option<Lsn>) -> Option<Lsn> {
+    views.iter().find_map(|candidate| {
+        let index = match target {
+            Some(target) => target,
+            None => eligible(views, candidate).map(|view| view.tail).max()?,
+        };
+        (eligible(views, candidate)
+            .filter(|view| view.head >= index)
+            .count()
+            >= QUORUM)
+            .then_some(index)
+    })
 }
 
 pub(super) async fn check_keeper(

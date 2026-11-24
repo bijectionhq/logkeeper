@@ -53,11 +53,35 @@ pub(super) fn stream(request: &Request) -> StreamId {
         | Request::Read { stream, .. }
         | Request::Replace { stream, .. }
         | Request::Delete { stream, .. } => stream,
+        // An envelope names no stream. The keeper splits it before any per-stream rule.
+        Request::Batch(_) => StreamId(0),
     }
 }
 
 pub fn encode_request(request: &Request) -> io::Result<Bytes> {
+    if !well_formed_batch(request) {
+        return Err(invalid("empty or nested keeper batch"));
+    }
     encode(&RequestFrame::from(request), MAX_FRAME_BYTES)
+}
+
+/// A batch carries at least one request and never another batch.
+fn well_formed_batch(request: &Request) -> bool {
+    match request {
+        Request::Batch(requests) => {
+            !requests.is_empty()
+                && !requests
+                    .iter()
+                    .any(|request| matches!(request, Request::Batch(_)))
+        }
+        _ => true,
+    }
+}
+
+/// Encoded size of one request inside a batch frame, including its field header.
+pub fn batched_request_len(request: &Request) -> usize {
+    let len = RequestFrame::from(request).encoded_len();
+    1 + prost::encoding::encoded_len_varint(len as u64) + len
 }
 
 pub fn decode_request(body: Bytes) -> io::Result<Request> {
@@ -65,6 +89,11 @@ pub fn decode_request(body: Bytes) -> io::Result<Request> {
 }
 
 pub fn encode_reply(reply: &Reply) -> io::Result<Bytes> {
+    if let Reply::Batch(replies) = reply
+        && (replies.is_empty() || replies.iter().any(|reply| matches!(reply, Reply::Batch(_))))
+    {
+        return Err(invalid("empty or nested keeper batch"));
+    }
     encode(&ReplyFrame::from(reply), MAX_FRAME_BYTES)
 }
 
@@ -228,6 +257,9 @@ struct RequestFrame {
     stream: Bytes,
     #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
     body: Option<RequestBody>,
+    /// A `Request::Batch` envelope. Exclusive with `stream` and `body`.
+    #[prost(message, repeated, tag = "12")]
+    batch: Vec<RequestFrame>,
 }
 
 // Each request schema declares its protobuf fields and their domain conversion together.
@@ -254,12 +286,19 @@ macro_rules! request_messages {
         impl From<&Request> for RequestFrame {
             fn from(value: &Request) -> Self {
                 let body = match value {
+                    Request::Batch(requests) => {
+                        return Self {
+                            stream: Bytes::new(),
+                            body: None,
+                            batch: requests.iter().map(Self::from).collect(),
+                        };
+                    }
                     $(Request::$variant { stream: _, $($field),+ } =>
                         RequestBody::$variant(request::$variant {
                             $($field: request_field!(encode $conversion, $field),)+
                         }),)+
                 };
-                Self { stream: encode_id(stream(value).0), body: Some(body) }
+                Self { stream: encode_id(stream(value).0), body: Some(body), batch: Vec::new() }
             }
         }
 
@@ -267,6 +306,15 @@ macro_rules! request_messages {
             type Error = io::Error;
 
             fn try_from(frame: RequestFrame) -> io::Result<Self> {
+                if !frame.batch.is_empty() {
+                    if frame.body.is_some()
+                        || !frame.stream.is_empty()
+                        || frame.batch.iter().any(|request| !request.batch.is_empty())
+                    {
+                        return Err(invalid("malformed keeper batch"));
+                    }
+                    return frame.batch.into_iter().map(Self::try_from).collect::<io::Result<_>>().map(Self::Batch);
+                }
                 let stream = StreamId(decode_id(&frame.stream)?);
                 Ok(match frame.body.ok_or_else(|| invalid("missing keeper request variant"))? {
                     $(RequestBody::$variant(body) => Self::$variant {
@@ -399,6 +447,9 @@ request_messages! {
 struct ReplyFrame {
     #[prost(oneof = "ReplyBody", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     body: Option<ReplyBody>,
+    /// A `Reply::Batch` envelope. Exclusive with `body`.
+    #[prost(message, repeated, tag = "11")]
+    batch: Vec<ReplyFrame>,
 }
 
 #[derive(Clone, prost::Oneof)]
@@ -514,8 +565,17 @@ impl From<&Reply> for ReplyFrame {
             Reply::Deleted => ReplyBody::Deleted(Empty {}),
             Reply::Replaced => ReplyBody::Replaced(Empty {}),
             Reply::Refused(refusal) => ReplyBody::Refused(RefusalFrame::from(refusal)),
+            Reply::Batch(replies) => {
+                return Self {
+                    body: None,
+                    batch: replies.iter().map(Self::from).collect(),
+                };
+            }
         };
-        Self { body: Some(body) }
+        Self {
+            body: Some(body),
+            batch: Vec::new(),
+        }
     }
 }
 
@@ -523,6 +583,17 @@ impl TryFrom<ReplyFrame> for Reply {
     type Error = io::Error;
 
     fn try_from(frame: ReplyFrame) -> io::Result<Self> {
+        if !frame.batch.is_empty() {
+            if frame.body.is_some() || frame.batch.iter().any(|reply| !reply.batch.is_empty()) {
+                return Err(invalid("malformed keeper batch"));
+            }
+            return frame
+                .batch
+                .into_iter()
+                .map(Self::try_from)
+                .collect::<io::Result<_>>()
+                .map(Self::Batch);
+        }
         Ok(
             match frame
                 .body
@@ -741,6 +812,65 @@ mod tests {
         assert!(
             decode_reply(Bytes::from_static(&[0, 0])).is_err(),
             "accepted trailing reply bytes"
+        );
+    }
+
+    #[test]
+    fn batch_envelopes_round_trip_and_reject_nesting() {
+        let stream = StreamId(6);
+        let check = Request::Check {
+            stream,
+            epoch: Epoch(1),
+        };
+        let append = Request::Append {
+            stream: StreamId(7),
+            epoch: Epoch(1),
+            at: Lsn(1),
+            records: vec![Bytes::from_static(b"record")],
+            head: Lsn(0),
+        };
+        let batch = Request::Batch(vec![check.clone(), append]);
+        let body = encode_request(&batch).unwrap();
+        assert_eq!(decode_request(body).unwrap(), batch);
+        let replies = Reply::Batch(vec![
+            Reply::Appended { tail: Lsn(1) },
+            Reply::Refused(Refusal::NotFound),
+        ]);
+        assert_eq!(
+            decode_reply(encode_reply(&replies).unwrap()).unwrap(),
+            replies
+        );
+        for malformed in [
+            Request::Batch(Vec::new()),
+            Request::Batch(vec![Request::Batch(vec![check.clone()])]),
+        ] {
+            assert!(encode_request(&malformed).is_err(), "encoded {malformed:?}");
+        }
+        assert!(encode_reply(&Reply::Batch(Vec::new())).is_err());
+        assert!(encode_reply(&Reply::Batch(vec![replies.clone()])).is_err());
+        // Hand-built frames that the encoder refuses must not decode either.
+        let nested = RequestFrame {
+            stream: Bytes::new(),
+            body: None,
+            batch: vec![RequestFrame::from(&Request::Batch(vec![check.clone()]))],
+        };
+        let mixed = RequestFrame {
+            batch: vec![RequestFrame::from(&check)],
+            ..RequestFrame::from(&check)
+        };
+        for frame in [nested, mixed] {
+            assert!(decode_request(encode(&frame, MAX_FRAME_BYTES).unwrap()).is_err());
+        }
+        let nested = ReplyFrame {
+            body: None,
+            batch: vec![ReplyFrame::from(&replies)],
+        };
+        assert!(decode_reply(encode(&nested, MAX_FRAME_BYTES).unwrap()).is_err());
+        assert_eq!(
+            batched_request_len(&check),
+            encode_request(&Request::Batch(vec![check.clone()]))
+                .unwrap()
+                .len()
         );
     }
 
