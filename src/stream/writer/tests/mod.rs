@@ -242,6 +242,44 @@ async fn append_retry_after_lost_replies_is_exact() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn conflicting_retry_cannot_fill_a_lagging_keeper() {
+    let (network, writer) = started().await;
+    let lagging = KEEPERS[2];
+    network.down(lagging, true);
+    assert_eq!(
+        writer.append(STREAM, E1, Lsn(1), record("chosen")).await,
+        Ok(Lsn(1))
+    );
+    network.down(lagging, false);
+
+    assert_eq!(
+        writer.append(STREAM, E1, Lsn(1), record("other")).await,
+        Err(JournalError::Conflict { head: Lsn(1) })
+    );
+    // The background lane may have already repaired the keeper. A retry must
+    // never let that keeper publish the conflicting payload at this position.
+    let reply = crate::stream::wire::Transport::call(
+        &*network.client(1),
+        lagging,
+        crate::stream::wire::Request::Read {
+            stream: STREAM,
+            from: Lsn(1),
+            max: 1,
+            wait_ms: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let crate::stream::wire::Reply::Records { records, .. } = reply else {
+        panic!("expected a page, got {reply:?}");
+    };
+    assert!(
+        records.is_empty() || records == [(Lsn(1), record("chosen"))],
+        "conflicting retry published different bytes on a lagging keeper"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn seal_retries_lost_promises_and_completed_syncs_at_the_same_epoch() {
     let (network, _) = started().await;
     let next = writer(&network, 2);

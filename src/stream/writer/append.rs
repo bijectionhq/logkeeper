@@ -194,6 +194,10 @@ impl Active {
                     return Err(JournalError::Trimmed { floor: state.floor });
                 }
                 if at <= state.head {
+                    // A retry can arrive after an unavailable keeper has returned.
+                    // Wake its lane so it can catch up using the chosen payload.
+                    state.revision += 1;
+                    self.wake();
                     break None;
                 }
                 let last = state
@@ -240,10 +244,23 @@ impl Active {
     }
 
     async fn retry_committed(&self, at: Lsn, payload: Bytes) -> Result<Lsn> {
-        let head = self.head();
-        quorum(FuturesUnordered::from_iter(self.ensemble.map(|keeper| {
-            self.send_append(keeper, at, payload.clone(), head)
-        })))
+        // On a keeper that lacks this position, Append would install the caller's
+        // bytes instead of comparing them. Only the replication lanes may fill gaps.
+        let accepted = {
+            let state = self.state.lock();
+            std::array::from_fn::<_, 3, _>(|index| {
+                state.lanes[index]
+                    .accepted
+                    .is_some_and(|tail| tail >= at)
+                    .then_some(self.ensemble[index])
+            })
+        };
+        quorum(FuturesUnordered::from_iter(
+            accepted
+                .into_iter()
+                .flatten()
+                .map(|keeper| self.send_append(keeper, at, payload.clone(), at)),
+        ))
         .await
         .map(|_| at)
         .map_err(|error| match error {
