@@ -5,6 +5,9 @@ pub(super) mod decision;
 mod head;
 mod read;
 mod recovery;
+mod timed;
+
+pub use super::timed::{TimedOriginal, TimedOriginalProof};
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -37,6 +40,7 @@ pub struct Writer {
     keepers: Arc<[KeeperId]>,
     streams: Arc<Mutex<HashMap<StreamId, Arc<Stream>>>>,
     seal_policy: Option<Arc<dyn SealPolicy>>,
+    timed_authority: Option<Arc<timed::Authority>>,
 }
 
 struct Io {
@@ -81,6 +85,7 @@ impl Writer {
             keepers,
             streams: Arc::default(),
             seal_policy: None,
+            timed_authority: None,
         })
     }
 
@@ -302,7 +307,10 @@ impl Journal for Writer {
         Box::pin(async move {
             let stream = self.stream(stream);
             match self.active(&stream, epoch) {
-                Ok(active) => match active.append(at, payload).await {
+                Ok(active) => match active
+                    .append(at, super::timed::Entry::Ordinary(payload))
+                    .await
+                {
                     Err(error @ (JournalError::Conflict { .. } | JournalError::Trimmed { .. })) => {
                         Err(self.authority(&stream, epoch, error).await)
                     }

@@ -5,7 +5,6 @@ use std::{
     sync::{Arc, Weak},
 };
 
-use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
 use journal_contract::{Epoch, JournalError, Lsn, Result, StreamId};
 use parking_lot::Mutex;
@@ -21,7 +20,10 @@ use super::{
 type Sender = oneshot::Sender<Result<Lsn>>;
 
 pub(super) use crate::stream::proposer::append::APPEND_RECORDS;
-use crate::stream::proposer::append::{Admission, Completions, State, Work};
+use crate::stream::{
+    proposer::append::{Admission, Completions, State, Work},
+    timed::{Entry, TimedOriginal},
+};
 type Observation = watch::Receiver<Option<Result<Lsn>>>;
 
 pub(super) struct Active {
@@ -121,7 +123,7 @@ impl Active {
         self.wake();
     }
 
-    pub(super) async fn append(&self, at: Lsn, payload: Bytes) -> Result<Lsn> {
+    pub(super) async fn append(&self, at: Lsn, payload: Entry) -> Result<Lsn> {
         let mut change = self.change.subscribe();
         let wait = loop {
             {
@@ -154,7 +156,7 @@ impl Active {
         }
     }
 
-    async fn retry_committed(&self, at: Lsn, payload: Bytes) -> Result<Lsn> {
+    async fn retry_committed(&self, at: Lsn, payload: Entry) -> Result<Lsn> {
         // Check retained bytes before publishing. Caller-supplied bytes are never
         // sent in a lane Append until the writer has assigned them a position.
         let accepted = {
@@ -184,6 +186,14 @@ impl Active {
             JournalError::Conflict { .. } => JournalError::Conflict { head: self.head() },
             error => error,
         })
+    }
+
+    pub(super) fn reserve_timed(&self, original: TimedOriginal) -> Result<()> {
+        self.state.lock().proposer.reserve_timed(original)
+    }
+
+    pub(super) fn timed_entry(&self, original: TimedOriginal) -> Option<Entry> {
+        self.state.lock().proposer.timed_entry(original)
     }
 
     fn wake(&self) {
@@ -276,7 +286,7 @@ impl Active {
     }
 
     /// Fetch a contiguous committed run from `at`, up to the writer's head.
-    async fn fetch_committed(&self, at: Lsn, index: usize, limit: usize) -> Result<Vec<Bytes>> {
+    async fn fetch_committed(&self, at: Lsn, index: usize, limit: usize) -> Result<Vec<Entry>> {
         let sources = self.state.lock().proposer.recover(at, index, limit)?;
         let mut fetches =
             FuturesUnordered::from_iter(self.ensemble.into_iter().zip(sources).filter_map(
@@ -298,24 +308,41 @@ impl Active {
         &self,
         keeper: KeeperId,
         at: Lsn,
-        records: Vec<Bytes>,
+        entries: Vec<Entry>,
         head: Lsn,
     ) -> Result<Lsn> {
-        let last = Lsn(at.0 + records.len() as u64 - 1);
-        match self
-            .io
-            .call(
-                keeper,
-                Request::Append {
+        let last = Lsn(at.0 + entries.len() as u64 - 1);
+        let request = match entries.as_slice() {
+            [Entry::Timed { evidence, payload }] => {
+                let original = evidence.origin.original;
+                if original.stream != self.stream
+                    || original.epoch != self.epoch
+                    || original.at != at
+                {
+                    return Err(JournalError::Unavailable);
+                }
+                Request::AppendOriginal {
                     stream: self.stream,
-                    epoch: self.epoch,
-                    at,
-                    records,
+                    evidence: evidence.clone(),
+                    payload: payload.clone(),
                     head,
-                },
-            )
-            .await?
-        {
+                }
+            }
+            _ => Request::Append {
+                stream: self.stream,
+                epoch: self.epoch,
+                at,
+                records: entries
+                    .into_iter()
+                    .map(|entry| match entry {
+                        Entry::Ordinary(bytes) => Ok(bytes),
+                        _ => Err(JournalError::Unavailable),
+                    })
+                    .collect::<Result<_>>()?,
+                head,
+            },
+        };
+        match self.io.call(keeper, request).await? {
             Reply::Appended { tail } if tail >= last => Ok(tail),
             _ => Err(JournalError::Unavailable),
         }

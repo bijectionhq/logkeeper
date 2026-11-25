@@ -24,6 +24,10 @@ use crate::stream::{
     wire::{Epoch, Lsn, StreamId},
 };
 
+// Pack numbers occupy the low 63 bits. A timed extent uses the high bit.
+// Legacy readers reject a flagged extent.
+const TIMED_EXTENT: u64 = 1 << 63;
+
 #[derive(Default)]
 pub(super) struct Checkpoint {
     streams: HashMap<StreamId, Indexed>,
@@ -209,7 +213,18 @@ impl Pack {
                 },
                 payload => self.append(record, payload)?,
             };
-            wal_bytes::append_bytes(body, &checkpoint_bytes::encode_extent(record.epoch.0, location));
+            let stored = Location {
+                seq: if record.timed {
+                    location.seq | TIMED_EXTENT
+                } else {
+                    location.seq
+                },
+                ..location
+            };
+            wal_bytes::append_bytes(
+                body,
+                &checkpoint_bytes::encode_extent(record.epoch.0, stored),
+            );
             packs.insert(location.seq);
             bytes += u64::from(location.len);
         }
@@ -302,6 +317,9 @@ impl Checkpoint {
         snapshots: Vec<Snapshot>,
         rewrite: bool,
     ) -> io::Result<()> {
+        if next >= TIMED_EXTENT {
+            return Err(invalid("keeper index pack sequence exhausted"));
+        }
         let path = pack_path(root, next);
         if !self.references(next) {
             // An earlier crash may have written this pack without publishing its index.
@@ -460,6 +478,9 @@ impl Checkpoint {
         file.read_exact(&mut header)?;
         let (next, count) = checkpoint_bytes::decode_index_header(&header)
             .ok_or_else(|| invalid("damaged keeper index header"))?;
+        if next >= TIMED_EXTENT {
+            return Err(invalid("keeper index pack sequence exhausted"));
+        }
         let mut remaining = length - INDEX_HEADER_BYTES as u64;
         let mut packs = HashMap::new();
         let mut states = HashMap::new();
@@ -570,6 +591,8 @@ impl PackReader<'_> {
                     _,
                 ) = checkpoint_bytes::decode_extent(row)
                     .ok_or_else(|| invalid("short keeper index extent"))?;
+                let timed = seq & TIMED_EXTENT != 0;
+                let seq = seq & !TIMED_EXTENT;
                 let (extent, size) = match self.known.entry(seq) {
                     std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::hash_map::Entry::Vacant(entry) => {
@@ -596,7 +619,8 @@ impl PackReader<'_> {
                         len,
                         crc,
                     },
-                ))
+                )
+                .with_timed(timed))
             })
             .collect()
     }

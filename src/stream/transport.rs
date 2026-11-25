@@ -214,7 +214,9 @@ struct Access {
 impl Access {
     fn allowed(&self, request: &Request) -> bool {
         match request {
-            Request::Read { .. } | Request::Check { .. } => self.can_read,
+            Request::Read { .. } | Request::Check { .. } | Request::ProveOriginal { .. } => {
+                self.can_read
+            }
             Request::Batch(_) => false,
             _ => self.can_write,
         }
@@ -415,10 +417,13 @@ impl TcpTransport {
             .routes
             .get(&keeper)
             .ok_or(TransportError::Unreachable)?;
-        // Waiting reads and Delete compaction would hold the shared connection's replies.
+        // Waiting reads, Delete compaction and timed staging can hold the shared connection.
         let measured = if matches!(
             request,
-            Request::Read { wait_ms: 1.., .. } | Request::Delete { .. } | Request::Batch(_)
+            Request::Read { wait_ms: 1.., .. }
+                | Request::Delete { .. }
+                | Request::StageOriginal { .. }
+                | Request::Batch(_)
         ) {
             None
         } else {

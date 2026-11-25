@@ -637,7 +637,11 @@ mod implementation {
                 }
             }
             // `Keeper::call` splits envelopes before any per-stream decision.
-            Request::Batch(_) => refuse(Refusal::Unauthorized),
+            Request::Batch(_)
+            | Request::StageOriginal { .. }
+            | Request::AppendOriginal { .. }
+            | Request::SyncOriginal { .. }
+            | Request::ProveOriginal { .. } => refuse(Refusal::Unauthorized),
             Request::Create { .. } | Request::Delete { .. } => unreachable!(),
         }
     }

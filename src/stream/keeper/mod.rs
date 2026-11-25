@@ -7,6 +7,7 @@ pub(super) mod memory;
 mod rules;
 mod state;
 mod sweep;
+mod timed;
 
 mod wal;
 mod wal_bytes;
@@ -31,7 +32,11 @@ use self::{
     state::Stream,
     wal::{FRAME_OVERHEAD, MAX_IDENTITY_BYTES, Round, Wal},
 };
-use super::{codec, wire::*};
+use super::{
+    codec,
+    timed::{TimedOriginalClock, TimedOriginalVerifier},
+    wire::*,
+};
 
 type CallResult = Result<Reply, TransportError>;
 
@@ -73,7 +78,25 @@ impl Keeper {
         limits: Limits,
         policy: Arc<dyn SealPolicy>,
     ) -> io::Result<Self> {
-        let engine = Engine::open(path, keeper, limits, policy)?;
+        Self::start(Engine::open(path, keeper, limits, policy)?, limits)
+    }
+
+    /// Mount historical verification keys, and optionally the trusted local
+    /// receiver clock and signing key for this keeper's original writes.
+    pub fn open_with_timed_original(
+        path: &Path,
+        keeper: KeeperId,
+        limits: Limits,
+        policy: Arc<dyn SealPolicy>,
+        verifier: Arc<dyn TimedOriginalVerifier>,
+        clock: Option<Arc<dyn TimedOriginalClock>>,
+    ) -> io::Result<Self> {
+        let authority = timed::Authority { verifier, clock };
+        let engine = Engine::open_with_authority(path, keeper, limits, policy, Some(authority))?;
+        Self::start(engine, limits)
+    }
+
+    fn start(engine: Engine, limits: Limits) -> io::Result<Self> {
         let (work, incoming) = mpsc::channel::<Vec<Work>>(limits.round_requests);
         std::thread::Builder::new()
             .name("stream-keeper-wal".into())
@@ -99,7 +122,11 @@ impl Keeper {
                 .map_err(|_| TransportError::Unreachable)?;
             return self.finish(identity, request, result).await;
         };
-        if requests.is_empty() || requests.iter().any(|r| matches!(r, Request::Batch(_))) {
+        if requests.is_empty()
+            || requests
+                .iter()
+                .any(|r| matches!(r, Request::Batch(_) | Request::StageOriginal { .. }))
+        {
             return Ok(Reply::Refused(Refusal::Unauthorized));
         }
         let (works, results): (Vec<_>, Vec<_>) = requests
@@ -204,7 +231,10 @@ impl Work {
     fn is_mutation(&self) -> bool {
         !matches!(
             self.request,
-            Request::Check { .. } | Request::Read { .. } | Request::Recover { .. }
+            Request::Check { .. }
+                | Request::Read { .. }
+                | Request::Recover { .. }
+                | Request::ProveOriginal { .. }
         )
     }
 }
@@ -218,6 +248,8 @@ struct Engine {
     deletions: HashMap<StreamId, Vec<Done>>,
     rotating_deletions: HashMap<StreamId, Vec<Done>>,
     recovering: bool,
+    timed_authority: Option<timed::Authority>,
+    stages: timed::Stages,
 }
 
 impl Engine {
@@ -226,6 +258,16 @@ impl Engine {
         keeper: KeeperId,
         limits: Limits,
         policy: Arc<dyn SealPolicy>,
+    ) -> io::Result<Self> {
+        Self::open_with_authority(path, keeper, limits, policy, None)
+    }
+
+    fn open_with_authority(
+        path: &Path,
+        keeper: KeeperId,
+        limits: Limits,
+        policy: Arc<dyn SealPolicy>,
+        timed_authority: Option<timed::Authority>,
     ) -> io::Result<Self> {
         if keeper.0 == 0
             || limits.round_bytes_per_stream <= FRAME_OVERHEAD
@@ -237,7 +279,15 @@ impl Engine {
                 "invalid keeper identity or byte limits",
             ));
         }
-        let (wal, streams) = Wal::open(path, keeper)?;
+        let (mut wal, streams) = Wal::open(path, keeper)?;
+        timed::verify_retained(&streams, timed_authority.as_ref(), &mut wal.reader)?;
+        let stages = timed::Stages::open(
+            path,
+            &streams,
+            timed_authority
+                .as_ref()
+                .is_some_and(|authority| authority.clock.is_some()),
+        )?;
         Ok(Self {
             keeper,
             limits,
@@ -247,6 +297,8 @@ impl Engine {
             deletions: HashMap::new(),
             rotating_deletions: HashMap::new(),
             recovering: false,
+            timed_authority,
+            stages,
         })
     }
 
@@ -319,7 +371,36 @@ impl Engine {
         // Bound the WAL suffix even if compaction runs slowly. Finish the admitted
         // work, then ask new mutations to retry while observations keep advancing.
         let backlogged = self.wal.uncheckpointed >= wal::MAX_WAL_SUFFIX_BYTES;
-        while !pending.is_empty() {
+        while let Some(first) = pending.front() {
+            if matches!(first.request, Request::StageOriginal { .. }) {
+                let work = pending.pop_front().expect("staged request");
+                let Request::StageOriginal {
+                    stream,
+                    original,
+                    payload,
+                } = work.request
+                else {
+                    unreachable!();
+                };
+                let reply = if original.stream != stream {
+                    Ok(Reply::Refused(Refusal::Unauthorized))
+                } else if backlogged {
+                    Err(TransportError::TimedOut)
+                } else {
+                    Ok(timed::stage(
+                        &mut self.stages,
+                        self.timed_authority.as_ref(),
+                        self.keeper,
+                        self.streams.get(&stream),
+                        &work.identity,
+                        original,
+                        payload,
+                        &self.limits,
+                    )?)
+                };
+                let _ = work.done.send((reply, None));
+                continue;
+            }
             if self.wal.remaining() <= FRAME_OVERHEAD {
                 self.wal.roll_segment()?;
             }
@@ -336,7 +417,14 @@ impl Engine {
         let mut blocked = HashSet::new();
         let mut changed = HashSet::new();
         let mut replies = Vec::new();
-        for mut work in std::mem::take(pending) {
+        let mut admitted = std::mem::take(pending);
+        while let Some(mut work) = admitted.pop_front() {
+            // Finish the preceding WAL work before sampling any original stage.
+            if matches!(work.request, Request::StageOriginal { .. }) {
+                pending.push_back(work);
+                pending.append(&mut admitted);
+                break;
+            }
             let id = codec::stream(&work.request);
             if blocked.contains(&id) {
                 pending.push_back(work);
@@ -348,15 +436,30 @@ impl Engine {
                     Request::Seal { epoch, .. } => self.policy.allow(&work.identity, id, epoch),
                     _ => true,
                 };
-                match state::decide(
-                    state,
-                    self.keeper,
-                    &work.request,
-                    &work.identity,
-                    seal_allowed,
-                    &self.limits,
-                    &mut self.wal.reader,
-                )? {
+                let timed_decision = if self.stages.blocks(&work.request) {
+                    Some(Decision::Reply(Reply::Refused(Refusal::Unauthorized)))
+                } else {
+                    timed::check(
+                        self.timed_authority.as_ref(),
+                        state,
+                        &work.request,
+                        &work.identity,
+                        &mut self.wal.reader,
+                    )?
+                };
+                let decision = match timed_decision {
+                    Some(decision) => decision,
+                    None => state::decide(
+                        state,
+                        self.keeper,
+                        &work.request,
+                        &work.identity,
+                        seal_allowed,
+                        &self.limits,
+                        &mut self.wal.reader,
+                    )?,
+                };
+                match decision {
                     Decision::Reply(Reply::Deleted) => {
                         if let Some(waiting) = self.deletions.get_mut(&id) {
                             waiting.push(work.done);
@@ -376,16 +479,20 @@ impl Engine {
                     }
                     Decision::Page { through } => {
                         let state = state.expect("page has state");
-                        let (from, max, wait) = match work.request {
-                            Request::Recover { from, max, .. } => (from, max, false),
+                        let (from, max, wait, recover) = match work.request {
+                            Request::Recover { from, max, .. } => (from, max, false, true),
                             Request::Read {
                                 from, max, wait_ms, ..
-                            } => (from, max, wait_ms != 0),
+                            } => (from, max, wait_ms != 0, false),
                             _ => unreachable!(),
                         };
                         let changed =
                             (wait && max != 0 && from > through).then(|| state.changed.subscribe());
-                        let reply = state.page(from, max, through, &mut self.wal.reader)?;
+                        let reply = if recover {
+                            state.recover(id, from, max, through, &mut self.wal.reader)?
+                        } else {
+                            state.page(from, max, through, &mut self.wal.reader)?
+                        };
                         replies.push((work.done, (Ok(reply), changed)));
                         continue;
                     }
@@ -446,7 +553,9 @@ impl Engine {
         }
         self.wal.write_round(&buffer)?;
         for id in changed {
-            self.streams[&id].changed.send_replace(());
+            let state = &self.streams[&id];
+            self.stages.retire(id, Some(state))?;
+            state.changed.send_replace(());
         }
         for (done, reply) in replies {
             let _ = done.send(reply);

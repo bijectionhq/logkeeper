@@ -1,6 +1,10 @@
 //! Keeper protocol messages. Rules for each request are in `verification/target-journal.md`, section 3.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
+
+use super::timed::{TimedEvidence, TimedOriginal, TimedSample};
 
 pub use journal_contract::{Epoch, Identity, Lsn, StreamId};
 
@@ -83,6 +87,33 @@ pub enum Request {
         from: [KeeperId; 3],
         to: [KeeperId; 3],
     },
+    /// Write exact original bytes to an original keeper's protected staging area.
+    StageOriginal {
+        stream: StreamId,
+        original: TimedOriginal,
+        payload: Bytes,
+    },
+    /// Admit a singleton at its original position with its original write quorum.
+    AppendOriginal {
+        stream: StreamId,
+        evidence: Arc<TimedEvidence>,
+        payload: Bytes,
+        head: Lsn,
+    },
+    /// Stage one certified record while installing a successor's chosen history.
+    SyncOriginal {
+        stream: StreamId,
+        epoch: Epoch,
+        floor: Lsn,
+        evidence: Arc<TimedEvidence>,
+        payload: Bytes,
+        head: Lsn,
+    },
+    /// Read retained evidence for a committed position.
+    ProveOriginal {
+        stream: StreamId,
+        at: Lsn,
+    },
     /// Node-level envelope: independent single-stream requests from one client process,
     /// decided in arrival order in one keeper round with one sync. Never nested or empty.
     Batch(Vec<Request>),
@@ -122,6 +153,12 @@ pub enum Reply {
         records: Vec<(Lsn, Bytes)>,
         head: Lsn,
     },
+    OriginalSample(TimedSample),
+    OriginalRecord {
+        evidence: Arc<TimedEvidence>,
+        payload: Bytes,
+    },
+    OriginalEvidence(Arc<TimedEvidence>),
     Deleted,
     Replaced,
     Refused(Refusal),
