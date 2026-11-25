@@ -18,7 +18,7 @@ use super::network::has_application_entries;
 use super::{Entry, Genesis, LogId, RaftTypes, StorageError, Vote};
 
 pub(super) use media::{Authority, Enrollment};
-#[cfg(test)]
+#[cfg(any(test, feature = "consensus-testing"))]
 pub(super) use media::{Provision, hex, sha256};
 pub(super) use objects::Object;
 pub(super) use snapshot::{SnapshotFile, StateMachine, repair_snapshot};

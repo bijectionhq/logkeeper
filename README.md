@@ -393,6 +393,35 @@ undetermined. Runs on this host varied by more than twofold, and no earlier
 baseline exists for the consensus keeper. The vote case confirms the vote was
 served. A live leader's lease can still refuse the ballot.
 
+### Journal contract
+
+`ConsensusJournal` implements `journal_contract::Journal` over consensus
+streams. Construct it from client credentials and a `JournalConfig` with the
+keeper inventory, the catalog keeper, the three voters and the quota for each
+stream it creates, the record limit and the operation deadline. Every
+principal authorised as a writer can seal, append and trim.
+
+The contract identifies a writer by its authenticated principal. The journal
+uses one fixed writer UUID, and the keeper checks the principal on every
+seal, append and trim. A same-principal reseal therefore succeeds after a
+process restart, and any other principal at an equal or lower epoch is
+fenced. The keeper's seal installs the epoch after the expected one, so a
+seal that jumps ahead installs each intermediate epoch in turn as separate
+compare-and-set steps. Epoch zero is never a sealed writer epoch. `head` is
+the keeper's fresh quorum-confirmed head, and `read` returns one keeper's
+applied page, which may lag. `append_batch` commits a contiguous group one
+record at a time and can leave a committed prefix on error.
+
+The `consensus-testing` feature exports `testing::LocalCluster`. It starts
+three voter keepers in distinct failure domains and a catalog keeper on
+loopback, with enrolled media and a private CA, issues client certificates
+for named principals and can stop and restart individual keepers. The
+contract conformance suite and a full-restart test run against it.
+
+```sh
+cargo test --locked --features consensus-testing --test consensus_journal_conformance
+```
+
 ## Integration
 
 Pin a release tag and consume the Rust client from this repository.

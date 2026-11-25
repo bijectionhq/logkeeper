@@ -4,12 +4,15 @@
 mod catalog;
 mod client;
 mod decisions;
+mod journal;
 mod keeper;
 mod network;
 mod ownership;
 mod placement;
 mod state;
 mod storage;
+#[cfg(feature = "consensus-testing")]
+pub mod testing;
 
 use std::{collections::BTreeMap, io, net::SocketAddr};
 
@@ -19,6 +22,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub use super::transport::Credentials;
 pub use client::Client;
+pub use journal::{ConsensusJournal, JournalConfig};
 pub use keeper::Config;
 pub use placement::Domains;
 
