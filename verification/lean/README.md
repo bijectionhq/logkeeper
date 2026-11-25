@@ -91,3 +91,10 @@ of the request at a chosen position. Run `python3 run_reducer_refinement.py`
 for the invariant, projection and reachability proofs and their controls.
 The [ordered reducer area](../verus/ordered_reducer/README.md) records which
 state updates are checked against production and the remaining adapter work.
+
+## Keeper-hosted leader journal
+
+[Leader journal model](leader-journal.md) specifies the proposed keeper-hosted
+consensus design and its proof boundary. The package checks the model alongside
+the shipped stream journal, whose proposer and publication protocol has its
+own refinement and trace checker.
