@@ -49,7 +49,7 @@ impl Manifest {
         body.put_u64(capacity);
         let proof = issuer.sign_bytes(&body)?;
         body.put_slice(&proof.proof);
-        publish_evidence(output, &body)?;
+        publish_evidence(output, &[&body])?;
         Ok(())
     }
 
@@ -99,11 +99,7 @@ impl Manifest {
             .await?
             .encode();
         let proof = issuer.sign_bytes(&seed)?;
-        let mut packet = BytesMut::with_capacity(SIGNATURE_BYTES + seed.len());
-        packet.put_slice(&proof.issuer);
-        packet.put_slice(&proof.proof);
-        packet.put_slice(&seed);
-        publish_evidence(output, &packet)?;
+        publish_evidence(output, &[&proof.issuer, &proof.proof, &seed])?;
         Ok(())
     }
 
@@ -193,9 +189,33 @@ fn read_evidence(path: &Path, limit: u64) -> Result<Bytes, Failure> {
     Ok(Bytes::from(bytes))
 }
 
-fn publish_evidence(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
+fn evidence_matches(path: &Path, parts: &[&[u8]]) -> Result<bool, Failure> {
+    let mut file = File::open(path)?;
+    let mut scratch = [0; 8192];
+    let mut equal = true;
+    for part in parts {
+        for expected in part.chunks(scratch.len()) {
+            match file.read_exact(&mut scratch[..expected.len()]) {
+                Ok(()) => equal &= &scratch[..expected.len()] == expected,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    loop {
+        match file.read(&mut scratch[..1]) {
+            Ok(0) => break,
+            Ok(_) => return Err(invalid("repair evidence exceeds its installed bound").into()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(equal)
+}
+
+fn publish_evidence(path: &Path, parts: &[&[u8]]) -> Result<(), Failure> {
     if path.try_exists()? {
-        if read_evidence(path, bytes.len() as u64)?.as_ref() == bytes {
+        if evidence_matches(path, parts)? {
             return Ok(());
         }
         return Err(invalid("a different repair receipt occupies this path").into());
@@ -206,14 +226,16 @@ fn publish_evidence(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
             .write(true)
             .create_new(true)
             .open(&stage)?;
-        file.write_all(bytes)?;
+        for part in parts {
+            file.write_all(part)?;
+        }
         file.sync_all()?;
         // Publish without overwriting a concurrent original result.
         match fs::hard_link(&stage, path) {
             Ok(()) => Ok(()),
             Err(error)
                 if error.kind() == std::io::ErrorKind::AlreadyExists
-                    && read_evidence(path, bytes.len() as u64)?.as_ref() == bytes =>
+                    && evidence_matches(path, parts)? =>
             {
                 Ok(())
             }

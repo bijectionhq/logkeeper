@@ -14,9 +14,9 @@ use super::transport_fields::{
     transport_magic_matches, transport_voter_matches, vote_read_back_matches,
 };
 use crate::ordered::codec::frame::{bounded_body_length, decode_flag, encode_flag};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::future::Future;
-use std::io;
+use std::io::{self, IoSlice};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
@@ -262,10 +262,39 @@ async fn write_prefix(
     channel: &mut (impl AsyncWrite + Unpin),
     prefix: &Prefix,
 ) -> Result<(), Error> {
-    let mut output = BytesMut::with_capacity(prefix.bytes);
-    prefix.encode_into(&mut output);
-    channel.write_u64(output.len() as u64).await?;
-    channel.write_all(&output).await?;
+    const PAYLOADS_PER_WRITE: usize = 32;
+    let mut header = [0; 9];
+    header[..8].copy_from_slice(&(prefix.bytes as u64).to_be_bytes());
+    header[8] = prefix.base_tag();
+    let mut control = header.as_slice();
+    let mut payloads = prefix.framed_payloads().peekable();
+    while !control.is_empty() || payloads.peek().is_some() {
+        let batch: [_; PAYLOADS_PER_WRITE] = std::array::from_fn(|_| payloads.next());
+        let mut spans: [IoSlice<'_>; 1 + 2 * PAYLOADS_PER_WRITE] =
+            std::array::from_fn(|_| IoSlice::new(&[]));
+        let mut count = 0;
+        if !control.is_empty() {
+            spans[count] = IoSlice::new(control);
+            count += 1;
+            control = &[];
+        }
+        for (length, payload) in batch.iter().map_while(Option::as_ref) {
+            spans[count] = IoSlice::new(length);
+            count += 1;
+            if !payload.is_empty() {
+                spans[count] = IoSlice::new(payload);
+                count += 1;
+            }
+        }
+        let mut remaining = &mut spans[..count];
+        while !remaining.is_empty() {
+            let written = channel.write_vectored(remaining).await?;
+            if written == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero").into());
+            }
+            IoSlice::advance_slices(&mut remaining, written);
+        }
+    }
     Ok(())
 }
 

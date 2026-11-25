@@ -49,6 +49,47 @@ impl super::super::Limits {
 impl State {
     pub(in crate::ordered) fn encode_base(&self) -> Bytes {
         let mut output = BytesMut::new();
+        self.write_base(&mut output, |output, payload| output.put_slice(payload));
+        output.freeze()
+    }
+
+    pub(in crate::ordered) fn encode_base_within(&self, limit: usize) -> Option<Bytes> {
+        let mut control = BytesMut::new();
+        let mut payload_offsets = Vec::new();
+        self.write_base(&mut control, |output, payload| {
+            if !payload.is_empty() {
+                payload_offsets.push(output.len());
+            }
+        });
+        if control.len() > limit {
+            return None;
+        }
+        let length = self.records.iter().try_fold(control.len(), |length, record| {
+            length
+                .checked_add(record.payload.len())
+                .filter(|&size| size <= limit)
+        })?;
+        if payload_offsets.is_empty() {
+            return Some(control.freeze());
+        }
+
+        let mut output = BytesMut::with_capacity(length);
+        let payloads = self
+            .records
+            .iter()
+            .map(|entry| &entry.payload)
+            .filter(|body| !body.is_empty());
+        let mut start = 0;
+        for (end, payload) in payload_offsets.into_iter().zip(payloads) {
+            output.put_slice(&control[start..end]);
+            output.put_slice(payload);
+            start = end;
+        }
+        output.put_slice(&control[start..]);
+        Some(output.freeze())
+    }
+
+    fn write_base(&self, output: &mut BytesMut, mut write_payload: impl FnMut(&mut BytesMut, &[u8])) {
         output.put_slice(MAGIC);
         output.put_u64(self.position);
         output.put_u64(self.time);
@@ -58,71 +99,71 @@ impl State {
         if let Some(successor) = self.successor {
             output.put_slice(&successor);
         }
-        writer_state(&mut output, self.writer_state());
+        writer_state(output, self.writer_state());
         output.put_u64(self.authority.key_generation);
         output.put_u64(self.enrollment_serial);
-        window(&mut output, self.window);
+        window(output, self.window);
         output.put_u64(self.spent);
-        cut(&mut output, self.floor);
+        cut(output, self.floor);
         output.put_u64(self.erasure_floor);
-        cut(&mut output, self.head);
-        checkpoint(&mut output, self.checkpoint);
+        cut(output, self.head);
+        checkpoint(output, self.checkpoint);
         output.put_u8(encode_flag(self.preparing.is_some()));
         if let Some(item) = self.preparing {
-            checkpoint_preparation(&mut output, item);
+            checkpoint_preparation(output, item);
         }
         output.put_u64(self.old_roots.len() as u64);
         for entry in self.old_roots.values() {
-            checkpoint(&mut output, entry.checkpoint);
+            checkpoint(output, entry.checkpoint);
             output.put_u8(encode_flag(entry.closed));
         }
 
         output.put_u64(self.roster.len() as u64);
         for member in self.roster.values() {
-            enrollment(&mut output, *member);
+            enrollment(output, *member);
         }
         output.put_u64(self.records.len() as u64);
         for entry in &self.records {
-            record(&mut output, entry);
+            record_header(output, entry);
+            write_payload(output, &entry.payload);
         }
         output.put_u64(self.holds.len() as u64);
         for admission in self.holds.values() {
-            hold_row(&mut output, admission.hold);
-            principal(&mut output, admission.origin);
+            hold_row(output, admission.hold);
+            principal(output, admission.origin);
             match admission.kind {
                 HoldKind::Ordinary => output.put_u8(0),
                 HoldKind::Recovery => output.put_u8(1),
                 HoldKind::Root(parent) => {
                     output.put_u8(2);
-                    request_id(&mut output, parent);
+                    request_id(output, parent);
                 }
             }
         }
         output.put_u64(self.outcomes.len() as u64);
         for ((issuer, id), retained) in &self.outcomes {
-            principal(&mut output, *issuer);
-            request_id(&mut output, *id);
+            principal(output, *issuer);
+            request_id(output, *id);
             output.put_slice(&retained.fingerprint);
             output.put_u64(retained.receipt.position);
-            result(&mut output, retained.receipt.outcome);
+            result(output, retained.receipt.outcome);
         }
         output.put_u64(self.leases.len() as u64);
         for (member, lease_end) in &self.leases {
-            enrollment(&mut output, *member);
+            enrollment(output, *member);
             output.put_u64(*lease_end);
         }
         if !self.root_references.is_empty() || !self.object_fences.is_empty() {
             output.put_u64(self.root_references.len() as u64);
             for (&revision, names) in &self.root_references {
                 output.put_u64(revision);
-                object_names(&mut output, names);
+                object_names(output, names);
             }
             output.put_u64(self.object_fences.len() as u64);
             for &fence in self.object_fences.values() {
-                encode_fence(&mut output, fence);
+                encode_fence(output, fence);
             }
         }
-        output.freeze()
     }
 
     pub(in crate::ordered) fn decode_base(initial: &Self, bytes: Bytes) -> Result<Self, Refusal> {
@@ -710,11 +751,6 @@ pub(super) fn append_result(output: &mut BytesMut, value: AppendResult) {
     window(output, value.window);
     output.put_u64(value.byte_start);
     output.put_u64(value.byte_end);
-}
-
-pub(super) fn record(output: &mut BytesMut, entry: &Record) {
-    record_header(output, entry);
-    output.put_slice(&entry.payload);
 }
 
 pub(super) fn record_header(output: &mut BytesMut, entry: &Record) {

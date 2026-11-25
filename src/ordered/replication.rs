@@ -403,6 +403,12 @@ impl Prefix {
         })
     }
 
+    fn compacted(state: &State, limit: usize) -> Result<Self, Error> {
+        let body_limit = limit.checked_sub(9).ok_or(Error::Capacity)?;
+        let body = state.encode_base_within(body_limit).ok_or(Error::Capacity)?;
+        Self::from_base(body, limit)
+    }
+
     fn is_empty(&self) -> bool {
         self.base.is_none() && self.frames.is_empty()
     }
@@ -428,6 +434,7 @@ impl Prefix {
             .map(|payload| ((payload.len() as u64).to_be_bytes(), payload.as_ref()))
     }
 
+    #[cfg(feature = "simulation")]
     fn encode_into(&self, output: &mut BytesMut) {
         output.put_u8(self.base_tag());
         for (length, payload) in self.framed_payloads() {
@@ -526,9 +533,8 @@ impl Group {
         let (prepared, mut prefix) = self.prepare(peers, round).await?;
         if !prefix.is_empty() {
             let state = self.replay(&prefix)?;
-            if let Ok(base) = Prefix::from_base(state.encode_base(), self.max_prefix_bytes)
-                && base.bytes < prefix.bytes
-            {
+            let limit = self.max_prefix_bytes.min(prefix.bytes.saturating_sub(1));
+            if let Ok(base) = Prefix::compacted(&state, limit) {
                 prefix = base;
             }
             let digest = prefix.identity(self.identity);
@@ -605,10 +611,14 @@ impl Group {
             }
             let appended = prefix.append(frame, self.max_prefix_bytes);
             if appended.is_err() || matches!(receipt.outcome, Ok(Outcome::Trimmed(_))) {
-                let compact = Prefix::from_base(state.encode_base(), self.max_prefix_bytes);
+                let limit = match &appended {
+                    Ok(()) => self.max_prefix_bytes.min(prefix.bytes.saturating_sub(1)),
+                    Err(_) => self.max_prefix_bytes,
+                };
+                let compact = Prefix::compacted(&state, limit);
                 match (appended, compact) {
                     (Err(_), Ok(base)) => prefix = base,
-                    (Ok(()), Ok(base)) if base.bytes < prefix.bytes => prefix = base,
+                    (Ok(()), Ok(base)) => prefix = base,
                     (Err(error), Err(_)) => return Err(error),
                     (Ok(()), _) => {}
                 }

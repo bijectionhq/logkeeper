@@ -209,6 +209,10 @@ impl Request {
         if !has_command_version(input.read_byte()?) {
             return Err(Refusal::Invalid);
         }
+        Self::decode_fields(input)
+    }
+
+    fn decode_fields(mut input: Input) -> Result<Self, Refusal> {
         let placement = input.placement()?;
         let principal = input.principal()?;
         let id = input.request_id()?;
@@ -336,11 +340,9 @@ pub(in crate::ordered) fn encode_decision(time: u64, request: &Request) -> Bytes
 }
 
 pub(in crate::ordered) fn decode_decision(frame: Bytes) -> Result<(u64, Request), Refusal> {
-    let (time, version, fields) = decision_request_parts(&frame).ok_or(Refusal::Invalid)?;
-    let mut body = BytesMut::with_capacity(frame.len() - 8);
-    body.put_slice(version);
-    body.put_slice(fields);
-    Ok((u64::from_be_bytes(time), Request::decode(body.freeze())?))
+    let (time, _, fields) = decision_request_parts(&frame).ok_or(Refusal::Invalid)?;
+    let fields = frame.slice_ref(fields);
+    Ok((u64::from_be_bytes(time), Request::decode_fields(Input(fields))?))
 }
 
 struct Input(Bytes);

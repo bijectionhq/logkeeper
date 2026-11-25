@@ -13,6 +13,7 @@ use crate::ordered::{
     },
 };
 use bytes::{BufMut, Bytes, BytesMut};
+use std::ops::Range;
 
 mod rotation;
 
@@ -162,21 +163,22 @@ impl Operation {
 }
 
 pub(in crate::ordered) struct EncodedReply {
-    header: Bytes,
+    control: Bytes,
+    header_end: usize,
     records: Vec<EncodedRecord>,
 }
 
 struct EncodedRecord {
-    header: Bytes,
+    header: Range<usize>,
     payload: Bytes,
 }
 
 impl EncodedReply {
     pub(in crate::ordered) fn parts(&self) -> impl Iterator<Item = &[u8]> + Clone {
-        std::iter::once(self.header.as_ref()).chain(
-            self.records
-                .iter()
-                .flat_map(|record| [record.header.as_ref(), record.payload.as_ref()]),
+        std::iter::once(&self.control[..self.header_end]).chain(
+            self.records.iter().flat_map(|record| {
+                [&self.control[record.header.clone()], record.payload.as_ref()]
+            }),
         )
     }
 
@@ -267,10 +269,10 @@ impl Reply {
                 output.put_u64(page.records.len() as u64);
                 records.reserve(page.records.len());
                 for record in page.records {
-                    let mut header = BytesMut::new();
-                    snapshot::record_header(&mut header, &record);
+                    let start = output.len();
+                    snapshot::record_header(&mut output, &record);
                     records.push(EncodedRecord {
-                        header: header.freeze(),
+                        header: start..output.len(),
                         payload: record.payload,
                     });
                 }
@@ -310,7 +312,10 @@ impl Reply {
             }
         }
         EncodedReply {
-            header: output.freeze(),
+            header_end: records
+                .first()
+                .map_or(output.len(), |record| record.header.start),
+            control: output.freeze(),
             records,
         }
     }
