@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use journal_contract::{Epoch, Identity, JournalError, Lsn, Result, StreamId};
 
 use super::{Effects, Event, Operation, Response, Send, Slot, journal_reply, refusal};
 use crate::stream::{
+    timed::Entry,
     wire::{EpochRun, KeeperId, Reply, Request, StreamView},
     writer::decision::{can_sync_from, matches_epoch, outranks},
 };
@@ -263,21 +263,32 @@ impl<'a> SyncLane<'a> {
         )
     }
 
-    fn sync(&self, copy: Copy, record: Option<(Epoch, Bytes)>, complete: bool) -> Send {
+    fn sync(&self, copy: Copy, record: Option<(Epoch, Entry)>, complete: bool) -> Send {
         let election = &self.recovery.election;
-        let (runs, records) = record
-            .map(|(epoch, bytes)| {
-                (
-                    EpochRun {
-                        epoch,
-                        first: copy.from,
-                        last: copy.from,
+        let (runs, records) = match record {
+            Some((_, Entry::Timed { evidence, payload })) => {
+                return election.send(
+                    self.target,
+                    Request::SyncOriginal {
+                        stream: election.stream,
+                        epoch: election.epoch,
+                        floor: copy.floor,
+                        evidence,
+                        payload,
+                        head: copy.head,
                     },
-                    bytes,
-                )
-            })
-            .into_iter()
-            .unzip();
+                );
+            }
+            Some((epoch, Entry::Ordinary(bytes))) => (
+                vec![EpochRun {
+                    epoch,
+                    first: copy.from,
+                    last: copy.from,
+                }],
+                vec![bytes],
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
         election.send(
             self.target,
             Request::Sync {
@@ -291,6 +302,17 @@ impl<'a> SyncLane<'a> {
                 complete,
             },
         )
+    }
+
+    fn fetched(&self, response: Response, at: Lsn, epoch: Epoch) -> Result<Entry> {
+        let entry = single_record(journal_reply(response), at)?;
+        if let Entry::Timed { evidence, .. } = &entry {
+            let original = evidence.origin.original;
+            if original.stream != self.recovery.election.stream || original.epoch != epoch {
+                return Err(JournalError::Unavailable);
+            }
+        }
+        Ok(entry)
     }
 
     fn finish(&mut self, install_floor: bool, tail: Lsn) -> Result<Effects<Result<Lsn>>> {
@@ -322,7 +344,7 @@ impl<'a> SyncLane<'a> {
         match phase {
             Phase::Seal if slot == self.target => self.start(response),
             Phase::Fetch(copy, epoch) if slot == self.recovery.source => {
-                match single_record(journal_reply(response), copy.from) {
+                match self.fetched(response, copy.from, epoch) {
                     Ok(bytes) => {
                         self.phase = Phase::Stage(copy);
                         Ok(Effects::Send(self.sync(copy, Some((epoch, bytes)), false)))
@@ -344,7 +366,7 @@ impl<'a> SyncLane<'a> {
                         }
                     }
                     Fallback::Fetch => {
-                        if let Ok(record) = single_record(journal_reply(response), copy.from) {
+                        if let Ok(record) = self.fetched(response, copy.from, epoch) {
                             self.phase = Phase::Stage(copy);
                             return Ok(Effects::CancelAndSend(self.sync(
                                 copy,
@@ -418,10 +440,16 @@ pub(in crate::stream) fn recover_request(
     }
 }
 
-pub(in crate::stream) fn single_record(reply: Result<Reply>, from: Lsn) -> Result<Bytes> {
+pub(in crate::stream) fn single_record(reply: Result<Reply>, from: Lsn) -> Result<Entry> {
     match reply? {
         Reply::Records { mut records, .. } if records.len() == 1 && records[0].0 == from => {
-            Ok(records.pop().unwrap().1)
+            Ok(Entry::Ordinary(records.pop().unwrap().1))
+        }
+        Reply::OriginalRecord { evidence, payload }
+            if evidence.origin.original.at == from
+                && evidence.origin.original.matches(&payload) =>
+        {
+            Ok(Entry::Timed { evidence, payload })
         }
         _ => Err(JournalError::Unavailable),
     }

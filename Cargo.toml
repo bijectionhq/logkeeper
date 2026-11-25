@@ -14,7 +14,7 @@ description = "Epoch-fenced durable journals and a Rust quorum client"
 [features]
 simulation = []
 ordered-daemon = ["dep:ring", "dep:serde", "dep:serde_json", "dep:tokio-rustls", "uuid/serde"]
-stream = ["dep:serde", "dep:serde_json", "dep:tokio-rustls", "dep:x509-parser", "uuid/serde", "journal-contract/serde", "dep:bincode", "dep:openraft", "tokio/fs"]
+stream = ["dep:ring", "dep:serde", "dep:serde_json", "dep:tokio-rustls", "dep:x509-parser", "uuid/serde", "journal-contract/serde", "dep:bincode", "dep:openraft", "tokio/fs"]
 
 [dependencies]
 journal-contract = { path = "contract" }

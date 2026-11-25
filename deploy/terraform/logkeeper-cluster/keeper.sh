@@ -97,9 +97,44 @@ prepare_keeper() {
     echo "Keeper $id for $host"
 }
 
+prepare_timed_original() {
+    local store=$1 runtime=$2 profile_dir=$3
+    local profile="$profile_dir/keeper-profile.json"
+    local marker="$store/keeper/timed-original-required"
+
+    [[ -f $profile && ! -L $profile && ! -L $profile_dir ]] ||
+        fail "The keeper requires an installed timed-original profile"
+    [[ $(wc -c < "$profile") -le 65536 ]] ||
+        fail "The timed-original keeper profile exceeds its size limit"
+    jq -e --slurpfile profile "$profile" '
+        if ($profile | length) != 1 or ($profile[0] | type) != "object"
+            or $profile[0].trust_file != "/run/logkeeper-timed-original/trust.json"
+            or ($profile[0].original != null and
+                ($profile[0].original | type) != "object")
+            or ($profile[0].original != null and (
+                $profile[0].original.signer_pkcs8_file != "/run/logkeeper-timed-original/signer.der"
+                or $profile[0].original.receiver_certificate_file != "/run/logkeeper-timed-original/receiver.json"
+                or $profile[0].original.clock_socket != "/run/logkeeper-timed-clock/clock.sock"
+            ))
+        then error("Invalid installed timed-original keeper profile")
+        else . + {timed_original: $profile[0]}
+        end
+    ' "$runtime/keeper.json" > "$runtime/keeper.json.timed"
+    mv -f "$runtime/keeper.json.timed" "$runtime/keeper.json"
+
+    # After commissioning, restart must retain a verifier even if the keeper
+    # later stops signing. The marker is on the same device as the journal.
+    if [[ ! -e $marker ]]; then
+        printf 'timed-original-v1\n' > "$marker"
+        sync -f "$store"
+    fi
+}
+
 start_keeper() {
     local store=/mnt/logkeeper runtime=/run/logkeeper deployment=/etc/logkeeper/deployment.json
     local region registry parameter image auth
+    local timed_profile=/etc/logkeeper/timed-original timed_clock=/run/logkeeper-timed-clock
+    local -a timed_mounts=()
     # shellcheck source=deploy/terraform/logkeeper-cluster/pki.sh
     source /usr/local/lib/logkeeper/pki.sh
 
@@ -120,6 +155,15 @@ start_keeper() {
 
     mount_instance_store "$store"
     prepare_keeper "$store" "$runtime" "$deployment" /etc/logkeeper/ca.pem
+    if [[ -e $timed_profile/keeper-profile.json || -L $timed_profile/keeper-profile.json ||
+        -e $store/keeper/timed-original-required ]]; then
+        prepare_timed_original "$store" "$runtime" "$timed_profile"
+        timed_mounts+=(--mount "type=bind,source=$timed_profile,target=/run/logkeeper-timed-original,readonly")
+        if jq -e '.timed_original.original != null' "$runtime/keeper.json" >/dev/null; then
+            [[ -S $timed_clock/clock.sock ]] || fail "The timed-original clock socket is unavailable"
+            timed_mounts+=(--mount "type=bind,source=$timed_clock,target=/run/logkeeper-timed-clock,readonly")
+        fi
+    fi
     chown 10001:10001 "$store/keeper/data"
     chgrp 10001 "$runtime" "$runtime/"{certificate.pem,private-key.pem,ca.pem,keeper.json}
     chmod 0750 "$runtime"
@@ -128,7 +172,8 @@ start_keeper() {
     exec docker run --rm --name logkeeper --pull never --read-only --cap-drop ALL \
         --security-opt no-new-privileges --publish 5448:5448 \
         --mount "type=bind,source=$store/keeper/data,target=/var/lib/logkeeper" \
-        --mount "type=bind,source=$runtime,target=/etc/logkeeper,readonly" "$image"
+        --mount "type=bind,source=$runtime,target=/etc/logkeeper,readonly" \
+        "${timed_mounts[@]}" "$image"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then

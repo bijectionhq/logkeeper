@@ -2,11 +2,13 @@
 
 use std::collections::BTreeMap;
 
-use bytes::Bytes;
 use journal_contract::{Epoch, JournalError, Lsn, Result};
 
 use super::refusal;
-use crate::stream::writer::decision::{QUORUM, accepted_tail, acknowledged, append_head};
+use crate::stream::{
+    timed::{Entry, TimedOriginal},
+    writer::decision::{QUORUM, accepted_tail, acknowledged, append_head},
+};
 
 pub(in crate::stream) const APPEND_RECORDS: usize = 1024;
 const APPEND_BYTES: usize = 512 * 1024;
@@ -20,11 +22,12 @@ pub(in crate::stream) struct State {
     head: Lsn,
     floor: Lsn,
     pending: BTreeMap<Lsn, Pending>,
+    timed_reservation: Option<TimedOriginal>,
     publishing: BTreeMap<Lsn, Vec<u64>>,
     /// An unanswered Append can still reach a keeper after a later capacity refusal.
     uncertain_through: Lsn,
     /// Chosen payloads that some lane may still need. Bounded by `RETAIN_BYTES`.
-    committed: BTreeMap<Lsn, Bytes>,
+    committed: BTreeMap<Lsn, Entry>,
     committed_bytes: usize,
     lanes: [Lane; 3],
     revision: u64,
@@ -47,7 +50,7 @@ struct Failure {
 }
 
 struct Pending {
-    payload: Bytes,
+    payload: Entry,
     waiters: Vec<u64>,
 }
 
@@ -58,7 +61,7 @@ pub(in crate::stream) enum Work {
     /// `limit` committed records that this lane lacks.
     Append {
         at: Lsn,
-        payloads: Option<Vec<Bytes>>,
+        payloads: Option<Vec<Entry>>,
         limit: usize,
         head: Lsn,
     },
@@ -90,6 +93,7 @@ impl State {
             head,
             floor,
             pending: BTreeMap::new(),
+            timed_reservation: None,
             publishing: BTreeMap::new(),
             uncertain_through: Lsn(0),
             committed: BTreeMap::new(),
@@ -138,7 +142,7 @@ impl State {
         completions
     }
 
-    pub(in crate::stream) fn append(&mut self, at: Lsn, payload: &Bytes) -> Admission {
+    pub(in crate::stream) fn append(&mut self, at: Lsn, payload: &Entry) -> Admission {
         if let Some(error) = &self.closed {
             return Admission::Refused(error.clone());
         }
@@ -149,6 +153,12 @@ impl State {
             // A returning lane can catch up from the chosen payload.
             self.revision += 1;
             return Admission::Retry;
+        }
+        if let Some(reservation) = self.timed_reservation
+            && at >= reservation.at
+            && !matches!(payload, Entry::Timed { evidence, .. } if evidence.origin.original == reservation)
+        {
+            return Admission::Refused(JournalError::Unavailable);
         }
         if at.0 == u64::MAX || at.0 > self.last().0 + 1 {
             return Admission::Refused(JournalError::Conflict { head: self.head });
@@ -174,6 +184,38 @@ impl State {
             });
         }
         Admission::Waiting
+    }
+
+    /// Keep the exact next position reserved after a possibly durable stage.
+    /// An unavailable or cancelled original can be retried or fenced by a seal.
+    pub(in crate::stream) fn reserve_timed(&mut self, original: TimedOriginal) -> Result<()> {
+        if let Some(error) = &self.closed {
+            return Err(error.clone());
+        }
+        if original.at.0 != self.head.0 + 1
+            || !self.pending.is_empty()
+            || self
+                .timed_reservation
+                .is_some_and(|other| other != original)
+        {
+            return Err(JournalError::Unavailable);
+        }
+        self.timed_reservation = Some(original);
+        Ok(())
+    }
+
+    pub(in crate::stream) fn timed_entry(&self, original: TimedOriginal) -> Option<Entry> {
+        let entry = self
+            .pending
+            .get(&original.at)
+            .map(|pending| &pending.payload)
+            .or_else(|| self.committed.get(&original.at))?;
+        match entry {
+            Entry::Timed { evidence, .. } if evidence.origin.original == original => {
+                Some(entry.clone())
+            }
+            _ => None,
+        }
     }
 
     fn last(&self) -> Lsn {
@@ -354,7 +396,7 @@ impl State {
     }
 
     /// The contiguous retained and pending payloads from `at`, within one append's bounds.
-    fn run_from(&self, at: Lsn, records: usize) -> Vec<Bytes> {
+    fn run_from(&self, at: Lsn, records: usize) -> Vec<Entry> {
         let mut bytes = 0;
         let mut next = at;
         let mut payloads = Vec::new();
@@ -363,7 +405,9 @@ impl State {
             .range(at..)
             .chain(self.pending.range(at..).map(|(lsn, p)| (lsn, &p.payload)));
         for (&lsn, payload) in known {
+            let timed = matches!(payload, Entry::Timed { .. });
             if lsn != next
+                || (timed && !payloads.is_empty())
                 || payloads.len() == records.max(1)
                 || (!payloads.is_empty() && bytes + payload.len() > APPEND_BYTES)
             {
@@ -371,6 +415,9 @@ impl State {
             }
             bytes += payload.len();
             payloads.push(payload.clone());
+            if timed {
+                break;
+            }
             next = Lsn(lsn.0 + 1);
         }
         payloads
@@ -438,6 +485,12 @@ impl State {
                 break;
             }
             self.head = at;
+            if self
+                .timed_reservation
+                .is_some_and(|original| original.at == at)
+            {
+                self.timed_reservation = None;
+            }
             let pending = self.pending.pop_first().unwrap().1;
             if !pending.waiters.is_empty() {
                 self.publishing.insert(at, pending.waiters);
@@ -547,6 +600,7 @@ mod tests {
             head: Lsn(3),
             floor: Lsn(1),
             pending: BTreeMap::new(),
+            timed_reservation: None,
             publishing: BTreeMap::new(),
             uncertain_through: Lsn(0),
             committed: BTreeMap::new(),

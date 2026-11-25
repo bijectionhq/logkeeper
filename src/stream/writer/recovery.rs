@@ -1,6 +1,5 @@
 //! Drive election and recovery transfers for the writer.
 
-use bytes::Bytes;
 use journal_contract::{Epoch, JournalError, Lsn, Result, StreamId};
 
 use crate::stream::proposer::{
@@ -11,6 +10,7 @@ use crate::stream::proposer::{
 pub(super) use crate::stream::proposer::recovery::Recovery;
 
 use super::{Io, KeeperId, Reply, Stream};
+use crate::stream::timed::Entry;
 
 pub(super) async fn choose(io: &Io, stream: &Stream, epoch: Epoch) -> Result<Recovery> {
     let election = Election::new(
@@ -56,7 +56,7 @@ pub(super) async fn fetch(
     stream: StreamId,
     epoch: Epoch,
     from: Lsn,
-) -> Result<Bytes> {
+) -> Result<Entry> {
     single_record(
         io.call(keeper, recover_request(stream, epoch, from, 1))
             .await,
@@ -71,7 +71,7 @@ pub(super) async fn fetch_run(
     epoch: Epoch,
     from: Lsn,
     max: u32,
-) -> Result<Vec<Bytes>> {
+) -> Result<Vec<Entry>> {
     match io
         .call(keeper, recover_request(stream, epoch, from, max))
         .await?
@@ -84,7 +84,13 @@ pub(super) async fn fetch_run(
                     .enumerate()
                     .all(|(i, (lsn, _))| from.0.checked_add(i as u64) == Some(lsn.0)) =>
         {
-            Ok(records.into_iter().map(|(_, payload)| payload).collect())
+            Ok(records
+                .into_iter()
+                .map(|(_, payload)| Entry::Ordinary(payload))
+                .collect())
+        }
+        reply @ Reply::OriginalRecord { .. } if max != 0 => {
+            Ok(vec![single_record(Ok(reply), from)?])
         }
         _ => Err(JournalError::Unavailable),
     }

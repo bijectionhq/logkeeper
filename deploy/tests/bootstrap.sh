@@ -150,6 +150,29 @@ jq -e --arg keeper "$replacement" --slurpfile host "$fixture/deployment.json" '.
 }' "$fixture/runtime/keeper.json" >/dev/null
 echo "Keeper JSON exactly matches the deployment format"
 
+project_timing() {
+    bash -c '
+        source "$1/keeper.sh"
+        timed_store=$2
+        sync() { [[ $1 == -f && $2 == "$timed_store" ]]; }
+        prepare_timed_original "$timed_store" "$fixture/runtime" "$fixture/timed"
+    ' bash "$module" "$fixture/replacement"
+}
+
+mkdir "$fixture/timed"
+printf '%s\n' '{"trust_file":"/run/logkeeper-timed-original/trust.json"}' \
+    > "$fixture/timed/keeper-profile.json"
+project_timing
+[[ -f "$fixture/replacement/keeper/timed-original-required" ]]
+jq -e '.timed_original == {trust_file: "/run/logkeeper-timed-original/trust.json"}' \
+    "$fixture/runtime/keeper.json" >/dev/null
+
+mv "$fixture/timed/keeper-profile.json" "$fixture/timed/recovered-profile.json"
+expect_failure "The keeper requires an installed timed-original profile" project_timing
+printf '%s\n' '{"trust_file":"/etc/logkeeper/deployment.json"}' \
+    > "$fixture/timed/keeper-profile.json"
+expect_failure "Invalid installed timed-original keeper profile" project_timing
+
 wrong_key="$fixture/keeper-key.$replacement" \
     expect_failure "Certificate does not match its private key" boot "$fixture/first" "$first"
 mv "$fixture/replacement/keeper/data" "$fixture/replacement/unbound"

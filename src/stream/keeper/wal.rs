@@ -195,7 +195,7 @@ pub(super) fn atomic_file(
     Ok(file)
 }
 
-fn directories(path: &Path) -> io::Result<()> {
+pub(super) fn directories(path: &Path) -> io::Result<()> {
     if path.is_dir() {
         return Ok(());
     }

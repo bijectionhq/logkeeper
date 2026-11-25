@@ -313,6 +313,7 @@ async fn writer_round_trips_through_three_tls_keepers() {
             clients: vec![CLIENT.into(), successor_uri.into(), READ_ONLY.into()],
             writers: vec![CLIENT.into(), successor_uri.into()],
             limits: Limits::default(),
+            timed_original: None,
         };
         tasks.push(tokio::spawn(config.serve(listener, stop.clone())));
         routes.push(listen.to_string());
@@ -449,6 +450,7 @@ async fn concurrent_calls_share_one_connection_and_batches_authorize_each_reques
         clients: vec![CLIENT.into(), READ_ONLY.into()],
         writers: vec![CLIENT.into()],
         limits,
+        timed_original: None,
     };
     let stop = CancellationToken::new();
     let task = tokio::spawn(config.serve(listener, stop.clone()));

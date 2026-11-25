@@ -223,7 +223,7 @@ pub(crate) fn decide_replace(
 pub use implementation::Limits;
 #[cfg(not(verus_keep_ghost))]
 pub(super) use implementation::{
-    Decision, StreamView, decide, installs_floor, promised, valid_limits,
+    Decision, StreamView, decide, installs_floor, last, promised, valid_limits,
 };
 
 #[cfg(verus_keep_ghost)]
@@ -637,7 +637,11 @@ mod implementation {
                 }
             }
             // `Keeper::call` splits envelopes before any per-stream decision.
-            Request::Batch(_) => refuse(Refusal::Unauthorized),
+            Request::Batch(_)
+            | Request::StageOriginal { .. }
+            | Request::AppendOriginal { .. }
+            | Request::SyncOriginal { .. }
+            | Request::ProveOriginal { .. } => refuse(Refusal::Unauthorized),
             Request::Create { .. } | Request::Delete { .. } => unreachable!(),
         }
     }

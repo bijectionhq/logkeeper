@@ -115,3 +115,82 @@ keeper's directory listing and compare every selected file against the
 observer before allowing background cleanup to run.
 
 As a negative control, run the same fault and recovery check on each stack with a keeper test build that replies before sync. Inject a fault after an acknowledgement and before persistence and require the acknowledged-record reconciliation to fail. Test whole-disk loss separately with the learner procedure, including refusal to count the new UUID before sync. Retain fault settings, the acknowledgement trace, recovery results and the failing control with the qualification record. [EC2 NVMe instance store](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ssd-instance-store.html)
+
+## Timed original keeper mounts
+
+The private `keeper --config` daemon accepts an optional `timed_original`
+object. Omitting it selects ordinary operation. For verify-only operation,
+supply `trust_file` and omit `original`. A verify-only keeper can recover and
+replicate already signed timed records. A keeper reopening timed media needs
+the historical verifier even when it will never sign a fresh original.
+Proof reopening uses the retained keeper signatures and can proceed through
+restart and successor recovery without fresh clock evidence.
+
+The absolute `trust_file` path names the same JSON schema as the RTDB
+`RTDB_TIMED_ORIGINAL_TRUST_FILE`. Its `keepers` entries contain an `identity`
+UUID and a 32-byte Ed25519 `verification_key` array. The optional
+`maximum_payload_bytes` is interpreted by RTDB. Keep each historical key under
+its original keeper UUID for as long as its evidence can be retained. Use a
+new keeper identity when replacing the signing key. Omit the writer limit
+from the RTDB registry until the original keeper mounts qualify.
+
+A signing keeper also needs the following `timed_original.original` fields.
+
+| Field | Installed value |
+| --- | --- |
+| `signer_pkcs8_file` | Absolute path to this keeper's separate Ed25519 PKCS#8 DER private key, matching its registry entry. Mount read-only to the keeper UID or its private group. |
+| `receiver_certificate_file` | Absolute path to the exact signed receiver certificate JSON envelope consumed by RTDB. |
+| `receiver_issuer_key` | Pinned 32-byte Ed25519 public key array for the receiver certificate issuer. |
+| `deployment`, `source` | The expected deployment and source UUIDs. The source UUID supplies the exact StreamId. |
+| `cell`, `rtdb_image`, `service_scope` | The expected cell, RTDB image, and lowercase service-scope SHA-256 from the independent installation binding. |
+| `clock_socket`, `clock_timeout_ms` | Absolute path to the private Unix clock socket, with no permissions for other users, and a request timeout from 1 through 1000 ms. |
+| `clock_verification_key` | Pinned 32-byte Ed25519 public key array for the installed live clock evidence service. |
+
+The clock service must authenticate each post-sync sample in the Unix
+nanosecond scale covered by the receiver certificate. It must independently
+match the authorized keeper, stream, receiver envelope digest, and signed
+`evidenceSha256` against its mounted evidence. It samples after receiving the
+challenge, supplies the conservative current clock error in that scale, and
+withholds a reply when that error is unavailable. Only the clock service holds
+this signing key. The receiver issuer, keeper signer, clock evidence key and
+keeper TLS key are separate authorities.
+
+A request is one binary exchange per Unix connection. All integers are
+big-endian and digests are raw bytes. The request concatenates the ASCII
+domain `logkeeper/stream/original-clock/v1` followed by a NUL, the 16-byte keeper
+UUID, the original tuple below, the 32-byte certificate `evidenceSha256`, and a
+fresh 32-byte nonce.
+
+1. Source StreamId as 16 bytes.
+2. Sealed writer epoch and LSN as two unsigned 64-bit integers.
+3. Exact sealed payload SHA-256 as 32 bytes.
+4. Exclusive journal cutoff in microseconds as a signed 64-bit integer.
+5. Exact receiver envelope SHA-256 as 32 bytes.
+
+The 80-byte reply contains the sampled Unix nanoseconds and the positive
+current error in nanoseconds as two unsigned 64-bit integers, followed by the
+64-byte Ed25519 signature over the complete request and those first 16 reply
+bytes. The keeper adds the error, rounds the upper bound up to microseconds,
+and requires it to precede both the original exclusive cutoff and the
+certificate expiry. The error may be at most the signed certificate limit.
+
+The stock keeper launcher loads an operator-installed
+`/etc/logkeeper/timed-original/keeper-profile.json` after the host has its
+persistent keeper UUID. The file contains the exact `timed_original` object.
+Use `/run/logkeeper-timed-original/trust.json`, `signer.der` and
+`receiver.json` as container paths under the private profile mount. The
+clock service creates `/run/logkeeper-timed-clock/clock.sock` on the host and
+keeps its signing key outside both keeper mounts. Give the keeper UID or
+group 10001 read access to the required files and access to the socket.
+Both mounts are read-only and the stock launcher mounts the clock only for
+a signing profile. Keep signer and clock keys out of cloud-init, deployment
+JSON and Terraform state.
+
+Install the profile and corresponding historical verification keys before
+restarting each keeper. After the first commissioning, the journal device
+requires a profile on restart. Use verify-only with the same retained trust
+registry when taking a signer offline. The remaining ordinary keepers can
+start without a profile before commissioning. Keep funded capability
+disabled until both original keeper slots supply live evidence, all stream
+participants carry the historical registry, and the paired RTDB route is
+qualified.

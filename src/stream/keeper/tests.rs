@@ -8,6 +8,9 @@ use tokio::sync::Notify;
 
 use super::*;
 
+#[cfg(feature = "stream")]
+mod timed_original;
+
 const A: StreamId = StreamId(10);
 const B: StreamId = StreamId(20);
 const MEMBERS: [KeeperId; 3] = [KeeperId(1), KeeperId(2), KeeperId(3)];
@@ -38,7 +41,9 @@ fn wal_request_is_encoded_after_the_identity_in_the_final_owner() {
     }
     let oversized = Identity::from("a".repeat(wal::MAX_IDENTITY_BYTES + 1).as_str());
     assert_eq!(
-        wal::entry(&request, Some(&oversized)).unwrap_err().to_string(),
+        wal::entry(&request, Some(&oversized))
+            .unwrap_err()
+            .to_string(),
         "oversized WAL identity",
     );
 }

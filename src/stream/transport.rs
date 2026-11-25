@@ -45,6 +45,9 @@ use super::{
     wire::*,
 };
 
+mod timed_original;
+pub use timed_original::TimedOriginalConfig;
+
 const ALPN: &[u8] = b"logkeeper-stream/2";
 const KEEPER_URI: &str = "urn:logkeeper:keeper:";
 const CLIENT_URI: &str = "urn:logkeeper:client:";
@@ -76,6 +79,7 @@ pub struct Config {
     pub clients: Vec<String>,
     pub writers: Vec<String>,
     pub limits: Limits,
+    pub timed_original: Option<TimedOriginalConfig>,
 }
 
 impl Config {
@@ -103,7 +107,7 @@ impl Config {
         policy: Option<Arc<dyn SealPolicy>>,
     ) -> io::Result<()> {
         let id = KeeperId(self.keeper.as_u128());
-        let acceptor = self.tls.server(id)?;
+        let (acceptor, tls_public_key) = self.tls.server(id)?;
         if self.zone.is_empty()
             || self
                 .clients
@@ -115,9 +119,22 @@ impl Config {
         }
         let clients: Arc<HashSet<String>> = Arc::new(self.clients.into_iter().collect());
         let writers: Arc<HashSet<String>> = Arc::new(self.writers.into_iter().collect());
-        let keeper = tokio::task::spawn_blocking(move || match policy {
-            Some(policy) => Keeper::open_with_policy(&self.data, id, self.limits, policy),
-            None => Keeper::open(&self.data, id, self.limits),
+        let runtime = tokio::runtime::Handle::current();
+        let keeper = tokio::task::spawn_blocking(move || {
+            if let Some(timed) = self.timed_original {
+                return timed.open(
+                    &self.data,
+                    id,
+                    self.limits,
+                    policy,
+                    &tls_public_key,
+                    runtime,
+                );
+            }
+            match policy {
+                Some(policy) => Keeper::open_with_policy(&self.data, id, self.limits, policy),
+                None => Keeper::open(&self.data, id, self.limits),
+            }
         })
         .await??;
         let mut tasks = JoinSet::new();
@@ -214,7 +231,9 @@ struct Access {
 impl Access {
     fn allowed(&self, request: &Request) -> bool {
         match request {
-            Request::Read { .. } | Request::Check { .. } => self.can_read,
+            Request::Read { .. } | Request::Check { .. } | Request::ProveOriginal { .. } => {
+                self.can_read
+            }
             Request::Batch(_) => false,
             _ => self.can_write,
         }
@@ -415,10 +434,13 @@ impl TcpTransport {
             .routes
             .get(&keeper)
             .ok_or(TransportError::Unreachable)?;
-        // Waiting reads and Delete compaction would hold the shared connection's replies.
+        // Waiting reads, Delete compaction and timed staging can hold the shared connection.
         let measured = if matches!(
             request,
-            Request::Read { wait_ms: 1.., .. } | Request::Delete { .. } | Request::Batch(_)
+            Request::Read { wait_ms: 1.., .. }
+                | Request::Delete { .. }
+                | Request::StageOriginal { .. }
+                | Request::Batch(_)
         ) {
             None
         } else {
@@ -529,8 +551,8 @@ pub(super) async fn connect_protocol(
 }
 
 impl Credentials {
-    fn server(&self, keeper: KeeperId) -> io::Result<TlsAcceptor> {
-        self.server_protocol(keeper, ALPN)
+    fn server(&self, keeper: KeeperId) -> io::Result<(TlsAcceptor, Vec<u8>)> {
+        self.keyed_server(keeper, &[ALPN])
     }
 
     pub(super) fn server_protocol(
@@ -546,6 +568,16 @@ impl Credentials {
         keeper: KeeperId,
         protocols: &[&[u8]],
     ) -> io::Result<TlsAcceptor> {
+        Ok(self.keyed_server(keeper, protocols)?.0)
+    }
+
+    /// Builds a server for the given ALPN protocols and returns the keeper's
+    /// certificate public key alongside it.
+    fn keyed_server(
+        &self,
+        keeper: KeeperId,
+        protocols: &[&[u8]],
+    ) -> io::Result<(TlsAcceptor, Vec<u8>)> {
         let provider = Arc::new(ring::default_provider());
         let verifier = WebPkiClientVerifier::builder_with_provider(
             Arc::new(self.root_store()?),
@@ -554,9 +586,13 @@ impl Credentials {
         .build()
         .map_err(display_error)?;
         let chain = certificates(&self.certificate)?;
-        if keeper_id(leaf(Some(&chain))?)? != keeper {
+        let certificate = leaf(Some(&chain))?;
+        if keeper_id(certificate)? != keeper {
             return Err(invalid("configured keeper does not match certificate URI"));
         }
+        let (_, certificate) =
+            parse_x509_certificate(certificate.as_ref()).map_err(display_error)?;
+        let public_key = certificate.public_key().subject_public_key.data.to_vec();
         let mut config = ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&TLS13])
             .map_err(display_error)?
@@ -565,7 +601,7 @@ impl Credentials {
             .map_err(display_error)?;
         config.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
         config.send_tls13_tickets = 0;
-        Ok(TlsAcceptor::from(Arc::new(config)))
+        Ok((TlsAcceptor::from(Arc::new(config)), public_key))
     }
 
     fn client(&self) -> io::Result<(TlsConnector, Identity)> {

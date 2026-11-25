@@ -203,6 +203,14 @@ requests require writer authorization.
   reads, deletes and requests of 1 MiB or more use separate pooled
   connections, so they never delay the shared connection's replies.
 
+### Timed original proofs
+
+The `Writer` can be commissioned to prove a timed original append on the same stream. The request binds the stream, sealed writer epoch, next LSN, exact payload SHA-256, exclusive journal cutoff and original receiver certificate SHA-256. The first two keepers in the sealed ensemble stage and sync the original bytes, then independently sign conservative upper bounds for that durability event. Both bounds must be strictly before the original cutoff. The writer publishes the timed entry through the same committed-prefix protocol as other appends.
+
+A staged record without a verified timely sample keeps its exact reservation until durable supersession and never becomes visible on that evidence. Retrying a staged original cannot take a new sample. The ordinary recovery and replacement paths copy the signed original evidence with the chosen entry. A proof read establishes committed visibility through a current quorum, verifies the original signatures against their retained keeper identities, and returns the same bound and evidence digest while the entry remains retained.
+
+Operators commission the keeper roster, individual attestation keys, receiver certificate and clock authority before enabling timed appends. The proof-only mount can verify records without an original signing clock. [Deployment and clock service](../deploy/README.md)
+
 ### Keeper storage
 
 One append-only segmented WAL per keeper carries all streams. A frame records
@@ -259,6 +267,7 @@ These are not Logkeeper's job, but the journal must not prevent them:
   - A candidate reads the stream through `head` before sealing.
 - **Catch-up before serving:** after `seal` returns head `n`, a new writer applies through `n` before serving. The conformance suite states this as a consumer obligation.
 - **Erasure** is completed by key destruction (D02 extension) in the key authority, after closing outstanding key grants.
+- **Timed physical effects** use consumer-ordered `Settle` or `Refuse` records. RTDB owns cutoff selection and state-machine decisions. The optional provider proof certifies the original durability event for the exact opaque record.
 
 ## 5. Deployment
 
