@@ -23,6 +23,14 @@ damaging the other file. It covers one tear on the preallocated two-slot media.
 An unrecoverable file I/O error can propagate. The model's guarantee is about
 returned images.
 
+The second-slot fast path feeds the exact ballot framing, length words, and
+payload chunks into the [checked mirror-body comparison](../voter_mirror_body/area.json).
+An earlier mismatch remains a mismatch through later chunks, and reuse
+requires the full declared body. The reader also verifies this slot's digest
+and group and voter identities. A valid differing image goes through the
+original decode and replay path. That path's correspondence between the
+decoded compact base and the complete chosen history is still open.
+
 The foreign contracts cover file reads, hashing, semantic prefix decoding,
 `install` and a single physical readback visit. In the shipped adapter,
 `persist` writes the body and header then calls `sync_all`. The install
