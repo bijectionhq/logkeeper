@@ -259,7 +259,7 @@ impl Access {
     }
 }
 
-type Channel = TlsStream<TcpStream>;
+pub(super) type Channel = TlsStream<TcpStream>;
 
 mod mux;
 
@@ -460,7 +460,8 @@ impl TcpTransport {
                 channel
             }
         };
-        request.write(&mut channel)
+        request
+            .write(&mut channel)
             .await
             .map_err(connection_error)?;
         let reply = decode_reply(read_frame(&mut channel).await.map_err(connection_error)?)
@@ -506,13 +507,21 @@ impl Transport for TcpTransport {
 }
 
 async fn connect(tls: &TlsConnector, address: &str) -> io::Result<(KeeperId, Channel)> {
+    connect_protocol(tls, address, ALPN).await
+}
+
+pub(super) async fn connect_protocol(
+    tls: &TlsConnector,
+    address: &str,
+    protocol: &[u8],
+) -> io::Result<(KeeperId, Channel)> {
     let socket = TcpStream::connect(address).await?;
     socket.set_nodelay(true)?;
     // The server verifier validates a keeper URI identity. SNI and DNS names are unused.
     let name = ServerName::try_from("logkeeper").expect("valid placeholder name");
     let channel = tls.connect(name, socket).await?;
     let (_, peer) = channel.get_ref();
-    if peer.alpn_protocol() != Some(ALPN) {
+    if peer.alpn_protocol() != Some(protocol) {
         return Err(invalid("invalid keeper ALPN"));
     }
     let id = keeper_id(leaf(peer.peer_certificates())?)?;
@@ -521,6 +530,22 @@ async fn connect(tls: &TlsConnector, address: &str) -> io::Result<(KeeperId, Cha
 
 impl Credentials {
     fn server(&self, keeper: KeeperId) -> io::Result<TlsAcceptor> {
+        self.server_protocol(keeper, ALPN)
+    }
+
+    pub(super) fn server_protocol(
+        &self,
+        keeper: KeeperId,
+        protocol: &[u8],
+    ) -> io::Result<TlsAcceptor> {
+        self.server_protocols(keeper, &[protocol])
+    }
+
+    pub(super) fn server_protocols(
+        &self,
+        keeper: KeeperId,
+        protocols: &[&[u8]],
+    ) -> io::Result<TlsAcceptor> {
         let provider = Arc::new(ring::default_provider());
         let verifier = WebPkiClientVerifier::builder_with_provider(
             Arc::new(self.root_store()?),
@@ -538,19 +563,43 @@ impl Credentials {
             .with_client_cert_verifier(verifier)
             .with_single_cert(chain, self.key()?)
             .map_err(display_error)?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
+        config.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
         config.send_tls13_tickets = 0;
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
     fn client(&self) -> io::Result<(TlsConnector, Identity)> {
+        self.client_protocol(ALPN)
+    }
+
+    pub(super) fn client_protocol(&self, protocol: &[u8]) -> io::Result<(TlsConnector, Identity)> {
+        let chain = certificates(&self.certificate)?;
+        let identity = client_identity(leaf(Some(&chain))?)?;
+        Ok((self.connector(protocol, chain)?, identity))
+    }
+
+    pub(super) fn peer_protocol(
+        &self,
+        keeper: KeeperId,
+        protocol: &[u8],
+    ) -> io::Result<TlsConnector> {
+        let chain = certificates(&self.certificate)?;
+        if keeper_id(leaf(Some(&chain))?)? != keeper {
+            return Err(invalid("configured keeper does not match certificate URI"));
+        }
+        self.connector(protocol, chain)
+    }
+
+    fn connector(
+        &self,
+        protocol: &[u8],
+        chain: Vec<CertificateDer<'static>>,
+    ) -> io::Result<TlsConnector> {
         let provider = Arc::new(ring::default_provider());
         let verifier = Arc::new(KeeperVerifier {
             roots: self.root_store()?,
             algorithms: provider.signature_verification_algorithms,
         });
-        let chain = certificates(&self.certificate)?;
-        let identity = client_identity(leaf(Some(&chain))?)?;
         let mut config = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&TLS13])
             .map_err(display_error)?
@@ -558,10 +607,10 @@ impl Credentials {
             .with_custom_certificate_verifier(verifier)
             .with_client_auth_cert(chain, self.key()?)
             .map_err(display_error)?;
-        config.alpn_protocols = vec![ALPN.to_vec()];
+        config.alpn_protocols = vec![protocol.to_vec()];
         config.enable_sni = false;
         config.resumption = rustls::client::Resumption::disabled();
-        Ok((TlsConnector::from(Arc::new(config)), identity))
+        Ok(TlsConnector::from(Arc::new(config)))
     }
 
     fn key(&self) -> io::Result<PrivateKeyDer<'static>> {
@@ -634,7 +683,7 @@ fn certificates(path: &Path) -> io::Result<Vec<CertificateDer<'static>>> {
         .map_err(display_error)
 }
 
-fn leaf<'cert, 'der>(
+pub(super) fn leaf<'cert, 'der>(
     chain: Option<&'cert [CertificateDer<'der>]>,
 ) -> io::Result<&'cert CertificateDer<'der>> {
     chain
@@ -642,7 +691,7 @@ fn leaf<'cert, 'der>(
         .ok_or_else(|| invalid("missing peer certificate"))
 }
 
-fn valid_client_uri(uri: &str) -> bool {
+pub(super) fn valid_client_uri(uri: &str) -> bool {
     uri.strip_prefix(CLIENT_URI)
         .is_some_and(|name| !name.is_empty() && uri.len() <= 4096)
 }
@@ -670,7 +719,7 @@ fn certificate_uri(certificate: &CertificateDer<'_>, prefix: &str) -> io::Result
     Ok(uri.to_owned())
 }
 
-fn client_identity(certificate: &CertificateDer<'_>) -> io::Result<Identity> {
+pub(super) fn client_identity(certificate: &CertificateDer<'_>) -> io::Result<Identity> {
     let uri = certificate_uri(certificate, CLIENT_URI)?;
     if !valid_client_uri(&uri) {
         return Err(invalid("invalid client URI"));
@@ -678,7 +727,7 @@ fn client_identity(certificate: &CertificateDer<'_>) -> io::Result<Identity> {
     Ok(Identity::from(uri))
 }
 
-fn keeper_id(certificate: &CertificateDer<'_>) -> io::Result<KeeperId> {
+pub(super) fn keeper_id(certificate: &CertificateDer<'_>) -> io::Result<KeeperId> {
     let uri = certificate_uri(certificate, KEEPER_URI)?;
     let id = uuid::Uuid::parse_str(&uri[KEEPER_URI.len()..]).map_err(display_error)?;
     if id.is_nil() || id.to_string() != uri[KEEPER_URI.len()..] {
@@ -702,4 +751,4 @@ fn connection_error(error: io::Error) -> TransportError {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

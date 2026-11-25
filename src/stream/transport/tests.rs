@@ -8,7 +8,7 @@ use super::*;
 const CLIENT: &str = "urn:logkeeper:client:writer";
 const READ_ONLY: &str = "urn:logkeeper:client:reader";
 
-fn ca(path: &Path) -> Issuer<'static, KeyPair> {
+pub(in crate::stream) fn ca(path: &Path) -> Issuer<'static, KeyPair> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     let name = path.file_stem().unwrap().to_str().unwrap();
@@ -26,10 +26,21 @@ fn credentials(
     issuer: &Issuer<KeyPair>,
     roots: &Path,
 ) -> Credentials {
+    credentials_with_usages(dir, name, uri, vec![purpose], issuer, roots)
+}
+
+pub(in crate::stream) fn credentials_with_usages(
+    dir: &Path,
+    name: &str,
+    uri: &str,
+    purposes: Vec<ExtendedKeyUsagePurpose>,
+    issuer: &Issuer<KeyPair>,
+    roots: &Path,
+) -> Credentials {
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::default();
     params.subject_alt_names = vec![SanType::URI(uri.try_into().unwrap())];
-    params.extended_key_usages = vec![purpose];
+    params.extended_key_usages = purposes;
     let cert = params.signed_by(&key, issuer).unwrap();
     let certificate = dir.join(format!("{name}.pem"));
     let private_key = dir.join(format!("{name}.key"));

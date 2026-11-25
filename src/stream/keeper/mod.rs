@@ -1,7 +1,7 @@
 //! A durable keeper for many streams. The keeper serializes decisions and WAL rounds.
 mod checkpoint;
 mod checkpoint_bytes;
-mod durability;
+pub(super) mod durability;
 #[cfg(test)]
 pub(super) mod memory;
 mod rules;
@@ -13,6 +13,8 @@ mod wal_bytes;
 mod wal_layout;
 
 pub use rules::Limits;
+#[cfg(feature = "stream")]
+pub(super) use rules::record_charge;
 pub use sweep::{Sweep, SweepError, sweep_idle};
 
 use std::{

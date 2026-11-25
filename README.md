@@ -1,7 +1,7 @@
 # Logkeeper
 
 Logkeeper is a Rust journal server and quorum client for named streams of opaque records.
-The caller supplies the ensemble and the writer epoch.
+The original quorum client takes the ensemble and the writer epoch from the caller.
 The client seals an intersecting quorum before opening a writer.
 It reports append durability once a write quorum has persisted the record.
 Readers receive committed records in stream order.
@@ -21,6 +21,377 @@ A restart uses the same durable directory and journal identity.
 The serving process takes an exclusive journal lock before accepting traffic.
 Run listeners on a trusted private network.
 A deployment that needs its own discovery, credential, or placement policy can embed `PreparedJournal` and supply its own listener.
+
+## Keeper-hosted consensus streams
+
+Use the `stream` feature and `logkeeper::stream::consensus::Client` for streams
+whose keepers elect a leader and allocate writer epochs. Each keeper uses its
+own data directory and the same authenticated inventory and catalog UUID.
+For example, the first of four keepers can use this file.
+
+```json
+{
+  "keeper": "00000000-0000-0000-0000-000000000001",
+  "listen": "127.0.0.1:5441",
+  "data": "./keeper-1",
+  "enrollment": "./registry-1",
+  "tls": { "certificate": "keeper-1.pem", "private_key": "keeper-1.key", "ca": "ca.pem" },
+  "keepers": {
+    "00000000-0000-0000-0000-000000000001": "127.0.0.1:5441",
+    "00000000-0000-0000-0000-000000000002": "127.0.0.1:5442",
+    "00000000-0000-0000-0000-000000000003": "127.0.0.1:5443",
+    "00000000-0000-0000-0000-000000000004": "127.0.0.1:5444"
+  },
+  "peers": {
+    "00000000-0000-0000-0000-000000000001": "127.0.0.1:5541",
+    "00000000-0000-0000-0000-000000000002": "127.0.0.1:5542",
+    "00000000-0000-0000-0000-000000000003": "127.0.0.1:5543",
+    "00000000-0000-0000-0000-000000000004": "127.0.0.1:5544"
+  },
+  "bulk": {
+    "00000000-0000-0000-0000-000000000001": "127.0.0.1:5641",
+    "00000000-0000-0000-0000-000000000002": "127.0.0.1:5642",
+    "00000000-0000-0000-0000-000000000003": "127.0.0.1:5643",
+    "00000000-0000-0000-0000-000000000004": "127.0.0.1:5644"
+  },
+  "domains": {
+    "00000000-0000-0000-0000-000000000001": "zone-a",
+    "00000000-0000-0000-0000-000000000002": "zone-b",
+    "00000000-0000-0000-0000-000000000003": "zone-c",
+    "00000000-0000-0000-0000-000000000004": "zone-a"
+  },
+  "catalog": "00000000-0000-0000-0000-000000000004",
+  "readers": [],
+  "writers": ["urn:logkeeper:client:app"],
+  "administrators": ["urn:logkeeper:client:app"]
+}
+```
+
+Issue each keeper a certificate with URI SAN `urn:logkeeper:keeper:<uuid>`,
+usable for both TLS client and server authentication. The CA assigns a unique
+keeper UUID to each incarnation. Issue the application a client certificate
+with the exact URI listed in its roles. Administrators can create, replace and
+delete streams. Writers can seal, append and trim. All three roles can read.
+The keeper requires three distinct declared failure domains in each roster,
+including both sides of a joint configuration. The operator verifies the
+actual failure domains.
+
+Create the enrollment directory on trusted storage outside the keeper's data
+directory. The provisioning authority writes `placement.json` there with the
+same `catalog` and `domains` from the keeper configuration. It also writes
+`<keeper-uuid>.provision.json` with `keeper`, the canonical absolute `data`
+path, the keeper's `domain`, and `certificate_sha256` as the lowercase SHA-256
+hex digest of the configured certificate file.
+
+```sh
+cargo run --locked --features stream -- keeper initialize --config keeper.json
+cargo run --locked --features stream -- keeper --config keeper.json
+```
+
+Initialization consumes the authorized UUID before publishing its media.
+Preserve the enrollment records and WAL boundary independently of media loss
+and prevent registry rollback. Serving opens only checked, installed media.
+Use a fresh UUID after media loss or an interrupted install that consumed the
+old UUID. A fresh replacement joins as a learner. After the initial copy,
+the leader briefly gates writes and matches the full issued prefix on every
+newcomer before joint membership. The consensus development format
+predating explicit enrollment requires a fresh installation.
+
+Expose `keepers` addresses to application clients. Restrict the `peers` and
+`bulk` addresses to trusted keeper networks, with ingress isolation so
+application and bulk traffic cannot exhaust the control listener's
+pre-authentication resources. The keeper separates TLS handshakes, authenticated
+connection budgets, frame limits, and WAL queue admission. Give each keeper a
+dedicated data volume or enforce equivalent bounds on other users of that volume.
+Provide separate capacity for the enrollment volume. The keeper accepts data
+volumes with an allocation unit up to 16 KiB.
+
+Pass the application certificate paths, the inventory, the catalog UUID, and
+an operation deadline to `Client::new`. With an authorized client and three
+voter UUIDs, a first write looks like this.
+
+```rust,ignore
+use bytes::Bytes;
+use journal_contract::{Epoch, Lsn, StreamId};
+use uuid::Uuid;
+
+let stream = StreamId(Uuid::new_v4().as_u128());
+journal.create(stream, voters, 64 * 1024 * 1024).await?;
+let sealed = journal.seal(stream, Epoch(0), Uuid::new_v4()).await?;
+let at = Lsn(sealed.head.0 + 1);
+journal.append(stream, sealed.fence, at, Bytes::from_static(b"first")).await?;
+```
+
+Retain the stream ID across create retries and the writer UUID across seal
+retries. An unavailable append has an unknown outcome. Retry the same fence,
+LSN and bytes while that fence and record are still retained. A fresh `head`
+confirms a quorum after invocation and waits for local application. A `read`
+returns one keeper's applied page and may lag. Use `read_at_least` to supply a
+minimum head, for example a position returned by an append. The client remembers
+an authenticated committed roster by stream and genesis and starts one alternate
+if its preferred keeper is still pending after 25 ms. It bounds discovery and
+fallback to eight peers each, deduplicates page attempts and uses the operation
+deadline. A trusted catalog binding lookup can establish that a stream was
+never created. Unreachable or obsolete peers leave that question open.
+Records can be up to 4 MiB. Trim advances the logical read floor. Delete is
+terminal for a stream ID.
+
+Use `configuration` to fetch a revision, then call `replace` with that revision
+and the three desired voters. Retry the same revision and target if the
+outcome is uncertain. The keeper commits the exact catalog staging receipt
+before entering joint consensus. Once retained, that receipt supports the
+matching change during catalog outage. A later leader can finish committed
+joint membership without the catalog or original caller.
+
+An administrator can query `replica_generation` on a keeper and call
+`retire_copy` with the stream, target keeper, a different keeper serving the
+current placement proof, the committed revision and the exact local generation.
+The target verifies exclusion from the entire committed roster, including both
+sides of a joint roster, before durably detaching that generation. Acknowledgment
+means detach is durable. Cleanup resumes after restart and waits for pins on that
+generation. Staging records a new generation and its target revision before
+copying, then compares the exact receipt, generation and durable log cut before
+installation. The keeper retains its term and vote across both transitions.
+
+The configured catalog keeper durably assigns genesis and records discovery
+contacts. An unavailable catalog leaves genesis unknown and existing groups
+can use authenticated inventory contacts to elect and serve. Creation and
+unpublished staging require the catalog. A deployment that needs both
+operations to survive a catalog failure needs a separately highly available
+catalog with the same linearizable genesis CAS and retained staging semantics.
+The shipped catalog has one keeper.
+
+Detected snapshot damage quarantines the affected replica across restarts.
+Detected corruption of the keeper identity, WAL, or its trusted boundary
+disables the keeper. With the keeper stopped and the WAL intact, restore only
+the exact bytes named by the local WAL's snapshot digest.
+
+```sh
+cargo run --locked --features stream -- keeper repair-snapshot --config keeper.json --stream STREAM_UUID --snapshot BACKUP_FILE
+```
+
+Repair preserves the local term, vote, and log suffix. An indexed snapshot
+backup also needs its exact referenced index pages, extents and any legacy
+image. Restore those dependencies at their original names before repairing the
+root. An unverifiable basis requires a fresh keeper incarnation.
+
+### Keeper storage and upgrade
+
+Admission leaves 64 MiB free for durable protocol control (32 MiB), maintenance
+records (8 MiB), maintenance scratch (16 MiB), and bounded external allocations
+and filesystem overhead (8 MiB). Ordinary entries reserve bytes and a pending
+suffix slot together. A reserved WAL lane services exact snapshot selection and
+covered purge alongside the independently admitted control lane. One snapshot
+builder at a time reserves up to 12 MiB of scratch on the volume. If the 512-slot
+ordinary suffix fills, covered purge can reopen it while bulk is full and
+ordinary operations including `Trim` are refused. Application trim still needs
+the caller's fence and a committed entry.
+
+Each accepted log entry is a shared immutable segment of at most 5 MiB. WAL
+updates write only affected stream leaves (up to 160 KiB each) and a directory
+of at most 384 KiB. A sync round takes at most 16 records and stops taking more
+after crossing 32 MiB of serialized work. Per-work serialized input is capped
+at 68 MiB and 64 appended entries. The directory holds up to 4,096 scopes and
+a leaf up to 1,024 accepted entries. Keepers default to 128 locally installed
+groups.
+
+A local snapshot writes a root of at most 384 KiB and references payload
+already on disk. Its immutable index pages hold up to 128 records each, with
+at most 513 pages and 12 changed pages per ordinary build. The first local build
+from a legacy image can write all index pages within the same scratch budget.
+New appends enforce a 65,536 retained-record ceiling alongside the configured
+retained-byte quota. Selection becomes durable through one WAL boundary update
+before purge. The cleanup worker considers at most 64 object names at a time
+and up to 16 directory entries for one detached generation per pass. Actual
+available filesystem space governs reuse, including allocations left behind
+by interrupted work and unlinked files with open handles.
+
+The existing bulk ALPN, 1 MiB chunks and `LKRIMG03` wire image remain supported.
+Bulk admission is shared by incoming files and private seekable outbound files.
+It allows four sessions, up to 256 MiB per file and 512 MiB in total, subject to
+available volume space. A sender pins the selected cut and serves the same
+bytes at every retry offset. A receiver drops an incomplete session after 30
+seconds of inactivity. Size retained data for a wire image within that limit,
+including framing and metadata, when replacement by snapshot is required.
+
+The keeper can reopen a selected `LKRIMG03` image in place. A first local snapshot
+can reference it as an immutable extent. New selected local roots use
+`LKRIDX01` and new WAL directories use `LKRWAL03`. On first startup, an enrolled
+framed WAL is migrated through the existing trusted boundary. Budget additional
+free space for the encoded live suffix, two allocation units per entry, 160 KiB
+plus two allocation units per scope, 1 MiB for the root and overhead, and the
+64 MiB headroom. The old WAL stays selected until the new files and boundary
+are durable. Before upgrading, prune any former data exceeding the new suffix
+or retained-record geometry through supported caller-authorized operations.
+Coordinate keeper upgrades before using the new ownership or consensus
+commands. Existing application `Read` messages and bulk chunk messages retain
+their format. Older keeper binaries require their old media to reopen.
+
+Progress through local pressure requires an exact covering applied cut, enough
+allocatable space for the bounded work and continued scheduling of durable I/O.
+Protocol recovery also needs eligible peers. Physical write admission resumes
+when pins release and the allocator reports enough net space returned.
+
+### Reclamation verification
+
+Local Rust tests exercise both retirement and staging orders, duplicate and
+unknown exclusion, restart after durable detach, stale installation callbacks,
+same-length wrong log cuts and hard-vote continuity. Storage tests exercise
+concurrent ticket settlement and cancellation, measured space refusal,
+simultaneous ordinary and bulk byte saturation, full suffix with all bulk
+sessions held, incoming admission refusal and retry, and an old seekable
+transfer held across selection and purge. WAL fault injection covers synced
+files before selection, a synced boundary temporary, durable selection before
+purge, and unlink before the writer returns accounting. Integration tests also
+reopen framed WAL and legacy images, verify retained bytes, head, trim floor and
+membership, and exercise scoped read rejection, one delayed hedge, a disjoint
+roster move and a partition. These are deterministic fault cuts and local
+filesystem tests. Power-loss behavior depends on the filesystem durability
+contract.
+
+The local all-features workspace suite passed 273 tests, including 24 focused
+consensus tests. One pre-existing ignored test remained ignored. The default
+workspace check and loopback CLI smoke passed. The smoke exercised enrollment,
+all three consensus TLS listeners, verified restart, wiped-media refusal and
+the legacy keeper CLI.
+
+### Replication admission
+
+Peers classify each AppendEntries request by its decoded entries. Votes,
+empty AppendEntries (including fresh-head probes) and batches holding only
+blank, membership or staging entries use the control lane. Any batch with an
+application command uses the replication lane, which shares the configured
+`bulk` address under its own ALPN. Control frames are limited to 64 KiB, and a
+control-lane frame carrying application entries is refused. The protocol WAL
+queue rejects application entries and oversized metadata. A peer batch holds
+at most four entries, matching `max_payload_entries`. An `Admitted` wrapper
+decodes only one unwrapped application or staging command.
+
+The receiver reads the 4-byte length before allocating a replication body.
+Each in-flight body is charged at four times its encoded size plus 64 KiB to
+cover decoding and handoff copies. The receiver allows 256 MiB and 16 frames
+in total, with at most 96 MiB and four frames per authenticated sender
+across all of its connections and streams. Replication sockets are capped at 32
+per receiver and four per sender. Control work is capped at 24 requests in
+total and four per sender. At most 64 idle control connections wait for a
+header, and the oldest is closed first.
+
+Before dispatch into Raft storage, a follower reserves the batch's upper
+bound from the shared disk owner. That bound is the encoded entries plus
+768 KiB of WAL metadata and 16 KiB per entry plus one more. Follower appends
+use the ordinary physical pool and leave the 64 MiB control and maintenance
+floors intact. New follower entries are limited to 496 of the 512 suffix
+slots. A busy stream, full transport budget, or refused disk or suffix
+reservation produces a retryable `Busy` reply with no acknowledgment. The
+leader treats it as a temporary per-target failure. A full suffix also
+requests covered purge. The exact ticket travels with the matching ordered
+storage write. Cancellation or a dropped socket after dispatch keeps the
+charge until the write settles. A failed or partial write keeps the charge and
+disables the WAL, and reopening recomputes allocations from the trusted
+boundary. Fresh `head`, commit and quorum rules are unchanged.
+
+The durable worker rotates through five queues after each completed round:
+peer control, covered maintenance, follower replication, ordinary
+application work and maintenance or incoming transfer. Empty queues are
+skipped. A round takes at most 16 records and stops after crossing 32 MiB.
+Each stream admits one follower batch at a time, so the follower queue holds
+at most one batch per stream, at most 16 in total, in FIFO order. A stream
+therefore cannot overtake itself, and a ready stream waits behind at most 15
+other streams. The per-sender transport caps limit one sender to four of
+those slots. This rotation over streams gives the checked `5 * W` service
+bound with `W = 16`, assuming each earlier durable round completes. A sender
+splits a valid batch that exceeds its lane, and a single entry that cannot fit
+is unreachable.
+
+A replica supplies quorum evidence only through Raft's existing voter rules
+and only while it is healthy. A quarantined replica refuses the exchange
+before storage. On restart, a keeper that led its last term rejoins without
+resuming that term's leadership. The vote stays in storage unchanged, and the
+keeper still refuses other candidates in that term. A fresh `head` or
+configuration read is served only after a leader commits an entry in a new
+term, so it includes every write acknowledged before the restart. A
+stream's first reads after a full restart wait for that election. The Lean
+module `Logkeeper.LeaderJournal.RestartRead` checks this rule, with leader
+completeness as a premise, in the Lean worktree's
+`verification/lean/restart-read.md`.
+
+Peer-wire compatibility changed. The control ALPN is now
+`logkeeper-consensus-control/2`, and payload replication requires
+`logkeeper-consensus-replication/1`. Mixed versions are unsupported, because
+a keeper offering `logkeeper-consensus-control/1` fails the TLS handshake with
+`no_application_protocol`. Upgrade all keepers in a group together. Application, bulk chunk and `LKRIMG03` formats
+are unchanged, and the on-disk WAL format is unchanged.
+
+Verus checks the shipped admission, classification, rotation, batch and
+restart decisions in `src/stream/consensus/decisions.rs` against laws named
+after the Lean theorems. The baseline verifies 48 functions, and 16
+production mutations each fail their declared contract. See
+`verification/verus/consensus_admission/README.md` for the mapping and the
+unverified stateful glue.
+
+Local Rust tests cover these acceptance cuts:
+
+- A mixed batch sent on the control lane is refused. With disk space
+  exhausted, the same batch on the replication lane gets `Busy` with no
+  outstanding charge and an unchanged log.
+- One sender is held at its share and the receiver at its frame limit while
+  another sender still enters. A vote and a fresh `head` are served, and a
+  covered snapshot and purge commit, all while replication data is saturated.
+  Payload resumes after release, and the stopped original voter catches up
+  with unchanged membership once the pressure clears.
+- With a refusing target, continuous fresh `head` load, a stream busy with
+  2 MiB appends and 210 idle authenticated control connections, ten appends
+  to an unrelated stream each commit within five seconds. The busy stream
+  keeps committing. The refusing target holds no charge, stays at its prefix
+  and catches up after its space returns.
+- Unit tests cover the per-sender and receiver byte and frame caps, socket
+  caps, exact release, control work caps and oldest-first eviction of idle
+  control waits. The sender splits oversized valid batches.
+- A reservation cancelled before dispatch releases once. A request aborted
+  after dispatch keeps its charge until the durable settlement. A racing retry
+  gets `Busy` without a second charge, and a later retry succeeds.
+- A partial segment, a failed sync, a failure before selection and a failure
+  after selection each keep the ticket and disable the WAL. Restart recovers
+  the selected cut and clears the charge.
+- All five durable queues stay saturated and are served in rotation without
+  reordering within a queue.
+- A quarantined follower and the leader form a numeric majority, but appends
+  and fresh `head` stay unavailable until an eligible voter returns. The retry
+  then resolves the unknown outcome.
+- A leader restarted with a snapshot older than its acknowledged appends
+  does not resume its term. The next fresh `head` returns the last
+  acknowledged append from a later term.
+- A caught-up newcomer durably confirms the pending entry, which is either the
+  joint configuration or the append. The old voters are stopped, so nothing
+  commits and fresh `head` stays unavailable until an old voter returns.
+
+The focused consensus tests (36 tests) passed eight consecutive runs. The
+all-features workspace suite passed 285 tests. It ignores the one
+pre-existing test and the opt-in measurement below. The loopback CLI smoke checked enrollment, all four TLS lanes,
+reopening, wiped-media refusal, refusal of the old control ALPN and the legacy
+keeper CLI. These checks did not test power loss. Mixed-version keepers are
+unsupported.
+
+`measure_consensus_append_throughput` is an ignored test that drives an
+in-process four-keeper cluster on one host. Each stream has three voters and
+one append in flight. Run it with
+`cargo test --features stream --release --lib measure_consensus -- --ignored --nocapture`.
+On a 12-core Apple M6 over 10 seconds per case, with Spotlight indexing in the
+background, one run measured these rates.
+
+| Streams | Record | Records/s | p50 | p99 |
+| --- | --- | --- | --- | --- |
+| 1 | 256 B | 623 | 1.5 ms | 2.9 ms |
+| 8 | 256 B | 1,548 | 4.2 ms | 17.8 ms |
+| 32 | 256 B | 1,948 | 6.9 ms | 206 ms |
+| 8 | 64 KiB | 1,134 (71 MiB/s) | 5.7 ms | 22.6 ms |
+| 32 | 4 KiB | 1,690 | 8.6 ms | 381 ms |
+
+No follower returned `Busy` and no control request was refused in any case.
+Raising the control work caps did not reduce the 32-stream tail. Its cause is
+undetermined. Runs on this host varied by more than twofold, and no earlier
+baseline exists for the consensus keeper. The vote case confirms the vote was
+served. A live leader's lease can still refuse the ballot.
 
 ## Integration
 

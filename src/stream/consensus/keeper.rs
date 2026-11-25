@@ -1,0 +1,939 @@
+mod admission;
+mod ingress;
+mod replacement;
+mod replicas;
+#[cfg(test)]
+mod tests;
+
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    io,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::{Arc, Weak},
+    time::Duration,
+};
+
+use journal_contract::{JournalError, Lsn, StreamId};
+use openraft::{
+    BasicNode, SnapshotPolicy,
+    error::{ClientWriteError, InitializeError, RaftError},
+};
+use serde::Deserialize;
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, Semaphore, mpsc, oneshot, watch},
+    task::JoinSet,
+    time::{Instant, timeout, timeout_at},
+};
+use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    Credentials, Domains, Genesis, Keepers, NodeId, Raft, Vote,
+    catalog::Catalog,
+    invalid,
+    network::{Frame, Lane, Network, Reply, Request, Rpc},
+    placement::Placement,
+    state::{Command, Outcome},
+    storage::{self, Authority, Disk, Enrollment, FollowerAppend, LogStore, Record, StateMachine},
+};
+use crate::stream::{transport, wire::KeeperId};
+use admission::ReplicationIngress;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_HEAD_REQUESTS: usize = 256;
+const MAX_PENDING_WRITES: usize = 16;
+const MAX_LOG_SUFFIX: u64 = 512;
+const SNAPSHOT_CHUNK_BYTES: u64 = 1024 * 1024;
+use ingress::{MAX_BULK_CONNECTIONS, MAX_CLIENT_CONNECTIONS};
+
+fn default_max_streams() -> usize {
+    128
+}
+
+/// Installed, authenticated keeper inventory and local service settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    pub keeper: uuid::Uuid,
+    pub listen: SocketAddr,
+    pub data: PathBuf,
+    pub tls: Credentials,
+    pub keepers: Keepers,
+    pub peers: Keepers,
+    pub bulk: Keepers,
+    pub domains: Domains,
+    pub enrollment: PathBuf,
+    pub catalog: uuid::Uuid,
+    pub readers: Vec<String>,
+    pub writers: Vec<String>,
+    pub administrators: Vec<String>,
+    #[serde(default = "default_max_streams")]
+    pub max_streams: usize,
+}
+
+impl Config {
+    pub fn read(path: &Path) -> io::Result<Self> {
+        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    }
+
+    pub fn initialize(&self) -> io::Result<()> {
+        self.validate()?;
+        self.tls
+            .peer_protocol(KeeperId(self.keeper.as_u128()), Lane::Control.alpn())?;
+        self.enrollment()?.initialize()
+    }
+
+    pub async fn repair_snapshot(&self, stream: StreamId, backup: &Path) -> io::Result<()> {
+        let placement = self.validate()?;
+        self.tls
+            .peer_protocol(KeeperId(self.keeper.as_u128()), Lane::Control.alpn())?;
+        let enrollment = self.enrollment()?;
+        let backup = backup.to_owned();
+        let (disk, result) = tokio::task::spawn_blocking(move || {
+            let disk = Disk::open(enrollment)?;
+            let result = storage::repair_snapshot(&disk, stream, &backup, &placement);
+            Ok::<_, io::Error>((disk, result))
+        })
+        .await??;
+        let shutdown = disk.shutdown().await;
+        result.and(shutdown)
+    }
+
+    fn enrollment(&self) -> io::Result<Enrollment> {
+        Enrollment::authorized(
+            &self.enrollment,
+            &self.data,
+            self.keeper,
+            self.catalog,
+            &self.domains[&self.keeper],
+            &self.tls.certificate,
+        )
+    }
+
+    fn validate(&self) -> io::Result<Placement> {
+        if !(3..=1024).contains(&self.keepers.len())
+            || self.max_streams == 0
+            || !self.keepers.contains_key(&self.keeper)
+            || !self.keepers.contains_key(&self.catalog)
+            || self.keepers.keys().any(uuid::Uuid::is_nil)
+            || !self.keepers.keys().eq(self.peers.keys())
+            || !self.keepers.keys().eq(self.bulk.keys())
+            || self
+                .keepers
+                .values()
+                .chain(self.peers.values())
+                .chain(self.bulk.values())
+                .collect::<BTreeSet<_>>()
+                .len()
+                != self.keepers.len() * 3
+            || self
+                .readers
+                .iter()
+                .chain(&self.writers)
+                .chain(&self.administrators)
+                .any(|uri| !transport::valid_client_uri(uri))
+        {
+            return Err(invalid("invalid consensus keeper configuration"));
+        }
+        let authority = Authority::read(&self.enrollment)?;
+        if authority.catalog != self.catalog || authority.domains != self.domains {
+            return Err(invalid(
+                "inventory does not match its trusted placement authority",
+            ));
+        }
+        Placement::new(&self.keepers, authority.domains)
+    }
+
+    pub async fn serve(self, listener: TcpListener, stop: CancellationToken) -> io::Result<()> {
+        let peer = self
+            .peers
+            .get(&self.keeper)
+            .ok_or_else(|| invalid("missing local peer address"))?;
+        let bulk = self
+            .bulk
+            .get(&self.keeper)
+            .ok_or_else(|| invalid("missing local bulk address"))?;
+        let control = TcpListener::bind(peer).await?;
+        let bulk = TcpListener::bind(bulk).await?;
+        let (engine, acceptors) = self.prepare(stop).await?;
+        engine.serve([listener, control, bulk], acceptors).await
+    }
+
+    async fn prepare(self, stop: CancellationToken) -> io::Result<(Arc<Engine>, [TlsAcceptor; 3])> {
+        let placement = self.validate()?;
+        let keeper = KeeperId(self.keeper.as_u128());
+        let acceptors = [
+            self.tls.server_protocol(keeper, Lane::Application.alpn())?,
+            self.tls.server_protocol(keeper, Lane::Control.alpn())?,
+            self.tls
+                .server_protocols(keeper, &[Lane::Bulk.alpn(), Lane::Replication.alpn()])?,
+        ];
+        let enrollment = self.enrollment()?;
+        let (rpc, control, bulk, replication) = (
+            Rpc::new(
+                self.tls.peer_protocol(keeper, Lane::Application.alpn())?,
+                self.keepers,
+                Lane::Application,
+            ),
+            Rpc::new(
+                self.tls.peer_protocol(keeper, Lane::Control.alpn())?,
+                self.peers,
+                Lane::Control,
+            ),
+            Rpc::new(
+                self.tls.peer_protocol(keeper, Lane::Bulk.alpn())?,
+                self.bulk.clone(),
+                Lane::Bulk,
+            ),
+            Rpc::new(
+                self.tls.peer_protocol(keeper, Lane::Replication.alpn())?,
+                self.bulk,
+                Lane::Replication,
+            ),
+        );
+        let id = self.keeper;
+        let disk = tokio::task::spawn_blocking(move || Disk::open(enrollment)).await??;
+        let raft_config = openraft::Config {
+            heartbeat_interval: 100,
+            election_timeout_min: 450,
+            election_timeout_max: 900,
+            max_payload_entries: 4,
+            snapshot_policy: SnapshotPolicy::LogsSinceLast(128),
+            snapshot_max_chunk_size: SNAPSHOT_CHUNK_BYTES,
+            max_in_snapshot_log_to_keep: 16,
+            purge_batch_size: 16,
+            ..Default::default()
+        }
+        .validate()
+        .map_err(io::Error::other)?;
+        let engine = Arc::new(Engine {
+            id,
+            catalog_id: self.catalog,
+            catalog: (id == self.catalog).then(|| Catalog::new(disk.clone())),
+            disk,
+            rpc,
+            control,
+            bulk,
+            replication,
+            replication_ingress: Arc::default(),
+            placement,
+            raft_config: Arc::new(raft_config),
+            readers: self.readers.into_iter().collect(),
+            writers: self.writers.into_iter().collect(),
+            administrators: self.administrators.into_iter().collect(),
+            openings: Mutex::default(),
+            detached_pins: Default::default(),
+            quarantined: parking_lot::RwLock::default(),
+            max_streams: self.max_streams,
+            groups: Mutex::default(),
+            stop: stop.child_token(),
+            #[cfg(test)]
+            reject_append: Default::default(),
+            #[cfg(test)]
+            read_delay: Default::default(),
+            #[cfg(test)]
+            scoped_reads: Default::default(),
+            #[cfg(test)]
+            busy_replies: Default::default(),
+        });
+        Ok((engine, acceptors))
+    }
+}
+
+struct Engine {
+    id: uuid::Uuid,
+    catalog_id: uuid::Uuid,
+    catalog: Option<Catalog>,
+    disk: Disk,
+    rpc: Rpc,
+    control: Rpc,
+    bulk: Rpc,
+    replication: Rpc,
+    replication_ingress: Arc<ReplicationIngress>,
+    placement: Placement,
+    raft_config: Arc<openraft::Config>,
+    readers: HashSet<String>,
+    writers: HashSet<String>,
+    administrators: HashSet<String>,
+    openings: Mutex<BTreeMap<StreamId, Arc<Mutex<()>>>>,
+    detached_pins: parking_lot::Mutex<BTreeMap<(StreamId, u64), Weak<()>>>,
+    quarantined: parking_lot::RwLock<HashSet<StreamId>>,
+    max_streams: usize,
+    groups: Mutex<BTreeMap<StreamId, Arc<Group>>>,
+    stop: CancellationToken,
+    #[cfg(test)]
+    reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
+    #[cfg(test)]
+    read_delay: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    scoped_reads: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    busy_replies: std::sync::atomic::AtomicU64,
+}
+
+enum Identity {
+    Keeper(NodeId),
+    Client(journal_contract::Identity),
+}
+
+impl Engine {
+    async fn serve(
+        self: Arc<Self>,
+        listeners: [TcpListener; 3],
+        acceptors: [TlsAcceptor; 3],
+    ) -> io::Result<()> {
+        let mut sockets = JoinSet::new();
+        let result = async {
+            for genesis in self.disk.streams() {
+                if self
+                    .disk
+                    .ownership(genesis.stream)
+                    .is_some_and(|owner| owner.generation().is_none())
+                {
+                    continue;
+                }
+                if let Err(error) = self.group(genesis.clone()).await {
+                    if !self.disk.healthy() {
+                        return Err(error);
+                    }
+                    self.quarantine(genesis.stream, &error);
+                }
+            }
+            self.disk.enable_reaping();
+            let engine = self.clone();
+            let stop = self.stop.clone();
+            sockets.spawn(async move {
+                let mut schedule = tokio::time::interval(Duration::from_millis(50));
+                schedule.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut cursor = None;
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => return Ok(()),
+                        _ = schedule.tick() => {
+                            if let Err(error) = engine.disk.reap_objects().await {
+                                eprintln!("logkeeper object cleanup deferred: {error}");
+                            }
+                            if let Err(error) = engine.reclaim_detached(&mut cursor).await {
+                                eprintln!("logkeeper replica cleanup deferred: {error}");
+                            }
+                        },
+                    }
+                }
+            });
+            for ((listener, acceptor), (lane, capacity)) in
+                listeners.into_iter().zip(acceptors).zip([
+                    (Lane::Application, MAX_CLIENT_CONNECTIONS),
+                    (Lane::Control, 0),
+                    (Lane::Bulk, MAX_BULK_CONNECTIONS),
+                ])
+            {
+                let engine = self.clone();
+                sockets
+                    .spawn(async move { engine.listen(listener, acceptor, lane, capacity).await });
+            }
+            tokio::select! {
+                _ = self.stop.cancelled() => Ok(()),
+                result = sockets.join_next() => result.expect("keeper has listeners")?,
+            }
+        }
+        .await;
+        self.stop.cancel();
+        self.disk.disable_reaping();
+        sockets.shutdown().await;
+        for group in std::mem::take(&mut *self.groups.lock().await).into_values() {
+            let _ = group.raft.shutdown().await;
+            group.state.shutdown().await;
+        }
+        let shutdown = self.disk.shutdown().await;
+        result.and(shutdown)
+    }
+
+    fn quarantine(&self, stream: StreamId, error: &io::Error) {
+        self.disk.protect_objects(stream);
+        if self.quarantined.write().insert(stream) {
+            eprintln!("logkeeper quarantined stream {stream:?}: {error}");
+        }
+    }
+
+    fn require_media(&self) -> io::Result<()> {
+        if self.disk.healthy() {
+            Ok(())
+        } else {
+            Err(invalid("keeper media is unavailable"))
+        }
+    }
+
+    async fn opening(&self, stream: StreamId) -> io::Result<Arc<Mutex<()>>> {
+        let mut openings = self.openings.lock().await;
+        if openings.len() >= self.max_streams && !openings.contains_key(&stream) {
+            return Err(io::Error::other("keeper stream limit reached"));
+        }
+        Ok(openings.entry(stream).or_default().clone())
+    }
+
+    async fn group(&self, genesis: Genesis) -> io::Result<Arc<Group>> {
+        self.require_media()?;
+        if self.quarantined.read().contains(&genesis.stream) {
+            return Err(invalid("stream replica is quarantined"));
+        }
+        if let Some(group) = self.groups.lock().await.get(&genesis.stream).cloned() {
+            return group.for_genesis(&genesis);
+        }
+        let opening = self.opening(genesis.stream).await?;
+        let _guard = opening.lock().await;
+        if let Some(group) = self.groups.lock().await.get(&genesis.stream).cloned() {
+            return group.for_genesis(&genesis);
+        }
+        if self.quarantined.read().contains(&genesis.stream) {
+            return Err(invalid("stream replica is quarantined"));
+        }
+        match self.disk.genesis(genesis.stream) {
+            Some(previous) if previous != genesis => {
+                return Err(invalid("stream genesis mismatch"));
+            }
+            Some(_)
+                if self
+                    .disk
+                    .ownership(genesis.stream)
+                    .is_some_and(|book| book.generation().is_some()) =>
+            {
+                ()
+            }
+            Some(_) => return Err(invalid("replica is detached")),
+            None if !genesis.voters.contains(&self.id) => {
+                return Err(invalid("learner has no staged ownership"));
+            }
+            None => {
+                self.disk
+                    .maintenance(Record::Register(genesis.clone()))
+                    .await?
+            }
+        }
+        let startup = async {
+            self.disk.check_placement(genesis.stream, &self.placement)?;
+            StateMachine::open(&self.disk, genesis.clone(), self.placement.clone()).await
+        }
+        .await;
+        let state = match startup {
+            Ok(state) => state,
+            Err(error) => {
+                self.quarantine(genesis.stream, &error);
+                return Err(error);
+            }
+        };
+        let follower = Arc::new(FollowerAppend::default());
+        let store = LogStore {
+            disk: self.disk.clone(),
+            stream: genesis.stream,
+            state: state.clone(),
+            keeper: self.id.as_u128(),
+            generation: state.generation(),
+            follower: follower.clone(),
+        };
+        let (split_vote, collisions) = watch::channel(None);
+        let raft = Raft::new(
+            self.id.as_u128(),
+            self.raft_config.clone(),
+            Network {
+                control: self.control.clone(),
+                bulk: self.bulk.clone(),
+                replication: self.replication.clone(),
+                genesis: genesis.clone(),
+                state: state.clone(),
+                split_vote,
+            },
+            store,
+            state.clone(),
+        )
+        .await
+        .map_err(io::Error::other)?;
+        let (heads, pending_heads) = mpsc::channel(MAX_HEAD_REQUESTS);
+        let group = Arc::new(Group {
+            genesis,
+            raft,
+            state,
+            membership: Mutex::new(()),
+            snapshot_receive: Mutex::new(None),
+            append_order: Arc::default(),
+            follower,
+            heads,
+            writes: Arc::new(Semaphore::new(MAX_PENDING_WRITES)),
+            stop: self.stop.child_token(),
+        });
+        self.groups
+            .lock()
+            .await
+            .insert(group.genesis.stream, group.clone());
+        let resume = group.clone();
+        let stop = group.stop.clone();
+        let id = self.id.as_u128();
+        tokio::spawn(async move {
+            resume.resume_membership(id, stop).await;
+        });
+        let elector = group.clone();
+        let stop = group.stop.clone();
+        tokio::spawn(async move {
+            elector.retry_split_elections(collisions, stop).await;
+        });
+        let serve = group.clone();
+        let stop = group.stop.clone();
+        tokio::spawn(async move {
+            serve.serve_heads(pending_heads, stop).await;
+        });
+        Ok(group)
+    }
+
+    fn authorize(&self, identity: &Identity, request: &Request) -> io::Result<Option<String>> {
+        let denied = || {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unauthorized journal request",
+            )
+        };
+        match identity {
+            Identity::Keeper(_)
+                if matches!(
+                    request,
+                    Request::Locate(_)
+                        | Request::PlacementProof(_)
+                        | Request::StageReplica { .. }
+                        | Request::InstallReplica { .. }
+                ) =>
+            {
+                Ok(None)
+            }
+            Identity::Keeper(id)
+                if matches!(request, Request::Stage(stage)
+                if stage.old.contains(&uuid::Uuid::from_u128(*id))) =>
+            {
+                Ok(None)
+            }
+            Identity::Keeper(_) => Err(denied()),
+            Identity::Client(identity) => {
+                let uri = identity.as_str();
+                let admin = self.administrators.contains(uri);
+                let writer = self.writers.contains(uri);
+                let reader = self.readers.contains(uri);
+                let allowed = match request {
+                    Request::Locate(_)
+                    | Request::Head(_)
+                    | Request::Configuration(_)
+                    | Request::Read { .. }
+                    | Request::ReadAt { .. } => admin || writer || reader,
+                    Request::Seal { .. } | Request::Append { .. } | Request::Trim { .. } => writer,
+                    Request::Stage(_)
+                    | Request::StageReplica { .. }
+                    | Request::InstallReplica { .. } => false,
+                    _ => admin,
+                };
+                if allowed {
+                    Ok(Some(uri.to_owned()))
+                } else {
+                    Err(denied())
+                }
+            }
+        }
+    }
+
+    async fn request(&self, identity: &Identity, request: Request) -> io::Result<Reply> {
+        self.require_media()?;
+        let owner = self.authorize(identity, &request)?;
+        let stream = request.stream();
+        match request {
+            Request::LocalCopy(_) => Ok(self
+                .disk
+                .ownership(stream)
+                .and_then(|book| book.generation())
+                .map(Reply::Generation)
+                .unwrap_or_else(|| failure(JournalError::Unavailable))),
+            Request::RetireCopy {
+                authority,
+                revision,
+                generation,
+                ..
+            } => {
+                self.retire_copy(stream, authority, revision, generation)
+                    .await
+            }
+            Request::StageReplica { genesis, stage } => {
+                let Identity::Keeper(id) = identity else {
+                    return Err(invalid("invalid staging sender"));
+                };
+                self.stage_replica(uuid::Uuid::from_u128(*id), genesis, stage)
+                    .await
+            }
+            Request::InstallReplica {
+                genesis,
+                stage,
+                generation,
+                through,
+            } => {
+                let Identity::Keeper(id) = identity else {
+                    return Err(invalid("invalid installation sender"));
+                };
+                self.install_replica(
+                    uuid::Uuid::from_u128(*id),
+                    genesis,
+                    stage,
+                    generation,
+                    through,
+                )
+                .await
+            }
+            Request::Claim(genesis) => self.catalog()?.claim(genesis, &self.placement).await,
+            Request::Locate(stream) => self.catalog()?.locate(stream),
+            Request::Stage(stage) => self.catalog()?.stage(stage, &self.placement).await,
+            Request::Bootstrap(stream) => self.bootstrap(stream).await,
+            request => {
+                let group = self.groups.lock().await.get(&stream).cloned();
+                let Some(group) = group else {
+                    return Ok(Reply::Leader(None));
+                };
+                if !self.disk.installed(stream) {
+                    return Ok(failure(JournalError::Unavailable));
+                }
+                group.require_healthy()?;
+                let reply = match request {
+                    Request::Head(_) => Ok(group.head().await),
+                    Request::PlacementProof(_) => Ok(group.proof().await),
+                    Request::Configuration(_) => Ok(group.configuration().await),
+                    Request::Read {
+                        from,
+                        limit,
+                        wait_ms,
+                        ..
+                    } => Ok(Reply::Decision(
+                        group.read(from, limit, wait_ms, Lsn(0)).await,
+                    )),
+                    Request::ReadAt {
+                        genesis,
+                        from,
+                        minimum_head,
+                        limit,
+                        wait_ms,
+                    } => {
+                        #[cfg(test)]
+                        {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            self.scoped_reads.fetch_add(1, Relaxed);
+                            let delay = self.read_delay.load(Relaxed);
+                            if delay != 0 {
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
+                            }
+                        }
+                        if genesis != group.genesis {
+                            return Err(invalid("page scope differs"));
+                        }
+                        if !group.state.serves_applied_pages(self.id.as_u128()) {
+                            return Ok(failure(JournalError::Unavailable));
+                        }
+                        let outcome = group.read(from, limit, wait_ms, minimum_head).await;
+                        Ok(Reply::ScopedPage {
+                            genesis,
+                            configuration: group.state.finalized(),
+                            outcome,
+                        })
+                    }
+                    Request::Replace {
+                        expected, voters, ..
+                    } => self.replace(&group, expected, voters).await,
+                    Request::Create(_) => Ok(group.write(Command::Create).await),
+                    Request::Seal {
+                        expected, writer, ..
+                    } if !writer.is_nil() => Ok(group
+                        .write(Command::Seal {
+                            expected,
+                            writer,
+                            owner: owner.unwrap(),
+                        })
+                        .await),
+                    Request::Append {
+                        fence, at, payload, ..
+                    } => {
+                        if payload.len() > super::MAX_RECORD {
+                            return Ok(failure(JournalError::TooLarge {
+                                max: super::MAX_RECORD,
+                            }));
+                        }
+                        Ok(group
+                            .write(Command::Append {
+                                fence,
+                                owner: owner.unwrap(),
+                                at,
+                                payload,
+                            })
+                            .await)
+                    }
+                    Request::Trim { fence, through, .. } => Ok(group
+                        .write(Command::Trim {
+                            fence,
+                            owner: owner.unwrap(),
+                            through,
+                        })
+                        .await),
+                    Request::Delete(_) => Ok(group.write(Command::Delete).await),
+                    _ => Err(invalid("invalid application request")),
+                }?;
+                group.require_healthy()?;
+                Ok(reply)
+            }
+        }
+    }
+
+    fn catalog(&self) -> io::Result<&Catalog> {
+        self.catalog
+            .as_ref()
+            .ok_or_else(|| invalid("request requires the catalog keeper"))
+    }
+
+    async fn catalog_request(&self, request: Request) -> io::Result<Reply> {
+        if let Some(catalog) = &self.catalog {
+            match request {
+                Request::Locate(stream) => catalog.locate(stream),
+                Request::Stage(stage) => catalog.stage(stage, &self.placement).await,
+                _ => Err(invalid("invalid internal catalog request")),
+            }
+        } else {
+            self.rpc
+                .call(self.catalog_id, Frame::Client(request), REQUEST_TIMEOUT)
+                .await
+        }
+    }
+
+    async fn bootstrap(&self, stream: StreamId) -> io::Result<Reply> {
+        let Reply::Catalog(genesis, _) = self.catalog_request(Request::Locate(stream)).await?
+        else {
+            return Ok(failure(JournalError::NotFound));
+        };
+        if !genesis.voters.contains(&self.id) {
+            return Err(invalid("keeper is outside the genesis configuration"));
+        }
+        let members = self.nodes(genesis.voters);
+        let group = self.group(genesis).await?;
+        let initialized = group.raft.initialize(members).await;
+        group.require_healthy()?;
+        match initialized {
+            Ok(()) | Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
+                Ok(Reply::Decision(Outcome::Unit))
+            }
+            Err(error) => Err(io::Error::other(error)),
+        }
+    }
+
+    fn nodes(&self, voters: [uuid::Uuid; 3]) -> BTreeMap<NodeId, BasicNode> {
+        voters
+            .into_iter()
+            .map(|id| {
+                (
+                    id.as_u128(),
+                    BasicNode::new(self.rpc.keepers()[&id].to_string()),
+                )
+            })
+            .collect()
+    }
+}
+
+struct Group {
+    genesis: Genesis,
+    raft: Raft,
+    state: StateMachine,
+    membership: Mutex<()>,
+    snapshot_receive: Mutex<Option<ingress::Incoming>>,
+    append_order: Arc<Mutex<()>>,
+    follower: Arc<FollowerAppend>,
+    heads: mpsc::Sender<oneshot::Sender<Reply>>,
+    writes: Arc<Semaphore>,
+    stop: CancellationToken,
+}
+
+impl Group {
+    fn for_genesis(self: Arc<Self>, genesis: &Genesis) -> io::Result<Arc<Self>> {
+        if &self.genesis != genesis {
+            return Err(invalid("stream genesis mismatch"));
+        }
+        self.require_healthy()?;
+        Ok(self)
+    }
+
+    fn require_healthy(&self) -> io::Result<()> {
+        if self.state.healthy() {
+            Ok(())
+        } else {
+            Err(invalid("stream replica is quarantined"))
+        }
+    }
+
+    async fn retry_split_elections(
+        &self,
+        mut collisions: watch::Receiver<Option<Vote>>,
+        stop: CancellationToken,
+    ) {
+        let mut metrics = self.raft.server_metrics();
+        loop {
+            let collision = *collisions.borrow_and_update();
+            let candidate = {
+                let current = metrics.borrow_and_update();
+                current.state == openraft::ServerState::Candidate && collision == Some(current.vote)
+            };
+            // OpenRaft chooses its regular timeout at startup. Fresh jitter
+            // lets split same-term candidacies escape repeated tick alignment.
+            let retry = async {
+                if candidate {
+                    let random = uuid::Uuid::new_v4().as_u128() as u64;
+                    tokio::time::sleep(Duration::from_millis(220 + random % 200)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                changed = metrics.changed() => if changed.is_err() { return; },
+                changed = collisions.changed() => if changed.is_err() { return; },
+                _ = retry => {
+                    if !self.state.healthy() || self.raft.trigger().elect().await.is_err() { return; }
+                }
+            }
+        }
+    }
+
+    async fn write(&self, command: Command) -> Reply {
+        if self.require_healthy().is_err() {
+            return failure(JournalError::Unavailable);
+        }
+        let Ok(permit) = self.writes.clone().try_acquire_owned() else {
+            return failure(JournalError::Unavailable);
+        };
+        let ticket = uuid::Uuid::new_v4();
+        let space = match self
+            .state
+            .reserve_command(&command, ticket, MAX_LOG_SUFFIX as usize)
+        {
+            Ok(space) => space,
+            Err(storage::Admission::FullSuffix) => {
+                self.request_covered_purge().await;
+                return failure(JournalError::Unavailable);
+            }
+            Err(storage::Admission::Space) => return failure(JournalError::Unavailable),
+        };
+        let raft = self.raft.clone();
+        // The proposal owns its reservation even when the caller drops the
+        // request or times out. The WAL settles it as it publishes the slot.
+        let proposal = tokio::spawn(async move {
+            let (_permit, _space) = (permit, space);
+            let Ok(response) = raft
+                .client_write_ff(Command::Admitted(ticket, Box::new(command)))
+                .await
+            else {
+                return failure(JournalError::Unavailable);
+            };
+            match response.await {
+                Ok(Ok(response)) => Reply::Decision(response.data),
+                Ok(Err(ClientWriteError::ForwardToLeader(leader))) => {
+                    leader_reply(leader.leader_id)
+                }
+                _ => failure(JournalError::Unavailable),
+            }
+        });
+        timeout(REQUEST_TIMEOUT, proposal)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_else(|| failure(JournalError::Unavailable))
+    }
+
+    async fn request_covered_purge(&self) {
+        if let Some(covered) = self.state.covered() {
+            let _ = self.raft.trigger().purge_log(covered.index).await;
+        }
+        let _ = self.raft.trigger().snapshot().await;
+    }
+
+    async fn head(&self) -> Reply {
+        let (send, receive) = oneshot::channel();
+        if self.heads.try_send(send).is_ok()
+            && let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, receive).await
+        {
+            return reply;
+        }
+        failure(JournalError::Unavailable)
+    }
+
+    async fn serve_heads(
+        &self,
+        mut pending: mpsc::Receiver<oneshot::Sender<Reply>>,
+        stop: CancellationToken,
+    ) {
+        loop {
+            let first = tokio::select! {
+                _ = stop.cancelled() => return,
+                first = pending.recv() => first,
+            };
+            let Some(first) = first else { return };
+            let mut batch = vec![first];
+            while batch.len() < MAX_HEAD_REQUESTS {
+                let Ok(waiter) = pending.try_recv() else {
+                    break;
+                };
+                batch.push(waiter);
+            }
+            // Every caller in this batch arrived before the quorum round opened.
+            let reply = tokio::select! {
+                _ = stop.cancelled() => return,
+                result = self.barrier(Instant::now() + REQUEST_TIMEOUT) => match result {
+                    Ok(()) => Reply::Decision(self.state.head().map(Outcome::At).into()),
+                    Err(reply) => reply,
+                },
+            };
+            for caller in batch {
+                let _ = caller.send(reply.clone());
+            }
+        }
+    }
+
+    async fn barrier(&self, deadline: Instant) -> Result<(), Reply> {
+        if self.require_healthy().is_err() {
+            return Err(failure(JournalError::Unavailable));
+        }
+        match timeout_at(deadline, self.raft.ensure_linearizable()).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => Err(leader_reply(
+                error
+                    .forward_to_leader()
+                    .and_then(|leader| leader.leader_id),
+            )),
+            Err(_) => Err(failure(JournalError::Unavailable)),
+        }
+    }
+
+    async fn read(&self, from: Lsn, limit: usize, wait_ms: u32, minimum_head: Lsn) -> Outcome {
+        let mut changed = self.state.subscribe();
+        let deadline =
+            Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(REQUEST_TIMEOUT);
+        loop {
+            if self.state.head().is_ok_and(|head| head < minimum_head) {
+                if timeout_at(deadline, changed.changed()).await.is_err() {
+                    return Outcome::Refused(JournalError::Unavailable);
+                }
+                continue;
+            }
+            let page = self.state.page(from, limit).await;
+            if !page
+                .as_ref()
+                .is_ok_and(|page| limit != 0 && from > page.head)
+                || timeout_at(deadline, changed.changed()).await.is_err()
+            {
+                return page.map(Outcome::Page).into();
+            }
+        }
+    }
+}
+
+fn leader_reply(id: Option<NodeId>) -> Reply {
+    Reply::Leader(id.map(uuid::Uuid::from_u128))
+}
+
+fn failure(error: JournalError) -> Reply {
+    Reply::Decision(Outcome::Refused(error))
+}

@@ -1,0 +1,393 @@
+use std::{collections::BTreeSet, time::Duration};
+
+use futures::stream::{FuturesUnordered, StreamExt};
+use journal_contract::{JournalError, Lsn, Page, Result, StreamId};
+use tokio::time::{Instant, sleep};
+use uuid::Uuid;
+
+use super::{Client, Configuration, Frame, Genesis, Outcome, Reply, Request, Route, remaining};
+use crate::stream::consensus::{MAX_PAGE, MAX_RECORD, MAX_RECORDS_PER_PAGE, network::Proof};
+
+const HEDGE_DELAY: Duration = Duration::from_millis(25);
+const DISCOVERY_ATTEMPTS: usize = 8;
+const FALLBACK_ATTEMPTS: usize = 8;
+
+impl Client {
+    pub async fn read(
+        &self,
+        stream: StreamId,
+        from: Lsn,
+        limit: usize,
+        wait: Duration,
+    ) -> Result<Page> {
+        self.read_at_least(stream, from, limit, wait, Lsn(0)).await
+    }
+
+    /// Reads one applied page whose head covers the caller's minimum.
+    /// Use `head` for a fresh quorum-confirmed position.
+    pub async fn read_at_least(
+        &self,
+        stream: StreamId,
+        from: Lsn,
+        limit: usize,
+        wait: Duration,
+        minimum_head: Lsn,
+    ) -> Result<Page> {
+        let deadline = Instant::now() + self.deadline;
+        let mut route = self.route(stream, deadline).await?;
+        if route.preferred.is_none() {
+            if let Some((keeper, proof)) = self.discover_placement(stream, &route, deadline).await {
+                self.remember_placement(stream, keeper, &proof);
+                route = self.routes.lock().get(&stream).cloned().unwrap_or(route);
+            }
+        }
+        let genesis = route.genesis.clone().ok_or(JournalError::Unavailable)?;
+        let wait = wait.min(Duration::from_secs(5));
+        let request = Request::ReadAt {
+            genesis: genesis.clone(),
+            from,
+            minimum_head,
+            limit,
+            wait_ms: wait.as_millis() as u32,
+        };
+        let attempt = wait.saturating_add(super::ATTEMPT);
+        let call = |keeper| {
+            let request = request.clone();
+            async move {
+                let result = self
+                    .rpc
+                    .call::<Reply>(
+                        keeper,
+                        Frame::Client(request),
+                        remaining(deadline).min(attempt),
+                    )
+                    .await
+                    .ok();
+                (keeper, result)
+            }
+        };
+        let mut view = Seen::default();
+        let accept = |view: &mut Seen, keeper, reply| {
+            let outcome = checked_page(reply?, &genesis, from, limit, minimum_head)?;
+            if let Some(configuration) = outcome.configuration {
+                self.remember_placement(
+                    stream,
+                    keeper,
+                    &Proof {
+                        genesis: genesis.clone(),
+                        configuration,
+                        joint: None,
+                        stage: None,
+                    },
+                );
+            }
+            view.record(outcome.outcome, limit)
+        };
+        let mut tried = BTreeSet::new();
+        let preferred = route.ordered_preferred();
+        if let Some(&first) = preferred.first() {
+            tried.insert(first);
+            let mut pending = FuturesUnordered::new();
+            pending.push(call(first));
+            if let Some(&alternate) = preferred.get(1) {
+                tokio::select! {
+                    biased;
+                    reply = pending.next() => {
+                        if let Some((keeper, reply)) = reply
+                            && let Some(page) = accept(&mut view, keeper, reply)
+                        {
+                            return Ok(page);
+                        }
+                    }
+                    _ = sleep(HEDGE_DELAY.min(remaining(deadline))), if !remaining(deadline).is_zero() => {
+                        tried.insert(alternate);
+                        pending.push(call(alternate));
+                    }
+                }
+            }
+            while let Some((keeper, reply)) = pending.next().await {
+                if let Some(page) = accept(&mut view, keeper, reply) {
+                    return Ok(page);
+                }
+            }
+        }
+
+        // A cache miss or unreachable old roster gets one trusted lookup.
+        // The lookup contributes contacts, never a preferred configuration.
+        let updated = if remaining(deadline).is_zero() {
+            None
+        } else {
+            self.refresh(stream, deadline).await.ok()
+        };
+        let discoveries = updated
+            .iter()
+            .flat_map(|route| route.contacts.iter().copied());
+        let fallback = preferred
+            .into_iter()
+            .chain(discoveries)
+            .chain(route.contacts)
+            .chain(self.rpc.keepers().keys().copied())
+            .filter(|id| tried.insert(*id))
+            .take(FALLBACK_ATTEMPTS)
+            .collect::<Vec<_>>();
+        let mut calls = futures::stream::iter(fallback.into_iter().map(call)).buffer_unordered(3);
+        while let Some((keeper, reply)) = calls.next().await {
+            if let Some(page) = accept(&mut view, keeper, reply) {
+                return Ok(page);
+            }
+        }
+        view.finish()
+    }
+
+    async fn discover_placement(
+        &self,
+        stream: StreamId,
+        route: &Route,
+        deadline: Instant,
+    ) -> Option<(Uuid, Proof)> {
+        let mut seen = BTreeSet::new();
+        let mut pending = FuturesUnordered::new();
+        let call = |id| async move {
+            let reply = self
+                .rpc
+                .call::<Reply>(
+                    id,
+                    Frame::Client(Request::PlacementProof(stream)),
+                    (remaining(deadline) / 3).min(Duration::from_millis(350)),
+                )
+                .await;
+            (id, reply)
+        };
+        for peer in route
+            .leader
+            .into_iter()
+            .chain(route.contacts.iter().copied())
+            .filter(|id| seen.insert(*id))
+            .take(DISCOVERY_ATTEMPTS)
+        {
+            pending.push(call(peer));
+        }
+        while let Some((keeper, reply)) = pending.next().await {
+            match reply {
+                Ok(Reply::Placement(proof))
+                    if route
+                        .genesis
+                        .as_ref()
+                        .is_none_or(|known| known == &proof.genesis)
+                        && self.valid_proof(stream, &proof) =>
+                {
+                    return Some((keeper, proof));
+                }
+                Ok(Reply::Leader(Some(next)))
+                    if seen.len() < DISCOVERY_ATTEMPTS
+                        && self.rpc.keepers().contains_key(&next)
+                        && seen.insert(next) =>
+                {
+                    pending.push(call(next));
+                }
+                _ => (),
+            }
+        }
+        None
+    }
+
+    fn valid_proof(&self, stream: StreamId, proof: &Proof) -> bool {
+        proof.genesis.stream == stream
+            && proof.genesis.valid(self.rpc.keepers())
+            && proof
+                .configuration
+                .voters
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            && proof
+                .configuration
+                .voters
+                .iter()
+                .all(|id| self.rpc.keepers().contains_key(id))
+    }
+
+    fn remember_placement(&self, stream: StreamId, keeper: Uuid, proof: &Proof) {
+        if !self.valid_proof(stream, proof) {
+            return;
+        }
+        let mut routes = self.routes.lock();
+        let route = routes.entry(stream).or_insert_with(|| Route {
+            genesis: Some(proof.genesis.clone()),
+            contacts: Vec::new(),
+            leader: None,
+            preferred: None,
+        });
+        if route
+            .genesis
+            .as_ref()
+            .is_some_and(|known| known != &proof.genesis)
+        {
+            return;
+        }
+        route.genesis = Some(proof.genesis.clone());
+        let incoming = proof.configuration;
+        if route
+            .preferred
+            .is_none_or(|(current, _)| incoming.revision > current.revision)
+        {
+            route.preferred = Some((
+                incoming,
+                if incoming.voters.contains(&keeper) {
+                    keeper
+                } else {
+                    incoming.voters[0]
+                },
+            ));
+        } else if let Some((current, last)) = &mut route.preferred
+            && *current == incoming
+            && incoming.voters.contains(&keeper)
+        {
+            *last = keeper;
+        }
+    }
+}
+
+impl Route {
+    fn ordered_preferred(&self) -> Vec<Uuid> {
+        self.preferred
+            .map_or_else(Vec::new, |(configuration, preferred)| {
+                std::iter::once(preferred)
+                    .chain(
+                        configuration
+                            .voters
+                            .into_iter()
+                            .filter(|id| *id != preferred),
+                    )
+                    .collect()
+            })
+    }
+}
+
+struct Checked {
+    configuration: Option<Configuration>,
+    outcome: Outcome,
+}
+
+fn checked_page(
+    reply: Reply,
+    expected: &Genesis,
+    from: Lsn,
+    limit: usize,
+    minimum: Lsn,
+) -> Option<Checked> {
+    let Reply::ScopedPage {
+        genesis,
+        configuration,
+        outcome,
+    } = reply
+    else {
+        return None;
+    };
+    if &genesis != expected {
+        return None;
+    }
+    if let Outcome::Page(page) = &outcome {
+        if page.head < minimum
+            || page.floor.0 == 0
+            || from < page.floor
+            || page
+                .head
+                .0
+                .checked_add(1)
+                .is_none_or(|after| page.floor.0 > after)
+            || page.records.len() > limit.min(MAX_RECORDS_PER_PAGE)
+            || page
+                .records
+                .iter()
+                .map(|(_, payload)| payload.len())
+                .sum::<usize>()
+                > MAX_PAGE
+            || page
+                .records
+                .iter()
+                .enumerate()
+                .any(|(offset, (at, payload))| {
+                    from.0.checked_add(offset as u64) != Some(at.0)
+                        || *at > page.head
+                        || payload.len() > MAX_RECORD
+                })
+        {
+            return None;
+        }
+    }
+    Some(Checked {
+        configuration,
+        outcome,
+    })
+}
+
+#[derive(Default)]
+struct Seen {
+    empty: Option<Page>,
+    floor: Option<Lsn>,
+    deleted: bool,
+}
+
+impl Seen {
+    fn record(&mut self, outcome: Outcome, limit: usize) -> Option<Page> {
+        match outcome {
+            Outcome::Page(page) if !page.records.is_empty() || limit == 0 => return Some(page),
+            Outcome::Page(page)
+                if self
+                    .empty
+                    .as_ref()
+                    .is_none_or(|prior| page.head > prior.head) =>
+            {
+                self.empty = Some(page);
+            }
+            Outcome::Refused(JournalError::Trimmed { floor }) => {
+                self.floor = self.floor.max(Some(floor))
+            }
+            Outcome::Refused(JournalError::Deleted) => self.deleted = true,
+            _ => (),
+        }
+        None
+    }
+
+    fn finish(self) -> Result<Page> {
+        if self.deleted {
+            return Err(JournalError::Deleted);
+        }
+        if let Some(floor) = self.floor {
+            return Err(JournalError::Trimmed { floor });
+        }
+        self.empty.ok_or(JournalError::Unavailable)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn pages_are_bound_to_scope_minimum_and_request_bounds() {
+        let genesis = Genesis {
+            stream: StreamId(4),
+            voters: [1, 2, 3].map(Uuid::from_u128),
+            quota_bytes: 128,
+        };
+        let page = |scope: Genesis, head| Reply::ScopedPage {
+            genesis: scope,
+            configuration: None,
+            outcome: Outcome::Page(Page {
+                floor: Lsn(1),
+                head: Lsn(head),
+                records: vec![(Lsn(1), Bytes::from_static(b"one"))],
+            }),
+        };
+        assert!(checked_page(page(genesis.clone(), 4), &genesis, Lsn(1), 1, Lsn(4)).is_some());
+        assert!(checked_page(page(genesis.clone(), 3), &genesis, Lsn(1), 1, Lsn(4)).is_none());
+        assert!(checked_page(page(genesis.clone(), 4), &genesis, Lsn(2), 1, Lsn(4)).is_none());
+        let foreign = Genesis {
+            quota_bytes: 129,
+            ..genesis.clone()
+        };
+        assert!(checked_page(page(foreign, 4), &genesis, Lsn(1), 1, Lsn(4)).is_none());
+    }
+}

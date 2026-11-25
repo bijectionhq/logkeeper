@@ -33,16 +33,62 @@ async fn main() -> ExitCode {
 async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(feature = "stream")]
     if args.first().is_some_and(|arg| arg == "keeper") {
+        if let [_, action, flag, file] = args
+            && action == "initialize"
+            && flag == "--config"
+        {
+            logkeeper::stream::consensus::Config::read(std::path::Path::new(file))?.initialize()?;
+            return Ok(());
+        }
+        if let [
+            _,
+            action,
+            flag,
+            file,
+            stream_flag,
+            stream,
+            snapshot_flag,
+            backup,
+        ] = args
+            && action == "repair-snapshot"
+            && flag == "--config"
+            && stream_flag == "--stream"
+            && snapshot_flag == "--snapshot"
+        {
+            let stream = journal_contract::StreamId(uuid::Uuid::parse_str(stream)?.as_u128());
+            logkeeper::stream::consensus::Config::read(std::path::Path::new(file))?
+                .repair_snapshot(stream, std::path::Path::new(backup))
+                .await?;
+            return Ok(());
+        }
         let [_, flag, file] = args else {
             return Err("Usage: logkeeper keeper --config FILE".into());
         };
         if flag != "--config" {
             return Err("Usage: logkeeper keeper --config FILE".into());
         }
-        let config = logkeeper::stream::transport::Config::read(std::path::Path::new(file))?;
-        let listener = TcpListener::bind(config.listen).await?;
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum KeeperConfig {
+            Consensus(logkeeper::stream::consensus::Config),
+            Stream(logkeeper::stream::transport::Config),
+        }
+
+        let config = serde_json::from_slice::<KeeperConfig>(&std::fs::read(file)?)?;
+        let listen = match &config {
+            KeeperConfig::Consensus(config) => config.listen,
+            KeeperConfig::Stream(config) => config.listen,
+        };
+        let listener = TcpListener::bind(listen).await?;
         let cancellation = CancellationToken::new();
-        let serving = config.serve(listener, cancellation.clone());
+        let serving = async {
+            match config {
+                KeeperConfig::Consensus(config) => {
+                    config.serve(listener, cancellation.clone()).await
+                }
+                KeeperConfig::Stream(config) => config.serve(listener, cancellation.clone()).await,
+            }
+        };
         tokio::pin!(serving);
         tokio::select! {
             result = &mut serving => result?,

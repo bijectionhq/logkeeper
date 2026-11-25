@@ -16,6 +16,7 @@ mod state;
 mod timer;
 
 /// A stream's identity. Never reused after `delete`.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId(pub u128);
 
@@ -46,14 +47,17 @@ impl From<String> for Identity {
 }
 
 /// The writer fence. A stream accepts appends only under its sealed epoch.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Epoch(pub u64);
 
 /// A record's position. The first record of a stream is at 1; an empty stream's head is 0.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lsn(pub u64);
 
 /// A page of committed records.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Page {
     /// The first LSN retained at the source of this page.
@@ -65,6 +69,7 @@ pub struct Page {
 }
 
 /// Every way a journal call can fail.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JournalError {
     /// A higher epoch has sealed the stream, or another identity sealed this epoch.

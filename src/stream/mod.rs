@@ -2,6 +2,8 @@
 //! Specification: `verification/target-journal.md`. Contract: the `journal-contract` crate.
 
 pub mod codec;
+#[cfg(feature = "stream")]
+pub mod consensus;
 pub mod keeper;
 mod proposer;
 #[cfg(feature = "stream")]

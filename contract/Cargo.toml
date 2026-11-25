@@ -9,9 +9,11 @@ description = "The ordered, fenced stream journal contract: the whole interface 
 
 [features]
 conformance = []
+serde = ["dep:serde", "bytes/serde"]
 
 [dependencies]
 bytes = "1"
+serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
