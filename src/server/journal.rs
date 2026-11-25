@@ -101,10 +101,15 @@ fn frame(stream: u64, kind: Kind, buffer: &mut BytesMut) {
 }
 
 fn frame_record(record: Record, buffer: &mut BytesMut) {
-    let body = record.encode_to_vec();
-    buffer.put_u32(body.len() as u32);
-    buffer.put_u32(crc32fast::hash(&body));
-    buffer.put_slice(&body);
+    let length = record.encoded_len();
+    buffer.reserve(8 + length);
+    buffer.put_u32(length as u32);
+    let checksum = buffer.len();
+    buffer.put_u32(0);
+    let body = buffer.len();
+    record.encode_raw(buffer);
+    let digest = crc32fast::hash(&buffer[body..]);
+    buffer[checksum..body].copy_from_slice(&digest.to_be_bytes());
 }
 
 fn io_error(path: &Path, error: std::io::Error) -> Error {
@@ -868,6 +873,25 @@ mod tests {
     fn entry(lsn: i64) -> Entry { Entry { lsn, epoch: 1, timestamp: lsn, payload: Bytes::from(format!("entry {lsn}")) } }
 
     fn sized(lsn: i64, epoch: u64, bytes: usize) -> Entry { Entry { lsn, epoch, timestamp: lsn, payload: Bytes::from(format!("{lsn}@{epoch}:{}", "x".repeat(bytes))) } }
+
+    #[test]
+    fn direct_frames_preserve_prost_bytes_and_checksums_in_one_round() {
+        let records = [
+            Record { stream: 0, kind: Some(Kind::Base(true)), active_ensemble: Bytes::new() },
+            Record { stream: 300, kind: Some(Kind::Synced(7)), active_ensemble: Bytes::from_static(b"installed") },
+            Record { stream: 300, kind: Some(Kind::Append(sized(13, 7, 512 * 1024))), active_ensemble: Bytes::new() },
+        ];
+        let mut actual = BytesMut::from(&b"preceding bytes"[..]);
+        let mut expected = actual.clone();
+        for record in records {
+            let body = record.encode_to_vec();
+            expected.put_u32(body.len() as u32);
+            expected.put_u32(crc32fast::hash(&body));
+            expected.put_slice(&body);
+            frame_record(record, &mut actual);
+        }
+        assert_eq!(actual, expected);
+    }
 
     fn work(write: Write) -> Work { Work { write, done: oneshot::channel().0, _admission: None } }
 
