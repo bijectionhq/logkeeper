@@ -181,15 +181,18 @@ pub(super) fn read_frame_with_header(
 pub(super) fn atomic_file(
     path: &Path,
     write: impl FnOnce(&mut BufWriter<File>) -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<File> {
     let temporary = path.with_extension("tmp");
-    let mut file = BufWriter::new(File::create(&temporary)?);
+    let mut file = BufWriter::new(
+        OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&temporary)?,
+    );
     write(&mut file)?;
     file.flush()?;
     sync_file(file.get_ref())?;
-    drop(file);
+    let (file, _) = file.into_parts();
     fs::rename(temporary, path)?;
-    sync_directory(path.parent().expect("file has parent"))
+    sync_directory(path.parent().expect("file has parent"))?;
+    Ok(file)
 }
 
 fn directories(path: &Path) -> io::Result<()> {

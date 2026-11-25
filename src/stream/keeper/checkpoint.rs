@@ -347,7 +347,7 @@ impl Checkpoint {
             indexed.encoded = encoded;
         }
         let mut published = Vec::with_capacity(self.streams.len());
-        atomic_file(&root.join("INDEX"), |file| {
+        let source = atomic_file(&root.join("INDEX"), |file| {
             let count: u32 = self
                 .streams
                 .len()
@@ -379,9 +379,8 @@ impl Checkpoint {
             }
             Ok(())
         })?;
-        // The keeper lock keeps other publishers out. Keep this opened instance
-        // across future renames so copied rows still name their original inode.
-        self.source = Some(File::open(root.join("INDEX"))?);
+        // Keep the exact inode that was published, including across future renames.
+        self.source = Some(source);
         for (stream, range) in published {
             self.streams.get_mut(&stream).expect("published stream").encoded.body =
                 IndexBody::Published(range);
