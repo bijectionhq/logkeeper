@@ -1,0 +1,43 @@
+{
+  "summary": "The shipped slot reader reuses an already decoded mirror only after every compared byte matches and the entire declared body has been consumed.",
+  "flags": ["--no-external-by-default", "--verify-module", "production", "--verify-module", "laws"],
+  "min_verified_functions": 5,
+  "controls": {
+    "forget-prior-mismatch": {
+      "defect": "A matching final chunk can overwrite the recorded mismatch of the preceding chunk.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/mirror_body.rs",
+          "find": "self.equal = self.equal && matches_bytes(expected, observed);",
+          "replace": "self.equal = matches_bytes(expected, observed);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/disk/mirror_body.rs",
+          "function": "observe",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    },
+    "reuse-before-end": {
+      "defect": "Matching the first part of a body authorizes reuse before the declared end.",
+      "mutate": [
+        {
+          "file": "src/ordered/replication/disk/mirror_body.rs",
+          "find": "        self.remaining == 0 && self.equal",
+          "replace": "        self.equal"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/ordered/replication/disk/mirror_body.rs",
+          "function": "matches",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 4
+    }
+  }
+}

@@ -1,3 +1,4 @@
+use super::mirror_body::{MirrorBody, mirror_body};
 use super::recover::recover_slot;
 use super::selection::authenticates_body;
 use super::{
@@ -31,10 +32,11 @@ pub(super) fn recover_slot_against(
         let mut hash = Sha256::new();
         hash.update(&raw[..DESCRIPTOR_BYTES]);
         let mut scratch = [0; 8192];
-        let mut equal = compare_part(&mut source, &mut hash, &mut scratch, &framing[..framing_len])?;
+        let mut body = mirror_body(header.length);
+        compare_part(&mut source, &mut hash, &mut scratch, &mut body, &framing[..framing_len])?;
         for (length, payload) in prefix.into_iter().flat_map(Prefix::framed_payloads) {
-            equal &= compare_part(&mut source, &mut hash, &mut scratch, &length)?;
-            equal &= compare_part(&mut source, &mut hash, &mut scratch, payload)?;
+            compare_part(&mut source, &mut hash, &mut scratch, &mut body, &length)?;
+            compare_part(&mut source, &mut hash, &mut scratch, &mut body, payload)?;
         }
         let observed: Fingerprint = hash.finalize().into();
         if !authenticates_body(&observed, &header.digest) {
@@ -43,7 +45,7 @@ pub(super) fn recover_slot_against(
         if !matches_slot(&header, &group.identity, voter.as_bytes()) {
             return Err(Error::Group);
         }
-        if equal {
+        if body.matches() {
             return Ok((
                 header.length,
                 Some((
@@ -66,14 +68,14 @@ fn compare_part(
     file: &mut impl Read,
     hash: &mut Sha256,
     scratch: &mut [u8],
+    body: &mut MirrorBody,
     expected: &[u8],
-) -> Result<bool, Error> {
-    let mut equal = true;
+) -> Result<(), Error> {
     for part in expected.chunks(scratch.len()) {
         let read = &mut scratch[..part.len()];
         file.read_exact(read)?;
         hash.update(&*read);
-        equal &= &*read == part;
+        body.observe(part, read);
     }
-    Ok(equal)
+    Ok(())
 }
