@@ -23,10 +23,10 @@ use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
-const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+mod compact_frame;
+use compact_frame::CompactionFrames;
 
-/// A compaction writes its base segment in pieces of about this size.
-const COMPACTION_WRITE_BYTES: usize = 4 * 1024 * 1024;
+const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Message)]
 struct Snapshot {
@@ -539,38 +539,34 @@ impl Journal {
         let sequence = current.sequence + 1;
         let path = segment_path(&self.segments, sequence);
         let temporary = path.with_extension("tmp");
-        let mut file = File::create(&temporary).map_err(|error| io_error(&temporary, error))?;
-        let mut buffer = BytesMut::new();
-        let mut written = 0u64;
+        let file = File::create(&temporary).map_err(|error| io_error(&temporary, error))?;
+        let mut output = CompactionFrames::new(file, &temporary);
         let mut copies = Vec::with_capacity(captured.len());
-        frame(0, Kind::Base(true), &mut buffer);
+        output.push_kind(0, Kind::Base(true))?;
         for stream in captured {
             let (id, state) = (stream.slot.id, &stream.state);
-            frame(id, Kind::Declare(stream.slot.name.clone()), &mut buffer);
-            frame(id, Kind::Snapshot(Snapshot {
+            output.push_kind(id, Kind::Declare(stream.slot.name.clone()))?;
+            output.push_kind(id, Kind::Snapshot(Snapshot {
                 promised: state.promised, synced: state.synced.unwrap_or(0), trim: state.trim, commit: state.commit, retired: state.dropped,
                 active_ensemble: state.active_ensemble.as_ref().map_or_else(Bytes::new, |ensemble| Bytes::copy_from_slice(ensemble)),
-            }), &mut buffer);
+            }))?;
             let mut locations = Vec::with_capacity(state.entries.len());
             for (held, lsn) in state.entries.iter().zip(state.trim + 1..) {
-                let payload = match &held.payload {
-                    Stored::Pending(payload) => payload.clone(),
-                    Stored::Written(location) => self.payload(lsn, *location)?,
-                };
-                let start = buffer.len();
-                let length = payload.len() as u32;
-                frame(id, Kind::Append(Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload }), &mut buffer);
-                locations.push(Location { segment: sequence, offset: written + start as u64, length: (buffer.len() - start) as u32, payload: length });
-                if buffer.len() >= COMPACTION_WRITE_BYTES {
-                    file.write_all(&buffer).map_err(|error| io_error(&temporary, error))?;
-                    written += buffer.len() as u64;
-                    buffer.clear();
-                }
+                let entry = Entry { lsn, epoch: held.epoch, timestamp: held.timestamp, payload: Bytes::new() };
+                let record = Record { stream: id, kind: Some(Kind::Append(entry)), ..Record::default() };
+                let start = output.position();
+                let payload = self.compact_append(&mut output, record, lsn, &held.payload)?;
+                locations.push(Location {
+                    segment: sequence,
+                    offset: start,
+                    length: (output.position() - start) as u32,
+                    payload,
+                });
             }
             copies.push(locations);
         }
-        file.write_all(&buffer).map_err(|error| io_error(&temporary, error))?;
-        written += buffer.len() as u64;
+        let written = output.position();
+        let file = output.finish()?;
         self.sync(&file, &temporary)?;
         drop(file);
         fs::rename(&temporary, &path).map_err(|error| io_error(&path, error))?;
@@ -612,11 +608,35 @@ impl Journal {
         }
     }
 
-    /// Reads a written payload, from the cache or from its segment.
-    fn payload(&self, lsn: i64, location: Location) -> Result<Bytes> {
-        if let Some(payload) = self.cache.lock().get(location) { return Ok(payload); }
-        let file = self.files.lock().get(&location.segment).cloned();
-        self.read(file.as_deref(), lsn, location)
+    fn compact_append(
+        &self,
+        output: &mut CompactionFrames<'_>,
+        mut record: Record,
+        lsn: i64,
+        stored: &Stored,
+    ) -> Result<u32> {
+        let payload = match stored {
+            Stored::Pending(payload) => payload.clone(),
+            Stored::Written(location) => {
+                let cached = self.cache.lock().get(*location);
+                if let Some(payload) = cached {
+                    payload
+                } else {
+                    let path = segment_path(&self.segments, location.segment);
+                    let file = self.files.lock().get(&location.segment).cloned()
+                        .ok_or_else(|| Error::fault("rtdb.logkeeper/segment-retired", format!("lsn {lsn} points at retired segment {}", path.display())))?;
+                    if output.copy_canonical(&file, &path, *location, record.clone())? {
+                        return Ok(location.payload);
+                    }
+                    read_payload(&file, &path, lsn, *location)?
+                }
+            }
+        };
+        let length = payload.len() as u32;
+        let Some(Kind::Append(entry)) = &mut record.kind else { unreachable!("compaction appends") };
+        entry.payload = payload;
+        output.push(&record)?;
+        Ok(length)
     }
 
     fn read(&self, file: Option<&File>, lsn: i64, location: Location) -> Result<Bytes> {
