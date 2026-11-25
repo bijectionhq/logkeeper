@@ -6,6 +6,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
+mod frame_parts;
+pub(crate) use frame_parts::{FrameParts, WIRE_BATCH_FRAMES};
+
 pub(crate) const MAXIMUM_FRAME_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Message)]

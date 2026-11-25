@@ -1,6 +1,6 @@
 //! Durable storage: every stream's events in one sequence of shared segment files, in decision order.
 //! Each record is framed as a big-endian u32 length, a CRC-32 of the body, and a prost body naming its stream by a server-wide id that a `Declare` record binds to the stream's name.
-//! A round of writes, across every stream, is one write and at most one sync.
+//! A round writes every stream in order before its durability barrier.
 //! A compaction writes a base segment holding a snapshot of every stream and then deletes every earlier segment; replay starts at the last base segment.
 //! A torn final record of the last segment is cut off on recovery, as it was never acknowledged.
 //! A retained entry's payload stays in the segment its record was written to, and a reader reads it from there; memory holds only each entry's location and a bounded cache of payloads.
@@ -9,7 +9,7 @@ use super::payload::{Cache, Item, Location, Source, Stored};
 use super::state::{Event, Held, StreamState, Window};
 use super::store::{Slot, Store};
 use crate::history::RetainedChain;
-use crate::protocol::{Entries, Entry};
+use crate::protocol::{Entries, Entry, FrameParts};
 use bytes::{BufMut, Bytes, BytesMut};
 use fs2::FileExt;
 use parking_lot::Mutex;
@@ -438,21 +438,21 @@ impl Journal {
     /// Commit records are synced like any other: a sealed loglet's commit lsn is written once, by the move that ends it, and no later writer re-establishes it.
     fn write_round(&self, works: &[Work]) -> Result<()> {
         let mut current = self.current.lock();
-        let mut buffer = BytesMut::new();
+        let mut buffer = FrameParts::default();
         let mut placed = Vec::new();
         let mut sync = false;
         for work in works {
             match &work.write {
                 Write::Events(_, events) if events.is_empty() => (),
                 Write::Events(slot, events) => {
-                    if current.declared.insert(slot.id) { frame(slot.id, Kind::Declare(slot.name.clone()), &mut buffer); }
+                    if current.declared.insert(slot.id) { buffer.push_durable(&Record { stream: slot.id, kind: Some(Kind::Declare(slot.name.clone())), active_ensemble: Bytes::new() }); }
                     for event in events {
                         let start = buffer.len();
                         let active_ensemble = match event {
                             Event::Activate { ensemble, .. } => Bytes::copy_from_slice(ensemble),
                             _ => Bytes::new(),
                         };
-                        frame_record(Record { stream: slot.id, kind: Some(record(event)), active_ensemble }, &mut buffer);
+                        buffer.push_durable(&Record { stream: slot.id, kind: Some(record(event)), active_ensemble });
                         if let Event::Append(entry) = event { placed.push(Placed { slot, entry, start, length: buffer.len() - start }); }
                     }
                     sync = true;
@@ -475,7 +475,7 @@ impl Journal {
 
     /// Appends a buffer, then points each entry it placed at its record.
     /// An entry already replaced by a later decision keeps that decision's payload, which a later record carries.
-    fn flush(&self, current: &mut Current, buffer: &[u8], sync: bool, placed: &[Placed]) -> Result<()> {
+    fn flush(&self, current: &mut Current, buffer: &FrameParts, sync: bool, placed: &[Placed]) -> Result<()> {
         let (segment, base) = (current.sequence, current.bytes);
         self.append(current, buffer, sync)?;
         for placed in placed {
@@ -493,9 +493,9 @@ impl Journal {
         Ok(())
     }
 
-    fn append(&self, current: &mut Current, buffer: &[u8], sync: bool) -> Result<()> {
-        if buffer.is_empty() { return Ok(()); }
-        current.file.write_all(buffer).map_err(|error| io_error(&current.path, error))?;
+    fn append(&self, current: &mut Current, buffer: &FrameParts, sync: bool) -> Result<()> {
+        if buffer.len() == 0 { return Ok(()); }
+        buffer.write_to(&*current.file).map_err(|error| io_error(&current.path, error))?;
         if sync { self.sync(&current.file, &current.path)?; }
         current.bytes += buffer.len() as u64;
         self.bytes.fetch_add(buffer.len() as u64, Ordering::Relaxed);
@@ -633,8 +633,7 @@ impl Journal {
                 Source::Ready(payload) => payload,
                 Source::Disk(file, location) => {
                     let payload = self.read(file.as_deref(), item.lsn, location)?;
-                    self.cache.lock().insert(location, &payload);
-                    payload
+                    self.cache.lock().insert_read(location, payload)
                 }
             };
             entries.push(Entry { lsn: item.lsn, epoch: item.epoch, timestamp: item.timestamp, payload });
