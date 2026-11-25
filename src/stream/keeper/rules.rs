@@ -38,7 +38,7 @@ pub(super) fn valid_epoch_run(
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == if len == 0 { 1 } else { len as u64 }
 ))]
-pub(in crate::stream) fn record_charge(len: usize) -> u64 {
+pub(crate) fn record_charge(len: usize) -> u64 {
     len.max(1) as u64
 }
 
