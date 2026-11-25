@@ -6,23 +6,77 @@ use bytes::{BufMut, Bytes};
 use prost::{Message, encoding};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
-use super::{MAX_FRAME_BYTES, Request, RequestBody, RequestFrame, checked_request_frame, request};
+use super::{MAX_FRAME_BYTES, Request, RequestBody, RequestFrame, invalid, request, well_formed_batch};
 
 const CONTROL_BYTES: usize = 4096;
 const RECORDS_PER_WRITE: usize = 16;
 // Append and Sync record keys each occupy one byte.
 const RECORD_HEADER_BYTES: usize = 1 + encoding::encoded_len_varint(MAX_FRAME_BYTES as u64);
 
-pub(in crate::stream) struct RequestWrite {
+pub(in crate::stream) struct MeasuredRequest {
     frame: RequestFrame,
     len: usize,
+    record_body_len: usize,
+    batched_len: usize,
+}
+
+impl MeasuredRequest {
+    pub(in crate::stream) fn new(request: &Request) -> Self {
+        debug_assert!(!matches!(request, Request::Batch(_)));
+        let frame = RequestFrame::from(request);
+        let record_body_len = match &frame.body {
+            Some(RequestBody::Append(body)) => body.encoded_len(),
+            Some(RequestBody::Sync(body)) => body.encoded_len(),
+            _ => 0,
+        };
+        let len = match &frame.body {
+            // The stream ID is always 16 bytes and both body tags occupy one byte.
+            Some(RequestBody::Append(_) | RequestBody::Sync(_)) => {
+                encoding::bytes::encoded_len(1, &frame.stream) + delimited_len(record_body_len)
+            }
+            _ => frame.encoded_len(),
+        };
+        Self {
+            frame,
+            len,
+            record_body_len,
+            batched_len: delimited_len(len),
+        }
+    }
+
+    pub(in crate::stream) fn batched_len(&self) -> usize {
+        self.batched_len
+    }
+}
+
+pub(in crate::stream) enum RequestWrite {
+    Single(MeasuredRequest),
+    Batch(Vec<MeasuredRequest>, usize),
 }
 
 impl RequestWrite {
     pub(in crate::stream) fn preflight(request: Request) -> io::Result<Self> {
-        // Prost sizes the complete message using the length of each retained Bytes.
-        let (frame, len) = checked_request_frame(&request)?;
-        Ok(Self { frame, len })
+        if !well_formed_batch(&request) {
+            return Err(invalid("empty or nested keeper batch"));
+        }
+        match request {
+            Request::Batch(requests) => {
+                Self::batch(requests.iter().map(MeasuredRequest::new).collect())
+            }
+            request => Self::single(MeasuredRequest::new(&request)),
+        }
+    }
+
+    pub(in crate::stream) fn single(request: MeasuredRequest) -> io::Result<Self> {
+        check_length(Some(request.len))?;
+        Ok(Self::Single(request))
+    }
+
+    pub(in crate::stream) fn batch(requests: Vec<MeasuredRequest>) -> io::Result<Self> {
+        let len = check_length(requests.iter().try_fold(0usize, |len, request| {
+            len.checked_add(request.batched_len())
+        }))?;
+        Ok(Self::Batch(requests, len))
     }
 
     pub(in crate::stream) async fn write(
@@ -30,12 +84,16 @@ impl RequestWrite {
         channel: &mut (impl AsyncWrite + Unpin),
     ) -> io::Result<()> {
         let mut control = Vec::with_capacity(128);
-        control.extend_from_slice(&(self.len as u32).to_be_bytes());
-        if self.frame.batch.is_empty() {
-            write_request(channel, &self.frame, false, &mut control).await?;
-        } else {
-            for frame in &self.frame.batch {
-                write_request(channel, frame, true, &mut control).await?;
+        match &self {
+            Self::Single(request) => {
+                control.extend_from_slice(&(request.len as u32).to_be_bytes());
+                write_request(channel, request, false, &mut control).await?;
+            }
+            Self::Batch(requests, len) => {
+                control.extend_from_slice(&(*len as u32).to_be_bytes());
+                for request in requests {
+                    write_request(channel, request, true, &mut control).await?;
+                }
             }
         }
         channel.write_all(&control).await?;
@@ -43,21 +101,32 @@ impl RequestWrite {
     }
 }
 
+fn check_length(length: Option<usize>) -> io::Result<usize> {
+    length
+        .filter(|&len| len <= MAX_FRAME_BYTES)
+        .ok_or_else(|| invalid("keeper message too large"))
+}
+
+fn delimited_len(len: usize) -> usize {
+    1 + encoding::encoded_len_varint(len as u64) + len
+}
+
 async fn write_request(
     channel: &mut (impl AsyncWrite + Unpin),
-    frame: &RequestFrame,
+    request: &MeasuredRequest,
     in_batch: bool,
     control: &mut Vec<u8>,
 ) -> io::Result<()> {
     flush_full_control(channel, control).await?;
     if in_batch {
-        encode_delimited_header(12, frame.encoded_len(), control);
+        encode_delimited_header(12, request.len, control);
     }
+    let frame = &request.frame;
     // Match Prost's tag order and omit default singular scalars. Repeated record
     // fields still get a header for a zero-length entry.
     match &frame.body {
         Some(RequestBody::Append(
-            body @ request::Append {
+            request::Append {
                 epoch,
                 at,
                 records,
@@ -65,14 +134,14 @@ async fn write_request(
             },
         )) => {
             encoding::bytes::encode(1, &frame.stream, control);
-            encode_delimited_header(5, body.encoded_len(), control);
+            encode_delimited_header(5, request.record_body_len, control);
             encode_fixed64(1, *epoch, control);
             encode_fixed64(2, *at, control);
             write_records(channel, 3, records, control).await?;
             encode_fixed64(4, *head, control);
         }
         Some(RequestBody::Sync(
-            body @ request::Sync {
+            request::Sync {
                 epoch,
                 floor,
                 from,
@@ -83,7 +152,7 @@ async fn write_request(
             },
         )) => {
             encoding::bytes::encode(1, &frame.stream, control);
-            encode_delimited_header(4, body.encoded_len(), control);
+            encode_delimited_header(4, request.record_body_len, control);
             encode_fixed64(1, *epoch, control);
             encode_fixed64(2, *floor, control);
             encode_fixed64(3, *from, control);

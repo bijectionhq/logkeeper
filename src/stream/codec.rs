@@ -1,7 +1,7 @@
 //! Protobuf keeper messages inside big-endian length-prefixed frames.
 use std::io;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use prost::Message;
 #[cfg(any(test, feature = "stream"))]
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -94,7 +94,16 @@ pub fn batched_request_len(request: &Request) -> usize {
 }
 
 pub fn decode_request(body: Bytes) -> io::Result<Request> {
-    decode::<RequestFrame>(body)?.try_into()
+    decode_request_buf(body)
+}
+
+pub(super) fn decode_request_buf(body: impl Buf) -> io::Result<Request> {
+    if body.remaining() == 0 || body.remaining() > MAX_FRAME_BYTES {
+        return Err(invalid("invalid keeper message length"));
+    }
+    RequestFrame::decode(body)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+        .try_into()
 }
 
 pub fn encode_reply(reply: &Reply) -> io::Result<Bytes> {

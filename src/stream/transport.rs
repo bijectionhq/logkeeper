@@ -38,8 +38,8 @@ use x509_parser::{extensions::GeneralName, parse_x509_certificate};
 
 use super::{
     codec::{
-        self, PreparedReply, decode_reply, decode_request, invalid, read_frame,
-        request_write::RequestWrite,
+        PreparedReply, decode_reply, decode_request, invalid, read_frame,
+        request_write::{MeasuredRequest, RequestWrite},
     },
     keeper::{Keeper, Limits, SealPolicy},
     wire::*,
@@ -416,14 +416,19 @@ impl TcpTransport {
             .get(&keeper)
             .ok_or(TransportError::Unreachable)?;
         // Waiting reads and Delete compaction would hold the shared connection's replies.
-        let exclusive = matches!(
+        let measured = if matches!(
             request,
             Request::Read { wait_ms: 1.., .. } | Request::Delete { .. } | Request::Batch(_)
-        )
-            || codec::batched_request_len(&request) >= SHARED_REQUEST_BYTES;
-        if !exclusive {
-            return route.shared.call(request).await;
-        }
+        ) {
+            None
+        } else {
+            let measured = MeasuredRequest::new(&request);
+            if measured.batched_len() < SHARED_REQUEST_BYTES {
+                drop(request);
+                return route.shared.call(measured).await;
+            }
+            Some(measured)
+        };
         // Leave capacity for mutations and checks while reads wait at the keeper.
         let _read = match request {
             Request::Read { wait_ms: 1.., .. } => {
@@ -432,7 +437,14 @@ impl TcpTransport {
             _ => None,
         };
         let _connection = route.connections.acquire().await.expect("open route");
-        let request = RequestWrite::preflight(request).map_err(protocol)?;
+        let request = match measured {
+            Some(measured) => {
+                drop(request);
+                RequestWrite::single(measured)
+            }
+            None => RequestWrite::preflight(request),
+        }
+        .map_err(protocol)?;
         let idle = route.idle.lock().channels.pop().map(|(_, channel)| channel);
         let mut channel = match idle {
             Some(channel) => channel,

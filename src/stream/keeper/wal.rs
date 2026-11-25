@@ -1,13 +1,13 @@
 //! Segmented keeper WAL. The checkpoint chooses a complete segment boundary.
 //! Physical segments may roll between fragments, but never exceed their byte cap.
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, BufReader, BufWriter, IoSlice, Read, Write},
     path::{Path, PathBuf},
 };
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use fs2::FileExt;
 
 use super::{
@@ -145,11 +145,19 @@ impl Round {
     }
 }
 
-pub(super) fn read_frame(
+fn read_frame(
     reader: &mut impl Read,
     remaining: u64,
     max: usize,
 ) -> io::Result<Option<Bytes>> {
+    Ok(read_frame_with_header(reader, remaining, max)?.map(|(_, body)| body))
+}
+
+pub(super) fn read_frame_with_header(
+    reader: &mut impl Read,
+    remaining: u64,
+    max: usize,
+) -> io::Result<Option<([u8; FRAME_HEADER_BYTES], Bytes)>> {
     if remaining < FRAME_HEADER_BYTES as u64 {
         return Ok(None);
     }
@@ -167,7 +175,7 @@ pub(super) fn read_frame(
     let mut bytes = Bytes::from(frame);
     bytes.advance(FRAME_HEADER_BYTES);
     debug_assert_eq!(bytes.len(), len as usize);
-    Ok(Some(bytes))
+    Ok(Some((header, bytes)))
 }
 
 pub(super) fn atomic_file(
@@ -516,13 +524,100 @@ struct Rotation {
     covered: u64,
 }
 
+/// Authenticated frame owners for one continued request.
+struct ContinuedEntry {
+    fragments: VecDeque<Bytes>,
+    remaining: usize,
+}
+
+impl ContinuedEntry {
+    fn new(payload: Bytes) -> Self {
+        Self {
+            remaining: payload.len(),
+            fragments: (!payload.is_empty()).then_some(payload).into_iter().collect(),
+        }
+    }
+
+    fn push(&mut self, payload: Bytes) -> io::Result<()> {
+        self.remaining = self.remaining.checked_add(payload.len())
+            .filter(|&len| len <= MAX_ENTRY_BYTES)
+            .ok_or_else(|| invalid("oversized keeper WAL entry"))?;
+        if !payload.is_empty() {
+            self.fragments.push_back(payload);
+        }
+        Ok(())
+    }
+
+    fn decode(mut self) -> io::Result<(Option<Identity>, Request)> {
+        if self.remaining() < 4 {
+            return Err(invalid("short keeper WAL entry"));
+        }
+        let len = self.get_u32() as usize;
+        if len > self.remaining() {
+            return Err(invalid("short keeper WAL entry"));
+        }
+        if len > MAX_IDENTITY_BYTES {
+            return Err(invalid("oversized WAL identity"));
+        }
+        let identity = decode_identity(&self.copy_to_bytes(len))?;
+        Ok((identity, codec::decode_request_buf(self)?))
+    }
+}
+
+impl Buf for ContinuedEntry {
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.fragments.front().map_or(&[], Bytes::as_ref)
+    }
+
+    fn advance(&mut self, mut len: usize) {
+        assert!(len <= self.remaining);
+        self.remaining -= len;
+        while len != 0 {
+            let front = self.fragments.front_mut().expect("remaining fragment");
+            if len < front.len() {
+                front.advance(len);
+                break;
+            }
+            len -= front.len();
+            self.fragments.pop_front();
+        }
+    }
+
+    fn copy_to_bytes(&mut self, len: usize) -> Bytes {
+        assert!(len <= self.remaining);
+        if len == 0 {
+            return Bytes::new();
+        }
+        if len <= self.chunk().len() {
+            self.remaining -= len;
+            let front = self.fragments.front_mut().expect("remaining fragment");
+            let span = front.split_to(len);
+            if front.is_empty() {
+                self.fragments.pop_front();
+            }
+            return span;
+        }
+        let mut bytes = Vec::with_capacity(len);
+        while bytes.len() < len {
+            let take = self.chunk().len().min(len - bytes.len());
+            bytes.extend_from_slice(&self.chunk()[..take]);
+            self.advance(take);
+        }
+        Bytes::from(bytes)
+    }
+}
+
 fn replay(
     path: &Path,
     tail: bool,
     keeper: KeeperId,
     states: &mut HashMap<StreamId, Stream>,
     dirty: &mut HashSet<StreamId>,
-    fragments: &mut HashMap<StreamId, BytesMut>,
+    fragments: &mut HashMap<StreamId, ContinuedEntry>,
 ) -> io::Result<u64> {
     let file = File::open(path)?;
     let length = file.metadata()?.len();
@@ -551,16 +646,15 @@ fn replay(
         if at_start {
             fragments.clear();
         }
-        let body = if flags == START | END {
+        let (identity, request) = if flags == START | END {
             if fragments.contains_key(&id) {
                 return Err(invalid("overlapping keeper WAL entries"));
             }
-            payload
+            let (identity, request) = wal_bytes::decode_field(&payload)
+                .ok_or_else(|| invalid("short keeper WAL entry"))?;
+            (decode_identity(identity)?, codec::decode_request(payload.slice_ref(request))?)
         } else if flags == START {
-            if fragments
-                .insert(id, BytesMut::from(payload.as_ref()))
-                .is_some()
-            {
+            if fragments.insert(id, ContinuedEntry::new(payload)).is_some() {
                 return Err(invalid("overlapping keeper WAL entries"));
             }
             continue;
@@ -568,19 +662,12 @@ fn replay(
             let fragment = fragments
                 .get_mut(&id)
                 .ok_or_else(|| invalid("keeper WAL fragment without start"))?;
-            if fragment.len() + payload.len() > MAX_ENTRY_BYTES {
-                return Err(invalid("oversized keeper WAL entry"));
-            }
-            fragment.put_slice(&payload);
+            fragment.push(payload)?;
             if flags != END {
                 continue;
             }
-            fragments.remove(&id).expect("finished entry").freeze()
+            fragments.remove(&id).expect("finished entry").decode()?
         };
-        let (identity, request) =
-            wal_bytes::decode_field(&body).ok_or_else(|| invalid("short keeper WAL entry"))?;
-        let identity = decode_identity(identity)?;
-        let request = codec::decode_request(body.slice_ref(request))?;
         if codec::stream(&request) != id
             || identity.is_some() != matches!(request, Request::Seal { .. })
         {

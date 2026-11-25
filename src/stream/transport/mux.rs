@@ -20,8 +20,11 @@ use tokio_rustls::TlsConnector;
 
 use super::{Channel, connect, connection_error, protocol};
 use crate::stream::{
-    codec::{batched_request_len, decode_reply, read_frame, request_write::RequestWrite},
-    wire::{KeeperId, Reply, Request, TransportError},
+    codec::{
+        decode_reply, read_frame,
+        request_write::{MeasuredRequest, RequestWrite},
+    },
+    wire::{KeeperId, Reply, TransportError},
 };
 
 /// Frames written but not yet answered on one connection.
@@ -39,12 +42,12 @@ type Answer = Result<Reply, Failure>;
 /// Why a multiplexed call produced no reply.
 pub(super) enum Failure {
     /// The request was never written, so it is safe to send it on a fresh connection.
-    NotSent(Request),
+    NotSent(MeasuredRequest),
     Transport(TransportError),
 }
 
 struct Call {
-    request: Request,
+    request: MeasuredRequest,
     size: usize,
     reply: oneshot::Sender<Answer>,
 }
@@ -83,8 +86,8 @@ impl Mux {
         *self.current.lock() = Some(self.spawn(Some(channel)));
     }
 
-    pub(super) async fn call(&self, mut request: Request) -> Result<Reply, TransportError> {
-        let size = batched_request_len(&request);
+    pub(super) async fn call(&self, mut request: MeasuredRequest) -> Result<Reply, TransportError> {
+        let size = request.batched_len();
         // A request is resent only if the connection closed before writing it.
         loop {
             let (reply, answer) = oneshot::channel();
@@ -221,10 +224,10 @@ async fn send(
             .unzip();
         let request = match requests.len() {
             0 => continue,
-            1 => requests.into_iter().next().unwrap(),
-            _ => Request::Batch(requests),
+            1 => RequestWrite::single(requests.into_iter().next().unwrap()),
+            _ => RequestWrite::batch(requests),
         };
-        let request = match RequestWrite::preflight(request) {
+        let request = match request {
             Ok(request) => request,
             Err(error) => {
                 fail(replies, TransportError::Protocol(error.to_string()));

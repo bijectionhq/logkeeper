@@ -65,6 +65,42 @@ impl ExtentReader {
     }
 }
 
+// Keep shared backing small even when one reply outlives the other slices.
+const PAGE_RUN_RECORDS: usize = 256;
+
+struct ExtentRun {
+    extent: Arc<Extent>,
+    offset: u64,
+    end: u64,
+    records: Vec<(Lsn, u32, u32)>,
+}
+
+impl ExtentRun {
+    fn can_extend(&self, extent: &Arc<Extent>, offset: u64, end: u64) -> bool {
+        Arc::ptr_eq(&self.extent, extent)
+            && offset == self.end
+            && end - self.offset <= EXTENT_COPY_BYTES as u64
+            && self.records.len() < PAGE_RUN_RECORDS
+    }
+
+    fn read(self, reader: &mut ExtentReader, output: &mut Vec<(Lsn, Bytes)>) -> io::Result<()> {
+        let mut bytes = vec![0; (self.end - self.offset) as usize];
+        read_at(reader.file(&self.extent)?, &mut bytes, self.offset)?;
+        let bytes = Bytes::from(bytes);
+        let mut start = 0;
+        for (lsn, len, crc) in self.records {
+            let end = start + len as usize;
+            let payload = bytes.slice(start..end);
+            if !check_extent(crc, &payload) {
+                return Err(invalid("stream extent checksum mismatch"));
+            }
+            output.push((lsn, payload));
+            start = end;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 fn read_at(file: &mut File, bytes: &mut [u8], offset: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
@@ -226,6 +262,7 @@ impl Stream {
     ) -> io::Result<Reply> {
         let mut bytes = 0;
         let mut records = Vec::new();
+        let mut run: Option<ExtentRun> = None;
         if from <= through && max != 0 {
             let count = (through.0 - from.0 + 1).min(u64::from(max));
             let offset = (from.0 - self.view.floor.0) as usize;
@@ -234,12 +271,45 @@ impl Stream {
                 .range(offset..offset + count as usize)
                 .enumerate()
             {
-                bytes += 20 + record.len();
+                let payload = record.payload.read();
+                bytes += 20 + payload.len();
                 if bytes > PAGE_BYTES {
                     break;
                 }
-                records.push((Lsn(from.0 + index as u64), record.read(reader)?));
+                let lsn = Lsn(from.0 + index as u64);
+                match &*payload {
+                    Payload::Pending(bytes) => {
+                        if let Some(run) = run.take() {
+                            run.read(reader, &mut records)?;
+                        }
+                        records.push((lsn, bytes.clone()));
+                    }
+                    Payload::Extent { extent, offset, len, crc } => {
+                        let end = offset.checked_add(u64::from(*len))
+                            .ok_or_else(|| invalid("invalid stream extent range"))?;
+                        if let Some(current) = run.as_mut().filter(|run| run.can_extend(extent, *offset, end)) {
+                            current.end = end;
+                            current.records.push((lsn, *len, *crc));
+                        } else {
+                            if let Some(run) = run.take() {
+                                run.read(reader, &mut records)?;
+                            }
+                            // Open while the current record still guards the pack name.
+                            // The reader holds this file until the run has been read.
+                            reader.file(extent)?;
+                            run = Some(ExtentRun {
+                                extent: Arc::clone(extent),
+                                offset: *offset,
+                                end,
+                                records: vec![(lsn, *len, *crc)],
+                            });
+                        }
+                    }
+                }
             }
+        }
+        if let Some(run) = run {
+            run.read(reader, &mut records)?;
         }
         Ok(Reply::Records {
             floor: self.view.floor,

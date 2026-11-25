@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::{self, File},
-    io::{self, BufReader, BufWriter, Read, Write},
+    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -15,9 +15,9 @@ use super::{
     checkpoint_bytes::{self, EXTENT_BYTES, INDEX_HEADER_BYTES, Location},
     durability::{sync_directory, sync_file},
     state::{EXTENT_COPY_BYTES, Extent, ExtentReader, Payload, Record, Staging, Stream},
-    wal::{SEGMENT_BYTES, atomic_file, read_frame, sequence},
+    wal::{SEGMENT_BYTES, atomic_file, read_frame_with_header, sequence},
     wal_bytes::{self, FRAME_HEADER_BYTES},
-    wal_layout::{extent_fits, stored_length},
+    wal_layout::{checksum_matches, extent_fits, stored_length},
 };
 use crate::stream::{
     codec::{self, MAX_FRAME_BYTES, invalid},
@@ -27,6 +27,7 @@ use crate::stream::{
 #[derive(Default)]
 pub(super) struct Checkpoint {
     streams: HashMap<StreamId, Indexed>,
+    source: Option<File>,
     compaction_due: bool,
     #[cfg(test)]
     pub syncs: usize,
@@ -39,9 +40,60 @@ struct Indexed {
 
 #[derive(Default)]
 struct EncodedIndex {
-    body: Bytes,
+    body: IndexBody,
     packs: HashSet<u64>,
     bytes: u64,
+}
+
+#[derive(Default)]
+enum IndexBody {
+    #[default]
+    Dirty,
+    Prepared(Bytes),
+    Published(IndexRange),
+}
+
+#[derive(Clone, Copy)]
+struct IndexRange {
+    offset: u64,
+    header: [u8; FRAME_HEADER_BYTES],
+    body_len: u32,
+}
+
+impl IndexRange {
+    fn len(self) -> u64 {
+        FRAME_HEADER_BYTES as u64 + u64::from(self.body_len)
+    }
+
+    fn copy_checked(
+        self,
+        source: &mut File,
+        scratch: &mut [u8],
+        output: &mut impl Write,
+    ) -> io::Result<()> {
+        source.seek(SeekFrom::Start(self.offset))?;
+        let mut header = [0; FRAME_HEADER_BYTES];
+        source.read_exact(&mut header)?;
+        if header != self.header {
+            return Err(invalid("damaged keeper index stream"));
+        }
+        let (len, expected_crc) = wal_bytes::decode_frame_header(&header, self.len(), u32::MAX as usize)
+            .ok_or_else(|| invalid("damaged keeper index stream"))?;
+        output.write_all(&header)?;
+        let mut crc = crc32fast::Hasher::new();
+        let mut remaining = len as usize;
+        while remaining != 0 {
+            let n = remaining.min(scratch.len());
+            source.read_exact(&mut scratch[..n])?;
+            crc.update(&scratch[..n]);
+            output.write_all(&scratch[..n])?;
+            remaining -= n;
+        }
+        if !checksum_matches(expected_crc, crc.finalize()) {
+            return Err(invalid("damaged keeper index stream"));
+        }
+        Ok(())
+    }
 }
 
 impl Indexed {
@@ -91,7 +143,7 @@ impl Indexed {
         }
         debug_assert_eq!(body.len(), capacity);
         Ok(EncodedIndex {
-            body: Bytes::from(body),
+            body: IndexBody::Prepared(Bytes::from(body)),
             packs,
             bytes,
         })
@@ -275,17 +327,17 @@ impl Checkpoint {
         for snapshot in snapshots {
             if let Some(indexed) = self.streams.get_mut(&snapshot.stream) {
                 indexed.snapshot = snapshot;
-                indexed.encoded.body = Bytes::new();
+                indexed.encoded.body = IndexBody::Dirty;
             } else {
                 self.streams.insert(snapshot.stream, Indexed::new(snapshot));
             }
         }
         let mut prepared = Vec::new();
         for indexed in self.streams.values_mut() {
-            if rewrite || indexed.encoded.body.is_empty() {
+            if rewrite || matches!(indexed.encoded.body, IndexBody::Dirty) {
                 // Release the old body before allocating the replacement. Keep
                 // its pack references until the new pack has synced.
-                indexed.encoded.body = Bytes::new();
+                indexed.encoded.body = IndexBody::Dirty;
                 let encoded = indexed.encode(&mut pack)?;
                 prepared.push((indexed, encoded));
             }
@@ -294,6 +346,7 @@ impl Checkpoint {
         for (indexed, encoded) in prepared {
             indexed.encoded = encoded;
         }
+        let mut published = Vec::with_capacity(self.streams.len());
         atomic_file(&root.join("INDEX"), |file| {
             let count: u32 = self
                 .streams
@@ -301,14 +354,38 @@ impl Checkpoint {
                 .try_into()
                 .map_err(|_| invalid("too many indexed streams"))?;
             file.write_all(&checkpoint_bytes::encode_index_header(next, count))?;
-            for stream in self.streams.values().map(|indexed| &indexed.encoded) {
-                let header = wal_bytes::encode_frame(&[], &stream.body)
+            let mut offset = INDEX_HEADER_BYTES as u64;
+            let mut scratch = [0; EXTENT_COPY_BYTES];
+            for (&stream, indexed) in &self.streams {
+                let (header, body_len) = match &indexed.encoded.body {
+                    IndexBody::Prepared(body) => {
+                        let header = wal_bytes::encode_frame(&[], body)
+                            .ok_or_else(|| invalid("stream index too large"))?;
+                        file.write_all(&header)?;
+                        file.write_all(body)?;
+                        (header, body.len() as u32)
+                    }
+                    IndexBody::Published(range) => {
+                        let source = self.source.as_mut().expect("published keeper index is open");
+                        range.copy_checked(source, &mut scratch, file)?;
+                        (range.header, range.body_len)
+                    }
+                    IndexBody::Dirty => unreachable!("unprepared keeper index row"),
+                };
+                let range = IndexRange { offset, header, body_len };
+                offset = offset.checked_add(range.len())
                     .ok_or_else(|| invalid("stream index too large"))?;
-                file.write_all(&header)?;
-                file.write_all(&stream.body)?;
+                published.push((stream, range));
             }
             Ok(())
         })?;
+        // The keeper lock keeps other publishers out. Keep this opened instance
+        // across future renames so copied rows still name their original inode.
+        self.source = Some(File::open(root.join("INDEX"))?);
+        for (stream, range) in published {
+            self.streams.get_mut(&stream).expect("published stream").encoded.body =
+                IndexBody::Published(range);
+        }
         pack.install();
         self.retire_packs(root)
     }
@@ -389,9 +466,14 @@ impl Checkpoint {
         let mut states = HashMap::new();
         let mut index = Self::default();
         for _ in 0..count {
-            let body = read_frame(&mut file, remaining, u32::MAX as usize)?
+            let (header, body) = read_frame_with_header(&mut file, remaining, u32::MAX as usize)?
                 .ok_or_else(|| invalid("damaged keeper index stream"))?;
-            remaining -= FRAME_HEADER_BYTES as u64 + body.len() as u64;
+            let range = IndexRange {
+                offset: length - remaining,
+                header,
+                body_len: body.len() as u32,
+            };
+            remaining -= range.len();
             let row = checkpoint_bytes::decode_stream_index(&body)
                 .ok_or_else(|| invalid("invalid keeper index stream"))?;
             let stream = StreamId(row.stream);
@@ -452,7 +534,7 @@ impl Checkpoint {
                 Indexed {
                     snapshot,
                     encoded: EncodedIndex {
-                        body,
+                        body: IndexBody::Published(range),
                         packs: live,
                         bytes,
                     },
@@ -462,6 +544,7 @@ impl Checkpoint {
         if remaining != 0 {
             return Err(invalid("trailing data in keeper index"));
         }
+        index.source = Some(file.into_inner());
         Ok(Some((next, index, states)))
     }
 }
