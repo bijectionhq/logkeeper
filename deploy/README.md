@@ -174,9 +174,23 @@ bytes. The keeper adds the error, rounds the upper bound up to microseconds,
 and requires it to precede both the original exclusive cutoff and the
 certificate expiry. The error may be at most the signed certificate limit.
 
-CUT supplies the per-keeper private mounts and the qualified clock service
-for the actual selected keeper hosts. Keep signer and clock private keys out
-of cloud-init, deployment JSON, and Terraform state. The default module
-projects ordinary configuration. Keep funded capability disabled until both
-original keeper slots supply live evidence, all stream participants carry
-the historical registry, and the paired RTDB route is qualified.
+The stock keeper launcher loads an operator-installed
+`/etc/logkeeper/timed-original/keeper-profile.json` after the host has its
+persistent keeper UUID. The file contains the exact `timed_original` object.
+Use `/run/logkeeper-timed-original/trust.json`, `signer.der` and
+`receiver.json` as container paths under the private profile mount. The
+clock service creates `/run/logkeeper-timed-clock/clock.sock` on the host and
+keeps its signing key outside both keeper mounts. Give the keeper UID or
+group 10001 read access to the required files and access to the socket.
+Both mounts are read-only and the stock launcher mounts the clock only for
+a signing profile. Keep signer and clock keys out of cloud-init, deployment
+JSON and Terraform state.
+
+Install the profile and corresponding historical verification keys before
+restarting each keeper. After the first commissioning, the journal device
+requires a profile on restart. Use verify-only with the same retained trust
+registry when taking a signer offline. The remaining ordinary keepers can
+start without a profile before commissioning. Keep funded capability
+disabled until both original keeper slots supply live evidence, all stream
+participants carry the historical registry, and the paired RTDB route is
+qualified.
