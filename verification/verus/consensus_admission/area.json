@@ -1,0 +1,306 @@
+{
+  "summary": "Verify the shipped consensus admission, classification, rotation, batch and restart decisions against the PeerBudget, Headroom and RestartRead laws.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 48,
+  "controls": {
+    "hide-application-entry": {
+      "defect": "classify a payload batch as metadata only",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "            return true;",
+          "replace": "            return false;"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "carries_application",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "replicate-on-control": {
+      "defect": "send application entries on the control lane",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "                PeerLane::Replication\n",
+          "replace": "                PeerLane::Control\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "peer_lane",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "vote-on-replication": {
+      "defect": "send votes on the replication lane",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "PeerKind::Vote => PeerLane::Control",
+          "replace": "PeerKind::Vote => PeerLane::Replication"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "peer_lane",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "undercharge-body": {
+      "defect": "charge a body once instead of for its copies",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        size * BODY_COPIES + BODY_OVERHEAD",
+          "replace": "        size + BODY_OVERHEAD"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "body_charge",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "ignore-sender-bytes": {
+      "defect": "let one sender spend the receiver budget",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "\n        && charge <= SENDER_BYTES - sender_bytes",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "admits_body",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "ignore-receiver-frames": {
+      "defect": "admit bodies past the receiver frame limit",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    total_frames < RECEIVER_FRAMES\n        && total_bytes <= RECEIVER_BYTES",
+          "replace": "    total_bytes <= RECEIVER_BYTES"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "admits_body",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "ignore-sender-control-cap": {
+      "defect": "let one sender take all control work",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "\n    total < MAX_CONTROL_WORK && sender < CONTROL_PER_SENDER",
+          "replace": "\n    total < MAX_CONTROL_WORK"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "admits_control",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "spend-the-floor": {
+      "defect": "let a reservation spend its class floor",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": " && floor <= measured - pending - bytes",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "fits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "ignore-pending-suffix-slots": {
+      "defect": "ignore suffix slots held by pending writes",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": " && slots <= limit - occupied - new",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "suffix_admits",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "stall-rotation": {
+      "defect": "restart the scan at the served lane",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    (lane + 1) % LANES",
+          "replace": "    lane % LANES"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "after",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "probe-skips-a-lane": {
+      "defect": "skip the lane at the scan start",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "(next + step) % LANES",
+          "replace": "(next + step + 1) % LANES"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "probe",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "split-without-shrinking": {
+      "defect": "resend a split batch at its original size",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "AppendFit::Split(count / 2)",
+          "replace": "AppendFit::Split(count)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "fit_append",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "resume-old-term": {
+      "defect": "restore a restarted leader in its old term",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    committed && voted_for_self\n}",
+          "replace": "    false\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "demotes_vote",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "accept-term-above-vote": {
+      "defect": "accept entries from a term above the sender's vote",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        if term > vote_term {",
+          "replace": "        if false {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "terms_ordered",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "accept-term-regression": {
+      "defect": "accept a decreasing entry term",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        if term < floor {",
+          "replace": "        if false {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "terms_ordered",
+          "category": "invariant not satisfied at end of loop body"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "terms_ordered",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 47
+    },
+    "accept-index-gap": {
+      "defect": "accept a gap after the previous entry",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "if ids[position].0 as u128 != expected {",
+          "replace": "if expected > ids[position].0 as u128 {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "indices_follow",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 47
+    }
+  }
+}
