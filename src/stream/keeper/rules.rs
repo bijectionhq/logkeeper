@@ -223,7 +223,7 @@ pub(crate) fn decide_replace(
 pub use implementation::Limits;
 #[cfg(not(verus_keep_ghost))]
 pub(super) use implementation::{
-    Decision, StreamView, decide, installs_floor, promised, valid_limits,
+    Decision, StreamView, decide, installs_floor, last, promised, valid_limits,
 };
 
 #[cfg(verus_keep_ghost)]
