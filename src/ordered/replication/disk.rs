@@ -18,11 +18,12 @@ use std::path::Path;
 use std::sync::Arc;
 use uuid::Uuid;
 
+mod known;
 mod mirror;
 mod recover;
 mod selection;
 
-use recover::recover_slot;
+use known::recover_slot_against;
 use selection::{read_back_matches, select_slot};
 
 const SLOTS: [&str; 2] = ["ordered.slot-a", "ordered.slot-b"];
@@ -30,6 +31,7 @@ const LOCK: &str = "ordered.lock";
 const RESERVATION: &str = "ordered.reserve";
 const MAX_HEADER_BYTES: usize = 256;
 const BALLOT_BYTES: usize = 25;
+const SLOT_FRAMING_BYTES: usize = 2 * BALLOT_BYTES + 1;
 
 #[derive(Clone)]
 pub struct DurableVoter {
@@ -341,12 +343,18 @@ fn recover_media(
     identity: Uuid,
     size: usize,
 ) -> Result<Option<Selected>, Error> {
-    let mut candidates = [None, None];
-    for (index, file) in slots.iter_mut().enumerate() {
-        let (written, candidate) = recover_slot(file, index, group, identity, size)?;
-        used[index] = written;
-        candidates[index] = candidate.map(|(selected, _)| selected);
-    }
+    let (first_used, first) = recover_slot_against(&mut slots[0], 0, group, identity, size, None)?;
+    used[0] = first_used;
+    let (second_used, second) = recover_slot_against(
+        &mut slots[1],
+        1,
+        group,
+        identity,
+        size,
+        first.as_ref().map(|(selected, _)| &selected.state),
+    )?;
+    used[1] = second_used;
+    let mut candidates = [first, second].map(|slot| slot.map(|(selected, _)| selected));
     let [first, second] = candidates
         .each_ref()
         .map(|slot| slot.as_ref().map(|v| v.generation));
@@ -491,7 +499,9 @@ impl Inner {
     ) -> Result<(), Error> {
         let file = &mut media.slots[index];
         file.seek(SeekFrom::Start(0))?;
-        let (_, image) = recover_slot(file, index, &self.group, self.identity, size)?;
+        let known = &media.selected.as_ref().ok_or(Error::Stopped)?.state;
+        let (_, image) =
+            recover_slot_against(file, index, &self.group, self.identity, size, Some(known))?;
         let (image, observed) = image.ok_or(Error::Prefix)?;
         let accepted = image.state.accepted.ok_or(Error::Prefix)?;
         if !read_back_matches(
@@ -546,20 +556,10 @@ fn persist(
     previous: usize,
     size: usize,
 ) -> Result<(usize, Fingerprint), Error> {
-    let accepted = selected.state.accepted.as_ref();
-    let prefix = accepted.map(|accepted| &accepted.prefix);
-    let mut framing = [0; 2 * BALLOT_BYTES + 1];
-    let mut framing_len = put_ballot(&mut framing, selected.state.promised);
-    framing_len += put_ballot(&mut framing[framing_len..], accepted.map(|vote| vote.ballot));
-    // The stored prefix length already includes the base tag and length words.
-    let length = framing_len
-        .checked_add(prefix.map_or(0, |prefix| prefix.bytes))
+    let (framing, framing_len, prefix) = slot_framing(&selected.state);
+    let length = slot_body_len(framing_len, prefix)
         .filter(|&length| length <= size - HEADER)
         .ok_or(Error::Capacity)?;
-    if let Some(prefix) = prefix {
-        framing[framing_len] = prefix.base_tag();
-        framing_len += 1;
-    }
     let descriptor =
         encode_descriptor(&group, voter.as_bytes(), selected.generation, length as u64);
     let mut hash = Sha256::new();
@@ -582,6 +582,24 @@ fn persist(
     file.write_all(&header)?;
     file.sync_all()?;
     Ok((length, digest))
+}
+
+fn slot_framing(state: &VoterState) -> ([u8; SLOT_FRAMING_BYTES], usize, Option<&Prefix>) {
+    let accepted = state.accepted.as_ref();
+    let prefix = accepted.map(|vote| &vote.prefix);
+    let mut framing = [0; SLOT_FRAMING_BYTES];
+    let mut length = put_ballot(&mut framing, state.promised);
+    length += put_ballot(&mut framing[length..], accepted.map(|vote| vote.ballot));
+    if let Some(prefix) = prefix {
+        framing[length] = prefix.base_tag();
+        length += 1;
+    }
+    (framing, length, prefix)
+}
+
+fn slot_body_len(framing_len: usize, prefix: Option<&Prefix>) -> Option<usize> {
+    // The base tag is already in the framing and in the measured prefix.
+    framing_len.checked_add(prefix.map_or(0, |prefix| prefix.bytes - 1))
 }
 
 fn write_slot_body(
