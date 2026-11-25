@@ -3,7 +3,10 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use sha2::{Digest, Sha256};
 
 use crate::stream::{
-    timed::{TimedOriginal, TimedOriginalClock, TimedOriginalVerifier},
+    timed::{
+        TimedEvidence, TimedOrigin, TimedOriginal, TimedOriginalClock, TimedOriginalVerifier,
+        TimedSample,
+    },
     writer::Writer,
 };
 
@@ -81,6 +84,55 @@ async fn wait_for_original_keepers(live: &Local, epoch: Epoch) {
     })
     .await
     .expect("the original write quorum did not sync");
+}
+
+#[test]
+fn packed_plain_recovery_stops_before_the_timed_original() {
+    let mut test = Harness::new(Limits::default());
+    test.writer(A);
+    test.send(append(A, 1, 1, &[b"first", b"second"], 2));
+    let payload = Bytes::from_static(b"timed");
+    let evidence = Arc::new(TimedEvidence {
+        origin: TimedOrigin {
+            original: original(Epoch(1), Lsn(3), &payload, SAMPLE_UPPER_MICROS + 1),
+            ensemble: MEMBERS,
+            proposal: 1,
+        },
+        samples: [TimedSample {
+            upper_micros: SAMPLE_UPPER_MICROS,
+            signature: [0; 64],
+        }; 2],
+    });
+    // Apply an admitted entry directly to exercise the checkpoint/page transition.
+    test.engine
+        .streams
+        .get_mut(&A)
+        .unwrap()
+        .apply(
+            MEMBERS[0],
+            Request::AppendOriginal {
+                stream: A,
+                evidence: evidence.clone(),
+                payload: payload.clone(),
+                head: Lsn(3),
+            },
+            None,
+        )
+        .unwrap();
+    test.engine.wal.rotate(&test.engine.streams).unwrap();
+
+    assert_eq!(
+        test.send(recover(A, 1, 1)),
+        page(1, 3, &[(1, b"first"), (2, b"second")]),
+    );
+    assert_eq!(
+        test.send(recover(A, 1, 3)),
+        Reply::OriginalRecord { evidence, payload },
+    );
+    assert_eq!(
+        test.send(read(A, 1)),
+        page(1, 3, &[(1, b"first"), (2, b"second"), (3, b"timed")]),
+    );
 }
 
 #[tokio::test]
