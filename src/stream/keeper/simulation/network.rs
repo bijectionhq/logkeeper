@@ -481,6 +481,12 @@ fn trace_row(
             "replace",
             format!("{} {} {}", epoch.0, ensemble(from), ensemble(to)),
         ),
+        Request::StageOriginal { .. }
+        | Request::AppendOriginal { .. }
+        | Request::SyncOriginal { .. }
+        | Request::ProveOriginal { .. } => {
+            unreachable!("the trace schema covers ordinary operations")
+        }
         Request::Batch(_) => unreachable!("the simulator delivers single requests"),
     };
     let mut row = format!(
@@ -515,6 +521,11 @@ fn trace_row(
             }
             Reply::Deleted => row.push_str(" 8"),
             Reply::Replaced => row.push_str(" 9"),
+            Reply::OriginalSample(_)
+            | Reply::OriginalRecord { .. }
+            | Reply::OriginalEvidence(_) => {
+                unreachable!("the trace schema covers ordinary operations")
+            }
             Reply::Batch(_) => unreachable!("the simulator delivers single requests"),
         },
     }

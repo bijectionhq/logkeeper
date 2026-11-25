@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, fs::File, io, path::PathBuf, sync::Arc};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::watch;
 
 use super::{
@@ -10,6 +10,7 @@ use super::{
 };
 use crate::stream::{
     codec::{PAGE_BYTES, invalid},
+    timed::{EVIDENCE_BYTES, MAX_TIMED_PAYLOAD, TimedEvidence},
     wire::{self, *},
 };
 
@@ -119,6 +120,7 @@ impl Payload {
 #[derive(Clone)]
 pub(super) struct Record {
     pub epoch: Epoch,
+    pub timed: bool,
     // A checkpoint can move the same record even if a later Sync installed it
     // in a different position in the keeper's state.
     pub payload: Arc<parking_lot::RwLock<Payload>>,
@@ -128,16 +130,45 @@ impl Record {
     pub fn new(epoch: Epoch, payload: Payload) -> Self {
         Self {
             epoch,
+            timed: false,
             payload: Arc::new(parking_lot::RwLock::new(payload)),
         }
+    }
+
+    pub fn with_timed(mut self, timed: bool) -> Self {
+        self.timed = timed;
+        self
     }
 
     pub fn len(&self) -> usize {
         self.payload.read().len()
     }
 
-    pub fn read(&self, reader: &mut ExtentReader) -> io::Result<Bytes> {
+    fn read(&self, reader: &mut ExtentReader) -> io::Result<Bytes> {
         self.payload.read().read(reader)
+    }
+
+    pub(super) fn original(
+        &self,
+        reader: &mut ExtentReader,
+        stream: StreamId,
+        at: Lsn,
+    ) -> io::Result<(TimedEvidence, Bytes)> {
+        let bytes = self.read(reader)?;
+        let evidence = bytes
+            .get(..EVIDENCE_BYTES)
+            .and_then(TimedEvidence::decode)
+            .ok_or_else(|| invalid("damaged retained timed evidence"))?;
+        let original = evidence.origin.original;
+        let payload = bytes.slice(EVIDENCE_BYTES..);
+        if original.stream != stream
+            || original.at != at
+            || original.epoch != self.epoch
+            || !original.matches(&payload)
+        {
+            return Err(invalid("timed evidence differs from the retained record"));
+        }
+        Ok((evidence, payload))
     }
 }
 
@@ -172,9 +203,11 @@ pub(super) fn decide(
     limits: &Limits,
     reader: &mut ExtentReader,
 ) -> io::Result<Decision> {
+    let normalized = normalize_original(request)?;
+    let request = normalized.as_ref().unwrap_or(request);
     let (identical, retained_bytes) = match state {
         Some(state) => (
-            state.matches_retained(request, identity, reader)?,
+            state.matches_retained(request, normalized.is_some(), identity, reader)?,
             state.retained_charge(request),
         ),
         None => (false, 0),
@@ -224,6 +257,30 @@ impl Stream {
         through: Lsn,
         reader: &mut ExtentReader,
     ) -> io::Result<Reply> {
+        self.page_at(from, max, through, reader, None)
+    }
+
+    /// Recovery stops a plain page at a timed boundary. At the boundary it
+    /// transfers the exact original evidence and payload as one typed record.
+    pub(super) fn recover(
+        &self,
+        stream: StreamId,
+        from: Lsn,
+        max: u32,
+        through: Lsn,
+        reader: &mut ExtentReader,
+    ) -> io::Result<Reply> {
+        self.page_at(from, max, through, reader, Some(stream))
+    }
+
+    fn page_at(
+        &self,
+        from: Lsn,
+        max: u32,
+        through: Lsn,
+        reader: &mut ExtentReader,
+        recovery_stream: Option<StreamId>,
+    ) -> io::Result<Reply> {
         let mut bytes = 0;
         let mut records = Vec::new();
         if from <= through && max != 0 {
@@ -234,11 +291,33 @@ impl Stream {
                 .range(offset..offset + count as usize)
                 .enumerate()
             {
+                let at = Lsn(from.0 + index as u64);
+                if record.timed
+                    && let Some(stream) = recovery_stream
+                {
+                    if !records.is_empty() {
+                        break;
+                    }
+                    let (evidence, payload) = record.original(reader, stream, at)?;
+                    return Ok(Reply::OriginalRecord {
+                        evidence: Arc::new(evidence),
+                        payload,
+                    });
+                }
                 bytes += 20 + record.len();
                 if bytes > PAGE_BYTES {
                     break;
                 }
-                records.push((Lsn(from.0 + index as u64), record.read(reader)?));
+                let payload = record.read(reader)?;
+                let payload = if record.timed {
+                    payload
+                        .get(EVIDENCE_BYTES..)
+                        .map(|slice| payload.slice_ref(slice))
+                        .ok_or_else(|| invalid("short retained timed record"))?
+                } else {
+                    payload
+                };
+                records.push((at, payload));
             }
         }
         Ok(Reply::Records {
@@ -248,9 +327,15 @@ impl Stream {
         })
     }
 
+    pub(super) fn record(&self, at: Lsn) -> Option<&Record> {
+        let offset = rules::retained_index(self.view.floor.0, self.records.len(), at.0)?;
+        self.records.get(offset)
+    }
+
     fn matches_retained(
         &self,
         request: &Request,
+        timed: bool,
         identity: &Identity,
         reader: &mut ExtentReader,
     ) -> io::Result<bool> {
@@ -303,6 +388,7 @@ impl Stream {
                 Some(epoch)
             };
             if expected != Some(stored.epoch)
+                || stored.timed != timed
                 || payload.len() != stored.len()
                 || *payload != stored.read(reader)?
             {
@@ -406,6 +492,9 @@ impl Stream {
         request: Request,
         identity: Option<Identity>,
     ) -> io::Result<Reply> {
+        let normalized = normalize_original(&request)?;
+        let timed = normalized.is_some();
+        let request = normalized.unwrap_or(request);
         if rules::installs_floor(&self.view, &request)
             && let Request::Sync { floor, head, .. } = request
         {
@@ -472,7 +561,7 @@ impl Stream {
                 for (payload, epoch) in records.into_iter().zip(epochs).skip(skip) {
                     staging
                         .records
-                        .push_back(Record::new(epoch, Payload::Pending(payload)));
+                        .push_back(Record::new(epoch, Payload::Pending(payload)).with_timed(timed));
                 }
                 if complete {
                     self.install(staging, head);
@@ -493,7 +582,7 @@ impl Stream {
             } => {
                 if at > self.view.tail {
                     for payload in records {
-                        self.push(Record::new(epoch, Payload::Pending(payload)));
+                        self.push(Record::new(epoch, Payload::Pending(payload)).with_timed(timed));
                     }
                 }
                 self.view.head = self.view.head.max(head);
@@ -523,6 +612,60 @@ impl Stream {
             _ => Err(invalid("nonmutation in stream WAL")),
         }
     }
+}
+
+/// Use the existing singleton append and staged Sync reducer with a typed
+/// storage envelope. Old ordinary requests cannot match a timed record.
+fn normalize_original(request: &Request) -> io::Result<Option<Request>> {
+    let (stream, evidence, payload) = match request {
+        Request::AppendOriginal {
+            stream,
+            evidence,
+            payload,
+            ..
+        }
+        | Request::SyncOriginal {
+            stream,
+            evidence,
+            payload,
+            ..
+        } => (*stream, evidence, payload),
+        _ => return Ok(None),
+    };
+    let original = evidence.origin.original;
+    if original.stream != stream || !original.valid() || payload.len() > MAX_TIMED_PAYLOAD {
+        return Err(invalid("invalid timed keeper record"));
+    }
+    let mut stored = BytesMut::with_capacity(EVIDENCE_BYTES + payload.len());
+    stored.extend_from_slice(&evidence.encode());
+    stored.extend_from_slice(payload);
+    let records = vec![stored.freeze()];
+    Ok(Some(match request {
+        Request::AppendOriginal { head, .. } => Request::Append {
+            stream,
+            epoch: original.epoch,
+            at: original.at,
+            records,
+            head: *head,
+        },
+        Request::SyncOriginal {
+            epoch, floor, head, ..
+        } => Request::Sync {
+            stream,
+            epoch: *epoch,
+            floor: *floor,
+            from: original.at,
+            records,
+            runs: vec![EpochRun {
+                epoch: original.epoch,
+                first: original.at,
+                last: original.at,
+            }],
+            head: *head,
+            complete: false,
+        },
+        _ => unreachable!(),
+    }))
 }
 
 fn range_charge(records: &VecDeque<Record>, from: Lsn, first: Lsn, end: Lsn) -> u64 {

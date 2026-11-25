@@ -1,12 +1,15 @@
 //! Protobuf keeper messages inside big-endian length-prefixed frames.
-use std::io;
+use std::{io, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
 use prost::Message;
 #[cfg(any(test, feature = "stream"))]
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::wire::*;
+use super::{
+    timed::{TimedEvidence, TimedOriginal, TimedSample},
+    wire::*,
+};
 
 #[cfg(feature = "stream")]
 mod reply_write;
@@ -42,7 +45,11 @@ pub(super) fn stream(request: &Request) -> StreamId {
         | Request::Recover { stream, .. }
         | Request::Read { stream, .. }
         | Request::Replace { stream, .. }
-        | Request::Delete { stream, .. } => stream,
+        | Request::Delete { stream, .. }
+        | Request::StageOriginal { stream, .. }
+        | Request::AppendOriginal { stream, .. }
+        | Request::SyncOriginal { stream, .. }
+        | Request::ProveOriginal { stream, .. } => stream,
         // An envelope names no stream. The keeper splits it before any per-stream rule.
         Request::Batch(_) => StreamId(0),
     }
@@ -284,7 +291,10 @@ struct View {
 struct RequestFrame {
     #[prost(bytes = "bytes", tag = "1")]
     stream: Bytes,
-    #[prost(oneof = "RequestBody", tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11")]
+    #[prost(
+        oneof = "RequestBody",
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16"
+    )]
     body: Option<RequestBody>,
     /// A `Request::Batch` envelope. Exclusive with `stream` and `body`.
     #[prost(message, repeated, tag = "12")]
@@ -360,6 +370,18 @@ macro_rules! request_messages {
 }
 
 macro_rules! request_field {
+    (encode original, $value:expr) => {
+        Bytes::copy_from_slice(&$value.encode())
+    };
+    (decode original, $value:expr) => {
+        TimedOriginal::decode(&$value).ok_or_else(|| invalid("invalid timed original"))?
+    };
+    (encode evidence, $value:expr) => {
+        Bytes::copy_from_slice(&$value.encode())
+    };
+    (decode evidence, $value:expr) => {
+        Arc::new(TimedEvidence::decode(&$value).ok_or_else(|| invalid("invalid timed evidence"))?)
+    };
     (encode copy, $value:expr) => {
         *$value
     };
@@ -481,11 +503,44 @@ request_messages! {
         #[prost(bytes = "bytes", repeated, tag = "3")]
         to: Vec<Bytes> => ensemble,
     },
+    StageOriginal = "13" {
+        #[prost(bytes = "bytes", tag = "1")]
+        original: Bytes => original,
+        #[prost(bytes = "bytes", tag = "2")]
+        payload: Bytes => clone,
+    },
+    AppendOriginal = "14" {
+        #[prost(bytes = "bytes", tag = "1")]
+        evidence: Bytes => evidence,
+        #[prost(bytes = "bytes", tag = "2")]
+        payload: Bytes => clone,
+        #[prost(fixed64, tag = "3")]
+        head: u64 => position,
+    },
+    SyncOriginal = "15" {
+        #[prost(fixed64, tag = "1")]
+        epoch: u64 => epoch,
+        #[prost(fixed64, tag = "2")]
+        floor: u64 => position,
+        #[prost(bytes = "bytes", tag = "3")]
+        evidence: Bytes => evidence,
+        #[prost(bytes = "bytes", tag = "4")]
+        payload: Bytes => clone,
+        #[prost(fixed64, tag = "5")]
+        head: u64 => position,
+    },
+    ProveOriginal = "16" {
+        #[prost(fixed64, tag = "1")]
+        at: u64 => position,
+    },
 }
 
 #[derive(Clone, Message)]
 struct ReplyFrame {
-    #[prost(oneof = "ReplyBody", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
+    #[prost(
+        oneof = "ReplyBody",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14"
+    )]
     body: Option<ReplyBody>,
     /// A `Reply::Batch` envelope. Exclusive with `body`.
     #[prost(message, repeated, tag = "11")]
@@ -514,6 +569,20 @@ enum ReplyBody {
     Replaced(Empty),
     #[prost(message, tag = "10")]
     Refused(RefusalFrame),
+    #[prost(message, tag = "12")]
+    OriginalSample(TimedReply),
+    #[prost(message, tag = "13")]
+    OriginalRecord(TimedReply),
+    #[prost(message, tag = "14")]
+    OriginalEvidence(TimedReply),
+}
+
+#[derive(Clone, Message)]
+struct TimedReply {
+    #[prost(bytes = "bytes", tag = "1")]
+    evidence: Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    payload: Bytes,
 }
 
 #[derive(Clone, Message)]
@@ -602,6 +671,18 @@ impl From<&Reply> for ReplyFrame {
                     .collect(),
                 head: head.0,
             }),
+            Reply::OriginalSample(sample) => ReplyBody::OriginalSample(TimedReply {
+                evidence: Bytes::copy_from_slice(&sample.encode()),
+                payload: Bytes::new(),
+            }),
+            Reply::OriginalRecord { evidence, payload } => ReplyBody::OriginalRecord(TimedReply {
+                evidence: Bytes::copy_from_slice(&evidence.encode()),
+                payload: payload.clone(),
+            }),
+            Reply::OriginalEvidence(evidence) => ReplyBody::OriginalEvidence(TimedReply {
+                evidence: Bytes::copy_from_slice(&evidence.encode()),
+                payload: Bytes::new(),
+            }),
             Reply::Deleted => ReplyBody::Deleted(Empty {}),
             Reply::Replaced => ReplyBody::Replaced(Empty {}),
             Reply::Refused(refusal) => ReplyBody::Refused(RefusalFrame::from(refusal)),
@@ -660,6 +741,26 @@ impl TryFrom<ReplyFrame> for Reply {
                         .collect(),
                     head: Lsn(body.head),
                 },
+                ReplyBody::OriginalSample(body) if body.payload.is_empty() => Self::OriginalSample(
+                    TimedSample::decode(&body.evidence)
+                        .ok_or_else(|| invalid("invalid timed sample"))?,
+                ),
+                ReplyBody::OriginalRecord(body) => Self::OriginalRecord {
+                    evidence: Arc::new(
+                        TimedEvidence::decode(&body.evidence)
+                            .ok_or_else(|| invalid("invalid timed evidence"))?,
+                    ),
+                    payload: body.payload,
+                },
+                ReplyBody::OriginalEvidence(body) if body.payload.is_empty() => {
+                    Self::OriginalEvidence(Arc::new(
+                        TimedEvidence::decode(&body.evidence)
+                            .ok_or_else(|| invalid("invalid timed evidence"))?,
+                    ))
+                }
+                ReplyBody::OriginalSample(_) | ReplyBody::OriginalEvidence(_) => {
+                    return Err(invalid("unexpected timed proof payload"));
+                }
                 ReplyBody::Deleted(_) => Self::Deleted,
                 ReplyBody::Replaced(_) => Self::Replaced,
                 ReplyBody::Refused(body) => Self::Refused(Refusal::try_from(body)?),

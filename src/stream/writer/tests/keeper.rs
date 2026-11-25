@@ -42,6 +42,12 @@ impl Kind {
             Request::Read { wait_ms, .. } if *wait_ms > 0 => Self::Poll,
             Request::Read { .. } => Self::Read,
             Request::Delete { .. } => Self::Delete,
+            Request::StageOriginal { .. }
+            | Request::AppendOriginal { .. }
+            | Request::SyncOriginal { .. }
+            | Request::ProveOriginal { .. } => {
+                unreachable!("this fixture exercises ordinary operations")
+            }
             Request::Batch(_) => unreachable!("the writer issues single requests"),
         }
     }
