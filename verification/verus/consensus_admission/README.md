@@ -1,6 +1,6 @@
 # Consensus admission verification
 
-`proof.rs` imports the shipped `src/stream/consensus/decisions.rs`. The keeper-hosted consensus code calls these functions on its real paths. `network.rs` uses them to classify each decoded peer request and to split oversized AppendEntries batches. `keeper/admission.rs` uses them for replication message and control admission and for every meter update and release. `keeper/ingress.rs` uses them to check each received batch, `storage/space.rs` for disk floors and suffix slots, `storage/wal.rs` for durable lane rotation and `storage/mod.rs` for the restart vote. `keeper/recovery.rs` uses them to admit an operator recovery and to choose its term, and `state.rs` to choose its fence epoch. `keeper/liveness.rs` and `keeper/repair.rs` use them to decide when a keeper is dead and how long a stream whose repair or wake failed waits. `keeper/ingress.rs` also uses them to decide which replicas vote and which peers it refuses without an answer. The harness uses no custom axioms, assumptions or external bodies.
+`proof.rs` imports the shipped `src/stream/consensus/decisions.rs`. The keeper-hosted consensus code calls these functions on its real paths. `network.rs` uses them to classify each decoded peer request and to split oversized AppendEntries batches. `keeper/admission.rs` uses them for replication message and control admission and for every meter update and release. `keeper/ingress.rs` uses them to check each received batch, `storage/space.rs` for disk floors and suffix slots, `storage/wal.rs` for durable lane rotation and `storage/mod.rs` for the restart vote. `keeper/recovery.rs` uses them to admit an operator recovery and to choose its term, and `state.rs` to choose its fence epoch. `keeper/liveness.rs` and `keeper/repair.rs` use them to decide when a keeper is dead and how long a stream whose repair or wake failed waits. `keeper/ingress.rs` also uses them to decide which replicas vote and which peers it refuses without an answer. `keeper/incarnation.rs` uses them to recognize a keeper ID reused on new media, `keeper.rs` to decide whether a keeper registers a replica it does not hold, and `network.rs` to decide whether a campaign counts a peer's grant. The harness uses no custom axioms, assumptions or external bodies.
 
 `laws.rs` states independent laws over the shipped functions. Each law names the checked Lean theorem it refines.
 
@@ -25,6 +25,9 @@
 | `only_installed_members_vote` | Vote eligibility, with recovery replacements | `votes` |
 | `dead_only_after_the_repair_delay` | A keeper that answered within the repair delay is never treated as dead | `keeper_dead` |
 | `backoff_is_bounded_and_grows` | Repair and wake backoff stays within its cap and never shrinks with another failure | `backoff` |
+| `only_another_incarnation_is_a_reuse` | A keeper ID is reused only when a peer saw it under another media incarnation first | `reincarnated` |
+| `a_reused_keeper_never_registers` | A keeper with reinstalled media never votes with an empty log | `registers` |
+| `a_reused_keeper_grants_nothing` | A grant from a reused keeper ID never counts toward a campaign | `counts_grant` |
 
 ## Scope
 
@@ -36,7 +39,9 @@ These proofs cover the decisions, not the stateful bookkeeping around them. Unve
 
 ## Controls
 
-`area.json` declares 26 production mutations. Each one removes or inverts one decision, such as sending application entries on control, charging a body once, ignoring the per-sender byte, message or control cap, releasing a message without its bytes, spending a class floor, stalling rotation, splitting without shrinking, restoring a restarted leader, accepting a term regression or index gap, recovering beside a live voter or without the acknowledgement, stepping the recovery term or epoch too little, letting an uninstalled copy vote, refusing a member without an answer, counting a keeper live at the repair delay, or growing a repair backoff by one millisecond. The baseline verifies 70 functions. Each control fails exactly its declared contract or loop invariant and verifies the other 69.
+`area.json` declares 30 production mutations. Each one removes or inverts one decision, such as sending application entries on control, charging a body once, ignoring the per-sender byte, message or control cap, releasing a message without its bytes, spending a class floor, stalling rotation, splitting without shrinking, restoring a restarted leader, accepting a term regression or index gap, recovering beside a live voter or without the acknowledgement, stepping the recovery term or epoch too little, letting an uninstalled copy vote, refusing a member without an answer, counting a keeper live at the repair delay, growing a repair backoff by one millisecond, trusting a peer's new incarnation, registering a replica on a reused or unconfirmed keeper, or counting a reused keeper's grant. The baseline verifies 76 functions. Each control fails exactly its declared contract or loop invariant and verifies the other 75.
+
+The incarnation laws cover the decisions only. That each keeper stores the incarnations it first saw durably before it answers with them, and marks itself reused before that mark could be outrun by a confirmation, is unverified Rust covered by the keeper tests. So is the trust on first contact itself: a keeper whose peers never saw its old incarnation is not recognized.
 
 The recovery laws cover the decisions only. That the recovery write is one durable WAL round, that the recovered membership follows only an applied `Command::Recover`, and that a lost voter retires only on a certified placement proof are unverified Rust covered by the keeper tests.
 

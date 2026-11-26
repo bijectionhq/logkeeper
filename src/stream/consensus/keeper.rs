@@ -1,5 +1,6 @@
 mod admission;
 mod catalog_stream;
+mod incarnation;
 mod ingress;
 mod liveness;
 mod park;
@@ -258,7 +259,13 @@ impl Config {
             ),
         );
         let id = self.keeper;
-        let disk = tokio::task::spawn_blocking(move || Disk::open(enrollment)).await??;
+        let registry = self.enrollment.clone();
+        let (disk, recognition) = tokio::task::spawn_blocking(move || {
+            let disk = Disk::open(enrollment)?;
+            let recognition = incarnation::Recognition::open(&registry, id, disk.incarnation)?;
+            Ok::<_, io::Error>((disk, recognition))
+        })
+        .await??;
         let raft_config = openraft::Config {
             heartbeat_interval: 100,
             election_timeout_min: 450,
@@ -305,6 +312,7 @@ impl Config {
                 .catalog_voters
                 .map(|voters| catalog_stream::CatalogStream::new(voters, self.catalog)),
             disk,
+            recognition,
             rpc,
             control,
             bulk,
@@ -364,6 +372,8 @@ struct Engine {
     catalog: Option<Catalog>,
     catalog_stream: Option<catalog_stream::CatalogStream>,
     disk: Disk,
+    /// The media incarnations of this keeper and its peers.
+    recognition: incarnation::Recognition,
     rpc: Rpc,
     control: Rpc,
     bulk: Rpc,
@@ -682,6 +692,16 @@ impl Engine {
             None if !genesis.voters.contains(&self.id) => {
                 return Err(invalid("learner has no staged ownership"));
             }
+            // A genesis voter registers the stream when a peer or a
+            // bootstrap names it, unless its media may have lost a replica
+            // it held: see `incarnation`.
+            None if !self.recognition.registers(true) => {
+                return Err(invalid(if self.recognition.reused() {
+                    "keeper ID was reused on new media; only staging adds its replicas"
+                } else {
+                    "no peer has confirmed this keeper's media incarnation yet"
+                }));
+            }
             None => {
                 self.disk
                     .maintenance(Record::Register(genesis.clone()))
@@ -724,6 +744,7 @@ impl Engine {
                 split_vote,
                 excluded: excluded.clone(),
                 retire: self.retire_now.clone(),
+                reincarnated: self.recognition.reincarnated_peers(),
             },
             store,
             state.clone(),
@@ -1249,6 +1270,9 @@ impl Engine {
             return Ok(failure(JournalError::Deleted));
         }
         let members = self.nodes(genesis.voters);
+        if self.disk.genesis(stream).is_none() {
+            self.check_identity().await;
+        }
         let group = self.group(genesis).await?;
         let initialized = group.raft.initialize(members).await;
         group.require_healthy()?;

@@ -424,6 +424,8 @@ pub(in crate::stream::consensus) struct Disk {
     healthy: Arc<AtomicBool>,
     stopped: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<io::Result<()>>>>>,
     pub path: Arc<PathBuf>,
+    /// The incarnation of the installed media, new at each installation.
+    pub incarnation: Uuid,
     pub space: Space,
     pub(super) objects: Objects,
     #[cfg(test)]
@@ -459,6 +461,7 @@ impl Disk {
             Segmented::migrate(&media, boundary, &objects, &space)?;
         }
         let (wal, state) = Segmented::open(&media, &objects, tuning)?;
+        let incarnation = media.incarnation();
         drop(media);
         let state = Arc::new(RwLock::new(state));
         let (work, incoming) = mpsc::channel(MAX_ROUND_RECORDS);
@@ -519,6 +522,7 @@ impl Disk {
             healthy,
             stopped: Arc::new(tokio::sync::Mutex::new(Some(stopped))),
             path: Arc::new(path),
+            incarnation,
             space,
             objects,
             #[cfg(test)]

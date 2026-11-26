@@ -323,6 +323,42 @@ pub(super) fn votes(
     installed && (recovering || if configured { member } else { genesis_voter })
 }
 
+/// Whether a peer's media incarnation shows its keeper ID reused: this
+/// keeper first saw the peer under another incarnation. The first contact
+/// records the incarnation and is never a reuse.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        recorded is None ==> !out,
+        recorded matches Some(first) ==> out == (first != reported),
+))]
+pub(super) fn reincarnated(recorded: Option<u128>, reported: u128) -> bool {
+    match recorded {
+        Some(first) => first != reported,
+        None => false,
+    }
+}
+
+/// Whether a keeper registers a replica it does not hold because a peer or
+/// a bootstrap named it. Only a genesis voter does, only once a peer
+/// confirmed its identity, and never once a peer knows it under another
+/// incarnation: its media was installed again under its old ID, and an
+/// empty replica would vote as if it had never acknowledged anything.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (genesis_voter && confirmed && !reused)
+))]
+pub(super) fn registers(genesis_voter: bool, confirmed: bool, reused: bool) -> bool {
+    genesis_voter && confirmed && !reused
+}
+
+/// Whether a campaign counts a peer's vote or pre-vote grant: never one
+/// from a peer this keeper saw under another incarnation.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (granted && !reincarnated)
+))]
+pub(super) fn counts_grant(granted: bool, reincarnated: bool) -> bool {
+    granted && !reincarnated
+}
+
 /// Whether a keeper silent for `silent_ms` is dead: it has not answered a
 /// liveness ping for the repair delay. Repair replaces a dead keeper's
 /// voters, parked streams that name it wake, and parking no longer waits

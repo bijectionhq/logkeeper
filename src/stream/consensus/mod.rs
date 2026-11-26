@@ -31,7 +31,7 @@ pub use placement::Domains;
 pub use timed::TimedAuthority;
 
 pub(super) const ALPN: &[u8] = b"logkeeper-consensus/1";
-const CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/7";
+const CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/8";
 const REPLICATION_ALPN: &[u8] = b"logkeeper-consensus-replication/3";
 const BULK_ALPN: &[u8] = b"logkeeper-consensus-bulk/2";
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
@@ -77,7 +77,10 @@ impl SnapshotMeta {
 }
 
 /// Certificate-bound keeper addresses. A keeper ID is never reused after loss
-/// of the directory that holds its vote and log.
+/// of the directory that holds its vote and log: peers record the media
+/// incarnation they first saw each keeper under, and a keeper whose media
+/// was installed again under its old ID registers no replica it does not
+/// hold and casts no counted vote.
 pub type Keepers = BTreeMap<uuid::Uuid, SocketAddr>;
 
 /// The right to write as one incarnation of an authenticated principal.

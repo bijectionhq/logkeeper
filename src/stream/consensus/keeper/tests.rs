@@ -15,6 +15,7 @@ use crate::stream::{
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod catalog;
+mod incarnation;
 mod recovery;
 mod repair;
 

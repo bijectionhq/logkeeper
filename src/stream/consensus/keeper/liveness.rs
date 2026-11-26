@@ -9,6 +9,9 @@
 //! - whether a keeper is dead: unreachable for the repair delay;
 //! - which keeper campaigns at once when a parked stream reopens.
 //!
+//! Pings and their answers also carry media incarnations, from which each
+//! keeper recognizes a keeper ID reused on new media: see `incarnation`.
+//!
 //! Repair runs on leaders, and a parked stream has none. So each keeper also
 //! sweeps its own parked copies: one whose configuration names a dead keeper
 //! reopens, at a bounded rate and with a per-stream backoff, and its new
@@ -28,7 +31,10 @@ use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 use super::{Engine, Group};
-use crate::stream::consensus::{KeeperStatus, decisions, metrics, network::Frame};
+use crate::stream::consensus::{
+    KeeperStatus, decisions, metrics,
+    network::{Frame, Pong},
+};
 
 #[cfg(not(test))]
 pub(super) const PING_INTERVAL: Duration = Duration::from_secs(2);
@@ -120,7 +126,18 @@ impl Engine {
         }
     }
 
-    /// Pings every other keeper concurrently and records who answered.
+    /// Pings the other keepers at once when no peer has confirmed this
+    /// keeper's identity yet, so a bootstrap need not wait for the next
+    /// round.
+    pub(super) async fn check_identity(&self) {
+        if let Some(_checking) = self.recognition.checking().await {
+            self.ping().await;
+        }
+    }
+
+    /// Pings every other keeper concurrently and records who answered, the
+    /// incarnation each answered under, and the one each knows this keeper
+    /// under.
     async fn ping(&self) {
         let peers = self
             .placement
@@ -129,24 +146,38 @@ impl Engine {
             .copied()
             .filter(|keeper| *keeper != self.id)
             .collect::<Vec<_>>();
+        let own = self.recognition.own();
         let answers = futures::future::join_all(peers.into_iter().map(|keeper| async move {
             let answer = timeout(
                 PING_TIMEOUT,
                 self.control
-                    .call::<KeeperStatus>(keeper, Frame::Liveness, PING_TIMEOUT),
+                    .call::<Pong>(keeper, Frame::Liveness(own), PING_TIMEOUT),
             )
             .await;
             (keeper, answer)
         }))
         .await;
+        let answers = answers
+            .into_iter()
+            .filter_map(|(keeper, answer)| match answer {
+                Ok(Ok(pong)) if pong.status.keeper == keeper => Some((keeper, pong)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !answers.is_empty() {
+            self.recognition
+                .answered(
+                    &answers
+                        .iter()
+                        .map(|(keeper, pong)| (*keeper, pong.incarnation, pong.known_as))
+                        .collect::<Vec<_>>(),
+                )
+                .await;
+        }
         let now = Instant::now();
         let mut liveness = self.liveness.lock();
-        for (keeper, answer) in answers {
-            if let Ok(Ok(status)) = answer
-                && status.keeper == keeper
-            {
-                liveness.peers.insert(keeper, (now, status));
-            }
+        for (keeper, pong) in answers {
+            liveness.peers.insert(keeper, (now, pong.status));
         }
     }
 

@@ -6,6 +6,7 @@
 //! data volume that silently loses acknowledged writes is refused at open.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -69,6 +70,57 @@ struct Identity {
 pub(super) struct Media {
     enrollment: Enrollment,
     identity: Identity,
+}
+
+/// The media incarnations a keeper has seen its peers under, trusted on
+/// first contact. It lives in the registry, beside the enrollment, so a
+/// peer's records of this keeper outlive this keeper's media: a keeper
+/// whose media was installed again under its old ID meets peers that still
+/// know its old incarnation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::stream::consensus) struct Incarnations {
+    /// The incarnation this keeper first saw each peer under.
+    pub peers: BTreeMap<Uuid, Uuid>,
+    /// Peers seen since under another incarnation.
+    pub reincarnated: BTreeSet<Uuid>,
+    /// Whether a peer knows this keeper under another incarnation.
+    pub reused: bool,
+}
+
+impl Incarnations {
+    pub fn path(registry: &Path, keeper: Uuid) -> PathBuf {
+        registry.join(format!("{keeper}.incarnations.json"))
+    }
+
+    /// The record at `path`, empty before the first one is stored.
+    pub fn load(path: &Path) -> io::Result<Self> {
+        match read_bounded(path, 1024 * 1024) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            result => result,
+        }
+    }
+
+    /// Adds this record to the one at `path` and replaces it by a synced
+    /// rename. Records only grow, so a store that a cancelled exchange or a
+    /// stopped keeper left running loses nothing when it lands last.
+    pub fn store(&self, path: &Path) -> io::Result<()> {
+        static STORES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _store = STORES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let stored = Self::load(path)?;
+        let mut merged = stored.clone();
+        for (peer, first) in &self.peers {
+            merged.peers.entry(*peer).or_insert(*first);
+        }
+        merged.reincarnated.extend(&self.reincarnated);
+        merged.reused |= self.reused;
+        if merged == stored {
+            return Ok(());
+        }
+        replace_json(path, &merged)
+    }
 }
 
 /// The boundary of the WAL format before segments, a JSON file replaced by
@@ -560,6 +612,30 @@ pub(in crate::stream::consensus) fn hex(digest: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incarnation_records_only_grow() {
+        let root = tempfile::tempdir().unwrap();
+        let path = Incarnations::path(root.path(), Uuid::new_v4());
+        assert_eq!(Incarnations::load(&path).unwrap(), Incarnations::default());
+        let (peer, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let newer = Incarnations {
+            peers: BTreeMap::from([(peer, first), (other, first)]),
+            reincarnated: BTreeSet::from([peer]),
+            reused: true,
+        };
+        newer.store(&path).unwrap();
+        // A stale store that lands last keeps the first incarnations and
+        // the marks.
+        Incarnations {
+            peers: BTreeMap::from([(peer, second)]),
+            ..Incarnations::default()
+        }
+        .store(&path)
+        .unwrap();
+        assert_eq!(Incarnations::load(&path).unwrap(), newer);
+    }
 
     #[test]
     fn interrupted_enrollment_burns_identity_before_media_publication() {

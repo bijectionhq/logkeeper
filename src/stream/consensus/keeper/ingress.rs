@@ -23,7 +23,9 @@ use super::admission::{Charge, Control};
 use super::{Command, Engine, Group, Identity, Lane, SNAPSHOT_CHUNK_BYTES, invalid, transport};
 use crate::stream::consensus::{
     Genesis, MAX_MESSAGE, MAX_RECORD, NodeId, RaftTypes, SnapshotMeta, Vote, decode, encode,
-    network::{self, AppendReply, ChunkReply, Frame, PeerRequest, SnapshotChunk, SnapshotMismatch},
+    network::{
+        self, AppendReply, ChunkReply, Frame, PeerRequest, Pong, SnapshotChunk, SnapshotMismatch,
+    },
     storage::{Admission, MAX_TRANSFER_FILE, SnapshotFile},
 };
 
@@ -343,11 +345,19 @@ impl Engine {
                     let (genesis, request) = match decode(message)? {
                         Frame::Peer(genesis, request) => (genesis, request),
                         // A ping costs one status read and no admission.
-                        Frame::Liveness if lane == Lane::Control => {
+                        Frame::Liveness(incarnation) if lane == Lane::Control => {
                             let (engine, answers) = (self.clone(), answers.clone());
                             work.spawn(async move {
-                                let status = engine.keeper_status().await;
-                                let reply = encode(&status).map_err(|error| error.to_string());
+                                let known_as = engine
+                                    .recognition
+                                    .greet(Uuid::from_u128(sender), incarnation)
+                                    .await;
+                                let pong = Pong {
+                                    status: engine.keeper_status().await,
+                                    incarnation: engine.recognition.own(),
+                                    known_as,
+                                };
+                                let reply = encode(&pong).map_err(|error| error.to_string());
                                 let _ = answers.send((id, reply));
                             });
                             continue;

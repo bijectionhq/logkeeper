@@ -272,6 +272,40 @@ fn accepted_batches_are_consecutive(
 }
 
 
+// A keeper ID reused on new media is recognized: a first contact is never a
+// reuse, the incarnation first seen is never one, and any other is.
+fn only_another_incarnation_is_a_reuse(first: u128, reported: u128) {
+    let unknown = reincarnated(None, reported);
+    assert(!unknown);
+    let same = reincarnated(Some(reported), reported);
+    assert(!same);
+    let other = reincarnated(Some(first), reported);
+    assert(other == (first != reported));
+}
+
+// A keeper registers a replica it does not hold only as a genesis voter
+// whose identity a peer confirmed, and never once its ID was reused, so a
+// keeper with reinstalled media never votes with an empty log.
+fn a_reused_keeper_never_registers(genesis_voter: bool, confirmed: bool, reused: bool) {
+    let registered = registers(genesis_voter, confirmed, reused);
+    assert(registered ==> genesis_voter && confirmed);
+    assert(reused ==> !registered);
+    let unconfirmed = registers(genesis_voter, false, reused);
+    assert(!unconfirmed);
+    let fresh = registers(true, true, false);
+    assert(fresh);
+}
+
+// A grant from a peer seen under another incarnation never counts toward a
+// campaign; any other grant does.
+fn a_reused_keeper_grants_nothing(granted: bool, reincarnated: bool) {
+    let counted = counts_grant(granted, reincarnated);
+    assert(reincarnated ==> !counted);
+    assert(!granted ==> !counted);
+    let honest = counts_grant(granted, false);
+    assert(honest == granted);
+}
+
 // A keeper counts as dead only once its silence reaches the repair delay, so
 // a keeper that answered within the delay is never repaired away, parked
 // past or woken for.

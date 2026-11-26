@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     future::Future,
     io,
@@ -36,8 +36,9 @@ use tokio_rustls::TlsConnector;
 
 use super::decisions::{self, AppendFit, EntryKind, PeerKind, PeerLane};
 use super::{
-    ALPN, BULK_ALPN, CONTROL_ALPN, Entry, Fence, Genesis, Keepers, LogId, MAX_MESSAGE, NodeId,
-    REPLICATION_ALPN, RaftTypes, SnapshotMeta, Stage, Vote, decode, encode, invalid, options,
+    ALPN, BULK_ALPN, CONTROL_ALPN, Entry, Fence, Genesis, KeeperStatus, Keepers, LogId,
+    MAX_MESSAGE, NodeId, REPLICATION_ALPN, RaftTypes, SnapshotMeta, Stage, Vote, decode, encode,
+    invalid, options,
     state::{Command, Outcome},
     storage::{SnapshotFile, StateMachine},
 };
@@ -228,9 +229,21 @@ impl Request {
 pub(super) enum Frame {
     Client(Request),
     Peer(Genesis, PeerRequest),
-    /// A keeper-level liveness ping on the control lane, answered with the
-    /// receiver's keeper-wide `KeeperStatus`.
-    Liveness,
+    /// A keeper-level liveness ping on the control lane, carrying the
+    /// sender's media incarnation and answered with a `Pong`.
+    Liveness(uuid::Uuid),
+}
+
+/// The answer to a liveness ping.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(super) struct Pong {
+    /// The receiver's keeper-wide status.
+    pub status: KeeperStatus,
+    /// The receiver's media incarnation.
+    pub incarnation: uuid::Uuid,
+    /// The incarnation the receiver first saw the sender under, `None` on
+    /// their first contact.
+    pub known_as: Option<uuid::Uuid>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -969,9 +982,27 @@ pub(super) struct Network {
     /// for an immediate retirement check.
     pub excluded: Arc<Mutex<Option<uuid::Uuid>>>,
     pub retire: Arc<tokio::sync::Notify>,
+    /// Peers this keeper saw under another media incarnation. Their vote
+    /// and pre-vote grants do not count.
+    pub reincarnated: Arc<parking_lot::RwLock<HashSet<NodeId>>>,
 }
 
 impl Network {
+    /// Refuses a grant from a peer seen under another incarnation, as if the
+    /// peer had not answered.
+    fn check_grant(
+        &self,
+        target: NodeId,
+        response: VoteResponse<RaftTypes>,
+    ) -> Result<VoteResponse<RaftTypes>, RPCError<RaftTypes>> {
+        if response.vote_granted
+            && !decisions::counts_grant(true, self.reincarnated.read().contains(&target))
+        {
+            return Err(unreachable(&invalid("vote grant from a reincarnated keeper")).into());
+        }
+        Ok(response)
+    }
+
     fn observe(&self, target: NodeId, error: &io::Error) {
         if error.to_string().contains(EXCLUDED) {
             *self.excluded.lock() = Some(uuid::Uuid::from_u128(target));
@@ -1195,7 +1226,7 @@ impl RaftNetworkV2<RaftTypes> for Peer {
                 true
             });
         }
-        Ok(response)
+        self.network.check_grant(self.target, response)
     }
 
     async fn pre_vote(
@@ -1205,7 +1236,8 @@ impl RaftNetworkV2<RaftTypes> for Peer {
     ) -> Result<VoteResponse<RaftTypes>, RPCError<RaftTypes>> {
         let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
             self.request(PeerRequest::PreVote(request), &option).await?;
-        Ok(response.map_err(|error| unreachable(&error))?)
+        let response = response.map_err(|error| unreachable(&error))?;
+        self.network.check_grant(self.target, response)
     }
 
     async fn transfer_leader(

@@ -92,7 +92,24 @@ Initialization consumes the authorized UUID before publishing its media.
 Preserve the enrollment records and WAL boundary independently of media loss
 and prevent registry rollback. Serving opens only checked, installed media.
 Use a fresh UUID after media loss or an interrupted install that consumed the
-old UUID. A fresh replacement joins as a learner. After the initial copy,
+old UUID. A fresh replacement joins as a learner.
+
+Re-initializing a keeper after losing its data volume always needs a new
+keeper UUID, even when the registry was lost too and `keeper initialize`
+accepts the old one again. Each installation draws a new media
+incarnation, and every keeper records in its registry, in
+`<keeper-uuid>.incarnations.json`, the incarnation it first saw each peer
+under. If the old UUID is reused anyway, its peers still know its old
+incarnation and say so in their ping answers. The keeper then marks itself
+reused, durably, and logs it. A reused keeper never registers a stream it
+does not hold because a peer or a bootstrap names it, so it cannot come back
+as an empty voter and help a lagging voter erase committed entries. It takes
+replicas only through staging, as a replacement. Peers that saw the other
+incarnation stop counting its vote and pre-vote grants. Its old streams
+report no replica on it, so their leaders replace it after
+`repair_after_secs`. A stream whose other healthy voter is also down stays
+unavailable until that voter returns. Give the keeper a new UUID and retire
+the old one. After the initial copy,
 the leader briefly gates writes and matches the full issued prefix on every
 newcomer before joint membership. The consensus development format
 predating explicit enrollment requires a fresh installation.
@@ -478,7 +495,7 @@ completeness as a premise, in the Lean worktree's
 
 Keepers run OpenRaft 0.10.1. Its peer messages differ from 0.9 under
 bincode, and the control and replication lanes carry multiplexed batch
-frames, so the peer ALPNs are `logkeeper-consensus-control/7`,
+frames, so the peer ALPNs are `logkeeper-consensus-control/8`,
 `logkeeper-consensus-replication/3` and `logkeeper-consensus-bulk/2`. A keeper
 on an older version fails the TLS handshake with `no_application_protocol`
 instead of failing to decode. Mixed versions are unsupported: upgrade all
@@ -493,10 +510,11 @@ working leader. A graceful shutdown first transfers every stream the keeper
 leads to a caught-up voter, waiting at most 3 seconds, so a rolling restart
 does not wait out a lease and an election per stream.
 
-Verus checks the shipped admission, metering, classification, rotation, batch
-and restart decisions in `src/stream/consensus/decisions.rs` against laws
-named after the Lean theorems. The baseline verifies 52 functions, and 18
-production mutations each fail their declared contract. See
+Verus checks the shipped admission, metering, classification, rotation, batch,
+restart, recovery, repair and keeper incarnation decisions in
+`src/stream/consensus/decisions.rs` against laws named after the Lean
+theorems. The baseline verifies 76 functions, and 30 production mutations
+each fail their declared contract. See
 `verification/verus/consensus_admission/README.md` for the mapping and the
 unverified stateful glue.
 
@@ -620,6 +638,11 @@ accepting keeper. `reconcile_placement` also moves a voter off a full keeper.
 Every keeper pings every other keeper on the multiplexed control channel
 every 2 seconds and keeps when each last answered, with the keeper-wide
 status it reported. A keeper unreachable for `repair_after_secs` is dead.
+A ping carries the sender's media incarnation, and its answer carries the
+receiver's and the one the receiver first saw the sender under. Until one
+peer has answered, a keeper registers no stream it does not hold: peer
+traffic for such a stream is refused and retried, and a bootstrap pings at
+once.
 
 Each stream's leader repairs its own stream. A voter that has not
 acknowledged the leader for `repair_after_secs` (600 by default), or whose

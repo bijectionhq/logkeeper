@@ -519,6 +519,9 @@ impl Engine {
         {
             return Ok(());
         }
+        if self.disk.genesis(STREAM).is_none() {
+            self.check_identity().await;
+        }
         let group = self.group(catalog.genesis.clone()).await?;
         match group
             .raft

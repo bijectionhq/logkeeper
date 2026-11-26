@@ -19,7 +19,7 @@ use uuid::Uuid;
 use super::network::has_application_entries;
 use super::{Entry, Genesis, LogId, RaftTypes, Vote};
 
-pub(super) use media::{Authority, Enrollment};
+pub(super) use media::{Authority, Enrollment, Incarnations};
 #[cfg(any(test, feature = "consensus-testing"))]
 pub(super) use media::{Provision, hex, sha256};
 pub(super) use objects::Object;
