@@ -482,10 +482,17 @@ async fn failover_snapshot_replacement_and_restart_preserve_the_stream() {
         .await
         .unwrap();
     assert_eq!(page.records, [(Lsn(161), Bytes::from_static(b"last"))]);
-    assert_eq!(
-        journal.read(stream, Lsn(160), 1, Duration::ZERO).await,
-        Err(JournalError::Trimmed { floor: Lsn(161) })
-    );
+    // A read is one keeper's applied page and may lag until that keeper
+    // applies the committed trim after the restart.
+    timeout(WAIT, async {
+        while journal.read(stream, Lsn(160), 1, Duration::ZERO).await
+            != Err(JournalError::Trimmed { floor: Lsn(161) })
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
 
     cluster.restart(leader).await;
     let restored = journal
@@ -2440,5 +2447,39 @@ async fn deleted_streams_release_their_keeper_slots() {
     assert_eq!(journal.head(StreamId(8)).await, Err(JournalError::Deleted));
     let page = journal.read(StreamId(8), Lsn(1), 1, Duration::ZERO).await;
     assert!(matches!(page, Err(JournalError::Deleted)), "{page:?}");
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gracefully_stopped_leader_hands_its_streams_to_a_voter() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(51);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
+    let leader = cluster.leader(stream).await;
+    cluster.running.remove(&leader).unwrap().stop().await;
+    // Without a handoff the followers wait out the leader's lease before an
+    // election, which takes longer than this.
+    let others = [a, b, c]
+        .into_iter()
+        .filter(|id| *id != leader)
+        .collect::<Vec<_>>();
+    timeout(Duration::from_millis(300), async {
+        loop {
+            for id in &others {
+                if let Some(group) = cluster.running[id].engine.groups.lock().await.get(&stream)
+                    && group.raft.metrics().borrow_watched().state == openraft::ServerState::Leader
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("leadership moved during the graceful stop");
+    assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
     cluster.stop_all().await;
 }

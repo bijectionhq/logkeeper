@@ -206,6 +206,8 @@ pub(super) enum PeerRequest {
     Append(#[serde(deserialize_with = "bounded_append")] AppendEntriesRequest<RaftTypes>),
     Vote(VoteRequest<RaftTypes>),
     Snapshot(SnapshotChunk, [u8; 32]),
+    PreVote(VoteRequest<RaftTypes>),
+    TransferLeader(openraft::raft::TransferLeaderRequest<RaftTypes>),
 }
 
 /// One chunk of a snapshot transfer, in the OpenRaft 0.9
@@ -246,7 +248,7 @@ impl PeerRequest {
     pub fn lane(&self) -> Lane {
         let (kind, application) = match self {
             Self::Append(request) => (PeerKind::Append, has_application_entries(&request.entries)),
-            Self::Vote(_) => (PeerKind::Vote, false),
+            Self::Vote(_) | Self::PreVote(_) | Self::TransferLeader(_) => (PeerKind::Vote, false),
             Self::Snapshot(..) => (PeerKind::Snapshot, false),
         };
         match decisions::peer_lane(kind, application) {
@@ -259,7 +261,10 @@ impl PeerRequest {
     pub fn sender(&self) -> Option<NodeId> {
         match self {
             Self::Append(request) => Some(request.vote.leader_id().voted_for),
-            Self::Vote(request) => Some(request.vote.leader_id().voted_for),
+            Self::Vote(request) | Self::PreVote(request) => {
+                Some(request.vote.leader_id().voted_for)
+            }
+            Self::TransferLeader(request) => Some(request.from_leader().leader_id().voted_for),
             Self::Snapshot(request, _) => Some(request.vote.leader_id().voted_for),
         }
     }
@@ -673,6 +678,30 @@ impl RaftNetworkV2<RaftTypes> for Peer {
             });
         }
         Ok(response)
+    }
+
+    async fn pre_vote(
+        &mut self,
+        request: VoteRequest<RaftTypes>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<RaftTypes>, RPCError<RaftTypes>> {
+        let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
+            self.request(PeerRequest::PreVote(request), &option).await?;
+        Ok(response.map_err(|error| unreachable(&error))?)
+    }
+
+    async fn transfer_leader(
+        &mut self,
+        request: openraft::raft::TransferLeaderRequest<RaftTypes>,
+        option: RPCOption,
+    ) -> Result<openraft::raft::TransferLeaderResponse<RaftTypes>, RPCError<RaftTypes>> {
+        let response: Result<
+            openraft::raft::TransferLeaderResponse<RaftTypes>,
+            openraft::errors::Fatal<RaftTypes>,
+        > = self
+            .request(PeerRequest::TransferLeader(request), &option)
+            .await?;
+        Ok(response.map_err(|error| unreachable(&error))?)
     }
 
     /// Sends the snapshot in chunks on the bulk lane. A chunk that fails to

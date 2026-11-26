@@ -220,6 +220,12 @@ impl Config {
             snapshot_max_chunk_size: SNAPSHOT_CHUNK_BYTES,
             max_in_snapshot_log_to_keep: 16,
             purge_batch_size: 16,
+            // A follower asks for votes without raising its term first, so a
+            // keeper that rejoins after a partition does not depose a leader.
+            enable_pre_vote: Some(true),
+            // A leader that cannot confirm its quorum for a lease plus an
+            // election timeout yields, instead of refusing writes forever.
+            quorum_loss_probe_interval: Some(1800),
             ..Default::default()
         }
         .validate()
@@ -401,6 +407,7 @@ impl Engine {
         .await;
         self.stop.cancel();
         self.disk.disable_reaping();
+        self.evict_leaders(Duration::from_secs(3)).await;
         sockets.shutdown().await;
         for group in std::mem::take(&mut *self.groups.lock().await).into_values() {
             let _ = group.raft.shutdown().await;
@@ -408,6 +415,52 @@ impl Engine {
         }
         let shutdown = self.disk.shutdown().await;
         result.and(shutdown)
+    }
+
+    /// Hands every stream this keeper leads to a caught-up voter before a
+    /// graceful shutdown, so its streams elect no new leader after a lease
+    /// expires. Waits at most `limit` for leadership to move.
+    async fn evict_leaders(&self, limit: Duration) {
+        let groups = self
+            .groups
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut leading = Vec::new();
+        for group in groups {
+            let metrics = group.raft.metrics().borrow_watched().clone();
+            if metrics.state != openraft::ServerState::Leader {
+                continue;
+            }
+            let last = metrics.last_log_index;
+            let target = metrics.replication.as_ref().and_then(|progress| {
+                progress
+                    .iter()
+                    .filter(|(id, matched)| {
+                        **id != self.id.as_u128() && matched.map(|log| log.index) == last
+                    })
+                    .map(|(id, _)| *id)
+                    .next()
+            });
+            if let Some(target) = target
+                && group.raft.trigger().transfer_leader(target).await.is_ok()
+            {
+                leading.push(group);
+            }
+        }
+        let _ = timeout(limit, async {
+            for group in leading {
+                let mut metrics = group.raft.metrics();
+                while metrics.borrow_watched().state == openraft::ServerState::Leader {
+                    if metrics.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
     }
 
     fn quarantine(&self, stream: StreamId, error: &io::Error) {

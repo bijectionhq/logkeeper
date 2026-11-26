@@ -335,7 +335,9 @@ impl Engine {
                             timeout(CONNECTION_TIMEOUT, network::send(&mut channel, &reply))
                                 .await??;
                         }
-                        PeerRequest::Vote(request) => {
+                        request @ (PeerRequest::Vote(_)
+                        | PeerRequest::PreVote(_)
+                        | PeerRequest::TransferLeader(_)) => {
                             if !self.disk.installed(group.genesis.stream) {
                                 return Err(invalid("staged replica cannot vote"));
                             }
@@ -352,10 +354,36 @@ impl Engine {
                             if !eligible {
                                 return Err(invalid("vote is outside the effective placement"));
                             }
-                            let reply = group.raft.vote(request).await;
-                            group.require_healthy()?;
-                            timeout(CONNECTION_TIMEOUT, network::send(&mut channel, &reply))
-                                .await??;
+                            match request {
+                                PeerRequest::Vote(request) => {
+                                    let reply = group.raft.vote(request).await;
+                                    group.require_healthy()?;
+                                    timeout(
+                                        CONNECTION_TIMEOUT,
+                                        network::send(&mut channel, &reply),
+                                    )
+                                    .await??;
+                                }
+                                PeerRequest::PreVote(request) => {
+                                    let reply = group.raft.pre_vote(request).await;
+                                    group.require_healthy()?;
+                                    timeout(
+                                        CONNECTION_TIMEOUT,
+                                        network::send(&mut channel, &reply),
+                                    )
+                                    .await??;
+                                }
+                                PeerRequest::TransferLeader(request) => {
+                                    let reply = group.raft.handle_transfer_leader(request).await;
+                                    group.require_healthy()?;
+                                    timeout(
+                                        CONNECTION_TIMEOUT,
+                                        network::send(&mut channel, &reply),
+                                    )
+                                    .await??;
+                                }
+                                _ => unreachable!("matched a vote-class request"),
+                            }
                         }
                         PeerRequest::Snapshot(request, digest) => {
                             let data = request.data.len() as u64;

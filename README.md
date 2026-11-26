@@ -316,7 +316,7 @@ completeness as a premise, in the Lean worktree's
 `verification/lean/restart-read.md`.
 
 Keepers run OpenRaft 0.10.1. Its peer messages differ from 0.9 under
-bincode, so the peer ALPNs are `logkeeper-consensus-control/3`,
+bincode, so the peer ALPNs are `logkeeper-consensus-control/4`,
 `logkeeper-consensus-replication/2` and `logkeeper-consensus-bulk/2`. A keeper
 on an older version fails the TLS handshake with `no_application_protocol`
 instead of failing to decode. Mixed versions are unsupported: upgrade all
@@ -324,7 +324,12 @@ keepers in a group together. The application protocol, `LKRIMG03` images
 and the on-disk WAL format are unchanged; a test pins the persisted bytes of
 votes, log ids, memberships, entries and snapshot metadata to their 0.9
 encoding. A leader that cannot confirm a recent quorum now refuses writes
-and answers that it has no leader.
+and answers that it has no leader; after 1.8 seconds without a quorum it
+gives way to a new leader. Followers run a pre-vote round before raising
+their term, so a keeper that rejoins after a partition does not depose a
+working leader. A graceful shutdown first transfers every stream the keeper
+leads to a caught-up voter, waiting at most 3 seconds, so a rolling restart
+does not wait out a lease and an election per stream.
 
 Verus checks the shipped admission, classification, rotation, batch and
 restart decisions in `src/stream/consensus/decisions.rs` against laws named
