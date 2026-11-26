@@ -46,7 +46,20 @@ pub(super) enum Lane {
     Bulk,
 }
 
-pub(super) const MAX_PEER_ENTRIES: usize = 4;
+/// Entries in one AppendEntries. The lane's frame limit still splits larger
+/// batches by bytes through `fit_append`.
+pub(super) const MAX_PEER_ENTRIES: usize = 64;
+/// Retry delays after a refused or failed peer append: 5 ms doubling to
+/// 500 ms. A follower's momentary `Busy` then costs milliseconds, where
+/// OpenRaft's default waits a flat 500 ms.
+const PEER_BACKOFF_FIRST: Duration = Duration::from_millis(5);
+const PEER_BACKOFF_LAST: Duration = Duration::from_millis(500);
+
+fn peer_backoff() -> impl Iterator<Item = Duration> {
+    std::iter::successors(Some(PEER_BACKOFF_FIRST), |delay| {
+        Some((*delay * 2).min(PEER_BACKOFF_LAST))
+    })
+}
 
 impl Lane {
     pub fn alpn(self) -> &'static [u8] {
@@ -507,6 +520,10 @@ impl Peer {
 }
 
 impl RaftNetwork<RaftTypes> for Peer {
+    fn backoff(&self) -> openraft::network::Backoff {
+        openraft::network::Backoff::new(peer_backoff())
+    }
+
     async fn append_entries(
         &mut self,
         request: AppendEntriesRequest<RaftTypes>,
@@ -537,11 +554,17 @@ impl RaftNetwork<RaftTypes> for Peer {
             Ok(AppendReply::Raft(reply)) => {
                 reply.map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))
             }
-            Ok(AppendReply::Busy) => Err(RPCError::Unreachable(Unreachable::new(&io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "replication receiver is busy",
-            )))),
-            Err(error) => Err(RPCError::Unreachable(Unreachable::new(&error))),
+            Ok(AppendReply::Busy) => {
+                super::metrics::count(&super::metrics::COUNTERS.peer_busy);
+                Err(RPCError::Unreachable(Unreachable::new(&io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "replication receiver is busy",
+                ))))
+            }
+            Err(error) => {
+                super::metrics::count(&super::metrics::COUNTERS.peer_unreachable);
+                Err(RPCError::Unreachable(Unreachable::new(&error)))
+            }
         }
     }
 
@@ -616,12 +639,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn refused_peer_appends_back_off_briefly_then_up_to_half_a_second() {
+        let delays = peer_backoff().take(10).collect::<Vec<_>>();
+        assert_eq!(delays[0], Duration::from_millis(5));
+        assert_eq!(delays[1], Duration::from_millis(10));
+        assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(delays[9], Duration::from_millis(500));
+    }
+
+    #[test]
     fn an_oversized_valid_batch_is_split_at_the_sender() {
         let limit = Lane::Replication.frame_limit();
         assert!(fit_append(Lane::Replication, limit, MAX_PEER_ENTRIES).is_ok());
         for (lane, size, count, hint) in [
             (Lane::Replication, limit + 1, 4, 2),
-            (Lane::Replication, 1024, MAX_PEER_ENTRIES + 2, 3),
+            (
+                Lane::Replication,
+                1024,
+                MAX_PEER_ENTRIES + 2,
+                (MAX_PEER_ENTRIES as u64 + 2) / 2,
+            ),
             (Lane::Control, Lane::Control.frame_limit() + 1, 2, 1),
         ] {
             match fit_append(lane, size, count) {

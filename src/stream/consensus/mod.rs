@@ -7,6 +7,7 @@ mod client;
 mod decisions;
 mod journal;
 mod keeper;
+mod metrics;
 mod network;
 mod ownership;
 mod placement;

@@ -208,7 +208,7 @@ impl Config {
             heartbeat_interval: 100,
             election_timeout_min: 450,
             election_timeout_max: 900,
-            max_payload_entries: 4,
+            max_payload_entries: super::network::MAX_PEER_ENTRIES as u64,
             snapshot_policy: SnapshotPolicy::LogsSinceLast(128),
             snapshot_max_chunk_size: SNAPSHOT_CHUNK_BYTES,
             max_in_snapshot_log_to_keep: 16,
@@ -335,6 +335,11 @@ impl Engine {
                 }
             }
             self.disk.enable_reaping();
+            tokio::spawn(super::metrics::report(
+                self.id,
+                Duration::from_secs(5),
+                self.stop.clone(),
+            ));
             let engine = self.clone();
             let stop = self.stop.clone();
             sockets.spawn(async move {
@@ -1020,10 +1025,13 @@ impl Group {
     }
 
     async fn write(&self, command: Command) -> Reply {
+        use super::metrics::{COUNTERS, count};
         if self.require_healthy().is_err() {
+            count(&COUNTERS.write_unhealthy);
             return failure(JournalError::Unavailable);
         }
         let Ok(permit) = self.writes.clone().try_acquire_owned() else {
+            count(&COUNTERS.write_pending);
             return failure(JournalError::Unavailable);
         };
         let ticket = uuid::Uuid::new_v4();
@@ -1033,35 +1041,51 @@ impl Group {
         {
             Ok(space) => space,
             Err(storage::Admission::FullSuffix) => {
+                count(&COUNTERS.write_full_suffix);
                 self.request_covered_purge().await;
                 return failure(JournalError::Unavailable);
             }
-            Err(storage::Admission::Space) => return failure(JournalError::Unavailable),
+            Err(storage::Admission::Space) => {
+                count(&COUNTERS.write_space);
+                return failure(JournalError::Unavailable);
+            }
         };
         let raft = self.raft.clone();
         // The proposal owns its reservation even when the caller drops the
         // request or times out. The WAL settles it as it publishes the slot.
         let proposal = tokio::spawn(async move {
             let (_permit, _space) = (permit, space);
-            let Ok(response) = raft
+            let response = match raft
                 .client_write_ff(Command::Admitted(ticket, Box::new(command)))
                 .await
-            else {
-                return failure(JournalError::Unavailable);
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    super::metrics::sample("write.proposal_failed", || format!("{error:?}"));
+                    count(&COUNTERS.write_proposal);
+                    return failure(JournalError::Unavailable);
+                }
             };
             match response.await {
                 Ok(Ok(response)) => Reply::Decision(response.data),
                 Ok(Err(ClientWriteError::ForwardToLeader(leader))) => {
                     leader_reply(leader.leader_id)
                 }
-                _ => failure(JournalError::Unavailable),
+                other => {
+                    super::metrics::sample("write.proposal_failed", || format!("{other:?}"));
+                    count(&COUNTERS.write_proposal);
+                    failure(JournalError::Unavailable)
+                }
             }
         });
         timeout(REQUEST_TIMEOUT, proposal)
             .await
             .ok()
             .and_then(Result::ok)
-            .unwrap_or_else(|| failure(JournalError::Unavailable))
+            .unwrap_or_else(|| {
+                count(&COUNTERS.write_timeout);
+                failure(JournalError::Unavailable)
+            })
     }
 
     async fn request_covered_purge(&self) {
@@ -1073,10 +1097,12 @@ impl Group {
 
     async fn head(&self) -> Reply {
         let (send, receive) = oneshot::channel();
-        if self.heads.try_send(send).is_ok()
-            && let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, receive).await
-        {
+        if self.heads.try_send(send).is_err() {
+            super::metrics::count(&super::metrics::COUNTERS.head_queue);
+        } else if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, receive).await {
             return reply;
+        } else {
+            super::metrics::count(&super::metrics::COUNTERS.head_timeout);
         }
         failure(JournalError::Unavailable)
     }
