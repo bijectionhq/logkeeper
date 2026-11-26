@@ -450,6 +450,19 @@ a wall-clock sampler on every keeper.
 `Unavailable`, such as momentarily full write admission or log suffix, with
 backoff until the operation deadline. An identical retry is idempotent.
 
+A keeper's `max_streams` counts streams with an open group. Once a deleted
+stream's deletion is applied, replicated to every voter the leader sees, and
+the group has served no client for 30 seconds, the keeper closes the group and
+keeps an in-memory tombstone. Clients are then answered `Deleted` and peers
+are refused, and the stream's slot is reused. At startup a stream past the
+limit opens on demand instead of being quarantined.
+
+One WAL thread serves every stream on a keeper and takes up to 128 queued
+writes per round. A round that runs longer than 20 seconds, such as a disk
+sync that never returns, ends the keeper process so the other voters elect
+new leaders. Each keeper prints a count of every refusal it answered as
+`Unavailable`, by reason, every 5 seconds when the counts change.
+
 The `consensus-testing` feature exports `testing::LocalCluster`. It starts
 three voter keepers in distinct failure domains and a catalog keeper on
 loopback, with enrolled media and a private CA, issues client certificates

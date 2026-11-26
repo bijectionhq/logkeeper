@@ -317,6 +317,9 @@ impl Engine {
                     if request.sender() != Some(sender) || !self.placement.genesis(&genesis) {
                         return Err(invalid("invalid consensus sender or stream genesis"));
                     }
+                    if self.deleted.read().contains(&genesis.stream) {
+                        return Err(invalid("stream is deleted"));
+                    }
                     let group = self.group(genesis).await?;
                     group.require_healthy()?;
                     match request {

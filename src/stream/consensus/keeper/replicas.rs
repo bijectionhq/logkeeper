@@ -191,7 +191,7 @@ impl Engine {
         }
     }
 
-    async fn close_copy(&self, scope: StreamId) {
+    pub(super) async fn close_copy(&self, scope: StreamId) {
         if let Some(group) = self.groups.lock().await.remove(&scope) {
             group.state.suspend();
             group.stop.cancel();

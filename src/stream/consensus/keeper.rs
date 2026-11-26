@@ -6,7 +6,7 @@ mod replicas;
 mod tests;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -46,6 +46,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEAD_REQUESTS: usize = 256;
 const MAX_PENDING_WRITES: usize = 16;
 const MAX_LOG_SUFFIX: u64 = 512;
+/// How long a deleted stream's settled group stays open for late requests.
+#[cfg(not(test))]
+const DELETED_GROUP_GRACE: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const DELETED_GROUP_GRACE: Duration = Duration::from_secs(2);
 const SNAPSHOT_CHUNK_BYTES: u64 = 1024 * 1024;
 use ingress::{MAX_BULK_CONNECTIONS, MAX_CLIENT_CONNECTIONS};
 
@@ -255,6 +260,8 @@ impl Config {
             quarantined: parking_lot::RwLock::default(),
             max_streams: self.max_streams,
             groups: Mutex::default(),
+            deletions: parking_lot::Mutex::default(),
+            deleted: parking_lot::RwLock::default(),
             stop: stop.child_token(),
             #[cfg(test)]
             reject_append: Default::default(),
@@ -295,6 +302,10 @@ struct Engine {
     quarantined: parking_lot::RwLock<HashSet<StreamId>>,
     max_streams: usize,
     groups: Mutex<BTreeMap<StreamId, Arc<Group>>>,
+    deletions: parking_lot::Mutex<HashMap<StreamId, Instant>>,
+    /// Deleted streams whose groups this keeper closed. Clients are answered
+    /// `Deleted` and peers are refused instead of reopening the group.
+    deleted: parking_lot::RwLock<HashSet<StreamId>>,
     stop: CancellationToken,
     #[cfg(test)]
     reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
@@ -331,7 +342,11 @@ impl Engine {
                     if !self.disk.healthy() {
                         return Err(error);
                     }
-                    self.quarantine(genesis.stream, &error);
+                    // Past the stream limit a replica opens on its first
+                    // request instead of being quarantined.
+                    if error.kind() != io::ErrorKind::QuotaExceeded {
+                        self.quarantine(genesis.stream, &error);
+                    }
                 }
             }
             self.disk.enable_reaping();
@@ -346,10 +361,15 @@ impl Engine {
                 let mut schedule = tokio::time::interval(Duration::from_millis(50));
                 schedule.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut cursor = None;
+                let mut ticks = 0u64;
                 loop {
                     tokio::select! {
                         _ = stop.cancelled() => return Ok(()),
                         _ = schedule.tick() => {
+                            ticks += 1;
+                            if ticks % 20 == 0 {
+                                engine.close_settled_deletions().await;
+                            }
                             if let Err(error) = engine.disk.reap_objects().await {
                                 eprintln!("logkeeper object cleanup deferred: {error}");
                             }
@@ -403,12 +423,63 @@ impl Engine {
         }
     }
 
+    /// The opening lock of `stream`, which takes one of the keeper's
+    /// `max_streams` slots. A slot whose group is closed and that no caller
+    /// holds is released when the keeper reaches its limit, so deleted and
+    /// retired streams do not count.
     async fn opening(&self, stream: StreamId) -> io::Result<Arc<Mutex<()>>> {
         let mut openings = self.openings.lock().await;
         if openings.len() >= self.max_streams && !openings.contains_key(&stream) {
-            return Err(io::Error::other("keeper stream limit reached"));
+            if let Ok(groups) = self.groups.try_lock() {
+                openings.retain(|id, slot| groups.contains_key(id) || Arc::strong_count(slot) > 1);
+            }
+            if openings.len() >= self.max_streams {
+                return Err(io::Error::new(
+                    io::ErrorKind::QuotaExceeded,
+                    "keeper stream limit reached",
+                ));
+            }
         }
         Ok(openings.entry(stream).or_default().clone())
+    }
+
+    /// Closes the groups of deleted streams once the deletion is applied on
+    /// this replica, replicated to every voter it can see, and older than
+    /// `DELETED_GROUP_GRACE`. A later request reopens the group and is
+    /// answered `Deleted`.
+    async fn close_settled_deletions(&self) {
+        let groups = self
+            .groups
+            .lock()
+            .await
+            .iter()
+            .map(|(stream, group)| (*stream, group.clone()))
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        let mut closing = Vec::new();
+        {
+            let mut seen = self.deletions.lock();
+            seen.retain(|stream, _| groups.iter().any(|(open, _)| open == stream));
+            for (stream, group) in &groups {
+                if !matches!(group.state.head(), Err(JournalError::Deleted)) || !group.settled() {
+                    seen.remove(stream);
+                    continue;
+                }
+                let since = *seen.entry(*stream).or_insert(now);
+                if now.duration_since(since) >= DELETED_GROUP_GRACE
+                    && now.duration_since(*group.used.lock()) >= DELETED_GROUP_GRACE
+                {
+                    closing.push(*stream);
+                }
+            }
+            for stream in &closing {
+                seen.remove(stream);
+            }
+        }
+        for stream in closing {
+            self.deleted.write().insert(stream);
+            self.close_copy(stream).await;
+        }
     }
 
     async fn group(&self, genesis: Genesis) -> io::Result<Arc<Group>> {
@@ -498,6 +569,7 @@ impl Engine {
             follower,
             heads,
             writes: Arc::new(Semaphore::new(MAX_PENDING_WRITES)),
+            used: parking_lot::Mutex::new(Instant::now()),
             stop: self.stop.child_token(),
         });
         self.groups
@@ -633,8 +705,20 @@ impl Engine {
             request => {
                 let group = self.groups.lock().await.get(&stream).cloned();
                 let Some(group) = group else {
+                    if self.deleted.read().contains(&stream) {
+                        let refused = Outcome::Refused(JournalError::Deleted);
+                        return Ok(match (&request, self.disk.genesis(stream)) {
+                            (Request::ReadAt { .. }, Some(genesis)) => Reply::ScopedPage {
+                                genesis,
+                                configuration: None,
+                                outcome: refused,
+                            },
+                            _ => Reply::Decision(refused),
+                        });
+                    }
                     return Ok(Reply::Leader(None));
                 };
+                *group.used.lock() = Instant::now();
                 if !self.disk.installed(stream) {
                     return Ok(failure(JournalError::Unavailable));
                 }
@@ -936,6 +1020,9 @@ impl Engine {
         if !genesis.voters.contains(&self.id) {
             return Err(invalid("keeper is outside the genesis configuration"));
         }
+        if self.deleted.read().contains(&stream) {
+            return Ok(failure(JournalError::Deleted));
+        }
         let members = self.nodes(genesis.voters);
         let group = self.group(genesis).await?;
         let initialized = group.raft.initialize(members).await;
@@ -971,6 +1058,8 @@ struct Group {
     follower: Arc<FollowerAppend>,
     heads: mpsc::Sender<oneshot::Sender<Reply>>,
     writes: Arc<Semaphore>,
+    /// When a request last reached this group.
+    used: parking_lot::Mutex<Instant>,
     stop: CancellationToken,
 }
 
@@ -981,6 +1070,19 @@ impl Group {
         }
         self.require_healthy()?;
         Ok(self)
+    }
+
+    /// Whether this replica has applied its whole log and, when it leads,
+    /// every voter has matched it.
+    fn settled(&self) -> bool {
+        let metrics = self.raft.metrics().borrow().clone();
+        let last = metrics.last_log_index;
+        metrics.last_applied.map(|applied| applied.index) == last
+            && metrics.replication.as_ref().is_none_or(|progress| {
+                progress
+                    .values()
+                    .all(|matched| matched.map(|id| id.index) == last)
+            })
     }
 
     fn require_healthy(&self) -> io::Result<()> {

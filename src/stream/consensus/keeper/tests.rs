@@ -2373,3 +2373,52 @@ async fn measure_consensus_append_throughput() {
     }
     cluster.stop_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleted_streams_release_their_keeper_slots() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    cluster.stop_all().await;
+    for config in cluster.configs.values_mut() {
+        config.max_streams = 3;
+    }
+    for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
+        cluster.restart(id).await;
+    }
+    let journal = cluster.client(&cluster.credentials);
+    // Eight streams in turn on keepers that hold three at a time.
+    for stream in (1..=8).map(StreamId) {
+        timeout(WAIT, async {
+            loop {
+                match journal.create(stream, [a, b, c], 4096).await {
+                    Ok(()) => return,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("create {stream:?} past the stream limit"));
+        journal.delete(stream).await.unwrap();
+        assert_eq!(journal.head(stream).await, Err(JournalError::Deleted));
+    }
+    // Every voter closes the settled group and still answers Deleted.
+    timeout(WAIT, async {
+        for id in [a, b, c] {
+            while cluster.running[&id]
+                .engine
+                .groups
+                .lock()
+                .await
+                .contains_key(&StreamId(8))
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(journal.head(StreamId(8)).await, Err(JournalError::Deleted));
+    let page = journal.read(StreamId(8), Lsn(1), 1, Duration::ZERO).await;
+    assert!(matches!(page, Err(JournalError::Deleted)), "{page:?}");
+    cluster.stop_all().await;
+}
