@@ -2695,3 +2695,48 @@ async fn a_leader_without_space_hands_its_streams_to_a_follower() {
         .set_available(u64::MAX);
     cluster.stop_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_leader_removes_a_learner_left_by_an_aborted_replacement() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, d] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(57);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let leader = cluster.leader_after_head(&journal, stream).await;
+    let group = cluster.group(leader, stream).await;
+    let node = group
+        .raft
+        .metrics()
+        .borrow_watched()
+        .membership_config
+        .membership()
+        .get_node(&a.as_u128())
+        .unwrap()
+        .clone();
+    group
+        .raft
+        .add_learner(d.as_u128(), node, false)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(20), async {
+        while group
+            .raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .get_node(&d.as_u128())
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the stale learner was removed");
+    assert_eq!(
+        journal.configuration(stream).await.unwrap().voters,
+        [a, b, c]
+    );
+    cluster.stop_all().await;
+}

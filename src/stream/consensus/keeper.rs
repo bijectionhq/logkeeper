@@ -296,6 +296,7 @@ impl Config {
             max_streams: self.max_streams,
             repair_after: Duration::from_secs(self.repair_after_secs),
             led_since: parking_lot::Mutex::default(),
+            learners_seen: parking_lot::Mutex::default(),
             groups: Mutex::default(),
             deletions: parking_lot::Mutex::default(),
             deleted: parking_lot::RwLock::default(),
@@ -345,6 +346,8 @@ struct Engine {
     repair_after: Duration,
     /// The term and time from which this keeper has led each stream.
     led_since: parking_lot::Mutex<HashMap<StreamId, (u64, Instant)>>,
+    /// When the leader first saw each learner of each stream it leads.
+    learners_seen: parking_lot::Mutex<HashMap<(StreamId, NodeId), Instant>>,
     groups: Mutex<BTreeMap<StreamId, Arc<Group>>>,
     deletions: parking_lot::Mutex<HashMap<StreamId, Instant>>,
     /// Deleted streams whose groups this keeper closed. Clients are answered

@@ -25,6 +25,12 @@ const REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const REPAIR_INTERVAL: Duration = Duration::from_millis(500);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+/// A learner that outlives two replacement deadlines belongs to an aborted
+/// replacement.
+#[cfg(not(test))]
+const STALE_LEARNER: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const STALE_LEARNER: Duration = Duration::from_secs(2);
 
 impl Engine {
     pub(super) async fn status(&self, stream: StreamId) -> KeeperStatus {
@@ -83,6 +89,7 @@ impl Engine {
                 () = self.stop.cancelled() => return,
                 _ = schedule.tick() => {
                     self.shed_leadership_when_full().await;
+                    self.drop_stale_learners().await;
                     self.repair_once().await;
                     self.retire_removed().await;
                     self.park_idle().await;
@@ -130,6 +137,73 @@ impl Engine {
                     break;
                 }
             }
+        }
+    }
+
+    /// Removes learners that an aborted replacement left in the membership,
+    /// where they would keep receiving the stream's replication. A learner
+    /// is stale once the leader has seen it for `STALE_LEARNER` while no
+    /// replacement holds the stream's membership lock.
+    async fn drop_stale_learners(&self) {
+        let groups = self
+            .groups
+            .lock()
+            .await
+            .iter()
+            .map(|(stream, group)| (*stream, group.clone()))
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        let mut stale = Vec::new();
+        {
+            let mut seen = self.learners_seen.lock();
+            let mut present = std::collections::HashSet::new();
+            for (stream, group) in &groups {
+                let metrics = group.raft.metrics().borrow_watched().clone();
+                let membership = metrics.membership_config.membership();
+                if metrics.state != ServerState::Leader || membership.get_joint_config().len() != 1
+                {
+                    continue;
+                }
+                let learners = membership
+                    .nodes()
+                    .map(|(id, _)| *id)
+                    .filter(|id| membership.voter_ids().all(|voter| voter != *id))
+                    .collect::<Vec<_>>();
+                let mut expired = std::collections::BTreeSet::new();
+                for learner in learners {
+                    present.insert((*stream, learner));
+                    let since = *seen.entry((*stream, learner)).or_insert(now);
+                    if now.duration_since(since) >= STALE_LEARNER {
+                        expired.insert(learner);
+                    }
+                }
+                if !expired.is_empty() {
+                    stale.push((group.clone(), expired));
+                }
+            }
+            seen.retain(|key, _| present.contains(key));
+        }
+        for (group, learners) in stale {
+            let Ok(_guard) = group.membership.try_lock() else {
+                continue;
+            };
+            let removed = tokio::time::timeout(
+                STATUS_TIMEOUT,
+                group.raft.change_membership(
+                    openraft::ChangeMembers::RemoveNodes(learners.clone()),
+                    false,
+                ),
+            )
+            .await;
+            eprintln!(
+                "logkeeper removed stale learners {learners:?} of stream {:?}: {}",
+                group.genesis.stream,
+                if matches!(removed, Ok(Ok(_))) {
+                    "removed"
+                } else {
+                    "deferred"
+                }
+            );
         }
     }
 

@@ -457,7 +457,10 @@ that lost two voters has no quorum to change its membership and needs an
 operator. A replica that hears from no leader for the repair delay asks
 other keepers for the stream's current placement; when that placement no
 longer names it, the keeper retires its copy, so a voter replaced while it
-was down, or moved off by a drain, frees its slot and disk when it returns.
+was down, or moved off by a drain, frees its slot and disk when it returns. A
+learner that a timed-out replacement left in the membership would keep
+receiving the stream's replication; the leader removes a learner it has
+seen for 60 seconds while no replacement holds the stream.
 
 A stream that served no client and appended nothing for `park_after_secs`
 (600 by default) is parked: its leader asks each follower holding exactly
