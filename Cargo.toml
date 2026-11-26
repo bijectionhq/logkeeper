@@ -57,3 +57,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(verus_keep_gh
 name = "stream-measure"
 path = "verification/measure/main.rs"
 required-features = ["stream"]
+
+[[example]]
+name = "consensus-streams"
+path = "verification/measure/consensus_streams.rs"
+required-features = ["consensus-testing"]
