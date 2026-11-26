@@ -94,6 +94,12 @@ pub enum JournalError {
     /// administrator acknowledges the recovery; consumers must then rebuild
     /// from the journal instead of trusting their previous head.
     Recovered { head: Lsn },
+    /// The target keeper or cluster version does not support this request or
+    /// feature.
+    Unsupported,
+    /// A retained record or WAL segment slice failed its checksum on the
+    /// replica, which has been durably quarantined.
+    Corrupted,
 }
 
 impl fmt::Display for JournalError {

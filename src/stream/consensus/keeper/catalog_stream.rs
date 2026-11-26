@@ -46,7 +46,6 @@ use uuid::Uuid;
 use super::{Engine, Group, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
 use crate::stream::consensus::{
     Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, decode, encode,
-    network::Frame,
     state::{Command, Outcome},
     storage::CatalogEntry,
 };
@@ -261,7 +260,7 @@ impl Engine {
                     self.serve_catalog_stream(request).await
                 } else {
                     let budget = end.saturating_duration_since(Instant::now()).min(ATTEMPT);
-                    self.rpc.call(keeper, Frame::Client(request), budget).await
+                    self.rpc.call_application(keeper, request, budget).await
                 }
             }
         })

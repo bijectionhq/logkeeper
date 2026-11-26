@@ -46,7 +46,7 @@ use super::{
     Credentials, Domains, Fence, Genesis, Keepers, NodeId, Raft, Vote,
     catalog::Catalog,
     invalid,
-    network::{Frame, Lane, Network, Reply, Request, Rpc},
+    network::{Lane, Network, Reply, Request, Rpc},
     placement::Placement,
     state::{Command, Outcome},
     storage::{self, Authority, Disk, Enrollment, FollowerAppend, LogStore, Record, StateMachine},
@@ -338,10 +338,18 @@ impl Config {
         let summary = self.summary();
         let keeper = KeeperId(self.keeper.as_u128());
         let acceptors = [
-            self.tls.server_protocol(keeper, Lane::Application.alpn())?,
-            self.tls.server_protocol(keeper, Lane::Control.alpn())?,
             self.tls
-                .server_protocols(keeper, &[Lane::Bulk.alpn(), Lane::Replication.alpn()])?,
+                .server_protocols(keeper, Lane::Application.alpns())?,
+            self.tls.server_protocols(keeper, Lane::Control.alpns())?,
+            self.tls.server_protocols(
+                keeper,
+                &[
+                    super::BULK_ALPN,
+                    super::PREV_BULK_ALPN,
+                    super::REPLICATION_ALPN,
+                    super::PREV_REPLICATION_ALPN,
+                ],
+            )?,
         ];
         let admin_tls = match &self.admin {
             Some(admin) if admin.mtls => Some(self.tls.server_protocols(keeper, &[b"http/1.1"])?),
@@ -350,22 +358,22 @@ impl Config {
         let enrollment = self.enrollment()?;
         let (rpc, control, bulk, replication) = (
             Rpc::new(
-                self.tls.peer_protocol(keeper, Lane::Application.alpn())?,
+                self.tls.peer_protocols(keeper, Lane::Application.alpns())?,
                 self.keepers,
                 Lane::Application,
             ),
             Rpc::new(
-                self.tls.peer_protocol(keeper, Lane::Control.alpn())?,
+                self.tls.peer_protocols(keeper, Lane::Control.alpns())?,
                 self.peers,
                 Lane::Control,
             ),
             Rpc::new(
-                self.tls.peer_protocol(keeper, Lane::Bulk.alpn())?,
+                self.tls.peer_protocols(keeper, Lane::Bulk.alpns())?,
                 self.bulk.clone(),
                 Lane::Bulk,
             ),
             Rpc::new(
-                self.tls.peer_protocol(keeper, Lane::Replication.alpn())?,
+                self.tls.peer_protocols(keeper, Lane::Replication.alpns())?,
                 self.bulk,
                 Lane::Replication,
             ),
@@ -1801,7 +1809,7 @@ impl Engine {
             }
         } else {
             self.rpc
-                .call(self.catalog_id, Frame::Client(request), REQUEST_TIMEOUT)
+                .call_application(self.catalog_id, request, REQUEST_TIMEOUT)
                 .await
         }
     }

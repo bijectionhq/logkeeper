@@ -22,9 +22,10 @@ use uuid::Uuid;
 use super::admission::{Charge, Control};
 use super::{Command, Engine, Group, Identity, Lane, SNAPSHOT_CHUNK_BYTES, invalid, transport};
 use crate::stream::consensus::{
-    Genesis, MAX_MESSAGE, MAX_RECORD, NodeId, RaftTypes, SnapshotMeta, Vote, decode, encode,
+    Genesis, MAX_MESSAGE, MAX_RECORD, NodeId, RaftTypes, SnapshotMeta, Vote, encode,
     network::{
-        self, AppendReply, ChunkReply, Frame, PeerRequest, Pong, SnapshotChunk, SnapshotMismatch,
+        self, AppendReply, BatchReply, ChunkReply, DecodedFrame, Frame, PeerRequest, Reply,
+        SnapshotChunk, SnapshotMismatch, WireVersion,
     },
     storage::{Admission, MAX_TRANSFER_FILE, SnapshotFile},
 };
@@ -255,19 +256,24 @@ impl Engine {
             Ok(_) => return Err(invalid("unknown peer keeper")),
             Err(_) => Identity::Client(transport::client_identity(certificate)?),
         };
-        let lane = if lane == Lane::Bulk && tls.alpn_protocol() == Some(Lane::Replication.alpn()) {
-            Lane::Replication
-        } else {
-            lane
-        };
-        if tls.alpn_protocol() != Some(lane.alpn())
-            || (lane != Lane::Application && !matches!(identity, Identity::Keeper(_)))
+        let negotiated = tls
+            .alpn_protocol()
+            .and_then(Lane::classify)
+            .ok_or_else(|| invalid("invalid consensus channel ALPN"))?;
+        let (negotiated_lane, version) = negotiated;
+        let allowed_lane =
+            negotiated_lane == lane || (lane == Lane::Bulk && negotiated_lane == Lane::Replication);
+        if !allowed_lane
+            || (negotiated_lane != Lane::Application && !matches!(identity, Identity::Keeper(_)))
         {
             return Err(invalid("invalid consensus channel identity"));
         }
+        let lane = negotiated_lane;
         if let (Lane::Control | Lane::Replication, Identity::Keeper(sender)) = (lane, &identity) {
             drop(pending);
-            return self.multiplexed(channel, lane, *sender, control).await;
+            return self
+                .multiplexed(channel, lane, version, *sender, control)
+                .await;
         }
         let _connection = connections
             .clone()
@@ -281,16 +287,33 @@ impl Engine {
                 network::receive_size(&mut channel, lane.frame_limit()),
             )
             .await??;
-            let frame = timeout(
-                CONNECTION_TIMEOUT,
-                network::receive_body(&mut channel, size),
-            )
-            .await??;
+            let mut body = vec![0; size];
+            timeout(CONNECTION_TIMEOUT, channel.read_exact(&mut body)).await??;
+            let frame = match network::decode_frame(&body, version)? {
+                DecodedFrame::Frame(frame) => frame,
+                DecodedFrame::Unsupported(reason) if lane == Lane::Application => {
+                    let encoded = network::encode_reply(Reply::Unsupported(reason), version)?;
+                    timeout(
+                        CONNECTION_TIMEOUT,
+                        network::send_encoded(&mut channel, &encoded),
+                    )
+                    .await??;
+                    continue;
+                }
+                DecodedFrame::Unsupported(reason) => {
+                    return Err(network::unsupported(reason));
+                }
+            };
             match frame {
                 Frame::Client(request) if lane == Lane::Application => {
                     let reply = self.request(&identity, request).await?;
                     self.require_media()?;
-                    timeout(CONNECTION_TIMEOUT, network::send(&mut channel, &reply)).await??;
+                    let encoded = network::encode_reply(reply, version)?;
+                    timeout(
+                        CONNECTION_TIMEOUT,
+                        network::send_encoded(&mut channel, &encoded),
+                    )
+                    .await??;
                 }
                 Frame::Peer(genesis, request) if lane == Lane::Bulk => {
                     let Identity::Keeper(sender) = identity else {
@@ -319,11 +342,12 @@ impl Engine {
         self: &Arc<Self>,
         channel: tokio_rustls::server::TlsStream<TcpStream>,
         lane: Lane,
+        version: WireVersion,
         sender: NodeId,
         control: &Arc<Control>,
     ) -> io::Result<()> {
         let (mut read, mut write) = tokio::io::split(channel);
-        let (answers, mut answered) = mpsc::unbounded_channel::<(u64, Result<Vec<u8>, String>)>();
+        let (answers, mut answered) = mpsc::unbounded_channel::<(u64, BatchReply)>();
         let reading = async {
             let mut work = JoinSet::new();
             loop {
@@ -359,22 +383,33 @@ impl Engine {
                 timeout(CONNECTION_TIMEOUT, read.read_exact(&mut body)).await??;
                 let mut batch = Vec::new();
                 for (id, message) in network::messages(&body)? {
-                    let (genesis, request) = match decode(message)? {
+                    let frame = match network::decode_frame(message, version)? {
+                        DecodedFrame::Frame(frame) => frame,
+                        DecodedFrame::Unsupported(reason) => {
+                            let _ = answers.send((id, BatchReply::Unsupported(reason)));
+                            continue;
+                        }
+                    };
+                    let (genesis, request) = match frame {
                         Frame::Peer(genesis, request) => (genesis, request),
                         // A ping costs one status read and no admission.
                         Frame::Liveness(incarnation) if lane == Lane::Control => {
                             let (engine, answers) = (self.clone(), answers.clone());
                             work.spawn(async move {
-                                let known_as = engine
-                                    .recognition
-                                    .greet(Uuid::from_u128(sender), incarnation)
-                                    .await;
-                                let pong = Pong {
-                                    status: engine.keeper_status().await,
-                                    incarnation: engine.recognition.own(),
-                                    known_as,
-                                };
-                                let reply = encode(&pong).map_err(|error| error.to_string());
+                                let reply = engine.pong(sender, incarnation, version).await;
+                                let _ = answers.send((id, reply));
+                            });
+                            continue;
+                        }
+                        Frame::Ping {
+                            incarnation,
+                            version: build,
+                            features,
+                        } if lane == Lane::Control && version == WireVersion::Current => {
+                            self.record_incoming_ping(Uuid::from_u128(sender), build, features);
+                            let (engine, answers) = (self.clone(), answers.clone());
+                            work.spawn(async move {
+                                let reply = engine.pong(sender, incarnation, version).await;
                                 let _ = answers.send((id, reply));
                             });
                             continue;
@@ -412,15 +447,25 @@ impl Engine {
                                 PeerRequest::Append(_) => encode(&AppendReply::Busy),
                                 _ => Err(refused),
                             };
-                            let _ = answers.send((id, answer.map_err(|error| error.to_string())));
+                            let reply = match answer {
+                                Ok(bytes) => BatchReply::Ok(bytes),
+                                Err(error) => BatchReply::Err(error.to_string()),
+                            };
+                            let _ = answers.send((id, reply));
                             continue;
                         }
                     };
                     let (engine, answers) = (self.clone(), answers.clone());
                     work.spawn(async move {
                         let _admission = admission;
-                        let reply = engine.peer(sender, genesis, request, body).await;
-                        let _ = answers.send((id, reply.map_err(|error| error.to_string())));
+                        let reply = match engine.peer(sender, genesis, request, body).await {
+                            Ok(bytes) => BatchReply::Ok(bytes),
+                            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                                BatchReply::Unsupported(error.to_string())
+                            }
+                            Err(error) => BatchReply::Err(error.to_string()),
+                        };
+                        let _ = answers.send((id, reply));
                     });
                 }
             }
@@ -428,7 +473,7 @@ impl Engine {
         let writing = async {
             while let Some((id, reply)) = answered.recv().await {
                 let mut frame = network::batch_frame();
-                network::push_reply(&mut frame, id, &reply);
+                network::push_reply(&mut frame, id, &reply, version);
                 for _ in 1..network::BATCH_MESSAGES {
                     if frame.len() >= network::REPLY_BATCH_BYTES {
                         break;
@@ -436,7 +481,7 @@ impl Engine {
                     let Ok((id, reply)) = answered.try_recv() else {
                         break;
                     };
-                    network::push_reply(&mut frame, id, &reply);
+                    network::push_reply(&mut frame, id, &reply, version);
                 }
                 self.require_media()?;
                 timeout(CONNECTION_TIMEOUT, async {

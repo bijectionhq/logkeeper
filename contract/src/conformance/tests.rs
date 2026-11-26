@@ -14,14 +14,18 @@ async fn run_controlled(make: impl Fn(Identity) -> Arc<dyn Journal>) {
 #[test]
 fn memory() {
     let journal = MemoryJournal::new(LIMITS);
-    block_on(run_controlled(|identity| Arc::new(journal.handle(identity))));
+    block_on(run_controlled(|identity| {
+        Arc::new(journal.handle(identity))
+    }));
 }
 
 #[test]
 fn file() {
     let scratch = Scratch::new();
     let journal = FileJournal::open(scratch.path().join("journal"), LIMITS).unwrap();
-    block_on(run_controlled(|identity| Arc::new(journal.handle(identity))));
+    block_on(run_controlled(|identity| {
+        Arc::new(journal.handle(identity))
+    }));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

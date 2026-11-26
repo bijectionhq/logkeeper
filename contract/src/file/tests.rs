@@ -49,10 +49,13 @@ fn refuses_numeric_identity_frames() {
         .write_all(&frame)
         .unwrap();
 
-    assert!(matches!(
-        FileJournal::open(&path, LIMITS),
-        Err(error) if error.kind() == io::ErrorKind::InvalidData
-    ), "reference journal accepted an obsolete numeric identity frame");
+    assert!(
+        matches!(
+            FileJournal::open(&path, LIMITS),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData
+        ),
+        "reference journal accepted an obsolete numeric identity frame"
+    );
 }
 
 async fn populate(journal: &FileJournal) {

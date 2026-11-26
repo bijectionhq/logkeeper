@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::{Closed, Engine, Group, Outcome, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
 use crate::stream::consensus::{
     Genesis, LogId, Stage, decisions,
-    network::{Frame, Proof},
+    network::Proof,
     ownership::{self, Change},
     storage::Record,
 };
@@ -28,9 +28,9 @@ impl Engine {
         }
         let Reply::Placement(proof) = self
             .rpc
-            .call(
+            .call_application(
                 authority,
-                Frame::Client(Request::PlacementProof(genesis.stream)),
+                Request::PlacementProof(genesis.stream),
                 REQUEST_TIMEOUT,
             )
             .await?

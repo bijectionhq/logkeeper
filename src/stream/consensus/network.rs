@@ -36,13 +36,22 @@ use tokio_rustls::TlsConnector;
 
 use super::decisions::{self, AppendFit, EntryKind, PeerKind, PeerLane};
 use super::{
-    ALPN, BULK_ALPN, CONTROL_ALPN, Entry, Fence, Genesis, KeeperStatus, Keepers, LogId,
-    MAX_MESSAGE, NodeId, REPLICATION_ALPN, RaftTypes, SnapshotMeta, Stage, Vote, decode, encode,
+    ALPN, BULK_ALPN, CONTROL_ALPN, Entry, Fence, Genesis, KeeperStatus, KeeperStatusV1, Keepers,
+    LogId, MAX_MESSAGE, NodeId, PREV_ALPN, PREV_BULK_ALPN, PREV_CONTROL_ALPN,
+    PREV_REPLICATION_ALPN, REPLICATION_ALPN, RaftTypes, SnapshotMeta, Stage, Vote, decode, encode,
     invalid, options,
     state::{Command, Outcome},
     storage::{SnapshotFile, StateMachine},
 };
-use crate::stream::transport::{Channel, connect_protocol};
+use crate::stream::transport::{Channel, connect_protocols, is_alpn_mismatch};
+
+/// Wire protocol version negotiated via TLS ALPN. Rolling upgrades support
+/// adjacent versions `Previous` (N-1) and `Current` (N) only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WireVersion {
+    Previous,
+    Current,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Lane {
@@ -50,6 +59,16 @@ pub(super) enum Lane {
     Control,
     Replication,
     Bulk,
+}
+
+/// Whether `error` indicates an ALPN / protocol version mismatch rather than a
+/// dead or crashed keeper.
+pub(super) fn is_version_mismatch(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Unsupported || is_alpn_mismatch(error)
+}
+
+pub(super) fn unsupported(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, message.into())
 }
 
 /// Entries in one AppendEntries. The lane's frame limit still splits larger
@@ -74,6 +93,37 @@ impl Lane {
             Self::Control => CONTROL_ALPN,
             Self::Replication => REPLICATION_ALPN,
             Self::Bulk => BULK_ALPN,
+        }
+    }
+
+    pub fn alpns(self) -> &'static [&'static [u8]] {
+        match self {
+            Self::Application => &[ALPN, PREV_ALPN],
+            Self::Control => &[CONTROL_ALPN, PREV_CONTROL_ALPN],
+            Self::Replication => &[REPLICATION_ALPN, PREV_REPLICATION_ALPN],
+            Self::Bulk => &[BULK_ALPN, PREV_BULK_ALPN],
+        }
+    }
+
+    pub fn classify(alpn: &[u8]) -> Option<(Self, WireVersion)> {
+        if alpn == ALPN {
+            Some((Self::Application, WireVersion::Current))
+        } else if alpn == PREV_ALPN {
+            Some((Self::Application, WireVersion::Previous))
+        } else if alpn == CONTROL_ALPN {
+            Some((Self::Control, WireVersion::Current))
+        } else if alpn == PREV_CONTROL_ALPN {
+            Some((Self::Control, WireVersion::Previous))
+        } else if alpn == REPLICATION_ALPN {
+            Some((Self::Replication, WireVersion::Current))
+        } else if alpn == PREV_REPLICATION_ALPN {
+            Some((Self::Replication, WireVersion::Previous))
+        } else if alpn == BULK_ALPN {
+            Some((Self::Bulk, WireVersion::Current))
+        } else if alpn == PREV_BULK_ALPN {
+            Some((Self::Bulk, WireVersion::Previous))
+        } else {
+            None
         }
     }
 
@@ -252,12 +302,20 @@ pub(super) enum Frame {
     Client(Request),
     Peer(Genesis, PeerRequest),
     /// A keeper-level liveness ping on the control lane, carrying the
-    /// sender's media incarnation and answered with a `Pong`.
+    /// sender's media incarnation and answered with a `Pong` (the N-1
+    /// layout, still sent to N-1 peers).
     Liveness(uuid::Uuid),
+    /// A liveness ping on the N control lane that also carries the sender's
+    /// build version and feature bits.
+    Ping {
+        incarnation: uuid::Uuid,
+        version: String,
+        features: u64,
+    },
 }
 
 /// The answer to a liveness ping.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Pong {
     /// The receiver's keeper-wide status.
     pub status: KeeperStatus,
@@ -266,6 +324,155 @@ pub(super) struct Pong {
     /// The incarnation the receiver first saw the sender under, `None` on
     /// their first contact.
     pub known_as: Option<uuid::Uuid>,
+}
+
+/// The N-1 wire layout of [`Pong`].
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(super) struct PongV1 {
+    pub status: KeeperStatusV1,
+    pub incarnation: uuid::Uuid,
+    pub known_as: Option<uuid::Uuid>,
+}
+
+impl From<&Pong> for PongV1 {
+    fn from(pong: &Pong) -> Self {
+        Self {
+            status: KeeperStatusV1::from(&pong.status),
+            incarnation: pong.incarnation,
+            known_as: pong.known_as,
+        }
+    }
+}
+
+impl From<PongV1> for Pong {
+    fn from(pong: PongV1) -> Self {
+        Self {
+            status: pong.status.into(),
+            incarnation: pong.incarnation,
+            known_as: pong.known_as,
+        }
+    }
+}
+
+/// Encodes a ping answer for a peer speaking `version`.
+pub(super) fn encode_pong(pong: &Pong, version: WireVersion) -> io::Result<Vec<u8>> {
+    match version {
+        WireVersion::Current => encode(pong),
+        WireVersion::Previous => encode(&PongV1::from(pong)),
+    }
+}
+
+/// Highest known bincode variant tag on `Frame`, `Request` and `PeerRequest`.
+const MAX_FRAME_TAG_V1: u32 = 2;
+const MAX_FRAME_TAG_CURRENT: u32 = 3;
+const MAX_REQUEST_TAG_V1: u32 = 27;
+const MAX_REQUEST_TAG_CURRENT: u32 = 29;
+const MAX_PEER_REQUEST_TAG_V1: u32 = 5;
+const MAX_PEER_REQUEST_TAG_CURRENT: u32 = 5;
+/// Serialized size of `Genesis` under fixint bincode: StreamId(16) + [Uuid; 3](48) + u64(8).
+const GENESIS_WIRE_BYTES: usize = 16 + 48 + 8;
+
+pub(super) enum DecodedFrame {
+    Frame(Frame),
+    Unsupported(String),
+}
+
+/// Decodes a wire `Frame` for `version`. On `WireVersion::Current`, unknown
+/// `Frame`, `Request`, or `PeerRequest` variant tags return
+/// `DecodedFrame::Unsupported` so the receiver can reply with a typed
+/// `Unsupported` instead of closing the connection.
+pub(super) fn decode_frame(bytes: &[u8], version: WireVersion) -> io::Result<DecodedFrame> {
+    if bytes.len() < 4 {
+        return Err(invalid("truncated consensus frame"));
+    }
+    let frame_tag = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    let (max_frame, max_req, max_peer) = match version {
+        WireVersion::Previous => (
+            MAX_FRAME_TAG_V1,
+            MAX_REQUEST_TAG_V1,
+            MAX_PEER_REQUEST_TAG_V1,
+        ),
+        WireVersion::Current => (
+            MAX_FRAME_TAG_CURRENT,
+            MAX_REQUEST_TAG_CURRENT,
+            MAX_PEER_REQUEST_TAG_CURRENT,
+        ),
+    };
+    if frame_tag > max_frame {
+        return match version {
+            WireVersion::Current => Ok(DecodedFrame::Unsupported(format!(
+                "unsupported frame variant {frame_tag}"
+            ))),
+            WireVersion::Previous => Err(unsupported(format!(
+                "unsupported N-1 frame variant {frame_tag}"
+            ))),
+        };
+    }
+    if frame_tag == 0 && bytes.len() >= 8 {
+        let req_tag = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if req_tag > max_req {
+            return match version {
+                WireVersion::Current => Ok(DecodedFrame::Unsupported(format!(
+                    "unsupported request variant {req_tag}"
+                ))),
+                WireVersion::Previous => Err(unsupported(format!(
+                    "unsupported N-1 request variant {req_tag}"
+                ))),
+            };
+        }
+    }
+    if frame_tag == 1 && bytes.len() >= 4 + GENESIS_WIRE_BYTES + 4 {
+        let start = 4 + GENESIS_WIRE_BYTES;
+        let peer_tag = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
+        if peer_tag > max_peer {
+            return match version {
+                WireVersion::Current => Ok(DecodedFrame::Unsupported(format!(
+                    "unsupported peer request variant {peer_tag}"
+                ))),
+                WireVersion::Previous => Err(unsupported(format!(
+                    "unsupported N-1 peer request variant {peer_tag}"
+                ))),
+            };
+        }
+    }
+    Ok(DecodedFrame::Frame(decode(bytes)?))
+}
+
+impl Request {
+    /// Whether a peer speaking `version` knows this request. One added
+    /// since N-1 is refused locally on an N-1 connection.
+    pub(super) fn supported_on(&self, version: WireVersion) -> bool {
+        match self {
+            Self::LocalConfiguration(_) | Self::Staging(_) => version == WireVersion::Current,
+            _ => true,
+        }
+    }
+}
+
+impl PeerRequest {
+    pub(super) fn supported_on(&self, _version: WireVersion) -> bool {
+        true
+    }
+}
+
+impl Frame {
+    /// Encodes `self` for a peer speaking `version`, never emitting a variant
+    /// that an N-1 peer cannot decode.
+    pub(super) fn encode_for(&self, version: WireVersion) -> io::Result<Vec<u8>> {
+        match version {
+            WireVersion::Current => encode(self),
+            WireVersion::Previous => match self {
+                Self::Ping { incarnation, .. } => encode(&Self::Liveness(*incarnation)),
+                Self::Client(request) if !request.supported_on(WireVersion::Previous) => {
+                    Err(unsupported("request requires a newer keeper protocol"))
+                }
+                Self::Peer(_, request) if !request.supported_on(WireVersion::Previous) => {
+                    Err(unsupported("peer request requires a newer keeper protocol"))
+                }
+                frame => encode(frame),
+            },
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -448,6 +655,99 @@ pub(super) enum Reply {
     /// The configuration a keeper's own copy finalized, if it holds one.
     /// Added last.
     Configured(Option<super::Configuration>),
+    /// Typed refusal when the receiver does not recognize a request or
+    /// feature on the current protocol lane.
+    Unsupported(String),
+}
+
+/// The N-1 wire codec for [`Reply`], the bincode layout of
+/// `logkeeper-consensus/1` peers and clients. It has no `Configured`: N-1
+/// knows no `LocalConfiguration` request to ask for one.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) enum ReplyV1 {
+    Decision(Outcome),
+    Leader(Option<uuid::Uuid>),
+    Catalog(Genesis, Vec<uuid::Uuid>),
+    Staged(Stage),
+    Placement(Proof),
+    Generation(u64),
+    ScopedPage {
+        genesis: Genesis,
+        configuration: Option<super::Configuration>,
+        outcome: Outcome,
+    },
+    Status(KeeperStatusV1),
+}
+
+fn outcome_v1(outcome: Outcome) -> Outcome {
+    match outcome {
+        Outcome::Refused(
+            journal_contract::JournalError::Unsupported | journal_contract::JournalError::Corrupted,
+        ) => Outcome::Refused(journal_contract::JournalError::Unavailable),
+        other => other,
+    }
+}
+
+impl ReplyV1 {
+    pub(super) fn from_reply(reply: Reply) -> io::Result<Self> {
+        Ok(match reply {
+            Reply::Decision(outcome) => Self::Decision(outcome_v1(outcome)),
+            Reply::Leader(leader) => Self::Leader(leader),
+            Reply::Catalog(genesis, contacts) => Self::Catalog(genesis, contacts),
+            Reply::Staged(stage) => Self::Staged(stage),
+            Reply::Placement(proof) => Self::Placement(proof),
+            Reply::Generation(generation) => Self::Generation(generation),
+            Reply::ScopedPage {
+                genesis,
+                configuration,
+                outcome,
+            } => Self::ScopedPage {
+                genesis,
+                configuration,
+                outcome: outcome_v1(outcome),
+            },
+            Reply::Status(status) => Self::Status(KeeperStatusV1::from(&status)),
+            Reply::Configured(_) => {
+                return Err(unsupported("N-1 knows no local configuration request"));
+            }
+            Reply::Unsupported(reason) => return Err(unsupported(reason)),
+        })
+    }
+
+    pub(super) fn into_reply(self) -> Reply {
+        match self {
+            Self::Decision(outcome) => Reply::Decision(outcome),
+            Self::Leader(leader) => Reply::Leader(leader),
+            Self::Catalog(genesis, contacts) => Reply::Catalog(genesis, contacts),
+            Self::Staged(stage) => Reply::Staged(stage),
+            Self::Placement(proof) => Reply::Placement(proof),
+            Self::Generation(generation) => Reply::Generation(generation),
+            Self::ScopedPage {
+                genesis,
+                configuration,
+                outcome,
+            } => Reply::ScopedPage {
+                genesis,
+                configuration,
+                outcome,
+            },
+            Self::Status(status) => Reply::Status(KeeperStatus::from(status)),
+        }
+    }
+}
+
+pub(super) fn encode_reply(reply: Reply, version: WireVersion) -> io::Result<Vec<u8>> {
+    match version {
+        WireVersion::Current => encode(&reply),
+        WireVersion::Previous => encode(&ReplyV1::from_reply(reply)?),
+    }
+}
+
+pub(super) fn decode_reply(bytes: &[u8], version: WireVersion) -> io::Result<Reply> {
+    match version {
+        WireVersion::Current => decode(bytes),
+        WireVersion::Previous => Ok(decode::<ReplyV1>(bytes)?.into_reply()),
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -458,6 +758,7 @@ pub(super) struct Proof {
     pub stage: Option<Stage>,
 }
 
+#[cfg(test)]
 pub(super) async fn receive<T: DeserializeOwned>(
     channel: &mut (impl AsyncRead + Unpin),
     limit: u64,
@@ -477,6 +778,17 @@ pub(super) async fn receive_size(
     Ok(size as usize)
 }
 
+pub(super) async fn receive_raw(
+    channel: &mut (impl AsyncRead + Unpin),
+    limit: u64,
+) -> io::Result<Vec<u8>> {
+    let size = receive_size(channel, limit).await?;
+    let mut body = vec![0; size];
+    channel.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+#[cfg(test)]
 pub(super) async fn receive_body<T: DeserializeOwned>(
     channel: &mut (impl AsyncRead + Unpin),
     size: usize,
@@ -486,6 +798,7 @@ pub(super) async fn receive_body<T: DeserializeOwned>(
     decode(&body)
 }
 
+#[cfg(test)]
 pub(super) async fn send<T: Serialize>(
     channel: &mut (impl AsyncWrite + Unpin),
     message: &T,
@@ -540,10 +853,21 @@ fn push_message(frame: &mut Vec<u8>, id: u64, message: &[u8]) {
     frame.extend_from_slice(message);
 }
 
-pub(super) fn push_reply(frame: &mut Vec<u8>, id: u64, reply: &Result<Vec<u8>, String>) {
+pub(super) enum BatchReply {
+    Ok(Vec<u8>),
+    Err(String),
+    /// Typed unsupported status (wire status byte `2`, Current ALPN only).
+    Unsupported(String),
+}
+
+pub(super) fn push_reply(frame: &mut Vec<u8>, id: u64, reply: &BatchReply, version: WireVersion) {
     let (status, bytes) = match reply {
-        Ok(bytes) => (0, bytes.as_slice()),
-        Err(text) => (1, text.as_bytes()),
+        BatchReply::Ok(bytes) => (0, bytes.as_slice()),
+        BatchReply::Err(text) => (1, text.as_bytes()),
+        BatchReply::Unsupported(text) => match version {
+            WireVersion::Current => (2, text.as_bytes()),
+            WireVersion::Previous => (1, text.as_bytes()),
+        },
     };
     frame.extend_from_slice(&id.to_be_bytes());
     frame.push(status);
@@ -582,7 +906,13 @@ pub(super) fn messages(mut body: &[u8]) -> io::Result<Vec<(u64, &[u8])>> {
     Ok(messages)
 }
 
-fn replies(mut body: &[u8]) -> io::Result<Vec<(u64, Result<&[u8], &[u8]>)>> {
+enum RawReply<'a> {
+    Ok(&'a [u8]),
+    Err(&'a [u8]),
+    Unsupported(&'a [u8]),
+}
+
+fn replies(mut body: &[u8]) -> io::Result<Vec<(u64, RawReply<'_>)>> {
     let mut replies = Vec::new();
     while !body.is_empty() {
         let id = take_u64(&mut body)?;
@@ -592,8 +922,9 @@ fn replies(mut body: &[u8]) -> io::Result<Vec<(u64, Result<&[u8], &[u8]>)>> {
         replies.push((
             id,
             match status {
-                0 => Ok(bytes),
-                1 => Err(bytes),
+                0 => RawReply::Ok(bytes),
+                1 => RawReply::Err(bytes),
+                2 => RawReply::Unsupported(bytes),
                 _ => return Err(invalid("invalid peer reply status")),
             },
         ));
@@ -630,7 +961,7 @@ pub(super) struct Rpc {
 struct Connections {
     tls: TlsConnector,
     keepers: Keepers,
-    idle: Mutex<HashMap<uuid::Uuid, Vec<Channel>>>,
+    idle: Mutex<HashMap<uuid::Uuid, Vec<(Channel, WireVersion)>>>,
     /// In-flight snapshot chunks per target on the bulk lane.
     in_flight: Mutex<HashMap<uuid::Uuid, Arc<Semaphore>>>,
     /// The multiplexed channel to each target on the control and
@@ -666,17 +997,17 @@ struct PeerChannel {
 /// arrives or the connection fails, even if the caller gave up, so the
 /// sender never exceeds the receiver's share.
 struct Outgoing {
-    message: Vec<u8>,
+    frame: Frame,
     permit: OwnedSemaphorePermit,
     reply: oneshot::Sender<Answer>,
 }
 
 enum Answer {
-    Reply(Vec<u8>),
+    Reply(WireVersion, Vec<u8>),
     Failed(io::Error),
     /// The connection closed before writing the message, so a fresh one may
     /// send it.
-    NotSent(Vec<u8>, OwnedSemaphorePermit),
+    NotSent(Frame, OwnedSemaphorePermit),
 }
 
 type Waiting = Mutex<HashMap<u64, (oneshot::Sender<Answer>, OwnedSemaphorePermit)>>;
@@ -690,13 +1021,18 @@ impl Connections {
         &self,
         target: uuid::Uuid,
         address: &std::net::SocketAddr,
-    ) -> io::Result<Channel> {
-        let (peer, channel) =
-            connect_protocol(&self.tls, &address.to_string(), self.lane.alpn()).await?;
+    ) -> io::Result<(Channel, WireVersion)> {
+        let (peer, negotiated, channel) =
+            connect_protocols(&self.tls, &address.to_string(), self.lane.alpns()).await?;
         if peer.0 != target.as_u128() {
             return Err(invalid("keeper certificate does not match route"));
         }
-        Ok(channel)
+        let (lane, version) = Lane::classify(&negotiated)
+            .ok_or_else(|| unsupported("negotiated unknown keeper ALPN"))?;
+        if lane != self.lane {
+            return Err(unsupported("negotiated ALPN for the wrong lane"));
+        }
+        Ok((channel, version))
     }
 
     async fn run(
@@ -709,7 +1045,7 @@ impl Connections {
         let dial = self.dial.lock().clone();
         #[cfg(test)]
         if let Some(dial) = dial {
-            return self.drive(Ok(dial()), queue).await;
+            return self.drive(Ok((dial(), WireVersion::Current)), queue).await;
         }
         let connected = timeout(CONNECT_TIMEOUT, self.connect(target, &address))
             .await
@@ -721,18 +1057,18 @@ impl Connections {
     /// messages then fail and unwritten ones are handed back unsent.
     async fn drive<S: AsyncRead + AsyncWrite>(
         &self,
-        connected: io::Result<S>,
+        connected: io::Result<(S, WireVersion)>,
         mut queue: mpsc::UnboundedReceiver<Outgoing>,
     ) {
         let waiting = Waiting::default();
         let mut carry = None;
         let refused = match connected {
             Err(error) => Some(error),
-            Ok(channel) => {
+            Ok((channel, version)) => {
                 let (read, write) = tokio::io::split(channel);
                 tokio::select! {
-                    _ = self.write_batches(write, &mut queue, &mut carry, &waiting) => {}
-                    _ = read_replies(read, &waiting) => {}
+                    _ = self.write_batches(write, version, &mut queue, &mut carry, &waiting) => {}
+                    _ = read_replies(read, version, &waiting) => {}
                 }
                 None
             }
@@ -746,8 +1082,8 @@ impl Connections {
             .chain(std::iter::from_fn(|| queue.try_recv().ok()));
         for outgoing in unsent {
             let answer = match &refused {
-                Some(error) => Answer::Failed(io::Error::new(error.kind(), error.to_string())),
-                None => Answer::NotSent(outgoing.message, outgoing.permit),
+                Some(error) => Answer::Failed(clone_io_error(error)),
+                None => Answer::NotSent(outgoing.frame, outgoing.permit),
             };
             let _ = outgoing.reply.send(answer);
         }
@@ -756,6 +1092,7 @@ impl Connections {
     async fn write_batches(
         &self,
         mut write: WriteHalf<impl AsyncWrite>,
+        version: WireVersion,
         queue: &mut mpsc::UnboundedReceiver<Outgoing>,
         carry: &mut Option<Outgoing>,
         waiting: &Waiting,
@@ -798,11 +1135,28 @@ impl Connections {
                 if outgoing.reply.is_closed() {
                     continue;
                 }
-                if count > 0 && frame.len() + MESSAGE_HEADER + outgoing.message.len() > limit {
+                let message = match outgoing.frame.encode_for(version) {
+                    Ok(bytes)
+                        if (bytes.len() + MESSAGE_HEADER) as u64 <= self.lane.frame_limit() =>
+                    {
+                        bytes
+                    }
+                    Ok(_) => {
+                        let _ = outgoing
+                            .reply
+                            .send(Answer::Failed(invalid("peer message exceeds its lane")));
+                        continue;
+                    }
+                    Err(error) => {
+                        let _ = outgoing.reply.send(Answer::Failed(error));
+                        continue;
+                    }
+                };
+                if count > 0 && frame.len() + MESSAGE_HEADER + message.len() > limit {
                     *carry = Some(outgoing);
                     break;
                 }
-                push_message(&mut frame, next, &outgoing.message);
+                push_message(&mut frame, next, &message);
                 waiting
                     .lock()
                     .insert(next, (outgoing.reply, outgoing.permit));
@@ -822,7 +1176,21 @@ impl Connections {
     }
 }
 
-async fn read_replies(mut read: ReadHalf<impl AsyncRead>, waiting: &Waiting) -> io::Result<()> {
+/// Preserves version-mismatch classification when fanning out a connection
+/// error across queued callers.
+fn clone_io_error(error: &io::Error) -> io::Error {
+    if is_version_mismatch(error) {
+        unsupported(error.to_string())
+    } else {
+        io::Error::new(error.kind(), error.to_string())
+    }
+}
+
+async fn read_replies(
+    mut read: ReadHalf<impl AsyncRead>,
+    version: WireVersion,
+    waiting: &Waiting,
+) -> io::Result<()> {
     loop {
         let size = receive_size(&mut read, MAX_MESSAGE).await?;
         let mut body = vec![0; size];
@@ -833,9 +1201,12 @@ async fn read_replies(mut read: ReadHalf<impl AsyncRead>, waiting: &Waiting) -> 
             // A caller that timed out drops its late reply here.
             if let Some((sender, _permit)) = waiting.remove(&id) {
                 let _ = sender.send(match reply {
-                    Ok(bytes) => Answer::Reply(bytes.to_vec()),
-                    Err(text) => {
+                    RawReply::Ok(bytes) => Answer::Reply(version, bytes.to_vec()),
+                    RawReply::Err(text) => {
                         Answer::Failed(io::Error::other(String::from_utf8_lossy(text).into_owned()))
+                    }
+                    RawReply::Unsupported(text) => {
+                        Answer::Failed(unsupported(String::from_utf8_lossy(text).into_owned()))
                     }
                 });
             }
@@ -890,6 +1261,53 @@ impl Rpc {
         request: Frame,
         deadline: Duration,
     ) -> io::Result<T> {
+        let (_, bytes) = self.faulted(target, request, deadline).await?;
+        decode(&bytes)
+    }
+
+    /// Calls a keeper on the application lane, automatically adapting between
+    /// the N and N-1 codecs based on the negotiated ALPN.
+    pub async fn call_application(
+        &self,
+        target: uuid::Uuid,
+        request: Request,
+        deadline: Duration,
+    ) -> io::Result<Reply> {
+        let (version, bytes) = self
+            .faulted(target, Frame::Client(request), deadline)
+            .await?;
+        decode_reply(&bytes, version)
+    }
+
+    /// Sends a liveness ping on the control lane carrying this keeper's build
+    /// version and feature bits (or an N-1 `Frame::Liveness` to an N-1 peer).
+    pub async fn ping(
+        &self,
+        target: uuid::Uuid,
+        incarnation: uuid::Uuid,
+        version: String,
+        features: u64,
+        deadline: Duration,
+    ) -> io::Result<Pong> {
+        let frame = Frame::Ping {
+            incarnation,
+            version,
+            features,
+        };
+        let (wire, bytes) = self.faulted(target, frame, deadline).await?;
+        Ok(match wire {
+            WireVersion::Current => decode::<Pong>(&bytes)?,
+            WireVersion::Previous => decode::<PongV1>(&bytes)?.into(),
+        })
+    }
+
+    /// One exchange within `deadline`, through the fault filter of tests.
+    async fn faulted(
+        &self,
+        target: uuid::Uuid,
+        request: Frame,
+        deadline: Duration,
+    ) -> io::Result<(WireVersion, Vec<u8>)> {
         #[cfg(test)]
         let action = self
             .inner
@@ -915,13 +1333,13 @@ impl Rpc {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
-                    self.exchange(target, request).await
+                    self.exchange_raw(target, request).await
                 })
                 .await?;
             }
             RpcFault::DropReply(delay) => {
                 let _ = timeout(deadline, async {
-                    let _ = self.exchange::<T>(target, request).await;
+                    let _ = self.exchange_raw(target, request).await;
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
@@ -946,27 +1364,13 @@ impl Rpc {
                 }
             }
         }
-        timeout(deadline, self.exchange(target, request)).await?
+        timeout(deadline, self.exchange_raw(target, request)).await?
     }
 
     #[cfg(test)]
     async fn send_duplicate(&self, target: uuid::Uuid, encoded: Vec<u8>) -> io::Result<()> {
         let frame: Frame = decode(&encoded)?;
-        let address = *self
-            .keepers()
-            .get(&target)
-            .ok_or_else(|| invalid("unknown keeper"))?;
-        match self.inner.lane {
-            Lane::Control | Lane::Replication => {
-                let _ = self.multiplexed(target, address, &frame).await;
-            }
-            Lane::Bulk => {
-                let _ = self.exchange::<ChunkReply>(target, frame).await;
-            }
-            Lane::Application => {
-                let _ = self.exchange::<Reply>(target, frame).await;
-            }
-        }
+        let _ = self.exchange_raw(target, frame).await;
         Ok(())
     }
 
@@ -976,17 +1380,17 @@ impl Rpc {
         self.inner.frames.load(Ordering::Relaxed)
     }
 
-    async fn exchange<T: DeserializeOwned>(
+    async fn exchange_raw(
         &self,
         target: uuid::Uuid,
         request: Frame,
-    ) -> io::Result<T> {
+    ) -> io::Result<(WireVersion, Vec<u8>)> {
         let address = self
             .keepers()
             .get(&target)
             .ok_or_else(|| invalid("unknown keeper"))?;
         if matches!(self.inner.lane, Lane::Control | Lane::Replication) {
-            return decode(&self.multiplexed(target, *address, &request).await?);
+            return self.multiplexed(target, *address, request).await;
         }
         let peer_lane = self.inner.lane != Lane::Application;
         let _permit = if peer_lane {
@@ -1003,31 +1407,33 @@ impl Rpc {
         };
         let cached = self.inner.idle.lock().get_mut(&target).and_then(Vec::pop);
         let reused = cached.is_some();
-        let mut channel = match cached {
-            Some(channel) => channel,
+        let (mut channel, mut version) = match cached {
+            Some(entry) => entry,
             None => self.connect(target, address).await?,
         };
-        let mut result = Self::round_trip(&mut channel, &request).await;
+        let encoded = request.encode_for(version)?;
+        let mut result = Self::round_trip_raw(&mut channel, &encoded).await;
         // The receiver may have closed an idle pooled connection. Peer
         // messages are idempotent, so they retry once on a fresh one.
         if result.is_err() && reused && peer_lane {
-            channel = self.connect(target, address).await?;
-            result = Self::round_trip(&mut channel, &request).await;
+            (channel, version) = self.connect(target, address).await?;
+            let encoded = request.encode_for(version)?;
+            result = Self::round_trip_raw(&mut channel, &encoded).await;
         }
         let result = result?;
         let mut idle = self.inner.idle.lock();
         let idle = idle.entry(target).or_default();
         if idle.len() < POOLED_CHANNELS {
-            idle.push(channel);
+            idle.push((channel, version));
         }
-        Ok(result)
+        Ok((version, result))
     }
 
     async fn connect(
         &self,
         target: uuid::Uuid,
         address: &std::net::SocketAddr,
-    ) -> io::Result<Channel> {
+    ) -> io::Result<(Channel, WireVersion)> {
         self.inner.connect(target, address).await
     }
 
@@ -1038,12 +1444,8 @@ impl Rpc {
         &self,
         target: uuid::Uuid,
         address: std::net::SocketAddr,
-        request: &Frame,
-    ) -> io::Result<Vec<u8>> {
-        let mut message = encode(request)?;
-        if (message.len() + MESSAGE_HEADER) as u64 > self.inner.lane.frame_limit() {
-            return Err(invalid("peer message exceeds its lane"));
-        }
+        mut frame: Frame,
+    ) -> io::Result<(WireVersion, Vec<u8>)> {
         let channel = self
             .inner
             .channels
@@ -1060,7 +1462,7 @@ impl Rpc {
         for _ in 0..2 {
             let (reply, answer) = oneshot::channel();
             let outgoing = Outgoing {
-                message,
+                frame,
                 permit,
                 reply,
             };
@@ -1075,26 +1477,23 @@ impl Rpc {
                     queue.as_ref().expect("open channel").send(outgoing)
                 {
                     queue.take();
-                    (message, permit) = (outgoing.message, outgoing.permit);
+                    (frame, permit) = (outgoing.frame, outgoing.permit);
                     continue;
                 }
             }
             match answer.await {
-                Ok(Answer::Reply(reply)) => return Ok(reply),
+                Ok(Answer::Reply(version, reply)) => return Ok((version, reply)),
                 Ok(Answer::Failed(error)) => return Err(error),
-                Ok(Answer::NotSent(unsent, held)) => (message, permit) = (unsent, held),
+                Ok(Answer::NotSent(unsent, held)) => (frame, permit) = (unsent, held),
                 Err(_) => return Err(closed()),
             }
         }
         Err(closed())
     }
 
-    async fn round_trip<T: DeserializeOwned>(
-        channel: &mut Channel,
-        request: &Frame,
-    ) -> io::Result<T> {
-        send(channel, request).await?;
-        receive(channel, MAX_MESSAGE).await
+    async fn round_trip_raw(channel: &mut Channel, request: &[u8]) -> io::Result<Vec<u8>> {
+        send_encoded(channel, request).await?;
+        receive_raw(channel, MAX_MESSAGE).await
     }
 }
 
@@ -1631,14 +2030,14 @@ mod tests {
                 };
                 let (delay, reply) = match policy(n, dial) {
                     Answering::Close => return,
-                    Answering::Fail => (Duration::ZERO, Err("refused".to_owned())),
-                    Answering::At(delay) => (delay, Ok(encode(&n).unwrap())),
+                    Answering::Fail => (Duration::ZERO, BatchReply::Err("refused".to_owned())),
+                    Answering::At(delay) => (delay, BatchReply::Ok(encode(&n).unwrap())),
                 };
                 let write = write.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
                     let mut frame = batch_frame();
-                    push_reply(&mut frame, id, &reply);
+                    push_reply(&mut frame, id, &reply, WireVersion::Current);
                     let _ = write.lock().await.write_all(seal_frame(&mut frame)).await;
                 });
             }

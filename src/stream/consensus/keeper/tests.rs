@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::stream::{
     consensus::{
         Client, Entry, Fence, LogId, RaftTypes,
-        network::{AppendReply, PeerRequest},
+        network::{AppendReply, Frame, PeerRequest},
     },
     transport::tests::{ca, credentials_with_usages},
 };
@@ -24,6 +24,7 @@ mod ops;
 mod park;
 mod recovery;
 mod repair;
+mod upgrades;
 
 pub(super) type RejectAppend =
     Box<dyn Fn(StreamId, NodeId, &AppendEntriesRequest<RaftTypes>) -> bool + Send + Sync>;

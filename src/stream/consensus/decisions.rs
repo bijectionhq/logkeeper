@@ -463,6 +463,39 @@ pub(super) fn keeper_dead(silent_ms: u64, repair_after_ms: u64) -> bool {
     silent_ms >= repair_after_ms
 }
 
+/// Whether a keeper triggers automatic voter repair. A keeper that answered
+/// with a protocol version mismatch is alive on another version and must
+/// never trigger mass repair.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (!version_mismatch && silent_ms >= repair_after_ms)
+))]
+pub(super) fn triggers_repair(
+    silent_ms: u64,
+    repair_after_ms: u64,
+    version_mismatch: bool,
+) -> bool {
+    !version_mismatch && keeper_dead(silent_ms, repair_after_ms)
+}
+
+/// Whether the finalized cluster feature level allows writing a format or
+/// command that requires `required`. New binaries keep writing old formats
+/// until the cluster finalizes at least `required`, so rollback stays safe.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (finalized >= required)
+))]
+pub(super) fn write_version_allows(finalized: u32, required: u32) -> bool {
+    finalized >= required
+}
+
+/// Whether a peer advertising `peer_features` supports every feature bit in
+/// `required`.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == ((peer_features & required) == required)
+))]
+pub(super) fn peer_supports(peer_features: u64, required: u64) -> bool {
+    (peer_features & required) == required
+}
+
 /// The wait after `failures` failed attempts: `base_ms` doubled once per
 /// failure, never above `cap_ms`. Repair and the wake sweep use it so that
 /// one stream that keeps failing yields to the others.

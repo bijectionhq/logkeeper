@@ -31,7 +31,7 @@ use crate::stream::{
         Entry, LogId, Stage, Vote, assignment,
         catalog::{self, Catalog},
         decisions, invalid,
-        network::{Frame, Lane, Rpc},
+        network::{Lane, Rpc},
         placement::Placement,
         state::{Command, Outcome},
         storage::{self, Disk, Record},
@@ -116,7 +116,7 @@ impl Config {
         let placement = self.validate()?;
         let keeper = KeeperId(self.keeper.as_u128());
         let rpc = Rpc::new(
-            self.tls.peer_protocol(keeper, Lane::Application.alpn())?,
+            self.tls.peer_protocols(keeper, Lane::Application.alpns())?,
             self.keepers.clone(),
             Lane::Application,
         );
@@ -202,7 +202,7 @@ impl Config {
         let ask = |keeper: Uuid, limit: Duration| async move {
             let status = timeout(
                 limit,
-                rpc.call::<Reply>(keeper, Frame::Client(Request::KeeperStatus(stream)), limit),
+                rpc.call_application(keeper, Request::KeeperStatus(stream), limit),
             )
             .await;
             match status {
@@ -223,7 +223,7 @@ impl Config {
         for _ in 0..LOST_STATUS_ROUNDS {
             let silent = others
                 .into_iter()
-                .filter(|voter| statuses.get(voter).copied().flatten().is_none())
+                .filter(|voter| statuses.get(voter).cloned().flatten().is_none())
                 .collect::<Vec<_>>();
             if silent.is_empty() {
                 break;
@@ -243,8 +243,7 @@ impl Config {
             .filter(|voter| {
                 statuses
                     .get(voter)
-                    .copied()
-                    .flatten()
+                    .and_then(|status| status.as_ref())
                     .is_some_and(|status| status.replica == Some(true))
             })
             .count() as u64;
@@ -262,8 +261,8 @@ impl Config {
                     *keeper,
                     assignment::Health {
                         live: status.is_some(),
-                        accepting: status.is_some_and(|status| status.accepting),
-                        streams: status.map_or(0, |status| status.streams),
+                        accepting: status.as_ref().is_some_and(|status| status.accepting),
+                        streams: status.as_ref().map_or(0, |status| status.streams),
                     },
                 )
             })
@@ -276,8 +275,7 @@ impl Config {
                     old.contains(keeper)
                         || !statuses
                             .get(keeper)
-                            .copied()
-                            .flatten()
+                            .and_then(|status| status.as_ref())
                             .is_some_and(|status| status.accepting)
                 }) || !placement.roster(&target)
                 {
@@ -357,12 +355,12 @@ impl Config {
 
         for replacement in target.into_iter().filter(|id| !old.contains(id)) {
             match rpc
-                .call::<Reply>(
+                .call_application(
                     replacement,
-                    Frame::Client(Request::StageRecovered {
+                    Request::StageRecovered {
                         genesis: genesis.clone(),
                         stage: stage.clone(),
-                    }),
+                    },
                     STAGING_TIMEOUT,
                 )
                 .await?
@@ -475,12 +473,8 @@ impl Config {
                     .await?
             }
             None => {
-                rpc.call(
-                    self.catalog,
-                    Frame::Client(Request::Stage(stage.clone())),
-                    STAGING_TIMEOUT,
-                )
-                .await?
+                rpc.call_application(self.catalog, Request::Stage(stage.clone()), STAGING_TIMEOUT)
+                    .await?
             }
             Some(voters) => {
                 // Repair may have replaced every configured voter.
@@ -490,11 +484,7 @@ impl Config {
                     .filter(|voter| *voter != self.keeper)
                     .collect::<Vec<_>>();
                 catalog::ask(&order, Instant::now() + STAGING_TIMEOUT, |voter| {
-                    rpc.call(
-                        voter,
-                        Frame::Client(Request::Stage(stage.clone())),
-                        STATUS_TIMEOUT,
-                    )
+                    rpc.call_application(voter, Request::Stage(stage.clone()), STATUS_TIMEOUT)
                 })
                 .await
                 .map_or_else(

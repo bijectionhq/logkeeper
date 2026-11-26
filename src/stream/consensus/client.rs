@@ -17,9 +17,8 @@ use parking_lot::Mutex;
 use tokio::time::{Instant, sleep};
 
 use super::{
-    ALPN, Configuration, Credentials, Fence, Genesis, KeeperStatus, Keepers, MAX_RECORD, Sealed,
-    invalid,
-    network::{Frame, Lane, Reply, Request, Rpc},
+    Configuration, Credentials, Fence, Genesis, KeeperStatus, Keepers, MAX_RECORD, Sealed, invalid,
+    network::{Lane, Reply, Request, Rpc},
     state::Outcome,
 };
 
@@ -62,7 +61,7 @@ impl Client {
         if !keepers.contains_key(&catalog) || deadline.is_zero() {
             return Err(invalid("invalid catalog address or client deadline"));
         }
-        let (tls, _) = credentials.client_protocol(ALPN)?;
+        let (tls, _) = credentials.client_protocols(Lane::Application.alpns())?;
         Ok(Self {
             rpc: Rpc::new(tls, keepers, Lane::Application),
             catalog,
@@ -129,9 +128,9 @@ impl Client {
                     while !remaining(end).is_zero() {
                         if matches!(
                             self.rpc
-                                .call::<Reply>(
+                                .call_application(
                                     keeper,
-                                    Frame::Client(Request::Bootstrap(stream)),
+                                    Request::Bootstrap(stream),
                                     remaining(end).min(ATTEMPT),
                                 )
                                 .await,
@@ -488,12 +487,17 @@ impl Client {
             if budget.is_zero() {
                 break;
             }
-            if let Ok(reply) = self
+            match self
                 .rpc
-                .call(keeper, Frame::Client(request.clone()), budget)
+                .call_application(keeper, request.clone(), budget)
                 .await
             {
-                return Ok(reply);
+                Ok(Reply::Unsupported(_)) => return Err(JournalError::Unsupported),
+                Ok(reply) => return Ok(reply),
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    return Err(JournalError::Unsupported);
+                }
+                Err(_) => (),
             }
         }
         Err(JournalError::Unavailable)
@@ -555,7 +559,7 @@ impl Client {
                 async move {
                     let reply = self
                         .rpc
-                        .call::<Reply>(keeper, Frame::Client(request), remaining(end).min(attempt))
+                        .call_application(keeper, request, remaining(end).min(attempt))
                         .await;
                     (keeper, reply)
                 }
@@ -585,6 +589,10 @@ impl Client {
                                 && visited.insert(leader) =>
                         {
                             calls.push(call(leader));
+                        }
+                        Ok(Reply::Unsupported(_)) => return Err(JournalError::Unsupported),
+                        Err(ref error) if error.kind() == io::ErrorKind::Unsupported => {
+                            return Err(JournalError::Unsupported);
                         }
                         Ok(Reply::Decision(Outcome::Refused(JournalError::Unavailable)))
                         | Err(_) => {
@@ -650,15 +658,18 @@ impl Client {
         attempt: Duration,
     ) -> Result<Reply> {
         let Some(voters) = self.catalog_voters else {
-            return self
+            return match self
                 .rpc
-                .call(
-                    self.catalog,
-                    Frame::Client(request),
-                    remaining(end).min(attempt),
-                )
+                .call_application(self.catalog, request, remaining(end).min(attempt))
                 .await
-                .map_err(|_| JournalError::Unavailable);
+            {
+                Ok(Reply::Unsupported(_)) => Err(JournalError::Unsupported),
+                Ok(reply) => Ok(reply),
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    Err(JournalError::Unsupported)
+                }
+                Err(_) => Err(JournalError::Unavailable),
+            };
         };
         let order = self
             .catalog_leader
@@ -673,12 +684,15 @@ impl Client {
             let request = request.clone();
             async move {
                 self.rpc
-                    .call(keeper, Frame::Client(request), remaining(end).min(attempt))
+                    .call_application(keeper, request, remaining(end).min(attempt))
                     .await
             }
         })
         .await
         .ok_or(JournalError::Unavailable)?;
+        if matches!(reply, Reply::Unsupported(_)) {
+            return Err(JournalError::Unsupported);
+        }
         // A keeper found past the configured voters is remembered for every
         // request, since they no longer host the catalog.
         if claim || !voters.contains(&keeper) {

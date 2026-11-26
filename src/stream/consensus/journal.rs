@@ -384,8 +384,8 @@ impl ConsensusJournal {
                 *keeper,
                 assignment::Health {
                     live: status.is_some(),
-                    accepting: status.is_some_and(|status| status.accepting),
-                    streams: status.map_or(0, |status| status.streams),
+                    accepting: status.as_ref().is_some_and(|status| status.accepting),
+                    streams: status.as_ref().map_or(0, |status| status.streams),
                 },
             )
         });

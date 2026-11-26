@@ -32,10 +32,10 @@ use uuid::Uuid;
 
 use super::{Engine, Group, NodeId, Reply, Request};
 use crate::stream::consensus::{
-    Configuration, KeeperStatus,
+    BUILD_VERSION, CLUSTER_VERSION_V1, Configuration, KeeperStatus,
     assignment::{self, Health, View},
-    decisions,
-    network::{Frame, Proof},
+    decisions, features,
+    network::{self, Proof},
 };
 use std::io;
 
@@ -135,6 +135,9 @@ impl Engine {
             streams: groups.len() as u32,
             led: led as u32,
             replica: None,
+            build_version: BUILD_VERSION.to_owned(),
+            features: features::SUPPORTED,
+            cluster_version: CLUSTER_VERSION_V1,
         }
     }
 
@@ -172,25 +175,31 @@ impl Engine {
             streams: groups.len() as u32,
             led: led as u32,
             replica,
+            build_version: BUILD_VERSION.to_owned(),
+            features: features::SUPPORTED,
+            cluster_version: CLUSTER_VERSION_V1,
         }
     }
 
-    async fn peer_status(&self, keeper: Uuid, stream: StreamId) -> Option<KeeperStatus> {
+    async fn peer_status(
+        &self,
+        keeper: Uuid,
+        stream: StreamId,
+    ) -> Result<Option<KeeperStatus>, bool> {
         if keeper == self.id {
-            return Some(self.status(stream).await);
+            return Ok(Some(self.status(stream).await));
         }
         match timeout(
             STATUS_TIMEOUT,
-            self.rpc.call(
-                keeper,
-                Frame::Client(Request::KeeperStatus(stream)),
-                STATUS_TIMEOUT,
-            ),
+            self.rpc
+                .call_application(keeper, Request::KeeperStatus(stream), STATUS_TIMEOUT),
         )
         .await
         {
-            Ok(Ok(Reply::Status(status))) if status.keeper == keeper => Some(status),
-            _ => None,
+            Ok(Ok(Reply::Status(status))) if status.keeper == keeper => Ok(Some(status)),
+            Ok(Ok(Reply::Unsupported(_))) => Err(true),
+            Ok(Err(ref error)) if network::is_version_mismatch(error) => Err(true),
+            _ => Ok(None),
         }
     }
 
@@ -276,17 +285,22 @@ impl Engine {
                 };
                 // A voter is silent when it has not acknowledged this leader
                 // for the repair delay, or its keeper has been unreachable
-                // for that long, as after a parked stream wakes.
+                // for that long, as after a parked stream wakes. A voter on an
+                // incompatible protocol version counts as alive, never silent.
                 let quiet = heartbeat
                     .iter()
                     .filter(|(id, _)| **id != self.id.as_u128())
                     .filter(|(id, acked)| {
-                        decisions::silent(
-                            self.dead(Uuid::from_u128(**id)),
-                            acked.as_ref().map(|acked| acked.elapsed().as_nanos()),
-                            now.duration_since(since).as_nanos(),
-                            self.repair_after.as_nanos(),
-                        )
+                        let keeper = Uuid::from_u128(**id);
+                        // A voter on an incompatible protocol version is
+                        // alive, never silent.
+                        !self.version_mismatched(keeper)
+                            && decisions::silent(
+                                self.dead(keeper),
+                                acked.as_ref().map(|acked| acked.elapsed().as_nanos()),
+                                now.duration_since(since).as_nanos(),
+                                self.repair_after.as_nanos(),
+                            )
                     })
                     .map(|(id, _)| Uuid::from_u128(*id))
                     .collect::<Vec<_>>();
@@ -451,13 +465,18 @@ impl Engine {
                 continue;
             }
             let status = self.reachable(keeper).await;
+            if voter && self.version_mismatched(keeper) {
+                continue;
+            }
             // Only a silent voter whose keeper still answers is asked about
-            // its replica of this stream.
+            // its replica of this stream. A version mismatch counts as alive.
             let live = match status {
-                Some(_) if voter => self
-                    .peer_status(keeper, stream)
-                    .await
-                    .is_some_and(|status| status.replica == Some(true)),
+                Some(_) if voter => match self.peer_status(keeper, stream).await {
+                    Ok(Some(status)) => status.replica == Some(true),
+                    Ok(None) => false,
+                    Err(true) => continue,
+                    Err(false) => false,
+                },
                 Some(_) => true,
                 None => false,
             };
@@ -465,8 +484,8 @@ impl Engine {
                 keeper,
                 Health {
                     live,
-                    accepting: status.is_some_and(|status| status.accepting),
-                    streams: status.map_or(0, |status| status.streams),
+                    accepting: status.as_ref().is_some_and(|status| status.accepting),
+                    streams: status.as_ref().map_or(0, |status| status.streams),
                 },
             );
         }
@@ -590,9 +609,9 @@ impl Engine {
                 .flatten()
                 .filter(|voter| *voter != self.id);
             futures::future::join_all(followers.map(|follower| {
-                self.rpc.call::<Reply>(
+                self.rpc.call_application(
                     follower,
-                    Frame::Client(Request::PreferLeader { stream, keeper }),
+                    Request::PreferLeader { stream, keeper },
                     STATUS_TIMEOUT,
                 )
             }))
@@ -694,9 +713,9 @@ impl Engine {
                 .map(|keeper| async move {
                     let reply = self
                         .rpc
-                        .call::<Reply>(
+                        .call_application(
                             keeper,
-                            Frame::Client(Request::LocalConfiguration(stream)),
+                            Request::LocalConfiguration(stream),
                             PLACEMENT_TIMEOUT,
                         )
                         .await;

@@ -544,17 +544,49 @@ pub(super) async fn connect_protocol(
     address: &str,
     protocol: &[u8],
 ) -> io::Result<(KeeperId, Channel)> {
+    let (id, _, channel) = connect_protocols(tls, address, &[protocol]).await?;
+    Ok((id, channel))
+}
+
+pub(super) async fn connect_protocols(
+    tls: &TlsConnector,
+    address: &str,
+    protocols: &[&[u8]],
+) -> io::Result<(KeeperId, Vec<u8>, Channel)> {
     let socket = TcpStream::connect(address).await?;
     socket.set_nodelay(true)?;
     // The server verifier validates a keeper URI identity. SNI and DNS names are unused.
     let name = ServerName::try_from("logkeeper").expect("valid placeholder name");
     let channel = tls.connect(name, socket).await?;
     let (_, peer) = channel.get_ref();
-    if peer.alpn_protocol() != Some(protocol) {
-        return Err(invalid("invalid keeper ALPN"));
-    }
+    let negotiated = peer
+        .alpn_protocol()
+        .filter(|alpn| protocols.iter().any(|allowed| *allowed == *alpn))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "invalid keeper ALPN"))?
+        .to_vec();
     let id = keeper_id(leaf(peer.peer_certificates())?)?;
-    Ok((id, channel))
+    Ok((id, negotiated, channel))
+}
+
+/// Whether `error` came from TLS ALPN negotiation failing because the peer
+/// runs an incompatible protocol version.
+pub(super) fn is_alpn_mismatch(error: &io::Error) -> bool {
+    let mut source = error
+        .get_ref()
+        .map(|inner| inner as &(dyn std::error::Error + 'static));
+    while let Some(current) = source {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>()
+            && matches!(
+                tls,
+                rustls::Error::AlertReceived(rustls::AlertDescription::NoApplicationProtocol)
+                    | rustls::Error::NoApplicationProtocol
+            )
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
 }
 
 impl Credentials {
@@ -567,6 +599,7 @@ impl Credentials {
         Ok(self.keyed_server(keeper, &[ALPN])?.1)
     }
 
+    #[cfg(test)]
     pub(super) fn server_protocol(
         &self,
         keeper: KeeperId,
@@ -621,9 +654,16 @@ impl Credentials {
     }
 
     pub(super) fn client_protocol(&self, protocol: &[u8]) -> io::Result<(TlsConnector, Identity)> {
+        self.client_protocols(&[protocol])
+    }
+
+    pub(super) fn client_protocols(
+        &self,
+        protocols: &[&[u8]],
+    ) -> io::Result<(TlsConnector, Identity)> {
         let chain = certificates(&self.certificate)?;
         let identity = client_identity(leaf(Some(&chain))?)?;
-        Ok((self.connector(protocol, chain)?, identity))
+        Ok((self.connector(protocols, chain)?, identity))
     }
 
     pub(super) fn peer_protocol(
@@ -631,16 +671,24 @@ impl Credentials {
         keeper: KeeperId,
         protocol: &[u8],
     ) -> io::Result<TlsConnector> {
+        self.peer_protocols(keeper, &[protocol])
+    }
+
+    pub(super) fn peer_protocols(
+        &self,
+        keeper: KeeperId,
+        protocols: &[&[u8]],
+    ) -> io::Result<TlsConnector> {
         let chain = certificates(&self.certificate)?;
         if keeper_id(leaf(Some(&chain))?)? != keeper {
             return Err(invalid("configured keeper does not match certificate URI"));
         }
-        self.connector(protocol, chain)
+        self.connector(protocols, chain)
     }
 
     fn connector(
         &self,
-        protocol: &[u8],
+        protocols: &[&[u8]],
         chain: Vec<CertificateDer<'static>>,
     ) -> io::Result<TlsConnector> {
         let provider = Arc::new(ring::default_provider());
@@ -655,7 +703,7 @@ impl Credentials {
             .with_custom_certificate_verifier(verifier)
             .with_client_auth_cert(chain, self.key()?)
             .map_err(display_error)?;
-        config.alpn_protocols = vec![protocol.to_vec()];
+        config.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
         config.enable_sni = false;
         config.resumption = rustls::client::Resumption::disabled();
         Ok(TlsConnector::from(Arc::new(config)))

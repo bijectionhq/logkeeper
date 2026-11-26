@@ -776,11 +776,14 @@ impl StateMachine {
             )
         };
         let matches = tokio::task::spawn_blocking(move || {
-            records.iter().zip(&payloads).try_fold(true, |same, (record, payload)| {
-                Ok::<_, io::Error>(
-                    same && record.len() == payload.len() && record.load()? == *payload,
-                )
-            })
+            records
+                .iter()
+                .zip(&payloads)
+                .try_fold(true, |same, (record, payload)| {
+                    Ok::<_, io::Error>(
+                        same && record.len() == payload.len() && record.load()? == *payload,
+                    )
+                })
         })
         .await
         .map_err(|_| JournalError::Unavailable)?

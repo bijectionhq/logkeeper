@@ -5,7 +5,7 @@ use journal_contract::{JournalError, Lsn, Page, Result, StreamId};
 use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
 
-use super::{Client, Configuration, Frame, Genesis, Outcome, Reply, Request, Route, remaining};
+use super::{Client, Configuration, Genesis, Outcome, Reply, Request, Route, remaining};
 use crate::stream::consensus::{MAX_PAGE, MAX_RECORD, MAX_RECORDS_PER_PAGE, network::Proof};
 
 const HEDGE_DELAY: Duration = Duration::from_millis(25);
@@ -58,11 +58,7 @@ impl Client {
             async move {
                 let result = self
                     .rpc
-                    .call::<Reply>(
-                        keeper,
-                        Frame::Client(request),
-                        remaining(deadline).min(attempt),
-                    )
+                    .call_application(keeper, request, remaining(deadline).min(attempt))
                     .await
                     .ok();
                 (keeper, result)
@@ -168,9 +164,9 @@ impl Client {
         let call = |id| async move {
             let reply = self
                 .rpc
-                .call::<Reply>(
+                .call_application(
                     id,
-                    Frame::Client(Request::PlacementProof(stream)),
+                    Request::PlacementProof(stream),
                     (remaining(deadline) / 3).min(Duration::from_millis(350)),
                 )
                 .await;

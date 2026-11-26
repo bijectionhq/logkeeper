@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{Engine, Group, NodeId, Outcome, Reply, Request, failure, invalid, leader_reply};
-use crate::stream::consensus::{LogId, Stage, Vote, network::Frame, state::Command};
+use crate::stream::consensus::{LogId, Stage, Vote, state::Command};
 
 pub(super) const MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -91,12 +91,12 @@ impl Engine {
                     }
                     let Reply::Generation(generation) = self
                         .rpc
-                        .call(
+                        .call_application(
                             keeper,
-                            Frame::Client(Request::StageReplica {
+                            Request::StageReplica {
                                 genesis: group.genesis.clone(),
                                 stage: stage.clone(),
-                            }),
+                            },
                             deadline.saturating_duration_since(Instant::now()),
                         )
                         .await?
@@ -148,14 +148,14 @@ impl Engine {
                 for (keeper, generation) in handles {
                     let Reply::Decision(Outcome::Unit) = self
                         .rpc
-                        .call(
+                        .call_application(
                             keeper,
-                            Frame::Client(Request::InstallReplica {
+                            Request::InstallReplica {
                                 genesis: group.genesis.clone(),
                                 stage: stage.clone(),
                                 generation,
                                 through,
-                            }),
+                            },
                             deadline.saturating_duration_since(Instant::now()),
                         )
                         .await?

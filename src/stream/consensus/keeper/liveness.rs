@@ -32,8 +32,7 @@ use uuid::Uuid;
 
 use super::{Engine, Group};
 use crate::stream::consensus::{
-    KeeperStatus, decisions, metrics,
-    network::{Frame, Pong},
+    BUILD_VERSION, CLUSTER_VERSION_V1, KeeperStatus, decisions, features, metrics, network,
 };
 
 #[cfg(not(test))]
@@ -52,10 +51,18 @@ const MAX_WAKE_BACKOFF: Duration = Duration::from_secs(3600);
 #[cfg(test)]
 const MAX_WAKE_BACKOFF: Duration = Duration::from_secs(16);
 
+struct PeerState {
+    answered: Instant,
+    status: KeeperStatus,
+    /// True when the peer answered with an ALPN/protocol version mismatch.
+    /// Such a keeper is alive on another version and never triggers repair.
+    version_mismatch: bool,
+}
+
 pub(super) struct Liveness {
     started: Instant,
     populated: bool,
-    peers: HashMap<Uuid, (Instant, KeeperStatus)>,
+    peers: HashMap<Uuid, PeerState>,
     /// Failed wakes and the earliest next wake of each parked stream.
     wakes: HashMap<StreamId, (u32, Instant)>,
 }
@@ -78,8 +85,14 @@ impl Liveness {
         now.duration_since(
             self.peers
                 .get(&keeper)
-                .map_or(self.started, |(answered, _)| *answered),
+                .map_or(self.started, |peer| peer.answered),
         )
+    }
+
+    fn version_mismatched(&self, keeper: Uuid) -> bool {
+        self.peers.get(&keeper).is_some_and(|peer| {
+            peer.version_mismatch && peer.answered.elapsed() < PING_INTERVAL * MISSED_PINGS
+        })
     }
 }
 
@@ -103,7 +116,7 @@ impl Engine {
         liveness
             .peers
             .values()
-            .any(|(answered, _)| answered.elapsed() < PING_INTERVAL * MISSED_PINGS)
+            .any(|peer| peer.answered.elapsed() < PING_INTERVAL * MISSED_PINGS)
     }
 
     /// Synchronous liveness check for whether `keeper` answered a recent ping.
@@ -115,7 +128,7 @@ impl Engine {
         liveness
             .peers
             .get(&keeper)
-            .is_some_and(|(answered, _)| answered.elapsed() < PING_INTERVAL * MISSED_PINGS)
+            .is_some_and(|peer| peer.answered.elapsed() < PING_INTERVAL * MISSED_PINGS)
     }
 
     /// Liveness summary for every keeper in the cluster inventory.
@@ -139,10 +152,8 @@ impl Engine {
                 let silent = liveness.silent(keeper, now);
                 let dead = decisions::keeper_dead(silent.as_millis() as u64, repair_ms);
                 let (state, accepting) = match liveness.peers.get(&keeper) {
-                    Some((answered, status))
-                        if answered.elapsed() < PING_INTERVAL * MISSED_PINGS =>
-                    {
-                        (metrics::LivenessState::Alive, status.accepting)
+                    Some(peer) if peer.answered.elapsed() < PING_INTERVAL * MISSED_PINGS => {
+                        (metrics::LivenessState::Alive, peer.status.accepting)
                     }
                     _ if dead => (metrics::LivenessState::Dead, false),
                     _ => (metrics::LivenessState::Suspect, false),
@@ -165,20 +176,78 @@ impl Engine {
             return Some(self.keeper_status().await);
         }
         let liveness = self.liveness.lock();
-        let (answered, status) = liveness.peers.get(&keeper)?;
-        (answered.elapsed() < PING_INTERVAL * MISSED_PINGS).then_some(*status)
+        let peer = liveness.peers.get(&keeper)?;
+        (peer.answered.elapsed() < PING_INTERVAL * MISSED_PINGS).then(|| peer.status.clone())
     }
 
-    /// Whether `keeper` has been unreachable for the repair delay.
+    /// Whether `keeper` recently answered with an incompatible protocol version.
+    /// A version mismatch counts as alive and never triggers automatic repair.
+    pub(super) fn version_mismatched(&self, keeper: Uuid) -> bool {
+        keeper != self.id && self.liveness.lock().version_mismatched(keeper)
+    }
+
+    /// Feature bits advertised by `keeper`, or 0 when unknown or N-1.
+    pub(super) fn peer_features(&self, keeper: Uuid) -> u64 {
+        if keeper == self.id {
+            return features::SUPPORTED;
+        }
+        self.liveness
+            .lock()
+            .peers
+            .get(&keeper)
+            .map_or(0, |peer| peer.status.features)
+    }
+
+    /// Whether `keeper` advertises every feature bit in `required`.
+    pub(super) fn peer_supports(&self, keeper: Uuid, required: u64) -> bool {
+        decisions::peer_supports(self.peer_features(keeper), required)
+    }
+
+    /// Answers a liveness ping from `sender`, in the layout its lane speaks.
+    pub(super) async fn pong(
+        &self,
+        sender: u128,
+        incarnation: Uuid,
+        version: network::WireVersion,
+    ) -> network::BatchReply {
+        let known_as = self
+            .recognition
+            .greet(Uuid::from_u128(sender), incarnation)
+            .await;
+        let pong = network::Pong {
+            status: self.keeper_status().await,
+            incarnation: self.recognition.own(),
+            known_as,
+        };
+        match network::encode_pong(&pong, version) {
+            Ok(bytes) => network::BatchReply::Ok(bytes),
+            Err(error) => network::BatchReply::Err(error.to_string()),
+        }
+    }
+
+    /// Records the build version and feature bits carried by an incoming
+    /// ping. Only this keeper's own pings decide whether a peer answers, so
+    /// an incoming ping neither refreshes nor creates a peer's entry.
+    pub(super) fn record_incoming_ping(&self, keeper: Uuid, version: String, peer_features: u64) {
+        if let Some(peer) = self.liveness.lock().peers.get_mut(&keeper) {
+            peer.status.build_version = version;
+            peer.status.features = peer_features;
+        }
+    }
+
+    /// Whether `keeper` has been unreachable for the repair delay. A peer on
+    /// an incompatible protocol version counts as alive and is never dead.
     pub(super) fn dead(&self, keeper: Uuid) -> bool {
-        keeper != self.id
-            && decisions::keeper_dead(
-                self.liveness
-                    .lock()
-                    .silent(keeper, Instant::now())
-                    .as_millis() as u64,
-                self.repair_after.as_millis() as u64,
-            )
+        if keeper == self.id {
+            return false;
+        }
+        let liveness = self.liveness.lock();
+        let now = Instant::now();
+        decisions::triggers_repair(
+            liveness.silent(keeper, now).as_millis() as u64,
+            self.repair_after.as_millis() as u64,
+            liveness.version_mismatched(keeper),
+        )
     }
 
     /// Whether `keeper` missed its last pings, a much shorter signal than
@@ -226,17 +295,27 @@ impl Engine {
         let answers = futures::future::join_all(peers.into_iter().map(|keeper| async move {
             let answer = timeout(
                 PING_TIMEOUT,
-                self.control
-                    .call::<Pong>(keeper, Frame::Liveness(own), PING_TIMEOUT),
+                self.control.ping(
+                    keeper,
+                    own,
+                    BUILD_VERSION.to_owned(),
+                    features::SUPPORTED,
+                    PING_TIMEOUT,
+                ),
             )
             .await;
             (keeper, answer)
         }))
         .await;
+        let mut mismatched = Vec::new();
         let answers = answers
             .into_iter()
             .filter_map(|(keeper, answer)| match answer {
                 Ok(Ok(pong)) if pong.status.keeper == keeper => Some((keeper, pong)),
+                Ok(Err(error)) if network::is_version_mismatch(&error) => {
+                    mismatched.push((keeper, error));
+                    None
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -254,7 +333,52 @@ impl Engine {
         let mut liveness = self.liveness.lock();
         liveness.populated = true;
         for (keeper, pong) in answers {
-            liveness.peers.insert(keeper, (now, pong.status));
+            liveness.peers.insert(
+                keeper,
+                PeerState {
+                    answered: now,
+                    status: pong.status,
+                    version_mismatch: false,
+                },
+            );
+        }
+        // A keeper on an incompatible protocol version is alive: it counts
+        // as answering, accepts no new streams, and never triggers repair.
+        for (keeper, error) in mismatched {
+            let first = !liveness
+                .peers
+                .get(&keeper)
+                .is_some_and(|peer| peer.version_mismatch);
+            if first {
+                tracing::warn!(
+                    keeper = %self.id,
+                    peer = %keeper,
+                    error = %error,
+                    "peer runs an incompatible protocol version; counted as alive, not repaired"
+                );
+            }
+            liveness
+                .peers
+                .entry(keeper)
+                .and_modify(|peer| {
+                    peer.answered = now;
+                    peer.version_mismatch = true;
+                    peer.status.accepting = false;
+                })
+                .or_insert_with(|| PeerState {
+                    answered: now,
+                    status: KeeperStatus {
+                        keeper,
+                        accepting: false,
+                        streams: 0,
+                        led: 0,
+                        replica: None,
+                        build_version: String::new(),
+                        features: 0,
+                        cluster_version: CLUSTER_VERSION_V1,
+                    },
+                    version_mismatch: true,
+                });
         }
     }
 

@@ -372,6 +372,28 @@ fn slow_media_is_never_responsive(running_ms: u64, slow_until_ms: u64, now_ms: u
     assert(idle);
 }
 
+// A keeper that answered with a version mismatch is alive on another version
+// and never triggers automatic voter repair regardless of silence.
+fn version_mismatch_never_triggers_repair(
+    silent_ms: u64, repair_after_ms: u64, version_mismatch: bool,
+) {
+    let repair = triggers_repair(silent_ms, repair_after_ms, version_mismatch);
+    assert(version_mismatch ==> !repair);
+    assert(!version_mismatch ==> repair == (silent_ms >= repair_after_ms));
+}
+
+// New formats and commands are gated by the finalized cluster feature level,
+// and peer frames require every required feature bit on the target peer.
+fn write_version_and_peer_feature_gates(
+    finalized: u32, required_version: u32, peer_features: u64, required_features: u64,
+) {
+    let allowed = write_version_allows(finalized, required_version);
+    assert(finalized < required_version ==> !allowed);
+    assert(finalized >= required_version ==> allowed);
+    let supported = peer_supports(peer_features, required_features);
+    assert(supported == ((peer_features & required_features) == required_features));
+}
+
 proof fn grown_is_bounded(wait: int, cap: int, n: nat)
     requires 0 <= wait <= cap,
     ensures wait <= grown(wait, cap, n) <= cap,

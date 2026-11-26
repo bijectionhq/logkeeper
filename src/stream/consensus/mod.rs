@@ -41,10 +41,40 @@ pub use placement::Domains;
 pub use storage::{InspectReport, SegmentDump, VerifyReport, dump_segment_file};
 pub use timed::TimedAuthority;
 
-pub(super) const ALPN: &[u8] = b"logkeeper-consensus/1";
-const CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/8";
-const REPLICATION_ALPN: &[u8] = b"logkeeper-consensus-replication/3";
-const BULK_ALPN: &[u8] = b"logkeeper-consensus-bulk/2";
+pub(super) const ALPN: &[u8] = b"logkeeper-consensus/2";
+pub(super) const PREV_ALPN: &[u8] = b"logkeeper-consensus/1";
+const CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/9";
+const PREV_CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/8";
+const REPLICATION_ALPN: &[u8] = b"logkeeper-consensus-replication/4";
+const PREV_REPLICATION_ALPN: &[u8] = b"logkeeper-consensus-replication/3";
+const BULK_ALPN: &[u8] = b"logkeeper-consensus-bulk/3";
+const PREV_BULK_ALPN: &[u8] = b"logkeeper-consensus-bulk/2";
+
+/// Build version advertised in liveness pings and [`KeeperStatus`].
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Cluster feature level before any rolling-upgrade format finalization (N-1).
+pub const CLUSTER_VERSION_V1: u32 = 1;
+/// Cluster feature level enabled once all keepers run this build and an
+/// operator finalizes the upgrade.
+pub const CLUSTER_VERSION_CURRENT: u32 = 2;
+
+/// Feature bits advertised in liveness pings and [`KeeperStatus`].
+pub mod features {
+    /// Supports N/N-1 ALPN version negotiation, feature pings, and typed
+    /// `Unsupported` replies.
+    pub const VERSION_NEGOTIATION: u64 = 1 << 0;
+    /// Supports finalized cluster feature levels (write-version gate).
+    pub const WRITE_VERSION_GATE: u64 = 1 << 1;
+    /// Supports durable corruption quarantine markers and quarantine clearing.
+    pub const DURABLE_QUARANTINE: u64 = 1 << 2;
+    /// Supports placement changes without quarantine and retired keepers.
+    pub const SOFT_PLACEMENT: u64 = 1 << 3;
+
+    /// All features supported by this build.
+    pub const SUPPORTED: u64 =
+        VERSION_NEGOTIATION | WRITE_VERSION_GATE | DURABLE_QUARANTINE | SOFT_PLACEMENT;
+}
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
 const MAX_PAGE: usize = 8 * 1024 * 1024;
@@ -108,7 +138,7 @@ pub struct Sealed {
 }
 
 /// What a keeper reports about itself to placement and repair.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KeeperStatus {
     pub keeper: uuid::Uuid,
     /// Whether the keeper's media is healthy and has room for new streams.
@@ -120,6 +150,50 @@ pub struct KeeperStatus {
     /// For the stream asked about: whether the keeper holds a healthy
     /// replica, a quarantined one, or none.
     pub replica: Option<bool>,
+    /// Build version string advertised by the keeper (empty for N-1 peers).
+    pub build_version: String,
+    /// Feature bits advertised by the keeper (0 for N-1 peers).
+    pub features: u64,
+    /// Finalized cluster feature level observed by this keeper.
+    pub cluster_version: u32,
+}
+
+/// The N-1 wire representation of [`KeeperStatus`] (five fields, no build
+/// version, feature bits, or cluster version).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct KeeperStatusV1 {
+    pub keeper: uuid::Uuid,
+    pub accepting: bool,
+    pub streams: u32,
+    pub led: u32,
+    pub replica: Option<bool>,
+}
+
+impl From<&KeeperStatus> for KeeperStatusV1 {
+    fn from(status: &KeeperStatus) -> Self {
+        Self {
+            keeper: status.keeper,
+            accepting: status.accepting,
+            streams: status.streams,
+            led: status.led,
+            replica: status.replica,
+        }
+    }
+}
+
+impl From<KeeperStatusV1> for KeeperStatus {
+    fn from(status: KeeperStatusV1) -> Self {
+        Self {
+            keeper: status.keeper,
+            accepting: status.accepting,
+            streams: status.streams,
+            led: status.led,
+            replica: status.replica,
+            build_version: String::new(),
+            features: 0,
+            cluster_version: CLUSTER_VERSION_V1,
+        }
+    }
 }
 
 /// The most recent finalized voter configuration of a stream.
