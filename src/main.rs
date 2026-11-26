@@ -68,12 +68,31 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
         if args.get(1).is_some_and(|action| action == "recover-stream") {
             return recover_stream(&args[2..]).await;
         }
-        let [_, flag, file] = args else {
-            return Err("Usage: logkeeper keeper --config FILE".into());
-        };
-        if flag != "--config" {
-            return Err("Usage: logkeeper keeper --config FILE".into());
+        let mut config_file = None;
+        let mut log_format = None;
+        let mut iter = args[1..].iter();
+        while let Some(flag) = iter.next() {
+            match flag.as_str() {
+                "--config" => config_file = iter.next(),
+                "--log-format" => {
+                    let value = iter
+                        .next()
+                        .ok_or("Usage: logkeeper keeper --config FILE [--log-format human|json]")?;
+                    log_format = Some(
+                        logkeeper::stream::consensus::LogFormat::parse(value)
+                            .ok_or("invalid --log-format: expected human or json")?,
+                    );
+                }
+                _ => {
+                    return Err(
+                        "Usage: logkeeper keeper --config FILE [--log-format human|json]".into(),
+                    );
+                }
+            }
         }
+        let Some(file) = config_file else {
+            return Err("Usage: logkeeper keeper --config FILE [--log-format human|json]".into());
+        };
         #[derive(serde::Deserialize)]
         #[serde(untagged)]
         enum KeeperConfig {
@@ -83,7 +102,12 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
 
         let config = serde_json::from_slice::<KeeperConfig>(&std::fs::read(file)?)?;
         let listen = match &config {
-            KeeperConfig::Consensus(config) => config.listen,
+            KeeperConfig::Consensus(config) => {
+                logkeeper::stream::consensus::logging::init(
+                    log_format.unwrap_or(config.log_format),
+                );
+                config.listen
+            }
             KeeperConfig::Stream(config) => config.listen,
         };
         let listener = TcpListener::bind(listen).await?;
@@ -185,9 +209,9 @@ async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error
         return Err(RECOVER_USAGE.into());
     };
     let stream = journal_contract::StreamId(uuid::Uuid::parse_str(stream)?.as_u128());
-    let recovered = logkeeper::stream::consensus::Config::read(std::path::Path::new(config))?
-        .recover_stream(stream, recovery)
-        .await?;
+    let config = logkeeper::stream::consensus::Config::read(std::path::Path::new(config))?;
+    logkeeper::stream::consensus::logging::init(config.log_format);
+    let recovered = config.recover_stream(stream, recovery).await?;
     println!("{recovered}");
     Ok(())
 }

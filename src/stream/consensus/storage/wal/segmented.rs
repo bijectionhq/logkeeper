@@ -125,6 +125,7 @@ pub(super) struct Staged {
 }
 
 pub(super) struct Segmented {
+    keeper: Uuid,
     writer: Writer,
     checkpoints: PathBuf,
     boundaries: Boundaries,
@@ -382,6 +383,7 @@ impl Segmented {
         let scopes = state.scope_ids();
         Ok((
             Self {
+                keeper: media.keeper(),
                 writer: Writer {
                     incarnation,
                     directory,
@@ -579,13 +581,22 @@ impl Segmented {
             // once the caller adopts the new one.
             Ok(Ok(reference)) => Some((reference, (position, pins, retired))),
             Ok(Err(error)) => {
-                eprintln!("logkeeper WAL checkpoint deferred: {error}");
+                if let Some(dropped) =
+                    crate::stream::consensus::logging::rate_limit("wal.checkpoint_deferred", None)
+                {
+                    tracing::warn!(
+                        keeper = %self.keeper,
+                        error = %error,
+                        dropped = dropped,
+                        "WAL checkpoint deferred"
+                    );
+                }
                 self.since = self.since.max(self.tuning.checkpoint_bytes / 2);
                 self.retired.extend(retired);
                 None
             }
             Err(_) => {
-                eprintln!("logkeeper WAL checkpoint writer panicked");
+                tracing::error!(keeper = %self.keeper, "WAL checkpoint writer panicked");
                 self.retired.extend(retired);
                 None
             }
@@ -603,7 +614,16 @@ impl Segmented {
             return;
         }
         if let Err(error) = self.start_checkpoint(state, objects, space) {
-            eprintln!("logkeeper WAL checkpoint deferred: {error}");
+            if let Some(dropped) =
+                crate::stream::consensus::logging::rate_limit("wal.checkpoint_start_deferred", None)
+            {
+                tracing::warn!(
+                    keeper = %self.keeper,
+                    error = %error,
+                    dropped = dropped,
+                    "WAL checkpoint deferred"
+                );
+            }
         }
         #[cfg(test)]
         if self.tuning.synchronous {

@@ -206,6 +206,7 @@ impl LocalCluster {
                         offset: offset.clone(),
                     }) as Arc<dyn TimedOriginalClock>),
                 }),
+                log_format: Default::default(),
             };
             provision(&config)?;
             config.initialize()?;

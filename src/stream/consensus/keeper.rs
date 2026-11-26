@@ -148,6 +148,9 @@ pub struct Config {
     /// `timed_original`.
     #[serde(skip)]
     pub timed_authority: Option<super::timed::TimedAuthority>,
+    /// Structured log format (`human` by default, or `json`).
+    #[serde(default)]
+    pub log_format: super::logging::LogFormat,
 }
 
 impl Config {
@@ -635,10 +638,28 @@ impl Engine {
                                 engine.close_settled_deletions().await;
                             }
                             if let Err(error) = engine.disk.reap_objects().await {
-                                eprintln!("logkeeper object cleanup deferred: {error}");
+                                if let Some(dropped) =
+                                    super::logging::rate_limit("keeper.object_cleanup", None)
+                                {
+                                    tracing::warn!(
+                                        keeper = %engine.id,
+                                        error = %error,
+                                        dropped = dropped,
+                                        "object cleanup deferred"
+                                    );
+                                }
                             }
                             if let Err(error) = engine.reclaim_detached(&mut cursor).await {
-                                eprintln!("logkeeper replica cleanup deferred: {error}");
+                                if let Some(dropped) =
+                                    super::logging::rate_limit("keeper.replica_cleanup", None)
+                                {
+                                    tracing::warn!(
+                                        keeper = %engine.id,
+                                        error = %error,
+                                        dropped = dropped,
+                                        "replica cleanup deferred"
+                                    );
+                                }
                             }
                         },
                     }
@@ -728,7 +749,12 @@ impl Engine {
     fn quarantine(&self, stream: StreamId, error: &io::Error) {
         self.disk.protect_objects(stream);
         if self.quarantined.write().insert(stream) {
-            eprintln!("logkeeper quarantined stream {stream:?}: {error}");
+            tracing::error!(
+                keeper = %self.id,
+                stream = %super::logging::stream_uuid(stream),
+                error = %error,
+                "quarantined stream replica"
+            );
         }
     }
 
@@ -1247,8 +1273,15 @@ impl Engine {
                 generation,
                 ..
             } => {
-                self.retire_copy(stream, authority, revision, generation)
-                    .await
+                let actor = owner.as_deref().unwrap_or("unknown");
+                let result = self
+                    .retire_copy(stream, authority, revision, generation)
+                    .await;
+                let outcome = describe_audit_result(&result);
+                super::logging::audit_retire(
+                    self.id, stream, actor, authority, revision, generation, &outcome,
+                );
+                result
             }
             Request::StageReplica { genesis, stage } => {
                 let Identity::Keeper(id) = identity else {
@@ -1386,9 +1419,23 @@ impl Engine {
                     }
                     Request::Replace {
                         expected, voters, ..
-                    } => self.replace(&group, expected, voters).await,
+                    } => {
+                        let actor = owner.as_deref().unwrap_or("unknown");
+                        let result = self.replace(&group, expected, voters).await;
+                        let outcome = describe_audit_result(&result);
+                        super::logging::audit_replace(
+                            self.id, stream, actor, expected, &voters, &outcome,
+                        );
+                        result
+                    }
                     Request::PreferLeader { keeper, .. } => {
-                        self.prefer_leader(&group, keeper).await
+                        let actor = owner.as_deref().unwrap_or("unknown");
+                        let result = self.prefer_leader(&group, keeper).await;
+                        let outcome = describe_audit_result(&result);
+                        super::logging::audit_prefer_leader(
+                            self.id, stream, actor, keeper, &outcome,
+                        );
+                        result
                     }
                     Request::Create(_) => Ok(group.write(Command::Create).await),
                     Request::Seal {
@@ -1482,7 +1529,13 @@ impl Engine {
                         .await),
                     Request::Delete(_) => Ok(group.write(Command::Delete).await),
                     Request::AcknowledgeRecovery(_) => {
-                        Ok(group.write(Command::AcknowledgeRecovery).await)
+                        let actor = owner.as_deref().unwrap_or("unknown");
+                        let reply = group.write(Command::AcknowledgeRecovery).await;
+                        let outcome = describe_audit_reply(&reply);
+                        super::logging::audit_acknowledge_recovery(
+                            self.id, stream, actor, &outcome,
+                        );
+                        Ok(reply)
                     }
                     _ => Err(invalid("invalid application request")),
                 }?;
@@ -1996,4 +2049,23 @@ fn leader_reply(id: Option<NodeId>) -> Reply {
 
 fn failure(error: JournalError) -> Reply {
     Reply::Decision(Outcome::Refused(error))
+}
+
+fn describe_audit_reply(reply: &Reply) -> String {
+    match reply {
+        Reply::Decision(Outcome::Refused(error)) => format!("refused:{error:?}"),
+        Reply::Decision(Outcome::At(lsn)) => format!("ok:head={}", lsn.0),
+        Reply::Decision(Outcome::Configuration(cfg)) => format!("ok:revision={}", cfg.revision),
+        Reply::Decision(_) => "ok".to_owned(),
+        Reply::Leader(Some(leader)) => format!("forward:{leader}"),
+        Reply::Leader(None) => "no_leader".to_owned(),
+        _ => "ok".to_owned(),
+    }
+}
+
+fn describe_audit_result(result: &io::Result<Reply>) -> String {
+    match result {
+        Ok(reply) => describe_audit_reply(reply),
+        Err(error) => format!("error:{error}"),
+    }
 }

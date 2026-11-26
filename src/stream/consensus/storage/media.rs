@@ -344,6 +344,10 @@ impl Media {
         self.identity.incarnation
     }
 
+    pub fn keeper(&self) -> Uuid {
+        self.identity.keeper
+    }
+
     pub fn wal(&self, generation: Uuid) -> PathBuf {
         self.data().join(format!("raft-{generation}.wal"))
     }

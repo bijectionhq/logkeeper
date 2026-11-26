@@ -267,7 +267,11 @@ impl Engine {
         for stream in woken {
             if self.wake(stream).await.is_some() {
                 metrics::count(&metrics::COUNTERS.unparked_for_repair);
-                eprintln!("logkeeper woke parked stream {stream:?} to repair a dead voter");
+                tracing::info!(
+                    keeper = %self.id,
+                    stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                    "woke parked stream to repair dead voter"
+                );
             }
         }
     }

@@ -159,6 +159,7 @@ impl Cluster {
                 timed_original: None,
                 sync_mode: SyncMode::Fsync,
                 timed_authority: None,
+                log_format: Default::default(),
             };
             provision(&config);
             config.initialize().unwrap();

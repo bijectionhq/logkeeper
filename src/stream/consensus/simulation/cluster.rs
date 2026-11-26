@@ -239,6 +239,7 @@ impl SimCluster {
                     .map_or(true, |value| value != "0"),
                 timed_original: None,
                 timed_authority: None,
+                log_format: Default::default(),
                 sync_mode: crate::server::durability::SyncMode::Fsync,
             };
             provision(&config);

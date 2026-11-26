@@ -477,6 +477,7 @@ impl Disk {
 
     fn open_tuned(enrollment: Enrollment, tuning: Tuning) -> io::Result<Self> {
         let (media, lock, opened) = enrollment.open()?;
+        let keeper_id = media.keeper();
         let path = media.data().to_path_buf();
         let space = Space::new(path.clone())?;
         let objects = Objects::open(&path)?;
@@ -538,7 +539,11 @@ impl Disk {
                 );
                 drop(lock);
                 if let Err(error) = &result {
-                    eprintln!("logkeeper consensus WAL stopped: {error}");
+                    tracing::error!(
+                        keeper = %keeper_id,
+                        error = %error,
+                        "consensus WAL stopped"
+                    );
                 }
                 let _ = finished.send(result);
             })?;

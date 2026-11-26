@@ -153,7 +153,10 @@ impl Watchdog {
 
 /// The production stall action: report and end the process.
 pub(super) fn exit_on_stall(running: Duration) {
-    eprintln!("logkeeper consensus WAL round stalled for {running:?}; exiting");
+    tracing::error!(
+        running_ms = running.as_millis() as u64,
+        "consensus WAL round stalled; exiting"
+    );
     std::process::exit(70);
 }
 

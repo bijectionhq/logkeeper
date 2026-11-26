@@ -299,7 +299,12 @@ impl Engine {
                 Ok(page) => {
                     for (at, bytes) in page.records {
                         let Ok(record) = decode::<CatalogRecord>(&bytes) else {
-                            eprintln!("logkeeper catalog record {at:?} is unreadable");
+                            tracing::error!(
+                                keeper = %self.id,
+                                stream = %crate::stream::consensus::logging::stream_uuid(STREAM),
+                                lsn = at.0,
+                                "catalog record is unreadable"
+                            );
                             return Err(JournalError::Unavailable);
                         };
                         fold.apply(record);
@@ -526,7 +531,20 @@ impl Engine {
             if !bootstrapped {
                 match self.bootstrap_catalog_stream(catalog).await {
                     Ok(()) => bootstrapped = true,
-                    Err(error) => eprintln!("logkeeper catalog bootstrap deferred: {error}"),
+                    Err(error) => {
+                        if let Some(dropped) = crate::stream::consensus::logging::rate_limit(
+                            "catalog.bootstrap_deferred",
+                            Some(STREAM),
+                        ) {
+                            tracing::warn!(
+                                keeper = %self.id,
+                                stream = %crate::stream::consensus::logging::stream_uuid(STREAM),
+                                error = %error,
+                                dropped = dropped,
+                                "catalog bootstrap deferred"
+                            );
+                        }
+                    }
                 }
             }
             self.tend(catalog).await;
@@ -607,8 +625,26 @@ impl Engine {
         }
         .await;
         match seeded {
-            Ok(_) => eprintln!("logkeeper seeded the replicated catalog with {count} entries"),
-            Err(reply) => eprintln!("logkeeper catalog seed deferred: {}", describe(&reply)),
+            Ok(_) => tracing::info!(
+                keeper = %self.id,
+                stream = %crate::stream::consensus::logging::stream_uuid(STREAM),
+                entries = count,
+                "seeded replicated catalog"
+            ),
+            Err(reply) => {
+                if let Some(dropped) = crate::stream::consensus::logging::rate_limit(
+                    "catalog.seed_deferred",
+                    Some(STREAM),
+                ) {
+                    tracing::warn!(
+                        keeper = %self.id,
+                        stream = %crate::stream::consensus::logging::stream_uuid(STREAM),
+                        reason = %describe(&reply),
+                        dropped = dropped,
+                        "catalog seed deferred"
+                    );
+                }
+            }
         }
     }
 
@@ -629,10 +665,18 @@ impl Engine {
         }
         .await;
         if let Err(reply) = compacted {
-            eprintln!(
-                "logkeeper catalog compaction deferred: {}",
-                describe(&reply)
-            );
+            if let Some(dropped) = crate::stream::consensus::logging::rate_limit(
+                "catalog.compaction_deferred",
+                Some(STREAM),
+            ) {
+                tracing::warn!(
+                    keeper = %self.id,
+                    stream = %crate::stream::consensus::logging::stream_uuid(STREAM),
+                    reason = %describe(&reply),
+                    dropped = dropped,
+                    "catalog compaction deferred"
+                );
+            }
         }
     }
 }

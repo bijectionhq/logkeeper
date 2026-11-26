@@ -381,9 +381,13 @@ impl Engine {
                     .await,
                     Ok(Ok(_))
                 );
-                eprintln!(
-                    "logkeeper removed stale learners {learners:?} of stream {stream:?}: {}",
-                    if removed { "removed" } else { "deferred" }
+                let outcome = if removed { "removed" } else { "deferred" };
+                tracing::info!(
+                    keeper = %self.id,
+                    stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                    learners = ?learners,
+                    outcome = outcome,
+                    "stale learners cleanup"
                 );
                 removed
             }
@@ -433,15 +437,41 @@ impl Engine {
             result,
             Ok(Reply::Decision(super::Outcome::Configuration(_)))
         );
-        eprintln!(
-            "logkeeper repair of stream {stream:?}: {:?} to {next:?}: {}",
-            configuration.voters,
-            match result {
-                Ok(_) if replaced => "replaced".to_owned(),
-                Ok(_) => "refused".to_owned(),
-                Err(error) => error.to_string(),
-            }
+        let outcome = match &result {
+            Ok(_) if replaced => "replaced".to_owned(),
+            Ok(_) => "refused".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        crate::stream::consensus::logging::audit_replace(
+            self.id,
+            stream,
+            "auto-repair",
+            configuration.revision,
+            &next,
+            &outcome,
         );
+        if replaced {
+            tracing::info!(
+                keeper = %self.id,
+                stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                old_voters = ?configuration.voters,
+                new_voters = ?next,
+                outcome = %outcome,
+                "repaired dead voter"
+            );
+        } else if let Some(dropped) =
+            crate::stream::consensus::logging::rate_limit("repair.replace_failed", Some(stream))
+        {
+            tracing::warn!(
+                keeper = %self.id,
+                stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                old_voters = ?configuration.voters,
+                new_voters = ?next,
+                outcome = %outcome,
+                dropped = dropped,
+                "voter repair did not complete"
+            );
+        }
         replaced
     }
 
@@ -747,13 +777,40 @@ impl Engine {
                 let result = self
                     .retire_copy(stream, authority, proof.configuration.revision, generation)
                     .await;
-                eprintln!(
-                    "logkeeper retired its removed copy of stream {stream:?}: {}",
-                    match result {
-                        Ok(_) => "retired".to_owned(),
-                        Err(error) => error.to_string(),
-                    }
+                let outcome = match &result {
+                    Ok(_) => "retired".to_owned(),
+                    Err(error) => error.to_string(),
+                };
+                crate::stream::consensus::logging::audit_retire(
+                    self.id,
+                    stream,
+                    "auto-retire",
+                    authority,
+                    proof.configuration.revision,
+                    generation,
+                    &outcome,
                 );
+                if result.is_ok() {
+                    tracing::info!(
+                        keeper = %self.id,
+                        stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                        authority = %authority,
+                        revision = proof.configuration.revision,
+                        generation = generation,
+                        "retired removed replica copy"
+                    );
+                } else if let Some(dropped) = crate::stream::consensus::logging::rate_limit(
+                    "repair.retire_failed",
+                    Some(stream),
+                ) {
+                    tracing::warn!(
+                        keeper = %self.id,
+                        stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                        outcome = %outcome,
+                        dropped = dropped,
+                        "retiring removed replica copy failed"
+                    );
+                }
             }
         }
     }

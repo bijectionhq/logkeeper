@@ -166,7 +166,7 @@ impl Config {
             })?;
         let point = disk.recovery_point(stream);
         if let Some(done) = point.written {
-            return Ok(RecoveryReport {
+            let report = RecoveryReport {
                 stream,
                 lost: lost(&done.old, self.keeper),
                 voters: done.target,
@@ -175,7 +175,20 @@ impl Config {
                 epoch: replayed.epoch,
                 term: point.vote_term,
                 written: false,
-            });
+            };
+            crate::stream::consensus::logging::audit_recovery(
+                self.keeper,
+                stream,
+                &report.lost,
+                &report.voters,
+                report.revision,
+                report.head,
+                report.epoch,
+                report.term,
+                report.written,
+                "already_written",
+            );
+            return Ok(report);
         }
         let survivor_votes = configuration.voters.contains(&self.keeper);
         if !survivor_votes {
@@ -423,7 +436,7 @@ impl Config {
             )),
         ))
         .await?;
-        Ok(RecoveryReport {
+        let report = RecoveryReport {
             stream,
             lost: others,
             voters: target,
@@ -432,7 +445,20 @@ impl Config {
             epoch,
             term,
             written: true,
-        })
+        };
+        crate::stream::consensus::logging::audit_recovery(
+            self.keeper,
+            stream,
+            &report.lost,
+            &report.voters,
+            report.revision,
+            report.head,
+            report.epoch,
+            report.term,
+            report.written,
+            "ok",
+        );
+        Ok(report)
     }
 
     async fn stage_in_catalog(

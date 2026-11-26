@@ -52,11 +52,12 @@ pub(super) static COUNTERS: Counters = Counters::new();
 
 static SAMPLES: AtomicU64 = AtomicU64::new(0);
 
-/// Prints the detail of the first few refusals of the process, so an operator
-/// can see what a counter stands for without a debug build.
-pub(super) fn sample(reason: &str, detail: impl FnOnce() -> String) {
+/// Logs the detail of refusals, rate-limited per reason with a dropped count.
+pub(super) fn sample(reason: &'static str, detail: impl FnOnce() -> String) {
     if SAMPLES.fetch_add(1, Ordering::Relaxed) < 8 {
-        eprintln!("logkeeper consensus refusal {reason}: {}", detail());
+        tracing::warn!(reason = reason, detail = %detail(), dropped = 0u64, "consensus refusal");
+    } else if let Some(dropped) = super::logging::rate_limit(reason, None) {
+        tracing::warn!(reason = reason, detail = %detail(), dropped = dropped, "consensus refusal");
     }
 }
 
@@ -96,9 +97,10 @@ pub(super) async fn report(
         let current = COUNTERS.snapshot();
         let changes = changed(&previous, &current);
         if !changes.is_empty() {
-            eprintln!(
-                "logkeeper consensus {keeper} refusals: {}",
-                changes.join(" ")
+            tracing::info!(
+                keeper = %keeper,
+                refusals = %changes.join(" "),
+                "consensus refusal counters"
             );
         }
         previous = current;

@@ -7,6 +7,7 @@ mod client;
 mod decisions;
 mod journal;
 mod keeper;
+pub mod logging;
 mod metrics;
 mod network;
 mod ownership;
@@ -30,6 +31,7 @@ pub use crate::server::durability::SyncMode;
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
 pub use keeper::{Config, Recovery, RecoveryReport};
+pub use logging::LogFormat;
 pub use placement::Domains;
 pub use timed::TimedAuthority;
 
