@@ -1,3 +1,4 @@
+mod admin;
 mod admission;
 mod catalog_stream;
 mod certify;
@@ -95,6 +96,24 @@ fn default_async_append() -> bool {
     true
 }
 
+fn default_admin_listen() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 9100))
+}
+
+/// Configuration for the separate operational HTTP/mTLS admin listener.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Address to bind the admin HTTP listener on. Defaults to `127.0.0.1:9100`.
+    #[serde(default = "default_admin_listen")]
+    pub listen: SocketAddr,
+    /// Require mutual TLS using the keeper's credentials and configured
+    /// `administrators` principals. Plain HTTP (default) requires a loopback
+    /// bind address.
+    #[serde(default)]
+    pub mtls: bool,
+}
+
 /// Installed, authenticated keeper inventory and local service settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,6 +170,10 @@ pub struct Config {
     /// Structured log format (`human` by default, or `json`).
     #[serde(default)]
     pub log_format: super::logging::LogFormat,
+    /// Optional operational HTTP/mTLS admin listener for `/metrics`, `/live`,
+    /// `/ready`, `/safe-to-stop`, and `/problems`.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
 }
 
 impl Config {
@@ -234,6 +257,22 @@ impl Config {
                 "catalog voters must be three sorted keepers in distinct domains, one the catalog",
             ));
         }
+        if let Some(admin) = &self.admin {
+            if !admin.mtls && !admin.listen.ip().is_loopback() {
+                return Err(invalid(
+                    "plain HTTP admin listener must bind to a loopback address; enable mtls for non-loopback addresses",
+                ));
+            }
+            if admin.listen.port() != 0
+                && (admin.listen == self.listen
+                    || self.peers.get(&self.keeper) == Some(&admin.listen)
+                    || self.bulk.get(&self.keeper) == Some(&admin.listen))
+            {
+                return Err(invalid(
+                    "admin listener address must be separate from consensus listeners",
+                ));
+            }
+        }
         Ok(placement)
     }
 
@@ -248,14 +287,21 @@ impl Config {
             .ok_or_else(|| invalid("missing local bulk address"))?;
         let control = TcpListener::bind(peer).await?;
         let bulk = TcpListener::bind(bulk).await?;
-        let (engine, acceptors) = self.prepare(stop).await?;
-        engine.serve([listener, control, bulk], acceptors).await
+        let admin_listener = match &self.admin {
+            Some(admin) => Some(TcpListener::bind(admin.listen).await?),
+            None => None,
+        };
+        let (engine, acceptors, admin_tls) = self.prepare(stop).await?;
+        let admin = admin_listener.map(|listener| (listener, admin_tls));
+        engine
+            .serve([listener, control, bulk], acceptors, admin)
+            .await
     }
 
     pub(super) async fn prepare(
         self,
         stop: CancellationToken,
-    ) -> io::Result<(Arc<Engine>, [TlsAcceptor; 3])> {
+    ) -> io::Result<(Arc<Engine>, [TlsAcceptor; 3], Option<TlsAcceptor>)> {
         let placement = self.validate()?;
         let keeper = KeeperId(self.keeper.as_u128());
         let acceptors = [
@@ -264,6 +310,10 @@ impl Config {
             self.tls
                 .server_protocols(keeper, &[Lane::Bulk.alpn(), Lane::Replication.alpn()])?,
         ];
+        let admin_tls = match &self.admin {
+            Some(admin) if admin.mtls => Some(self.tls.server_protocols(keeper, &[b"http/1.1"])?),
+            _ => None,
+        };
         let enrollment = self.enrollment()?;
         let (rpc, control, bulk, replication) = (
             Rpc::new(
@@ -375,6 +425,7 @@ impl Config {
             retire_now: Arc::default(),
             placement_confirmed: parking_lot::Mutex::default(),
             certification: Arc::default(),
+            replayed: std::sync::atomic::AtomicBool::new(false),
             stop: stop.child_token(),
             #[cfg(test)]
             reject_append: Default::default(),
@@ -393,7 +444,7 @@ impl Config {
             #[cfg(test)]
             crash: std::sync::atomic::AtomicBool::new(false),
         });
-        Ok((engine, acceptors))
+        Ok((engine, acceptors, admin_tls))
     }
 }
 
@@ -464,6 +515,8 @@ pub(super) struct Engine {
     /// The copies this keeper certified or the catalog fenced: see
     /// `certify`.
     certification: Arc<certify::Certification>,
+    /// True once startup WAL replay and initial stream opens have finished.
+    replayed: std::sync::atomic::AtomicBool,
     pub(super) stop: CancellationToken,
     #[cfg(test)]
     reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
@@ -540,9 +593,14 @@ impl Engine {
         self: Arc<Self>,
         listeners: [TcpListener; 3],
         acceptors: [TlsAcceptor; 3],
+        admin: Option<(TcpListener, Option<TlsAcceptor>)>,
     ) -> io::Result<()> {
         let mut sockets = JoinSet::new();
         let result = async {
+            if let Some((listener, acceptor)) = admin {
+                let engine = self.clone();
+                sockets.spawn(async move { engine.listen_admin(listener, acceptor).await });
+            }
             for genesis in self.disk.streams() {
                 if self
                     .disk
@@ -587,6 +645,8 @@ impl Engine {
                     }
                 }
             }
+            self.replayed
+                .store(true, std::sync::atomic::Ordering::Release);
             self.disk.enable_reaping();
             let repairing = self.clone();
             sockets.spawn(async move {
@@ -1127,6 +1187,7 @@ impl Engine {
             used: parking_lot::Mutex::new(Instant::now()),
             handoff: parking_lot::Mutex::new(None),
             heard: parking_lot::Mutex::new(Instant::now()),
+            leader_matched: parking_lot::Mutex::new(None),
             excluded,
             stop: self.stop.child_token(),
         });
@@ -1761,6 +1822,8 @@ pub(super) struct Group {
     pub(super) handoff: parking_lot::Mutex<Option<Instant>>,
     /// When this replica last received an append from a leader.
     heard: parking_lot::Mutex<Instant>,
+    /// The term and time when a leader's append last matched this follower's log.
+    leader_matched: parking_lot::Mutex<Option<(u64, Instant)>>,
     /// The last peer that refused this replica as outside its placement.
     excluded: Arc<parking_lot::Mutex<Option<uuid::Uuid>>>,
     stop: CancellationToken,

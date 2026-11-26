@@ -82,6 +82,7 @@ impl Group {
                 return Err(invalid("a newer snapshot transfer is already in progress"));
             }
             receiving.take();
+            *self.leader_matched.lock() = None;
             let file = self
                 .state
                 .receive_snapshot(digest, request.meta.clone())
@@ -707,37 +708,74 @@ impl Engine {
         request: AppendEntriesRequest<RaftTypes>,
         body: Option<Charge>,
     ) -> io::Result<AppendReply> {
-        if request.entries.is_empty() {
-            return Ok(raft_reply(group.raft.append_entries(request).await));
-        }
-        let Ok(ordered) = group.append_order.clone().try_lock_owned() else {
-            return Ok(AppendReply::Busy);
-        };
-        let Some(body) = body else {
-            let _ordered = ordered;
-            return Ok(raft_reply(group.raft.append_entries(request).await));
-        };
-        let destination = match group.follower.admit(
-            &self.disk,
-            group.genesis.stream,
-            request.vote,
-            &request.entries,
-        ) {
-            Ok(reservation) => reservation,
-            Err(Admission::FullSuffix) => {
-                group.request_covered_purge().await;
-                return Ok(AppendReply::Busy);
-            }
-            Err(Admission::Space) => return Ok(AppendReply::Busy),
-        };
-        // The request task owns the body, ordering gate and disk reservation
-        // from before dispatch through resolution, even if the socket closes.
-        tokio::spawn(async move {
-            let (_ordered, _body, _destination) = (ordered, body, destination);
+        let term = request.vote.leader_id().term;
+        let last_entry = request
+            .entries
+            .last()
+            .map(|entry| entry.log_id)
+            .or(request.prev_log_id);
+        let leader_commit = request.leader_commit;
+        let reply = if request.entries.is_empty() {
             raft_reply(group.raft.append_entries(request).await)
-        })
-        .await
-        .map_err(io::Error::other)
+        } else {
+            let Ok(ordered) = group.append_order.clone().try_lock_owned() else {
+                return Ok(AppendReply::Busy);
+            };
+            let Some(body) = body else {
+                let _ordered = ordered;
+                let reply = raft_reply(group.raft.append_entries(request).await);
+                record_leader_match(&group, term, last_entry, leader_commit, &reply);
+                return Ok(reply);
+            };
+            let destination = match group.follower.admit(
+                &self.disk,
+                group.genesis.stream,
+                request.vote,
+                &request.entries,
+            ) {
+                Ok(reservation) => reservation,
+                Err(Admission::FullSuffix) => {
+                    group.request_covered_purge().await;
+                    return Ok(AppendReply::Busy);
+                }
+                Err(Admission::Space) => return Ok(AppendReply::Busy),
+            };
+            // The request task owns the body, ordering gate and disk reservation
+            // from before dispatch through resolution, even if the socket closes.
+            let target = group.clone();
+            tokio::spawn(async move {
+                let (_ordered, _body, _destination) = (ordered, body, destination);
+                raft_reply(target.raft.append_entries(request).await)
+            })
+            .await
+            .map_err(io::Error::other)?
+        };
+        record_leader_match(&group, term, last_entry, leader_commit, &reply);
+        Ok(reply)
+    }
+}
+
+fn record_leader_match(
+    group: &Group,
+    term: u64,
+    last_entry: Option<crate::stream::consensus::LogId>,
+    leader_commit: Option<crate::stream::consensus::LogId>,
+    reply: &AppendReply,
+) {
+    match reply {
+        AppendReply::Raft(Ok(AppendEntriesResponse::Success)) => {
+            if leader_commit
+                .is_none_or(|commit| last_entry.is_some_and(|last| last.index >= commit.index))
+            {
+                *group.leader_matched.lock() = Some((term, Instant::now()));
+            }
+        }
+        AppendReply::Raft(Ok(
+            AppendEntriesResponse::Conflict | AppendEntriesResponse::HigherVote(_),
+        )) => {
+            *group.leader_matched.lock() = None;
+        }
+        _ => {}
     }
 }
 

@@ -54,6 +54,7 @@ const MAX_WAKE_BACKOFF: Duration = Duration::from_secs(16);
 
 pub(super) struct Liveness {
     started: Instant,
+    populated: bool,
     peers: HashMap<Uuid, (Instant, KeeperStatus)>,
     /// Failed wakes and the earliest next wake of each parked stream.
     wakes: HashMap<StreamId, (u32, Instant)>,
@@ -63,6 +64,7 @@ impl Default for Liveness {
     fn default() -> Self {
         Self {
             started: Instant::now(),
+            populated: false,
             peers: HashMap::new(),
             wakes: HashMap::new(),
         }
@@ -82,6 +84,80 @@ impl Liveness {
 }
 
 impl Engine {
+    /// Whether at least one ping round has finished and the keeper can see
+    /// at least one peer (or has no peers configured).
+    pub(super) fn liveness_populated(&self) -> bool {
+        let liveness = self.liveness.lock();
+        if !liveness.populated {
+            return false;
+        }
+        let expected_peers = self
+            .placement
+            .domains()
+            .keys()
+            .filter(|keeper| **keeper != self.id)
+            .count();
+        if expected_peers == 0 {
+            return true;
+        }
+        liveness
+            .peers
+            .values()
+            .any(|(answered, _)| answered.elapsed() < PING_INTERVAL * MISSED_PINGS)
+    }
+
+    /// Synchronous liveness check for whether `keeper` answered a recent ping.
+    pub(super) fn is_peer_reachable(&self, keeper: Uuid) -> bool {
+        if keeper == self.id {
+            return true;
+        }
+        let liveness = self.liveness.lock();
+        liveness
+            .peers
+            .get(&keeper)
+            .is_some_and(|(answered, _)| answered.elapsed() < PING_INTERVAL * MISSED_PINGS)
+    }
+
+    /// Liveness summary for every keeper in the cluster inventory.
+    pub(super) fn liveness_snapshot(&self, own_accepting: bool) -> Vec<metrics::KeeperLiveness> {
+        let liveness = self.liveness.lock();
+        let now = Instant::now();
+        let repair_ms = self.repair_after.as_millis() as u64;
+        self.placement
+            .domains()
+            .iter()
+            .map(|(&keeper, domain)| {
+                if keeper == self.id {
+                    return metrics::KeeperLiveness {
+                        keeper,
+                        domain: domain.clone(),
+                        state: metrics::LivenessState::Alive,
+                        accepting: own_accepting,
+                        silent_secs: 0.0,
+                    };
+                }
+                let silent = liveness.silent(keeper, now);
+                let dead = decisions::keeper_dead(silent.as_millis() as u64, repair_ms);
+                let (state, accepting) = match liveness.peers.get(&keeper) {
+                    Some((answered, status))
+                        if answered.elapsed() < PING_INTERVAL * MISSED_PINGS =>
+                    {
+                        (metrics::LivenessState::Alive, status.accepting)
+                    }
+                    _ if dead => (metrics::LivenessState::Dead, false),
+                    _ => (metrics::LivenessState::Suspect, false),
+                };
+                metrics::KeeperLiveness {
+                    keeper,
+                    domain: domain.clone(),
+                    state,
+                    accepting,
+                    silent_secs: silent.as_secs_f64(),
+                }
+            })
+            .collect()
+    }
+
     /// The status `keeper` reported with its last ping answer, when that
     /// answer is recent. This keeper's own status is always current.
     pub(super) async fn reachable(&self, keeper: Uuid) -> Option<KeeperStatus> {
@@ -176,6 +252,7 @@ impl Engine {
         }
         let now = Instant::now();
         let mut liveness = self.liveness.lock();
+        liveness.populated = true;
         for (keeper, pong) in answers {
             liveness.peers.insert(keeper, (now, pong.status));
         }

@@ -207,6 +207,7 @@ impl LocalCluster {
                     }) as Arc<dyn TimedOriginalClock>),
                 }),
                 log_format: Default::default(),
+                admin: None,
             };
             provision(&config)?;
             config.initialize()?;

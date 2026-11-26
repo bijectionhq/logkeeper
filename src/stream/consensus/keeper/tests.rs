@@ -20,6 +20,7 @@ mod incarnation;
 mod lifecycle;
 mod model_counterexamples;
 mod park;
+mod ops;
 mod recovery;
 mod repair;
 
@@ -46,9 +47,14 @@ impl Running {
         listeners: [TcpListener; 3],
         before: impl FnOnce(&Engine),
     ) -> Self {
-        let (engine, acceptor) = config.prepare(CancellationToken::new()).await.unwrap();
+        let admin_listener = match &config.admin {
+            Some(admin) => Some(TcpListener::bind(admin.listen).await.unwrap()),
+            None => None,
+        };
+        let (engine, acceptor, admin_tls) = config.prepare(CancellationToken::new()).await.unwrap();
         before(&engine);
-        let task = tokio::spawn(engine.clone().serve(listeners, acceptor));
+        let admin = admin_listener.map(|listener| (listener, admin_tls));
+        let task = tokio::spawn(engine.clone().serve(listeners, acceptor, admin));
         Self { engine, task }
     }
 
@@ -160,6 +166,7 @@ impl Cluster {
                 sync_mode: SyncMode::Fsync,
                 timed_authority: None,
                 log_format: Default::default(),
+                admin: None,
             };
             provision(&config);
             config.initialize().unwrap();

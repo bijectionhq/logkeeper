@@ -118,12 +118,12 @@ impl Running {
         faults: &FaultNetwork,
         ignore_reused_ids: bool,
     ) -> Self {
-        let (engine, acceptor) = config.prepare(CancellationToken::new()).await.unwrap();
+        let (engine, acceptor, _) = config.prepare(CancellationToken::new()).await.unwrap();
         if ignore_reused_ids {
             engine.ignore_reused_ids();
         }
         engine.set_transport_filter(Some(faults.filter()));
-        let task = tokio::spawn(engine.clone().serve(listeners, acceptor));
+        let task = tokio::spawn(engine.clone().serve(listeners, acceptor, None));
         Self { engine, task }
     }
 
@@ -240,6 +240,7 @@ impl SimCluster {
                 timed_original: None,
                 timed_authority: None,
                 log_format: Default::default(),
+                admin: None,
                 sync_mode: crate::server::durability::SyncMode::Fsync,
             };
             provision(&config);

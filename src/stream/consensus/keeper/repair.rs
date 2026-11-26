@@ -102,6 +102,10 @@ impl Engine {
         self.repairs.lock().running.contains(&stream)
     }
 
+    pub(super) fn repairs_in_flight(&self) -> usize {
+        self.repairs.lock().running.len()
+    }
+
     /// This keeper's status without a replica.
     pub(super) async fn keeper_status(&self) -> KeeperStatus {
         let groups = self.groups.lock().await;

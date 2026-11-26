@@ -899,6 +899,14 @@ impl Disk {
         self.state.read().genesis.values().cloned().collect()
     }
 
+    pub fn suffix_len(&self, stream: StreamId) -> usize {
+        self.state
+            .read()
+            .logs
+            .get(&stream)
+            .map_or(0, |log| log.entries.len())
+    }
+
     pub fn check_placement(&self, stream: StreamId, placement: &Placement) -> io::Result<()> {
         let state = self.state.read();
         if !placement.genesis(&state.genesis[&stream])
