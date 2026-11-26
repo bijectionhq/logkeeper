@@ -1,20 +1,15 @@
-use std::{collections::HashMap, future::Future, io, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt, future::Future, io, sync::Arc, time::Duration};
 
 use bincode::Options;
+use futures::FutureExt;
 use journal_contract::{Epoch, Lsn, StreamId};
 use openraft::{
-    BasicNode, EntryPayload, Snapshot,
-    error::{
-        Fatal, InstallSnapshotError, PayloadTooLarge, RPCError, RaftError, RemoteError,
-        ReplicationClosed, StreamingError, Unreachable,
-    },
-    network::{
-        RPCOption, RaftNetwork, RaftNetworkFactory,
-        snapshot_transport::{Chunked, SnapshotTransport},
-    },
+    BasicNode, EntryPayload, OptionalSend,
+    errors::{NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable},
+    network::{Backoff, RPCOption, RaftNetworkFactory, RaftNetworkV2},
     raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, SnapshotResponse, VoteRequest, VoteResponse,
+        AppendEntriesRequest, AppendEntriesResponse, AppendError, AppendResult, SnapshotResponse,
+        VoteRequest, VoteResponse,
     },
 };
 use parking_lot::Mutex;
@@ -32,9 +27,9 @@ use tokio_rustls::TlsConnector;
 use super::decisions::{self, AppendFit, EntryKind, PeerKind, PeerLane};
 use super::{
     ALPN, BULK_ALPN, CONTROL_ALPN, Entry, Fence, Genesis, Keepers, LogId, MAX_MESSAGE, NodeId,
-    REPLICATION_ALPN, RaftTypes, Stage, Vote, decode, encode, invalid, options,
+    REPLICATION_ALPN, RaftTypes, SnapshotMeta, Stage, Vote, decode, encode, invalid, options,
     state::{Command, Outcome},
-    storage::StateMachine,
+    storage::{SnapshotFile, StateMachine},
 };
 use crate::stream::transport::{Channel, connect_protocol};
 
@@ -209,9 +204,43 @@ pub(super) enum Frame {
 #[derive(Serialize, Deserialize)]
 pub(super) enum PeerRequest {
     Append(#[serde(deserialize_with = "bounded_append")] AppendEntriesRequest<RaftTypes>),
-    Vote(VoteRequest<NodeId>),
-    Snapshot(InstallSnapshotRequest<RaftTypes>, [u8; 32]),
+    Vote(VoteRequest<RaftTypes>),
+    Snapshot(SnapshotChunk, [u8; 32]),
 }
+
+/// One chunk of a snapshot transfer, in the OpenRaft 0.9
+/// `InstallSnapshotRequest` layout.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(super) struct SnapshotChunk {
+    pub vote: Vote,
+    pub meta: SnapshotMeta,
+    pub offset: u64,
+    pub data: Vec<u8>,
+    pub done: bool,
+}
+
+/// The receiver holds no transfer that `got` continues; the sender restarts
+/// from offset zero.
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct SnapshotMismatch {
+    pub expect: u64,
+    pub got: u64,
+}
+
+impl fmt::Display for SnapshotMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "snapshot chunk at {} does not continue the transfer at {}",
+            self.got, self.expect
+        )
+    }
+}
+
+impl std::error::Error for SnapshotMismatch {}
+
+pub(super) type ChunkReply =
+    Result<SnapshotResponse<RaftTypes>, RaftError<RaftTypes, SnapshotMismatch>>;
 
 impl PeerRequest {
     pub fn lane(&self) -> Lane {
@@ -229,9 +258,9 @@ impl PeerRequest {
 
     pub fn sender(&self) -> Option<NodeId> {
         match self {
-            Self::Append(request) => request.vote.leader_id().voted_for(),
-            Self::Vote(request) => request.vote.leader_id().voted_for(),
-            Self::Snapshot(request, _) => request.vote.leader_id().voted_for(),
+            Self::Append(request) => Some(request.vote.leader_id().voted_for),
+            Self::Vote(request) => Some(request.vote.leader_id().voted_for),
+            Self::Snapshot(request, _) => Some(request.vote.leader_id().voted_for),
         }
     }
 }
@@ -304,28 +333,20 @@ fn bounded_entries<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<Entry>, 
     decoder.deserialize_seq(Entries)
 }
 
-/// A valid batch that exceeds its lane is split by OpenRaft at the sender, so
-/// the receiver never needs to allocate it. A single oversized entry cannot be
+/// A valid batch that exceeds its lane is split at the sender, so the
+/// receiver never needs to allocate it. A single oversized entry cannot be
 /// split and stays unreachable.
-fn fit_append(
-    lane: Lane,
-    size: u64,
-    count: usize,
-) -> Result<(), RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+fn fit_append(lane: Lane, size: u64, count: usize) -> Result<Option<usize>, RPCError<RaftTypes>> {
     match decisions::fit_append(size, lane.frame_limit(), count, MAX_PEER_ENTRIES) {
-        AppendFit::Fits => Ok(()),
-        AppendFit::Split(hint) => Err(RPCError::PayloadTooLarge(
-            PayloadTooLarge::new_entries_hint(hint as u64),
-        )),
-        AppendFit::Unfit => Err(RPCError::Unreachable(Unreachable::new(&invalid(
-            "peer append cannot fit its lane",
-        )))),
+        AppendFit::Fits => Ok(None),
+        AppendFit::Split(hint) => Ok(Some(hint)),
+        AppendFit::Unfit => Err(unreachable(&invalid("peer append cannot fit its lane")).into()),
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) enum AppendReply {
-    Raft(Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>),
+    Raft(Result<AppendEntriesResponse<RaftTypes>, RaftError<RaftTypes>>),
     Busy,
 }
 
@@ -489,20 +510,18 @@ impl RaftNetworkFactory<RaftTypes> for Network {
     }
 }
 
+fn unreachable(error: &(impl std::error::Error + 'static)) -> Unreachable<RaftTypes> {
+    Unreachable::new(error)
+}
+
 impl Peer {
-    async fn request<T, E>(
+    async fn request<T: DeserializeOwned>(
         &self,
         request: PeerRequest,
-        option: RPCOption,
-    ) -> Result<T, RPCError<NodeId, BasicNode, E>>
-    where
-        T: DeserializeOwned,
-        E: std::error::Error + DeserializeOwned,
-    {
+        option: &RPCOption,
+    ) -> Result<T, RPCError<RaftTypes>> {
         if !self.network.state.active() {
-            return Err(RPCError::Unreachable(Unreachable::new(&invalid(
-                "quarantined stream replica",
-            ))));
+            return Err(unreachable(&invalid("quarantined stream replica")).into());
         }
         let rpc = match request.lane() {
             Lane::Bulk => &self.network.bulk,
@@ -511,37 +530,19 @@ impl Peer {
             Lane::Application => unreachable!("peer request on application lane"),
         };
         let frame = Frame::Peer(self.network.genesis.clone(), request);
-        let result: Result<T, E> = rpc
-            .call(uuid::Uuid::from_u128(self.target), frame, option.hard_ttl())
+        rpc.call(uuid::Uuid::from_u128(self.target), frame, option.hard_ttl())
             .await
-            .map_err(|error| RPCError::Unreachable(Unreachable::new(&error)))?;
-        result.map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))
-    }
-}
-
-impl RaftNetwork<RaftTypes> for Peer {
-    fn backoff(&self) -> openraft::network::Backoff {
-        openraft::network::Backoff::new(peer_backoff())
+            .map_err(|error| unreachable(&error).into())
     }
 
-    async fn append_entries(
-        &mut self,
-        request: AppendEntriesRequest<RaftTypes>,
-        option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        if !self.network.state.active() {
-            return Err(RPCError::Unreachable(Unreachable::new(&invalid(
-                "quarantined stream replica",
-            ))));
-        }
-        let count = request.entries.len();
-        let request = PeerRequest::Append(request);
-        let lane = request.lane();
-        let frame = Frame::Peer(self.network.genesis.clone(), request);
-        let size = options()
-            .serialized_size(&frame)
-            .map_err(|error| RPCError::Unreachable(Unreachable::new(&error)))?;
-        fit_append(lane, size, count)?;
+    /// Sends one AppendEntries that fits its lane.
+    async fn append_part(
+        &self,
+        range: (Option<LogId>, Option<LogId>),
+        lane: Lane,
+        frame: Frame,
+        option: &RPCOption,
+    ) -> Result<AppendResult<RaftTypes>, RPCError<RaftTypes>> {
         let rpc = if lane == Lane::Replication {
             &self.network.replication
         } else {
@@ -551,32 +552,111 @@ impl RaftNetwork<RaftTypes> for Peer {
             .call(uuid::Uuid::from_u128(self.target), frame, option.hard_ttl())
             .await
         {
-            Ok(AppendReply::Raft(reply)) => {
-                reply.map_err(|error| RPCError::RemoteError(RemoteError::new(self.target, error)))
-            }
+            Ok(AppendReply::Raft(Ok(reply))) => Ok(reply.into_append_result(range.0, range.1)),
+            Ok(AppendReply::Raft(Err(error))) => Err(unreachable(&error).into()),
             Ok(AppendReply::Busy) => {
                 super::metrics::count(&super::metrics::COUNTERS.peer_busy);
-                Err(RPCError::Unreachable(Unreachable::new(&io::Error::new(
+                Err(unreachable(&io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "replication receiver is busy",
-                ))))
+                ))
+                .into())
             }
             Err(error) => {
                 super::metrics::count(&super::metrics::COUNTERS.peer_unreachable);
-                Err(RPCError::Unreachable(Unreachable::new(&error)))
+                Err(unreachable(&error).into())
+            }
+        }
+    }
+}
+
+/// Consecutive failures of one snapshot chunk before the transfer fails.
+const SNAPSHOT_CHUNK_MAX_RETRIES: u64 = 5;
+const SNAPSHOT_CHUNK_RETRY_BASE: Duration = Duration::from_millis(10);
+const SNAPSHOT_CHUNK_RETRY_MAX: Duration = Duration::from_millis(200);
+
+fn snapshot_chunk_retry_delay(failures: u64) -> Duration {
+    let shift = failures.saturating_sub(1).min(4) as u32;
+    SNAPSHOT_CHUNK_RETRY_BASE
+        .saturating_mul(2u32.saturating_pow(shift))
+        .min(SNAPSHOT_CHUNK_RETRY_MAX)
+}
+
+impl RaftNetworkV2<RaftTypes> for Peer {
+    type SnapshotData = Box<SnapshotFile>;
+
+    fn backoff(&self) -> Option<Backoff> {
+        Some(Backoff::new(peer_backoff()))
+    }
+
+    /// A request that exceeds its lane goes out in parts, each chained to the
+    /// part before it. A failure after an accepted part reports that part as
+    /// the follower's progress, and OpenRaft sends the rest again.
+    async fn append_entries(
+        &mut self,
+        request: AppendEntriesRequest<RaftTypes>,
+        option: RPCOption,
+    ) -> Result<AppendResult<RaftTypes>, RPCError<RaftTypes>> {
+        if !self.network.state.active() {
+            return Err(unreachable(&invalid("quarantined stream replica")).into());
+        }
+        let mut request = request;
+        let mut rest = Vec::new();
+        let mut accepted = None;
+        loop {
+            let count = request.entries.len();
+            let (vote, leader_commit) = (request.vote, request.leader_commit);
+            let range = (request.prev_log_id, request.last_log_id());
+            let message = PeerRequest::Append(request);
+            let lane = message.lane();
+            let frame = Frame::Peer(self.network.genesis.clone(), message);
+            let fit = options()
+                .serialized_size(&frame)
+                .map_err(|error| unreachable(&error).into())
+                .and_then(|size| fit_append(lane, size, count));
+            match fit {
+                Ok(None) => (),
+                Ok(Some(hint)) => {
+                    let Frame::Peer(_, PeerRequest::Append(mut part)) = frame else {
+                        unreachable!("an append frame holds its request");
+                    };
+                    rest.splice(0..0, part.entries.split_off(hint));
+                    request = part;
+                    continue;
+                }
+                Err(error) => return accepted.map(Ok).ok_or(error),
+            }
+            match (
+                self.append_part(range, lane, frame, &option).await,
+                accepted,
+            ) {
+                (Ok(Ok(matched)), _) if !rest.is_empty() => {
+                    accepted = Some(matched);
+                    request = AppendEntriesRequest {
+                        vote,
+                        prev_log_id: matched,
+                        entries: std::mem::take(&mut rest),
+                        leader_commit,
+                    };
+                }
+                (Ok(Err(AppendError::Conflict { .. })) | Err(_), Some(matched)) => {
+                    return Ok(Ok(matched));
+                }
+                (result, _) => return result,
             }
         }
     }
 
     async fn vote(
         &mut self,
-        request: VoteRequest<NodeId>,
+        request: VoteRequest<RaftTypes>,
         option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+    ) -> Result<VoteResponse<RaftTypes>, RPCError<RaftTypes>> {
         let proposed = request.vote;
         let last_log = request.last_log_id;
-        let response: VoteResponse<NodeId> =
-            self.request(PeerRequest::Vote(request), option).await?;
+        let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
+            self.request(PeerRequest::Vote(request), &option).await?;
+        let response = response.map_err(|error| unreachable(&error))?;
         if !response.vote_granted
             && !response.vote.is_committed()
             && response.vote.leader_id().term == proposed.leader_id().term
@@ -595,42 +675,106 @@ impl RaftNetwork<RaftTypes> for Peer {
         Ok(response)
     }
 
-    async fn install_snapshot(
-        &mut self,
-        request: InstallSnapshotRequest<RaftTypes>,
-        option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
-    > {
-        let digest = self
-            .network
-            .state
-            .snapshot_digest(&request.meta)
-            .ok_or_else(|| {
-                RPCError::Unreachable(Unreachable::new(&invalid("snapshot selection changed")))
-            })?;
-        self.request(PeerRequest::Snapshot(request, digest), option)
-            .await
-    }
-
+    /// Sends the snapshot in chunks on the bulk lane. A chunk that fails to
+    /// arrive is retried a few times, and a receiver that lost the transfer
+    /// restarts it from the first chunk.
     async fn full_snapshot(
         &mut self,
         vote: Vote,
-        mut snapshot: Snapshot<RaftTypes>,
-        cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
+        snapshot: openraft::type_config::alias::SnapshotOf<RaftTypes, Box<SnapshotFile>>,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
-    ) -> Result<SnapshotResponse<NodeId>, StreamingError<RaftTypes, Fatal<NodeId>>> {
+    ) -> Result<SnapshotResponse<RaftTypes>, StreamingError<RaftTypes>> {
         let mut cancel = Box::pin(cancel);
+        let mut file = snapshot.snapshot;
         // A private spool is a bulk admission, so refusal must be retryable.
-        // Once staged, OpenRaft uses the same stable file for all seeks.
-        tokio::select! {
+        // Once staged, every seek uses the same stable file.
+        let end = tokio::select! {
             closed = &mut cancel => return Err(closed.into()),
-            staged = snapshot.snapshot.seek(io::SeekFrom::End(0)) => {
-                staged.map_err(|error| Unreachable::new(&error))?;
+            staged = file.seek(io::SeekFrom::End(0)) => {
+                staged.map_err(|error| unreachable(&error))?
             }
+        };
+        let meta = file.meta().clone();
+        let digest = self
+            .network
+            .state
+            .snapshot_digest(&meta)
+            .ok_or_else(|| unreachable(&invalid("snapshot selection changed")))?;
+        let chunk_size = option
+            .snapshot_chunk_size()
+            .ok_or_else(|| unreachable(&invalid("snapshot chunk size is unset")))?;
+        let mut offset = 0;
+        let mut failures = 0;
+        let mut backoff = None::<Backoff>;
+        loop {
+            if let Some(closed) = cancel.as_mut().now_or_never() {
+                return Err(closed.into());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            file.seek(io::SeekFrom::Start(offset))
+                .await
+                .map_err(|error| unreachable(&error))?;
+            let mut data = Vec::with_capacity(chunk_size);
+            while data.len() < data.capacity() {
+                let read = file
+                    .read_buf(&mut data)
+                    .await
+                    .map_err(|error| unreachable(&error))?;
+                if read == 0 {
+                    break;
+                }
+            }
+            let read = data.len() as u64;
+            let done = offset + read == end;
+            let chunk = SnapshotChunk {
+                vote,
+                meta: meta.clone(),
+                offset,
+                data,
+                done,
+            };
+            let sent = timeout(
+                option.hard_ttl(),
+                self.request::<ChunkReply>(PeerRequest::Snapshot(chunk, digest), &option),
+            )
+            .await;
+            let reply = match sent {
+                Err(elapsed) => return Err(NetworkError::new(&elapsed).into()),
+                Ok(Ok(Ok(reply))) => {
+                    failures = 0;
+                    backoff = None;
+                    reply
+                }
+                Ok(Ok(Err(RaftError::APIError(_)))) => {
+                    offset = 0;
+                    failures = 0;
+                    backoff = None;
+                    continue;
+                }
+                Ok(Ok(Err(RaftError::Fatal(fatal)))) => return Err(unreachable(&fatal).into()),
+                Ok(Err(error)) => {
+                    failures += 1;
+                    if failures >= SNAPSHOT_CHUNK_MAX_RETRIES {
+                        return Err(error.into());
+                    }
+                    let delay = if matches!(error, RPCError::Unreachable(_)) {
+                        backoff
+                            .get_or_insert_with(|| Backoff::new(peer_backoff()))
+                            .next()
+                            .unwrap_or(PEER_BACKOFF_LAST)
+                    } else {
+                        snapshot_chunk_retry_delay(failures)
+                    };
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+            if reply.vote > vote || done {
+                return Ok(reply);
+            }
+            offset += read;
         }
-        Ok(Chunked::send_snapshot(self, vote, snapshot, cancel, option).await?)
     }
 }
 
@@ -650,20 +794,23 @@ mod tests {
     #[test]
     fn an_oversized_valid_batch_is_split_at_the_sender() {
         let limit = Lane::Replication.frame_limit();
-        assert!(fit_append(Lane::Replication, limit, MAX_PEER_ENTRIES).is_ok());
+        assert!(matches!(
+            fit_append(Lane::Replication, limit, MAX_PEER_ENTRIES),
+            Ok(None)
+        ));
         for (lane, size, count, hint) in [
             (Lane::Replication, limit + 1, 4, 2),
             (
                 Lane::Replication,
                 1024,
                 MAX_PEER_ENTRIES + 2,
-                (MAX_PEER_ENTRIES as u64 + 2) / 2,
+                (MAX_PEER_ENTRIES + 2) / 2,
             ),
             (Lane::Control, Lane::Control.frame_limit() + 1, 2, 1),
         ] {
             match fit_append(lane, size, count) {
-                Err(RPCError::PayloadTooLarge(error)) => assert_eq!(error.entries_hint(), hint),
-                other => panic!("expected a resize hint, got {other:?}"),
+                Ok(Some(split)) => assert_eq!(split, hint),
+                other => panic!("expected a split, got {other:?}"),
             }
         }
         assert!(matches!(

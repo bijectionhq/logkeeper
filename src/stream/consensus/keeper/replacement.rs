@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, time::Duration};
 
 use journal_contract::JournalError;
-use openraft::ServerState;
+use openraft::{ServerState, async_runtime::WatchReceiver};
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -51,7 +51,7 @@ impl Engine {
             [_] => {
                 let vote = {
                     let metrics = group.raft.metrics();
-                    let current = metrics.borrow();
+                    let current = metrics.borrow_watched();
                     if current.state != ServerState::Leader {
                         return Ok(leader_reply(current.current_leader));
                     }
@@ -194,11 +194,11 @@ impl Group {
         let mut metrics = self.raft.metrics();
         // A replication match covers the learner's durable log or installed snapshot.
         // Matching a later log ID in this ballot also covers this exact prefix.
-        let observed =
-            timeout_at(
-                deadline,
-                metrics.wait_for(|metrics| {
-                    metrics.vote != vote
+        let observed = timeout_at(deadline, async {
+            loop {
+                {
+                    let metrics = metrics.borrow_and_update();
+                    if metrics.vote != vote
                         || metrics.state != ServerState::Leader
                         || metrics.replication.as_ref().is_some_and(|matched| {
                             learners.iter().all(|id| {
@@ -207,10 +207,14 @@ impl Group {
                                 })
                             })
                         })
-                }),
-            )
-            .await?
-            .map_err(std::io::Error::other)?;
+                    {
+                        return Ok::<_, std::io::Error>(metrics.clone());
+                    }
+                }
+                metrics.changed().await.map_err(std::io::Error::other)?;
+            }
+        })
+        .await??;
         if observed.vote == vote && observed.state == ServerState::Leader {
             Ok(())
         } else {
@@ -245,7 +249,7 @@ impl Group {
                 result = metrics.changed() => if result.is_err() { return; },
             }
             let is_leader = {
-                let current = metrics.borrow();
+                let current = metrics.borrow_watched();
                 current.state == ServerState::Leader && current.current_leader == Some(id)
             };
             if !is_leader {

@@ -21,7 +21,10 @@ fn genesis() -> Genesis {
 
 fn entry(index: u64, payload: Bytes) -> Entry {
     Entry {
-        log_id: LogId::new(openraft::CommittedLeaderId::new(2, 1), index),
+        log_id: LogId::new(
+            openraft::vote::leader_id_std::CommittedLeaderId::new(2),
+            index,
+        ),
         payload: EntryPayload::Normal(Command::Append {
             fence: Fence {
                 epoch: Epoch(1),
@@ -172,7 +175,10 @@ async fn staged_install_requires_the_exact_cut_and_generation_and_keeps_the_vote
     let generation = disk.current_generation(stream).unwrap();
     let item = entry(0, Bytes::from_static(b"staged bytes"));
     let exact = item.log_id;
-    let other = LogId::new(openraft::CommittedLeaderId::new(3, 1), exact.index);
+    let other = LogId::new(
+        openraft::vote::leader_id_std::CommittedLeaderId::new(3),
+        exact.index,
+    );
     disk.write(Record::Owned(
         generation,
         Box::new(Record::Append(stream, vec![item])),
@@ -421,7 +427,7 @@ fn saturated_durable_lanes_rotate_without_overtaking_an_admitted_replica() {
         let (done, _) = oneshot::channel();
         lanes[lane]
             .try_send(Message::Write(Work {
-                record: Record::Vote(StreamId(10 * sequence + lane as u128), Vote::default()),
+                record: Record::Vote(StreamId(10 * sequence + lane as u128), Vote::new(0, 1)),
                 done,
                 _space: None,
                 follower: lane == 2,

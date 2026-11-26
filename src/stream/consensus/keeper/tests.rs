@@ -1,7 +1,7 @@
 use super::*;
 use bytes::Bytes;
 use journal_contract::Epoch;
-use openraft::{EntryPayload, raft::AppendEntriesRequest};
+use openraft::{EntryPayload, async_runtime::WatchReceiver, raft::AppendEntriesRequest};
 use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
 use uuid::Uuid;
 
@@ -204,7 +204,7 @@ impl Cluster {
         // A completed call to the fresh head path established a leader.
         for server in self.running.values() {
             if let Some(group) = server.engine.groups.lock().await.get(&stream)
-                && group.raft.metrics().borrow().state == openraft::ServerState::Leader
+                && group.raft.metrics().borrow_watched().state == openraft::ServerState::Leader
             {
                 return server.engine.id;
             }
@@ -366,7 +366,15 @@ async fn failover_snapshot_replacement_and_restart_preserve_the_stream() {
         Ok(Lsn(161))
     );
     let surviving = cluster.group(witness, stream).await;
-    assert!(surviving.raft.metrics().borrow().last_log_index.unwrap() >= through);
+    assert!(
+        surviving
+            .raft
+            .metrics()
+            .borrow_watched()
+            .last_log_index
+            .unwrap()
+            >= through
+    );
     assert!(surviving.state.applied().unwrap().index < through);
     assert!(
         cluster
@@ -374,7 +382,7 @@ async fn failover_snapshot_replacement_and_restart_preserve_the_stream() {
             .await
             .raft
             .metrics()
-            .borrow()
+            .borrow_watched()
             .last_log_index
             .unwrap_or(0)
             < through
@@ -389,7 +397,7 @@ async fn failover_snapshot_replacement_and_restart_preserve_the_stream() {
             let group = cluster.group(id, stream).await;
             eprintln!(
                 "{id} {} healthy={}",
-                *group.raft.metrics().borrow(),
+                *group.raft.metrics().borrow_watched(),
                 group.state.healthy()
             );
         }
@@ -565,7 +573,7 @@ async fn new_leader_finalizes_joint_membership_without_the_caller() {
         1
     );
     let learner = cluster.group(d, stream).await;
-    assert_eq!(learner.raft.metrics().borrow().last_log_index, None);
+    assert_eq!(learner.raft.metrics().borrow_watched().last_log_index, None);
     assert!(learner.state.generation() > 0);
     let fence = journal
         .seal(stream, Epoch(0), Uuid::new_v4())
@@ -599,7 +607,13 @@ async fn new_leader_finalizes_joint_membership_without_the_caller() {
         .unwrap();
     let joint_index = source.state.membership().log_id().unwrap().index;
     assert!(
-        source.raft.metrics().borrow().replication.as_ref().unwrap()[&d.as_u128()]
+        source
+            .raft
+            .metrics()
+            .borrow_watched()
+            .replication
+            .as_ref()
+            .unwrap()[&d.as_u128()]
             .is_some_and(|matched| matched.index >= issued.index)
     );
     source
@@ -641,7 +655,7 @@ async fn new_leader_finalizes_joint_membership_without_the_caller() {
             if let Some(group) = server.engine.groups.lock().await.get(&stream) {
                 eprintln!(
                     "{id} {} applied {:?}",
-                    *group.raft.metrics().borrow(),
+                    *group.raft.metrics().borrow_watched(),
                     group.state.membership()
                 );
             }
@@ -1089,7 +1103,7 @@ async fn a_vote_survives_a_lost_reply_and_rejects_another_candidate_in_its_term(
     for stopped in [a, b] {
         cluster.running.remove(&stopped).unwrap().stop().await;
     }
-    let term = voter.raft.metrics().borrow().current_term + 100;
+    let term = voter.raft.metrics().borrow_watched().current_term + 100;
     let last = voter.state.applied();
     let configs = cluster.configs.clone();
     let vote = |id| {
@@ -1104,7 +1118,7 @@ async fn a_vote_survives_a_lost_reply_and_rejects_another_candidate_in_its_term(
         let genesis = voter.genesis.clone();
         async move {
             client
-                .call::<Result<VoteResponse<NodeId>, RaftError<NodeId>>>(
+                .call::<Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>>>(
                     c,
                     Frame::Peer(
                         genesis,
@@ -1144,7 +1158,7 @@ fn follower_append(
     term: u64,
     fence: Fence,
 ) -> AppendEntriesRequest<RaftTypes> {
-    let leader = openraft::CommittedLeaderId::new(term, source.as_u128());
+    let leader = openraft::vote::leader_id_std::CommittedLeaderId::new(term);
     AppendEntriesRequest {
         vote: Vote::new_committed(term, source.as_u128()),
         prev_log_id: Some(previous),
@@ -1216,7 +1230,7 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
     disk.space.set_available(128 * MIB);
     let ordinary = disk.space.reserve(64 * MIB - 4 * 64 * 1024).unwrap();
     let previous = group.state.durable_tip().unwrap();
-    let term = group.raft.metrics().borrow().current_term + 50;
+    let term = group.raft.metrics().borrow_watched().current_term + 50;
     let mixed = follower_append(leader, previous, term, fence);
     assert!(
         cluster
@@ -1242,7 +1256,7 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
     ));
     assert_eq!(disk.space.outstanding(stream), (0, 0));
     assert_eq!(group.state.durable_tip(), Some(previous));
-    assert!(group.raft.metrics().borrow().current_term < term);
+    assert!(group.raft.metrics().borrow_watched().current_term < term);
 
     let inbound = &engine.replication_ingress;
     let donors = [busy, cluster.catalog, Uuid::from_u128(6)];
@@ -1278,12 +1292,12 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
 
     let voter = cluster.group(follower, auxiliary).await;
     let election = Vote::new(
-        voter.raft.metrics().borrow().current_term + 50,
+        voter.raft.metrics().borrow_watched().current_term + 50,
         leader.as_u128(),
     );
     let vote = cluster
         .peer_rpc(leader, Lane::Control)
-        .call::<Result<VoteResponse<NodeId>, RaftError<NodeId>>>(
+        .call::<Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>>>(
             follower,
             Frame::Peer(
                 voter.genesis.clone(),
@@ -1299,7 +1313,7 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
     // the service this cut requires while replication data is saturated.
     assert!(
         vote.vote_granted
-            || vote.vote.leader_id().term >= voter.raft.metrics().borrow().current_term
+            || vote.vote.leader_id().term >= voter.raft.metrics().borrow_watched().current_term
     );
     let cut = group.state.applied().unwrap();
     group.raft.trigger().snapshot().await.unwrap();
@@ -1395,7 +1409,7 @@ async fn cancelled_follower_exchange_retains_charges_until_the_exact_durable_set
     let engine = cluster.running[&receiver].engine.clone();
     let disk = &engine.disk;
     let previous = target.state.durable_tip().unwrap();
-    let term = target.raft.metrics().borrow().current_term + 100;
+    let term = target.raft.metrics().borrow_watched().current_term + 100;
     let request = follower_append(source, previous, term, fence);
     let cut = request.entries.last().unwrap().log_id;
 
@@ -1578,7 +1592,7 @@ async fn covered_maintenance_reopens_full_suffix_with_all_bulk_sessions_held() {
         .with_raft_state(|state| *state.vote_ref())
         .await
         .unwrap();
-    let incoming = openraft::raft::InstallSnapshotRequest {
+    let incoming = super::super::network::SnapshotChunk {
         vote,
         meta: super::super::SnapshotMeta {
             last_log_id: source.state.applied(),
@@ -2138,13 +2152,13 @@ async fn a_restarted_leader_reads_only_after_committing_in_a_new_term() {
             .await
             .unwrap();
     }
-    let term = source.raft.metrics().borrow().current_term;
+    let term = source.raft.metrics().borrow_watched().current_term;
     drop(source);
     cluster.stop_all().await;
     cluster.restart(leader).await;
     let restored = cluster.group(leader, stream).await;
     assert_ne!(
-        restored.raft.metrics().borrow().state,
+        restored.raft.metrics().borrow_watched().state,
         openraft::ServerState::Leader,
         "a restarted leader must not resume its old term"
     );
@@ -2154,7 +2168,7 @@ async fn a_restarted_leader_reads_only_after_committing_in_a_new_term() {
     assert_eq!(journal.head(stream).await, Ok(Lsn(8)));
     let current = cluster.leader(stream).await;
     let elected = cluster.group(current, stream).await;
-    assert!(elected.raft.metrics().borrow().current_term > term);
+    assert!(elected.raft.metrics().borrow_watched().current_term > term);
     assert_eq!(
         journal.configuration(stream).await.map(|c| c.revision),
         Ok(0)
@@ -2208,12 +2222,18 @@ async fn a_newcomer_confirms_persisted_progress_without_completing_a_quorum() {
         .metrics(
             |metrics| {
                 metrics
-                    .replication
-                    .as_ref()
-                    .and_then(|progress| progress.get(&d.as_u128()).copied().flatten())
-                    .is_some_and(|matched| Some(matched) == source.state.durable_tip())
+                    .membership_config
+                    .membership()
+                    .get_joint_config()
+                    .len()
+                    > 1
+                    && metrics
+                        .replication
+                        .as_ref()
+                        .and_then(|progress| progress.get(&d.as_u128()).copied().flatten())
+                        .is_some_and(|matched| Some(matched) == source.state.durable_tip())
             },
-            "learner matched the leader's log",
+            "learner matched the leader's joint configuration",
         )
         .await
         .unwrap();
@@ -2235,10 +2255,10 @@ async fn a_newcomer_confirms_persisted_progress_without_completing_a_quorum() {
         short.append(stream, fence, Lsn(2), second.clone()).await,
         Err(JournalError::Unavailable)
     );
-    // Once the newcomer matches, the leader gates writes and proposes the
-    // joint configuration, so the pending entry is either that configuration
-    // or the append. The newcomer durably confirms it, but without an old
-    // voter majority nothing commits.
+    // The leader proposed the joint configuration while the old voters still
+    // answered heartbeats; without them its lease lapses and it refuses the
+    // append. The newcomer durably confirms the pending configuration, but
+    // without an old voter majority nothing commits.
     let proposed = source.state.durable_tip().unwrap();
     source
         .raft
@@ -2259,7 +2279,7 @@ async fn a_newcomer_confirms_persisted_progress_without_completing_a_quorum() {
         source
             .raft
             .metrics()
-            .borrow()
+            .borrow_watched()
             .last_applied
             .is_some_and(|applied| applied < proposed)
     );

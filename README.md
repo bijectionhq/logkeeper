@@ -315,12 +315,16 @@ module `Logkeeper.LeaderJournal.RestartRead` checks this rule, with leader
 completeness as a premise, in the Lean worktree's
 `verification/lean/restart-read.md`.
 
-Peer-wire compatibility changed. The control ALPN is now
-`logkeeper-consensus-control/2`, and payload replication requires
-`logkeeper-consensus-replication/1`. Mixed versions are unsupported, because
-a keeper offering `logkeeper-consensus-control/1` fails the TLS handshake with
-`no_application_protocol`. Upgrade all keepers in a group together. Application, bulk chunk and `LKRIMG03` formats
-are unchanged, and the on-disk WAL format is unchanged.
+Keepers run OpenRaft 0.10.1. Its peer messages differ from 0.9 under
+bincode, so the peer ALPNs are `logkeeper-consensus-control/3`,
+`logkeeper-consensus-replication/2` and `logkeeper-consensus-bulk/2`. A keeper
+on an older version fails the TLS handshake with `no_application_protocol`
+instead of failing to decode. Mixed versions are unsupported: upgrade all
+keepers in a group together. The application protocol, `LKRIMG03` images
+and the on-disk WAL format are unchanged; a test pins the persisted bytes of
+votes, log ids, memberships, entries and snapshot metadata to their 0.9
+encoding. A leader that cannot confirm a recent quorum now refuses writes
+and answers that it has no leader.
 
 Verus checks the shipped admission, classification, rotation, batch and
 restart decisions in `src/stream/consensus/decisions.rs` against laws named

@@ -4,9 +4,9 @@ use crate::stream::consensus::decisions;
 use std::{io, sync::Arc, time::Duration};
 
 use openraft::{
-    Snapshot, SnapshotSegmentId,
-    error::{InstallSnapshotError, RaftError, SnapshotMismatch},
-    raft::{AppendEntriesRequest, InstallSnapshotRequest, InstallSnapshotResponse},
+    async_runtime::WatchReceiver,
+    errors::RaftError,
+    raft::{AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse},
 };
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
@@ -23,7 +23,7 @@ use super::admission::{Charge, Control};
 use super::{Command, Engine, Group, Identity, Lane, SNAPSHOT_CHUNK_BYTES, invalid, transport};
 use crate::stream::consensus::{
     MAX_MESSAGE, MAX_RECORD, RaftTypes, SnapshotMeta, Vote,
-    network::{self, AppendReply, Frame, PeerRequest},
+    network::{self, AppendReply, ChunkReply, Frame, PeerRequest, SnapshotChunk, SnapshotMismatch},
     storage::{Admission, MAX_TRANSFER_FILE, SnapshotFile},
 };
 
@@ -45,24 +45,22 @@ pub(super) struct Incoming {
     _expiry: AbortOnDropHandle<()>,
 }
 
-type InstallReply = Result<InstallSnapshotResponse<u128>, RaftError<u128, InstallSnapshotError>>;
-
 impl Group {
     // Keep the existing wire protocol. Admit and stage incoming chunks
     // outside Raft so a refused bulk allocation is a retryable transport
     // failure and never a failure of the replica's durable state machine.
     pub(super) async fn receive_chunk(
         self: &Arc<Self>,
-        request: InstallSnapshotRequest<RaftTypes>,
+        request: SnapshotChunk,
         digest: [u8; 32],
-    ) -> io::Result<InstallReply> {
+    ) -> io::Result<ChunkReply> {
         let vote = self
             .raft
             .with_raft_state(|state| *state.vote_ref())
             .await
             .map_err(io::Error::other)?;
         if request.vote < vote {
-            return Ok(Ok(InstallSnapshotResponse { vote }));
+            return Ok(Ok(SnapshotResponse::new(vote)));
         }
         let mut receiving = self.snapshot_receive.lock().await;
         if receiving
@@ -82,7 +80,10 @@ impl Group {
                 return Err(invalid("a newer snapshot transfer is already in progress"));
             }
             receiving.take();
-            let file = self.state.receive_snapshot(Some(digest)).await?;
+            let file = self
+                .state
+                .receive_snapshot(digest, request.meta.clone())
+                .await?;
             let session = Uuid::new_v4();
             let expires = Instant::now() + SNAPSHOT_IDLE;
             let expiry = self.expire_transfer(session, expires);
@@ -102,18 +103,10 @@ impl Group {
             .filter(|_| same || request.offset == 0)
             .map_or(0, |current| current.next);
         if (!same && request.offset != 0) || request.offset > next {
-            return Ok(Err(RaftError::APIError(
-                InstallSnapshotError::SnapshotMismatch(SnapshotMismatch {
-                    expect: SnapshotSegmentId {
-                        id: request.meta.snapshot_id.clone(),
-                        offset: next,
-                    },
-                    got: SnapshotSegmentId {
-                        id: request.meta.snapshot_id,
-                        offset: request.offset,
-                    },
-                }),
-            )));
+            return Ok(Err(RaftError::APIError(SnapshotMismatch {
+                expect: next,
+                got: request.offset,
+            })));
         }
         let current = receiving.as_mut().unwrap();
         current.expires = Instant::now() + SNAPSHOT_IDLE;
@@ -136,7 +129,7 @@ impl Group {
         let end = request.offset + request.data.len() as u64;
         current.next = current.next.max(end);
         if !request.done {
-            return Ok(Ok(InstallSnapshotResponse { vote }));
+            return Ok(Ok(SnapshotResponse::new(vote)));
         }
         let complete = receiving.take().unwrap();
         if end != complete.next {
@@ -146,13 +139,12 @@ impl Group {
             .raft
             .install_full_snapshot(
                 request.vote,
-                Snapshot {
-                    meta: complete.meta,
+                openraft::Snapshot {
+                    meta: complete.meta.raft(),
                     snapshot: complete.file,
                 },
             )
             .await
-            .map(Into::into)
             .map_err(RaftError::Fatal))
     }
 
@@ -349,7 +341,7 @@ impl Engine {
                             }
                             let eligible = {
                                 let metrics = group.raft.server_metrics();
-                                let current = metrics.borrow();
+                                let current = metrics.borrow_watched();
                                 let membership = current.membership_config.membership();
                                 if membership.get_joint_config().is_empty() {
                                     group.genesis.voters.contains(&self.id)
@@ -442,14 +434,14 @@ impl Engine {
         body: Option<Charge>,
     ) -> io::Result<AppendReply> {
         if request.entries.is_empty() {
-            return Ok(AppendReply::Raft(group.raft.append_entries(request).await));
+            return Ok(raft_reply(group.raft.append_entries(request).await));
         }
         let Ok(ordered) = group.append_order.clone().try_lock_owned() else {
             return Ok(AppendReply::Busy);
         };
         let Some(body) = body else {
             let _ordered = ordered;
-            return Ok(AppendReply::Raft(group.raft.append_entries(request).await));
+            return Ok(raft_reply(group.raft.append_entries(request).await));
         };
         let destination = match group.follower.admit(
             &self.disk,
@@ -468,9 +460,15 @@ impl Engine {
         // from before dispatch through resolution, even if the socket closes.
         tokio::spawn(async move {
             let (_ordered, _body, _destination) = (ordered, body, destination);
-            AppendReply::Raft(group.raft.append_entries(request).await)
+            raft_reply(group.raft.append_entries(request).await)
         })
         .await
         .map_err(io::Error::other)
     }
+}
+
+fn raft_reply(
+    result: Result<openraft::raft::AppendResult<RaftTypes>, RaftError<RaftTypes>>,
+) -> AppendReply {
+    AppendReply::Raft(result.map(AppendEntriesResponse::from))
 }

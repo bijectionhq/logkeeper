@@ -153,6 +153,30 @@ impl Command {
     }
 }
 
+/// Names the command without its payloads, which may be megabytes.
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Create => f.write_str("Create"),
+            Self::Seal { expected, .. } => write!(f, "Seal({expected:?})"),
+            Self::Append { at, payload, .. } => {
+                write!(f, "Append({at:?}, {} bytes)", payload.len())
+            }
+            Self::Trim { through, .. } => write!(f, "Trim({through:?})"),
+            Self::Delete => f.write_str("Delete"),
+            Self::Stage(stage) => write!(f, "Stage({})", stage.source),
+            Self::StageOwned(stage) => write!(f, "StageOwned({})", stage.source),
+            Self::Admitted(ticket, command) => write!(f, "Admitted({ticket}, {command})"),
+            Self::AppendBatch { at, payloads, .. } => {
+                write!(f, "AppendBatch({at:?}, {} records)", payloads.len())
+            }
+            Self::AppendOriginal { at, record, .. } => {
+                write!(f, "AppendOriginal({at:?}, {} bytes)", record.len())
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Outcome {
     Unit,

@@ -31,9 +31,9 @@ pub use placement::Domains;
 pub use timed::TimedAuthority;
 
 pub(super) const ALPN: &[u8] = b"logkeeper-consensus/1";
-const CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/2";
-const REPLICATION_ALPN: &[u8] = b"logkeeper-consensus-replication/1";
-const BULK_ALPN: &[u8] = b"logkeeper-consensus-bulk/1";
+const CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/3";
+const REPLICATION_ALPN: &[u8] = b"logkeeper-consensus-replication/2";
+const BULK_ALPN: &[u8] = b"logkeeper-consensus-bulk/2";
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
 const MAX_PAGE: usize = 8 * 1024 * 1024;
@@ -47,16 +47,34 @@ openraft::declare_raft_types!(
         R = state::Outcome,
         NodeId = NodeId,
         Node = openraft::BasicNode,
-        SnapshotData = storage::SnapshotFile,
+        Term = u64,
+        LeaderId = openraft::impls::leader_id_std::LeaderId<u64, NodeId>,
 );
 
-type Raft = openraft::Raft<RaftTypes>;
-type Entry = openraft::Entry<RaftTypes>;
-type LogId = openraft::LogId<NodeId>;
-type Vote = openraft::Vote<NodeId>;
-type Membership = openraft::StoredMembership<NodeId, openraft::BasicNode>;
-type SnapshotMeta = openraft::SnapshotMeta<NodeId, openraft::BasicNode>;
-type StorageError = openraft::StorageError<NodeId>;
+type Raft = openraft::Raft<RaftTypes, storage::StateMachine>;
+type Entry = openraft::type_config::alias::EntryOf<RaftTypes>;
+type LogId = openraft::type_config::alias::LogIdOf<RaftTypes>;
+type Vote = openraft::type_config::alias::VoteOf<RaftTypes>;
+type Membership = openraft::type_config::alias::StoredMembershipOf<RaftTypes>;
+
+/// Snapshot metadata as images and chunk transfers carry it. It keeps the
+/// OpenRaft 0.9 layout: `snapshot_id` names a transfer and marks a staged
+/// image, which OpenRaft's own metadata no longer records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SnapshotMeta {
+    last_log_id: Option<LogId>,
+    last_membership: Membership,
+    snapshot_id: String,
+}
+
+impl SnapshotMeta {
+    fn raft(&self) -> openraft::type_config::alias::SnapshotMetaOf<RaftTypes> {
+        openraft::SnapshotMeta {
+            last_log_id: self.last_log_id,
+            last_membership: self.last_membership.clone(),
+        }
+    }
+}
 
 /// Certificate-bound keeper addresses. A keeper ID is never reused after loss
 /// of the directory that holds its vote and log.
@@ -128,4 +146,86 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Checks `value` against the bytes OpenRaft 0.9.25 wrote for it.
+    fn written_by_0_9<T>(value: &T, captured: &str)
+    where
+        T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let bytes = options().serialize(value).unwrap();
+        assert_eq!(storage::hex(&bytes), captured);
+        assert_eq!(&options().deserialize::<T>(&bytes).unwrap(), value);
+    }
+
+    #[test]
+    fn persisted_raft_types_keep_their_encoding() {
+        let node = 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10_u128;
+        let log_id = LogId::new(openraft::vote::leader_id_std::CommittedLeaderId::new(7), 42);
+        let nodes = [
+            (node, openraft::BasicNode::new("k1:7000")),
+            (node + 1, openraft::BasicNode::new("k2:7000")),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let membership =
+            openraft::Membership::new(vec![nodes.keys().copied().collect()], nodes).unwrap();
+        let stored = Membership::new(Some(log_id), membership.clone());
+        let (first, second) = (
+            "100f0e0d0c0b0a090807060504030201",
+            "110f0e0d0c0b0a090807060504030201",
+        );
+        let membership_hex = format!(
+            "0100000000000000\
+             0200000000000000{first}{second}\
+             0200000000000000{first}07000000000000006b313a37303030\
+             {second}07000000000000006b323a37303030"
+        );
+        written_by_0_9(
+            &Vote::new_committed(7, node),
+            &format!("070000000000000001{first}01"),
+        );
+        written_by_0_9(&Vote::new(7, node), &format!("070000000000000001{first}00"));
+        written_by_0_9(&log_id, "07000000000000002a00000000000000");
+        written_by_0_9(
+            &stored,
+            &format!("0107000000000000002a00000000000000{membership_hex}"),
+        );
+        written_by_0_9(
+            &Entry {
+                log_id,
+                payload: openraft::EntryPayload::Blank,
+            },
+            "07000000000000002a0000000000000000000000",
+        );
+        written_by_0_9(
+            &Entry {
+                log_id,
+                payload: openraft::EntryPayload::Normal(state::Command::Create),
+            },
+            "07000000000000002a000000000000000100000000000000",
+        );
+        written_by_0_9(
+            &Entry {
+                log_id,
+                payload: openraft::EntryPayload::Membership(membership),
+            },
+            &format!("07000000000000002a0000000000000002000000{membership_hex}"),
+        );
+        written_by_0_9(
+            &SnapshotMeta {
+                last_log_id: Some(log_id),
+                last_membership: stored,
+                snapshot_id: "staged-1".into(),
+            },
+            &format!(
+                "0107000000000000002a000000000000000107000000000000002a00000000000000\
+                 {membership_hex}08000000000000007374616765642d31"
+            ),
+        );
+    }
 }

@@ -82,9 +82,12 @@ mod tests {
             .into_iter()
             .map(|id| (id.as_u128(), BasicNode::default()))
             .collect::<BTreeMap<_, _>>();
-        assert!(placement.membership(&openraft::Membership::new(configs.clone(), nodes.clone())));
+        assert!(
+            placement
+                .membership(&openraft::Membership::new(configs.clone(), nodes.clone()).unwrap())
+        );
         let invalid = vec![configs[0].clone(), BTreeSet::from([a, b, d])];
-        assert!(!placement.membership(&openraft::Membership::new(invalid, nodes)));
+        assert!(!placement.membership(&openraft::Membership::new(invalid, nodes).unwrap()));
         for lost in ["a", "b", "c"] {
             for side in &configs {
                 assert_eq!(

@@ -17,8 +17,10 @@ use std::{
 use bytes::Bytes;
 use journal_contract::{Epoch, JournalError, Lsn, StreamId};
 use openraft::{
-    BasicNode, SnapshotPolicy,
-    error::{ClientWriteError, InitializeError, RaftError},
+    BasicNode, ReadPolicy, SnapshotPolicy,
+    async_runtime::WatchReceiver,
+    errors::{ClientWriteError, InitializeError, RaftError},
+    impls::ProgressResponder,
 };
 use serde::Deserialize;
 use tokio::{
@@ -1075,7 +1077,7 @@ impl Group {
     /// Whether this replica has applied its whole log and, when it leads,
     /// every voter has matched it.
     fn settled(&self) -> bool {
-        let metrics = self.raft.metrics().borrow().clone();
+        let metrics = self.raft.metrics().borrow_watched().clone();
         let last = metrics.last_log_index;
         metrics.last_applied.map(|applied| applied.index) == last
             && metrics.replication.as_ref().is_none_or(|progress| {
@@ -1105,8 +1107,8 @@ impl Group {
                 let current = metrics.borrow_and_update();
                 current.state == openraft::ServerState::Candidate && collision == Some(current.vote)
             };
-            // OpenRaft chooses its regular timeout at startup. Fresh jitter
-            // lets split same-term candidacies escape repeated tick alignment.
+            // Fresh jitter lets split same-term candidacies escape repeated
+            // tick alignment.
             let retry = async {
                 if candidate {
                     let random = uuid::Uuid::new_v4().as_u128() as u64;
@@ -1120,7 +1122,7 @@ impl Group {
                 changed = metrics.changed() => if changed.is_err() { return; },
                 changed = collisions.changed() => if changed.is_err() { return; },
                 _ = retry => {
-                    if !self.state.healthy() || self.raft.trigger().elect().await.is_err() { return; }
+                    if !self.state.healthy() || self.raft.trigger().elect(false).await.is_err() { return; }
                 }
             }
         }
@@ -1157,17 +1159,18 @@ impl Group {
         // request or times out. The WAL settles it as it publishes the slot.
         let proposal = tokio::spawn(async move {
             let (_permit, _space) = (permit, space);
-            let response = match raft
-                .client_write_ff(Command::Admitted(ticket, Box::new(command)))
+            let (responder, response) = ProgressResponder::complete_only();
+            if let Err(error) = raft
+                .client_write_ff(
+                    Command::Admitted(ticket, Box::new(command)),
+                    Some(responder),
+                )
                 .await
             {
-                Ok(response) => response,
-                Err(error) => {
-                    super::metrics::sample("write.proposal_failed", || format!("{error:?}"));
-                    count(&COUNTERS.write_proposal);
-                    return failure(JournalError::Unavailable);
-                }
-            };
+                super::metrics::sample("write.proposal_failed", || format!("{error:?}"));
+                count(&COUNTERS.write_proposal);
+                return failure(JournalError::Unavailable);
+            }
             match response.await {
                 Ok(Ok(response)) => Reply::Decision(response.data),
                 Ok(Err(ClientWriteError::ForwardToLeader(leader))) => {
@@ -1245,7 +1248,12 @@ impl Group {
         if self.require_healthy().is_err() {
             return Err(failure(JournalError::Unavailable));
         }
-        match timeout_at(deadline, self.raft.ensure_linearizable()).await {
+        match timeout_at(
+            deadline,
+            self.raft.ensure_linearizable(ReadPolicy::ReadIndex),
+        )
+        .await
+        {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(error)) => Err(leader_reply(
                 error

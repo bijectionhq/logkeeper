@@ -13,9 +13,11 @@ use std::{
 };
 
 use bincode::Options;
+use futures::TryStreamExt;
 use journal_contract::{JournalError, Lsn, Page, StreamId};
 use openraft::{
-    EntryPayload, ErrorSubject, ErrorVerb, RaftSnapshotBuilder, Snapshot, storage::RaftStateMachine,
+    EntryPayload, OptionalSend, RaftSnapshotBuilder,
+    storage::{EntryResponder, RaftStateMachine},
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -25,14 +27,14 @@ pub(in crate::stream::consensus) use file::SnapshotFile;
 use file::{Open as WireFile, Temporary};
 
 use super::{
-    Disk, Record, io_error,
+    Disk, Record,
     media::{hex, sha256},
 };
 use crate::stream::timed::EVIDENCE_BYTES;
 use crate::stream::{
     consensus::{
         Configuration, Entry, Genesis, LogId, MAX_MESSAGE, MAX_RECORD, Membership, RaftTypes,
-        SnapshotMeta, Stage, StorageError, invalid, options,
+        SnapshotMeta, Stage, invalid, options,
         placement::Placement,
         state::{Command, MAX_RETAINED_RECORDS, Outcome, Payload, State, TIMED_RECORD},
     },
@@ -161,6 +163,8 @@ impl Image {
         }
     }
 }
+
+type Snapshot = openraft::type_config::alias::SnapshotOf<RaftTypes, Box<SnapshotFile>>;
 
 #[derive(Clone)]
 pub(in crate::stream::consensus) struct StateMachine {
@@ -402,13 +406,15 @@ impl StateMachine {
 
     pub async fn receive_snapshot(
         &self,
-        digest: Option<[u8; 32]>,
+        digest: [u8; 32],
+        meta: SnapshotMeta,
     ) -> io::Result<Box<SnapshotFile>> {
         SnapshotFile::receive(
             &self.inner.directory,
             &self.inner.disk.space,
             self.inner.lifetime.clone(),
             digest,
+            meta,
         )
         .await
         .map(Box::new)
@@ -430,7 +436,7 @@ impl StateMachine {
         self.inner.stopped.store(true, Ordering::Relaxed);
     }
 
-    pub async fn wait_for_snapshot(&self, through: LogId) -> Result<(), StorageError> {
+    pub async fn wait_for_snapshot(&self, through: LogId) -> io::Result<()> {
         // OpenRaft can enqueue a purge while a snapshot install still runs in
         // the state-machine worker. Only a published file can cover log removal.
         let mut published = self.inner.published.subscribe();
@@ -442,8 +448,8 @@ impl StateMachine {
             }),
         )
         .await
-        .map_err(|error| snapshot_error(ErrorVerb::Write, io::Error::other(error)))?
-        .map_err(|error| snapshot_error(ErrorVerb::Write, io::Error::other(error)))?;
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?;
         Ok(())
     }
 
@@ -479,7 +485,8 @@ impl StateMachine {
                 .writer()
                 .map(|(fence, owner)| (fence, owner.to_owned())),
             configuration: image.configuration.ok_or(JournalError::Unavailable)?,
-            changing: image.stage.is_some() || image.membership.membership().get_joint_config().len() > 1,
+            changing: image.stage.is_some()
+                || image.membership.membership().get_joint_config().len() > 1,
             fits: image
                 .state
                 .fits_timed(payload_len, self.inner.genesis.quota_bytes),
@@ -590,19 +597,20 @@ impl StateMachine {
 }
 
 impl RaftStateMachine<RaftTypes> for StateMachine {
+    type SnapshotData = Box<SnapshotFile>;
     type SnapshotBuilder = Builder;
 
-    async fn applied_state(&mut self) -> Result<(Option<LogId>, Membership), StorageError> {
+    async fn applied_state(&mut self) -> io::Result<(Option<LogId>, Membership)> {
         let image = self.inner.applied.read();
         Ok((image.applied, image.membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Outcome>, StorageError>
+    async fn apply<S>(&mut self, entries: S) -> io::Result<()>
     where
-        I: IntoIterator<Item = Entry> + Send,
-        I::IntoIter: Send,
+        S: futures::Stream<Item = io::Result<EntryResponder<RaftTypes>>> + Unpin + OptionalSend,
     {
-        let entries = entries.into_iter().collect::<Vec<_>>();
+        let (entries, responders): (Vec<_>, Vec<_>) =
+            entries.try_collect::<Vec<_>>().await?.into_iter().unzip();
         let may_read_snapshot = self.head().is_ok_and(|head| entries.iter().any(|entry| {
             matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } | Command::AppendOriginal { at, .. } if *at <= head))
         }));
@@ -615,10 +623,7 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
         } else {
             self.inner.apply(entries)
         };
-        let outcomes = outcomes.map_err(|error| {
-            self.inner.quarantine();
-            io_error(ErrorSubject::StateMachine, ErrorVerb::Write, error)
-        })?;
+        let outcomes = outcomes.inspect_err(|_| self.inner.quarantine())?;
         let revision = self
             .inner
             .applied
@@ -638,10 +643,14 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
                     generation: self.inner.generation,
                 },
             ))
-            .await
-            .map_err(|error| io_error(ErrorSubject::StateMachine, ErrorVerb::Write, error))?;
+            .await?;
         }
-        Ok(outcomes)
+        for (responder, outcome) in responders.into_iter().zip(outcomes) {
+            if let Some(responder) = responder {
+                responder.send(outcome);
+            }
+        }
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -651,32 +660,24 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<SnapshotFile>, StorageError> {
-        self.receive_snapshot(None)
-            .await
-            .map_err(|error| snapshot_error(ErrorVerb::Write, error))
-    }
-
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta,
+        meta: &openraft::type_config::alias::SnapshotMetaOf<RaftTypes>,
         snapshot: Box<SnapshotFile>,
-    ) -> Result<(), StorageError> {
+    ) -> io::Result<()> {
         let inner = self.inner.clone();
         let source = inner.clone();
         let expected = meta.clone();
-        let (file, temporary, digest) = snapshot
-            .received()
-            .await
-            .map_err(|error| snapshot_error(ErrorVerb::Write, error))?;
-        let (meta, image, selected, temporary) = blocking(ErrorVerb::Write, move || {
+        let transferred = snapshot.meta().clone();
+        let (file, temporary, digest) = snapshot.received().await?;
+        let (meta, image, selected, temporary) = blocking(move || {
             let (stored, image) = read_image(
                 file.try_clone()?,
                 &source.genesis,
                 digest,
                 MAX_RETAINED_RECORDS as u64,
             )?;
-            if stored != expected {
+            if stored != transferred || stored.raft() != expected {
                 return Err(invalid("snapshot metadata does not match its body"));
             }
             image.verify_placement(&source.placement, &source.genesis)?;
@@ -691,10 +692,7 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
         .await?;
         let _publish = inner.publishing.lock().await;
         if inner.applied.read().applied > meta.last_log_id {
-            return Err(snapshot_error(
-                ErrorVerb::Write,
-                invalid("snapshot would roll back applied state"),
-            ));
+            return Err(invalid("snapshot would roll back applied state"));
         }
         inner.select(&temporary.path, selected, true).await?;
         *inner.applied.write() = image.clone();
@@ -708,7 +706,7 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<RaftTypes>>, StorageError> {
+    async fn get_current_snapshot(&mut self) -> io::Result<Option<Snapshot>> {
         Ok(self.inner.current_snapshot())
     }
 }
@@ -719,17 +717,11 @@ impl Inner {
         self.changed.send_replace(());
     }
 
-    async fn select(
-        &self,
-        temporary: &Path,
-        selected: Selected,
-        incoming: bool,
-    ) -> Result<(), StorageError> {
-        self.ensure_running()
-            .map_err(|error| snapshot_error(ErrorVerb::Write, error))?;
+    async fn select(&self, temporary: &Path, selected: Selected, incoming: bool) -> io::Result<()> {
+        self.ensure_running()?;
         let directory = self.directory.clone();
         let temporary = temporary.to_path_buf();
-        blocking(ErrorVerb::Write, move || {
+        blocking(move || {
             fs::rename(temporary, selected.path(&directory))?;
             sync_directory(&directory)
         })
@@ -738,12 +730,11 @@ impl Inner {
             self.generation,
             Box::new(Record::Snapshot(self.genesis.stream, selected)),
         );
-        let result = if incoming {
+        if incoming {
             self.disk.maintenance(record).await
         } else {
             self.disk.covered(record).await
-        };
-        result.map_err(|error| snapshot_error(ErrorVerb::Write, error))
+        }
     }
 
     fn installed(&self, active: ActiveSnapshot) {
@@ -768,11 +759,11 @@ impl Inner {
         }
     }
 
-    fn current_snapshot(self: &Arc<Self>) -> Option<Snapshot<RaftTypes>> {
+    fn current_snapshot(self: &Arc<Self>) -> Option<Snapshot> {
         let active = self.snapshot.lock().clone()?;
         let meta = active.meta.clone();
         let inner = self.clone();
-        let snapshot = SnapshotFile::send(move || {
+        let snapshot = SnapshotFile::send(meta.clone(), move || {
             let mut transfer = inner.disk.space.transfer()?;
             let metadata = options()
                 .serialized_size(&(&inner.genesis, &active.meta, &active.image))
@@ -826,8 +817,8 @@ impl Inner {
                 _source: Some(Box::new(active)),
             })
         });
-        Some(Snapshot {
-            meta,
+        Some(openraft::Snapshot {
+            meta: meta.raft(),
             snapshot: Box::new(snapshot),
         })
     }
@@ -914,7 +905,9 @@ impl Inner {
 }
 
 impl RaftSnapshotBuilder<RaftTypes> for Builder {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<RaftTypes>, StorageError> {
+    type SnapshotData = Box<SnapshotFile>;
+
+    async fn build_snapshot(&mut self) -> io::Result<Snapshot> {
         #[cfg(test)]
         {
             let mut paused = self.inner.snapshot_paused.subscribe();
@@ -938,23 +931,18 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
             .as_ref()
             .is_some_and(|prior| prior.meta.last_log_id >= meta.last_log_id)
         {
-            return inner.current_snapshot().ok_or_else(|| {
-                snapshot_error(ErrorVerb::Read, invalid("selected image disappeared"))
-            });
+            return inner
+                .current_snapshot()
+                .ok_or_else(|| invalid("selected image disappeared"));
         }
         let previous =
             previous.map_or_else(index::Dependencies::default, |prior| prior.dependencies);
-        let scratch = inner
-            .disk
-            .space
-            .scratch(index::SCRATCH)
-            .await
-            .map_err(|error| snapshot_error(ErrorVerb::Write, error))?;
+        let scratch = inner.disk.space.scratch(index::SCRATCH).await?;
         let temporary = inner
             .directory
             .join(format!("building-{}", meta.snapshot_id));
         let target = temporary.clone();
-        let (active, scratch) = blocking(ErrorVerb::Write, move || {
+        let (active, scratch) = blocking(move || {
             let mut file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -988,7 +976,7 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
         inner.installed(active);
         inner
             .current_snapshot()
-            .ok_or_else(|| snapshot_error(ErrorVerb::Read, invalid("built image disappeared")))
+            .ok_or_else(|| invalid("built image disappeared"))
     }
 }
 
@@ -1080,18 +1068,12 @@ pub(in crate::stream::consensus) fn repair_snapshot(
 }
 
 async fn blocking<T: Send + 'static>(
-    verb: ErrorVerb,
     work: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> Result<T, StorageError> {
+) -> io::Result<T> {
     tokio::task::spawn_blocking(work)
         .await
         .map_err(io::Error::other)
         .and_then(|result| result)
-        .map_err(|error| snapshot_error(verb, error))
-}
-
-fn snapshot_error(verb: ErrorVerb, error: io::Error) -> StorageError {
-    io_error(ErrorSubject::Snapshot(None), verb, error)
 }
 
 const MAGIC: &[u8; 8] = b"LKRIMG03";

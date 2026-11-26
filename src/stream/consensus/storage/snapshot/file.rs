@@ -17,7 +17,7 @@ use tokio::{
 };
 
 use crate::stream::consensus::{
-    invalid,
+    SnapshotMeta, invalid,
     storage::space::{Space, Transfer},
 };
 
@@ -43,6 +43,7 @@ pub(super) struct Open {
 type MakeFile = Box<dyn FnOnce() -> io::Result<Open> + Send>;
 
 pub(in crate::stream::consensus) struct SnapshotFile {
+    meta: SnapshotMeta,
     open: Option<Open>,
     make: Option<MakeFile>,
     running: Option<JoinHandle<io::Result<Open>>>,
@@ -56,7 +57,8 @@ impl SnapshotFile {
         path: &Path,
         space: &Space,
         lifetime: Arc<()>,
-        digest: Option<[u8; 32]>,
+        digest: [u8; 32],
+        meta: SnapshotMeta,
     ) -> io::Result<Self> {
         let transfer = space.transfer()?;
         let path = path.join(format!("incoming-{}", uuid::Uuid::new_v4()));
@@ -67,6 +69,7 @@ impl SnapshotFile {
             .open(&path)
             .await?;
         Ok(Self {
+            meta,
             open: Some(Open {
                 file,
                 temporary: Temporary {
@@ -74,7 +77,7 @@ impl SnapshotFile {
                     transfer,
                     _pin: Some(lifetime),
                 },
-                digest: digest.map(Arc::new),
+                digest: Some(Arc::new(digest)),
                 _source: None,
             }),
             make: None,
@@ -85,8 +88,12 @@ impl SnapshotFile {
         })
     }
 
-    pub(super) fn send(make: impl FnOnce() -> io::Result<Open> + Send + 'static) -> Self {
+    pub(super) fn send(
+        meta: SnapshotMeta,
+        make: impl FnOnce() -> io::Result<Open> + Send + 'static,
+    ) -> Self {
         Self {
+            meta,
             open: None,
             make: Some(Box::new(make)),
             running: None,
@@ -94,6 +101,11 @@ impl SnapshotFile {
             position: 0,
             incoming: false,
         }
+    }
+
+    /// The metadata the image records, including its transfer id.
+    pub fn meta(&self) -> &SnapshotMeta {
+        &self.meta
     }
 
     pub(super) async fn received(mut self) -> io::Result<(std::fs::File, Temporary, [u8; 32])> {
