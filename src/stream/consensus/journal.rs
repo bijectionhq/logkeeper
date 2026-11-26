@@ -467,6 +467,17 @@ impl ConsensusJournal {
         self.client.acknowledge_recovery(stream).await
     }
 
+    /// Reads the finalized cluster feature level from the catalog.
+    pub async fn cluster_version(&self) -> Result<u32> {
+        self.client.cluster_version().await
+    }
+
+    /// Advances the finalized cluster feature level to `version` once all
+    /// active keepers support it. Administrators only.
+    pub async fn finalize_version(&self, version: u32) -> Result<u32> {
+        self.client.finalize_version(version).await
+    }
+
     /// The consensus client, for placement and replica administration.
     pub fn client(&self) -> &Client {
         &self.client

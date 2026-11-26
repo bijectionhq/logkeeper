@@ -80,6 +80,10 @@ enum CatalogRecord {
     Checkpoint(Vec<CatalogEntry>),
     /// The seed checkpoint is complete.
     Seeded,
+    /// Advances the finalized cluster feature level monotonically. Only
+    /// appended once finalized past V1, so N-1 binaries can read the catalog
+    /// stream before finalize.
+    ClusterVersion(u32),
 }
 
 struct Fold {
@@ -88,6 +92,7 @@ struct Fold {
     /// Records applied since the last checkpoint record.
     tail: u64,
     seeded: bool,
+    cluster_version: u32,
 }
 
 impl Fold {
@@ -103,6 +108,7 @@ impl Fold {
             tail: 0,
             // Only compaction trims, and it follows the seed.
             seeded: next > Lsn(1),
+            cluster_version: crate::stream::consensus::CLUSTER_VERSION_V1,
         }
     }
 
@@ -139,6 +145,9 @@ impl Fold {
                 }
             }
             CatalogRecord::Seeded => self.seeded = true,
+            CatalogRecord::ClusterVersion(version) => {
+                self.cluster_version = self.cluster_version.max(version);
+            }
         }
     }
 }
@@ -235,6 +244,11 @@ impl Engine {
             Request::Locate(stream) => self.locate_replicated(catalog, &group, stream).await,
             Request::Stage(stage) => self.stage_replicated(catalog, &group, stage).await,
             Request::Staging(stream) => self.staged_replicated(catalog, &group, stream).await,
+            Request::ClusterVersion => self.cluster_version_replicated(catalog, &group).await,
+            Request::FinalizeVersion(target) => {
+                self.finalize_version_replicated(catalog, &group, target)
+                    .await
+            }
             _ => Err(invalid("invalid catalog request")),
         }
     }
@@ -252,7 +266,10 @@ impl Engine {
         order.extend(catalog.genesis.voters);
         order.extend(self.placement.domains().keys().copied());
         let end = Instant::now() + REQUEST_TIMEOUT;
-        let write = !matches!(request, Request::Locate(_) | Request::Staging(_));
+        let write = !matches!(
+            request,
+            Request::Locate(_) | Request::Staging(_) | Request::ClusterVersion
+        );
         let answer = super::super::catalog::ask(&order, end, |keeper| {
             let request = request.clone();
             async move {
@@ -472,6 +489,67 @@ impl Engine {
         Ok(failure(JournalError::Unavailable))
     }
 
+    async fn cluster_version_replicated(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+    ) -> io::Result<Reply> {
+        let (fold, _) = match self.leading(catalog, group, false).await {
+            Ok(view) => view,
+            Err(reply) => return Ok(reply),
+        };
+        if !fold.seeded {
+            return Ok(failure(JournalError::Unavailable));
+        }
+        let version = fold.cluster_version;
+        self.disk.set_write_version(version);
+        Ok(Reply::ClusterVersion(version))
+    }
+
+    async fn finalize_version_replicated(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+        target: u32,
+    ) -> io::Result<Reply> {
+        if target < crate::stream::consensus::CLUSTER_VERSION_V1
+            || target > crate::stream::consensus::CLUSTER_VERSION_CURRENT
+        {
+            return Ok(failure(JournalError::Unsupported));
+        }
+        let _writing = catalog.writing.lock().await;
+        for _ in 0..3 {
+            let (fold, head) = match self.leading(catalog, group, true).await {
+                Ok(view) => view,
+                Err(reply) => return Ok(reply),
+            };
+            if !fold.seeded {
+                return Ok(failure(JournalError::Unavailable));
+            }
+            if target < fold.cluster_version {
+                return Ok(conflict());
+            }
+            if target == fold.cluster_version {
+                self.disk.set_write_version(target);
+                return Ok(Reply::ClusterVersion(target));
+            }
+            drop(fold);
+            match self
+                .append_catalog(group, head, &CatalogRecord::ClusterVersion(target))
+                .await
+            {
+                Ok(_) => {
+                    let _ = self.caught_up(catalog, group).await;
+                    self.disk.set_write_version(target);
+                    return Ok(Reply::ClusterVersion(target));
+                }
+                Err(reply) if is_conflict(&reply) => continue,
+                Err(reply) => return Ok(reply),
+            }
+        }
+        Ok(failure(JournalError::Unavailable))
+    }
+
     async fn locate_replicated(
         &self,
         catalog: &CatalogStream,
@@ -606,8 +684,9 @@ impl Engine {
             }
         } else if fold.tail > COMPACT_AFTER {
             let entries = fold.entries.values().cloned().collect();
+            let cluster_version = fold.cluster_version;
             drop(fold);
-            self.compact(&group, head, entries).await;
+            self.compact(&group, head, entries, cluster_version).await;
         }
     }
 
@@ -619,9 +698,15 @@ impl Engine {
             .into_iter()
             .filter(|entry| entry.genesis.stream != STREAM)
             .collect::<Vec<_>>();
+        let cluster_version = self.disk.cluster_version();
         let count = entries.len();
         let seeded = async {
-            let (_, head) = self.checkpoint(group, head, entries).await?;
+            let (_, mut head) = self.checkpoint(group, head, entries).await?;
+            if cluster_version > crate::stream::consensus::CLUSTER_VERSION_V1 {
+                head = self
+                    .append_catalog(group, head, &CatalogRecord::ClusterVersion(cluster_version))
+                    .await?;
+            }
             self.append_catalog(group, head, &CatalogRecord::Seeded)
                 .await
         }
@@ -650,9 +735,19 @@ impl Engine {
         }
     }
 
-    async fn compact(&self, group: &Group, head: Lsn, entries: Vec<CatalogEntry>) {
+    async fn compact(
+        &self,
+        group: &Group,
+        head: Lsn,
+        entries: Vec<CatalogEntry>,
+        cluster_version: u32,
+    ) {
         let compacted = async {
-            let (first, _) = self.checkpoint(group, head, entries).await?;
+            let (first, last) = self.checkpoint(group, head, entries).await?;
+            if cluster_version > crate::stream::consensus::CLUSTER_VERSION_V1 {
+                self.append_catalog(group, last, &CatalogRecord::ClusterVersion(cluster_version))
+                    .await?;
+            }
             match group
                 .write(Command::Trim {
                     fence: FENCE,

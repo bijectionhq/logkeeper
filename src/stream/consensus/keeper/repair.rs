@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use super::{Engine, Group, NodeId, Reply, Request};
 use crate::stream::consensus::{
-    BUILD_VERSION, CLUSTER_VERSION_V1, Configuration, KeeperStatus,
+    BUILD_VERSION, Configuration, KeeperStatus,
     assignment::{self, Health, View},
     decisions, features,
     network::{self, Proof},
@@ -137,7 +137,7 @@ impl Engine {
             replica: None,
             build_version: BUILD_VERSION.to_owned(),
             features: features::SUPPORTED,
-            cluster_version: CLUSTER_VERSION_V1,
+            cluster_version: self.disk.cluster_version(),
         }
     }
 
@@ -177,7 +177,7 @@ impl Engine {
             replica,
             build_version: BUILD_VERSION.to_owned(),
             features: features::SUPPORTED,
-            cluster_version: CLUSTER_VERSION_V1,
+            cluster_version: self.disk.cluster_version(),
         }
     }
 

@@ -3,8 +3,8 @@
 
 use super::*;
 use crate::stream::consensus::{
-    BUILD_VERSION, CLUSTER_VERSION_V1, KeeperStatus, MAX_MESSAGE, PREV_ALPN, PREV_CONTROL_ALPN,
-    decode, encode, features,
+    BUILD_VERSION, CLUSTER_VERSION_CURRENT, CLUSTER_VERSION_V1, KeeperStatus, MAX_MESSAGE,
+    PREV_ALPN, PREV_CONTROL_ALPN, decode, encode, features,
     network::{self, ReplyV1},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -288,4 +288,201 @@ async fn version_mismatch_counts_as_alive_and_does_not_trigger_repair() {
     let _ = ctrl_task.await;
     let _ = app_task.await;
     cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_version_gate_keeps_v1_checkpoints_until_finalized_in_replicated_and_single_catalog()
+{
+    for replicated in [false, true] {
+        let mut cluster = if replicated {
+            Cluster::start_replicated().await
+        } else {
+            Cluster::start().await
+        };
+        let [a, b, c, _] = cluster.ids;
+        let client = cluster.client(&cluster.credentials);
+        let stream = StreamId(210 + u128::from(replicated));
+        client.create(stream, [a, b, c], 4096).await.unwrap();
+        let fence = client
+            .seal(stream, Epoch(0), Uuid::from_u128(50))
+            .await
+            .unwrap()
+            .fence;
+        client
+            .append(stream, fence, Lsn(1), Bytes::from_static(b"before"))
+            .await
+            .unwrap();
+
+        // Before finalize: cluster version is V1 and checkpoints use N-1 magic LKRWAL04.
+        assert_eq!(
+            client.cluster_version().await,
+            Ok(crate::stream::consensus::CLUSTER_VERSION_V1)
+        );
+        assert!(
+            !cluster.running[&a]
+                .engine
+                .disk
+                .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+        );
+        cluster.running[&a]
+            .engine
+            .disk
+            .checkpoint_now()
+            .await
+            .unwrap();
+        let ckpt_dir = cluster.configs[&a].data.join("raft-checkpoints");
+        let files: Vec<_> = std::fs::read_dir(&ckpt_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(&std::fs::read(&files[0]).unwrap()[..8], b"LKRWAL04");
+
+        // Finalizing to an unsupported future version is refused with Unsupported.
+        assert_eq!(
+            client.finalize_version(99).await,
+            Err(JournalError::Unsupported)
+        );
+
+        // Finalizing while a keeper in the inventory is down is refused as
+        // unavailable, and nothing is finalized.
+        let stopped = cluster.ids[3];
+        cluster.running.remove(&stopped).unwrap().stop().await;
+        assert_eq!(
+            client
+                .finalize_version(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+                .await,
+            Err(JournalError::Unavailable)
+        );
+        assert_eq!(
+            client.cluster_version().await,
+            Ok(crate::stream::consensus::CLUSTER_VERSION_V1)
+        );
+        cluster.restart(stopped).await;
+
+        // Once every keeper answers and supports WRITE_VERSION_GATE, finalize
+        // succeeds. A probe may still miss a keeper busy recording first
+        // contacts, which is the retryable Unavailable.
+        timeout(WAIT, async {
+            loop {
+                match client
+                    .finalize_version(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+                    .await
+                {
+                    Ok(version) => break assert_eq!(version, CLUSTER_VERSION_CURRENT),
+                    Err(JournalError::Unavailable) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(error) => panic!("finalize refused: {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("finalize succeeded once every keeper answered");
+        // Idempotent repeat succeeds; downgrade below finalized conflicts.
+        assert_eq!(
+            client
+                .finalize_version(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+                .await,
+            Ok(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+        );
+        assert!(matches!(
+            client
+                .finalize_version(crate::stream::consensus::CLUSTER_VERSION_V1)
+                .await,
+            Err(JournalError::Conflict { .. })
+        ));
+
+        // Keepers observe the finalized cluster version via liveness sync and
+        // begin writing LKRWAL05 checkpoints.
+        timeout(WAIT, async {
+            while !cluster.running[&a]
+                .engine
+                .disk
+                .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("keeper observed finalized cluster version");
+        assert_eq!(
+            client
+                .keeper_status(a, stream)
+                .await
+                .unwrap()
+                .cluster_version,
+            crate::stream::consensus::CLUSTER_VERSION_CURRENT
+        );
+        cluster.running[&a]
+            .engine
+            .disk
+            .checkpoint_now()
+            .await
+            .unwrap();
+        let files: Vec<_> = std::fs::read_dir(&ckpt_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(&std::fs::read(&files[0]).unwrap()[..8], b"LKRWAL05");
+
+        // Finalized version survives full cluster restart.
+        cluster.stop_all().await;
+        for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
+            cluster.restart(id).await;
+        }
+        assert_eq!(
+            client.cluster_version().await,
+            Ok(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+        );
+        assert_eq!(client.head(stream).await, Ok(Lsn(1)));
+        cluster.stop_all().await;
+    }
+}
+
+#[test]
+fn keeper_config_warns_on_unknown_fields_while_journal_config_stays_strict() {
+    let keeper_id = Uuid::from_u128(1);
+    let keeper_json = serde_json::json!({
+        "keeper": keeper_id,
+        "listen": "127.0.0.1:7001",
+        "data": "/tmp/data",
+        "tls": {
+            "certificate": "/tmp/cert.pem",
+            "private_key": "/tmp/key.pem",
+            "ca": "/tmp/ca.pem"
+        },
+        "keepers": { keeper_id.to_string(): "127.0.0.1:7001" },
+        "peers": { keeper_id.to_string(): "127.0.0.1:7002" },
+        "bulk": { keeper_id.to_string(): "127.0.0.1:7003" },
+        "domains": { keeper_id.to_string(): "a" },
+        "enrollment": "/tmp/reg",
+        "catalog": keeper_id,
+        "readers": [],
+        "writers": [],
+        "administrators": [],
+        "future_toggle": true,
+        "another_unknown": 42
+    });
+    let (parsed, warnings) =
+        Config::from_json_slice_with_warnings(&serde_json::to_vec(&keeper_json).unwrap()).unwrap();
+    assert_eq!(parsed.keeper, keeper_id);
+    assert!(warnings.contains(&"future_toggle".to_owned()));
+    assert!(warnings.contains(&"another_unknown".to_owned()));
+    assert_eq!(warnings.len(), 2);
+
+    // JournalConfig stays strict and refuses unknown fields.
+    let journal_json = serde_json::json!({
+        "keepers": { keeper_id.to_string(): "127.0.0.1:7001" },
+        "catalog": keeper_id,
+        "voters": [keeper_id, keeper_id, keeper_id],
+        "quota_bytes": 4096,
+        "future_toggle": true
+    });
+    let err = serde_json::from_slice::<crate::stream::consensus::JournalConfig>(
+        &serde_json::to_vec(&journal_json).unwrap(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown field"), "{err}");
 }

@@ -530,7 +530,7 @@ pub(in crate::stream::consensus) fn verify(enrollment: Enrollment) -> io::Result
     // Verify checkpoint if referenced by the active boundary slot.
     let (ckpt_report, ckpt_pos, ckpt_chain) = match active.checkpoint {
         Some(reference) => match segmented::read_checkpoint(&checkpoints_dir, reference) {
-            Ok(ckpt) => {
+            Ok((ckpt, _)) => {
                 let mut refs_checked = 0usize;
                 for (stream, leaf) in &ckpt.leaves {
                     for (&index, r) in &leaf.entries {
@@ -992,6 +992,7 @@ fn summarize_record(record: &Record) -> String {
         Record::Truncate(stream, since) => {
             format!("Truncate(stream={}, since={since})", stream_uuid(*stream))
         }
+        Record::ClusterVersion(version) => format!("ClusterVersion(version={version})"),
         Record::Purge(stream, log_id) => format!(
             "Purge(stream={}, term={}, index={})",
             stream_uuid(*stream),

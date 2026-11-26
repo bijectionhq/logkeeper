@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 
@@ -77,6 +77,10 @@ pub(in crate::stream::consensus) enum Record {
     /// checkpoint taken after the move. Added after `Recover`, so an older
     /// keeper refuses a WAL whose unpublished suffix holds it.
     Relocate(Location, Vec<u8>),
+    /// Advances the single-keeper catalog's finalized cluster feature level.
+    /// Only written once an operator finalizes past V1, so N-1 binaries can
+    /// still open the WAL before finalize.
+    ClusterVersion(u32),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -104,11 +108,23 @@ impl CatalogEntry {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct State {
     pub(super) genesis: BTreeMap<StreamId, Genesis>,
     pub(super) catalog: BTreeMap<StreamId, CatalogEntry>,
     pub(super) logs: BTreeMap<StreamId, Log>,
+    pub(super) cluster_version: u32,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            genesis: BTreeMap::new(),
+            catalog: BTreeMap::new(),
+            logs: BTreeMap::new(),
+            cluster_version: crate::stream::consensus::CLUSTER_VERSION_V1,
+        }
+    }
 }
 
 impl State {
@@ -245,6 +261,14 @@ impl State {
                 }
                 log.snapshot = Some(snapshot);
             }
+            Record::ClusterVersion(version) => {
+                if version < self.cluster_version
+                    || version > crate::stream::consensus::CLUSTER_VERSION_CURRENT
+                {
+                    return Err(invalid("cluster feature level regressed or unsupported"));
+                }
+                self.cluster_version = version;
+            }
         }
         Ok(())
     }
@@ -286,6 +310,7 @@ impl State {
                 .iter()
                 .filter_map(|id| self.logs.get(id).map(|log| (*id, log.clone())))
                 .collect(),
+            cluster_version: self.cluster_version,
         }
     }
 
@@ -384,6 +409,7 @@ impl Record {
         match self {
             Self::Register(genesis) | Self::Claim(genesis) => genesis.stream,
             Self::Stage(stage) => stage.stream,
+            Self::ClusterVersion(_) => StreamId(0),
             Self::Owned(_, record) => record.stream(),
             Self::Vote(stream, _)
             | Self::Append(stream, _)
@@ -426,6 +452,8 @@ struct Work {
 
 enum Message {
     Write(Work),
+    #[cfg(test)]
+    Checkpoint(oneshot::Sender<io::Result<()>>),
     Shutdown,
 }
 
@@ -440,6 +468,8 @@ pub(in crate::stream::consensus) struct Disk {
     healthy: Arc<AtomicBool>,
     watchdog: Arc<super::watchdog::Watchdog>,
     inflight: Arc<parking_lot::Mutex<BTreeMap<StreamId, Arc<super::inflight::Inflight>>>>,
+    /// Finalized cluster feature level gating new on-disk formats and commands.
+    write_version: Arc<AtomicU32>,
     stopped: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<io::Result<()>>>>>,
     pub path: Arc<PathBuf>,
     /// The incarnation of the installed media, new at each installation.
@@ -492,6 +522,7 @@ impl Disk {
         let (wal, state) = Segmented::open(&media, &objects, tuning)?;
         let incarnation = media.incarnation();
         drop(media);
+        let initial_version = state.cluster_version;
         let state = Arc::new(RwLock::new(state));
         let (work, incoming) = mpsc::channel(MAX_ROUND_RECORDS);
         let (maintenance, housekeeping) = mpsc::channel(MAINTENANCE_QUEUE);
@@ -499,7 +530,9 @@ impl Disk {
         let (control, peer) = mpsc::channel(64);
         let (replication, follower) = mpsc::channel(REPLICATION_QUEUE);
         let healthy = Arc::new(AtomicBool::new(true));
+        let write_version = Arc::new(AtomicU32::new(initial_version));
         let writer_healthy = healthy.clone();
+        let writer_version = write_version.clone();
         let watchdog = super::watchdog::Watchdog::new();
         watchdog.spawn(
             healthy.clone(),
@@ -538,6 +571,7 @@ impl Disk {
                     &writer_objects,
                     &writer_space,
                     &writer_healthy,
+                    &writer_version,
                     &writer_watchdog,
                     &writer_metrics,
                     #[cfg(test)]
@@ -565,6 +599,7 @@ impl Disk {
             healthy,
             watchdog,
             inflight: Arc::default(),
+            write_version,
             stopped: Arc::new(tokio::sync::Mutex::new(Some(stopped))),
             path: Arc::new(path),
             incarnation,
@@ -596,6 +631,35 @@ impl Disk {
     #[cfg(test)]
     pub fn mark_slow(&self, hold: std::time::Duration) {
         self.watchdog.mark_slow(hold);
+    }
+
+    /// Finalized cluster feature level gating new on-disk formats and commands.
+    pub fn cluster_version(&self) -> u32 {
+        self.write_version
+            .load(Ordering::Acquire)
+            .max(self.state.read().cluster_version)
+    }
+
+    /// Advances the keeper's observed finalized cluster feature level monotonically.
+    pub fn set_write_version(&self, version: u32) {
+        let clamped = version.min(crate::stream::consensus::CLUSTER_VERSION_CURRENT);
+        let _ = self.write_version.fetch_max(clamped, Ordering::AcqRel);
+    }
+
+    /// Whether the finalized cluster feature level allows writing a format or
+    /// command requiring `required`.
+    pub fn write_version_allows(&self, required: u32) -> bool {
+        decisions::write_version_allows(self.cluster_version(), required)
+    }
+
+    #[cfg(test)]
+    pub async fn checkpoint_now(&self) -> io::Result<()> {
+        let (done, reply) = oneshot::channel();
+        self.work
+            .send(Message::Checkpoint(done))
+            .await
+            .map_err(io::Error::other)?;
+        reply.await.map_err(io::Error::other)?
     }
 
     #[cfg(test)]
@@ -1085,6 +1149,7 @@ fn run(
     objects: &Objects,
     space: &Space,
     health: &AtomicBool,
+    write_version: &AtomicU32,
     watchdog: &super::watchdog::Watchdog,
     metrics: &crate::stream::consensus::metrics::Metrics,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
@@ -1097,6 +1162,7 @@ fn run(
         &mut queues,
         objects,
         space,
+        write_version,
         watchdog,
         metrics,
         #[cfg(test)]
@@ -1115,17 +1181,31 @@ fn rounds(
     queues: &mut Queues,
     objects: &Objects,
     space: &Space,
+    write_version: &AtomicU32,
     watchdog: &super::watchdog::Watchdog,
     metrics: &crate::stream::consensus::metrics::Metrics,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
     #[cfg(test)] wal_delay_ms: &std::sync::atomic::AtomicU64,
 ) -> io::Result<()> {
     let mut finish = false;
-    while let Some(Message::Write(first)) = queues.recv() {
+    while let Some(message) = queues.recv() {
+        let first = match message {
+            Message::Write(first) => first,
+            #[cfg(test)]
+            Message::Checkpoint(done) => {
+                let version = write_version.load(Ordering::Acquire);
+                let result = wal.checkpoint_now_versioned(&state.read(), objects, space, version);
+                let _ = done.send(result);
+                continue;
+            }
+            Message::Shutdown => break,
+        };
         let round_start = std::time::Instant::now();
         let _round = watchdog.begin();
         let mut round = vec![first];
         let mut bytes = 0;
+        #[cfg(test)]
+        let mut checkpoint_waiters = Vec::new();
         while round.len() < MAX_ROUND_RECORDS {
             bytes += bincode::serialized_size(&round.last().unwrap().record)
                 .map_err(io::Error::other)?;
@@ -1134,6 +1214,8 @@ fn rounds(
             }
             match queues.try_recv() {
                 Some(Message::Write(work)) => round.push(work),
+                #[cfg(test)]
+                Some(Message::Checkpoint(done)) => checkpoint_waiters.push(done),
                 Some(Message::Shutdown) => {
                     finish = true;
                     break;
@@ -1293,11 +1375,23 @@ fn rounds(
                 installed.genesis.extend(working.genesis);
                 installed.catalog.extend(working.catalog);
                 installed.logs.extend(working.logs);
+                installed.cluster_version = installed.cluster_version.max(working.cluster_version);
             });
-            wal.maybe_checkpoint(&state.read(), objects, space);
+            let _ = write_version.fetch_max(working.cluster_version, Ordering::AcqRel);
+            wal.maybe_checkpoint(
+                &state.read(),
+                objects,
+                space,
+                write_version.load(Ordering::Acquire),
+            );
         }
         for (reply, _reservation) in replies {
             let _ = reply.send(Ok(()));
+        }
+        #[cfg(test)]
+        for done in checkpoint_waiters {
+            let version = write_version.load(Ordering::Acquire);
+            let _ = done.send(wal.checkpoint_now_versioned(&state.read(), objects, space, version));
         }
         if finish {
             break;

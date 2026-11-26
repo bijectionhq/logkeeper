@@ -32,7 +32,8 @@ use uuid::Uuid;
 
 use super::{Engine, Group};
 use crate::stream::consensus::{
-    BUILD_VERSION, CLUSTER_VERSION_V1, KeeperStatus, decisions, features, metrics, network,
+    BUILD_VERSION, CLUSTER_VERSION_CURRENT, CLUSTER_VERSION_V1, KeeperStatus, decisions, features,
+    metrics, network,
 };
 
 #[cfg(not(test))]
@@ -40,6 +41,12 @@ pub(super) const PING_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(test)]
 pub(super) const PING_INTERVAL: Duration = Duration::from_millis(250);
 const PING_TIMEOUT: Duration = Duration::from_millis(1500);
+/// How often a keeper below this build's cluster version asks the catalog
+/// whether the version was finalized.
+#[cfg(not(test))]
+const VERSION_INTERVAL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const VERSION_INTERVAL: Duration = Duration::from_millis(250);
 /// A keeper that missed this many pings in a row is unreachable.
 const MISSED_PINGS: u32 = 3;
 /// Parked streams one keeper reopens per sweep.
@@ -269,6 +276,101 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Learns the finalized cluster feature level from the catalog until it
+    /// reaches this build's level. It runs apart from the pings, so a slow
+    /// or unreachable catalog never delays them.
+    pub(super) async fn cluster_version_loop(&self) {
+        let mut schedule = tokio::time::interval(VERSION_INTERVAL);
+        schedule.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        while self.disk.cluster_version() < CLUSTER_VERSION_CURRENT {
+            tokio::select! {
+                () = self.stop.cancelled() => return,
+                _ = schedule.tick() => self.sync_cluster_version().await,
+            }
+        }
+        // The keeper stops when any of its tasks ends, so this one waits.
+        self.stop.cancelled().await;
+    }
+
+    /// Queries the catalog for the finalized cluster feature level and
+    /// advances this keeper's write-version gate monotonically.
+    pub(super) async fn sync_cluster_version(&self) {
+        if let Ok(super::Reply::ClusterVersion(version)) =
+            self.catalog_request(super::Request::ClusterVersion).await
+        {
+            self.disk.set_write_version(version);
+        }
+    }
+
+    /// Whether every other keeper in the inventory answers a live probe now
+    /// and advertises the write-version gate: `Ok(())` when all do,
+    /// `Unsupported` when one answers without the feature or on another
+    /// protocol version, and `Unavailable` when one does not answer. Live
+    /// probes, not cached liveness, so a keeper stopped or downgraded since
+    /// its last ping cannot slip past.
+    pub(super) async fn all_keepers_support_version(
+        &self,
+        target: u32,
+    ) -> Result<(), journal_contract::JournalError> {
+        use journal_contract::JournalError;
+        if target > CLUSTER_VERSION_CURRENT {
+            return Err(JournalError::Unsupported);
+        }
+        let peers = self
+            .placement
+            .domains()
+            .keys()
+            .copied()
+            .filter(|keeper| *keeper != self.id)
+            .collect::<Vec<_>>();
+        // A probe retries a lost answer, so one slow round trip does not
+        // refuse the finalization; an unreachable keeper still does.
+        let checks = futures::future::join_all(peers.into_iter().map(|keeper| async move {
+            for _ in 0..3 {
+                let probed = timeout(
+                    PING_TIMEOUT,
+                    self.control.ping(
+                        keeper,
+                        self.recognition.own(),
+                        BUILD_VERSION.to_owned(),
+                        features::SUPPORTED,
+                        PING_TIMEOUT,
+                    ),
+                )
+                .await;
+                match probed {
+                    Ok(Ok(pong)) if pong.status.keeper == keeper => {
+                        return if decisions::peer_supports(
+                            pong.status.features,
+                            features::WRITE_VERSION_GATE,
+                        ) {
+                            Ok(())
+                        } else {
+                            Err(JournalError::Unsupported)
+                        };
+                    }
+                    Ok(Err(error)) if network::is_version_mismatch(&error) => {
+                        return Err(JournalError::Unsupported);
+                    }
+                    _ => (),
+                }
+            }
+            Err(JournalError::Unavailable)
+        }))
+        .await;
+        // A keeper without the feature outranks one that did not answer: the
+        // first will not change by retrying.
+        let mut result = Ok(());
+        for check in checks {
+            match check {
+                Err(JournalError::Unsupported) => return Err(JournalError::Unsupported),
+                Err(error) => result = Err(error),
+                Ok(()) => (),
+            }
+        }
+        result
     }
 
     /// Pings the other keepers at once when no peer has confirmed this

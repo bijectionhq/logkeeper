@@ -136,14 +136,22 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
         let Some(file) = config_file else {
             return Err("Usage: logkeeper keeper --config FILE [--log-format human|json]".into());
         };
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
+        let bytes = std::fs::read(file)?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let is_consensus = value.as_object().is_some_and(|object| {
+            object.contains_key("enrollment") || object.contains_key("peers")
+        });
         enum KeeperConfig {
             Consensus(logkeeper::stream::consensus::Config),
             Stream(logkeeper::stream::transport::Config),
         }
-
-        let config = serde_json::from_slice::<KeeperConfig>(&std::fs::read(file)?)?;
+        let config = if is_consensus {
+            KeeperConfig::Consensus(logkeeper::stream::consensus::Config::from_json_slice(
+                &bytes,
+            )?)
+        } else {
+            KeeperConfig::Stream(serde_json::from_slice(&bytes)?)
+        };
         let listen = match &config {
             KeeperConfig::Consensus(config) => {
                 logkeeper::stream::consensus::logging::init(

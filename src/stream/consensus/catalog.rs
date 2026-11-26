@@ -103,6 +103,30 @@ impl Catalog {
         Ok(Reply::Staged(stage))
     }
 
+    pub fn cluster_version(&self) -> io::Result<Reply> {
+        self.require_trusted()?;
+        Ok(Reply::ClusterVersion(self.disk.cluster_version()))
+    }
+
+    pub async fn finalize_version(&self, target: u32) -> io::Result<Reply> {
+        let _guard = self.claim.lock().await;
+        self.require_trusted()?;
+        if target < super::CLUSTER_VERSION_V1 || target > super::CLUSTER_VERSION_CURRENT {
+            return Ok(Reply::Decision(Outcome::Refused(JournalError::Unsupported)));
+        }
+        let current = self.disk.cluster_version();
+        if target < current {
+            return Ok(Reply::Decision(Outcome::Refused(JournalError::Conflict {
+                head: Lsn(0),
+            })));
+        }
+        if target > current {
+            self.disk.write(Record::ClusterVersion(target)).await?;
+            self.disk.set_write_version(target);
+        }
+        Ok(Reply::ClusterVersion(target))
+    }
+
     fn require_trusted(&self) -> io::Result<()> {
         if !self.disk.healthy() {
             return Err(invalid("catalog media is unavailable"));

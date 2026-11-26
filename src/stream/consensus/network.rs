@@ -258,6 +258,11 @@ pub(super) enum Request {
     /// certify its copy (`keeper/certify.rs`). Added last, so a catalog
     /// keeper older than this refuses it.
     Staging(StreamId),
+    /// Reads the finalized cluster feature level from the catalog.
+    ClusterVersion,
+    /// Advances the finalized cluster feature level to `version` once all
+    /// active keepers support it. Administrators only.
+    FinalizeVersion(u32),
 }
 
 impl Request {
@@ -281,6 +286,7 @@ impl Request {
             | Self::Staging(stream)
             | Self::Configuration(stream) => stream,
             Self::Stage(ref stage) => stage.stream,
+            Self::ClusterVersion | Self::FinalizeVersion(_) => StreamId(0),
             Self::Seal { stream, .. }
             | Self::Append { stream, .. }
             | Self::AppendBatch { stream, .. }
@@ -366,7 +372,7 @@ pub(super) fn encode_pong(pong: &Pong, version: WireVersion) -> io::Result<Vec<u
 const MAX_FRAME_TAG_V1: u32 = 2;
 const MAX_FRAME_TAG_CURRENT: u32 = 3;
 const MAX_REQUEST_TAG_V1: u32 = 27;
-const MAX_REQUEST_TAG_CURRENT: u32 = 29;
+const MAX_REQUEST_TAG_CURRENT: u32 = 31;
 const MAX_PEER_REQUEST_TAG_V1: u32 = 5;
 const MAX_PEER_REQUEST_TAG_CURRENT: u32 = 5;
 /// Serialized size of `Genesis` under fixint bincode: StreamId(16) + [Uuid; 3](48) + u64(8).
@@ -443,7 +449,10 @@ impl Request {
     /// since N-1 is refused locally on an N-1 connection.
     pub(super) fn supported_on(&self, version: WireVersion) -> bool {
         match self {
-            Self::LocalConfiguration(_) | Self::Staging(_) => version == WireVersion::Current,
+            Self::LocalConfiguration(_)
+            | Self::Staging(_)
+            | Self::ClusterVersion
+            | Self::FinalizeVersion(_) => version == WireVersion::Current,
             _ => true,
         }
     }
@@ -658,6 +667,8 @@ pub(super) enum Reply {
     /// Typed refusal when the receiver does not recognize a request or
     /// feature on the current protocol lane.
     Unsupported(String),
+    /// The finalized cluster feature level.
+    ClusterVersion(u32),
 }
 
 /// The N-1 wire codec for [`Reply`], the bincode layout of
@@ -711,6 +722,9 @@ impl ReplyV1 {
                 return Err(unsupported("N-1 knows no local configuration request"));
             }
             Reply::Unsupported(reason) => return Err(unsupported(reason)),
+            Reply::ClusterVersion(_) => {
+                return Err(unsupported("cluster version requires a newer protocol"));
+            }
         })
     }
 

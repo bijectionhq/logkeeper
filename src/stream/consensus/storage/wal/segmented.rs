@@ -49,7 +49,12 @@ use crate::stream::{
 pub(super) const MAX_SCOPES: usize = 4096;
 pub(super) const MAX_SUFFIX: usize = 1024;
 pub(in crate::stream::consensus::storage) const CHECKPOINTS: &str = "raft-checkpoints";
+/// N-1 checkpoint format; written until the cluster feature level is finalized
+/// at `CLUSTER_VERSION_CURRENT` so downgrade before finalize stays possible.
 const CHECKPOINT_MAGIC: &[u8; 8] = b"LKRWAL04";
+/// N checkpoint format carrying the finalized cluster feature level; gated by
+/// `decisions::write_version_allows`.
+const CHECKPOINT_MAGIC_V5: &[u8; 8] = b"LKRWAL05";
 const MAX_CHECKPOINT: u64 = 1024 * 1024 * 1024;
 #[cfg(not(test))]
 const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
@@ -96,6 +101,12 @@ pub(in crate::stream::consensus::storage) struct Checkpoint {
 }
 
 #[derive(Serialize, Deserialize)]
+struct CheckpointV5 {
+    cluster_version: u32,
+    checkpoint: Checkpoint,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub(in crate::stream::consensus::storage) struct Leaf {
     pub genesis: Option<Genesis>,
     pub catalog: Option<CatalogEntry>,
@@ -299,8 +310,11 @@ impl Segmented {
         let directory = objects.segment_directory().to_owned();
         let (mut state, position, chain, pins) = match slot.checkpoint {
             Some(reference) => {
-                let checkpoint = read_checkpoint(&checkpoints, reference)?;
-                let mut state = State::default();
+                let (checkpoint, cluster_version) = read_checkpoint(&checkpoints, reference)?;
+                let mut state = State {
+                    cluster_version,
+                    ..State::default()
+                };
                 for (scope, leaf) in checkpoint.leaves {
                     leaf.restore(scope, objects, &mut state)?;
                 }
@@ -469,7 +483,12 @@ impl Segmented {
         }
         writer.flush()?;
         let (checkpoint, _pins) = capture(&state, objects, writer.end(), writer.chain)?;
-        let reference = write_checkpoint(&checkpoints, &checkpoint, space)?;
+        let reference = write_checkpoint(
+            &checkpoints,
+            &checkpoint,
+            space,
+            crate::stream::consensus::CLUSTER_VERSION_V1,
+        )?;
         media.migrate(&Slot {
             sequence: 1,
             segment: writer.id,
@@ -619,7 +638,13 @@ impl Segmented {
 
     /// Starts a checkpoint of the installed state once enough frames or time
     /// passed since the last one.
-    pub fn maybe_checkpoint(&mut self, state: &State, objects: &Objects, space: &Space) {
+    pub fn maybe_checkpoint(
+        &mut self,
+        state: &State,
+        objects: &Objects,
+        space: &Space,
+        write_version: u32,
+    ) {
         if self.pending.is_some()
             || self.since == 0
             || (self.since < self.tuning.checkpoint_bytes
@@ -627,7 +652,7 @@ impl Segmented {
         {
             return;
         }
-        if let Err(error) = self.start_checkpoint(state, objects, space) {
+        if let Err(error) = self.start_checkpoint(state, objects, space, write_version) {
             if let Some(dropped) =
                 crate::stream::consensus::logging::rate_limit("wal.checkpoint_start_deferred", None)
             {
@@ -650,6 +675,7 @@ impl Segmented {
         state: &State,
         objects: &Objects,
         space: &Space,
+        write_version: u32,
     ) -> io::Result<()> {
         let position = self.writer.end();
         let (checkpoint, pins) = capture(state, objects, position, self.writer.chain)?;
@@ -657,7 +683,7 @@ impl Segmented {
         let space = space.clone();
         let handle = std::thread::Builder::new()
             .name("logkeeper-raft-checkpoint".into())
-            .spawn(move || write_checkpoint(&directory, &checkpoint, &space))?;
+            .spawn(move || write_checkpoint(&directory, &checkpoint, &space, write_version))?;
         self.since = 0;
         self.last = Instant::now();
         self.pending = Some(Pending {
@@ -688,8 +714,19 @@ impl Segmented {
         objects: &Objects,
         space: &Space,
     ) -> io::Result<()> {
+        self.checkpoint_now_versioned(state, objects, space, state.cluster_version)
+    }
+
+    #[cfg(test)]
+    pub fn checkpoint_now_versioned(
+        &mut self,
+        state: &State,
+        objects: &Objects,
+        space: &Space,
+        write_version: u32,
+    ) -> io::Result<()> {
         self.finish();
-        self.start_checkpoint(state, objects, space)?;
+        self.start_checkpoint(state, objects, space, write_version)?;
         self.publish_now(objects)
     }
 
@@ -831,12 +868,37 @@ fn write_checkpoint(
     directory: &Path,
     checkpoint: &Checkpoint,
     space: &Space,
+    write_version: u32,
 ) -> io::Result<CheckpointRef> {
-    let mut body = CHECKPOINT_MAGIC.to_vec();
-    options()
-        .with_limit(MAX_CHECKPOINT)
-        .serialize_into(&mut body, checkpoint)
-        .map_err(io::Error::other)?;
+    let body = if crate::stream::consensus::decisions::write_version_allows(
+        write_version,
+        crate::stream::consensus::CLUSTER_VERSION_CURRENT,
+    ) {
+        let mut body = CHECKPOINT_MAGIC_V5.to_vec();
+        options()
+            .with_limit(MAX_CHECKPOINT)
+            .serialize_into(
+                &mut body,
+                &CheckpointV5 {
+                    cluster_version: write_version,
+                    checkpoint: Checkpoint {
+                        position: checkpoint.position,
+                        chain: checkpoint.chain,
+                        leaves: checkpoint.leaves.clone(),
+                        segments: checkpoint.segments.clone(),
+                    },
+                },
+            )
+            .map_err(io::Error::other)?;
+        body
+    } else {
+        let mut body = CHECKPOINT_MAGIC.to_vec();
+        options()
+            .with_limit(MAX_CHECKPOINT)
+            .serialize_into(&mut body, checkpoint)
+            .map_err(io::Error::other)?;
+        body
+    };
     // Checkpoints let segments be deleted, so they draw on the protected
     // protocol floor rather than the ordinary one.
     let _space = space.protocol(body.len() as u64 + space.allocation_unit())?;
@@ -869,8 +931,11 @@ pub(in crate::stream::consensus::storage) fn open_readonly(
     let directory = objects.segment_directory().to_owned();
     let (mut state, position, chain) = match slot.checkpoint {
         Some(reference) => {
-            let checkpoint = read_checkpoint(&checkpoints, reference)?;
-            let mut state = State::default();
+            let (checkpoint, cluster_version) = read_checkpoint(&checkpoints, reference)?;
+            let mut state = State {
+                cluster_version,
+                ..State::default()
+            };
             for (scope, leaf) in checkpoint.leaves {
                 leaf.restore(scope, objects, &mut state)?;
             }
@@ -908,7 +973,7 @@ pub(in crate::stream::consensus::storage) fn open_readonly(
 pub(in crate::stream::consensus::storage) fn read_checkpoint(
     directory: &Path,
     reference: CheckpointRef,
-) -> io::Result<Checkpoint> {
+) -> io::Result<(Checkpoint, u32)> {
     let mut bytes = Vec::new();
     File::open(directory.join(checkpoint_name(reference.id)))
         .map_err(|error| {
@@ -922,16 +987,28 @@ pub(in crate::stream::consensus::storage) fn read_checkpoint(
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 != reference.len
         || <[u8; 32]>::from(Sha256::digest(&bytes)) != reference.digest
-        || !bytes.starts_with(CHECKPOINT_MAGIC)
     {
         return Err(invalid(
             "WAL checkpoint does not match its trusted boundary",
         ));
     }
-    options()
+    if bytes.starts_with(CHECKPOINT_MAGIC_V5) {
+        let v5: CheckpointV5 = options()
+            .with_limit(MAX_CHECKPOINT)
+            .deserialize(&bytes[CHECKPOINT_MAGIC_V5.len()..])
+            .map_err(io::Error::other)?;
+        return Ok((v5.checkpoint, v5.cluster_version));
+    }
+    if !bytes.starts_with(CHECKPOINT_MAGIC) {
+        return Err(invalid(
+            "WAL checkpoint does not match its trusted boundary",
+        ));
+    }
+    let checkpoint: Checkpoint = options()
         .with_limit(MAX_CHECKPOINT)
         .deserialize(&bytes[CHECKPOINT_MAGIC.len()..])
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?;
+    Ok((checkpoint, crate::stream::consensus::CLUSTER_VERSION_V1))
 }
 
 impl Leaf {

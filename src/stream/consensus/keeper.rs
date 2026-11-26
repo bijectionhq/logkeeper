@@ -120,6 +120,8 @@ pub struct AdminConfig {
 }
 
 /// Installed, authenticated keeper inventory and local service settings.
+/// `Config::read` ignores unknown top-level fields with a warning, so a
+/// configuration may name a setting of a newer release before its binary.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -183,7 +185,44 @@ pub struct Config {
 
 impl Config {
     pub fn read(path: &Path) -> io::Result<Self> {
-        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+        Self::from_json_slice(&std::fs::read(path)?)
+    }
+
+    /// Parses keeper JSON configuration, warning on unknown top-level fields
+    /// instead of refusing so config rollouts can precede binary upgrades.
+    pub fn from_json_slice(bytes: &[u8]) -> io::Result<Self> {
+        let (config, warnings) = Self::from_json_slice_with_warnings(bytes)?;
+        for field in warnings {
+            eprintln!("logkeeper warning: ignoring unknown keeper config field {field:?}");
+        }
+        Ok(config)
+    }
+
+    /// Parses keeper JSON configuration and names the unknown top-level
+    /// fields it ignored. Fields inside nested settings stay strict.
+    pub fn from_json_slice_with_warnings(bytes: &[u8]) -> io::Result<(Self, Vec<String>)> {
+        let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
+        let mut warnings = Vec::new();
+        loop {
+            let error = match serde_json::from_value::<Self>(value.clone()) {
+                Ok(config) => return Ok((config, warnings)),
+                Err(error) => error,
+            };
+            // `deny_unknown_fields` names the first unknown field it meets.
+            let unknown = error
+                .to_string()
+                .strip_prefix("unknown field `")
+                .and_then(|rest| rest.split_once('`'))
+                .map(|(field, _)| field.to_owned());
+            let removed = match (unknown, value.as_object_mut()) {
+                (Some(field), Some(object)) => object.remove(&field).map(|_| field),
+                _ => None,
+            };
+            match removed {
+                Some(field) => warnings.push(field),
+                None => return Err(error.into()),
+            }
+        }
     }
 
     pub fn initialize(&self) -> io::Result<()> {
@@ -715,6 +754,11 @@ impl Engine {
             let certifying = self.clone();
             sockets.spawn(async move {
                 certifying.certify_loop().await;
+                Ok(())
+            });
+            let versioning = self.clone();
+            sockets.spawn(async move {
+                versioning.cluster_version_loop().await;
                 Ok(())
             });
             if self.catalog_stream.is_some() {
@@ -1291,6 +1335,7 @@ impl Engine {
                         | Request::InstallReplica { .. }
                         | Request::StageRecovered { .. }
                         | Request::PreferLeader { .. }
+                        | Request::ClusterVersion
                 ) =>
             {
                 Ok(None)
@@ -1310,6 +1355,7 @@ impl Engine {
                 let allowed = match request {
                     Request::Locate(_)
                     | Request::KeeperStatus(_)
+                    | Request::ClusterVersion
                     | Request::Head(_)
                     | Request::Configuration(_)
                     | Request::Read { .. }
@@ -1441,7 +1487,24 @@ impl Engine {
                 self.record_preference(stream, keeper);
                 Ok(Reply::Decision(Outcome::Unit))
             }
-            Request::Claim(_) | Request::Locate(_) | Request::Stage(_) | Request::Staging(_)
+            Request::FinalizeVersion(target) => {
+                if target > super::CLUSTER_VERSION_V1
+                    && let Err(error) = self.all_keepers_support_version(target).await
+                {
+                    return Ok(failure(error));
+                }
+                if self.catalog_stream.is_some() {
+                    self.serve_catalog_stream(Request::FinalizeVersion(target))
+                        .await
+                } else {
+                    self.catalog()?.finalize_version(target).await
+                }
+            }
+            Request::Claim(_)
+            | Request::Locate(_)
+            | Request::Stage(_)
+            | Request::Staging(_)
+            | Request::ClusterVersion
                 if self.catalog_stream.is_some() =>
             {
                 self.serve_catalog_stream(request).await
@@ -1450,6 +1513,7 @@ impl Engine {
             Request::Locate(stream) => self.catalog()?.locate(stream),
             Request::Stage(stage) => self.catalog()?.stage(stage, &self.placement).await,
             Request::Staging(stream) => self.catalog()?.staged(stream),
+            Request::ClusterVersion => self.catalog()?.cluster_version(),
             Request::Bootstrap(stream) => self.bootstrap(stream).await,
             request => {
                 let group = self.groups.lock().await.get(&stream).cloned();
@@ -1805,6 +1869,7 @@ impl Engine {
                 Request::Locate(stream) => catalog.locate(stream),
                 Request::Stage(stage) => catalog.stage(stage, &self.placement).await,
                 Request::Staging(stream) => catalog.staged(stream),
+                Request::ClusterVersion => catalog.cluster_version(),
                 _ => Err(invalid("invalid internal catalog request")),
             }
         } else {

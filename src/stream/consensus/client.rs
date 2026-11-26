@@ -444,6 +444,41 @@ impl Client {
         )?)
     }
 
+    /// Reads the finalized cluster feature level from the catalog.
+    pub async fn cluster_version(&self) -> Result<u32> {
+        let end = Instant::now() + self.deadline;
+        match self
+            .ask_catalog(Request::ClusterVersion, end, ATTEMPT)
+            .await?
+        {
+            Reply::ClusterVersion(version) => Ok(version),
+            Reply::Decision(Outcome::Refused(error)) => Err(error),
+            Reply::Unsupported(_) => Err(JournalError::Unsupported),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
+    /// Advances the finalized cluster feature level to `version`.
+    /// Administrators only. `Unsupported` when a keeper in the inventory
+    /// lacks `version`; `Unavailable`, worth retrying, when one did not
+    /// answer.
+    pub async fn finalize_version(&self, version: u32) -> Result<u32> {
+        let end = Instant::now() + self.deadline;
+        let attempt = match self.catalog_voters {
+            Some(_) => CATALOG_WRITE_ATTEMPT,
+            None => self.deadline,
+        };
+        match self
+            .ask_catalog(Request::FinalizeVersion(version), end, attempt)
+            .await?
+        {
+            Reply::ClusterVersion(finalized) => Ok(finalized),
+            Reply::Decision(Outcome::Refused(error)) => Err(error),
+            Reply::Unsupported(_) => Err(JournalError::Unsupported),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
     /// The status `keeper` reports about itself and its replica of `stream`.
     pub async fn keeper_status(
         &self,
@@ -658,18 +693,25 @@ impl Client {
         attempt: Duration,
     ) -> Result<Reply> {
         let Some(voters) = self.catalog_voters else {
-            return match self
-                .rpc
-                .call_application(self.catalog, request, remaining(end).min(attempt))
-                .await
-            {
-                Ok(Reply::Unsupported(_)) => Err(JournalError::Unsupported),
-                Ok(reply) => Ok(reply),
-                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                    Err(JournalError::Unsupported)
+            for _ in 0..3 {
+                let budget = remaining(end).min(attempt);
+                if budget.is_zero() {
+                    break;
                 }
-                Err(_) => Err(JournalError::Unavailable),
-            };
+                match self
+                    .rpc
+                    .call_application(self.catalog, request.clone(), budget)
+                    .await
+                {
+                    Ok(Reply::Unsupported(_)) => return Err(JournalError::Unsupported),
+                    Ok(reply) => return Ok(reply),
+                    Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                        return Err(JournalError::Unsupported);
+                    }
+                    Err(_) => sleep(Duration::from_millis(25).min(remaining(end))).await,
+                }
+            }
+            return Err(JournalError::Unavailable);
         };
         let order = self
             .catalog_leader
