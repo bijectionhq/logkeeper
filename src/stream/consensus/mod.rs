@@ -31,7 +31,7 @@ pub use placement::Domains;
 pub use timed::TimedAuthority;
 
 pub(super) const ALPN: &[u8] = b"logkeeper-consensus/1";
-const CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/6";
+const CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/7";
 const REPLICATION_ALPN: &[u8] = b"logkeeper-consensus-replication/3";
 const BULK_ALPN: &[u8] = b"logkeeper-consensus-bulk/2";
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;

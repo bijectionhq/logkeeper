@@ -228,6 +228,9 @@ impl Request {
 pub(super) enum Frame {
     Client(Request),
     Peer(Genesis, PeerRequest),
+    /// A keeper-level liveness ping on the control lane, answered with the
+    /// receiver's keeper-wide `KeeperStatus`.
+    Liveness,
 }
 
 #[derive(Serialize, Deserialize)]

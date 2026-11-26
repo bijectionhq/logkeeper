@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::{Engine, Group, NodeId, Outcome, Reply, Request, failure, invalid, leader_reply};
 use crate::stream::consensus::{LogId, Stage, Vote, network::Frame, state::Command};
 
-const MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl Engine {
     pub(super) async fn replace(

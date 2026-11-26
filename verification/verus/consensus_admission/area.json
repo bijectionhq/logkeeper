@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 62,
+  "min_verified_functions": 70,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -25,7 +25,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "replicate-on-control": {
       "defect": "send application entries on the control lane",
@@ -43,7 +43,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "vote-on-replication": {
       "defect": "send votes on the replication lane",
@@ -61,7 +61,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "undercharge-body": {
       "defect": "charge a body once instead of for its copies",
@@ -79,7 +79,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "ignore-sender-bytes": {
       "defect": "let one sender spend the receiver budget",
@@ -97,7 +97,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "ignore-sender-frames": {
       "defect": "let one sender take every message slot",
@@ -115,7 +115,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "ignore-receiver-frames": {
       "defect": "admit bodies past the receiver frame limit",
@@ -133,7 +133,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "ignore-sender-control-cap": {
       "defect": "let one sender take all control work",
@@ -151,7 +151,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "inexact-release": {
       "defect": "release a message without its bytes",
@@ -169,7 +169,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "spend-the-floor": {
       "defect": "let a reservation spend its class floor",
@@ -187,7 +187,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "ignore-pending-suffix-slots": {
       "defect": "ignore suffix slots held by pending writes",
@@ -205,7 +205,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "stall-rotation": {
       "defect": "restart the scan at the served lane",
@@ -223,7 +223,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "probe-skips-a-lane": {
       "defect": "skip the lane at the scan start",
@@ -241,7 +241,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "split-without-shrinking": {
       "defect": "resend a split batch at its original size",
@@ -259,7 +259,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "resume-old-term": {
       "defect": "restore a restarted leader in its old term",
@@ -277,7 +277,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "accept-term-above-vote": {
       "defect": "accept entries from a term above the sender's vote",
@@ -295,7 +295,7 @@
           "category": "invariant not satisfied at end of loop body"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "accept-term-regression": {
       "defect": "accept a decreasing entry term",
@@ -318,7 +318,7 @@
           "category": "invariant not satisfied at end of loop body"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "accept-index-gap": {
       "defect": "accept a gap after the previous entry",
@@ -336,7 +336,7 @@
           "category": "invariant not satisfied at end of loop body"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "recover-beside-a-live-voter": {
       "defect": "allow a recovery while another voter answers healthy",
@@ -354,7 +354,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "recover-unacknowledged": {
       "defect": "allow a recovery without the operator's acknowledgement",
@@ -372,7 +372,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "reuse-recovery-term": {
       "defect": "step the recovery term by one instead of past any term the lost voters reached",
@@ -390,7 +390,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "keep-recovery-epoch": {
       "defect": "install the recovery fence at the current epoch",
@@ -408,7 +408,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "staged-copy-votes": {
       "defect": "let an uninstalled recovery copy vote",
@@ -426,7 +426,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
     },
     "exclude-a-member": {
       "defect": "refuse a member of the effective membership without answering it",
@@ -444,7 +444,43 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 61
+      "min_verified_functions": 69
+    },
+    "live-at-the-delay": {
+      "defect": "count a keeper live when its silence just reaches the repair delay",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    silent_ms >= repair_after_ms\n}",
+          "replace": "    silent_ms > repair_after_ms\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "keeper_dead",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 69
+    },
+    "backoff-grows-too-little": {
+      "defect": "grow a failed stream's backoff by one millisecond instead of doubling it",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "            wait * 2\n",
+          "replace": "            wait + 1\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "backoff",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 69
     }
   }
 }

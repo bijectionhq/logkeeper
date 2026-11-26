@@ -340,8 +340,19 @@ impl Engine {
                 timeout(CONNECTION_TIMEOUT, read.read_exact(&mut body)).await??;
                 let mut batch = Vec::new();
                 for (id, message) in network::messages(&body)? {
-                    let Frame::Peer(genesis, request) = decode(message)? else {
-                        return Err(invalid("request used the wrong lane"));
+                    let (genesis, request) = match decode(message)? {
+                        Frame::Peer(genesis, request) => (genesis, request),
+                        // A ping costs one status read and no admission.
+                        Frame::Liveness if lane == Lane::Control => {
+                            let (engine, answers) = (self.clone(), answers.clone());
+                            work.spawn(async move {
+                                let status = engine.keeper_status().await;
+                                let reply = encode(&status).map_err(|error| error.to_string());
+                                let _ = answers.send((id, reply));
+                            });
+                            continue;
+                        }
+                        _ => return Err(invalid("request used the wrong lane")),
                     };
                     check_peer(lane, sender, &request)?;
                     batch.push((id, message.len(), genesis, request));

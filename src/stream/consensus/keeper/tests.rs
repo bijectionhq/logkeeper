@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 mod catalog;
 mod recovery;
+mod repair;
 
 pub(super) type RejectAppend =
     Box<dyn Fn(StreamId, NodeId, &AppendEntriesRequest<RaftTypes>) -> bool + Send + Sync>;

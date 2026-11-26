@@ -473,7 +473,7 @@ completeness as a premise, in the Lean worktree's
 
 Keepers run OpenRaft 0.10.1. Its peer messages differ from 0.9 under
 bincode, and the control and replication lanes carry multiplexed batch
-frames, so the peer ALPNs are `logkeeper-consensus-control/6`,
+frames, so the peer ALPNs are `logkeeper-consensus-control/7`,
 `logkeeper-consensus-replication/3` and `logkeeper-consensus-bulk/2`. A keeper
 on an older version fails the TLS handshake with `no_application_protocol`
 instead of failing to decode. Mixed versions are unsupported: upgrade all
@@ -612,12 +612,22 @@ new stream is placed, skipping keepers that are down or full or carry more
 than a quarter above the average stream count, with a fallback to every
 accepting keeper. `reconcile_placement` also moves a voter off a full keeper.
 
+Every keeper pings every other keeper on the multiplexed control channel
+every 2 seconds and keeps when each last answered, with the keeper-wide
+status it reported. A keeper unreachable for `repair_after_secs` is dead.
+
 Each stream's leader repairs its own stream. A voter that has not
-acknowledged the leader for `repair_after_secs` (600 by default), and whose
-keeper does not answer or answers without a healthy replica, is replaced by
-the best-ranked live keeper with room in a free failure domain, through the
-same staged joint change as `replace`. Nothing moves unless two voters are
-live, and a keeper repairs at most one stream every 30 seconds. A stream
+acknowledged the leader for `repair_after_secs` (600 by default), or whose
+keeper is dead, and whose keeper does not answer pings or answers without a
+healthy replica, is replaced by the best-ranked live keeper with room in a
+free failure domain, through the same staged joint change as `replace`.
+Nothing moves unless two voters are live. Every 30 seconds a keeper queues
+the repair work of all streams it leads, in priority order: finish a joint
+change, remove stale learners, then replace dead or quarantined voters. Up
+to four repairs run at once, streams take turns, and a stream whose repair
+fails waits a backoff that doubles from 30 seconds up to 10 minutes, so one
+stuck stream does not hold up the others. Health comes from the ping table
+rather than a status call per stream. A stream
 that lost two voters has no quorum to change its membership and needs an
 operator. A replica that hears from no leader for the repair delay asks
 other keepers for the stream's current placement; when that placement no
@@ -632,8 +642,17 @@ A stream that served no client and appended nothing for `park_after_secs`
 its applied log to close the group, then closes its own. A parked stream
 runs no timers and sends no heartbeats. A parked follower answers an empty
 heartbeat as busy without opening the group; entries, votes, snapshots and
-client requests reopen it, and the first request after parking waits for
-one election. On one host, 128 idle streams used 0.09 CPU cores parked
+client requests reopen it. The voter that led the stream campaigns as soon as
+it reopens and its followers grant it at once, so the first request after
+parking waits for one vote round instead of an election timeout (about 35 ms
+on loopback); when that voter's keeper is unreachable, the first reachable
+voter campaigns when the old leader's lease ends. A leader parks a stream
+without a follower whose keeper is dead, so a zone outage does not keep every
+stream awake. A parked stream has no leader to repair it: every keeper
+reopens, at most eight per sweep and with a doubling backoff, its parked or
+unopened copies of streams whose configuration names a dead keeper, and
+their leaders repair them. Parked streams whose voters all live stay parked.
+On one host, 128 idle streams used 0.09 CPU cores parked
 against 0.47 unparked.
 
 On the control and replication lanes a keeper keeps one long-lived
@@ -663,7 +682,14 @@ reads then go first to a voter in that domain, then to the keeper that
 answered last. After each seal such a journal also asks the stream's leader to hand
 leadership to the voter in its domain, which saves a cross-zone round trip
 per append; a leader does so only when that voter has matched its log and
-no hand-off reached or left it in the last minute.
+no hand-off reached or left it in the last minute. The leader records the
+preferred domain and forwards it to the other voters, which keep it in
+memory, and every 30 seconds each leader moves a stream back to the voter in
+its preferred domain under the same rules, provided that voter's keeper
+accepts streams. Leadership therefore returns to the writer's domain after a
+park, a restart, a graceful hand-off, shedding from a full keeper or an
+election, without a new seal. A full restart of every voter forgets the
+preference until the writer's next seal.
 
 A keeper whose media is unhealthy or full hands every stream it leads to a
 follower that has matched its log and whose keeper accepts streams, since

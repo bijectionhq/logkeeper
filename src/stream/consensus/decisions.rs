@@ -323,6 +323,47 @@ pub(super) fn votes(
     installed && (recovering || if configured { member } else { genesis_voter })
 }
 
+/// Whether a keeper silent for `silent_ms` is dead: it has not answered a
+/// liveness ping for the repair delay. Repair replaces a dead keeper's
+/// voters, parked streams that name it wake, and parking no longer waits
+/// for it.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (silent_ms >= repair_after_ms)
+))]
+pub(super) fn keeper_dead(silent_ms: u64, repair_after_ms: u64) -> bool {
+    silent_ms >= repair_after_ms
+}
+
+/// The wait after `failures` failed attempts: `base_ms` doubled once per
+/// failure, never above `cap_ms`. Repair and the wake sweep use it so that
+/// one stream that keeps failing yields to the others.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out as int == grown(if base_ms < cap_ms { base_ms as int } else { cap_ms as int },
+        cap_ms as int, failures as nat)
+))]
+pub(super) fn backoff(failures: u32, base_ms: u64, cap_ms: u64) -> u64 {
+    let mut wait = if base_ms < cap_ms { base_ms } else { cap_ms };
+    let mut step = 0;
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant
+            step <= failures,
+            wait <= cap_ms,
+            grown(wait as int, cap_ms as int, (failures - step) as nat)
+                == grown(if base_ms < cap_ms { base_ms as int } else { cap_ms as int },
+                    cap_ms as int, failures as nat),
+        decreases failures - step,
+    ))]
+    while step < failures && wait < cap_ms {
+        wait = if wait > cap_ms - wait {
+            cap_ms
+        } else {
+            wait * 2
+        };
+        step += 1;
+    }
+    wait
+}
+
 #[cfg(verus_keep_ghost)]
 verus! {
     /// The limit relations the laws rely on.
@@ -342,6 +383,19 @@ verus! {
             BODY_COPIES == 4,
             BODY_OVERHEAD == 65_536,
     {
+    }
+
+    /// `wait` doubled `n` times, never above `cap`.
+    pub(super) open spec fn grown(wait: int, cap: int, n: nat) -> int
+        decreases n,
+    {
+        if wait >= cap {
+            cap
+        } else if n == 0 {
+            wait
+        } else {
+            grown(if 2 * wait > cap { cap } else { 2 * wait }, cap, (n - 1) as nat)
+        }
     }
 
     /// The first index the peer batch must start at.

@@ -271,4 +271,58 @@ fn accepted_batches_are_consecutive(
     }
 }
 
+
+// A keeper counts as dead only once its silence reaches the repair delay, so
+// a keeper that answered within the delay is never repaired away, parked
+// past or woken for.
+fn dead_only_after_the_repair_delay(silent_ms: u64, repair_after_ms: u64) {
+    let dead = keeper_dead(silent_ms, repair_after_ms);
+    assert(silent_ms < repair_after_ms ==> !dead);
+    assert(silent_ms >= repair_after_ms ==> dead);
+}
+
+proof fn grown_is_bounded(wait: int, cap: int, n: nat)
+    requires 0 <= wait <= cap,
+    ensures wait <= grown(wait, cap, n) <= cap,
+    decreases n,
+{
+    if wait < cap && n > 0 {
+        let next = if 2 * wait > cap { cap } else { 2 * wait };
+        grown_is_bounded(next, cap, (n - 1) as nat);
+    }
+}
+
+proof fn grown_never_shrinks(wait: int, cap: int, n: nat)
+    requires 0 <= wait <= cap,
+    ensures grown(wait, cap, n) <= grown(wait, cap, n + 1),
+    decreases n,
+{
+    if wait < cap {
+        let next = if 2 * wait > cap { cap } else { 2 * wait };
+        if n == 0 {
+            grown_is_bounded(next, cap, 0);
+        } else {
+            grown_never_shrinks(next, cap, (n - 1) as nat);
+        }
+    }
+}
+
+// A repair or wake backoff never exceeds its cap, never undercuts its base
+// below the cap, and never shrinks after another failure: a stream that
+// keeps failing waits longer each time, up to the cap.
+fn backoff_is_bounded_and_grows(failures: u32, base_ms: u64, cap_ms: u64)
+    requires failures < u32::MAX,
+{
+    let wait = backoff(failures, base_ms, cap_ms);
+    let next = backoff(failures + 1, base_ms, cap_ms);
+    proof {
+        let start = if base_ms < cap_ms { base_ms as int } else { cap_ms as int };
+        grown_is_bounded(start, cap_ms as int, failures as nat);
+        grown_never_shrinks(start, cap_ms as int, failures as nat);
+    }
+    assert(wait <= cap_ms);
+    assert(wait >= base_ms || wait == cap_ms);
+    assert(next >= wait);
+}
+
 }

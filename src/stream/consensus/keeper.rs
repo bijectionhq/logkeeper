@@ -1,6 +1,7 @@
 mod admission;
 mod catalog_stream;
 mod ingress;
+mod liveness;
 mod park;
 mod recovery;
 mod repair;
@@ -54,7 +55,10 @@ const MAX_HEAD_REQUESTS: usize = 256;
 const MAX_PENDING_WRITES: usize = 16;
 const MAX_LOG_SUFFIX: u64 = 512;
 /// The least time between two leadership hand-offs of one stream.
+#[cfg(not(test))]
 const LEADER_HOLD_DOWN: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const LEADER_HOLD_DOWN: Duration = Duration::from_secs(4);
 /// How long a deleted stream's settled group stays open for late requests.
 #[cfg(not(test))]
 const DELETED_GROUP_GRACE: Duration = Duration::from_secs(30);
@@ -324,6 +328,9 @@ impl Config {
             parked: parking_lot::RwLock::default(),
             closed_states: parking_lot::Mutex::default(),
             activity: parking_lot::Mutex::default(),
+            liveness: parking_lot::Mutex::default(),
+            repairs: parking_lot::Mutex::default(),
+            preferred: parking_lot::Mutex::default(),
             park_after: Duration::from_secs(self.park_after_secs),
             snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
             retire_now: Arc::default(),
@@ -336,6 +343,10 @@ impl Config {
             scoped_reads: Default::default(),
             #[cfg(test)]
             busy_replies: Default::default(),
+            #[cfg(test)]
+            fail_repairs: Default::default(),
+            #[cfg(test)]
+            repair_attempts: Default::default(),
         });
         Ok((engine, acceptors))
     }
@@ -384,6 +395,12 @@ struct Engine {
     closed_states: parking_lot::Mutex<HashMap<StreamId, StateMachine>>,
     /// The last log index of each led stream and when it last changed.
     activity: parking_lot::Mutex<HashMap<StreamId, (Option<u64>, Instant)>>,
+    /// When each other keeper last answered a ping, and what it reported.
+    liveness: parking_lot::Mutex<liveness::Liveness>,
+    repairs: parking_lot::Mutex<repair::RepairQueue>,
+    /// The failure domain each stream's writer asked its leader to be in.
+    /// Every voter keeps it, so whichever voter leads restores it.
+    preferred: parking_lot::Mutex<HashMap<StreamId, String>>,
     park_after: Duration,
     snapshot_rate: Arc<super::network::RateLimiter>,
     /// Wakes the repair loop when a peer excluded one of this keeper's
@@ -398,6 +415,10 @@ struct Engine {
     scoped_reads: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     busy_replies: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    fail_repairs: parking_lot::RwLock<HashSet<StreamId>>,
+    #[cfg(test)]
+    repair_attempts: parking_lot::Mutex<HashMap<StreamId, u32>>,
 }
 
 enum Identity {
@@ -436,6 +457,11 @@ impl Engine {
             let repairing = self.clone();
             sockets.spawn(async move {
                 repairing.repair_loop().await;
+                Ok(())
+            });
+            let pinging = self.clone();
+            sockets.spawn(async move {
+                pinging.liveness_loop().await;
                 Ok(())
             });
             if self.catalog_stream.is_some() {
@@ -763,6 +789,7 @@ impl Engine {
                         | Request::StageReplica { .. }
                         | Request::InstallReplica { .. }
                         | Request::StageRecovered { .. }
+                        | Request::PreferLeader { .. }
                 ) =>
             {
                 Ok(None)
@@ -871,6 +898,12 @@ impl Engine {
                 )
                 .await
             }
+            // A leader forwards its writer's preference to the other voters,
+            // which only record it.
+            Request::PreferLeader { keeper, .. } if matches!(identity, Identity::Keeper(_)) => {
+                self.record_preference(stream, keeper);
+                Ok(Reply::Decision(Outcome::Unit))
+            }
             Request::Claim(_) | Request::Locate(_) | Request::Stage(_)
                 if self.catalog_stream.is_some() =>
             {
@@ -894,13 +927,10 @@ impl Engine {
                             _ => Reply::Decision(refused),
                         });
                     }
-                    if self.parked.write().remove(&stream)
-                        && let Some(genesis) = self.disk.genesis(stream)
-                    {
-                        // Reopen the parked stream; it elects a leader and
-                        // the client retries.
+                    // Reopen the parked stream; it elects a leader at once
+                    // and the client retries.
+                    if self.unpark(stream).await.is_some() {
                         super::metrics::count(&super::metrics::COUNTERS.unparked_by_client);
-                        let _ = self.group(genesis).await;
                     }
                     return Ok(Reply::Leader(None));
                 };
@@ -953,7 +983,9 @@ impl Engine {
                     Request::Replace {
                         expected, voters, ..
                     } => self.replace(&group, expected, voters).await,
-                    Request::PreferLeader { keeper, .. } => Ok(group.prefer_leader(keeper).await),
+                    Request::PreferLeader { keeper, .. } => {
+                        self.prefer_leader(&group, keeper).await
+                    }
                     Request::Create(_) => Ok(group.write(Command::Create).await),
                     Request::Seal {
                         expected, writer, ..
@@ -1306,13 +1338,19 @@ impl Group {
     /// Whether this replica has applied its whole log and, when it leads,
     /// every voter has matched it.
     fn settled(&self) -> bool {
+        self.settled_except(&|_| false)
+    }
+
+    /// Whether this replica is settled, leaving out the voters `ignored`
+    /// names, such as followers on dead keepers.
+    fn settled_except(&self, ignored: &dyn Fn(NodeId) -> bool) -> bool {
         let metrics = self.raft.metrics().borrow_watched().clone();
         let last = metrics.last_log_index;
         metrics.last_applied.map(|applied| applied.index) == last
             && metrics.replication.as_ref().is_none_or(|progress| {
                 progress
-                    .values()
-                    .all(|matched| matched.map(|id| id.index) == last)
+                    .iter()
+                    .all(|(id, matched)| ignored(*id) || matched.map(|id| id.index) == last)
             })
     }
 

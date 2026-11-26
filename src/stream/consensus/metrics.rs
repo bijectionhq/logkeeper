@@ -41,6 +41,7 @@ counters! {
     parked: "stream.parked",
     unparked_by_peer: "stream.unparked_by_peer",
     unparked_by_client: "stream.unparked_by_client",
+    unparked_for_repair: "stream.unparked_for_repair",
     park_declined: "stream.park_declined",
 }
 

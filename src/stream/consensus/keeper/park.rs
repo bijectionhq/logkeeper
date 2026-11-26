@@ -6,7 +6,9 @@
 //! the stream: close the group and keep only a mark. When every follower has
 //! parked, the leader parks too. A parked follower answers empty heartbeats
 //! as busy without opening the group; entries, votes, snapshots and client
-//! requests reopen it, and the next request pays one election.
+//! requests reopen it. The voter that led the stream restores its
+//! leadership as soon as it reopens, so waking costs one vote round rather
+//! than an election timeout. A follower whose keeper is dead is skipped.
 
 use std::time::Duration;
 
@@ -16,7 +18,7 @@ use tokio::time::Instant;
 
 use super::{Engine, Group};
 use crate::stream::consensus::{
-    LogId, Vote,
+    LogId, NodeId, Vote,
     network::{Frame, PeerRequest},
 };
 
@@ -73,7 +75,8 @@ impl Engine {
             .collect::<Vec<_>>();
         for (group, idle) in groups.into_iter().zip(idle) {
             let metrics = group.raft.metrics().borrow_watched().clone();
-            if metrics.state != ServerState::Leader || !group.settled() || !idle {
+            let dead = |id: NodeId| self.dead(uuid::Uuid::from_u128(id));
+            if metrics.state != ServerState::Leader || !group.settled_except(&dead) || !idle {
                 continue;
             }
             let stream = group.genesis.stream;
@@ -86,6 +89,12 @@ impl Engine {
                 .collect::<Vec<_>>();
             let mut parked = true;
             for follower in followers {
+                // A dead follower cannot answer. Parking without it keeps a
+                // zone outage from holding every stream awake; the wake
+                // sweep reopens the stream for repair.
+                if self.dead(uuid::Uuid::from_u128(follower)) {
+                    continue;
+                }
                 let frame = Frame::Peer(group.genesis.clone(), PeerRequest::Park { vote, last });
                 let accepted: bool = self
                     .control
