@@ -1312,24 +1312,6 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
         .await
         .unwrap();
     }
-    let mut exceeds_sender = cluster.replication_header(busy, follower, header).await;
-    assert_ne!(
-        timeout(Duration::from_secs(2), exceeds_sender.read_u8())
-            .await
-            .unwrap()
-            .ok(),
-        Some(0)
-    );
-    let mut exceeds_receiver = cluster
-        .replication_header(Uuid::from_u128(7), follower, header)
-        .await;
-    let no_reply = timeout(Duration::from_secs(2), exceeds_receiver.read_u8())
-        .await
-        .unwrap();
-    assert!(no_reply.is_err());
-    assert_eq!(inbound.frames(None), 3);
-    assert_eq!(journal.head(stream).await, Ok(Lsn(1)));
-
     let voter = cluster.group(follower, auxiliary).await;
     let election = Vote::new(
         voter.raft.metrics().borrow_watched().current_term + 50,
@@ -1355,6 +1337,25 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
         vote.vote_granted
             || vote.vote.leader_id().term >= voter.raft.metrics().borrow_watched().current_term
     );
+
+    // Frames past a sender's share or the receiver's budget wait unread.
+    let mut exceeds_sender = cluster.replication_header(busy, follower, header).await;
+    assert!(
+        timeout(Duration::from_millis(500), exceeds_sender.read_u8())
+            .await
+            .is_err()
+    );
+    let mut exceeds_receiver = cluster
+        .replication_header(Uuid::from_u128(7), follower, header)
+        .await;
+    assert!(
+        timeout(Duration::from_millis(500), exceeds_receiver.read_u8())
+            .await
+            .is_err()
+    );
+    assert_eq!(inbound.frames(None), 3);
+    assert_eq!(inbound.frames(Some(busy.as_u128())), 1);
+    assert_eq!(journal.head(stream).await, Ok(Lsn(1)));
     let cut = group.state.applied().unwrap();
     group.raft.trigger().snapshot().await.unwrap();
     group
@@ -1378,6 +1379,7 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
         .unwrap();
 
     drop(ordinary);
+    drop((exceeds_sender, exceeds_receiver));
     drop(open.pop());
     let missing = donors[2].as_u128();
     timeout(WAIT, async {
@@ -2846,5 +2848,70 @@ async fn a_parked_stream_keeps_its_snapshot_and_retained_extents() {
     .await
     .unwrap();
     assert_eq!(page.records, [(Lsn(1), record(1))]);
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn heartbeats_for_many_streams_share_one_frame_and_keep_the_parked_and_deleted_rules() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let streams = (90..106).map(StreamId).collect::<Vec<_>>();
+    let mut genesis = Vec::new();
+    for stream in &streams {
+        journal.create(*stream, [a, b, c], 4096).await.unwrap();
+        genesis.push(cluster.group(a, *stream).await.genesis.clone());
+    }
+    let engine = cluster.running[&a].engine.clone();
+    let (parked, deleted) = (&streams[..4], streams[4]);
+    engine.parked.write().extend(parked.iter().copied());
+    engine.deleted.write().insert(deleted);
+    // A stale heartbeat from `b` reaches Raft, which refuses its old vote.
+    let vote = Vote::new_committed(0, b.as_u128());
+    let heartbeat = |genesis: Genesis| {
+        Frame::Peer(
+            genesis,
+            PeerRequest::Append(AppendEntriesRequest {
+                vote,
+                prev_log_id: None,
+                leader_commit: None,
+                entries: Vec::new(),
+            }),
+        )
+    };
+    let rpc = cluster.peer_rpc(b, Lane::Control);
+    let (beats, park) = tokio::join!(
+        futures::future::join_all(genesis.iter().map(|genesis| rpc.call::<AppendReply>(
+            a,
+            heartbeat(genesis.clone()),
+            WAIT
+        )),),
+        rpc.call::<bool>(
+            a,
+            Frame::Peer(genesis[0].clone(), PeerRequest::Park { vote, last: None }),
+            WAIT,
+        ),
+    );
+    // Every message was queued while the connection opened.
+    assert_eq!(rpc.frames(), 1);
+    for (stream, beat) in streams.iter().zip(beats) {
+        match beat {
+            Ok(AppendReply::Busy) => assert!(parked.contains(stream)),
+            Ok(AppendReply::Raft(_)) => assert!(!parked.contains(stream) && *stream != deleted),
+            Err(_) => assert_eq!(*stream, deleted),
+        }
+    }
+    // A repeated park of a parked stream is accepted without opening it.
+    assert!(park.unwrap());
+    assert!(engine.parked.read().contains(&streams[0]));
+    engine.deleted.write().remove(&deleted);
+    engine.parked.write().clear();
+    // The connection survived the deleted stream's refusal.
+    assert!(matches!(
+        rpc.call::<AppendReply>(a, heartbeat(genesis[5].clone()), WAIT)
+            .await,
+        Ok(AppendReply::Raft(_))
+    ));
+    assert_eq!(rpc.frames(), 2);
     cluster.stop_all().await;
 }

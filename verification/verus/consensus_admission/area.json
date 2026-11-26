@@ -1,5 +1,5 @@
 {
-  "summary": "Verify the shipped consensus admission, classification, rotation, batch and restart decisions against the PeerBudget, Headroom and RestartRead laws.",
+  "summary": "Verify the shipped consensus admission, metering, classification, rotation, batch and restart decisions against the PeerBudget, Headroom and RestartRead laws.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 48,
+  "min_verified_functions": 52,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -25,7 +25,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "replicate-on-control": {
       "defect": "send application entries on the control lane",
@@ -43,7 +43,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "vote-on-replication": {
       "defect": "send votes on the replication lane",
@@ -61,7 +61,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "undercharge-body": {
       "defect": "charge a body once instead of for its copies",
@@ -79,7 +79,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "ignore-sender-bytes": {
       "defect": "let one sender spend the receiver budget",
@@ -97,7 +97,25 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
+    },
+    "ignore-sender-frames": {
+      "defect": "let one sender take every message slot",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        && sender_frames < SENDER_FRAMES\n        && sender_bytes <= SENDER_BYTES",
+          "replace": "        && sender_bytes <= SENDER_BYTES"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "admits_body",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 51
     },
     "ignore-receiver-frames": {
       "defect": "admit bodies past the receiver frame limit",
@@ -115,7 +133,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "ignore-sender-control-cap": {
       "defect": "let one sender take all control work",
@@ -133,7 +151,25 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
+    },
+    "inexact-release": {
+      "defect": "release a message without its bytes",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    (frames - 1, bytes - charge)",
+          "replace": "    (frames - 1, bytes)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "meter_release",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 51
     },
     "spend-the-floor": {
       "defect": "let a reservation spend its class floor",
@@ -151,7 +187,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "ignore-pending-suffix-slots": {
       "defect": "ignore suffix slots held by pending writes",
@@ -169,7 +205,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "stall-rotation": {
       "defect": "restart the scan at the served lane",
@@ -187,7 +223,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "probe-skips-a-lane": {
       "defect": "skip the lane at the scan start",
@@ -205,7 +241,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "split-without-shrinking": {
       "defect": "resend a split batch at its original size",
@@ -223,7 +259,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "resume-old-term": {
       "defect": "restore a restarted leader in its old term",
@@ -241,7 +277,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "accept-term-above-vote": {
       "defect": "accept entries from a term above the sender's vote",
@@ -259,7 +295,7 @@
           "category": "invariant not satisfied at end of loop body"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "accept-term-regression": {
       "defect": "accept a decreasing entry term",
@@ -282,7 +318,7 @@
           "category": "invariant not satisfied at end of loop body"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     },
     "accept-index-gap": {
       "defect": "accept a gap after the previous entry",
@@ -300,7 +336,7 @@
           "category": "invariant not satisfied at end of loop body"
         }
       ],
-      "min_verified_functions": 47
+      "min_verified_functions": 51
     }
   }
 }

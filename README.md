@@ -317,14 +317,22 @@ queue rejects application entries and oversized metadata. A peer batch holds
 at most 64 entries, matching `max_payload_entries`. An `Admitted` wrapper
 decodes only one unwrapped application or staging command.
 
-The receiver reads the 4-byte length before allocating a replication body.
-Each in-flight body is charged at four times its encoded size plus 64 KiB to
-cover decoding and handoff copies. The receiver allows 256 MiB and 48 frames
-in total, with at most 96 MiB and 16 frames per authenticated sender
-across all of its connections and streams. Replication sockets are capped at 32
-per receiver and 16 per sender. Control work is capped at 48 requests in
-total and 16 per sender, leaving 32 for other senders. At most 64 idle control connections wait for a
-header, and the oldest is closed first.
+Admission counts peer messages, not connections or batch frames. The
+receiver reads the 4-byte length of a replication batch frame and charges it
+before allocating the body, waiting while the sender or the receiver is full;
+the wait stalls only that sender's connection. Once the frame is decoded, its
+charge is exchanged under one lock for one charge per message, and a message
+past the budgets is answered `Busy`. Each in-flight message is charged at
+four times its encoded size plus 64 KiB to cover decoding and handoff copies.
+The receiver allows 256 MiB and 384 messages in total, with at most 96 MiB
+and 128 messages per authenticated sender across all of its connections and
+streams, which leaves 256 message slots for other senders. Control work is
+capped at 384 messages in total and 128 per sender, leaving 256 for other
+senders; a control message over its sender's share waits up to 100 ms for a
+slot and is then refused. Verus checks these decisions and that releasing a
+message restores both meters exactly. At most 64 idle control connections
+wait for a header, and the oldest is closed first; a connection with
+messages in flight is not idle.
 
 Before dispatch into Raft storage, a follower reserves the batch's upper
 bound from the shared disk owner. That bound is the encoded entries plus
@@ -347,8 +355,8 @@ skipped. A round takes at most 128 records and stops after crossing 32 MiB.
 Each stream admits one follower batch at a time, so the follower queue holds
 at most one batch per stream, at most 16 in total, in FIFO order. A stream
 therefore cannot overtake itself, and a ready stream waits behind at most 15
-other streams. One sender's 16 frames can occupy all of those slots; the
-bound still holds. This rotation over streams gives the checked `5 * W` service
+other streams. One sender's 128 messages can fill all of those slots and
+wait behind them; the bound still holds. This rotation over streams gives the checked `5 * W` service
 bound with `W = 16`, assuming each earlier durable round completes. A sender
 splits a valid batch that exceeds its lane, and a single entry that cannot fit
 is unreachable.
@@ -366,8 +374,9 @@ completeness as a premise, in the Lean worktree's
 `verification/lean/restart-read.md`.
 
 Keepers run OpenRaft 0.10.1. Its peer messages differ from 0.9 under
-bincode, so the peer ALPNs are `logkeeper-consensus-control/5`,
-`logkeeper-consensus-replication/2` and `logkeeper-consensus-bulk/2`. A keeper
+bincode, and the control and replication lanes carry multiplexed batch
+frames, so the peer ALPNs are `logkeeper-consensus-control/6`,
+`logkeeper-consensus-replication/3` and `logkeeper-consensus-bulk/2`. A keeper
 on an older version fails the TLS handshake with `no_application_protocol`
 instead of failing to decode. Mixed versions are unsupported: upgrade all
 keepers in a group together. The application protocol, `LKRIMG03` images
@@ -381,9 +390,9 @@ working leader. A graceful shutdown first transfers every stream the keeper
 leads to a caught-up voter, waiting at most 3 seconds, so a rolling restart
 does not wait out a lease and an election per stream.
 
-Verus checks the shipped admission, classification, rotation, batch and
-restart decisions in `src/stream/consensus/decisions.rs` against laws named
-after the Lean theorems. The baseline verifies 48 functions, and 16
+Verus checks the shipped admission, metering, classification, rotation, batch
+and restart decisions in `src/stream/consensus/decisions.rs` against laws
+named after the Lean theorems. The baseline verifies 52 functions, and 18
 production mutations each fail their declared contract. See
 `verification/verus/consensus_admission/README.md` for the mapping and the
 unverified stateful glue.
@@ -393,8 +402,8 @@ Local Rust tests cover these acceptance cuts:
 - A mixed batch sent on the control lane is refused. With disk space
   exhausted, the same batch on the replication lane gets `Busy` with no
   outstanding charge and an unchanged log.
-- One sender is held at its share and the receiver at its frame limit while
-  another sender still enters. A vote and a fresh `head` are served, and a
+- One sender is held at its share and the receiver at its byte budget, and
+  their next frames wait unread, while another sender still enters. A vote and a fresh `head` are served, and a
   covered snapshot and purge commit, all while replication data is saturated.
   Payload resumes after release, and the stopped original voter catches up
   with unchanged membership once the pressure clears.
@@ -403,9 +412,17 @@ Local Rust tests cover these acceptance cuts:
   to an unrelated stream each commit within five seconds. The busy stream
   keeps committing. The refusing target holds no charge, stays at its prefix
   and catches up after its space returns.
-- Unit tests cover the per-sender and receiver byte and frame caps, socket
-  caps, exact release, control work caps and oldest-first eviction of idle
-  control waits. The sender splits oversized valid batches.
+- Unit tests cover the per-sender and receiver byte and message caps, a
+  batch read that waits for its sender and splits into exact message charges,
+  exact release, control work caps and oldest-first eviction of idle control
+  waits. The sender splits oversized valid batches.
+- On one multiplexed connection, 128 concurrent messages travel in one frame
+  and each caller gets its own reply; a slow reply holds back no other, a
+  late one is dropped, and a failure answers only its own message. A dropped
+  connection fails its waiters and the next call reconnects. Heartbeats for
+  16 streams reach a keeper in one frame, where parked streams answer
+  `Busy`, a repeated park is accepted, a deleted stream fails alone and the
+  connection keeps serving.
 - A reservation cancelled before dispatch releases once. A request aborted
   after dispatch keeps its charge until the durable settlement. A racing retry
   gets `Busy` without a second charge, and a later retry succeeds.
@@ -521,12 +538,24 @@ client requests reopen it, and the first request after parking waits for
 one election. On one host, 128 idle streams used 0.09 CPU cores parked
 against 0.47 unparked.
 
-On peer lanes a keeper keeps at most sixteen requests in flight to each
-other keeper, the most a receiver admits from one sender, and queues the rest
-instead of opening connections the receiver would refuse. A request that
-fails on a pooled connection the receiver had closed retries once on a
-fresh one, since peer messages are idempotent. A control frame over its
-sender's share waits up to 100 ms for a slot before it is refused.
+On the control and replication lanes a keeper keeps one long-lived
+connection to each other keeper, opened on first use and again after it
+fails. Every message carries a request id. A writer task sends the messages
+queued for that keeper in one batch frame, up to 256 messages, the lane's
+frame limit or 1 ms of collecting, and never waits on an empty queue; the
+empty heartbeats of many streams that fall due together therefore share a
+frame. A reader task hands each reply to its caller by id. The receiver
+admits each message on its own, runs the messages of one connection
+concurrently within the sender's share, answers each under its id and
+batches replies that finish together. A message refused for its stream, for
+example a deleted one, fails alone; a message on the wrong lane or under
+another keeper's name closes the connection. A sender keeps at most the
+receiver's per-sender share in flight to each keeper, 128 messages per lane,
+and queues the rest. Each caller times out on its own and a late reply is
+dropped. A broken connection fails the messages it had sent, which Raft
+retries after its usual backoff, and hands unsent ones to a fresh
+connection. Snapshot chunks on the bulk lane still use one request per
+pooled connection, at most sixteen in flight to each keeper.
 
 A keeper paces the bytes it sends in snapshot transfers, across all its
 streams, to `snapshot_send_bytes_per_second` (64 MiB/s by default; zero

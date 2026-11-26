@@ -22,18 +22,19 @@ pub const MAINTENANCE_FLOOR: u64 = 58_720_256; // control, scratch and external
 pub const COVERED_FLOOR: u64 = 41_943_040; // control and external
 pub const SCRATCH_FLOOR: u64 = 50_331_648; // control, maintenance and external
 
-/// Replication transport limits for one receiving keeper.
+/// Replication transport limits for one receiving keeper. A frame is one
+/// peer message in flight, whichever connection or batch carried it.
 pub const RECEIVER_BYTES: usize = 268_435_456; // 256 MiB
 pub const SENDER_BYTES: usize = 100_663_296; // 96 MiB
-pub const RECEIVER_FRAMES: usize = 48;
-pub const SENDER_FRAMES: usize = 16;
+pub const RECEIVER_FRAMES: usize = 384;
+pub const SENDER_FRAMES: usize = 128;
 /// Each body is charged for its encoding, decoding and handoff copies.
 pub const BODY_COPIES: usize = 4;
 pub const BODY_OVERHEAD: usize = 65_536;
 
-/// Control work limits for one receiving keeper.
-pub const MAX_CONTROL_WORK: usize = 48;
-pub const CONTROL_PER_SENDER: usize = 16;
+/// Control work limits for one receiving keeper, in peer messages.
+pub const MAX_CONTROL_WORK: usize = 384;
+pub const CONTROL_PER_SENDER: usize = 128;
 
 /// Durable WAL lanes served in rotation.
 pub const LANES: usize = 5;
@@ -145,6 +146,24 @@ pub(super) fn admits_body(
         && charge <= SENDER_BYTES - sender_bytes
 }
 
+/// A meter after it admits one message charged `charge` bytes.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires frames < usize::MAX, bytes as int + charge as int <= usize::MAX as int,
+    ensures out.0 as int == frames as int + 1, out.1 as int == bytes as int + charge as int,
+))]
+pub(super) fn meter_admit(frames: usize, bytes: usize, charge: usize) -> (usize, usize) {
+    (frames + 1, bytes + charge)
+}
+
+/// A meter after it releases one message charged `charge` bytes.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires 0 < frames, charge <= bytes,
+    ensures out.0 as int == frames as int - 1, out.1 as int == bytes as int - charge as int,
+))]
+pub(super) fn meter_release(frames: usize, bytes: usize, charge: usize) -> (usize, usize) {
+    (frames - 1, bytes - charge)
+}
+
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out == (total < MAX_CONTROL_WORK && sender < CONTROL_PER_SENDER)
 ))]
@@ -222,8 +241,9 @@ verus! {
             SENDER_BYTES < RECEIVER_BYTES,
             RECEIVER_BYTES - SENDER_BYTES == 167_772_160,
             SENDER_FRAMES < RECEIVER_FRAMES,
+            RECEIVER_FRAMES - SENDER_FRAMES == 256,
             CONTROL_PER_SENDER < MAX_CONTROL_WORK,
-            MAX_CONTROL_WORK - CONTROL_PER_SENDER == 32,
+            MAX_CONTROL_WORK - CONTROL_PER_SENDER == 256,
             LANES == 5,
             BODY_COPIES == 4,
             BODY_OVERHEAD == 65_536,

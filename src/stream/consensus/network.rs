@@ -1,4 +1,14 @@
-use std::{collections::HashMap, fmt, future::Future, io, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use bincode::Options;
 use futures::FutureExt;
@@ -18,9 +28,9 @@ use serde::{
     de::{self, DeserializeOwned, SeqAccess, Visitor},
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt},
-    sync::watch,
-    time::timeout,
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
+    time::{Instant, timeout},
 };
 use tokio_rustls::TlsConnector;
 
@@ -359,7 +369,7 @@ fn bounded_entries<'de, D: Deserializer<'de>>(decoder: D) -> Result<Vec<Entry>, 
 
 /// A valid batch that exceeds its lane is split at the sender, so the
 /// receiver never needs to allocate it. A single oversized entry cannot be
-/// split and stays unreachable.
+/// split and stays unreachable. `size` includes the message's batch header.
 fn fit_append(lane: Lane, size: u64, count: usize) -> Result<Option<usize>, RPCError<RaftTypes>> {
     match decisions::fit_append(size, lane.frame_limit(), count, MAX_PEER_ENTRIES) {
         AppendFit::Fits => Ok(None),
@@ -430,10 +440,115 @@ pub(super) async fn send<T: Serialize>(
     channel: &mut (impl AsyncWrite + Unpin),
     message: &T,
 ) -> io::Result<()> {
-    let bytes = encode(message)?;
+    send_encoded(channel, &encode(message)?).await
+}
+
+pub(super) async fn send_encoded(
+    channel: &mut (impl AsyncWrite + Unpin),
+    bytes: &[u8],
+) -> io::Result<()> {
     channel.write_u32(bytes.len() as u32).await?;
-    channel.write_all(&bytes).await?;
+    channel.write_all(bytes).await?;
     channel.flush().await
+}
+
+// The control and replication lanes carry batch frames. A frame is the usual
+// 4-byte length and a body of messages, each an 8-byte request id, a 4-byte
+// length and an encoded `Frame`. The receiver answers each message under its
+// id, in batch frames of replies: the id, a status byte (0 for an encoded
+// reply, 1 for a failure text), a 4-byte length and the bytes. Replies may
+// arrive in any order.
+
+/// Bytes ahead of each message in a batch frame.
+pub(super) const MESSAGE_HEADER: usize = 12;
+/// Messages in one batch frame. A frame closes at this many, when the next
+/// message would pass the lane's frame limit, or when the queue is empty
+/// after the writer yielded once for more, which it does only within
+/// `FLUSH_WINDOW` of the first message. The writer never sleeps on an empty
+/// queue: tokio timers round up to the next millisecond, which cost every
+/// message about that much.
+pub(super) const BATCH_MESSAGES: usize = 256;
+const FLUSH_WINDOW: Duration = Duration::from_millis(1);
+/// A reply batch stops growing past this size.
+pub(super) const REPLY_BATCH_BYTES: usize = 1024 * 1024;
+
+/// A frame under construction, with room for its length.
+pub(super) fn batch_frame() -> Vec<u8> {
+    vec![0; 4]
+}
+
+/// Fills in the length of a frame from `batch_frame` and returns its bytes.
+pub(super) fn seal_frame(frame: &mut [u8]) -> &[u8] {
+    let size = (frame.len() - 4) as u32;
+    frame[..4].copy_from_slice(&size.to_be_bytes());
+    frame
+}
+
+fn push_message(frame: &mut Vec<u8>, id: u64, message: &[u8]) {
+    frame.extend_from_slice(&id.to_be_bytes());
+    frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    frame.extend_from_slice(message);
+}
+
+pub(super) fn push_reply(frame: &mut Vec<u8>, id: u64, reply: &Result<Vec<u8>, String>) {
+    let (status, bytes) = match reply {
+        Ok(bytes) => (0, bytes.as_slice()),
+        Err(text) => (1, text.as_bytes()),
+    };
+    frame.extend_from_slice(&id.to_be_bytes());
+    frame.push(status);
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(bytes);
+}
+
+fn take<'a>(body: &mut &'a [u8], count: usize) -> io::Result<&'a [u8]> {
+    if body.len() < count {
+        return Err(invalid("truncated peer batch"));
+    }
+    let (head, rest) = body.split_at(count);
+    *body = rest;
+    Ok(head)
+}
+
+fn take_u32(body: &mut &[u8]) -> io::Result<usize> {
+    Ok(u32::from_be_bytes(take(body, 4)?.try_into().unwrap()) as usize)
+}
+
+fn take_u64(body: &mut &[u8]) -> io::Result<u64> {
+    Ok(u64::from_be_bytes(take(body, 8)?.try_into().unwrap()))
+}
+
+/// Splits a batch frame body into its messages.
+pub(super) fn messages(mut body: &[u8]) -> io::Result<Vec<(u64, &[u8])>> {
+    let mut messages = Vec::new();
+    while !body.is_empty() {
+        if messages.len() == BATCH_MESSAGES {
+            return Err(invalid("too many messages in a peer batch"));
+        }
+        let id = take_u64(&mut body)?;
+        let size = take_u32(&mut body)?;
+        messages.push((id, take(&mut body, size)?));
+    }
+    Ok(messages)
+}
+
+fn replies(mut body: &[u8]) -> io::Result<Vec<(u64, Result<&[u8], &[u8]>)>> {
+    let mut replies = Vec::new();
+    while !body.is_empty() {
+        let id = take_u64(&mut body)?;
+        let status = take(&mut body, 1)?[0];
+        let size = take_u32(&mut body)?;
+        let bytes = take(&mut body, size)?;
+        replies.push((
+            id,
+            match status {
+                0 => Ok(bytes),
+                1 => Err(bytes),
+                _ => return Err(invalid("invalid peer reply status")),
+            },
+        ));
+    }
+    Ok(replies)
 }
 
 #[derive(Clone)]
@@ -445,15 +560,227 @@ struct Connections {
     tls: TlsConnector,
     keepers: Keepers,
     idle: Mutex<HashMap<uuid::Uuid, Vec<Channel>>>,
-    /// In-flight requests per target on a peer lane. A receiver admits at
-    /// most `PEER_IN_FLIGHT` frames from one sender, so more connections
-    /// would only be refused; requests past it queue here instead.
-    in_flight: Mutex<HashMap<uuid::Uuid, Arc<tokio::sync::Semaphore>>>,
+    /// In-flight snapshot chunks per target on the bulk lane.
+    in_flight: Mutex<HashMap<uuid::Uuid, Arc<Semaphore>>>,
+    /// The multiplexed channel to each target on the control and
+    /// replication lanes.
+    channels: Mutex<HashMap<uuid::Uuid, Arc<PeerChannel>>>,
+    /// Batch frames written on multiplexed channels.
+    frames: AtomicU64,
     lane: Lane,
+    /// Replaces the TLS connection to every target in unit tests.
+    #[cfg(test)]
+    dial: Mutex<Option<Arc<dyn Fn() -> tokio::io::DuplexStream + Send + Sync>>>,
 }
 
 const PEER_IN_FLIGHT: usize = 16;
 const POOLED_CHANNELS: usize = 16;
+/// A multiplexed channel with nothing in flight closes after this long,
+/// before the receiver's 60 s idle limit can race a new message.
+const CHANNEL_IDLE: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// One long-lived connection to a target on a multiplexed lane, opened on
+/// first use and again after it fails. Each sender keeps at most the
+/// receiver's per-sender share of messages in flight and queues the rest.
+struct PeerChannel {
+    permits: Arc<Semaphore>,
+    queue: Mutex<Option<mpsc::UnboundedSender<Outgoing>>>,
+}
+
+/// A message on its way to the writer. Its permit is held until the reply
+/// arrives or the connection fails, even if the caller gave up, so the
+/// sender never exceeds the receiver's share.
+struct Outgoing {
+    message: Vec<u8>,
+    permit: OwnedSemaphorePermit,
+    reply: oneshot::Sender<Answer>,
+}
+
+enum Answer {
+    Reply(Vec<u8>),
+    Failed(io::Error),
+    /// The connection closed before writing the message, so a fresh one may
+    /// send it.
+    NotSent(Vec<u8>, OwnedSemaphorePermit),
+}
+
+type Waiting = Mutex<HashMap<u64, (oneshot::Sender<Answer>, OwnedSemaphorePermit)>>;
+
+fn closed() -> io::Error {
+    io::Error::new(io::ErrorKind::ConnectionAborted, "peer connection closed")
+}
+
+impl Connections {
+    async fn connect(
+        &self,
+        target: uuid::Uuid,
+        address: &std::net::SocketAddr,
+    ) -> io::Result<Channel> {
+        let (peer, channel) =
+            connect_protocol(&self.tls, &address.to_string(), self.lane.alpn()).await?;
+        if peer.0 != target.as_u128() {
+            return Err(invalid("keeper certificate does not match route"));
+        }
+        Ok(channel)
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        target: uuid::Uuid,
+        address: std::net::SocketAddr,
+        queue: mpsc::UnboundedReceiver<Outgoing>,
+    ) {
+        #[cfg(test)]
+        let dial = self.dial.lock().clone();
+        #[cfg(test)]
+        if let Some(dial) = dial {
+            return self.drive(Ok(dial()), queue).await;
+        }
+        let connected = timeout(CONNECT_TIMEOUT, self.connect(target, &address))
+            .await
+            .unwrap_or_else(|elapsed| Err(elapsed.into()));
+        self.drive(connected, queue).await
+    }
+
+    /// Runs one multiplexed connection until it fails or idles out. Written
+    /// messages then fail and unwritten ones are handed back unsent.
+    async fn drive<S: AsyncRead + AsyncWrite>(
+        &self,
+        connected: io::Result<S>,
+        mut queue: mpsc::UnboundedReceiver<Outgoing>,
+    ) {
+        let waiting = Waiting::default();
+        let mut carry = None;
+        let refused = match connected {
+            Err(error) => Some(error),
+            Ok(channel) => {
+                let (read, write) = tokio::io::split(channel);
+                tokio::select! {
+                    _ = self.write_batches(write, &mut queue, &mut carry, &waiting) => {}
+                    _ = read_replies(read, &waiting) => {}
+                }
+                None
+            }
+        };
+        queue.close();
+        for (_, (reply, _)) in waiting.lock().drain() {
+            let _ = reply.send(Answer::Failed(closed()));
+        }
+        let unsent = carry
+            .into_iter()
+            .chain(std::iter::from_fn(|| queue.try_recv().ok()));
+        for outgoing in unsent {
+            let answer = match &refused {
+                Some(error) => Answer::Failed(io::Error::new(error.kind(), error.to_string())),
+                None => Answer::NotSent(outgoing.message, outgoing.permit),
+            };
+            let _ = outgoing.reply.send(answer);
+        }
+    }
+
+    async fn write_batches(
+        &self,
+        mut write: WriteHalf<impl AsyncWrite>,
+        queue: &mut mpsc::UnboundedReceiver<Outgoing>,
+        carry: &mut Option<Outgoing>,
+        waiting: &Waiting,
+    ) -> io::Result<()> {
+        let limit = self.lane.frame_limit() as usize + 4;
+        let mut next = 0u64;
+        loop {
+            let first = match carry.take() {
+                Some(outgoing) => outgoing,
+                None => match timeout(CHANNEL_IDLE, queue.recv()).await {
+                    Ok(Some(outgoing)) => outgoing,
+                    Ok(None) => return Ok(()),
+                    Err(_) if waiting.lock().is_empty() => return Ok(()),
+                    Err(_) => continue,
+                },
+            };
+            let window = Instant::now() + FLUSH_WINDOW;
+            let mut frame = batch_frame();
+            let mut count = 0;
+            let mut pending = Some(first);
+            let mut yielded = false;
+            loop {
+                let outgoing = match pending.take() {
+                    Some(outgoing) => outgoing,
+                    None => match queue.try_recv() {
+                        Ok(outgoing) => outgoing,
+                        // Tasks woken together, such as the heartbeats of
+                        // many streams, queue while the writer yields once.
+                        Err(mpsc::error::TryRecvError::Empty)
+                            if !yielded && Instant::now() < window =>
+                        {
+                            yielded = true;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Err(_) => break,
+                    },
+                };
+                // A caller that gave up before the write needs no message.
+                if outgoing.reply.is_closed() {
+                    continue;
+                }
+                if count > 0 && frame.len() + MESSAGE_HEADER + outgoing.message.len() > limit {
+                    *carry = Some(outgoing);
+                    break;
+                }
+                push_message(&mut frame, next, &outgoing.message);
+                waiting
+                    .lock()
+                    .insert(next, (outgoing.reply, outgoing.permit));
+                next += 1;
+                count += 1;
+                if count == BATCH_MESSAGES {
+                    break;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            write.write_all(seal_frame(&mut frame)).await?;
+            write.flush().await?;
+            self.frames.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+async fn read_replies(mut read: ReadHalf<impl AsyncRead>, waiting: &Waiting) -> io::Result<()> {
+    loop {
+        let size = receive_size(&mut read, MAX_MESSAGE).await?;
+        let mut body = vec![0; size];
+        read.read_exact(&mut body).await?;
+        let replies = replies(&body)?;
+        let mut waiting = waiting.lock();
+        for (id, reply) in replies {
+            // A caller that timed out drops its late reply here.
+            if let Some((sender, _permit)) = waiting.remove(&id) {
+                let _ = sender.send(match reply {
+                    Ok(bytes) => Answer::Reply(bytes.to_vec()),
+                    Err(text) => {
+                        Answer::Failed(io::Error::other(String::from_utf8_lossy(text).into_owned()))
+                    }
+                });
+            }
+        }
+    }
+}
+
+impl PeerChannel {
+    fn new(lane: Lane) -> Self {
+        let share = match lane {
+            Lane::Replication => decisions::SENDER_FRAMES,
+            _ => decisions::CONTROL_PER_SENDER,
+        };
+        Self {
+            permits: Arc::new(Semaphore::new(share)),
+            queue: Mutex::default(),
+        }
+    }
+}
 
 impl Rpc {
     pub fn new(tls: TlsConnector, keepers: Keepers, lane: Lane) -> Self {
@@ -463,7 +790,11 @@ impl Rpc {
                 keepers,
                 idle: Mutex::default(),
                 in_flight: Mutex::default(),
+                channels: Mutex::default(),
+                frames: AtomicU64::new(0),
                 lane,
+                #[cfg(test)]
+                dial: Mutex::default(),
             }),
         }
     }
@@ -481,6 +812,12 @@ impl Rpc {
         timeout(deadline, self.exchange(target, request)).await?
     }
 
+    /// Batch frames this client has written on multiplexed channels.
+    #[cfg(test)]
+    pub fn frames(&self) -> u64 {
+        self.inner.frames.load(Ordering::Relaxed)
+    }
+
     async fn exchange<T: DeserializeOwned>(
         &self,
         target: uuid::Uuid,
@@ -490,6 +827,9 @@ impl Rpc {
             .keepers()
             .get(&target)
             .ok_or_else(|| invalid("unknown keeper"))?;
+        if matches!(self.inner.lane, Lane::Control | Lane::Replication) {
+            return decode(&self.multiplexed(target, *address, &request).await?);
+        }
         let peer_lane = self.inner.lane != Lane::Application;
         let _permit = if peer_lane {
             let permits = self
@@ -497,7 +837,7 @@ impl Rpc {
                 .in_flight
                 .lock()
                 .entry(target)
-                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(PEER_IN_FLIGHT)))
+                .or_insert_with(|| Arc::new(Semaphore::new(PEER_IN_FLIGHT)))
                 .clone();
             Some(permits.acquire_owned().await.map_err(io::Error::other)?)
         } else {
@@ -530,16 +870,65 @@ impl Rpc {
         target: uuid::Uuid,
         address: &std::net::SocketAddr,
     ) -> io::Result<Channel> {
-        let (peer, channel) = connect_protocol(
-            &self.inner.tls,
-            &address.to_string(),
-            self.inner.lane.alpn(),
-        )
-        .await?;
-        if peer.0 != target.as_u128() {
-            return Err(invalid("keeper certificate does not match route"));
+        self.inner.connect(target, address).await
+    }
+
+    /// Sends one message on the target's multiplexed channel and waits for
+    /// its reply. A message the connection closed before writing goes once
+    /// more on a fresh connection.
+    async fn multiplexed(
+        &self,
+        target: uuid::Uuid,
+        address: std::net::SocketAddr,
+        request: &Frame,
+    ) -> io::Result<Vec<u8>> {
+        let mut message = encode(request)?;
+        if (message.len() + MESSAGE_HEADER) as u64 > self.inner.lane.frame_limit() {
+            return Err(invalid("peer message exceeds its lane"));
         }
-        Ok(channel)
+        let channel = self
+            .inner
+            .channels
+            .lock()
+            .entry(target)
+            .or_insert_with(|| Arc::new(PeerChannel::new(self.inner.lane)))
+            .clone();
+        let mut permit = channel
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(io::Error::other)?;
+        for _ in 0..2 {
+            let (reply, answer) = oneshot::channel();
+            let outgoing = Outgoing {
+                message,
+                permit,
+                reply,
+            };
+            {
+                let mut queue = channel.queue.lock();
+                if queue.as_ref().is_none_or(mpsc::UnboundedSender::is_closed) {
+                    let (sender, receiver) = mpsc::unbounded_channel();
+                    tokio::spawn(self.inner.clone().run(target, address, receiver));
+                    *queue = Some(sender);
+                }
+                if let Err(mpsc::error::SendError(outgoing)) =
+                    queue.as_ref().expect("open channel").send(outgoing)
+                {
+                    queue.take();
+                    (message, permit) = (outgoing.message, outgoing.permit);
+                    continue;
+                }
+            }
+            match answer.await {
+                Ok(Answer::Reply(reply)) => return Ok(reply),
+                Ok(Answer::Failed(error)) => return Err(error),
+                Ok(Answer::NotSent(unsent, held)) => (message, permit) = (unsent, held),
+                Err(_) => return Err(closed()),
+            }
+        }
+        Err(closed())
     }
 
     async fn round_trip<T: DeserializeOwned>(
@@ -714,7 +1103,7 @@ impl RaftNetworkV2<RaftTypes> for Peer {
             let fit = options()
                 .serialized_size(&frame)
                 .map_err(|error| unreachable(&error).into())
-                .and_then(|size| fit_append(lane, size, count));
+                .and_then(|size| fit_append(lane, size + MESSAGE_HEADER as u64, count));
             match fit {
                 Ok(None) => (),
                 Ok(Some(hint)) => {
@@ -957,6 +1346,168 @@ mod tests {
             fit_append(Lane::Replication, limit + 1, 1),
             Err(RPCError::Unreachable(_))
         ));
+    }
+
+    /// How the fake receiver answers a message carrying `n`.
+    #[derive(Clone, Copy)]
+    enum Answering {
+        At(Duration),
+        Fail,
+        Close,
+    }
+
+    /// A control-lane client whose connections reach an in-process fake
+    /// receiver. Each message is a client `Head(n)` and is answered with `n`,
+    /// after the delay `policy` picks, with every batch answered in reverse.
+    fn muxed(
+        policy: impl Fn(u128, usize) -> Answering + Send + Sync + 'static,
+    ) -> (Rpc, uuid::Uuid, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio_rustls::rustls::{ClientConfig, RootCertStore, crypto::ring};
+        let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(RootCertStore::empty())
+            .with_no_client_auth();
+        let target = uuid::Uuid::from_u128(2);
+        let keepers = Keepers::from([(target, "127.0.0.1:1".parse().unwrap())]);
+        let rpc = Rpc::new(TlsConnector::from(Arc::new(config)), keepers, Lane::Control);
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let policy = Arc::new(policy);
+        *rpc.inner.dial.lock() = Some(Arc::new({
+            let dials = dials.clone();
+            move || {
+                let dial = dials.fetch_add(1, Ordering::Relaxed);
+                let (client, server) = tokio::io::duplex(1 << 20);
+                tokio::spawn(fake_receiver(server, dial, policy.clone()));
+                client
+            }
+        }));
+        (rpc, target, dials)
+    }
+
+    async fn fake_receiver(
+        channel: tokio::io::DuplexStream,
+        dial: usize,
+        policy: Arc<dyn Fn(u128, usize) -> Answering + Send + Sync>,
+    ) {
+        let (mut read, write) = tokio::io::split(channel);
+        let write = Arc::new(tokio::sync::Mutex::new(write));
+        loop {
+            let Ok(size) = receive_size(&mut read, Lane::Control.frame_limit()).await else {
+                return;
+            };
+            let mut body = vec![0; size];
+            if read.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            for (id, message) in messages(&body).unwrap().into_iter().rev() {
+                let Frame::Client(Request::Head(StreamId(n))) = decode(message).unwrap() else {
+                    panic!("unexpected message");
+                };
+                let (delay, reply) = match policy(n, dial) {
+                    Answering::Close => return,
+                    Answering::Fail => (Duration::ZERO, Err("refused".to_owned())),
+                    Answering::At(delay) => (delay, Ok(encode(&n).unwrap())),
+                };
+                let write = write.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let mut frame = batch_frame();
+                    push_reply(&mut frame, id, &reply);
+                    let _ = write.lock().await.write_all(seal_frame(&mut frame)).await;
+                });
+            }
+        }
+    }
+
+    async fn head(rpc: &Rpc, target: uuid::Uuid, n: u128, deadline: Duration) -> io::Result<u128> {
+        rpc.call(target, Frame::Client(Request::Head(StreamId(n))), deadline)
+            .await
+    }
+
+    #[tokio::test]
+    async fn concurrent_messages_share_one_connection_and_frame_and_match_their_ids() {
+        let (rpc, target, dials) = muxed(|_, _| Answering::At(Duration::ZERO));
+        let count = decisions::CONTROL_PER_SENDER as u128;
+        let replies = futures::future::join_all(
+            (0..count).map(|n| head(&rpc, target, n, Duration::from_secs(5))),
+        )
+        .await;
+        for (n, reply) in replies.into_iter().enumerate() {
+            assert_eq!(reply.unwrap(), n as u128);
+        }
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+        // Messages queued together, such as heartbeats, travel in one frame.
+        assert_eq!(rpc.frames(), 1);
+        // A failure answers only its own message.
+        let (rpc, target, _) = muxed(|n, _| {
+            if n == 3 {
+                Answering::Fail
+            } else {
+                Answering::At(Duration::ZERO)
+            }
+        });
+        let replies = futures::future::join_all(
+            (0..8).map(|n| head(&rpc, target, n, Duration::from_secs(5))),
+        )
+        .await;
+        for (n, reply) in replies.into_iter().enumerate() {
+            assert_eq!(reply.is_err(), n == 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_reply_holds_back_no_other_message_and_a_late_one_is_dropped() {
+        let (rpc, target, dials) = muxed(|n, _| match n {
+            0 => Answering::At(Duration::from_millis(300)),
+            _ => Answering::At(Duration::ZERO),
+        });
+        let started = tokio::time::Instant::now();
+        let slow = head(&rpc, target, 0, Duration::from_millis(100));
+        let quick = futures::future::join_all(
+            (1..=8).map(|n| head(&rpc, target, n, Duration::from_secs(5))),
+        );
+        let (slow, quick) = tokio::join!(slow, quick);
+        assert_eq!(slow.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(quick.into_iter().all(|reply| reply.is_ok()));
+        // The quick replies were not queued behind the slow one.
+        assert!(started.elapsed() < Duration::from_millis(250));
+        // The late reply finds no caller and the channel keeps serving.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            head(&rpc, target, 9, Duration::from_secs(5)).await.unwrap(),
+            9
+        );
+        assert_eq!(dials.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            rpc.inner.channels.lock()[&target]
+                .permits
+                .available_permits(),
+            decisions::CONTROL_PER_SENDER
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_fails_its_waiters_and_the_next_call_reconnects() {
+        let (rpc, target, dials) = muxed(|n, dial| match (n, dial) {
+            (0, 0) => Answering::Close,
+            _ => Answering::At(Duration::from_millis(50)),
+        });
+        let waiting = futures::future::join_all(
+            (0..4).map(|n| head(&rpc, target, 3 - n, Duration::from_secs(5))),
+        )
+        .await;
+        // The receiver closed before answering any message of the batch.
+        assert!(waiting.iter().all(|reply| {
+            reply
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::ConnectionAborted)
+        }));
+        assert_eq!(
+            head(&rpc, target, 5, Duration::from_secs(5)).await.unwrap(),
+            5
+        );
+        assert_eq!(dials.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

@@ -9,9 +9,9 @@ use openraft::{
     raft::{AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse},
 };
 use tokio::{
-    io::{AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinSet,
     time::{Instant, sleep_until, timeout},
 };
@@ -22,7 +22,7 @@ use uuid::Uuid;
 use super::admission::{Charge, Control};
 use super::{Command, Engine, Group, Identity, Lane, SNAPSHOT_CHUNK_BYTES, invalid, transport};
 use crate::stream::consensus::{
-    MAX_MESSAGE, MAX_RECORD, RaftTypes, SnapshotMeta, Vote,
+    Genesis, MAX_MESSAGE, MAX_RECORD, NodeId, RaftTypes, SnapshotMeta, Vote, decode, encode,
     network::{self, AppendReply, ChunkReply, Frame, PeerRequest, SnapshotChunk, SnapshotMismatch},
     storage::{Admission, MAX_TRANSFER_FILE, SnapshotFile},
 };
@@ -212,13 +212,13 @@ impl Engine {
     }
 
     async fn connection(
-        &self,
+        self: &Arc<Self>,
         socket: TcpStream,
         acceptor: TlsAcceptor,
         lane: Lane,
         pending: OwnedSemaphorePermit,
         connections: Arc<Semaphore>,
-        control: &Control,
+        control: &Arc<Control>,
     ) -> io::Result<()> {
         socket.set_nodelay(true)?;
         let mut channel = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(socket)).await??;
@@ -246,50 +246,22 @@ impl Engine {
         {
             return Err(invalid("invalid consensus channel identity"));
         }
-        let _connection = match lane {
-            Lane::Application | Lane::Bulk => Some(
-                connections
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| io::Error::other("consensus lane is full"))?,
-            ),
-            Lane::Control | Lane::Replication => None,
-        };
-        let _replication_socket = match (lane, &identity) {
-            (Lane::Replication, Identity::Keeper(sender)) => {
-                Some(self.replication_ingress.socket(*sender)?)
-            }
-            _ => None,
-        };
+        if let (Lane::Control | Lane::Replication, Identity::Keeper(sender)) = (lane, &identity) {
+            drop(pending);
+            return self.multiplexed(channel, lane, *sender, control).await;
+        }
+        let _connection = connections
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| io::Error::other("consensus lane is full"))?;
         drop(pending);
         loop {
             self.require_media()?;
-            let header = timeout(
+            let size = timeout(
                 CONNECTION_TIMEOUT,
                 network::receive_size(&mut channel, lane.frame_limit()),
-            );
-            let size = if lane == Lane::Control {
-                let idle = control.wait_for_header();
-                tokio::select! {
-                    biased;
-                    _ = idle.cancelled.cancelled() => return Ok(()),
-                    header = header => header??,
-                }
-            } else {
-                header.await??
-            };
-            let _control = match (lane, &identity) {
-                (Lane::Control, Identity::Keeper(sender)) => {
-                    Some(control.admit_waiting(*sender).await?)
-                }
-                _ => None,
-            };
-            let body = match (lane, &identity) {
-                (Lane::Replication, Identity::Keeper(sender)) => {
-                    Some(self.replication_ingress.body(*sender, size)?)
-                }
-                _ => None,
-            };
+            )
+            .await??;
             let frame = timeout(
                 CONNECTION_TIMEOUT,
                 network::receive_body(&mut channel, size),
@@ -301,152 +273,266 @@ impl Engine {
                     self.require_media()?;
                     timeout(CONNECTION_TIMEOUT, network::send(&mut channel, &reply)).await??;
                 }
-                Frame::Peer(genesis, request) if lane != Lane::Application => {
+                Frame::Peer(genesis, request) if lane == Lane::Bulk => {
                     let Identity::Keeper(sender) = identity else {
                         return Err(invalid("application certificate used for consensus"));
                     };
-                    if request.lane() != lane {
-                        return Err(invalid("peer request used the wrong lane"));
-                    }
-                    if request.sender() != Some(sender) || !self.placement.genesis(&genesis) {
-                        return Err(invalid("invalid consensus sender or stream genesis"));
-                    }
-                    if self.deleted.read().contains(&genesis.stream) {
-                        return Err(invalid("stream is deleted"));
-                    }
-                    if self.parked.read().contains(&genesis.stream) {
-                        // An empty heartbeat or a repeated park leaves the
-                        // stream parked; anything else reopens it.
-                        match &request {
-                            PeerRequest::Append(append) if append.entries.is_empty() => {
-                                timeout(
-                                    CONNECTION_TIMEOUT,
-                                    network::send(&mut channel, &AppendReply::Busy),
-                                )
-                                .await??;
-                                continue;
-                            }
-                            PeerRequest::Park { .. } => {
-                                timeout(CONNECTION_TIMEOUT, network::send(&mut channel, &true))
-                                    .await??;
-                                continue;
-                            }
-                            _ => {
-                                if self.parked.write().remove(&genesis.stream) {
-                                    super::super::metrics::count(
-                                        &super::super::metrics::COUNTERS.unparked_by_peer,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    let group = self.group(genesis).await?;
-                    group.require_healthy()?;
-                    match request {
-                        PeerRequest::Append(request) => {
-                            #[cfg(test)]
-                            if self.reject_append.read().as_ref().is_some_and(|reject| {
-                                reject(group.genesis.stream, sender, &request)
-                            }) {
-                                return Err(io::Error::other("injected append loss"));
-                            }
-                            self.check_entries(&group, &request)?;
-                            *group.heard.lock() = tokio::time::Instant::now();
-                            let reply = self.append(group.clone(), request, body).await?;
-                            #[cfg(test)]
-                            if matches!(reply, AppendReply::Busy) {
-                                self.busy_replies
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                            if !matches!(reply, AppendReply::Raft(Err(_))) {
-                                group.require_healthy()?;
-                            }
-                            timeout(CONNECTION_TIMEOUT, network::send(&mut channel, &reply))
-                                .await??;
-                        }
-                        request @ (PeerRequest::Vote(_)
-                        | PeerRequest::PreVote(_)
-                        | PeerRequest::TransferLeader(_)
-                        | PeerRequest::Park { .. }) => {
-                            if !self.disk.installed(group.genesis.stream) {
-                                return Err(invalid("staged replica cannot vote"));
-                            }
-                            let eligible = {
-                                let metrics = group.raft.server_metrics();
-                                let current = metrics.borrow_watched();
-                                let membership = current.membership_config.membership();
-                                if membership.get_joint_config().is_empty() {
-                                    group.genesis.voters.contains(&self.id)
-                                } else {
-                                    membership.voter_ids().any(|id| id == self.id.as_u128())
-                                }
-                            };
-                            if !eligible {
-                                return Err(invalid("vote is outside the effective placement"));
-                            }
-                            match request {
-                                PeerRequest::Vote(request) => {
-                                    let reply = group.raft.vote(request).await;
-                                    group.require_healthy()?;
-                                    timeout(
-                                        CONNECTION_TIMEOUT,
-                                        network::send(&mut channel, &reply),
-                                    )
-                                    .await??;
-                                }
-                                PeerRequest::PreVote(request) => {
-                                    let reply = group.raft.pre_vote(request).await;
-                                    group.require_healthy()?;
-                                    timeout(
-                                        CONNECTION_TIMEOUT,
-                                        network::send(&mut channel, &reply),
-                                    )
-                                    .await??;
-                                }
-                                PeerRequest::Park { vote, last } => {
-                                    let parked = self.accept_park(&group, vote, last).await;
-                                    timeout(
-                                        CONNECTION_TIMEOUT,
-                                        network::send(&mut channel, &parked),
-                                    )
-                                    .await??;
-                                }
-                                PeerRequest::TransferLeader(request) => {
-                                    *group.handoff.lock() = Some(tokio::time::Instant::now());
-                                    let reply = group.raft.handle_transfer_leader(request).await;
-                                    group.require_healthy()?;
-                                    timeout(
-                                        CONNECTION_TIMEOUT,
-                                        network::send(&mut channel, &reply),
-                                    )
-                                    .await??;
-                                }
-                                _ => unreachable!("matched a vote-class request"),
-                            }
-                        }
-                        PeerRequest::Snapshot(request, digest) => {
-                            let data = request.data.len() as u64;
-                            let capacity = group
-                                .genesis
-                                .quota_bytes
-                                .saturating_mul(9)
-                                .saturating_add(MAX_MESSAGE);
-                            if data > SNAPSHOT_CHUNK_BYTES
-                                || request
-                                    .offset
-                                    .checked_add(data)
-                                    .is_none_or(|end| end > capacity.min(MAX_TRANSFER_FILE))
-                            {
-                                return Err(invalid("invalid consensus snapshot chunk range"));
-                            }
-                            let response = group.receive_chunk(request, digest).await?;
-                            group.require_healthy()?;
-                            timeout(CONNECTION_TIMEOUT, network::send(&mut channel, &response))
-                                .await??;
-                        }
-                    }
+                    check_peer(lane, sender, &request)?;
+                    let reply = self.peer(sender, genesis, request, None).await?;
+                    timeout(
+                        CONNECTION_TIMEOUT,
+                        network::send_encoded(&mut channel, &reply),
+                    )
+                    .await??;
                 }
                 _ => return Err(invalid("request used the wrong lane")),
+            }
+        }
+    }
+
+    /// Serves one multiplexed peer connection. Each batch frame is split
+    /// into messages, each message is admitted on its own and runs
+    /// concurrently with the others, and replies go back in batch frames as
+    /// they finish. A message the sender may not send on this lane or as
+    /// this keeper closes the connection; any other failure answers only
+    /// its own message.
+    async fn multiplexed(
+        self: &Arc<Self>,
+        channel: tokio_rustls::server::TlsStream<TcpStream>,
+        lane: Lane,
+        sender: NodeId,
+        control: &Arc<Control>,
+    ) -> io::Result<()> {
+        let (mut read, mut write) = tokio::io::split(channel);
+        let (answers, mut answered) = mpsc::unbounded_channel::<(u64, Result<Vec<u8>, String>)>();
+        let reading = async {
+            let mut work = JoinSet::new();
+            loop {
+                self.require_media()?;
+                let header = timeout(
+                    CONNECTION_TIMEOUT,
+                    network::receive_size(&mut read, lane.frame_limit()),
+                );
+                while work.try_join_next().is_some() {}
+                // A connection with messages in flight is not idle, so the
+                // idle limit never closes it under its own replies.
+                let size = if lane == Lane::Control && work.is_empty() {
+                    let idle = control.wait_for_header();
+                    tokio::select! {
+                        biased;
+                        _ = idle.cancelled.cancelled() => return Ok(()),
+                        header = header => header??,
+                    }
+                } else {
+                    header.await??
+                };
+                let read_charge = match lane {
+                    Lane::Replication => Some(
+                        timeout(
+                            CONNECTION_TIMEOUT,
+                            self.replication_ingress.read(sender, size),
+                        )
+                        .await?,
+                    ),
+                    _ => None,
+                };
+                let mut body = vec![0; size];
+                timeout(CONNECTION_TIMEOUT, read.read_exact(&mut body)).await??;
+                let mut batch = Vec::new();
+                for (id, message) in network::messages(&body)? {
+                    let Frame::Peer(genesis, request) = decode(message)? else {
+                        return Err(invalid("request used the wrong lane"));
+                    };
+                    check_peer(lane, sender, &request)?;
+                    batch.push((id, message.len(), genesis, request));
+                }
+                drop(body);
+                let mut charges = match read_charge {
+                    Some(read) => {
+                        let sizes = batch.iter().map(|(_, size, ..)| *size).collect::<Vec<_>>();
+                        self.replication_ingress.split(read, &sizes)
+                    }
+                    None => Vec::new(),
+                }
+                .into_iter();
+                for (id, _, genesis, request) in batch {
+                    let admitted = match lane {
+                        Lane::Replication => charges
+                            .next()
+                            .flatten()
+                            .map(|charge| (Some(charge), None))
+                            .ok_or_else(|| invalid("replication receiver is busy")),
+                        _ => control
+                            .admit_waiting(sender)
+                            .await
+                            .map(|work| (None, Some(work))),
+                    };
+                    let (body, admission) = match admitted {
+                        Ok(admitted) => admitted,
+                        Err(refused) => {
+                            let answer = match request {
+                                PeerRequest::Append(_) => encode(&AppendReply::Busy),
+                                _ => Err(refused),
+                            };
+                            let _ = answers.send((id, answer.map_err(|error| error.to_string())));
+                            continue;
+                        }
+                    };
+                    let (engine, answers) = (self.clone(), answers.clone());
+                    work.spawn(async move {
+                        let _admission = admission;
+                        let reply = engine.peer(sender, genesis, request, body).await;
+                        let _ = answers.send((id, reply.map_err(|error| error.to_string())));
+                    });
+                }
+            }
+        };
+        let writing = async {
+            while let Some((id, reply)) = answered.recv().await {
+                let mut frame = network::batch_frame();
+                network::push_reply(&mut frame, id, &reply);
+                for _ in 1..network::BATCH_MESSAGES {
+                    if frame.len() >= network::REPLY_BATCH_BYTES {
+                        break;
+                    }
+                    let Ok((id, reply)) = answered.try_recv() else {
+                        break;
+                    };
+                    network::push_reply(&mut frame, id, &reply);
+                }
+                self.require_media()?;
+                timeout(CONNECTION_TIMEOUT, async {
+                    write.write_all(network::seal_frame(&mut frame)).await?;
+                    write.flush().await
+                })
+                .await??;
+            }
+            Ok(())
+        };
+        tokio::select! {
+            result = reading => result,
+            result = writing => result,
+        }
+    }
+
+    /// Serves one decoded peer message and returns its encoded reply.
+    async fn peer(
+        &self,
+        #[cfg_attr(not(test), allow(unused_variables))] sender: NodeId,
+        genesis: Genesis,
+        request: PeerRequest,
+        body: Option<Charge>,
+    ) -> io::Result<Vec<u8>> {
+        if !self.placement.genesis(&genesis) {
+            return Err(invalid("invalid consensus sender or stream genesis"));
+        }
+        if self.deleted.read().contains(&genesis.stream) {
+            return Err(invalid("stream is deleted"));
+        }
+        if self.parked.read().contains(&genesis.stream) {
+            // An empty heartbeat or a repeated park leaves the stream
+            // parked; anything else reopens it.
+            match &request {
+                PeerRequest::Append(append) if append.entries.is_empty() => {
+                    return encode(&AppendReply::Busy);
+                }
+                PeerRequest::Park { .. } => return encode(&true),
+                _ => {
+                    if self.parked.write().remove(&genesis.stream) {
+                        super::super::metrics::count(
+                            &super::super::metrics::COUNTERS.unparked_by_peer,
+                        );
+                    }
+                }
+            }
+        }
+        let group = self.group(genesis).await?;
+        group.require_healthy()?;
+        match request {
+            PeerRequest::Append(request) => {
+                #[cfg(test)]
+                if self
+                    .reject_append
+                    .read()
+                    .as_ref()
+                    .is_some_and(|reject| reject(group.genesis.stream, sender, &request))
+                {
+                    return Err(io::Error::other("injected append loss"));
+                }
+                self.check_entries(&group, &request)?;
+                *group.heard.lock() = tokio::time::Instant::now();
+                let reply = self.append(group.clone(), request, body).await?;
+                #[cfg(test)]
+                if matches!(reply, AppendReply::Busy) {
+                    self.busy_replies
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                if !matches!(reply, AppendReply::Raft(Err(_))) {
+                    group.require_healthy()?;
+                }
+                encode(&reply)
+            }
+            request @ (PeerRequest::Vote(_)
+            | PeerRequest::PreVote(_)
+            | PeerRequest::TransferLeader(_)
+            | PeerRequest::Park { .. }) => {
+                if !self.disk.installed(group.genesis.stream) {
+                    return Err(invalid("staged replica cannot vote"));
+                }
+                let eligible = {
+                    let metrics = group.raft.server_metrics();
+                    let current = metrics.borrow_watched();
+                    let membership = current.membership_config.membership();
+                    if membership.get_joint_config().is_empty() {
+                        group.genesis.voters.contains(&self.id)
+                    } else {
+                        membership.voter_ids().any(|id| id == self.id.as_u128())
+                    }
+                };
+                if !eligible {
+                    return Err(invalid("vote is outside the effective placement"));
+                }
+                match request {
+                    PeerRequest::Vote(request) => {
+                        let reply = group.raft.vote(request).await;
+                        group.require_healthy()?;
+                        encode(&reply)
+                    }
+                    PeerRequest::PreVote(request) => {
+                        let reply = group.raft.pre_vote(request).await;
+                        group.require_healthy()?;
+                        encode(&reply)
+                    }
+                    PeerRequest::Park { vote, last } => {
+                        encode(&self.accept_park(&group, vote, last).await)
+                    }
+                    PeerRequest::TransferLeader(request) => {
+                        *group.handoff.lock() = Some(tokio::time::Instant::now());
+                        let reply = group.raft.handle_transfer_leader(request).await;
+                        group.require_healthy()?;
+                        encode(&reply)
+                    }
+                    _ => unreachable!("matched a vote-class request"),
+                }
+            }
+            PeerRequest::Snapshot(request, digest) => {
+                let data = request.data.len() as u64;
+                let capacity = group
+                    .genesis
+                    .quota_bytes
+                    .saturating_mul(9)
+                    .saturating_add(MAX_MESSAGE);
+                if data > SNAPSHOT_CHUNK_BYTES
+                    || request
+                        .offset
+                        .checked_add(data)
+                        .is_none_or(|end| end > capacity.min(MAX_TRANSFER_FILE))
+                {
+                    return Err(invalid("invalid consensus snapshot chunk range"));
+                }
+                let response = group.receive_chunk(request, digest).await?;
+                group.require_healthy()?;
+                encode(&response)
             }
         }
     }
@@ -532,6 +618,17 @@ impl Engine {
         .await
         .map_err(io::Error::other)
     }
+}
+
+/// A peer may send a message only on its own lane and only as itself.
+fn check_peer(lane: Lane, sender: NodeId, request: &PeerRequest) -> io::Result<()> {
+    if request.lane() != lane {
+        return Err(invalid("peer request used the wrong lane"));
+    }
+    if request.sender() != Some(sender) {
+        return Err(invalid("invalid consensus sender or stream genesis"));
+    }
+    Ok(())
 }
 
 fn raft_reply(

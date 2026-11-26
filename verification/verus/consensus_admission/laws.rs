@@ -70,16 +70,60 @@ fn one_sender_leaves_the_others_their_share(
     }
 }
 
-// Control work: one sender's cap leaves aggregate control work for others.
+// The frame share of the same theorem, where a frame is one peer message in
+// flight: an admitted message leaves the others at least
+// `RECEIVER_FRAMES - SENDER_FRAMES` slots minus what they already hold,
+// however many messages share a batch or a connection.
+fn one_sender_leaves_the_others_their_frames(
+    others: usize, sender_frames: usize, total_bytes: usize, sender_bytes: usize, size: usize,
+)
+    requires others as int + sender_frames as int <= usize::MAX as int,
+{
+    let charge = body_charge(size);
+    let total_frames = others + sender_frames;
+    if admits_body(total_frames, total_bytes, sender_frames, sender_bytes, charge) {
+        proof { limits(); }
+        assert(RECEIVER_FRAMES as int - (total_frames as int + 1)
+            >= RECEIVER_FRAMES as int - SENDER_FRAMES as int - others as int);
+        assert(RECEIVER_FRAMES - SENDER_FRAMES == 256);
+    }
+}
+
+// Releasing an admitted message restores its meter exactly, so a sender's
+// share and the receiver's budget return to what they were before.
+fn release_is_exact(
+    total_frames: usize, total_bytes: usize, sender_frames: usize, sender_bytes: usize, size: usize,
+) {
+    let charge = body_charge(size);
+    if admits_body(total_frames, total_bytes, sender_frames, sender_bytes, charge) {
+        proof { limits(); }
+        let (frames, bytes) = meter_admit(total_frames, total_bytes, charge);
+        let (from_frames, from_bytes) = meter_admit(sender_frames, sender_bytes, charge);
+        assert(frames <= RECEIVER_FRAMES && bytes <= RECEIVER_BYTES);
+        assert(from_frames <= SENDER_FRAMES && from_bytes <= SENDER_BYTES);
+        let (frames, bytes) = meter_release(frames, bytes, charge);
+        let (from_frames, from_bytes) = meter_release(from_frames, from_bytes, charge);
+        assert(frames == total_frames && bytes == total_bytes);
+        assert(from_frames == sender_frames && from_bytes == sender_bytes);
+    }
+}
+
+// Control work: one sender's cap leaves aggregate control work for others,
+// and releasing admitted work restores both counts.
 fn one_sender_leaves_control_work_for_others(total: usize, sender: usize)
     requires sender <= total,
 {
     if admits_control(total, sender) {
         assert(total + 1 <= MAX_CONTROL_WORK);
         assert(sender + 1 <= CONTROL_PER_SENDER);
+        let (work, _) = meter_admit(total, 0, 0);
+        let (from, _) = meter_admit(sender, 0, 0);
+        let (work, _) = meter_release(work, 0, 0);
+        let (from, _) = meter_release(from, 0, 0);
+        assert(work == total && from == sender);
     }
     proof { limits(); }
-    assert(MAX_CONTROL_WORK - CONTROL_PER_SENDER == 32);
+    assert(MAX_CONTROL_WORK - CONTROL_PER_SENDER == 256);
 }
 
 // PeerBudget.saturated_data_admits_control_and_maintenance and
