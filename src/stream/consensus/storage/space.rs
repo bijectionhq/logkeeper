@@ -192,6 +192,13 @@ impl Space {
         })
     }
 
+    /// Whether ordinary writes still have room above the ordinary floor,
+    /// with headroom for 64 MiB more.
+    pub fn accepts_streams(&self) -> bool {
+        let state = self.0.state.lock();
+        self.available(&state, 64 * MIB, ORDINARY_FLOOR).is_ok()
+    }
+
     fn available(&self, state: &Ledger, bytes: u64, floor: u64) -> io::Result<()> {
         if !fits(self.measured_space()?, state.pending, bytes, floor) {
             return Err(exhausted());

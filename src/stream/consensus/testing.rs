@@ -106,10 +106,10 @@ impl LocalCluster {
                 .iter()
                 .map(|id| {
                     let random = ring::rand::SystemRandom::new();
-                    let pkcs8 =
-                        Ed25519KeyPair::generate_pkcs8(&random).map_err(|_| io::Error::other("keeper key generation failed"))?;
-                    let key =
-                        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|_| io::Error::other("keeper key rejected"))?;
+                    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&random)
+                        .map_err(|_| io::Error::other("keeper key generation failed"))?;
+                    let key = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+                        .map_err(|_| io::Error::other("keeper key rejected"))?;
                     Ok((*id, Arc::new(key)))
                 })
                 .collect::<io::Result<BTreeMap<_, _>>>()?
@@ -161,6 +161,7 @@ impl LocalCluster {
                 writers: principals.clone(),
                 administrators: principals.clone(),
                 max_streams: 128,
+                repair_after_secs: 600,
                 timed_original: None,
                 timed_authority: keys.get(&id).map(|key| TimedAuthority {
                     verifier: verifier.clone(),

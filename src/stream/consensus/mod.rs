@@ -93,6 +93,21 @@ pub struct Sealed {
     pub head: Lsn,
 }
 
+/// What a keeper reports about itself to placement and repair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KeeperStatus {
+    pub keeper: uuid::Uuid,
+    /// Whether the keeper's media is healthy and has room for new streams.
+    pub accepting: bool,
+    /// Streams with an open group on the keeper.
+    pub streams: u32,
+    /// Streams the keeper currently leads.
+    pub led: u32,
+    /// For the stream asked about: whether the keeper holds a healthy
+    /// replica, a quarantined one, or none.
+    pub replica: Option<bool>,
+}
+
 /// The most recent finalized voter configuration of a stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Configuration {

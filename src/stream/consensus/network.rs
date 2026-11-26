@@ -162,6 +162,8 @@ pub(super) enum Request {
         stream: StreamId,
         at: Lsn,
     },
+    /// The keeper's own status, with its replica of `stream`.
+    KeeperStatus(StreamId),
 }
 
 impl Request {
@@ -179,6 +181,7 @@ impl Request {
             | Self::PlacementProof(stream)
             | Self::LocalCopy(stream)
             | Self::Delete(stream)
+            | Self::KeeperStatus(stream)
             | Self::Configuration(stream) => stream,
             Self::Stage(ref stage) => stage.stream,
             Self::Seal { stream, .. }
@@ -368,6 +371,7 @@ pub(super) enum Reply {
         configuration: Option<super::Configuration>,
         outcome: Outcome,
     },
+    Status(super::KeeperStatus),
 }
 
 #[derive(Clone, Serialize, Deserialize)]

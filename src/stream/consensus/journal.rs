@@ -299,13 +299,56 @@ impl ConsensusJournal {
             return Ok(None);
         };
         let current = self.client.configuration(stream).await?;
-        let Some(next) = assignment::next_roster(stream, current.voters, &eligible) else {
+        let health = self.health(stream, &eligible).await;
+        let view = assignment::View {
+            eligible: &eligible,
+            health: &health,
+        };
+        let Some(next) = assignment::repair_roster(stream, current.voters, &view) else {
             return Ok(None);
         };
         self.client
             .replace(stream, current.revision, next)
             .await
             .map(Some)
+    }
+
+    /// The status of every eligible keeper, asked concurrently. A keeper that
+    /// does not answer within 2 s counts as down.
+    async fn health(
+        &self,
+        stream: StreamId,
+        eligible: &Domains,
+    ) -> std::collections::BTreeMap<uuid::Uuid, assignment::Health> {
+        let asked = eligible.keys().map(|keeper| async move {
+            let status = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.client.keeper_status(*keeper, stream),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok);
+            (
+                *keeper,
+                assignment::Health {
+                    live: status.is_some(),
+                    accepting: status.is_some_and(|status| status.accepting),
+                    streams: status.map_or(0, |status| status.streams),
+                },
+            )
+        });
+        futures::future::join_all(asked).await.into_iter().collect()
+    }
+
+    /// The status `keeper` reports about itself, with its replica of
+    /// `stream`. Operators use it to see whether a draining keeper still
+    /// holds the stream.
+    pub async fn keeper_status(
+        &self,
+        keeper: uuid::Uuid,
+        stream: StreamId,
+    ) -> Result<super::KeeperStatus> {
+        self.client.keeper_status(keeper, stream).await
     }
 
     /// Commits a contiguous group in LSN order and returns its last LSN.
@@ -400,8 +443,38 @@ impl ConsensusJournal {
 impl Journal for ConsensusJournal {
     fn create(&self, stream: StreamId) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let voters = self.placement.read().voters(stream)?;
-            self.client.create(stream, voters, self.quota_bytes).await
+            let placement = self.placement.read().clone();
+            let Placement::Ranked { eligible } = placement else {
+                let voters = placement.voters(stream)?;
+                return self.client.create(stream, voters, self.quota_bytes).await;
+            };
+            // A retried or concurrent create reuses the catalog's genesis, so
+            // a changed keeper view never proposes a second one.
+            let voters = match self.client.claimed_voters(stream).await? {
+                Some(voters) => voters,
+                None => {
+                    let health = self.health(stream, &eligible).await;
+                    assignment::choose_balanced(
+                        stream,
+                        &assignment::View {
+                            eligible: &eligible,
+                            health: &health,
+                        },
+                    )
+                    .ok_or(JournalError::Unavailable)?
+                }
+            };
+            match self.client.create(stream, voters, self.quota_bytes).await {
+                Err(JournalError::Conflict { .. }) => {
+                    let voters = self
+                        .client
+                        .claimed_voters(stream)
+                        .await?
+                        .ok_or(JournalError::Unavailable)?;
+                    self.client.create(stream, voters, self.quota_bytes).await
+                }
+                result => result,
+            }
         })
     }
 

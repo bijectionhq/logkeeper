@@ -437,6 +437,24 @@ domain, replaces one other voter through `replace`, and returns the new
 configuration. Call it until it returns `None`. A keeper that is unreachable
 but still eligible is never replaced, because the quorum tolerates it.
 
+Every keeper answers `KeeperStatus`: whether its media is healthy with room
+for new streams, how many streams it hosts and leads, and whether it holds a
+healthy replica of a given stream. `ConsensusJournal::keeper_status` exposes
+it, for example to check that a draining keeper holds no stream. A placed
+create first asks the catalog for an existing genesis and reuses it; only a
+new stream is placed, skipping keepers that are down or full or carry more
+than a quarter above the average stream count, with a fallback to every
+accepting keeper. `reconcile_placement` also moves a voter off a full keeper.
+
+Each stream's leader repairs its own stream. A voter that has not
+acknowledged the leader for `repair_after_secs` (600 by default), and whose
+keeper does not answer or answers without a healthy replica, is replaced by
+the best-ranked live keeper with room in a free failure domain, through the
+same staged joint change as `replace`. Nothing moves unless two voters are
+live, and a keeper repairs at most one stream every 30 seconds. A stream
+that lost two voters has no quorum to change its membership and needs an
+operator.
+
 A keeper with `timed_original` in its configuration, in the stream keeper's
 mount format, holds installed keeper trust and, when signing, a commissioned
 clock and attestation key. `ConsensusJournal::with_timed_original` installs

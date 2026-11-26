@@ -119,6 +119,7 @@ impl Cluster {
                 writers: vec![OWNER.into(), OTHER.into()],
                 administrators: vec![OWNER.into()],
                 max_streams: default_max_streams(),
+                repair_after_secs: 2,
                 timed_original: None,
                 timed_authority: None,
             };
@@ -198,6 +199,11 @@ impl Cluster {
         })
         .await
         .unwrap()
+    }
+
+    async fn leader_after_head(&self, journal: &Client, stream: StreamId) -> Uuid {
+        assert!(journal.head(stream).await.is_ok());
+        self.leader(stream).await
     }
 
     async fn leader(&self, stream: StreamId) -> Uuid {
@@ -2480,6 +2486,43 @@ async fn a_gracefully_stopped_leader_hands_its_streams_to_a_voter() {
     })
     .await
     .expect("leadership moved during the graceful stop");
+    assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_leader_replaces_a_voter_whose_keeper_stays_down() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(52);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let initial = journal.configuration(stream).await.unwrap();
+    let leader = cluster.leader_after_head(&journal, stream).await;
+    let down = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    cluster.running.remove(&down).unwrap().stop().await;
+    // The test keepers repair after 2 s of silence. No client asks for it.
+    let repaired = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(configuration) = journal.configuration(stream).await
+                && configuration.revision > initial.revision
+                && !configuration.voters.contains(&down)
+            {
+                return configuration;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the leader replaced the down voter");
+    assert_eq!(
+        repaired
+            .voters
+            .iter()
+            .filter(|voter| initial.voters.contains(voter))
+            .count(),
+        2
+    );
     assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
     cluster.stop_all().await;
 }

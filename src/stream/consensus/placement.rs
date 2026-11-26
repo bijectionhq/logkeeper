@@ -23,6 +23,10 @@ impl Placement {
         Ok(Self(Arc::new(domains)))
     }
 
+    pub fn domains(&self) -> &Domains {
+        &self.0
+    }
+
     pub fn genesis(&self, genesis: &Genesis) -> bool {
         genesis.stream.0 != 0 && genesis.quota_bytes > 0 && self.roster(&genesis.voters)
     }

@@ -1,5 +1,6 @@
 mod admission;
 mod ingress;
+mod repair;
 mod replacement;
 mod replicas;
 #[cfg(test)]
@@ -60,6 +61,10 @@ fn default_max_streams() -> usize {
     128
 }
 
+fn default_repair_after_secs() -> u64 {
+    600
+}
+
 /// Installed, authenticated keeper inventory and local service settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -79,6 +84,9 @@ pub struct Config {
     pub administrators: Vec<String>,
     #[serde(default = "default_max_streams")]
     pub max_streams: usize,
+    /// How long a voter stays silent before its stream's leader replaces it.
+    #[serde(default = "default_repair_after_secs")]
+    pub repair_after_secs: u64,
     /// Installed timed-original trust and, on a signing keeper, its clock
     /// and attestation key, in the stream keeper's mount format.
     #[serde(default)]
@@ -267,6 +275,8 @@ impl Config {
             detached_pins: Default::default(),
             quarantined: parking_lot::RwLock::default(),
             max_streams: self.max_streams,
+            repair_after: Duration::from_secs(self.repair_after_secs),
+            led_since: parking_lot::Mutex::default(),
             groups: Mutex::default(),
             deletions: parking_lot::Mutex::default(),
             deleted: parking_lot::RwLock::default(),
@@ -309,6 +319,9 @@ struct Engine {
     detached_pins: parking_lot::Mutex<BTreeMap<(StreamId, u64), Weak<()>>>,
     quarantined: parking_lot::RwLock<HashSet<StreamId>>,
     max_streams: usize,
+    repair_after: Duration,
+    /// The term and time from which this keeper has led each stream.
+    led_since: parking_lot::Mutex<HashMap<StreamId, (u64, Instant)>>,
     groups: Mutex<BTreeMap<StreamId, Arc<Group>>>,
     deletions: parking_lot::Mutex<HashMap<StreamId, Instant>>,
     /// Deleted streams whose groups this keeper closed. Clients are answered
@@ -358,6 +371,11 @@ impl Engine {
                 }
             }
             self.disk.enable_reaping();
+            let repairing = self.clone();
+            sockets.spawn(async move {
+                repairing.repair_loop().await;
+                Ok(())
+            });
             tokio::spawn(super::metrics::report(
                 self.id,
                 Duration::from_secs(5),
@@ -662,6 +680,7 @@ impl Engine {
                 if matches!(
                     request,
                     Request::Locate(_)
+                        | Request::KeeperStatus(_)
                         | Request::PlacementProof(_)
                         | Request::StageReplica { .. }
                         | Request::InstallReplica { .. }
@@ -683,6 +702,7 @@ impl Engine {
                 let reader = self.readers.contains(uri);
                 let allowed = match request {
                     Request::Locate(_)
+                    | Request::KeeperStatus(_)
                     | Request::Head(_)
                     | Request::Configuration(_)
                     | Request::Read { .. }
@@ -713,6 +733,7 @@ impl Engine {
         let owner = self.authorize(identity, &request)?;
         let stream = request.stream();
         match request {
+            Request::KeeperStatus(stream) => Ok(Reply::Status(self.status(stream).await)),
             Request::LocalCopy(_) => Ok(self
                 .disk
                 .ownership(stream)

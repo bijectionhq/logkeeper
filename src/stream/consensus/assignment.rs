@@ -6,7 +6,7 @@
 //! create proposes the same genesis. When eligibility changes, a stream keeps
 //! every voter that is still eligible and replaces one other voter at a time.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use journal_contract::StreamId;
 use sha2::{Digest, Sha256};
@@ -35,6 +35,78 @@ fn sorted(mut voters: [Uuid; 3]) -> [Uuid; 3] {
     voters
 }
 
+/// What a placer knows about a keeper beyond its failure domain. A keeper with
+/// no entry counts as live, accepting, and carrying an average load.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Health {
+    /// False once the keeper has been unreachable past the repair delay, or
+    /// its replica is quarantined.
+    pub live: bool,
+    /// False when the keeper's disk is full or it takes no new streams.
+    pub accepting: bool,
+    /// Streams with an open group on the keeper.
+    pub streams: u32,
+}
+
+/// Eligible keepers with their domains and whatever health is known.
+pub struct View<'a> {
+    pub eligible: &'a Domains,
+    pub health: &'a BTreeMap<Uuid, Health>,
+}
+
+impl View<'_> {
+    fn live(&self, keeper: &Uuid) -> bool {
+        self.health.get(keeper).is_none_or(|health| health.live)
+    }
+
+    fn accepting(&self, keeper: &Uuid) -> bool {
+        self.health
+            .get(keeper)
+            .is_none_or(|health| health.live && health.accepting)
+    }
+
+    /// The stream count above which an eligible keeper takes no new voter:
+    /// a quarter above the eligible average, and at least one above it.
+    fn ceiling(&self) -> Option<u32> {
+        let known = self
+            .eligible
+            .keys()
+            .filter_map(|keeper| self.health.get(keeper))
+            .map(|health| u64::from(health.streams))
+            .collect::<Vec<_>>();
+        if known.is_empty() {
+            return None;
+        }
+        let average = known.iter().sum::<u64>().div_ceil(known.len() as u64);
+        Some((average + (average / 4).max(1)).min(u64::from(u32::MAX)) as u32)
+    }
+
+    fn roomy(&self, keeper: &Uuid, ceiling: Option<u32>) -> bool {
+        match (ceiling, self.health.get(keeper)) {
+            (Some(ceiling), Some(health)) => health.streams <= ceiling,
+            _ => true,
+        }
+    }
+
+    /// Eligible keepers that accept streams, first those under the load
+    /// ceiling and then, as a fallback, all of them.
+    fn tiers(&self) -> [Domains; 2] {
+        let ceiling = self.ceiling();
+        let accepting = self
+            .eligible
+            .iter()
+            .filter(|(keeper, _)| self.accepting(keeper))
+            .map(|(keeper, domain)| (*keeper, domain.clone()))
+            .collect::<Domains>();
+        let roomy = accepting
+            .iter()
+            .filter(|(keeper, _)| self.roomy(keeper, ceiling))
+            .map(|(keeper, domain)| (*keeper, domain.clone()))
+            .collect();
+        [roomy, accepting]
+    }
+}
+
 /// The best-ranked roster of three eligible keepers in distinct domains, or
 /// `None` when the eligible keepers span fewer than three domains.
 pub fn choose(stream: StreamId, eligible: &Domains) -> Option<[Uuid; 3]> {
@@ -51,25 +123,57 @@ pub fn choose(stream: StreamId, eligible: &Domains) -> Option<[Uuid; 3]> {
     None
 }
 
+/// Like `choose`, but skips keepers that are down, full or loaded more than
+/// a quarter above the eligible average. Falls back to every accepting
+/// keeper when that leaves fewer than three domains. Two placers with
+/// different views may choose different rosters; the catalog's first genesis
+/// claim decides.
+pub fn choose_balanced(stream: StreamId, view: &View<'_>) -> Option<[Uuid; 3]> {
+    view.tiers()
+        .iter()
+        .find_map(|candidates| choose(stream, candidates))
+}
+
 /// The next roster for a stream whose voters are `current`. Returns `None`
 /// when every current voter is eligible in a distinct domain, or when no
 /// eligible keeper can replace an ineligible voter. Otherwise it replaces
 /// exactly one voter: the first voter that is ineligible or repeats a kept
 /// voter's domain, with the best-ranked eligible keeper whose domain differs
 /// from the two voters it keeps.
+#[cfg(test)]
 pub fn next_roster(stream: StreamId, current: [Uuid; 3], eligible: &Domains) -> Option<[Uuid; 3]> {
+    repair_roster(
+        stream,
+        current,
+        &View {
+            eligible,
+            health: &BTreeMap::new(),
+        },
+    )
+}
+
+/// `next_roster` with keeper health. A voter also leaves when its keeper is
+/// down past the repair delay, quarantined, or full. The replacement must be
+/// live and accepting, and under the load ceiling when one exists. Nothing
+/// moves unless two current voters are live, since a membership change needs
+/// a quorum and the third voter may still hold the only copy of recent
+/// records.
+pub fn repair_roster(stream: StreamId, current: [Uuid; 3], view: &View<'_>) -> Option<[Uuid; 3]> {
+    if current.iter().filter(|voter| view.live(voter)).count() < 2 {
+        return None;
+    }
+    let eligible = view.eligible;
     let mut kept: Vec<Uuid> = Vec::with_capacity(3);
     let mut leaving = None;
     for voter in current {
-        let fits = eligible
-            .get(&voter)
-            .is_some_and(|domain| kept.iter().all(|other| eligible.get(other) != Some(domain)));
-        if fits {
+        let fits = view.accepting(&voter)
+            && eligible
+                .get(&voter)
+                .is_some_and(|domain| kept.iter().all(|other| eligible.get(other) != Some(domain)));
+        if fits || leaving.is_some() {
             kept.push(voter);
-        } else if leaving.is_none() {
-            leaving = Some(voter);
         } else {
-            kept.push(voter);
+            leaving = Some(voter);
         }
     }
     let leaving = leaving?;
@@ -81,9 +185,11 @@ pub fn next_roster(stream: StreamId, current: [Uuid; 3], eligible: &Domains) -> 
         .iter()
         .filter_map(|voter| eligible.get(voter))
         .collect::<BTreeSet<_>>();
-    let replacement = ranked(stream, eligible)
-        .into_iter()
-        .find(|keeper| !current.contains(keeper) && !taken.contains(&eligible[keeper]))?;
+    let replacement = view.tiers().iter().find_map(|candidates| {
+        ranked(stream, candidates)
+            .into_iter()
+            .find(|keeper| !current.contains(keeper) && !taken.contains(&candidates[keeper]))
+    })?;
     Some(sorted([staying[0], staying[1], replacement]))
 }
 
@@ -135,6 +241,105 @@ mod tests {
             choose(StreamId(1), &domains(&[(1, "a"), (2, "a"), (3, "b")])),
             None
         );
+    }
+
+    fn health(entries: &[(u128, bool, bool, u32)]) -> BTreeMap<Uuid, Health> {
+        entries
+            .iter()
+            .map(|(id, live, accepting, streams)| {
+                (
+                    Uuid::from_u128(*id),
+                    Health {
+                        live: *live,
+                        accepting: *accepting,
+                        streams: *streams,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn balanced_choice_skips_down_full_and_loaded_keepers() {
+        let eligible = domains(&[(1, "a"), (2, "a"), (3, "b"), (4, "b"), (5, "c"), (6, "c")]);
+        // Keeper 1 is down, 3 is full and 5 carries far more than average.
+        let known = health(&[
+            (1, false, true, 10),
+            (2, true, true, 10),
+            (3, true, false, 10),
+            (4, true, true, 10),
+            (5, true, true, 60),
+            (6, true, true, 10),
+        ]);
+        let view = View {
+            eligible: &eligible,
+            health: &known,
+        };
+        for stream in 0..64u128 {
+            let voters = choose_balanced(StreamId(stream), &view).unwrap();
+            assert_eq!(voters, sorted([2, 4, 6].map(Uuid::from_u128)));
+        }
+        // When the load ceiling leaves fewer than three domains, a loaded but
+        // accepting keeper still serves.
+        let crowded = health(&[(1, true, true, 90), (3, true, true, 1), (5, true, true, 1)]);
+        let small = domains(&[(1, "a"), (3, "b"), (5, "c")]);
+        let view = View {
+            eligible: &small,
+            health: &crowded,
+        };
+        assert_eq!(
+            choose_balanced(StreamId(7), &view),
+            Some(sorted([1, 3, 5].map(Uuid::from_u128)))
+        );
+    }
+
+    #[test]
+    fn repair_replaces_a_dead_or_full_voter_only_with_two_live_voters() {
+        let eligible = domains(&[(1, "a"), (2, "b"), (3, "c"), (4, "a"), (5, "b"), (6, "c")]);
+        let stream = StreamId(11);
+        let current = choose(stream, &eligible).unwrap();
+        let no_health = BTreeMap::new();
+        let view = View {
+            eligible: &eligible,
+            health: &no_health,
+        };
+        assert_eq!(repair_roster(stream, current, &view), None);
+
+        for (live, accepting) in [(false, true), (true, false)] {
+            let known = BTreeMap::from([(
+                current[0],
+                Health {
+                    live,
+                    accepting,
+                    streams: 0,
+                },
+            )]);
+            let view = View {
+                eligible: &eligible,
+                health: &known,
+            };
+            let next = repair_roster(stream, current, &view).unwrap();
+            assert!(!next.contains(&current[0]));
+            assert!(next.contains(&current[1]) && next.contains(&current[2]));
+            assert_eq!(repair_roster(stream, next, &view), None);
+        }
+
+        // With two voters down nothing moves: the change needs a quorum.
+        let two_down = BTreeMap::from([current[0], current[1]].map(|voter| {
+            (
+                voter,
+                Health {
+                    live: false,
+                    accepting: true,
+                    streams: 0,
+                },
+            )
+        }));
+        let view = View {
+            eligible: &eligible,
+            health: &two_down,
+        };
+        assert_eq!(repair_roster(stream, current, &view), None);
     }
 
     #[test]

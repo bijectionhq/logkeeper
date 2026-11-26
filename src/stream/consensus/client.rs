@@ -14,7 +14,8 @@ use parking_lot::Mutex;
 use tokio::time::{Instant, sleep};
 
 use super::{
-    ALPN, Configuration, Credentials, Fence, Genesis, Keepers, MAX_RECORD, Sealed, invalid,
+    ALPN, Configuration, Credentials, Fence, Genesis, KeeperStatus, Keepers, MAX_RECORD, Sealed,
+    invalid,
     network::{Frame, Lane, Reply, Request, Rpc},
     state::Outcome,
 };
@@ -303,6 +304,32 @@ impl Client {
         {
             Reply::Decision(outcome) => unit(decision(outcome)?),
             _ => Err(JournalError::Unavailable),
+        }
+    }
+
+    /// The status `keeper` reports about itself and its replica of `stream`.
+    pub async fn keeper_status(
+        &self,
+        keeper: uuid::Uuid,
+        stream: StreamId,
+    ) -> Result<KeeperStatus> {
+        match self
+            .keeper_operation(keeper, Request::KeeperStatus(stream))
+            .await?
+        {
+            Reply::Status(status) if status.keeper == keeper => Ok(status),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
+    /// The voters the catalog assigned to `stream`, or `None` when the
+    /// catalog has none.
+    pub(super) async fn claimed_voters(&self, stream: StreamId) -> Result<Option<[uuid::Uuid; 3]>> {
+        let end = Instant::now() + self.deadline;
+        match self.refresh(stream, end).await {
+            Ok(route) => Ok(route.genesis.map(|genesis| genesis.voters)),
+            Err(JournalError::NotFound) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
