@@ -209,6 +209,62 @@ async fn full_batches_snapshot_across_many_index_pages_and_survive_restart() {
     cluster.shutdown().await.unwrap();
 }
 
+/// A stream holds 262,144 retained records. Filled in full keeper batches,
+/// it snapshots, survives a restart of every keeper with its first and last
+/// records, and refuses one more record as full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_fills_to_its_retained_record_limit_and_survives_restart() {
+    use journal_contract::{Epoch, JournalError, Lsn, StreamId};
+
+    const LIMIT: u64 = 262_144;
+    const PER: u64 = 256;
+    let mut cluster = LocalCluster::start(&PRINCIPALS).await.unwrap();
+    let config = cluster.journal_config(64 << 20, 4096);
+    let journal = cluster.journal(PRINCIPALS[0], &config).unwrap();
+    let stream = StreamId(80);
+    journal.create(stream).await.unwrap();
+    assert_eq!(journal.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
+    let record = |at: u64| bytes::Bytes::from(at.to_be_bytes().to_vec());
+    for batch in 0..LIMIT / PER {
+        let group = (batch * PER + 1..=(batch + 1) * PER)
+            .map(|at| (Lsn(at), record(at)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            journal.append_batch(stream, Epoch(1), group).await,
+            Ok(Lsn((batch + 1) * PER)),
+            "batch {batch}"
+        );
+    }
+    assert!(matches!(
+        journal
+            .append(stream, Epoch(1), Lsn(LIMIT + 1), record(LIMIT + 1))
+            .await,
+        Err(JournalError::Full { .. })
+    ));
+    cluster.shutdown().await.unwrap();
+    for keeper in cluster.voters().into_iter().chain([cluster.catalog()]) {
+        cluster.restart(keeper).await.unwrap();
+    }
+    let journal = cluster.journal(PRINCIPALS[0], &config).unwrap();
+    assert_eq!(journal.head(stream).await, Ok(Lsn(LIMIT)));
+    for at in [1, LIMIT] {
+        let page = journal
+            .read(stream, Lsn(at), 1, std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(page.records, vec![(Lsn(at), record(at))]);
+    }
+    assert_eq!(journal.seal(stream, Epoch(1)).await, Ok(Lsn(LIMIT)));
+    assert!(matches!(
+        journal
+            .append_batch(stream, Epoch(1), vec![(Lsn(LIMIT + 1), record(LIMIT + 1))])
+            .await,
+        Err(JournalError::Full { .. })
+    ));
+    assert_eq!(journal.head(stream).await, Ok(Lsn(LIMIT)));
+    cluster.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batches_commit_atomically_and_survive_restart_and_replacement() {
     use journal_contract::{Epoch, JournalError, Lsn, StreamId};

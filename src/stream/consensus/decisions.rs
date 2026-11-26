@@ -11,14 +11,14 @@ use vstd::prelude::*;
 #[allow(dead_code)]
 pub const CONTROL_BYTES: u64 = 33_554_432; // 32 MiB
 pub const MAINTENANCE_BYTES: u64 = 8_388_608; // 8 MiB
-pub const SCRATCH_BYTES: u64 = 16_777_216; // 16 MiB
+pub const SCRATCH_BYTES: u64 = 41_943_040; // 40 MiB
 #[allow(dead_code)]
 pub const EXTERNAL_BYTES: u64 = 8_388_608; // 8 MiB
 
 /// Free space that must remain after each class of reservation.
-pub const ORDINARY_FLOOR: u64 = 67_108_864; // control, maintenance, scratch and external
-pub const PROTOCOL_FLOOR: u64 = 33_554_432; // maintenance, scratch and external
-pub const MAINTENANCE_FLOOR: u64 = 58_720_256; // control, scratch and external
+pub const ORDINARY_FLOOR: u64 = 92_274_688; // control, maintenance, scratch and external
+pub const PROTOCOL_FLOOR: u64 = 58_720_256; // maintenance, scratch and external
+pub const MAINTENANCE_FLOOR: u64 = 83_886_080; // control, scratch and external
 pub const COVERED_FLOOR: u64 = 41_943_040; // control and external
 pub const SCRATCH_FLOOR: u64 = 50_331_648; // control, maintenance and external
 

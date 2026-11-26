@@ -1,6 +1,6 @@
 //! Deterministic decisions over the committed journal view.
 
-pub(super) const MAX_RETAINED_RECORDS: usize = 65_536;
+pub(super) const MAX_RETAINED_RECORDS: usize = 262_144;
 
 /// The writer of the fence an operator recovery installs. No client seals
 /// as this UUID with an empty principal, so the fence admits no append or

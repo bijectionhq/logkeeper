@@ -24,13 +24,19 @@ const PAGE: usize = 128;
 const MAX_PAGES: usize = MAX_RETAINED_RECORDS / PAGE + 1;
 const MAX_PAGE_BYTES: usize = 16 * 1024;
 const MAX_ROOT_BYTES: u64 = 384 * 1024;
+// The encoded size of one page reference. A full stream's references take
+// under half the root, which leaves the rest for its genesis, metadata and
+// image.
+const PAGE_REF_BYTES: u64 = 92;
+const _: () = assert!(MAX_PAGES as u64 * PAGE_REF_BYTES <= MAX_ROOT_BYTES / 2);
 
 // One full set of index pages and a root. A snapshot rewrites only the pages
 // that changed since the previous one, but keeper batches of up to 256 records
 // per entry can change every page between two snapshots, so the scratch
 // reservation covers a full set.
-pub(super) const SCRATCH: u64 = 12 * 1024 * 1024;
+pub(super) const SCRATCH: u64 = 36 * 1024 * 1024;
 const _: () = assert!((MAX_PAGES * MAX_PAGE_BYTES) as u64 + MAX_ROOT_BYTES <= SCRATCH);
+const _: () = assert!(SCRATCH <= crate::stream::consensus::decisions::SCRATCH_BYTES);
 
 #[derive(Clone, Default)]
 pub(super) struct Dependencies {
@@ -199,6 +205,7 @@ pub(super) fn open(
     }
     let mut first = root.image.state.retained_floor().0;
     let mut records = VecDeque::new();
+    let mut entry = None;
     for page in root.pages {
         if page.first != first
             || page.count == 0
@@ -216,7 +223,7 @@ pub(super) fn open(
             ));
         }
         for span in spans {
-            records.push_back(span.open(genesis.stream, objects, &legacy)?);
+            records.push_back(span.open(genesis.stream, objects, &legacy, &mut entry)?);
         }
         dependencies
             .pages
@@ -274,6 +281,7 @@ impl Span {
         scope: StreamId,
         objects: &Objects,
         legacy: &BTreeMap<[u8; 32], Arc<Mutex<File>>>,
+        entry: &mut Option<(Location, Arc<Object>)>,
     ) -> io::Result<Payload> {
         let Self {
             source,
@@ -294,8 +302,13 @@ impl Span {
                 crc,
                 timed,
             },
+            // Records of one batch entry share its slice, as they did when
+            // the entry was applied.
             Source::Segment(location) if location.scope == scope => Payload::Extent {
-                object: objects.slice(location)?,
+                object: match entry {
+                    Some((last, object)) if *last == location => object.clone(),
+                    _ => entry.insert((location, objects.slice(location)?)).1.clone(),
+                },
                 offset,
                 len,
                 crc,
@@ -316,5 +329,29 @@ impl Span {
         };
         payload.load()?;
         Ok(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_stream_of_page_references_fits_its_share_of_the_root() {
+        let page = PageRef {
+            first: u64::MAX,
+            count: PAGE as u32,
+            object: Key {
+                scope: StreamId(u128::MAX),
+                id: uuid::Uuid::from_u128(u128::MAX),
+                len: u64::MAX,
+                digest: [0xff; 32],
+            },
+        };
+        assert_eq!(encode(&page).unwrap().len() as u64, PAGE_REF_BYTES);
+        let pages = (0..MAX_PAGES)
+            .map(|_| PageRef { ..page })
+            .collect::<Vec<_>>();
+        assert!(encode(&pages).unwrap().len() as u64 <= MAX_ROOT_BYTES / 2);
     }
 }

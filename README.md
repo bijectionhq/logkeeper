@@ -306,12 +306,12 @@ after it.
 
 ### Keeper storage and upgrade
 
-Admission leaves 64 MiB free for durable protocol control (32 MiB), maintenance
-records (8 MiB), maintenance scratch (16 MiB), and bounded external allocations
+Admission leaves 88 MiB free for durable protocol control (32 MiB), maintenance
+records (8 MiB), maintenance scratch (40 MiB), and bounded external allocations
 and filesystem overhead (8 MiB). Ordinary entries reserve bytes and a pending
 suffix slot together. A reserved WAL lane services exact snapshot selection and
 covered purge alongside the independently admitted control lane. One snapshot
-builder at a time reserves up to 12 MiB of scratch on the volume. If the 512-slot
+builder at a time reserves up to 36 MiB of scratch on the volume. If the 512-slot
 ordinary suffix fills, covered purge can reopen it while bulk is full and
 ordinary operations including `Trim` are refused. Application trim still needs
 the caller's fence and a committed entry.
@@ -326,14 +326,27 @@ groups.
 
 A local snapshot writes a root of at most 384 KiB and references payload
 already on disk. Its immutable index pages hold up to 128 records each, with
-at most 513 pages and 12 changed pages per ordinary build. The first local build
-from a legacy image can write all index pages within the same scratch budget.
-New appends enforce a 65,536 retained-record ceiling alongside the configured
-retained-byte quota. Selection becomes durable through one WAL boundary update
+at most 2,049 pages. A build rewrites only the pages that changed since the
+previous snapshot, and the scratch budget covers a full set, since keeper
+batches can change every page between two snapshots.
+New appends enforce a 262,144 retained-record ceiling alongside the configured
+retained-byte quota. A further append or batch past the ceiling returns
+`Full` until a trim lowers the count. Consumers that checkpoint and trim on a
+record count should do so at half the ceiling; RTDB checkpoints at 131,072
+retained records. Selection becomes durable through one WAL boundary update
 before purge. The cleanup worker considers at most 64 object names at a time
 and up to 16 directory entries for one detached generation per pass. Actual
 available filesystem space governs reuse, including allocations left behind
 by interrupted work and unlinked files with open handles.
+
+Each retained record costs a voter 64 bytes in the applied record index, and
+the current local snapshot keeps its own 64-byte copy for the cut it serves.
+Records of one batch entry share a single extent handle, also after restart.
+A stream at the ceiling measured 137 bytes per record per voter after a full
+restart, about 36 MB (16 MiB applied, 16 MiB snapshot, the rest handles and
+index-page dependencies). Directly after the fill, before any restart, the
+same stream measured about 265 bytes per record per voter, including
+write-path state that a restart does not rebuild.
 
 The existing bulk ALPN, 1 MiB chunks and `LKRIMG03` wire image remain supported.
 Bulk admission is shared by incoming files and private seekable outbound files.
@@ -349,9 +362,12 @@ can reference it as an immutable extent. New selected local roots use
 framed WAL is migrated through the existing trusted boundary. Budget additional
 free space for the encoded live suffix, two allocation units per entry, 160 KiB
 plus two allocation units per scope, 1 MiB for the root and overhead, and the
-64 MiB headroom. The old WAL stays selected until the new files and boundary
+88 MiB headroom. The old WAL stays selected until the new files and boundary
 are durable. Before upgrading, prune any former data exceeding the new suffix
 or retained-record geometry through supported caller-authorized operations.
+Keepers before the 262,144-record ceiling refuse snapshots of streams holding
+more than 65,536 records, so upgrade every voter before a stream grows past
+that.
 Coordinate keeper upgrades before using the new ownership or consensus
 commands. Existing application `Read` messages and bulk chunk messages retain
 their format. Older keeper binaries require their old media to reopen.
@@ -416,7 +432,7 @@ messages in flight is not idle.
 Before dispatch into Raft storage, a follower reserves the batch's upper
 bound from the shared disk owner. That bound is the encoded entries plus
 768 KiB of WAL metadata and 16 KiB per entry plus one more. Follower appends
-use the ordinary physical pool and leave the 64 MiB control and maintenance
+use the ordinary physical pool and leave the 88 MiB control and maintenance
 floors intact. New follower entries are limited to 496 of the 512 suffix
 slots. A busy stream, full transport budget, or refused disk or suffix
 reservation produces a retryable `Busy` reply with no acknowledgment. The

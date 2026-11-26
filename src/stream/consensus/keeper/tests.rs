@@ -1268,7 +1268,7 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
     let disk = &engine.disk;
     let bulk = group.state.occupy_transfers();
     const MIB: u64 = 1024 * 1024;
-    disk.space.set_available(128 * MIB);
+    disk.space.set_available(152 * MIB);
     let ordinary = disk.space.reserve(64 * MIB - 4 * 64 * 1024).unwrap();
     let previous = group.state.durable_tip().unwrap();
     let term = group.raft.metrics().borrow_watched().current_term + 50;
@@ -2084,7 +2084,7 @@ async fn continuous_control_and_a_busy_stream_leave_unrelated_progress_and_targe
     let hot_leader = cluster.leader(hot).await;
     // The target keeps its protocol floor but cannot admit follower payload.
     let target = cluster.running[&refusing].engine.clone();
-    target.disk.space.set_available(64 * MIB + 256 * 1024);
+    target.disk.space.set_available(88 * MIB + 256 * 1024);
 
     // Idle authenticated control connections beyond the idle limit.
     let mut idle = Vec::new();
