@@ -522,13 +522,14 @@ impl Slot {
 impl Boundaries {
     /// Publishes the next boundary over the older slot. A torn write leaves
     /// the newer slot, which names a boundary the data volume still holds.
+    /// Returns the duration of the boundary `fdatasync`.
     pub fn write(
         &mut self,
         segment: u64,
         offset: u64,
         chain: [u8; 32],
         checkpoint: Option<CheckpointRef>,
-    ) -> io::Result<()> {
+    ) -> io::Result<std::time::Duration> {
         let slot = Slot {
             sequence: self.last.sequence + 1,
             segment,
@@ -538,9 +539,11 @@ impl Boundaries {
         };
         self.file.seek(SeekFrom::Start(slot.index() as u64))?;
         self.file.write_all(&slot.encode(self.incarnation)?)?;
+        let sync_start = std::time::Instant::now();
         sync_data(&self.file)?;
+        let sync_elapsed = sync_start.elapsed();
         self.last = slot;
-        Ok(())
+        Ok(sync_elapsed)
     }
 }
 

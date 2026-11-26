@@ -1250,7 +1250,7 @@ impl Peer {
             Ok(AppendReply::Raft(Ok(reply))) => Ok(reply.into_append_result(range.0, range.1)),
             Ok(AppendReply::Raft(Err(error))) => Err(unreachable(&error).into()),
             Ok(AppendReply::Busy) => {
-                super::metrics::count(&super::metrics::COUNTERS.peer_busy);
+                super::metrics::count(&self.network.state.metrics().peer_busy);
                 Err(unreachable(&io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "replication receiver is busy",
@@ -1259,7 +1259,7 @@ impl Peer {
             }
             Err(error) => {
                 self.network.observe(self.target, &error);
-                super::metrics::count(&super::metrics::COUNTERS.peer_unreachable);
+                super::metrics::count(&self.network.state.metrics().peer_unreachable);
                 super::metrics::sample("peer.unreachable", || format!("{error:?}"));
                 Err(unreachable(&error).into())
             }
@@ -1469,8 +1469,12 @@ impl RaftNetworkV2<RaftTypes> for Peer {
             )
             .await;
             let reply = match sent {
-                Err(elapsed) => return Err(NetworkError::new(&elapsed).into()),
+                Err(elapsed) => {
+                    super::metrics::count(&self.network.state.metrics().snapshots_sent_failed);
+                    return Err(NetworkError::new(&elapsed).into());
+                }
                 Ok(Ok(Ok(reply))) => {
+                    super::metrics::add(&self.network.state.metrics().snapshot_bytes_sent, read);
                     failures = 0;
                     backoff = None;
                     reply
@@ -1481,10 +1485,14 @@ impl RaftNetworkV2<RaftTypes> for Peer {
                     backoff = None;
                     continue;
                 }
-                Ok(Ok(Err(RaftError::Fatal(fatal)))) => return Err(unreachable(&fatal).into()),
+                Ok(Ok(Err(RaftError::Fatal(fatal)))) => {
+                    super::metrics::count(&self.network.state.metrics().snapshots_sent_failed);
+                    return Err(unreachable(&fatal).into());
+                }
                 Ok(Err(error)) => {
                     failures += 1;
                     if failures >= SNAPSHOT_CHUNK_MAX_RETRIES {
+                        super::metrics::count(&self.network.state.metrics().snapshots_sent_failed);
                         return Err(error.into());
                     }
                     let delay = if matches!(error, RPCError::Unreachable(_)) {
@@ -1500,6 +1508,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
                 }
             };
             if reply.vote > vote || done {
+                if done {
+                    super::metrics::count(&self.network.state.metrics().snapshots_sent_ok);
+                }
                 return Ok(reply);
             }
             offset += read;

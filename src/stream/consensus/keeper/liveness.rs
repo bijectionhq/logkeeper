@@ -266,7 +266,7 @@ impl Engine {
         }
         for stream in woken {
             if self.wake(stream).await.is_some() {
-                metrics::count(&metrics::COUNTERS.unparked_for_repair);
+                metrics::count(&self.disk.metrics.unparked_for_repair);
                 tracing::info!(
                     keeper = %self.id,
                     stream = %crate::stream::consensus::logging::stream_uuid(stream),

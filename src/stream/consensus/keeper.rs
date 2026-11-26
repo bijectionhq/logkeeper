@@ -618,6 +618,7 @@ impl Engine {
             let gauges = self.disk.clone();
             tokio::spawn(super::metrics::report(
                 self.id,
+                self.disk.metrics.clone(),
                 Duration::from_secs(5),
                 self.stop.clone(),
                 move || gauges.segment_usage().to_string(),
@@ -886,7 +887,7 @@ impl Engine {
                 )
                 .await;
             if closed {
-                super::metrics::count(&super::metrics::COUNTERS.evicted);
+                super::metrics::count(&self.disk.metrics.evicted);
                 return true;
             }
         }
@@ -979,8 +980,12 @@ impl Engine {
         if !self.disk.healthy() || !self.disk.space.accepts_protocol() {
             return Err(invalid("stream replica stopped and its media has no room"));
         }
-        super::metrics::count(&super::metrics::COUNTERS.reopened_stopped);
-        eprintln!("logkeeper reopens stream {stream:?}, whose Raft core stopped");
+        super::metrics::count(&self.disk.metrics.reopened_stopped);
+        tracing::warn!(
+            keeper = %self.id,
+            stream = %super::logging::stream_uuid(stream),
+            "reopening stream replica whose Raft core stopped"
+        );
         self.close_retaining(stream, || (), false).await;
         Ok(())
     }
@@ -1356,7 +1361,7 @@ impl Engine {
                     // Reopen a parked or never opened copy; it elects a
                     // leader at once and the client retries.
                     if self.unpark(stream).await.is_some() {
-                        super::metrics::count(&super::metrics::COUNTERS.unparked_by_client);
+                        super::metrics::count(&self.disk.metrics.unparked_by_client);
                     }
                     return Ok(Reply::Leader(None));
                 };
@@ -1870,13 +1875,15 @@ impl Group {
     }
 
     async fn write(&self, command: Command) -> Reply {
-        use super::metrics::{COUNTERS, count};
+        use super::metrics::count;
+        let metrics = self.state.metrics().clone();
+        let started = std::time::Instant::now();
         if self.require_healthy().is_err() {
-            count(&COUNTERS.write_unhealthy);
+            count(&metrics.write_unhealthy);
             return failure(JournalError::Unavailable);
         }
         let Ok(permit) = self.writes.clone().try_acquire_owned() else {
-            count(&COUNTERS.write_pending);
+            count(&metrics.write_pending);
             return failure(JournalError::Unavailable);
         };
         let ticket = uuid::Uuid::new_v4();
@@ -1886,16 +1893,17 @@ impl Group {
         {
             Ok(space) => space,
             Err(storage::Admission::FullSuffix) => {
-                count(&COUNTERS.write_full_suffix);
+                count(&metrics.write_full_suffix);
                 self.request_covered_purge().await;
                 return failure(JournalError::Unavailable);
             }
             Err(storage::Admission::Space) => {
-                count(&COUNTERS.write_space);
+                count(&metrics.write_space);
                 return failure(JournalError::Unavailable);
             }
         };
         let raft = self.raft.clone();
+        let proposal_metrics = metrics.clone();
         // The proposal owns its reservation even when the caller drops the
         // request or times out. The WAL settles it as it publishes the slot.
         let proposal = tokio::spawn(async move {
@@ -1909,17 +1917,20 @@ impl Group {
                 .await
             {
                 super::metrics::sample("write.proposal_failed", || format!("{error:?}"));
-                count(&COUNTERS.write_proposal);
+                count(&proposal_metrics.write_proposal);
                 return failure(JournalError::Unavailable);
             }
             match response.await {
-                Ok(Ok(response)) => Reply::Decision(response.data),
+                Ok(Ok(response)) => {
+                    proposal_metrics.commit_duration.observe(started.elapsed());
+                    Reply::Decision(response.data)
+                }
                 Ok(Err(ClientWriteError::ForwardToLeader(leader))) => {
                     leader_reply(leader.leader_id)
                 }
                 other => {
                     super::metrics::sample("write.proposal_failed", || format!("{other:?}"));
-                    count(&COUNTERS.write_proposal);
+                    count(&proposal_metrics.write_proposal);
                     failure(JournalError::Unavailable)
                 }
             }
@@ -1929,7 +1940,7 @@ impl Group {
             .ok()
             .and_then(Result::ok)
             .unwrap_or_else(|| {
-                count(&COUNTERS.write_timeout);
+                count(&metrics.write_timeout);
                 failure(JournalError::Unavailable)
             })
     }
@@ -1944,11 +1955,11 @@ impl Group {
     async fn head(&self) -> Reply {
         let (send, receive) = oneshot::channel();
         if self.heads.try_send(send).is_err() {
-            super::metrics::count(&super::metrics::COUNTERS.head_queue);
+            super::metrics::count(&self.state.metrics().head_queue);
         } else if let Ok(Ok(reply)) = timeout(REQUEST_TIMEOUT, receive).await {
             return reply;
         } else {
-            super::metrics::count(&super::metrics::COUNTERS.head_timeout);
+            super::metrics::count(&self.state.metrics().head_timeout);
         }
         failure(JournalError::Unavailable)
     }

@@ -128,16 +128,24 @@ impl Group {
             receiving.take();
             return Err(error);
         }
-        let end = request.offset + request.data.len() as u64;
+        let chunk_bytes = request.data.len() as u64;
+        let end = request.offset + chunk_bytes;
         current.next = current.next.max(end);
+        crate::stream::consensus::metrics::add(
+            &self.state.metrics().snapshot_bytes_received,
+            chunk_bytes,
+        );
         if !request.done {
             return Ok(Ok(SnapshotResponse::new(vote)));
         }
         let complete = receiving.take().unwrap();
         if end != complete.next {
+            crate::stream::consensus::metrics::count(
+                &self.state.metrics().snapshots_received_failed,
+            );
             return Err(invalid("final chunk does not end the snapshot"));
         }
-        Ok(self
+        let installed = self
             .raft
             .install_full_snapshot(
                 request.vote,
@@ -147,7 +155,15 @@ impl Group {
                 },
             )
             .await
-            .map_err(RaftError::Fatal))
+            .map_err(RaftError::Fatal);
+        if installed.is_ok() {
+            crate::stream::consensus::metrics::count(&self.state.metrics().snapshots_received_ok);
+        } else {
+            crate::stream::consensus::metrics::count(
+                &self.state.metrics().snapshots_received_failed,
+            );
+        }
+        Ok(installed)
     }
 
     fn expire_transfer(
@@ -474,9 +490,7 @@ impl Engine {
                 decisions::ParkedAnswer::Parked => return encode(&true),
                 decisions::ParkedAnswer::Reopen => {
                     if self.parked.write().remove(&genesis.stream).is_some() {
-                        super::super::metrics::count(
-                            &super::super::metrics::COUNTERS.unparked_by_peer,
-                        );
+                        super::super::metrics::count(&self.disk.metrics.unparked_by_peer);
                     }
                 }
             }
@@ -583,11 +597,25 @@ impl Engine {
                 match request {
                     PeerRequest::Vote(request) => {
                         let reply = group.raft.vote(request).await;
+                        if let Ok(resp) = &reply {
+                            if resp.vote_granted {
+                                super::super::metrics::count(&self.disk.metrics.votes_granted);
+                            } else {
+                                super::super::metrics::count(&self.disk.metrics.votes_denied);
+                            }
+                        }
                         group.require_healthy()?;
                         encode(&reply)
                     }
                     PeerRequest::PreVote(request) => {
                         let reply = group.raft.pre_vote(request).await;
+                        if let Ok(resp) = &reply {
+                            if resp.vote_granted {
+                                super::super::metrics::count(&self.disk.metrics.pre_votes_granted);
+                            } else {
+                                super::super::metrics::count(&self.disk.metrics.pre_votes_denied);
+                            }
+                        }
                         group.require_healthy()?;
                         encode(&reply)
                     }

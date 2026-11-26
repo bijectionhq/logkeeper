@@ -442,6 +442,7 @@ pub(in crate::stream::consensus) struct Disk {
     pub incarnation: Uuid,
     pub space: Space,
     pub(super) objects: Objects,
+    pub(in crate::stream::consensus) metrics: Arc<crate::stream::consensus::metrics::Metrics>,
     #[cfg(test)]
     replica_fault: Arc<parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>>,
     #[cfg(test)]
@@ -506,6 +507,8 @@ impl Disk {
         let writer_state = state.clone();
         let writer_objects = objects.clone();
         let writer_space = space.clone();
+        let metrics = Arc::new(crate::stream::consensus::metrics::Metrics::new());
+        let writer_metrics = metrics.clone();
         #[cfg(test)]
         let replica_fault = Arc::new(parking_lot::Mutex::new(None));
         #[cfg(test)]
@@ -532,6 +535,7 @@ impl Disk {
                     &writer_space,
                     &writer_healthy,
                     &writer_watchdog,
+                    &writer_metrics,
                     #[cfg(test)]
                     &writer_fault,
                     #[cfg(test)]
@@ -562,6 +566,7 @@ impl Disk {
             incarnation,
             space,
             objects,
+            metrics,
             #[cfg(test)]
             replica_fault,
             #[cfg(test)]
@@ -1048,6 +1053,7 @@ fn run(
     space: &Space,
     health: &AtomicBool,
     watchdog: &super::watchdog::Watchdog,
+    metrics: &crate::stream::consensus::metrics::Metrics,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
     #[cfg(test)] wal_delay_ms: &std::sync::atomic::AtomicU64,
 ) -> io::Result<()> {
@@ -1059,6 +1065,7 @@ fn run(
         objects,
         space,
         watchdog,
+        metrics,
         #[cfg(test)]
         replica_fault,
         #[cfg(test)]
@@ -1068,6 +1075,7 @@ fn run(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rounds(
     wal: &mut Segmented,
     state: &RwLock<State>,
@@ -1075,11 +1083,13 @@ fn rounds(
     objects: &Objects,
     space: &Space,
     watchdog: &super::watchdog::Watchdog,
+    metrics: &crate::stream::consensus::metrics::Metrics,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
     #[cfg(test)] wal_delay_ms: &std::sync::atomic::AtomicU64,
 ) -> io::Result<()> {
     let mut finish = false;
     while let Some(Message::Write(first)) = queues.recv() {
+        let round_start = std::time::Instant::now();
         let _round = watchdog.begin();
         let mut round = vec![first];
         let mut bytes = 0;
@@ -1202,7 +1212,11 @@ fn rounds(
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                 }
             }
-            wal.commit(objects, &changed)?;
+            let round_records = replies.len() as u64;
+            let round_bytes = wal.commit(objects, &changed, metrics)?;
+            metrics.wal_round_records.observe(round_records);
+            metrics.wal_round_bytes.observe(round_bytes);
+            metrics.wal_round_duration.observe(round_start.elapsed());
             // The copies are durable: every holder reads them from now on.
             // Their old segments stay for the checkpoint and the selected
             // snapshots that may still name them.

@@ -134,7 +134,7 @@ impl Engine {
             if let Some(_membership) = membership {
                 self.park(stream).await;
             } else {
-                super::super::metrics::count(&super::super::metrics::COUNTERS.park_declined);
+                super::super::metrics::count(&self.disk.metrics.park_declined);
                 // Ask again only after another park delay.
                 self.activity
                     .lock()
@@ -154,7 +154,7 @@ impl Engine {
             )
             .await;
         if parked {
-            super::super::metrics::count(&super::super::metrics::COUNTERS.parked);
+            super::super::metrics::count(&self.disk.metrics.parked);
         }
         self.activity.lock().remove(&stream);
     }

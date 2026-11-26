@@ -184,7 +184,15 @@ impl RaftLogStorage<RaftTypes> for LogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote) -> io::Result<()> {
-        self.write(Record::Vote(self.stream, *vote)).await
+        self.write(Record::Vote(self.stream, *vote)).await?;
+        if vote.leader_id().voted_for == self.keeper {
+            if vote.is_committed() {
+                super::metrics::count(&self.disk.metrics.elections_won);
+            } else {
+                super::metrics::count(&self.disk.metrics.elections_started);
+            }
+        }
+        Ok(())
     }
 
     async fn append<I>(&mut self, entries: I, callback: IOFlushed<RaftTypes>) -> io::Result<()>

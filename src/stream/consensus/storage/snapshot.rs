@@ -439,6 +439,18 @@ impl StateMachine {
             .log(self.inner.genesis.stream, |log| log.entries.len())
     }
 
+    pub fn metrics(&self) -> &Arc<super::super::metrics::Metrics> {
+        &self.inner.disk.metrics
+    }
+
+    pub fn retained_stats(&self) -> (u64, u64) {
+        self.inner.applied.read().state.retained_stats()
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.inner.applied.read().state.is_deleted()
+    }
+
     pub async fn open(disk: &Disk, genesis: Genesis, placement: Placement) -> io::Result<Self> {
         let root = disk.path.clone();
         let generation = disk
@@ -1279,6 +1291,7 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
                 .objects
                 .release_moved(inner.genesis.stream, moved);
         }
+        crate::stream::consensus::metrics::count(&inner.disk.metrics.snapshots_built);
         inner
             .current_snapshot()
             .ok_or_else(|| invalid("built image disappeared"))

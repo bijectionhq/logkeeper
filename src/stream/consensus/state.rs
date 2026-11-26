@@ -670,6 +670,17 @@ impl State {
         self.live().ok().map_or(Lsn(1), |live| live.floor)
     }
 
+    /// Retained record count and byte charge for a live stream, or `(0, 0)`.
+    pub fn retained_stats(&self) -> (u64, u64) {
+        self.live()
+            .ok()
+            .map_or((0, 0), |live| (live.records.len() as u64, live.bytes))
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        matches!(self, Self::Deleted)
+    }
+
     pub fn record_count(&self) -> io::Result<u64> {
         let Ok(live) = self.live() else { return Ok(0) };
         live.head

@@ -108,7 +108,7 @@ impl Engine {
                 Ok(0) => break,
                 Ok(copied) => {
                     super::super::metrics::add(
-                        &super::super::metrics::COUNTERS.compacted_bytes,
+                        &self.disk.metrics.compacted_bytes,
                         copied,
                     );
                     budget = budget.saturating_sub(copied);

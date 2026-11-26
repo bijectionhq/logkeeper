@@ -502,12 +502,18 @@ impl Segmented {
     }
 
     /// Makes the round's frames durable, then publishes them.
-    pub fn commit(&mut self, objects: &Objects, scopes: &BTreeSet<StreamId>) -> io::Result<()> {
+    pub fn commit(
+        &mut self,
+        objects: &Objects,
+        scopes: &BTreeSet<StreamId>,
+        metrics: &crate::stream::consensus::metrics::Metrics,
+    ) -> io::Result<u64> {
         #[cfg(test)]
         let cut = self.cut.replace(0);
         if self.writer.buffer.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+        let round_bytes = self.writer.buffer.len() as u64;
         #[cfg(test)]
         if cut == 6 {
             let half = self.writer.buffer.len() / 2;
@@ -520,7 +526,11 @@ impl Segmented {
         if cut == 5 {
             return Err(io::Error::other("injected WAL data sync failure"));
         }
+        let segment_sync = Instant::now();
         sync_data(&self.writer.file)?;
+        metrics
+            .wal_fsync_segment_duration
+            .observe(segment_sync.elapsed());
         #[cfg(test)]
         if cut == 2 {
             return Err(io::Error::other("interrupted before the WAL boundary"));
@@ -528,7 +538,7 @@ impl Segmented {
         let end = self.writer.end();
         let chain = segment::chain_frames(self.writer.chain, &self.writer.buffer);
         let ready = self.ready_checkpoint();
-        self.boundaries.write(
+        let boundary_sync = self.boundaries.write(
             end.segment,
             end.offset,
             chain,
@@ -537,7 +547,8 @@ impl Segmented {
                 .map(|(reference, _)| *reference)
                 .or(self.published.reference),
         )?;
-        self.since += self.writer.buffer.len() as u64;
+        metrics.wal_fsync_boundary_duration.observe(boundary_sync);
+        self.since += round_bytes;
         self.writer.advance(chain);
         self.scopes.extend(scopes);
         if let Some((reference, ready)) = ready {
@@ -547,7 +558,7 @@ impl Segmented {
         if cut == 3 {
             return Err(io::Error::other("interrupted after the WAL boundary"));
         }
-        Ok(())
+        Ok(round_bytes)
     }
 
     fn adopt(

@@ -503,7 +503,8 @@ fn a_restart_recovers_the_published_side_of_every_crash_point() {
                 ] {
                     state.apply_indexed(record, &mut wal, &objects).unwrap();
                 }
-                wal.commit(&objects, &scopes).unwrap();
+                let metrics = crate::stream::consensus::metrics::Metrics::new();
+                wal.commit(&objects, &scopes, &metrics).unwrap();
                 let new = entry(1, Bytes::from_static(b"new"));
                 let selected = Selected {
                     log_id: new.log_id,
@@ -516,7 +517,7 @@ fn a_restart_recovers_the_published_side_of_every_crash_point() {
                     .apply_indexed(Record::Snapshot(stream, selected), &mut wal, &objects)
                     .unwrap();
                 wal.interrupt(cut);
-                assert!(wal.commit(&objects, &scopes).is_err());
+                assert!(wal.commit(&objects, &scopes, &metrics).is_err());
             }
             let (media, _lock, _) = enrollment().open().unwrap();
             let (wal, recovered) = Segmented::open(&media, &objects, tuning).unwrap();
@@ -779,7 +780,8 @@ fn recovery_restores_the_checkpoint_and_replays_the_frames_after_it() {
         ] {
             state.apply_indexed(record, &mut wal, &objects).unwrap();
         }
-        wal.commit(&objects, &scopes).unwrap();
+        let metrics = crate::stream::consensus::metrics::Metrics::new();
+        wal.commit(&objects, &scopes, &metrics).unwrap();
         wal.checkpoint_now(&state, &objects, &space).unwrap();
         checkpoint = checkpoint_files(dir.path());
         assert_eq!(checkpoint.len(), 1);
@@ -790,7 +792,7 @@ fn recovery_restores_the_checkpoint_and_replays_the_frames_after_it() {
             Record::Append(stream, vec![entry(1, Bytes::from_static(b"replaced"))]),
         ] {
             state.apply_indexed(record, &mut wal, &objects).unwrap();
-            wal.commit(&objects, &scopes).unwrap();
+            wal.commit(&objects, &scopes, &metrics).unwrap();
         }
         // A checkpoint that crashed before its boundary published it.
         fs::write(

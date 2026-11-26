@@ -357,14 +357,20 @@ impl Engine {
                 let Ok(_guard) = group.membership.try_lock() else {
                     return true;
                 };
-                matches!(
+                let ok = matches!(
                     timeout(
                         super::replacement::MANAGEMENT_TIMEOUT,
                         group.raft.change_membership(target, false),
                     )
                     .await,
                     Ok(Ok(_))
-                )
+                );
+                if ok {
+                    super::super::metrics::count(&self.disk.metrics.repairs_joint_ok);
+                } else {
+                    super::super::metrics::count(&self.disk.metrics.repairs_joint_failed);
+                }
+                ok
             }
             Work::Learners(learners) => {
                 let Ok(_guard) = group.membership.try_lock() else {
@@ -381,6 +387,11 @@ impl Engine {
                     .await,
                     Ok(Ok(_))
                 );
+                if removed {
+                    super::super::metrics::count(&self.disk.metrics.repairs_learners_ok);
+                } else {
+                    super::super::metrics::count(&self.disk.metrics.repairs_learners_failed);
+                }
                 let outcome = if removed { "removed" } else { "deferred" };
                 tracing::info!(
                     keeper = %self.id,
@@ -391,7 +402,15 @@ impl Engine {
                 );
                 removed
             }
-            Work::Voters(quiet) => self.replace_dead_voter(stream, group, &quiet).await,
+            Work::Voters(quiet) => {
+                let ok = self.replace_dead_voter(stream, group, &quiet).await;
+                if ok {
+                    super::super::metrics::count(&self.disk.metrics.repairs_voter_ok);
+                } else {
+                    super::super::metrics::count(&self.disk.metrics.repairs_voter_failed);
+                }
+                ok
+            }
         }
     }
 
