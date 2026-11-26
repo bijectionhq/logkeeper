@@ -14,6 +14,8 @@ use crate::stream::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod catalog;
+
 pub(super) type RejectAppend =
     Box<dyn Fn(StreamId, NodeId, &AppendEntriesRequest<RaftTypes>) -> bool + Send + Sync>;
 
@@ -45,6 +47,7 @@ struct Cluster {
     keepers: Keepers,
     ids: [Uuid; 4],
     catalog: Uuid,
+    catalog_voters: Option<[Uuid; 3]>,
     credentials: Credentials,
     other: Credentials,
     _dir: tempfile::TempDir,
@@ -56,6 +59,17 @@ impl Cluster {
     }
 
     async fn start_domains(domains: [&str; 4]) -> Self {
+        Self::start_with(domains, None).await
+    }
+
+    /// Hosts the catalog as a consensus stream on keepers 5, 6 and 7. The
+    /// catalog keeper 5 seeds it.
+    async fn start_replicated() -> Self {
+        let voters = [5, 6, 7].map(Uuid::from_u128);
+        Self::start_with(["a", "b", "c", "d"], Some(voters)).await
+    }
+
+    async fn start_with(domains: [&str; 4], catalog_voters: Option<[Uuid; 3]>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let roots = dir.path().join("ca.pem");
         let ca = ca(&roots);
@@ -115,6 +129,7 @@ impl Cluster {
                 domains: domains.clone(),
                 enrollment: enrollment.clone(),
                 catalog,
+                catalog_voters,
                 readers: vec![OWNER.into(), OTHER.into()],
                 writers: vec![OWNER.into(), OTHER.into()],
                 administrators: vec![OWNER.into()],
@@ -140,6 +155,7 @@ impl Cluster {
             keepers,
             ids,
             catalog,
+            catalog_voters,
             credentials,
             other,
             _dir: dir,
@@ -147,7 +163,16 @@ impl Cluster {
     }
 
     fn client(&self, credentials: &Credentials) -> Client {
-        Client::new(credentials, self.keepers.clone(), self.catalog, WAIT).unwrap()
+        self.client_within(credentials, WAIT)
+    }
+
+    fn client_within(&self, credentials: &Credentials, deadline: Duration) -> Client {
+        let client =
+            Client::new(credentials, self.keepers.clone(), self.catalog, deadline).unwrap();
+        match self.catalog_voters {
+            Some(voters) => client.with_catalog_voters(voters),
+            None => client,
+        }
     }
 
     fn peer_rpc(&self, sender: Uuid, lane: Lane) -> Rpc {

@@ -35,6 +35,10 @@ pub struct JournalConfig {
     pub keepers: Keepers,
     /// The keeper that assigns stream genesis.
     pub catalog: uuid::Uuid,
+    /// The replicated catalog's three voters, when the keepers run one.
+    /// Claims and lookups then go to them instead of `catalog`.
+    #[serde(default)]
+    pub catalog_voters: Option<[uuid::Uuid; 3]>,
     /// The three voters of every stream this consumer creates. Give either
     /// this fixed roster or `placement`.
     #[serde(default)]
@@ -82,6 +86,12 @@ impl JournalConfig {
             return Err(invalid(
                 "journal record limit must be between 1 byte and 4 MiB",
             ));
+        }
+        if self
+            .catalog_voters
+            .is_some_and(|voters| voters.iter().any(|voter| !self.keepers.contains_key(voter)))
+        {
+            return Err(invalid("catalog voters must be known keepers"));
         }
         match (&self.voters, &self.placement) {
             (Some(voters), None) if voters.iter().all(|voter| self.keepers.contains_key(voter)) => {
@@ -189,13 +199,16 @@ impl ConsensusJournal {
                 .collect(),
             _ => BTreeSet::new(),
         };
-        let client = Client::new(
+        let mut client = Client::new(
             credentials,
             config.keepers.clone(),
             config.catalog,
             Duration::from_millis(config.deadline_ms),
         )?
         .with_local_keepers(local.clone());
+        if let Some(voters) = config.catalog_voters {
+            client = client.with_catalog_voters(voters);
+        }
         Ok(Self {
             client,
             placement: Arc::new(RwLock::new(Placement::new(config))),

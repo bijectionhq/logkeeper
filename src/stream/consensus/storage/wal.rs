@@ -714,6 +714,12 @@ impl Disk {
         self.state.read().catalog.get(&stream).cloned()
     }
 
+    /// Every entry of the single-keeper catalog, which a replicated catalog
+    /// imports once.
+    pub fn catalog_entries(&self) -> Vec<CatalogEntry> {
+        self.state.read().catalog.values().cloned().collect()
+    }
+
     pub(super) fn log<T>(&self, stream: StreamId, read: impl FnOnce(&Log) -> T) -> T {
         read(&self.state.read().logs[&stream])
     }

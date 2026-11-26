@@ -22,6 +22,8 @@ use super::{
 
 const ATTEMPT: Duration = Duration::from_millis(1200);
 const ROUTE_FANOUT: usize = 16;
+/// The longest one replicated catalog voter may take with a claim.
+const CATALOG_WRITE_ATTEMPT: Duration = Duration::from_secs(3);
 
 /// A journal client with authenticated, cached routes. An ordinary append and
 /// head use the stream leader directly after discovery.
@@ -29,6 +31,10 @@ const ROUTE_FANOUT: usize = 16;
 pub struct Client {
     rpc: Rpc,
     catalog: uuid::Uuid,
+    /// The replicated catalog's voters, which replace `catalog` when set.
+    catalog_voters: Option<[uuid::Uuid; 3]>,
+    /// The replicated catalog voter that last answered a claim.
+    catalog_leader: Arc<Mutex<Option<uuid::Uuid>>>,
     deadline: Duration,
     routes: Arc<Mutex<BTreeMap<StreamId, Route>>>,
     /// Keepers in this client's failure domain, tried first for reads.
@@ -57,10 +63,19 @@ impl Client {
         Ok(Self {
             rpc: Rpc::new(tls, keepers, Lane::Application),
             catalog,
+            catalog_voters: None,
+            catalog_leader: Arc::default(),
             deadline,
             routes: Arc::default(),
             local: Arc::default(),
         })
+    }
+
+    /// Uses the replicated catalog on `voters` instead of the single catalog
+    /// keeper. Claims and lookups try them in order and follow leader hints.
+    pub fn with_catalog_voters(mut self, voters: [uuid::Uuid; 3]) -> Self {
+        self.catalog_voters = Some(voters);
+        self
     }
 
     /// Reads go first to a voter among `keepers`, those in the client's own
@@ -88,15 +103,13 @@ impl Client {
             return Err(JournalError::Unavailable);
         }
         let end = Instant::now() + self.deadline;
-        let reply: Reply = self
-            .rpc
-            .call(
-                self.catalog,
-                Frame::Client(Request::Claim(genesis)),
-                self.deadline,
-            )
-            .await
-            .map_err(|_| JournalError::Unavailable)?;
+        let attempt = match self.catalog_voters {
+            Some(_) => CATALOG_WRITE_ATTEMPT,
+            None => self.deadline,
+        };
+        let reply = self
+            .ask_catalog(Request::Claim(genesis), end, attempt)
+            .await?;
         self.install_route(stream, reply)?;
         let bootstrap = async {
             let mut calls =
@@ -487,15 +500,56 @@ impl Client {
 
     async fn refresh(&self, stream: StreamId, end: Instant) -> Result<Route> {
         let reply = self
-            .rpc
-            .call(
-                self.catalog,
-                Frame::Client(Request::Locate(stream)),
-                (remaining(end) / 4).min(ATTEMPT),
+            .ask_catalog(
+                Request::Locate(stream),
+                Instant::now() + remaining(end) / 4,
+                ATTEMPT,
             )
-            .await
-            .map_err(|_| JournalError::Unavailable)?;
+            .await?;
         self.install_route(stream, reply)
+    }
+
+    /// Asks the catalog keeper, or the replicated catalog's voters until one
+    /// answers, giving each call at most `attempt`.
+    async fn ask_catalog(
+        &self,
+        request: Request,
+        end: Instant,
+        attempt: Duration,
+    ) -> Result<Reply> {
+        let Some(voters) = self.catalog_voters else {
+            return self
+                .rpc
+                .call(
+                    self.catalog,
+                    Frame::Client(request),
+                    remaining(end).min(attempt),
+                )
+                .await
+                .map_err(|_| JournalError::Unavailable);
+        };
+        let order = self
+            .catalog_leader
+            .lock()
+            .iter()
+            .copied()
+            .chain(voters)
+            .collect::<Vec<_>>();
+        let claim = matches!(request, Request::Claim(_));
+        let (keeper, reply) = super::catalog::ask(&order, end, |keeper| {
+            let request = request.clone();
+            async move {
+                self.rpc
+                    .call(keeper, Frame::Client(request), remaining(end).min(attempt))
+                    .await
+            }
+        })
+        .await
+        .ok_or(JournalError::Unavailable)?;
+        if claim {
+            *self.catalog_leader.lock() = Some(keeper);
+        }
+        Ok(reply)
     }
 
     fn install_route(&self, stream: StreamId, reply: Reply) -> Result<Route> {

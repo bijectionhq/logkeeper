@@ -107,7 +107,8 @@ Provide separate capacity for the enrollment volume. The keeper accepts data
 volumes with an allocation unit up to 16 KiB.
 
 Pass the application certificate paths, the inventory, the catalog UUID, and
-an operation deadline to `Client::new`. With an authorized client and three
+an operation deadline to `Client::new`. With a replicated catalog, also pass
+its voters to `Client::with_catalog_voters`. With an authorized client and three
 voter UUIDs, a first write looks like this.
 
 ```rust,ignore
@@ -153,13 +154,62 @@ generation. Staging records a new generation and its target revision before
 copying, then compares the exact receipt, generation and durable log cut before
 installation. The keeper retains its term and vote across both transitions.
 
-The configured catalog keeper durably assigns genesis and records discovery
-contacts. An unavailable catalog leaves genesis unknown and existing groups
-can use authenticated inventory contacts to elect and serve. Creation and
-unpublished staging require the catalog. A deployment that needs both
-operations to survive a catalog failure needs a separately highly available
-catalog with the same linearizable genesis CAS and retained staging semantics.
-The shipped catalog has one keeper.
+The catalog durably assigns genesis and records discovery contacts. An
+unavailable catalog leaves genesis unknown and existing groups can use
+authenticated inventory contacts to elect and serve. Creation and unpublished
+staging require the catalog.
+
+By default the configured `catalog` keeper holds the catalog alone. To keep
+creation and staging available through the loss of a keeper, give every
+keeper the same `catalog_voters`: three sorted keeper UUIDs in distinct
+failure domains, one of them the `catalog` keeper.
+
+```json
+  "catalog": "00000000-0000-0000-0000-000000000004",
+  "catalog_voters": [
+    "00000000-0000-0000-0000-000000000002",
+    "00000000-0000-0000-0000-000000000003",
+    "00000000-0000-0000-0000-000000000004"
+  ],
+```
+
+The catalog is then a consensus stream of its own, with the reserved ID
+`u128::MAX`, whose genesis comes from this configuration. Each catalog voter
+registers and initializes it at startup. Only its leader appends, with an
+internal writer fence and at exactly the next position, so claims keep the
+first-claim-wins rule and stages keep the exact-receipt rule. Clients may
+read the stream but not write, seal, trim or delete it.
+
+- **Lookups:** any catalog voter answers a lookup it finds in its applied
+  records. It may lag the leader, which is harmless because a genesis never
+  changes and contacts are hints. Only the leader, after a read barrier,
+  answers that a stream does not exist.
+- **Claims and stages:** a follower answers with its leader. The leader takes
+  a read barrier, catches up, and appends.
+- **Outages:** with one catalog voter down, creation, staging and repair
+  continue. With two down, creation and unpublished staging fail with
+  `Unavailable`; existing streams keep serving, and a cold client still finds
+  a stream that the remaining voter has applied.
+- **Compaction:** when more than 1024 records follow the last checkpoint,
+  the leader appends a checkpoint of every entry and trims the records
+  before it.
+- **Maintenance:** the catalog stream is never parked or deleted. Its leader
+  repairs it like any other stream, so a catalog voter silent for
+  `repair_after_secs` moves to a live keeper in a free domain. The configured
+  `catalog_voters` then only serve as first contacts. Leader hints lead to
+  the rest.
+
+**Migration:** stop every keeper, add `catalog_voters` to every keeper and
+consumer configuration, and restart. The first record of the replicated
+catalog is a seed that the `catalog` keeper appends as its leader: a
+checkpoint of its single-keeper entries, which may be empty, and a seed
+marker. Another leader hands leadership to the `catalog` keeper for this.
+Until the seed is complete the catalog refuses claims, stages and "not found"
+answers, so it needs the `catalog` keeper once, at the first start. After
+that the single-keeper entries are never read or changed again. A consumer
+that still lacks `catalog_voters` can still reach the `catalog` keeper, but
+it does not follow a leader hint, so its creates fail while another keeper
+leads.
 
 Detected snapshot damage quarantines the affected replica across restarts.
 Detected corruption of the keeper identity, WAL, or its trusted boundary
@@ -406,8 +456,8 @@ served. A live leader's lease can still refuse the ballot.
 
 `ConsensusJournal` implements `journal_contract::Journal` over consensus
 streams. Construct it from client credentials and a `JournalConfig` with the
-keeper inventory, the catalog keeper, the three voters and the quota for each
-stream it creates, the record limit and the operation deadline. Every
+keeper inventory, the catalog keeper and, with a replicated catalog, its
+`catalog_voters`, the three voters and the quota for each stream it creates, the record limit and the operation deadline. Every
 principal authorised as a writer can seal, append and trim.
 
 The contract identifies a writer by its authenticated principal. The journal
@@ -530,8 +580,10 @@ new leaders. Each keeper prints a count of every refusal it answered as
 The `consensus-testing` feature exports `testing::LocalCluster`. It starts
 three voter keepers in distinct failure domains and a catalog keeper on
 loopback, with enrolled media and a private CA, issues client certificates
-for named principals and can stop and restart individual keepers. The
-contract conformance suite and a full-restart test run against it.
+for named principals and can stop and restart individual keepers.
+`LocalCluster::start_replicated_catalog` hosts a replicated catalog on two
+voters and the catalog keeper instead. The contract conformance suite and a
+full-restart test run against both.
 
 ```sh
 cargo test --locked --features consensus-testing --test consensus_journal_conformance

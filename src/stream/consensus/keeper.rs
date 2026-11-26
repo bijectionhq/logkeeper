@@ -1,4 +1,5 @@
 mod admission;
+mod catalog_stream;
 mod ingress;
 mod park;
 mod repair;
@@ -90,6 +91,12 @@ pub struct Config {
     pub domains: Domains,
     pub enrollment: PathBuf,
     pub catalog: uuid::Uuid,
+    /// Three keepers in distinct failure domains that host the catalog as a
+    /// consensus stream of its own. Without them `catalog` alone holds it.
+    /// `catalog` must be one of them: it seeds the replicated catalog with
+    /// its single-keeper entries once.
+    #[serde(default)]
+    pub catalog_voters: Option<[uuid::Uuid; 3]>,
     pub readers: Vec<String>,
     pub writers: Vec<String>,
     pub administrators: Vec<String>,
@@ -186,7 +193,15 @@ impl Config {
                 "inventory does not match its trusted placement authority",
             ));
         }
-        Placement::new(&self.keepers, authority.domains)
+        let placement = Placement::new(&self.keepers, authority.domains)?;
+        if let Some(voters) = &self.catalog_voters
+            && (!placement.roster(voters) || !voters.contains(&self.catalog))
+        {
+            return Err(invalid(
+                "catalog voters must be three sorted keepers in distinct domains, one the catalog",
+            ));
+        }
+        Ok(placement)
     }
 
     pub async fn serve(self, listener: TcpListener, stop: CancellationToken) -> io::Result<()> {
@@ -278,7 +293,11 @@ impl Config {
             timed,
             id,
             catalog_id: self.catalog,
-            catalog: (id == self.catalog).then(|| Catalog::new(disk.clone())),
+            catalog: (id == self.catalog && self.catalog_voters.is_none())
+                .then(|| Catalog::new(disk.clone())),
+            catalog_stream: self
+                .catalog_voters
+                .map(|voters| catalog_stream::CatalogStream::new(voters, self.catalog)),
             disk,
             rpc,
             control,
@@ -329,6 +348,7 @@ struct Engine {
     id: uuid::Uuid,
     catalog_id: uuid::Uuid,
     catalog: Option<Catalog>,
+    catalog_stream: Option<catalog_stream::CatalogStream>,
     disk: Disk,
     rpc: Rpc,
     control: Rpc,
@@ -412,6 +432,13 @@ impl Engine {
                 repairing.repair_loop().await;
                 Ok(())
             });
+            if self.catalog_stream.is_some() {
+                let tending = self.clone();
+                sockets.spawn(async move {
+                    tending.tend_catalog_stream().await;
+                    Ok(())
+                });
+            }
             tokio::spawn(super::metrics::report(
                 self.id,
                 Duration::from_secs(5),
@@ -774,6 +801,15 @@ impl Engine {
         self.require_media()?;
         let owner = self.authorize(identity, &request)?;
         let stream = request.stream();
+        if self.catalog_stream.is_some()
+            && matches!(identity, Identity::Client(_))
+            && catalog_stream::internal(&request)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the catalog stream is internal",
+            ));
+        }
         match request {
             Request::KeeperStatus(stream) => Ok(Reply::Status(self.status(stream).await)),
             Request::LocalCopy(_) => Ok(self
@@ -815,6 +851,11 @@ impl Engine {
                     through,
                 )
                 .await
+            }
+            Request::Claim(_) | Request::Locate(_) | Request::Stage(_)
+                if self.catalog_stream.is_some() =>
+            {
+                self.serve_catalog_stream(request).await
             }
             Request::Claim(genesis) => self.catalog()?.claim(genesis, &self.placement).await,
             Request::Locate(stream) => self.catalog()?.locate(stream),
@@ -1126,7 +1167,9 @@ impl Engine {
     }
 
     async fn catalog_request(&self, request: Request) -> io::Result<Reply> {
-        if let Some(catalog) = &self.catalog {
+        if self.catalog_stream.is_some() {
+            self.ask_catalog_stream(request).await
+        } else if let Some(catalog) = &self.catalog {
             match request {
                 Request::Locate(stream) => catalog.locate(stream),
                 Request::Stage(stage) => catalog.stage(stage, &self.placement).await,

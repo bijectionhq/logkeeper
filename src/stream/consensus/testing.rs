@@ -5,6 +5,8 @@
 //! and a catalog keeper, each with its own enrolled media, TLS identity and
 //! data directory. Consumers open [`ConsensusJournal`] handles for named
 //! client principals and can stop and restart individual keepers.
+//! [`LocalCluster::start_replicated_catalog`] instead hosts the catalog as a
+//! consensus stream on two voters and the catalog keeper.
 
 use std::{
     collections::BTreeMap,
@@ -52,6 +54,7 @@ pub struct LocalCluster {
     keepers: Keepers,
     voters: [Uuid; 3],
     catalog: Uuid,
+    catalog_voters: Option<[Uuid; 3]>,
     issued: Mutex<BTreeMap<String, Credentials>>,
 }
 
@@ -59,32 +62,40 @@ impl LocalCluster {
     /// Starts the keepers. Every listed principal may read, write and
     /// administer streams.
     pub async fn start(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false, 600).await
+        Self::start_with(principals, false, 600, false).await
+    }
+
+    /// Starts the keepers with a replicated catalog on voters 1 and 2 and
+    /// the catalog keeper, which seeds it.
+    pub async fn start_replicated_catalog(principals: &[&str]) -> io::Result<Self> {
+        Self::start_with(principals, false, 600, true).await
     }
 
     /// Starts the keepers so that a stream idle for `park_after_secs` is
     /// parked on every voter.
     pub async fn start_parking(principals: &[&str], park_after_secs: u64) -> io::Result<Self> {
-        Self::start_with(principals, false, park_after_secs).await
+        Self::start_with(principals, false, park_after_secs, false).await
     }
 
     /// Starts the keepers with timed-original authority: each keeper signs
     /// with its own Ed25519 key and samples a wall clock shifted by
     /// [`LocalCluster::shift_timed_clock`].
     pub async fn start_timed(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, true, 600).await
+        Self::start_with(principals, true, 600, false).await
     }
 
     async fn start_with(
         principals: &[&str],
         timed: bool,
         park_after_secs: u64,
+        replicated: bool,
     ) -> io::Result<Self> {
         let dir = tempfile::tempdir()?;
         let roots = dir.path().join("ca.pem");
         let issuer = authority(&roots)?;
         let voters = [1, 2, 3].map(Uuid::from_u128);
         let catalog = Uuid::from_u128(4);
+        let catalog_voters = replicated.then_some([voters[0], voters[1], catalog]);
         let roster = voters.into_iter().chain([catalog]).collect::<Vec<_>>();
         let domains: Domains = roster
             .iter()
@@ -144,6 +155,7 @@ impl LocalCluster {
             keepers: keepers.clone(),
             voters,
             catalog,
+            catalog_voters,
             issued: Mutex::default(),
             dir,
         };
@@ -167,6 +179,7 @@ impl LocalCluster {
                 domains: domains.clone(),
                 enrollment: enrollment.clone(),
                 catalog,
+                catalog_voters,
                 readers: principals.clone(),
                 writers: principals.clone(),
                 administrators: principals.clone(),
@@ -209,6 +222,11 @@ impl LocalCluster {
         self.catalog
     }
 
+    /// The replicated catalog's voters, when the cluster runs one.
+    pub fn catalog_voters(&self) -> Option<[Uuid; 3]> {
+        self.catalog_voters
+    }
+
     pub fn keepers(&self) -> &Keepers {
         &self.keepers
     }
@@ -218,6 +236,7 @@ impl LocalCluster {
         JournalConfig {
             keepers: self.keepers.clone(),
             catalog: self.catalog,
+            catalog_voters: self.catalog_voters,
             voters: Some(self.voters),
             placement: None,
             draining: Default::default(),

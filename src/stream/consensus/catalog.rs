@@ -1,10 +1,14 @@
 //! The catalog assigns one immutable genesis. Later contacts help discovery
 //! while the stream's own membership log decides voting authority.
+//!
+//! A single keeper holds the catalog on its own media unless keepers name
+//! `catalog_voters`; then the catalog is a consensus stream of its own (see
+//! `keeper/catalog_stream.rs`), and callers find its leader with [`ask`].
 
-use std::{io, sync::Arc};
+use std::{collections::BTreeSet, io, sync::Arc, time::Duration};
 
 use journal_contract::{JournalError, Lsn, StreamId};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::Instant};
 
 use super::{
     Genesis, Stage, invalid,
@@ -94,4 +98,42 @@ impl Catalog {
         }
         Ok(())
     }
+}
+
+/// Asks the replicated catalog's voters in `order`, following leader hints,
+/// until one gives an answer other than a hint or `Unavailable`. Rounds
+/// repeat until `end`.
+pub(super) async fn ask<F>(
+    order: &[uuid::Uuid],
+    end: Instant,
+    mut call: impl FnMut(uuid::Uuid) -> F,
+) -> Option<(uuid::Uuid, Reply)>
+where
+    F: Future<Output = io::Result<Reply>>,
+{
+    while Instant::now() < end {
+        let mut visited = BTreeSet::new();
+        let mut pending = order.to_vec();
+        pending.reverse();
+        while let Some(keeper) = pending.pop() {
+            if Instant::now() >= end {
+                return None;
+            }
+            if !visited.insert(keeper) {
+                continue;
+            }
+            match call(keeper).await {
+                Ok(Reply::Leader(Some(leader))) => pending.push(leader),
+                Ok(Reply::Leader(None))
+                | Ok(Reply::Decision(Outcome::Refused(JournalError::Unavailable)))
+                | Err(_) => (),
+                Ok(reply) => return Some((keeper, reply)),
+            }
+        }
+        tokio::time::sleep(
+            Duration::from_millis(50).min(end.saturating_duration_since(Instant::now())),
+        )
+        .await;
+    }
+    None
 }

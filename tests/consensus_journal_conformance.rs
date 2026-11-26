@@ -32,6 +32,60 @@ async fn consensus_journal_satisfies_the_contract() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consensus_journal_with_a_replicated_catalog_satisfies_the_contract() {
+    let mut cluster = LocalCluster::start_replicated_catalog(&PRINCIPALS)
+        .await
+        .unwrap();
+    let config = cluster.journal_config(
+        conformance::LIMITS.stream_quota_bytes,
+        conformance::LIMITS.max_record_bytes,
+    );
+    assert!(config.catalog_voters.is_some());
+    let journals = PRINCIPALS.map(|principal| cluster.journal(principal, &config).unwrap());
+    conformance::run(|identity| {
+        let index = PRINCIPALS
+            .iter()
+            .position(|principal| identity.as_str() == *principal)
+            .expect("conformance identity has a principal");
+        Arc::new(journals[index].clone()) as Arc<dyn Journal>
+    })
+    .await;
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replicated_catalog_creates_without_its_seeding_keeper_and_survives_restart() {
+    use bytes::Bytes;
+    use journal_contract::{Epoch, Lsn, StreamId};
+
+    let mut cluster = LocalCluster::start_replicated_catalog(&PRINCIPALS)
+        .await
+        .unwrap();
+    let config = cluster.journal_config(1 << 20, 4096);
+    let journal = cluster.journal(PRINCIPALS[0], &config).unwrap();
+    journal.create(StreamId(70)).await.unwrap();
+    cluster.stop(cluster.catalog()).await.unwrap();
+    let stream = StreamId(71);
+    journal.create(stream).await.unwrap();
+    assert_eq!(journal.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
+    assert_eq!(
+        journal
+            .append(stream, Epoch(1), Lsn(1), Bytes::from_static(b"one"))
+            .await,
+        Ok(Lsn(1))
+    );
+    cluster.restart(cluster.catalog()).await.unwrap();
+    cluster.shutdown().await.unwrap();
+    for keeper in cluster.voters().into_iter().chain([cluster.catalog()]) {
+        cluster.restart(keeper).await.unwrap();
+    }
+    let cold = cluster.journal(PRINCIPALS[1], &config).unwrap();
+    assert_eq!(cold.head(stream).await, Ok(Lsn(1)));
+    assert_eq!(journal.create(StreamId(72)).await, Ok(()));
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn contract_state_survives_a_full_keeper_restart() {
     use bytes::Bytes;
     use journal_contract::{Epoch, JournalError, Lsn, StreamId};

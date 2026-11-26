@@ -24,7 +24,11 @@ const PARK_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Engine {
     /// Whether `group` served no client and grew no log for the park delay.
+    /// The replicated catalog is never idle.
     fn idle(&self, group: &Group, now: Instant) -> bool {
+        if self.catalog_stream.is_some() && group.genesis.stream == super::catalog_stream::STREAM {
+            return false;
+        }
         let metrics = group.raft.metrics().borrow_watched().clone();
         let mut activity = self.activity.lock();
         let entry = activity
