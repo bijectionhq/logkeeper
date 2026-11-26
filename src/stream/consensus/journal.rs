@@ -3,14 +3,15 @@
 //! RTDB Multi and other contract consumers use [`ConsensusJournal`] without
 //! knowing about voter placement, fences or the consensus client.
 
-use std::{io, path::Path, time::Duration};
+use std::{collections::BTreeSet, io, path::Path, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, Result, StreamId};
+use parking_lot::RwLock;
 use serde::Deserialize;
 
 use super::{
-    Client, Credentials, Fence, Keepers, MAX_RECORD,
+    Client, Configuration, Credentials, Domains, Fence, Keepers, MAX_RECORD, assignment,
     state::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS},
 };
 
@@ -29,8 +30,18 @@ pub struct JournalConfig {
     pub keepers: Keepers,
     /// The keeper that assigns stream genesis.
     pub catalog: uuid::Uuid,
-    /// The three voters of every stream this consumer creates.
-    pub voters: [uuid::Uuid; 3],
+    /// The three voters of every stream this consumer creates. Give either
+    /// this fixed roster or `placement`.
+    #[serde(default)]
+    pub voters: Option<[uuid::Uuid; 3]>,
+    /// Keepers eligible to vote, with their failure domains. Each created
+    /// stream gets three of them in distinct domains.
+    #[serde(default)]
+    pub placement: Option<Domains>,
+    /// Placement keepers that streams move off. They keep serving until
+    /// every stream has moved.
+    #[serde(default)]
+    pub draining: BTreeSet<uuid::Uuid>,
     /// Retained byte quota of every stream this consumer creates.
     pub quota_bytes: u64,
     /// Largest record this consumer may append, at most 4 MiB.
@@ -51,7 +62,69 @@ fn default_deadline_ms() -> u64 {
 
 impl JournalConfig {
     pub fn read(path: &Path) -> io::Result<Self> {
-        Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+        let config: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+        if self.max_record_bytes == 0 || self.max_record_bytes > MAX_RECORD {
+            return Err(invalid(
+                "journal record limit must be between 1 byte and 4 MiB",
+            ));
+        }
+        match (&self.voters, &self.placement) {
+            (Some(voters), None) if voters.iter().all(|voter| self.keepers.contains_key(voter)) => {
+                ()
+            }
+            (None, Some(placement))
+                if placement
+                    .keys()
+                    .all(|keeper| self.keepers.contains_key(keeper))
+                    && self
+                        .draining
+                        .iter()
+                        .all(|keeper| placement.contains_key(keeper)) => {}
+            _ => {
+                return Err(invalid(
+                    "a journal configuration names fixed voters or a placement of known keepers",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Where streams are placed. Fixed rosters never move.
+#[derive(Clone, Debug)]
+enum Placement {
+    Fixed([uuid::Uuid; 3]),
+    Ranked { eligible: Domains },
+}
+
+impl Placement {
+    fn new(config: &JournalConfig) -> Self {
+        match (config.voters, &config.placement) {
+            (Some(voters), _) => Self::Fixed(voters),
+            (None, Some(placement)) => Self::Ranked {
+                eligible: placement
+                    .iter()
+                    .filter(|(keeper, _)| !config.draining.contains(keeper))
+                    .map(|(keeper, domain)| (*keeper, domain.clone()))
+                    .collect(),
+            },
+            (None, None) => unreachable!("validated journal configuration"),
+        }
+    }
+
+    fn voters(&self, stream: StreamId) -> Result<[uuid::Uuid; 3]> {
+        match self {
+            Self::Fixed(voters) => Ok(*voters),
+            Self::Ranked { eligible } => {
+                assignment::choose(stream, eligible).ok_or(JournalError::Unavailable)
+            }
+        }
     }
 }
 
@@ -59,19 +132,14 @@ impl JournalConfig {
 #[derive(Clone)]
 pub struct ConsensusJournal {
     client: Client,
-    voters: [uuid::Uuid; 3],
+    placement: Arc<RwLock<Placement>>,
     quota_bytes: u64,
     max_record_bytes: usize,
 }
 
 impl ConsensusJournal {
     pub fn new(credentials: &Credentials, config: &JournalConfig) -> io::Result<Self> {
-        if config.max_record_bytes == 0 || config.max_record_bytes > MAX_RECORD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "journal record limit must be between 1 byte and 4 MiB",
-            ));
-        }
+        config.validate()?;
         let client = Client::new(
             credentials,
             config.keepers.clone(),
@@ -80,10 +148,37 @@ impl ConsensusJournal {
         )?;
         Ok(Self {
             client,
-            voters: config.voters,
+            placement: Arc::new(RwLock::new(Placement::new(config))),
             quota_bytes: config.quota_bytes,
             max_record_bytes: config.max_record_bytes,
         })
+    }
+
+    /// Applies a changed eligible keeper set or draining list. The keeper
+    /// inventory, quota and limits stay as constructed.
+    pub fn update_placement(&self, config: &JournalConfig) -> io::Result<()> {
+        config.validate()?;
+        *self.placement.write() = Placement::new(config);
+        Ok(())
+    }
+
+    /// Moves one voter of `stream` toward its placement when a current voter
+    /// is draining, no longer eligible, or shares a failure domain. Returns
+    /// the new configuration after a move, or `None` when the roster already
+    /// fits or no eligible keeper can take the voter. Call it again until it
+    /// returns `None`. Fixed rosters never move.
+    pub async fn reconcile_placement(&self, stream: StreamId) -> Result<Option<Configuration>> {
+        let Placement::Ranked { eligible } = self.placement.read().clone() else {
+            return Ok(None);
+        };
+        let current = self.client.configuration(stream).await?;
+        let Some(next) = assignment::next_roster(stream, current.voters, &eligible) else {
+            return Ok(None);
+        };
+        self.client
+            .replace(stream, current.revision, next)
+            .await
+            .map(Some)
     }
 
     /// Commits a contiguous group in LSN order and returns its last LSN.
@@ -175,7 +270,10 @@ impl ConsensusJournal {
 
 impl Journal for ConsensusJournal {
     fn create(&self, stream: StreamId) -> BoxFuture<'_, Result<()>> {
-        Box::pin(self.client.create(stream, self.voters, self.quota_bytes))
+        Box::pin(async move {
+            let voters = self.placement.read().voters(stream)?;
+            self.client.create(stream, voters, self.quota_bytes).await
+        })
     }
 
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, Result<Lsn>> {

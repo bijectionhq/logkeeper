@@ -213,3 +213,93 @@ async fn batches_commit_atomically_and_survive_restart_and_replacement() {
     cluster.restart(first).await.unwrap();
     cluster.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn placement_spreads_streams_and_drains_a_keeper() {
+    use journal_contract::{Epoch, Lsn, StreamId};
+    use std::collections::BTreeSet;
+
+    let mut cluster = LocalCluster::start(&PRINCIPALS).await.unwrap();
+    let mut config = cluster.placement_config(1 << 20, 4096);
+    let journal = cluster.journal(PRINCIPALS[0], &config).unwrap();
+    let streams = (100..112).map(StreamId).collect::<Vec<_>>();
+    let mut rosters = Vec::new();
+    for stream in &streams {
+        journal.create(*stream).await.unwrap();
+        // A retried create derives the same voters.
+        journal.create(*stream).await.unwrap();
+        journal.seal(*stream, Epoch(1)).await.unwrap();
+        journal
+            .append_batch(
+                *stream,
+                Epoch(1),
+                (1..=20).map(|at| (Lsn(at), batch_record(at))).collect(),
+            )
+            .await
+            .unwrap();
+        rosters.push(journal.client().configuration(*stream).await.unwrap());
+    }
+    let carried = rosters
+        .iter()
+        .flat_map(|roster| roster.voters)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(carried.len(), 4, "placement uses every eligible keeper");
+    for stream in &streams {
+        assert_eq!(journal.reconcile_placement(*stream).await, Ok(None));
+    }
+
+    // Drain one voter keeper. Only the streams on it move, one voter each.
+    let drained = cluster.voters()[0];
+    config.draining.insert(drained);
+    journal.update_placement(&config).unwrap();
+    let mut moved = 0;
+    for (stream, before) in streams.iter().zip(&rosters) {
+        let change = journal.reconcile_placement(*stream).await.unwrap();
+        if before.voters.contains(&drained) {
+            let after = change.expect("a stream on the drained keeper moves");
+            assert!(!after.voters.contains(&drained));
+            assert_eq!(
+                after
+                    .voters
+                    .iter()
+                    .filter(|voter| before.voters.contains(voter))
+                    .count(),
+                2
+            );
+            assert!(after.revision > before.revision);
+            moved += 1;
+        } else {
+            assert_eq!(change, None);
+        }
+        assert_eq!(journal.reconcile_placement(*stream).await, Ok(None));
+    }
+    assert!(moved > 0);
+    // The drained keeper can stop. Every stream keeps its records and quorum.
+    cluster.stop(drained).await.unwrap();
+    for stream in &streams {
+        assert_eq!(journal.head(*stream).await, Ok(Lsn(20)));
+        assert_eq!(
+            read_all(&journal, *stream, 20).await,
+            (1..=20)
+                .map(|at| (Lsn(at), batch_record(at)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            journal
+                .append(
+                    *stream,
+                    Epoch(1),
+                    Lsn(21),
+                    bytes::Bytes::from_static(b"after drain")
+                )
+                .await,
+            Ok(Lsn(21))
+        );
+    }
+    // A fixed roster never moves.
+    let fixed = cluster
+        .journal(PRINCIPALS[0], &cluster.journal_config(1 << 20, 4096))
+        .unwrap();
+    assert_eq!(fixed.reconcile_placement(streams[0]).await, Ok(None));
+    cluster.shutdown().await.unwrap();
+}

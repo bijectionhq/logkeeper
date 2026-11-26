@@ -140,10 +140,27 @@ impl LocalCluster {
         JournalConfig {
             keepers: self.keepers.clone(),
             catalog: self.catalog,
-            voters: self.voters,
+            voters: Some(self.voters),
+            placement: None,
+            draining: Default::default(),
             quota_bytes,
             max_record_bytes,
             deadline_ms: 10_000,
+        }
+    }
+
+    /// A contract configuration that places each stream on three of the
+    /// four keepers, each in its own failure domain.
+    pub fn placement_config(&self, quota_bytes: u64, max_record_bytes: usize) -> JournalConfig {
+        let domains = self
+            .configs
+            .values()
+            .map(|config| (config.keeper, config.domains[&config.keeper].clone()))
+            .collect();
+        JournalConfig {
+            voters: None,
+            placement: Some(domains),
+            ..self.journal_config(quota_bytes, max_record_bytes)
         }
     }
 

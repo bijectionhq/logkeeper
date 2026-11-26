@@ -1,6 +1,7 @@
 //! Keeper-hosted stream consensus. Each stream has a Raft group, and each
 //! keeper shares one durable log across all of its groups.
 
+mod assignment;
 mod catalog;
 mod client;
 mod decisions;

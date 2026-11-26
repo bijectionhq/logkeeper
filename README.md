@@ -417,6 +417,17 @@ records already retained with identical bytes returns the batch's last LSN.
 An error can leave a committed prefix of whole batches. `Client::append_batch`
 exposes one batch directly.
 
+A `JournalConfig` names either fixed `voters` for every stream or a
+`placement`: the eligible keepers with their failure domains, plus an
+optional `draining` list. With a placement, `create` chooses three eligible,
+non-draining keepers in distinct domains by rendezvous ranking of the stream
+and keeper identities, so every consumer derives the same voters.
+`update_placement` applies a changed eligible set or draining list.
+`reconcile_placement` keeps every voter that is still eligible in a distinct
+domain, replaces one other voter through `replace`, and returns the new
+configuration. Call it until it returns `None`. A keeper that is unreachable
+but still eligible is never replaced, because the quorum tolerates it.
+
 The `consensus-testing` feature exports `testing::LocalCluster`. It starts
 three voter keepers in distinct failure domains and a catalog keeper on
 loopback, with enrolled media and a private CA, issues client certificates
