@@ -83,8 +83,64 @@ impl Engine {
                 () = self.stop.cancelled() => return,
                 _ = schedule.tick() => {
                     self.repair_once().await;
+                    self.retire_removed().await;
                     self.park_idle().await;
                 }
+            }
+        }
+    }
+
+    /// Retires this keeper's copy of a stream that has heard from no leader
+    /// for the repair delay and whose current placement, certified by another
+    /// keeper, no longer names this keeper. That copy belongs to a voter
+    /// replaced while it was down or moved off by a drain.
+    async fn retire_removed(&self) {
+        let groups = self
+            .groups
+            .lock()
+            .await
+            .iter()
+            .map(|(stream, group)| (*stream, group.clone()))
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        let orphaned = groups
+            .iter()
+            .filter(|(_, group)| {
+                group.raft.metrics().borrow_watched().state != ServerState::Leader
+                    && now.duration_since(*group.heard.lock()) >= self.repair_after
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for (stream, group) in orphaned {
+            let Some(generation) = self
+                .disk
+                .ownership(stream)
+                .and_then(|book| book.generation())
+            else {
+                continue;
+            };
+            for authority in self.placement.domains().keys().copied() {
+                if authority == self.id {
+                    continue;
+                }
+                let Ok(proof) = self.verified_proof(authority, &group.genesis).await else {
+                    continue;
+                };
+                let named = proof.configuration.voters.contains(&self.id)
+                    || proof.joint.is_some_and(|roster| roster.contains(&self.id));
+                if !named {
+                    let result = self
+                        .retire_copy(stream, authority, proof.configuration.revision, generation)
+                        .await;
+                    eprintln!(
+                        "logkeeper retired its removed copy of stream {stream:?}: {}",
+                        match result {
+                            Ok(_) => "retired".to_owned(),
+                            Err(error) => error.to_string(),
+                        }
+                    );
+                }
+                break;
             }
         }
     }

@@ -2585,3 +2585,42 @@ async fn idle_streams_park_on_every_voter_and_reopen_on_request() {
     assert_eq!(page.records.len(), 2);
     cluster.stop_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_voter_retires_its_copy_when_it_returns() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(54);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let initial = journal.configuration(stream).await.unwrap();
+    let leader = cluster.leader_after_head(&journal, stream).await;
+    let down = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    let generation = journal.replica_generation(stream, down).await.unwrap();
+    cluster.running.remove(&down).unwrap().stop().await;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(configuration) = journal.configuration(stream).await
+                && configuration.revision > initial.revision
+                && !configuration.voters.contains(&down)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the leader replaced the down voter");
+    cluster.restart(down).await;
+    // The returning keeper finds no leader, learns it was removed, and
+    // retires its copy.
+    timeout(Duration::from_secs(30), async {
+        while journal.replica_generation(stream, down).await == Ok(generation) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the returning keeper retired its removed copy");
+    assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
+    cluster.stop_all().await;
+}

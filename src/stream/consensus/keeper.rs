@@ -660,6 +660,7 @@ impl Engine {
             heads,
             writes: Arc::new(Semaphore::new(MAX_PENDING_WRITES)),
             used: parking_lot::Mutex::new(Instant::now()),
+            heard: parking_lot::Mutex::new(Instant::now()),
             stop: self.stop.child_token(),
         });
         self.groups
@@ -1161,6 +1162,8 @@ struct Group {
     writes: Arc<Semaphore>,
     /// When a request last reached this group.
     used: parking_lot::Mutex<Instant>,
+    /// When this replica last received an append from a leader.
+    heard: parking_lot::Mutex<Instant>,
     stop: CancellationToken,
 }
 

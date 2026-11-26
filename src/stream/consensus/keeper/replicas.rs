@@ -15,7 +15,11 @@ use crate::stream::consensus::{
 };
 
 impl Engine {
-    async fn verified_proof(&self, authority: Uuid, genesis: &Genesis) -> io::Result<Proof> {
+    pub(super) async fn verified_proof(
+        &self,
+        authority: Uuid,
+        genesis: &Genesis,
+    ) -> io::Result<Proof> {
         if authority == self.id {
             return Err(invalid(
                 "replica ownership requires independent placement evidence",

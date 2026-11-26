@@ -434,8 +434,9 @@ and keeper identities, so every consumer derives the same voters.
 `update_placement` applies a changed eligible set or draining list.
 `reconcile_placement` keeps every voter that is still eligible in a distinct
 domain, replaces one other voter through `replace`, and returns the new
-configuration. Call it until it returns `None`. A keeper that is unreachable
-but still eligible is never replaced, because the quorum tolerates it.
+configuration. Call it until it returns `None`. It also moves a voter whose
+keeper does not answer; the stream's leader does the same on its own after
+`repair_after_secs`, described below.
 
 Every keeper answers `KeeperStatus`: whether its media is healthy with room
 for new streams, how many streams it hosts and leads, and whether it holds a
@@ -453,7 +454,10 @@ the best-ranked live keeper with room in a free failure domain, through the
 same staged joint change as `replace`. Nothing moves unless two voters are
 live, and a keeper repairs at most one stream every 30 seconds. A stream
 that lost two voters has no quorum to change its membership and needs an
-operator.
+operator. A replica that hears from no leader for the repair delay asks
+other keepers for the stream's current placement; when that placement no
+longer names it, the keeper retires its copy, so a voter replaced while it
+was down, or moved off by a drain, frees its slot and disk when it returns.
 
 A stream that served no client and appended nothing for `park_after_secs`
 (600 by default) is parked: its leader asks each follower holding exactly
