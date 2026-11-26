@@ -2,13 +2,15 @@ use std::{collections::BTreeSet, time::Duration};
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use journal_contract::{JournalError, Lsn, Page, Result, StreamId};
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep_until};
 use uuid::Uuid;
 
 use super::{Client, Configuration, Frame, Genesis, Outcome, Reply, Request, Route, remaining};
 use crate::stream::consensus::{MAX_PAGE, MAX_RECORD, MAX_RECORDS_PER_PAGE, network::Proof};
 
 const HEDGE_DELAY: Duration = Duration::from_millis(25);
+/// How long past its wait a long poll runs before the read hedges.
+const LONG_POLL_MARGIN: Duration = Duration::from_millis(250);
 const DISCOVERY_ATTEMPTS: usize = 8;
 const FALLBACK_ATTEMPTS: usize = 8;
 
@@ -89,25 +91,41 @@ impl Client {
             tried.insert(first);
             let mut pending = FuturesUnordered::new();
             pending.push(call(first));
-            if let Some(&alternate) = preferred.get(1) {
+            let mut alternates = preferred[1..].iter().copied().peekable();
+            let mut delay = hedge_delay(wait);
+            let mut hedge_at = Instant::now() + delay;
+            loop {
+                let hedging = alternates.peek().is_some() && !remaining(deadline).is_zero();
                 tokio::select! {
                     biased;
                     reply = pending.next() => {
-                        if let Some((keeper, reply)) = reply
-                            && let Some(page) = accept(&mut view, keeper, reply)
-                        {
+                        let Some((keeper, reply)) = reply else { break };
+                        let pages = view.pages;
+                        if let Some(page) = accept(&mut view, keeper, reply) {
                             return Ok(page);
                         }
+                        // A voter that waited out a long poll answered it.
+                        if !wait.is_zero() && view.pages > pages {
+                            return view.finish();
+                        }
+                        // A failed voter is hedged at once.
+                        if pending.is_empty()
+                            && hedging
+                            && let Some(next) = alternates.next()
+                        {
+                            tried.insert(next);
+                            pending.push(call(next));
+                            hedge_at = Instant::now() + delay;
+                        }
                     }
-                    _ = sleep(HEDGE_DELAY.min(remaining(deadline))), if !remaining(deadline).is_zero() => {
-                        tried.insert(alternate);
-                        pending.push(call(alternate));
+                    () = sleep_until(hedge_at.min(deadline)), if hedging => {
+                        if let Some(next) = alternates.next() {
+                            tried.insert(next);
+                            pending.push(call(next));
+                        }
+                        delay = delay.saturating_mul(2);
+                        hedge_at = Instant::now() + delay;
                     }
-                }
-            }
-            while let Some((keeper, reply)) = pending.next().await {
-                if let Some(page) = accept(&mut view, keeper, reply) {
-                    return Ok(page);
                 }
             }
         }
@@ -247,6 +265,18 @@ impl Client {
     }
 }
 
+/// How long a read waits for one voter before it also asks the next. A
+/// short read hedges after 25 ms. A long poll is expected to wait, so it
+/// hedges only once its wait and a margin have passed; a failed voter is
+/// hedged at once either way. Each later hedge waits twice as long.
+fn hedge_delay(wait: Duration) -> Duration {
+    if wait.is_zero() {
+        HEDGE_DELAY
+    } else {
+        wait.saturating_add(LONG_POLL_MARGIN)
+    }
+}
+
 impl Route {
     /// The voters to read from, in order: a voter in the client's own failure
     /// domain, then the keeper that answered last, then the rest.
@@ -320,6 +350,8 @@ fn checked_page(
 
 #[derive(Default)]
 struct Seen {
+    /// Valid pages received, empty or not.
+    pages: usize,
     empty: Option<Page>,
     floor: Option<Lsn>,
     deleted: bool,
@@ -327,6 +359,9 @@ struct Seen {
 
 impl Seen {
     fn record(&mut self, outcome: Outcome, limit: usize) -> Option<Page> {
+        if matches!(outcome, Outcome::Page(_)) {
+            self.pages += 1;
+        }
         match outcome {
             Outcome::Page(page) if !page.records.is_empty() || limit == 0 => return Some(page),
             Outcome::Page(page)

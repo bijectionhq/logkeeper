@@ -129,8 +129,11 @@ LSN and bytes while that fence and record are still retained. A fresh `head`
 confirms a quorum after invocation and waits for local application. A `read`
 returns one keeper's applied page and may lag. Use `read_at_least` to supply a
 minimum head, for example a position returned by an append. The client remembers
-an authenticated committed roster by stream and genesis and starts one alternate
-if its preferred keeper is still pending after 25 ms. It bounds discovery and
+an authenticated committed roster by stream and genesis and starts an alternate
+if its preferred keeper is still pending after 25 ms, or at once when that
+keeper fails. A read with a long-poll `wait` is expected to wait, so it hedges
+only once the wait plus 250 ms has passed, and an empty page from a keeper that
+waited it out answers the read; each further hedge waits twice as long. It bounds discovery and
 fallback to eight peers each, deduplicates page attempts and uses the operation
 deadline. A trusted catalog binding lookup can establish that a stream was
 never created. Unreachable or obsolete peers leave that question open.

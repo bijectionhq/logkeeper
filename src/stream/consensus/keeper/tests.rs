@@ -1918,9 +1918,10 @@ async fn preferred_read_hedges_once_and_discovers_a_disjoint_roster() {
         .engine
         .read_delay
         .store(200, Ordering::Relaxed);
+    // A short read hedges once to the next voter after 25 ms.
     assert_eq!(
         reader
-            .read_at_least(stream, Lsn(1), 1, Duration::from_secs(1), Lsn(1))
+            .read_at_least(stream, Lsn(1), 1, Duration::ZERO, Lsn(1))
             .await,
         Ok(first.clone())
     );
@@ -1973,6 +1974,68 @@ async fn preferred_read_hedges_once_and_discovers_a_disjoint_roster() {
             .await,
         Err(JournalError::Unavailable)
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_poll_waits_on_one_voter_without_hedging() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(44);
+    let journal = cluster.client(&cluster.credentials);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let fence = journal
+        .seal(stream, Epoch(0), Uuid::new_v4())
+        .await
+        .unwrap()
+        .fence;
+    journal
+        .append(stream, fence, Lsn(1), Bytes::from_static(b"first"))
+        .await
+        .unwrap();
+    // Learn the placement so the long poll goes to a preferred voter.
+    journal
+        .read_at_least(stream, Lsn(1), 1, Duration::ZERO, Lsn(1))
+        .await
+        .unwrap();
+    let reads = || {
+        [a, b, c]
+            .map(|id| {
+                cluster.running[&id]
+                    .engine
+                    .scoped_reads
+                    .load(Ordering::Relaxed)
+            })
+            .iter()
+            .sum::<u64>()
+    };
+    let before = reads();
+    let started = Instant::now();
+    let page = journal
+        .read(stream, Lsn(2), 1, Duration::from_millis(800))
+        .await
+        .unwrap();
+    assert!(page.records.is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(700));
+    // The long poll waited on one voter and was not hedged after 25 ms.
+    assert_eq!(reads() - before, 1);
+    // A record appended during the wait ends it on the same single request.
+    let before = reads();
+    let (page, appended) = tokio::join!(
+        journal.read(stream, Lsn(2), 1, Duration::from_secs(3)),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            journal
+                .append(stream, fence, Lsn(2), Bytes::from_static(b"second"))
+                .await
+        }
+    );
+    appended.unwrap();
+    assert_eq!(
+        page.unwrap().records,
+        [(Lsn(2), Bytes::from_static(b"second"))]
+    );
+    assert_eq!(reads() - before, 1);
+    cluster.stop_all().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
