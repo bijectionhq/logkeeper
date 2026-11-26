@@ -19,7 +19,7 @@ use crate::stream::consensus::decisions::{admits_body, admits_control, body_char
 #[cfg(test)]
 const MIB: usize = 1024 * 1024;
 const RECEIVER_SOCKETS: usize = 32;
-const SENDER_SOCKETS: usize = 4;
+const SENDER_SOCKETS: usize = 16;
 const IDLE_CONTROL_SOCKETS: usize = 64;
 
 fn busy() -> io::Error {
@@ -239,8 +239,12 @@ mod tests {
     #[test]
     fn one_sender_cannot_spend_the_shares_of_others_and_release_is_exact() {
         let ingress = Arc::new(ReplicationIngress::default());
-        // Each frame is charged at four times its size plus 64 KiB.
-        let frame = 5 * MIB;
+        // Each frame is charged at four times its size plus 64 KiB, so a
+        // sender's full frame count fits inside its byte share.
+        let frame = MIB;
+        assert!(
+            SENDER_FRAMES * (4 * frame + 64 * 1024) <= super::super::super::decisions::SENDER_BYTES
+        );
         let held = (0..SENDER_FRAMES)
             .map(|_| ingress.body(1, frame).unwrap())
             .collect::<Vec<_>>();

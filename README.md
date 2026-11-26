@@ -264,16 +264,16 @@ application command uses the replication lane, which shares the configured
 `bulk` address under its own ALPN. Control frames are limited to 64 KiB, and a
 control-lane frame carrying application entries is refused. The protocol WAL
 queue rejects application entries and oversized metadata. A peer batch holds
-at most four entries, matching `max_payload_entries`. An `Admitted` wrapper
+at most 64 entries, matching `max_payload_entries`. An `Admitted` wrapper
 decodes only one unwrapped application or staging command.
 
 The receiver reads the 4-byte length before allocating a replication body.
 Each in-flight body is charged at four times its encoded size plus 64 KiB to
-cover decoding and handoff copies. The receiver allows 256 MiB and 16 frames
-in total, with at most 96 MiB and four frames per authenticated sender
+cover decoding and handoff copies. The receiver allows 256 MiB and 48 frames
+in total, with at most 96 MiB and 16 frames per authenticated sender
 across all of its connections and streams. Replication sockets are capped at 32
-per receiver and four per sender. Control work is capped at 24 requests in
-total and four per sender. At most 64 idle control connections wait for a
+per receiver and 16 per sender. Control work is capped at 48 requests in
+total and 16 per sender, leaving 32 for other senders. At most 64 idle control connections wait for a
 header, and the oldest is closed first.
 
 Before dispatch into Raft storage, a follower reserves the batch's upper
@@ -293,12 +293,12 @@ boundary. Fresh `head`, commit and quorum rules are unchanged.
 The durable worker rotates through five queues after each completed round:
 peer control, covered maintenance, follower replication, ordinary
 application work and maintenance or incoming transfer. Empty queues are
-skipped. A round takes at most 16 records and stops after crossing 32 MiB.
+skipped. A round takes at most 128 records and stops after crossing 32 MiB.
 Each stream admits one follower batch at a time, so the follower queue holds
 at most one batch per stream, at most 16 in total, in FIFO order. A stream
 therefore cannot overtake itself, and a ready stream waits behind at most 15
-other streams. The per-sender transport caps limit one sender to four of
-those slots. This rotation over streams gives the checked `5 * W` service
+other streams. One sender's 16 frames can occupy all of those slots; the
+bound still holds. This rotation over streams gives the checked `5 * W` service
 bound with `W = 16`, assuming each earlier durable round completes. A sender
 splits a valid batch that exceeds its lane, and a single entry that cannot fit
 is unreachable.
@@ -468,8 +468,8 @@ client requests reopen it, and the first request after parking waits for
 one election. On one host, 128 idle streams used 0.09 CPU cores parked
 against 0.47 unparked.
 
-On peer lanes a keeper keeps at most four requests in flight to each other
-keeper, the most a receiver admits from one sender, and queues the rest
+On peer lanes a keeper keeps at most sixteen requests in flight to each
+other keeper, the most a receiver admits from one sender, and queues the rest
 instead of opening connections the receiver would refuse. A request that
 fails on a pooled connection the receiver had closed retries once on a
 fresh one, since peer messages are idempotent. A control frame over its

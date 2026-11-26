@@ -25,15 +25,15 @@ pub const SCRATCH_FLOOR: u64 = 50_331_648; // control, maintenance and external
 /// Replication transport limits for one receiving keeper.
 pub const RECEIVER_BYTES: usize = 268_435_456; // 256 MiB
 pub const SENDER_BYTES: usize = 100_663_296; // 96 MiB
-pub const RECEIVER_FRAMES: usize = 16;
-pub const SENDER_FRAMES: usize = 4;
+pub const RECEIVER_FRAMES: usize = 48;
+pub const SENDER_FRAMES: usize = 16;
 /// Each body is charged for its encoding, decoding and handoff copies.
 pub const BODY_COPIES: usize = 4;
 pub const BODY_OVERHEAD: usize = 65_536;
 
 /// Control work limits for one receiving keeper.
-pub const MAX_CONTROL_WORK: usize = 24;
-pub const CONTROL_PER_SENDER: usize = 4;
+pub const MAX_CONTROL_WORK: usize = 48;
+pub const CONTROL_PER_SENDER: usize = 16;
 
 /// Durable WAL lanes served in rotation.
 pub const LANES: usize = 5;
@@ -223,7 +223,7 @@ verus! {
             RECEIVER_BYTES - SENDER_BYTES == 167_772_160,
             SENDER_FRAMES < RECEIVER_FRAMES,
             CONTROL_PER_SENDER < MAX_CONTROL_WORK,
-            MAX_CONTROL_WORK - CONTROL_PER_SENDER == 20,
+            MAX_CONTROL_WORK - CONTROL_PER_SENDER == 32,
             LANES == 5,
             BODY_COPIES == 4,
             BODY_OVERHEAD == 65_536,

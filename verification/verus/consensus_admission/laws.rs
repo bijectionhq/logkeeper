@@ -79,7 +79,7 @@ fn one_sender_leaves_control_work_for_others(total: usize, sender: usize)
         assert(sender + 1 <= CONTROL_PER_SENDER);
     }
     proof { limits(); }
-    assert(MAX_CONTROL_WORK - CONTROL_PER_SENDER == 20);
+    assert(MAX_CONTROL_WORK - CONTROL_PER_SENDER == 32);
 }
 
 // PeerBudget.saturated_data_admits_control_and_maintenance and

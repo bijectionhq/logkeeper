@@ -445,8 +445,8 @@ struct Connections {
     lane: Lane,
 }
 
-const PEER_IN_FLIGHT: usize = 4;
-const POOLED_CHANNELS: usize = 4;
+const PEER_IN_FLIGHT: usize = 16;
+const POOLED_CHANNELS: usize = 16;
 
 impl Rpc {
     pub fn new(tls: TlsConnector, keepers: Keepers, lane: Lane) -> Self {
