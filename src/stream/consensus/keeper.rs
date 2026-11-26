@@ -1,5 +1,6 @@
 mod admission;
 mod ingress;
+mod park;
 mod repair;
 mod replacement;
 mod replicas;
@@ -65,6 +66,10 @@ fn default_repair_after_secs() -> u64 {
     600
 }
 
+fn default_park_after_secs() -> u64 {
+    600
+}
+
 /// Installed, authenticated keeper inventory and local service settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +92,10 @@ pub struct Config {
     /// How long a voter stays silent before its stream's leader replaces it.
     #[serde(default = "default_repair_after_secs")]
     pub repair_after_secs: u64,
+    /// How long a stream serves no client and appends nothing before its
+    /// voters park it.
+    #[serde(default = "default_park_after_secs")]
+    pub park_after_secs: u64,
     /// Installed timed-original trust and, on a signing keeper, its clock
     /// and attestation key, in the stream keeper's mount format.
     #[serde(default)]
@@ -280,6 +289,9 @@ impl Config {
             groups: Mutex::default(),
             deletions: parking_lot::Mutex::default(),
             deleted: parking_lot::RwLock::default(),
+            parked: parking_lot::RwLock::default(),
+            activity: parking_lot::Mutex::default(),
+            park_after: Duration::from_secs(self.park_after_secs),
             stop: stop.child_token(),
             #[cfg(test)]
             reject_append: Default::default(),
@@ -327,6 +339,11 @@ struct Engine {
     /// Deleted streams whose groups this keeper closed. Clients are answered
     /// `Deleted` and peers are refused instead of reopening the group.
     deleted: parking_lot::RwLock<HashSet<StreamId>>,
+    /// Idle streams whose groups this keeper closed until the next request.
+    parked: parking_lot::RwLock<HashSet<StreamId>>,
+    /// The last log index of each led stream and when it last changed.
+    activity: parking_lot::Mutex<HashMap<StreamId, (Option<u64>, Instant)>>,
+    park_after: Duration,
     stop: CancellationToken,
     #[cfg(test)]
     reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
@@ -791,6 +808,14 @@ impl Engine {
                             },
                             _ => Reply::Decision(refused),
                         });
+                    }
+                    if self.parked.write().remove(&stream)
+                        && let Some(genesis) = self.disk.genesis(stream)
+                    {
+                        // Reopen the parked stream; it elects a leader and
+                        // the client retries.
+                        super::metrics::count(&super::metrics::COUNTERS.unparked_by_client);
+                        let _ = self.group(genesis).await;
                     }
                     return Ok(Reply::Leader(None));
                 };

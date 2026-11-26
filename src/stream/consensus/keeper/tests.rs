@@ -120,6 +120,7 @@ impl Cluster {
                 administrators: vec![OWNER.into()],
                 max_streams: default_max_streams(),
                 repair_after_secs: 2,
+                park_after_secs: 3600,
                 timed_original: None,
                 timed_authority: None,
             };
@@ -2524,5 +2525,63 @@ async fn the_leader_replaces_a_voter_whose_keeper_stays_down() {
         2
     );
     assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_streams_park_on_every_voter_and_reopen_on_request() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    cluster.stop_all().await;
+    for config in cluster.configs.values_mut() {
+        config.park_after_secs = 2;
+    }
+    for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
+        cluster.restart(id).await;
+    }
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(53);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let fence = journal
+        .seal(stream, Epoch(0), uuid::Uuid::from_u128(9))
+        .await
+        .unwrap();
+    journal
+        .append(stream, fence.fence, Lsn(1), Bytes::from_static(b"one"))
+        .await
+        .unwrap();
+    // Every voter closes the idle group.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let mut open = 0;
+            for id in [a, b, c] {
+                open += usize::from(
+                    cluster.running[&id]
+                        .engine
+                        .groups
+                        .lock()
+                        .await
+                        .contains_key(&stream),
+                );
+            }
+            if open == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("every voter parked the idle stream");
+    // A request reopens it: the stream elects a leader and keeps its log.
+    assert_eq!(journal.head(stream).await, Ok(Lsn(1)));
+    journal
+        .append(stream, fence.fence, Lsn(2), Bytes::from_static(b"two"))
+        .await
+        .unwrap();
+    let page = journal
+        .read(stream, Lsn(1), 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.records.len(), 2);
     cluster.stop_all().await;
 }

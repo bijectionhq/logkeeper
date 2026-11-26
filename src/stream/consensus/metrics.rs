@@ -38,6 +38,10 @@ counters! {
     head_timeout: "head.timeout",
     peer_busy: "peer.busy",
     peer_unreachable: "peer.unreachable",
+    parked: "stream.parked",
+    unparked_by_peer: "stream.unparked_by_peer",
+    unparked_by_client: "stream.unparked_by_client",
+    park_declined: "stream.park_declined",
 }
 
 pub(super) static COUNTERS: Counters = Counters::new();

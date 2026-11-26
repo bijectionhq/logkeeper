@@ -59,17 +59,27 @@ impl LocalCluster {
     /// Starts the keepers. Every listed principal may read, write and
     /// administer streams.
     pub async fn start(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false).await
+        Self::start_with(principals, false, 600).await
+    }
+
+    /// Starts the keepers so that a stream idle for `park_after_secs` is
+    /// parked on every voter.
+    pub async fn start_parking(principals: &[&str], park_after_secs: u64) -> io::Result<Self> {
+        Self::start_with(principals, false, park_after_secs).await
     }
 
     /// Starts the keepers with timed-original authority: each keeper signs
     /// with its own Ed25519 key and samples a wall clock shifted by
     /// [`LocalCluster::shift_timed_clock`].
     pub async fn start_timed(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, true).await
+        Self::start_with(principals, true, 600).await
     }
 
-    async fn start_with(principals: &[&str], timed: bool) -> io::Result<Self> {
+    async fn start_with(
+        principals: &[&str],
+        timed: bool,
+        park_after_secs: u64,
+    ) -> io::Result<Self> {
         let dir = tempfile::tempdir()?;
         let roots = dir.path().join("ca.pem");
         let issuer = authority(&roots)?;
@@ -162,6 +172,7 @@ impl LocalCluster {
                 administrators: principals.clone(),
                 max_streams: 128,
                 repair_after_secs: 600,
+                park_after_secs,
                 timed_original: None,
                 timed_authority: keys.get(&id).map(|key| TimedAuthority {
                     verifier: verifier.clone(),

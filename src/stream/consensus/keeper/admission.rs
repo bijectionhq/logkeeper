@@ -131,7 +131,14 @@ impl Drop for Charge {
 pub(super) struct Control {
     idle: Mutex<VecDeque<(Uuid, CancellationToken)>>,
     work: Mutex<(usize, BTreeMap<NodeId, usize>)>,
+    freed: tokio::sync::Notify,
 }
+
+/// How long a control frame over its sender's share waits for a slot before
+/// the keeper refuses it. Many streams between the same keepers send their
+/// heartbeats together; a short wait absorbs that burst instead of resetting
+/// the connections.
+const CONTROL_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Control requests refused by `Control::admit`, across all keepers in a test
 /// process.
@@ -164,6 +171,25 @@ impl Control {
             idle: self,
             id,
             cancelled,
+        }
+    }
+
+    /// Admits one control frame, waiting up to `CONTROL_ADMISSION_WAIT` for
+    /// a slot under the same limits.
+    pub async fn admit_waiting(&self, sender: NodeId) -> io::Result<ControlWork<'_>> {
+        let deadline = tokio::time::Instant::now() + CONTROL_ADMISSION_WAIT;
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            match self.admit(sender) {
+                Ok(work) => return Ok(work),
+                Err(refused) => {
+                    if tokio::time::timeout_at(deadline, freed).await.is_err() {
+                        return Err(refused);
+                    }
+                }
+            }
         }
     }
 
@@ -201,6 +227,8 @@ impl Drop for ControlWork<'_> {
         if *count == 0 {
             work.1.remove(&self.sender);
         }
+        drop(work);
+        self.control.freed.notify_waiters();
     }
 }
 

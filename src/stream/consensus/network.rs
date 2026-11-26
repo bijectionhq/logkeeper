@@ -211,6 +211,12 @@ pub(super) enum PeerRequest {
     Snapshot(SnapshotChunk, [u8; 32]),
     PreVote(VoteRequest<RaftTypes>),
     TransferLeader(openraft::raft::TransferLeaderRequest<RaftTypes>),
+    /// The leader asks a follower holding exactly `last` under `vote` to park
+    /// the idle stream.
+    Park {
+        vote: Vote,
+        last: Option<LogId>,
+    },
 }
 
 /// One chunk of a snapshot transfer, in the OpenRaft 0.9
@@ -251,7 +257,9 @@ impl PeerRequest {
     pub fn lane(&self) -> Lane {
         let (kind, application) = match self {
             Self::Append(request) => (PeerKind::Append, has_application_entries(&request.entries)),
-            Self::Vote(_) | Self::PreVote(_) | Self::TransferLeader(_) => (PeerKind::Vote, false),
+            Self::Vote(_) | Self::PreVote(_) | Self::TransferLeader(_) | Self::Park { .. } => {
+                (PeerKind::Vote, false)
+            }
             Self::Snapshot(..) => (PeerKind::Snapshot, false),
         };
         match decisions::peer_lane(kind, application) {
@@ -268,6 +276,7 @@ impl PeerRequest {
                 Some(request.vote.leader_id().voted_for)
             }
             Self::TransferLeader(request) => Some(request.from_leader().leader_id().voted_for),
+            Self::Park { vote, .. } => Some(vote.leader_id().voted_for),
             Self::Snapshot(request, _) => Some(request.vote.leader_id().voted_for),
         }
     }
@@ -429,8 +438,15 @@ struct Connections {
     tls: TlsConnector,
     keepers: Keepers,
     idle: Mutex<HashMap<uuid::Uuid, Vec<Channel>>>,
+    /// In-flight requests per target on a peer lane. A receiver admits at
+    /// most `PEER_IN_FLIGHT` frames from one sender, so more connections
+    /// would only be refused; requests past it queue here instead.
+    in_flight: Mutex<HashMap<uuid::Uuid, Arc<tokio::sync::Semaphore>>>,
     lane: Lane,
 }
+
+const PEER_IN_FLIGHT: usize = 4;
+const POOLED_CHANNELS: usize = 4;
 
 impl Rpc {
     pub fn new(tls: TlsConnector, keepers: Keepers, lane: Lane) -> Self {
@@ -439,6 +455,7 @@ impl Rpc {
                 tls,
                 keepers,
                 idle: Mutex::default(),
+                in_flight: Mutex::default(),
                 lane,
             }),
         }
@@ -466,30 +483,64 @@ impl Rpc {
             .keepers()
             .get(&target)
             .ok_or_else(|| invalid("unknown keeper"))?;
+        let peer_lane = self.inner.lane != Lane::Application;
+        let _permit = if peer_lane {
+            let permits = self
+                .inner
+                .in_flight
+                .lock()
+                .entry(target)
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(PEER_IN_FLIGHT)))
+                .clone();
+            Some(permits.acquire_owned().await.map_err(io::Error::other)?)
+        } else {
+            None
+        };
         let cached = self.inner.idle.lock().get_mut(&target).and_then(Vec::pop);
+        let reused = cached.is_some();
         let mut channel = match cached {
             Some(channel) => channel,
-            None => {
-                let (peer, channel) = connect_protocol(
-                    &self.inner.tls,
-                    &address.to_string(),
-                    self.inner.lane.alpn(),
-                )
-                .await?;
-                if peer.0 != target.as_u128() {
-                    return Err(invalid("keeper certificate does not match route"));
-                }
-                channel
-            }
+            None => self.connect(target, address).await?,
         };
-        send(&mut channel, &request).await?;
-        let result = receive(&mut channel, MAX_MESSAGE).await?;
+        let mut result = Self::round_trip(&mut channel, &request).await;
+        // The receiver may have closed an idle pooled connection. Peer
+        // messages are idempotent, so they retry once on a fresh one.
+        if result.is_err() && reused && peer_lane {
+            channel = self.connect(target, address).await?;
+            result = Self::round_trip(&mut channel, &request).await;
+        }
+        let result = result?;
         let mut idle = self.inner.idle.lock();
         let idle = idle.entry(target).or_default();
-        if idle.len() < 4 {
+        if idle.len() < POOLED_CHANNELS {
             idle.push(channel);
         }
         Ok(result)
+    }
+
+    async fn connect(
+        &self,
+        target: uuid::Uuid,
+        address: &std::net::SocketAddr,
+    ) -> io::Result<Channel> {
+        let (peer, channel) = connect_protocol(
+            &self.inner.tls,
+            &address.to_string(),
+            self.inner.lane.alpn(),
+        )
+        .await?;
+        if peer.0 != target.as_u128() {
+            return Err(invalid("keeper certificate does not match route"));
+        }
+        Ok(channel)
+    }
+
+    async fn round_trip<T: DeserializeOwned>(
+        channel: &mut Channel,
+        request: &Frame,
+    ) -> io::Result<T> {
+        send(channel, request).await?;
+        receive(channel, MAX_MESSAGE).await
     }
 }
 
@@ -573,6 +624,7 @@ impl Peer {
             }
             Err(error) => {
                 super::metrics::count(&super::metrics::COUNTERS.peer_unreachable);
+                super::metrics::sample("peer.unreachable", || format!("{error:?}"));
                 Err(unreachable(&error).into())
             }
         }

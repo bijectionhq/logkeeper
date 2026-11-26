@@ -316,7 +316,7 @@ completeness as a premise, in the Lean worktree's
 `verification/lean/restart-read.md`.
 
 Keepers run OpenRaft 0.10.1. Its peer messages differ from 0.9 under
-bincode, so the peer ALPNs are `logkeeper-consensus-control/4`,
+bincode, so the peer ALPNs are `logkeeper-consensus-control/5`,
 `logkeeper-consensus-replication/2` and `logkeeper-consensus-bulk/2`. A keeper
 on an older version fails the TLS handshake with `no_application_protocol`
 instead of failing to decode. Mixed versions are unsupported: upgrade all
@@ -454,6 +454,22 @@ same staged joint change as `replace`. Nothing moves unless two voters are
 live, and a keeper repairs at most one stream every 30 seconds. A stream
 that lost two voters has no quorum to change its membership and needs an
 operator.
+
+A stream that served no client and appended nothing for `park_after_secs`
+(600 by default) is parked: its leader asks each follower holding exactly
+its applied log to close the group, then closes its own. A parked stream
+runs no timers and sends no heartbeats. A parked follower answers an empty
+heartbeat as busy without opening the group; entries, votes, snapshots and
+client requests reopen it, and the first request after parking waits for
+one election. On one host, 128 idle streams used 0.09 CPU cores parked
+against 0.47 unparked.
+
+On peer lanes a keeper keeps at most four requests in flight to each other
+keeper, the most a receiver admits from one sender, and queues the rest
+instead of opening connections the receiver would refuse. A request that
+fails on a pooled connection the receiver had closed retries once on a
+fresh one, since peer messages are idempotent. A control frame over its
+sender's share waits up to 100 ms for a slot before it is refused.
 
 A keeper with `timed_original` in its configuration, in the stream keeper's
 mount format, holds installed keeper trust and, when signing, a commissioned

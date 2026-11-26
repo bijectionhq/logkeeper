@@ -81,7 +81,10 @@ impl Engine {
         loop {
             tokio::select! {
                 () = self.stop.cancelled() => return,
-                _ = schedule.tick() => self.repair_once().await,
+                _ = schedule.tick() => {
+                    self.repair_once().await;
+                    self.park_idle().await;
+                }
             }
         }
     }

@@ -25,6 +25,7 @@ struct Args {
     batch: u64,
     record: usize,
     seconds: f64,
+    park: Option<u64>,
 }
 
 fn args() -> Args {
@@ -34,6 +35,7 @@ fn args() -> Args {
         batch: 16,
         record: 256,
         seconds: 10.0,
+        park: None,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -46,6 +48,7 @@ fn args() -> Args {
             "--batch" => args.batch = value.parse().unwrap(),
             "--record" => args.record = value.parse().unwrap(),
             "--seconds" => args.seconds = value.parse().unwrap(),
+            "--park-after" => args.park = Some(value.parse().unwrap()),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -64,7 +67,11 @@ fn cpu_seconds() -> f64 {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args = args();
-    let mut cluster = LocalCluster::start(&[PRINCIPAL]).await.unwrap();
+    let mut cluster = match args.park {
+        Some(seconds) => LocalCluster::start_parking(&[PRINCIPAL], seconds).await,
+        None => LocalCluster::start(&[PRINCIPAL]).await,
+    }
+    .unwrap();
     let config = cluster.journal_config(1 << 30, args.record.max(4096));
     let journal = cluster.journal(PRINCIPAL, &config).unwrap();
     for id in 1..=args.streams {
@@ -74,8 +81,9 @@ async fn main() {
             .await
             .unwrap();
     }
-    // Let idle streams settle before measuring their steady cost.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Let idle streams settle, and park when asked, before measuring their
+    // steady cost.
+    tokio::time::sleep(Duration::from_secs(args.park.map_or(2, |park| park + 35))).await;
     let cpu = cpu_seconds();
     let started = Instant::now();
     let deadline = started + Duration::from_secs_f64(args.seconds);

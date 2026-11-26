@@ -279,7 +279,9 @@ impl Engine {
                 header.await??
             };
             let _control = match (lane, &identity) {
-                (Lane::Control, Identity::Keeper(sender)) => Some(control.admit(*sender)?),
+                (Lane::Control, Identity::Keeper(sender)) => {
+                    Some(control.admit_waiting(*sender).await?)
+                }
                 _ => None,
             };
             let body = match (lane, &identity) {
@@ -312,6 +314,32 @@ impl Engine {
                     if self.deleted.read().contains(&genesis.stream) {
                         return Err(invalid("stream is deleted"));
                     }
+                    if self.parked.read().contains(&genesis.stream) {
+                        // An empty heartbeat or a repeated park leaves the
+                        // stream parked; anything else reopens it.
+                        match &request {
+                            PeerRequest::Append(append) if append.entries.is_empty() => {
+                                timeout(
+                                    CONNECTION_TIMEOUT,
+                                    network::send(&mut channel, &AppendReply::Busy),
+                                )
+                                .await??;
+                                continue;
+                            }
+                            PeerRequest::Park { .. } => {
+                                timeout(CONNECTION_TIMEOUT, network::send(&mut channel, &true))
+                                    .await??;
+                                continue;
+                            }
+                            _ => {
+                                if self.parked.write().remove(&genesis.stream) {
+                                    super::super::metrics::count(
+                                        &super::super::metrics::COUNTERS.unparked_by_peer,
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let group = self.group(genesis).await?;
                     group.require_healthy()?;
                     match request {
@@ -337,7 +365,8 @@ impl Engine {
                         }
                         request @ (PeerRequest::Vote(_)
                         | PeerRequest::PreVote(_)
-                        | PeerRequest::TransferLeader(_)) => {
+                        | PeerRequest::TransferLeader(_)
+                        | PeerRequest::Park { .. }) => {
                             if !self.disk.installed(group.genesis.stream) {
                                 return Err(invalid("staged replica cannot vote"));
                             }
@@ -370,6 +399,14 @@ impl Engine {
                                     timeout(
                                         CONNECTION_TIMEOUT,
                                         network::send(&mut channel, &reply),
+                                    )
+                                    .await??;
+                                }
+                                PeerRequest::Park { vote, last } => {
+                                    let parked = self.accept_park(&group, vote, last).await;
+                                    timeout(
+                                        CONNECTION_TIMEOUT,
+                                        network::send(&mut channel, &parked),
                                     )
                                     .await??;
                                 }
