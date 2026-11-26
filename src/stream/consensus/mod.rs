@@ -11,6 +11,8 @@ mod metrics;
 mod network;
 mod ownership;
 mod placement;
+#[cfg(test)]
+mod simulation;
 mod state;
 mod storage;
 #[cfg(feature = "consensus-testing")]
