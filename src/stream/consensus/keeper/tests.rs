@@ -119,6 +119,8 @@ impl Cluster {
                 writers: vec![OWNER.into(), OTHER.into()],
                 administrators: vec![OWNER.into()],
                 max_streams: default_max_streams(),
+                timed_original: None,
+                timed_authority: None,
             };
             provision(&config);
             config.initialize().unwrap();

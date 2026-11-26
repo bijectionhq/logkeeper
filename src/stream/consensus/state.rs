@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Fence, Genesis, MAX_PAGE, MAX_RECORD, MAX_RECORDS_PER_PAGE, Sealed, Stage};
 use crate::stream::keeper::record_charge;
+use crate::stream::timed::{EVIDENCE_BYTES, TimedEvidence};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
@@ -51,6 +52,14 @@ pub enum Command {
         owner: String,
         at: Lsn,
         payloads: Vec<Bytes>,
+    },
+    /// A timed original: its signed quorum-sync evidence followed by its
+    /// payload, retained together as one record.
+    AppendOriginal {
+        fence: Fence,
+        owner: String,
+        at: Lsn,
+        record: Bytes,
     },
 }
 
@@ -112,6 +121,12 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
             at: Lsn,
             payloads: Vec<Bytes>,
         },
+        AppendOriginal {
+            fence: Fence,
+            owner: String,
+            at: Lsn,
+            record: Bytes,
+        },
     }
     Application::deserialize(decoder).map(Box::new)
 }
@@ -146,6 +161,10 @@ pub enum Outcome {
     Page(Page),
     Refused(JournalError),
     Configuration(super::Configuration),
+    /// One keeper's signed sync sample for a staged original.
+    OriginalSample(Vec<u8>),
+    /// The retained evidence of a timed original record.
+    OriginalEvidence(Vec<u8>),
 }
 
 impl From<Result<Outcome>> for Outcome {
@@ -179,6 +198,7 @@ pub(super) enum Payload {
         offset: u64,
         len: u32,
         crc: u32,
+        timed: bool,
     },
     Snapshot {
         file: Arc<Mutex<File>>,
@@ -186,10 +206,34 @@ pub(super) enum Payload {
         offset: u64,
         len: u32,
         crc: u32,
+        timed: bool,
     },
 }
 
+/// Marks a timed record in snapshot and wire record lengths. Records are at
+/// most 4 MiB, so the bit is free, and an older reader refuses it as an
+/// oversized record instead of reading evidence as payload.
+pub(super) const TIMED_RECORD: u32 = 1 << 31;
+
 impl Payload {
+    pub(super) fn timed(&self) -> bool {
+        match self {
+            Self::Extent { timed, .. } | Self::Snapshot { timed, .. } => *timed,
+        }
+    }
+
+    /// The application payload. A timed record drops its evidence prefix.
+    pub fn contents(&self) -> io::Result<Bytes> {
+        let record = self.load()?;
+        if self.timed() {
+            return record
+                .get(EVIDENCE_BYTES..)
+                .map(|payload| record.slice_ref(payload))
+                .ok_or_else(|| super::invalid("short retained timed record"));
+        }
+        Ok(record)
+    }
+
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Extent { len, .. } | Self::Snapshot { len, .. } => *len as usize,
@@ -239,7 +283,7 @@ impl ReadPage {
         let records = self
             .records
             .into_iter()
-            .map(|(lsn, payload)| Ok((lsn, payload.load()?)))
+            .map(|(lsn, payload)| Ok((lsn, payload.contents()?)))
             .collect::<io::Result<_>>()?;
         Ok(Page {
             floor: self.floor,
@@ -273,7 +317,10 @@ impl State {
             if at >= live.floor && at <= live.head {
                 let retained = &live.records[(at.0 - live.floor.0) as usize];
                 return Ok(
-                    if retained.len() == payload.len() && retained.load()? == payload {
+                    if !retained.timed()
+                        && retained.len() == payload.len()
+                        && retained.load()? == payload
+                    {
                         Outcome::At(at)
                     } else {
                         Outcome::Refused(JournalError::Conflict { head: live.head })
@@ -293,6 +340,63 @@ impl State {
                 offset,
                 len,
                 crc: crc32fast::hash(&payload),
+                timed: false,
+            };
+            return Ok(live.append(at, retained, genesis.quota_bytes).into());
+        }
+        if let Command::AppendOriginal {
+            fence,
+            owner,
+            at,
+            record,
+        } = command
+        {
+            let live = match self.live_mut() {
+                Ok(live) => live,
+                Err(error) => return Ok(Outcome::Refused(error)),
+            };
+            if let Err(error) = live.require_writer(fence, &owner) {
+                return Ok(Outcome::Refused(error));
+            }
+            // The leader verified the signatures before proposing. The state
+            // machine checks only what every replica derives identically.
+            let structural = record.len() > EVIDENCE_BYTES
+                && record.len() <= MAX_RECORD
+                && TimedEvidence::decode(&record[..EVIDENCE_BYTES]).is_some_and(|evidence| {
+                    let original = evidence.origin.original;
+                    original.stream.0 == genesis.stream.0
+                        && original.epoch.0 == fence.epoch.0
+                        && original.at.0 == at.0
+                        && original.matches(&record[EVIDENCE_BYTES..])
+                });
+            if !structural {
+                return Ok(Outcome::Refused(JournalError::Unavailable));
+            }
+            if at >= live.floor && at <= live.head {
+                let retained = &live.records[(at.0 - live.floor.0) as usize];
+                return Ok(
+                    if retained.timed()
+                        && retained.len() == record.len()
+                        && retained.load()? == record
+                    {
+                        Outcome::At(at)
+                    } else {
+                        Outcome::Refused(JournalError::Conflict { head: live.head })
+                    },
+                );
+            }
+            let len = record.len() as u32;
+            let offset = segment
+                .key()
+                .len
+                .checked_sub(u64::from(len))
+                .ok_or_else(|| super::invalid("accepted WAL extent does not contain the record"))?;
+            let retained = Payload::Extent {
+                object: segment,
+                offset,
+                len,
+                crc: crc32fast::hash(&record),
+                timed: true,
             };
             return Ok(live.append(at, retained, genesis.quota_bytes).into());
         }
@@ -378,7 +482,8 @@ impl State {
             | Command::Stage(_)
             | Command::StageOwned(_)
             | Command::Admitted(..)
-            | Command::AppendBatch { .. } => unreachable!(),
+            | Command::AppendBatch { .. }
+            | Command::AppendOriginal { .. } => unreachable!(),
         }
     }
 
@@ -388,6 +493,41 @@ impl State {
 
     pub fn read(&self, from: Lsn, limit: usize) -> Result<ReadPage> {
         self.live()?.read(from, limit)
+    }
+
+    /// The sealed writer fence and principal, when a writer holds the stream.
+    pub fn writer(&self) -> Option<(Fence, &str)> {
+        let (fence, owner) = self.live().ok()?.writer.as_ref()?;
+        Some((*fence, owner))
+    }
+
+    /// The retained timed record at `at`. A position below the floor is
+    /// trimmed, and an ordinary or missing record has no original evidence.
+    pub fn timed_record(&self, at: Lsn) -> Result<Payload> {
+        let live = self.live()?;
+        if at < live.floor {
+            return Err(JournalError::Trimmed { floor: live.floor });
+        }
+        if at > live.head {
+            return Err(JournalError::Conflict { head: live.head });
+        }
+        let record = &live.records[(at.0 - live.floor.0) as usize];
+        if !record.timed() {
+            return Err(JournalError::Unavailable);
+        }
+        Ok(record.clone())
+    }
+
+    /// The bytes a new timed record of `payload_len` would charge, if the
+    /// stream can still hold it.
+    pub fn fits_timed(&self, payload_len: usize, quota_bytes: u64) -> bool {
+        self.live().is_ok_and(|live| {
+            live.records.len() < MAX_RETAINED_RECORDS
+                && live
+                    .bytes
+                    .checked_add(record_charge(EVIDENCE_BYTES + payload_len))
+                    .is_some_and(|used| used <= quota_bytes)
+        })
     }
 
     pub fn records(&self) -> impl Iterator<Item = &Payload> {
@@ -535,7 +675,7 @@ impl Live {
         let retained = if at > self.head { 0 } else { retained };
         for (index, payload) in payloads.iter().take(retained).enumerate() {
             let record = &self.records[(at.0 - self.floor.0) as usize + index];
-            if record.len() != payload.len() || record.load()? != *payload {
+            if record.timed() || record.len() != payload.len() || record.load()? != *payload {
                 return Ok(Err(conflict));
             }
         }
@@ -564,6 +704,7 @@ impl Live {
                 offset: *offset,
                 len: payload.len() as u32,
                 crc: crc32fast::hash(payload),
+                timed: false,
             });
         }
         self.bytes = used;

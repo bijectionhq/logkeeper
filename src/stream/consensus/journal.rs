@@ -8,6 +8,11 @@ use std::{collections::BTreeSet, io, path::Path, sync::Arc, time::Duration};
 use bytes::Bytes;
 use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, Result, StreamId};
 use parking_lot::RwLock;
+
+use crate::stream::timed::{
+    EVIDENCE_BYTES, MAX_TIMED_PAYLOAD, TimedEvidence, TimedOriginal, TimedOriginalProof,
+    TimedOriginalVerifier,
+};
 use serde::Deserialize;
 
 use super::{
@@ -135,6 +140,36 @@ pub struct ConsensusJournal {
     placement: Arc<RwLock<Placement>>,
     quota_bytes: u64,
     max_record_bytes: usize,
+    timed: Option<TimedReader>,
+    deadline: Duration,
+}
+
+/// Retries an idempotent append while the keepers report `Unavailable`, for
+/// example while write admission or the log suffix is momentarily full.
+/// Definitive refusals return at once. The last error returns at `deadline`.
+async fn retry_unavailable<T, F: Future<Output = Result<T>>>(
+    deadline: Duration,
+    mut attempt: impl FnMut() -> F,
+) -> Result<T> {
+    let end = tokio::time::Instant::now() + deadline;
+    let mut backoff = Duration::from_millis(5);
+    loop {
+        match attempt().await {
+            Err(JournalError::Unavailable) if tokio::time::Instant::now() + backoff < end => {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_millis(200));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Installed keeper trust and the largest timed payload this consumer
+/// appends. Without a payload limit the trust only verifies retained proofs.
+#[derive(Clone)]
+struct TimedReader {
+    verifier: Arc<dyn TimedOriginalVerifier>,
+    max_payload_bytes: Option<usize>,
 }
 
 impl ConsensusJournal {
@@ -151,7 +186,99 @@ impl ConsensusJournal {
             placement: Arc::new(RwLock::new(Placement::new(config))),
             quota_bytes: config.quota_bytes,
             max_record_bytes: config.max_record_bytes,
+            timed: None,
+            deadline: Duration::from_millis(config.deadline_ms),
         })
+    }
+
+    /// Installs keeper trust for timed originals. With `max_payload_bytes`
+    /// this journal can append timed originals up to that size.
+    pub fn with_timed_original(
+        mut self,
+        verifier: Arc<dyn TimedOriginalVerifier>,
+        max_payload_bytes: Option<usize>,
+    ) -> Self {
+        let limit = MAX_TIMED_PAYLOAD.min(MAX_RECORD - EVIDENCE_BYTES);
+        self.timed = Some(TimedReader {
+            verifier,
+            max_payload_bytes: max_payload_bytes.map(|bytes| bytes.min(limit)),
+        });
+        self
+    }
+
+    pub fn maximum_timed_original_bytes(&self) -> Option<usize> {
+        self.timed.as_ref()?.max_payload_bytes
+    }
+
+    /// Appends a timed original and returns its verified quorum proof. The
+    /// exact payload is first staged on the stream's two signing voters,
+    /// whose signed sync samples become the record's evidence. A retry after
+    /// an uncertain outcome returns the committed proof.
+    pub async fn append_timed_original(
+        &self,
+        original: TimedOriginal,
+        payload: Bytes,
+    ) -> Result<TimedOriginalProof> {
+        let timed = self.timed.as_ref().ok_or(JournalError::Unavailable)?;
+        let max = timed.max_payload_bytes.ok_or(JournalError::Unavailable)?;
+        if payload.len() > max {
+            return Err(JournalError::TooLarge { max });
+        }
+        if !original.matches(&payload) {
+            return Err(JournalError::Unavailable);
+        }
+        if let Ok(proof) = self.prove_timed_original(original).await {
+            return Ok(proof);
+        }
+        let configuration = self.client.configuration(original.stream).await?;
+        let mut voters = configuration.voters;
+        voters.sort_unstable();
+        let stage = |keeper| {
+            self.client.stage_original(
+                keeper,
+                original.stream,
+                configuration.revision,
+                original,
+                payload.clone(),
+            )
+        };
+        let (first, second) = futures::try_join!(stage(voters[0]), stage(voters[1]))?;
+        let evidence = TimedEvidence {
+            origin: super::timed::origin(original, voters, configuration.revision),
+            samples: [first, second],
+        };
+        let proof = evidence
+            .proof(&*timed.verifier)
+            .ok_or(JournalError::Unavailable)?;
+        let fence = Self::fence(original.epoch);
+        match self
+            .client
+            .append_original(original.stream, fence, &evidence, payload)
+            .await
+        {
+            Ok(at) if at == original.at => Ok(proof),
+            Ok(_) => Err(JournalError::Unavailable),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reopens the retained proof of a timed original, for example after a
+    /// writer takeover. The retained evidence must name the exact original.
+    pub async fn prove_timed_original(
+        &self,
+        original: TimedOriginal,
+    ) -> Result<TimedOriginalProof> {
+        let timed = self.timed.as_ref().ok_or(JournalError::Unavailable)?;
+        let evidence = self
+            .client
+            .prove_original(original.stream, original.at)
+            .await?;
+        if evidence.origin.original != original {
+            return Err(JournalError::Unavailable);
+        }
+        evidence
+            .proof(&*timed.verifier)
+            .ok_or(JournalError::Unavailable)
     }
 
     /// Applies a changed eligible keeper set or draining list. The keeper
@@ -222,9 +349,11 @@ impl ConsensusJournal {
                 bytes += payload.len();
                 payloads.push(records.next().unwrap().1);
             }
-            self.client
-                .append_batch(stream, Self::fence(epoch), at, payloads)
-                .await?;
+            retry_unavailable(self.deadline, || {
+                self.client
+                    .append_batch(stream, Self::fence(epoch), at, payloads.clone())
+            })
+            .await?;
         }
         Ok(last)
     }
@@ -293,9 +422,11 @@ impl Journal for ConsensusJournal {
                     max: self.max_record_bytes,
                 });
             }
-            self.client
-                .append(stream, Self::fence(epoch), at, payload)
-                .await
+            retry_unavailable(self.deadline, || {
+                self.client
+                    .append(stream, Self::fence(epoch), at, payload.clone())
+            })
+            .await
         })
     }
 

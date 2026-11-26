@@ -11,7 +11,7 @@ use std::{
     io,
     net::{SocketAddr, TcpListener as StdListener},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 use rcgen::{
@@ -22,8 +22,16 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use ring::signature::{Ed25519KeyPair, KeyPair as _};
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use crate::stream::{
+    timed::{TimedOriginal, TimedOriginalClock, TimedOriginalVerifier},
+    wire::KeeperId,
+};
+
 use super::{
-    Config, ConsensusJournal, Credentials, Domains, JournalConfig, Keepers,
+    Config, ConsensusJournal, Credentials, Domains, JournalConfig, Keepers, TimedAuthority,
     storage::{Authority, Provision, hex, sha256},
 };
 
@@ -34,6 +42,8 @@ struct Running {
 
 /// Three voters and a catalog keeper serving on loopback.
 pub struct LocalCluster {
+    verifier: Arc<dyn TimedOriginalVerifier>,
+    offset: Arc<AtomicI64>,
     dir: tempfile::TempDir,
     issuer: Issuer<'static, KeyPair>,
     roots: PathBuf,
@@ -49,6 +59,17 @@ impl LocalCluster {
     /// Starts the keepers. Every listed principal may read, write and
     /// administer streams.
     pub async fn start(principals: &[&str]) -> io::Result<Self> {
+        Self::start_with(principals, false).await
+    }
+
+    /// Starts the keepers with timed-original authority: each keeper signs
+    /// with its own Ed25519 key and samples a wall clock shifted by
+    /// [`LocalCluster::shift_timed_clock`].
+    pub async fn start_timed(principals: &[&str]) -> io::Result<Self> {
+        Self::start_with(principals, true).await
+    }
+
+    async fn start_with(principals: &[&str], timed: bool) -> io::Result<Self> {
         let dir = tempfile::tempdir()?;
         let roots = dir.path().join("ca.pem");
         let issuer = authority(&roots)?;
@@ -79,7 +100,33 @@ impl LocalCluster {
             .iter()
             .map(|uri| uri.to_string())
             .collect::<Vec<_>>();
+        let offset = Arc::new(AtomicI64::new(0));
+        let keys = if timed {
+            roster
+                .iter()
+                .map(|id| {
+                    let random = ring::rand::SystemRandom::new();
+                    let pkcs8 =
+                        Ed25519KeyPair::generate_pkcs8(&random).map_err(|_| io::Error::other("keeper key generation failed"))?;
+                    let key =
+                        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).map_err(|_| io::Error::other("keeper key rejected"))?;
+                    Ok((*id, Arc::new(key)))
+                })
+                .collect::<io::Result<BTreeMap<_, _>>>()?
+        } else {
+            BTreeMap::new()
+        };
+        let verifier: Arc<dyn TimedOriginalVerifier> = Arc::new(LocalVerifier(
+            keys.iter()
+                .map(|(id, key)| {
+                    let public: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+                    (id.as_u128(), public)
+                })
+                .collect(),
+        ));
         let mut cluster = Self {
+            verifier: verifier.clone(),
+            offset: offset.clone(),
             issuer,
             roots,
             configs: BTreeMap::new(),
@@ -114,6 +161,14 @@ impl LocalCluster {
                 writers: principals.clone(),
                 administrators: principals.clone(),
                 max_streams: 128,
+                timed_original: None,
+                timed_authority: keys.get(&id).map(|key| TimedAuthority {
+                    verifier: verifier.clone(),
+                    clock: Some(Arc::new(LocalClock {
+                        key: key.clone(),
+                        offset: offset.clone(),
+                    }) as Arc<dyn TimedOriginalClock>),
+                }),
             };
             provision(&config)?;
             config.initialize()?;
@@ -121,6 +176,16 @@ impl LocalCluster {
             cluster.restart(id).await?;
         }
         Ok(cluster)
+    }
+
+    /// The installed keeper trust of a timed cluster.
+    pub fn timed_verifier(&self) -> Arc<dyn TimedOriginalVerifier> {
+        self.verifier.clone()
+    }
+
+    /// Shifts every keeper's timed clock, for example past a cutoff.
+    pub fn shift_timed_clock(&self, micros: i64) {
+        self.offset.store(micros, Ordering::SeqCst);
     }
 
     pub fn voters(&self) -> [Uuid; 3] {
@@ -240,6 +305,45 @@ impl LocalCluster {
             private_key,
             ca: self.roots.clone(),
         })
+    }
+}
+
+/// Installed trust: each keeper's Ed25519 verification key.
+struct LocalVerifier(BTreeMap<u128, [u8; 32]>);
+
+impl TimedOriginalVerifier for LocalVerifier {
+    fn verify(&self, keeper: KeeperId, statement: &[u8], signature: &[u8; 64]) -> bool {
+        self.0.get(&keeper.0).is_some_and(|key| {
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, key)
+                .verify(statement, signature)
+                .is_ok()
+        })
+    }
+}
+
+/// A commissioned clock for tests: wall time plus a shared offset.
+struct LocalClock {
+    key: Arc<Ed25519KeyPair>,
+    offset: Arc<AtomicI64>,
+}
+
+impl TimedOriginalClock for LocalClock {
+    fn authorize(&self, _: &TimedOriginal) -> bool {
+        true
+    }
+
+    fn sync_upper_micros(&self, _: &TimedOriginal) -> Option<i64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_micros();
+        i64::try_from(now)
+            .ok()?
+            .checked_add(self.offset.load(Ordering::SeqCst))
+    }
+
+    fn sign(&self, statement: &[u8]) -> Option<[u8; 64]> {
+        self.key.sign(statement).as_ref().try_into().ok()
     }
 }
 

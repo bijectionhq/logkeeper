@@ -303,3 +303,167 @@ async fn placement_spreads_streams_and_drains_a_keeper() {
     assert_eq!(fixed.reconcile_placement(streams[0]).await, Ok(None));
     cluster.shutdown().await.unwrap();
 }
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timed_originals_prove_quorum_sync_before_their_cutoff() {
+    use journal_contract::{Epoch, JournalError, Lsn, StreamId};
+    use logkeeper::stream::timed::TimedOriginal;
+    use sha2::{Digest, Sha256};
+
+    let mut cluster = LocalCluster::start_timed(&PRINCIPALS).await.unwrap();
+    let config = cluster.journal_config(1 << 20, 4096);
+    let verifier = cluster.timed_verifier();
+    let journal = cluster
+        .journal(PRINCIPALS[0], &config)
+        .unwrap()
+        .with_timed_original(verifier.clone(), Some(2048));
+    assert_eq!(journal.maximum_timed_original_bytes(), Some(2048));
+    let stream = StreamId(81);
+    journal.create(stream).await.unwrap();
+    journal.seal(stream, Epoch(1)).await.unwrap();
+    journal
+        .append(
+            stream,
+            Epoch(1),
+            Lsn(1),
+            bytes::Bytes::from_static(b"ordinary"),
+        )
+        .await
+        .unwrap();
+    let payload = bytes::Bytes::from_static(b"funded write");
+    let original = |at: u64, payload: &[u8], cutoff: i64| TimedOriginal {
+        stream,
+        epoch: Epoch(1),
+        at: Lsn(at),
+        payload_sha256: Sha256::digest(payload).into(),
+        exclusive_journal_cutoff_micros: cutoff,
+        original_receiver_certificate_sha256: [7; 32],
+    };
+    let cutoff = now_micros() + 60_000_000;
+    let timed = original(2, &payload, cutoff);
+    let proof = journal
+        .append_timed_original(timed, payload.clone())
+        .await
+        .unwrap();
+    assert_eq!(proof.original, timed);
+    assert!(0 < proof.original_quorum_sync_upper_micros);
+    assert!(proof.original_quorum_sync_upper_micros < cutoff);
+    // Readers see only the payload, and the retry returns the same proof.
+    let page = journal
+        .read(stream, Lsn(1), 8, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.records[1], (Lsn(2), payload.clone()));
+    assert_eq!(
+        journal.append_timed_original(timed, payload.clone()).await,
+        Ok(proof)
+    );
+    assert_eq!(journal.prove_timed_original(timed).await, Ok(proof));
+    // An ordinary append cannot overwrite the timed record, and an ordinary
+    // record has no timed proof.
+    assert!(matches!(
+        journal
+            .append(stream, Epoch(1), Lsn(2), payload.clone())
+            .await,
+        Err(JournalError::Conflict { .. })
+    ));
+    assert!(
+        journal
+            .prove_timed_original(original(1, b"ordinary", cutoff))
+            .await
+            .is_err()
+    );
+
+    // A durability sample at or after the cutoff refuses the original.
+    cluster.shift_timed_clock(120_000_000);
+    let late = original(3, b"late", now_micros() + 60_000_000);
+    assert!(
+        journal
+            .append_timed_original(late, bytes::Bytes::from_static(b"late"))
+            .await
+            .is_err()
+    );
+    cluster.shift_timed_clock(0);
+    assert_eq!(journal.head(stream).await, Ok(Lsn(2)));
+
+    // A payload that does not match its original is refused before staging.
+    let mismatched = original(3, b"declared", cutoff);
+    assert!(
+        journal
+            .append_timed_original(mismatched, bytes::Bytes::from_static(b"other"))
+            .await
+            .is_err()
+    );
+    // A fenced writer cannot stage or append.
+    let other = cluster
+        .journal(PRINCIPALS[1], &config)
+        .unwrap()
+        .with_timed_original(verifier.clone(), Some(2048));
+    assert_eq!(other.seal(stream, Epoch(2)).await, Ok(Lsn(2)));
+    let fenced = original(3, b"fenced", cutoff);
+    assert!(
+        journal
+            .append_timed_original(fenced, bytes::Bytes::from_static(b"fenced"))
+            .await
+            .is_err()
+    );
+    // A successor reopens the retained proof under the original identities.
+    assert_eq!(other.prove_timed_original(timed).await, Ok(proof));
+    let next = TimedOriginal {
+        epoch: Epoch(2),
+        ..original(3, b"successor", cutoff)
+    };
+    let successor = other
+        .append_timed_original(next, bytes::Bytes::from_static(b"successor"))
+        .await
+        .unwrap();
+    assert_eq!(successor.original, next);
+
+    // The evidence survives a full restart and a snapshot.
+    cluster.shutdown().await.unwrap();
+    for keeper in cluster.voters().into_iter().chain([cluster.catalog()]) {
+        cluster.restart(keeper).await.unwrap();
+    }
+    assert_eq!(other.prove_timed_original(timed).await, Ok(proof));
+    assert_eq!(other.prove_timed_original(next).await, Ok(successor));
+    let page = other
+        .read(stream, Lsn(1), 8, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.records[2],
+        (Lsn(3), bytes::Bytes::from_static(b"successor"))
+    );
+    // A replacement voter installs the timed records and keeps their proofs.
+    let configuration = other.client().configuration(stream).await.unwrap();
+    let [first, second, third] = cluster.voters();
+    other
+        .client()
+        .replace(
+            stream,
+            configuration.revision,
+            [first, third, cluster.catalog()],
+        )
+        .await
+        .unwrap();
+    cluster.stop(second).await.unwrap();
+    cluster.stop(first).await.unwrap();
+    assert_eq!(other.prove_timed_original(timed).await, Ok(proof));
+    assert_eq!(
+        other
+            .read(stream, Lsn(2), 1, std::time::Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        vec![(Lsn(2), payload)]
+    );
+    cluster.restart(first).await.unwrap();
+    cluster.shutdown().await.unwrap();
+}

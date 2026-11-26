@@ -555,6 +555,11 @@ impl Credentials {
         self.keyed_server(keeper, &[ALPN])
     }
 
+    /// The public key of the configured keeper certificate.
+    pub(super) fn public_key(&self, keeper: KeeperId) -> io::Result<Vec<u8>> {
+        Ok(self.keyed_server(keeper, &[ALPN])?.1)
+    }
+
     pub(super) fn server_protocol(
         &self,
         keeper: KeeperId,

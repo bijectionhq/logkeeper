@@ -28,15 +28,26 @@ use super::{
     Disk, Record, io_error,
     media::{hex, sha256},
 };
+use crate::stream::timed::EVIDENCE_BYTES;
 use crate::stream::{
     consensus::{
         Configuration, Entry, Genesis, LogId, MAX_MESSAGE, MAX_RECORD, Membership, RaftTypes,
         SnapshotMeta, Stage, StorageError, invalid, options,
         placement::Placement,
-        state::{Command, MAX_RETAINED_RECORDS, Outcome, Payload, State},
+        state::{Command, MAX_RETAINED_RECORDS, Outcome, Payload, State, TIMED_RECORD},
     },
     keeper::durability::{sync_directory, sync_file},
 };
+
+/// The applied state a timed original stage depends on.
+pub(in crate::stream::consensus) struct TimedView {
+    pub head: Lsn,
+    pub floor: Lsn,
+    pub writer: Option<(super::super::Fence, String)>,
+    pub configuration: Configuration,
+    pub changing: bool,
+    pub fits: bool,
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Image {
@@ -454,6 +465,35 @@ impl StateMachine {
         ))
     }
 
+    /// What a timed original stage checks, read from one applied image.
+    pub fn timed_view(&self, payload_len: usize) -> journal_contract::Result<TimedView> {
+        if !self.healthy() {
+            return Err(JournalError::Unavailable);
+        }
+        let image = self.inner.applied.read();
+        Ok(TimedView {
+            head: image.state.head()?,
+            floor: image.state.retained_floor(),
+            writer: image
+                .state
+                .writer()
+                .map(|(fence, owner)| (fence, owner.to_owned())),
+            configuration: image.configuration.ok_or(JournalError::Unavailable)?,
+            changing: image.stage.is_some() || image.membership.membership().get_joint_config().len() > 1,
+            fits: image
+                .state
+                .fits_timed(payload_len, self.inner.genesis.quota_bytes),
+        })
+    }
+
+    /// The retained timed record at `at`, from the applied image.
+    pub fn timed_record(&self, at: Lsn) -> journal_contract::Result<Payload> {
+        if !self.healthy() {
+            return Err(JournalError::Unavailable);
+        }
+        self.inner.applied.read().state.timed_record(at)
+    }
+
     pub fn staged(&self, stage: &Stage) -> bool {
         self.inner.applied.read().stage.as_ref() == Some(stage)
     }
@@ -564,7 +604,7 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
     {
         let entries = entries.into_iter().collect::<Vec<_>>();
         let may_read_snapshot = self.head().is_ok_and(|head| entries.iter().any(|entry| {
-            matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } if *at <= head))
+            matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } | Command::AppendOriginal { at, .. } if *at <= head))
         }));
         let outcomes = if may_read_snapshot {
             let inner = self.inner.clone();
@@ -1082,7 +1122,7 @@ fn write_image(
             .map_err(io::Error::other)?;
         for payload in image.state.records() {
             let bytes = payload.load().inspect_err(|_| quarantine())?;
-            let len = bytes.len() as u32;
+            let len = bytes.len() as u32 | if payload.timed() { TIMED_RECORD } else { 0 };
             let crc = crc32fast::hash(&bytes);
             writer.write_all(&len.to_be_bytes())?;
             writer.write_all(&crc.to_be_bytes())?;
@@ -1140,8 +1180,10 @@ fn read_image(
         let mut frame = [0; 8];
         reader.read_exact(&mut frame)?;
         let len = u32::from_be_bytes(frame[..4].try_into().unwrap());
+        let timed = len & TIMED_RECORD != 0;
+        let len = len & !TIMED_RECORD;
         let crc = u32::from_be_bytes(frame[4..].try_into().unwrap());
-        if len as usize > MAX_RECORD {
+        if len as usize > MAX_RECORD || timed && (len as usize) <= EVIDENCE_BYTES {
             return Err(invalid("invalid snapshot record length"));
         }
         records.push_back(Payload::Snapshot {
@@ -1150,6 +1192,7 @@ fn read_image(
             offset: reader.position,
             len,
             crc,
+            timed,
         });
         let mut remaining = len as usize;
         let mut payload = crc32fast::Hasher::new();

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::{Genesis, Image, Payload, Selected, SnapshotMeta, invalid, sha256};
 use crate::stream::consensus::{
     decode, encode,
-    state::MAX_RETAINED_RECORDS,
+    state::{MAX_RETAINED_RECORDS, TIMED_RECORD},
     storage::objects::{Key, Object, Objects},
 };
 
@@ -240,10 +240,11 @@ impl Span {
                 offset,
                 len,
                 crc,
+                timed,
             } => Self {
                 source: Source::Object(object.key()),
                 offset: *offset,
-                len: *len,
+                len: *len | if *timed { TIMED_RECORD } else { 0 },
                 crc: *crc,
             },
             Payload::Snapshot {
@@ -251,13 +252,14 @@ impl Span {
                 offset,
                 len,
                 crc,
+                timed,
                 ..
             } => {
                 legacy.insert(*digest);
                 Self {
                     source: Source::Legacy(*digest),
                     offset: *offset,
-                    len: *len,
+                    len: *len | if *timed { TIMED_RECORD } else { 0 },
                     crc: *crc,
                 }
             }
@@ -276,6 +278,8 @@ impl Span {
             len,
             crc,
         } = self;
+        let timed = len & TIMED_RECORD != 0;
+        let len = len & !TIMED_RECORD;
         if len as usize > crate::stream::consensus::MAX_RECORD {
             return Err(invalid("snapshot extent exceeds record bound"));
         }
@@ -285,6 +289,7 @@ impl Span {
                 offset,
                 len,
                 crc,
+                timed,
             },
             Source::Legacy(digest) => Payload::Snapshot {
                 file: legacy
@@ -295,6 +300,7 @@ impl Span {
                 offset,
                 len,
                 crc,
+                timed,
             },
             _ => return Err(invalid("foreign snapshot payload extent")),
         };

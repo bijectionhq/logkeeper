@@ -14,6 +14,7 @@ mod state;
 mod storage;
 #[cfg(feature = "consensus-testing")]
 pub mod testing;
+mod timed;
 
 use std::{collections::BTreeMap, io, net::SocketAddr};
 
@@ -26,6 +27,7 @@ pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
 pub use keeper::Config;
 pub use placement::Domains;
+pub use timed::TimedAuthority;
 
 pub(super) const ALPN: &[u8] = b"logkeeper-consensus/1";
 const CONTROL_ALPN: &[u8] = b"logkeeper-consensus-control/2";

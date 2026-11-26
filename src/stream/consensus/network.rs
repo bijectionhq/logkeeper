@@ -136,6 +136,24 @@ pub(super) enum Request {
         at: Lsn,
         payloads: Vec<bytes::Bytes>,
     },
+    /// Stage a timed original on one signing voter of `revision`.
+    StageOriginal {
+        stream: StreamId,
+        revision: u64,
+        original: Vec<u8>,
+        payload: bytes::Bytes,
+    },
+    /// Append a timed original with its encoded evidence.
+    AppendOriginal {
+        stream: StreamId,
+        fence: Fence,
+        evidence: Vec<u8>,
+        payload: bytes::Bytes,
+    },
+    ProveOriginal {
+        stream: StreamId,
+        at: Lsn,
+    },
 }
 
 impl Request {
@@ -158,6 +176,9 @@ impl Request {
             Self::Seal { stream, .. }
             | Self::Append { stream, .. }
             | Self::AppendBatch { stream, .. }
+            | Self::StageOriginal { stream, .. }
+            | Self::AppendOriginal { stream, .. }
+            | Self::ProveOriginal { stream, .. }
             | Self::Read { stream, .. }
             | Self::Trim { stream, .. }
             | Self::RetireCopy { stream, .. }

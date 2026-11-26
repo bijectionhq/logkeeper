@@ -14,7 +14,8 @@ use std::{
     time::Duration,
 };
 
-use journal_contract::{JournalError, Lsn, StreamId};
+use bytes::Bytes;
+use journal_contract::{Epoch, JournalError, Lsn, StreamId};
 use openraft::{
     BasicNode, SnapshotPolicy,
     error::{ClientWriteError, InitializeError, RaftError},
@@ -30,7 +31,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    Credentials, Domains, Genesis, Keepers, NodeId, Raft, Vote,
+    Credentials, Domains, Fence, Genesis, Keepers, NodeId, Raft, Vote,
     catalog::Catalog,
     invalid,
     network::{Frame, Lane, Network, Reply, Request, Rpc},
@@ -71,6 +72,14 @@ pub struct Config {
     pub administrators: Vec<String>,
     #[serde(default = "default_max_streams")]
     pub max_streams: usize,
+    /// Installed timed-original trust and, on a signing keeper, its clock
+    /// and attestation key, in the stream keeper's mount format.
+    #[serde(default)]
+    pub timed_original: Option<crate::stream::transport::TimedOriginalConfig>,
+    /// A timed authority supplied in process, which takes precedence over
+    /// `timed_original`.
+    #[serde(skip)]
+    pub timed_authority: Option<super::timed::TimedAuthority>,
 }
 
 impl Config {
@@ -208,7 +217,25 @@ impl Config {
         }
         .validate()
         .map_err(io::Error::other)?;
+        let timed = match (self.timed_authority.clone(), self.timed_original.clone()) {
+            (Some(authority), _) => Some(authority),
+            (None, Some(config)) => {
+                let public_key = self.tls.public_key(keeper)?;
+                Some(config.authority(keeper, &public_key, tokio::runtime::Handle::current())?)
+            }
+            (None, None) => None,
+        };
+        let timed = match timed {
+            Some(authority) => {
+                let data = self.data.clone();
+                let stages = tokio::task::spawn_blocking(move || super::timed::Stages::open(&data))
+                    .await??;
+                Some(Arc::new(TimedState { authority, stages }))
+            }
+            None => None,
+        };
         let engine = Arc::new(Engine {
+            timed,
             id,
             catalog_id: self.catalog,
             catalog: (id == self.catalog).then(|| Catalog::new(disk.clone())),
@@ -242,7 +269,13 @@ impl Config {
     }
 }
 
+struct TimedState {
+    authority: super::timed::TimedAuthority,
+    stages: super::timed::Stages,
+}
+
 struct Engine {
+    timed: Option<Arc<TimedState>>,
     id: uuid::Uuid,
     catalog_id: uuid::Uuid,
     catalog: Option<Catalog>,
@@ -525,7 +558,10 @@ impl Engine {
                     Request::Seal { .. }
                     | Request::Append { .. }
                     | Request::AppendBatch { .. }
+                    | Request::StageOriginal { .. }
+                    | Request::AppendOriginal { .. }
                     | Request::Trim { .. } => writer,
+                    Request::ProveOriginal { .. } => admin || writer || reader,
                     Request::Stage(_)
                     | Request::StageReplica { .. }
                     | Request::InstallReplica { .. } => false,
@@ -689,6 +725,42 @@ impl Engine {
                             })
                             .await)
                     }
+                    Request::StageOriginal {
+                        revision,
+                        original,
+                        payload,
+                        ..
+                    } => {
+                        self.stage_original(&group, owner.unwrap(), revision, &original, payload)
+                            .await
+                    }
+                    Request::AppendOriginal {
+                        fence,
+                        evidence,
+                        payload,
+                        ..
+                    } => {
+                        self.append_original(&group, owner.unwrap(), fence, &evidence, payload)
+                            .await
+                    }
+                    // Prove from the leader's applied state after a read
+                    // barrier, so a restoring or lagging keeper never answers.
+                    Request::ProveOriginal { at, .. } => {
+                        if let Err(reply) = group.barrier(Instant::now() + REQUEST_TIMEOUT).await {
+                            return Ok(reply);
+                        }
+                        Ok(Reply::Decision(match group.state.timed_record(at) {
+                            Ok(record) => {
+                                match tokio::task::spawn_blocking(move || record.load()).await {
+                                    Ok(Ok(bytes)) => Outcome::OriginalEvidence(
+                                        bytes[..crate::stream::timed::EVIDENCE_BYTES].to_vec(),
+                                    ),
+                                    _ => Outcome::Refused(JournalError::Unavailable),
+                                }
+                            }
+                            Err(error) => Outcome::Refused(error),
+                        }))
+                    }
                     Request::Trim { fence, through, .. } => Ok(group
                         .write(Command::Trim {
                             fence,
@@ -703,6 +775,132 @@ impl Engine {
                 Ok(reply)
             }
         }
+    }
+
+    async fn stage_original(
+        &self,
+        group: &Group,
+        owner: String,
+        revision: u64,
+        original: &[u8],
+        payload: Bytes,
+    ) -> io::Result<Reply> {
+        use crate::stream::timed::{EVIDENCE_BYTES, MAX_TIMED_PAYLOAD, TimedOriginal};
+        let refused = |error| Ok(Reply::Decision(Outcome::Refused(error)));
+        let Some(timed) = self.timed.clone() else {
+            return refused(JournalError::Unavailable);
+        };
+        let Some(clock) = timed.authority.clock.clone() else {
+            return refused(JournalError::Unavailable);
+        };
+        let max = MAX_TIMED_PAYLOAD.min(super::MAX_RECORD - EVIDENCE_BYTES);
+        if payload.len() > max {
+            return refused(JournalError::TooLarge { max });
+        }
+        let Some(original) = TimedOriginal::decode(original).filter(|original| {
+            original.stream == group.genesis.stream && original.matches(&payload)
+        }) else {
+            return refused(JournalError::Unavailable);
+        };
+        let view = match group.state.timed_view(payload.len()) {
+            Ok(view) => view,
+            Err(error) => return refused(error),
+        };
+        let mut voters = view.configuration.voters;
+        voters.sort_unstable();
+        if view.changing
+            || view.configuration.revision != revision
+            || !voters[..2].contains(&self.id)
+        {
+            return refused(JournalError::Unavailable);
+        }
+        match &view.writer {
+            Some((fence, principal)) if fence.epoch == original.epoch && *principal == owner => (),
+            writer => {
+                return refused(JournalError::Fenced {
+                    current: writer.as_ref().map_or(Epoch(0), |(fence, _)| fence.epoch),
+                });
+            }
+        }
+        if original.at.0 != view.head.0 + 1 {
+            return refused(JournalError::Conflict { head: view.head });
+        }
+        if !view.fits {
+            return refused(JournalError::Full { floor: view.floor });
+        }
+        let origin = super::timed::origin(original, voters, revision);
+        let keeper = crate::stream::wire::KeeperId(self.id.as_u128());
+        let (head, epoch) = (view.head.0, original.epoch.0);
+        let sample = tokio::task::spawn_blocking(move || {
+            timed.stages.stage(
+                keeper,
+                origin,
+                &payload,
+                head,
+                epoch,
+                &*clock,
+                &*timed.authority.verifier,
+            )
+        })
+        .await??;
+        Ok(Reply::Decision(match sample {
+            Some(sample) => Outcome::OriginalSample(sample.encode().to_vec()),
+            None => Outcome::Refused(JournalError::Unavailable),
+        }))
+    }
+
+    async fn append_original(
+        &self,
+        group: &Group,
+        owner: String,
+        fence: Fence,
+        evidence: &[u8],
+        payload: Bytes,
+    ) -> io::Result<Reply> {
+        use crate::stream::timed::{EVIDENCE_BYTES, TimedEvidence};
+        let refused = |error| Ok(Reply::Decision(Outcome::Refused(error)));
+        let Some(timed) = self.timed.clone() else {
+            return refused(JournalError::Unavailable);
+        };
+        let Some(evidence) = TimedEvidence::decode(evidence) else {
+            return refused(JournalError::Unavailable);
+        };
+        let original = evidence.origin.original;
+        if original.stream != group.genesis.stream
+            || original.epoch != fence.epoch
+            || EVIDENCE_BYTES + payload.len() > super::MAX_RECORD
+            || !original.matches(&payload)
+            || evidence.proof(&*timed.authority.verifier).is_none()
+        {
+            return refused(JournalError::Unavailable);
+        }
+        // A new record must carry evidence from the current roster. A retry
+        // of a committed record is compared byte for byte when it applies.
+        let view = match group.state.timed_view(payload.len()) {
+            Ok(view) => view,
+            Err(error) => return refused(error),
+        };
+        if original.at > view.head
+            && (view.changing
+                || super::timed::origin(
+                    original,
+                    view.configuration.voters,
+                    view.configuration.revision,
+                ) != evidence.origin)
+        {
+            return refused(JournalError::Unavailable);
+        }
+        let mut record = Vec::with_capacity(EVIDENCE_BYTES + payload.len());
+        record.extend_from_slice(&evidence.encode());
+        record.extend_from_slice(&payload);
+        Ok(group
+            .write(Command::AppendOriginal {
+                fence,
+                owner,
+                at: original.at,
+                record: Bytes::from(record),
+            })
+            .await)
     }
 
     fn catalog(&self) -> io::Result<&Catalog> {

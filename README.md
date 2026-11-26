@@ -428,6 +428,28 @@ domain, replaces one other voter through `replace`, and returns the new
 configuration. Call it until it returns `None`. A keeper that is unreachable
 but still eligible is never replaced, because the quorum tolerates it.
 
+A keeper with `timed_original` in its configuration, in the stream keeper's
+mount format, holds installed keeper trust and, when signing, a commissioned
+clock and attestation key. `ConsensusJournal::with_timed_original` installs
+the reader's trust and payload limit. `append_timed_original` stages the exact
+payload on the first two voters of the stream's sorted roster. Each voter
+syncs the stage as a shadow file, samples an upper bound on that durability
+event from its clock, and signs it with the roster and configuration
+revision. A repeated stage returns the stored sample and never samples again.
+The leader verifies both signatures before proposing the record, and the
+state machine checks the evidence structure. The evidence and payload are
+retained as one record. Reads return only the payload.
+`prove_timed_original` returns the verified quorum proof from the leader
+after a read barrier. A sample at or after the original's cutoff refuses the
+original. Snapshot index spans and wire image frames carry a timed flag in
+the high bit of the record length, so earlier images read as ordinary
+records. `testing::LocalCluster::start_timed` commissions an Ed25519 key and
+a wall-clock sampler on every keeper.
+
+`append` and `append_batch` retry a refusal the keepers report as
+`Unavailable`, such as momentarily full write admission or log suffix, with
+backoff until the operation deadline. An identical retry is idempotent.
+
 The `consensus-testing` feature exports `testing::LocalCluster`. It starts
 three voter keepers in distinct failure domains and a catalog keeper on
 loopback, with enrolled media and a private CA, issues client certificates

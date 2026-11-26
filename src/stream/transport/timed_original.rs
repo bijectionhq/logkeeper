@@ -20,14 +20,14 @@ mod clock;
 
 const MAX_TRUST_BYTES: u64 = 64 * 1024;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TimedOriginalConfig {
     trust_file: PathBuf,
     original: Option<OriginalConfig>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OriginalConfig {
     signer_pkcs8_file: PathBuf,
@@ -98,6 +98,24 @@ impl TimedOriginalVerifier for Trust {
 }
 
 impl TimedOriginalConfig {
+    /// Loads the installed trust and, when configured, the signing clock.
+    pub(crate) fn authority(
+        self,
+        id: KeeperId,
+        tls_public_key: &[u8],
+        runtime: Handle,
+    ) -> io::Result<crate::stream::consensus::TimedAuthority> {
+        let trust = Trust::read(&self.trust_file, tls_public_key)?;
+        let clock = self
+            .original
+            .map(|original| load_clock(original, id, &trust, tls_public_key, runtime))
+            .transpose()?;
+        Ok(crate::stream::consensus::TimedAuthority {
+            verifier: Arc::new(trust),
+            clock,
+        })
+    }
+
     pub(super) fn open(
         self,
         data: &Path,

@@ -202,6 +202,71 @@ impl Client {
         unit(self.operation(Request::Delete(stream)).await?)
     }
 
+    /// Stages a timed original on one signing voter and returns its signed
+    /// sync sample. Stage on the first two voters of the sorted roster.
+    pub(super) async fn stage_original(
+        &self,
+        keeper: uuid::Uuid,
+        stream: StreamId,
+        revision: u64,
+        original: crate::stream::timed::TimedOriginal,
+        payload: Bytes,
+    ) -> Result<crate::stream::timed::TimedSample> {
+        let request = Request::StageOriginal {
+            stream,
+            revision,
+            original: original.encode().to_vec(),
+            payload,
+        };
+        match self.keeper_operation(keeper, request).await? {
+            Reply::Decision(outcome) => match decision(outcome)? {
+                Outcome::OriginalSample(sample) => {
+                    crate::stream::timed::TimedSample::decode(&sample)
+                        .ok_or(JournalError::Unavailable)
+                }
+                _ => Err(JournalError::Unavailable),
+            },
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
+    /// Appends a timed original with the evidence of its two signing voters.
+    pub(super) async fn append_original(
+        &self,
+        stream: StreamId,
+        fence: Fence,
+        evidence: &crate::stream::timed::TimedEvidence,
+        payload: Bytes,
+    ) -> Result<Lsn> {
+        position(
+            self.operation(Request::AppendOriginal {
+                stream,
+                fence,
+                evidence: evidence.encode().to_vec(),
+                payload,
+            })
+            .await?,
+        )
+    }
+
+    /// The retained evidence of the timed record at `at`.
+    pub(super) async fn prove_original(
+        &self,
+        stream: StreamId,
+        at: Lsn,
+    ) -> Result<crate::stream::timed::TimedEvidence> {
+        match self
+            .operation(Request::ProveOriginal { stream, at })
+            .await?
+        {
+            Outcome::OriginalEvidence(evidence) => {
+                crate::stream::timed::TimedEvidence::decode(&evidence)
+                    .ok_or(JournalError::Unavailable)
+            }
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
     /// Reads the local generation to use in a conditional retirement.
     pub async fn replica_generation(&self, stream: StreamId, keeper: uuid::Uuid) -> Result<u64> {
         match self
