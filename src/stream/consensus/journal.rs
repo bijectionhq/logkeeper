@@ -146,6 +146,8 @@ pub struct ConsensusJournal {
     max_record_bytes: usize,
     timed: Option<TimedReader>,
     deadline: Duration,
+    /// Placement keepers in this consumer's own failure domain.
+    local: BTreeSet<uuid::Uuid>,
 }
 
 /// Retries an idempotent append while the keepers report `Unavailable`, for
@@ -193,7 +195,7 @@ impl ConsensusJournal {
             config.catalog,
             Duration::from_millis(config.deadline_ms),
         )?
-        .with_local_keepers(local);
+        .with_local_keepers(local.clone());
         Ok(Self {
             client,
             placement: Arc::new(RwLock::new(Placement::new(config))),
@@ -201,6 +203,7 @@ impl ConsensusJournal {
             max_record_bytes: config.max_record_bytes,
             timed: None,
             deadline: Duration::from_millis(config.deadline_ms),
+            local,
         })
     }
 
@@ -324,6 +327,25 @@ impl ConsensusJournal {
             .replace(stream, current.revision, next)
             .await
             .map(Some)
+    }
+
+    /// Asks for the stream's leader to move to a voter in this consumer's own
+    /// failure domain, which saves a cross-zone round trip on every append.
+    /// Best effort: a failure leaves the leader where it is.
+    async fn prefer_local_leader(&self, stream: StreamId) {
+        if self.local.is_empty() {
+            return;
+        }
+        let Ok(configuration) = self.client.configuration(stream).await else {
+            return;
+        };
+        if let Some(local) = configuration
+            .voters
+            .into_iter()
+            .find(|voter| self.local.contains(voter))
+        {
+            let _ = self.client.prefer_leader(stream, local).await;
+        }
     }
 
     /// The status of every eligible keeper, asked concurrently. A keeper that
@@ -492,7 +514,11 @@ impl Journal for ConsensusJournal {
     }
 
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, Result<Lsn>> {
-        Box::pin(self.seal_epoch(stream, epoch))
+        Box::pin(async move {
+            let head = self.seal_epoch(stream, epoch).await?;
+            self.prefer_local_leader(stream).await;
+            Ok(head)
+        })
     }
 
     fn append(

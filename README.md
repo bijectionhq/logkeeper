@@ -480,7 +480,14 @@ streams, to `snapshot_send_bytes_per_second` (64 MiB/s by default; zero
 disables pacing), so catch-up and repair do not saturate a cross-zone link.
 A `JournalConfig` with a `placement` may name the consumer's own `domain`;
 reads then go first to a voter in that domain, then to the keeper that
-answered last.
+answered last. After each seal such a journal also asks the stream's leader to hand
+leadership to the voter in its domain, which saves a cross-zone round trip
+per append; a leader does so only when that voter has matched its log and
+no hand-off reached or left it in the last minute.
+
+A keeper whose media is unhealthy or full hands every stream it leads to a
+follower that has matched its log and whose keeper accepts streams, since
+it cannot write even when its followers have room.
 
 A keeper with `timed_original` in its configuration, in the stream keeper's
 mount format, holds installed keeper trust and, when signing, a commissioned

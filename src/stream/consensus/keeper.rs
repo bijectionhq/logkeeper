@@ -50,6 +50,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEAD_REQUESTS: usize = 256;
 const MAX_PENDING_WRITES: usize = 16;
 const MAX_LOG_SUFFIX: u64 = 512;
+/// The least time between two leadership hand-offs of one stream.
+const LEADER_HOLD_DOWN: Duration = Duration::from_secs(60);
 /// How long a deleted stream's settled group stays open for late requests.
 #[cfg(not(test))]
 const DELETED_GROUP_GRACE: Duration = Duration::from_secs(30);
@@ -671,6 +673,7 @@ impl Engine {
             heads,
             writes: Arc::new(Semaphore::new(MAX_PENDING_WRITES)),
             used: parking_lot::Mutex::new(Instant::now()),
+            handoff: parking_lot::Mutex::new(None),
             heard: parking_lot::Mutex::new(Instant::now()),
             stop: self.stop.child_token(),
         });
@@ -741,6 +744,7 @@ impl Engine {
                     | Request::AppendBatch { .. }
                     | Request::StageOriginal { .. }
                     | Request::AppendOriginal { .. }
+                    | Request::PreferLeader { .. }
                     | Request::Trim { .. } => writer,
                     Request::ProveOriginal { .. } => admin || writer || reader,
                     Request::Stage(_)
@@ -880,6 +884,7 @@ impl Engine {
                     Request::Replace {
                         expected, voters, ..
                     } => self.replace(&group, expected, voters).await,
+                    Request::PreferLeader { keeper, .. } => Ok(group.prefer_leader(keeper).await),
                     Request::Create(_) => Ok(group.write(Command::Create).await),
                     Request::Seal {
                         expected, writer, ..
@@ -1173,6 +1178,9 @@ struct Group {
     writes: Arc<Semaphore>,
     /// When a request last reached this group.
     used: parking_lot::Mutex<Instant>,
+    /// When this replica last handed leadership away or was handed it. A
+    /// leader refuses another hand-off for a minute after either.
+    pub(super) handoff: parking_lot::Mutex<Option<Instant>>,
     /// When this replica last received an append from a leader.
     heard: parking_lot::Mutex<Instant>,
     stop: CancellationToken,
@@ -1185,6 +1193,38 @@ impl Group {
         }
         self.require_healthy()?;
         Ok(self)
+    }
+
+    /// Hands leadership to `target`, a voter that has matched the whole log,
+    /// at most once a minute so a moving writer cannot cause churn.
+    async fn prefer_leader(&self, target: uuid::Uuid) -> Reply {
+        let metrics = self.raft.metrics().borrow_watched().clone();
+        if metrics.state != openraft::ServerState::Leader {
+            return leader_reply(metrics.current_leader);
+        }
+        let matched = metrics
+            .replication
+            .as_ref()
+            .and_then(|progress| progress.get(&target.as_u128()).copied().flatten())
+            .map(|log| log.index);
+        let recent = self
+            .handoff
+            .lock()
+            .is_some_and(|at| at.elapsed() < LEADER_HOLD_DOWN);
+        if target.as_u128() != metrics.id
+            && matched.is_some()
+            && matched == metrics.last_log_index
+            && !recent
+            && self
+                .raft
+                .trigger()
+                .transfer_leader(target.as_u128())
+                .await
+                .is_ok()
+        {
+            *self.handoff.lock() = Some(Instant::now());
+        }
+        Reply::Decision(Outcome::Unit)
     }
 
     /// Whether this replica has applied its whole log and, when it leads,

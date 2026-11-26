@@ -82,9 +82,52 @@ impl Engine {
             tokio::select! {
                 () = self.stop.cancelled() => return,
                 _ = schedule.tick() => {
+                    self.shed_leadership_when_full().await;
                     self.repair_once().await;
                     self.retire_removed().await;
                     self.park_idle().await;
+                }
+            }
+        }
+    }
+
+    /// A keeper whose media is unhealthy or full cannot accept the writes of
+    /// the streams it leads, even when their followers have room. It hands
+    /// each to a follower that has matched its log and whose keeper accepts
+    /// streams.
+    async fn shed_leadership_when_full(&self) {
+        if self.disk.healthy() && self.disk.space.accepts_streams() {
+            return;
+        }
+        let groups = self
+            .groups
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for group in groups {
+            let metrics = group.raft.metrics().borrow_watched().clone();
+            if metrics.state != ServerState::Leader {
+                continue;
+            }
+            let matched = metrics
+                .replication
+                .iter()
+                .flatten()
+                .filter(|(id, log)| {
+                    **id != metrics.id && log.map(|log| log.index) == metrics.last_log_index
+                })
+                .map(|(id, _)| Uuid::from_u128(*id))
+                .collect::<Vec<_>>();
+            for target in matched {
+                if self
+                    .peer_status(target, group.genesis.stream)
+                    .await
+                    .is_some_and(|status| status.accepting)
+                {
+                    let _ = group.raft.trigger().transfer_leader(target.as_u128()).await;
+                    break;
                 }
             }
         }

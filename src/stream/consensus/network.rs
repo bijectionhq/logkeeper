@@ -164,6 +164,12 @@ pub(super) enum Request {
     },
     /// The keeper's own status, with its replica of `stream`.
     KeeperStatus(StreamId),
+    /// A writer asks the leader to hand `stream` to `keeper`, a voter in the
+    /// writer's own failure domain.
+    PreferLeader {
+        stream: StreamId,
+        keeper: uuid::Uuid,
+    },
 }
 
 impl Request {
@@ -193,6 +199,7 @@ impl Request {
             | Self::Read { stream, .. }
             | Self::Trim { stream, .. }
             | Self::RetireCopy { stream, .. }
+            | Self::PreferLeader { stream, .. }
             | Self::Replace { stream, .. } => stream,
         }
     }

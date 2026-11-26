@@ -317,6 +317,16 @@ impl Client {
         }
     }
 
+    /// Asks the stream's leader to hand leadership to `keeper`. The leader
+    /// does so when `keeper` has matched its log and no hand-off happened in
+    /// the last minute; either way the call succeeds.
+    pub async fn prefer_leader(&self, stream: StreamId, keeper: uuid::Uuid) -> Result<()> {
+        unit(decision(
+            self.operation(Request::PreferLeader { stream, keeper })
+                .await?,
+        )?)
+    }
+
     /// The status `keeper` reports about itself and its replica of `stream`.
     pub async fn keeper_status(
         &self,

@@ -2625,3 +2625,73 @@ async fn a_replaced_voter_retires_its_copy_when_it_returns() {
     assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
     cluster.stop_all().await;
 }
+
+async fn wait_for_leader(cluster: &Cluster, stream: StreamId, expected: Uuid) -> bool {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(group) = cluster.running[&expected]
+                .engine
+                .groups
+                .lock()
+                .await
+                .get(&stream)
+                && group.raft.metrics().borrow_watched().state == openraft::ServerState::Leader
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_writer_moves_leadership_to_its_domain_once_a_minute() {
+    let cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(55);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let leader = cluster.leader_after_head(&journal, stream).await;
+    let target = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    journal.prefer_leader(stream, target).await.unwrap();
+    assert!(wait_for_leader(&cluster, stream, target).await);
+    assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
+    // A second preference within the hold-down leaves the leader in place.
+    journal.prefer_leader(stream, leader).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(cluster.leader(stream).await, target);
+    let mut cluster = cluster;
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_without_space_hands_its_streams_to_a_follower() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(56);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let leader = cluster.leader_after_head(&journal, stream).await;
+    cluster.running[&leader].engine.disk.space.set_available(0);
+    let others = [a, b, c]
+        .into_iter()
+        .filter(|id| *id != leader)
+        .collect::<Vec<_>>();
+    let mut moved = false;
+    for target in others {
+        moved |= wait_for_leader(&cluster, stream, target).await;
+        if moved {
+            break;
+        }
+    }
+    assert!(moved, "the full leader handed its stream away");
+    assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
+    cluster.running[&leader]
+        .engine
+        .disk
+        .space
+        .set_available(u64::MAX);
+    cluster.stop_all().await;
+}

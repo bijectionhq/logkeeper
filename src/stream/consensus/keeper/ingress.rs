@@ -412,6 +412,7 @@ impl Engine {
                                     .await??;
                                 }
                                 PeerRequest::TransferLeader(request) => {
+                                    *group.handoff.lock() = Some(tokio::time::Instant::now());
                                     let reply = group.raft.handle_transfer_leader(request).await;
                                     group.require_healthy()?;
                                     timeout(
