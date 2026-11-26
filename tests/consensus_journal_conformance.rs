@@ -109,6 +109,52 @@ async fn read_all(
     records
 }
 
+/// Full keeper batches change every snapshot index page between two
+/// snapshots. Snapshots must still succeed, or the stream's Raft group stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_batches_snapshot_across_many_index_pages_and_survive_restart() {
+    use journal_contract::{Epoch, Lsn, StreamId};
+
+    let mut cluster = LocalCluster::start(&PRINCIPALS).await.unwrap();
+    let config = cluster.journal_config(64 << 20, 4096);
+    let journal = cluster.journal(PRINCIPALS[0], &config).unwrap();
+    let stream = StreamId(79);
+    journal.create(stream).await.unwrap();
+    assert_eq!(journal.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
+    let record = |at: u64| bytes::Bytes::from(at.to_be_bytes().to_vec());
+    // 300 entries of 200 records cross two snapshot intervals of 128 entries.
+    // The second snapshot changes about 200 of the 469 index pages.
+    const PER: u64 = 200;
+    let batches = 300u64;
+    for batch in 0..batches {
+        let group = (batch * PER + 1..=(batch + 1) * PER)
+            .map(|at| (Lsn(at), record(at)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            journal.append_batch(stream, Epoch(1), group).await,
+            Ok(Lsn((batch + 1) * PER)),
+            "batch {batch}"
+        );
+    }
+    let head = batches * PER;
+    assert_eq!(journal.head(stream).await, Ok(Lsn(head)));
+    cluster.shutdown().await.unwrap();
+    for keeper in cluster.voters().into_iter().chain([cluster.catalog()]) {
+        cluster.restart(keeper).await.unwrap();
+    }
+    let journal = cluster.journal(PRINCIPALS[0], &config).unwrap();
+    assert_eq!(journal.head(stream).await, Ok(Lsn(head)));
+    let page = journal
+        .read(stream, Lsn(head - 3), 4, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.records,
+        (head - 3..=head).map(|at| (Lsn(at), record(at))).collect::<Vec<_>>()
+    );
+    cluster.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batches_commit_atomically_and_survive_restart_and_replacement() {
     use journal_contract::{Epoch, JournalError, Lsn, StreamId};

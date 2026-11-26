@@ -24,11 +24,13 @@ const PAGE: usize = 128;
 const MAX_PAGES: usize = MAX_RETAINED_RECORDS / PAGE + 1;
 const MAX_PAGE_BYTES: usize = 16 * 1024;
 const MAX_ROOT_BYTES: u64 = 384 * 1024;
-const MAX_CHANGED_PAGES: usize = 12;
 
-// At most one full set of index pages for the one-time old-image conversion.
-// All subsequent snapshots rewrite only the changed tail and trim boundary.
+// One full set of index pages and a root. A snapshot rewrites only the pages
+// that changed since the previous one, but keeper batches of up to 256 records
+// per entry can change every page between two snapshots, so the scratch
+// reservation covers a full set.
 pub(super) const SCRATCH: u64 = 12 * 1024 * 1024;
+const _: () = assert!((MAX_PAGES * MAX_PAGE_BYTES) as u64 + MAX_ROOT_BYTES <= SCRATCH);
 
 #[derive(Clone, Default)]
 pub(super) struct Dependencies {
@@ -95,7 +97,6 @@ pub(super) fn build(
     }
     let mut records = image.state.records();
     let mut pages = Vec::new();
-    let mut changed = 0;
     while left > 0 {
         let count = left.min(PAGE - ((first - 1) % PAGE as u64) as usize);
         let payloads = records.by_ref().take(count);
@@ -109,10 +110,6 @@ pub(super) fn build(
                 page.clone()
             }
             None => {
-                changed += 1;
-                if changed > MAX_CHANGED_PAGES && !previous.pages.is_empty() {
-                    return Err(invalid("snapshot exceeded its changed-page budget"));
-                }
                 let spans = payloads
                     .map(|payload| Span::from_record(payload, &mut dependencies.legacy))
                     .collect::<Vec<_>>();
