@@ -112,7 +112,8 @@ pub trait Journal: Send + Sync {
     /// Creates an empty stream. Idempotent. Refused with `Deleted` after `delete`.
     fn create(&self, stream: StreamId) -> BoxFuture<'_, Result<()>>;
     /// Fences every append under a lower epoch and returns the head.
-    /// Returns `Recovered` while an operator recovery awaits acknowledgement.
+    /// Returns `Recovered` after an operator recovery of the stream until a
+    /// writer acknowledges it with `acknowledge_recovery`.
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, Result<Lsn>>;
     /// Commits `payload` at `at` iff `epoch` is sealed by this caller and `at` is the next LSN.
     /// An identical retry returns `at`.
@@ -139,6 +140,15 @@ pub trait Journal: Send + Sync {
     fn trim(&self, stream: StreamId, epoch: Epoch, through: Lsn) -> BoxFuture<'_, Result<()>>;
     /// Deletes the stream permanently.
     fn delete(&self, stream: StreamId) -> BoxFuture<'_, Result<()>>;
+    /// Accepts an operator recovery of the stream: lifts the recovery fence so
+    /// the next `seal` succeeds, and returns the recovered head. Idempotent.
+    /// The recovery itself already accepted the possible loss; a writer
+    /// acknowledges to record that it noticed. Journals without operator
+    /// recovery return `Unavailable`.
+    fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, Result<Lsn>> {
+        let _ = stream;
+        Box::pin(async { Err(JournalError::Unavailable) })
+    }
 }
 
 #[cfg(test)]

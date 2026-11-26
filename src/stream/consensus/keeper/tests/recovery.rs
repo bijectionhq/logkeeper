@@ -163,14 +163,12 @@ async fn a_survivor_recovers_its_stream_and_the_lost_voters_retire() {
         contract.seal(stream, Epoch(3)).await,
         Err(JournalError::Recovered { head: Lsn(5) })
     );
-    // Only an administrator acknowledges the recovery.
+    // A writer acknowledges the recovery through the generic journal
+    // contract, so a consumer can resume without an administrator.
     let other = contract_journal(&cluster, &cluster.other, report.voters);
-    assert!(other.acknowledge_recovery(stream).await.is_err());
-    assert_eq!(
-        contract.seal(stream, Epoch(3)).await,
-        Err(JournalError::Recovered { head: Lsn(5) })
-    );
-    assert_eq!(contract.acknowledge_recovery(stream).await, Ok(Lsn(5)));
+    let generic: &dyn journal_contract::Journal = &other;
+    assert_eq!(generic.acknowledge_recovery(stream).await, Ok(Lsn(5)));
+    assert_eq!(generic.acknowledge_recovery(stream).await, Ok(Lsn(5)));
     assert_eq!(contract.acknowledge_recovery(stream).await, Ok(Lsn(5)));
     assert_eq!(contract.seal(stream, Epoch(3)).await, Ok(Lsn(5)));
     assert_eq!(

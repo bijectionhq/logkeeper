@@ -819,7 +819,8 @@ impl Engine {
                     | Request::StageOriginal { .. }
                     | Request::AppendOriginal { .. }
                     | Request::PreferLeader { .. }
-                    | Request::Trim { .. } => writer,
+                    | Request::AcknowledgeRecovery(_)
+                    | Request::Trim { .. } => writer || admin,
                     Request::ProveOriginal { .. } => admin || writer || reader,
                     Request::Stage(_)
                     | Request::StageReplica { .. }

@@ -452,7 +452,8 @@ impl ConsensusJournal {
     /// Clears the recovery fence that `logkeeper keeper recover-stream` left
     /// on `stream`, after which `seal` stops returning
     /// `JournalError::Recovered` and writers seal above the recovery epoch.
-    /// Returns the recovered head. The caller must be an administrator.
+    /// Returns the recovered head. The caller must be a writer or an
+    /// administrator. `Journal::acknowledge_recovery` does the same.
     pub async fn acknowledge_recovery(&self, stream: StreamId) -> Result<Lsn> {
         self.client.acknowledge_recovery(stream).await
     }
@@ -497,6 +498,10 @@ impl ConsensusJournal {
 }
 
 impl Journal for ConsensusJournal {
+    fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, Result<Lsn>> {
+        Box::pin(self.client.acknowledge_recovery(stream))
+    }
+
     fn create(&self, stream: StreamId) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             let placement = self.placement.read().clone();

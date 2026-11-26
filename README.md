@@ -273,12 +273,17 @@ it becomes leader in the new membership and replicates its log to them, which
 commits the recovery. The stream's head is the survivor's.
 
 The recovery fence admits no append or trim. Every `seal` returns
-`JournalError::Recovered { head }` until an administrator calls
-`ConsensusJournal::acknowledge_recovery(stream)`, which returns the head and
+`JournalError::Recovered { head }` until a writer or an administrator calls
+`Journal::acknowledge_recovery(stream)` (also
+`ConsensusJournal::acknowledge_recovery`), which returns the head and
 replaces the fence with an ownerless one at the same epoch. Writers then seal
-above it. A consumer that sees `Recovered`, or a head below what it was
-acknowledged, must treat it as data loss and rebuild from the journal instead
-of its own previous head.
+above it. The operator already accepted the possible loss with
+`--acknowledge-data-loss`; the second call only records that the consumer
+noticed, so a consumer may acknowledge on its own and resume, recording the
+recovery durably and reporting it, rather than waiting for a person. A
+consumer that sees `Recovered`, or a head below what it was acknowledged,
+must treat it as data loss and rebuild from the journal instead of its own
+previous head.
 
 **Lost voters.** A lost voter that returns with its data finds a placement
 that no longer names it and retires its copy. It cannot win an election: its
