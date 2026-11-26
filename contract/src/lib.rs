@@ -88,6 +88,12 @@ pub enum JournalError {
     Deleted,
     /// Retry. The outcome of a mutation may be unknown.
     Unavailable,
+    /// An operator recovered the stream from a minority of its replicas
+    /// after acknowledging data loss. The journal now holds `head`, which may
+    /// be below positions it acknowledged before. Seals are refused until an
+    /// administrator acknowledges the recovery; consumers must then rebuild
+    /// from the journal instead of trusting their previous head.
+    Recovered { head: Lsn },
 }
 
 impl fmt::Display for JournalError {
@@ -106,6 +112,7 @@ pub trait Journal: Send + Sync {
     /// Creates an empty stream. Idempotent. Refused with `Deleted` after `delete`.
     fn create(&self, stream: StreamId) -> BoxFuture<'_, Result<()>>;
     /// Fences every append under a lower epoch and returns the head.
+    /// Returns `Recovered` while an operator recovery awaits acknowledgement.
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, Result<Lsn>>;
     /// Commits `payload` at `at` iff `epoch` is sealed by this caller and `at` is the next LSN.
     /// An identical retry returns `at`.

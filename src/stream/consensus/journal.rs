@@ -449,6 +449,14 @@ impl ConsensusJournal {
         Ok(last)
     }
 
+    /// Clears the recovery fence that `logkeeper keeper recover-stream` left
+    /// on `stream`, after which `seal` stops returning
+    /// `JournalError::Recovered` and writers seal above the recovery epoch.
+    /// Returns the recovered head. The caller must be an administrator.
+    pub async fn acknowledge_recovery(&self, stream: StreamId) -> Result<Lsn> {
+        self.client.acknowledge_recovery(stream).await
+    }
+
     /// The consensus client, for placement and replica administration.
     pub fn client(&self) -> &Client {
         &self.client

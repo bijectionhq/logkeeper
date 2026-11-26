@@ -15,6 +15,7 @@ use crate::stream::{
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod catalog;
+mod recovery;
 
 pub(super) type RejectAppend =
     Box<dyn Fn(StreamId, NodeId, &AppendEntriesRequest<RaftTypes>) -> bool + Send + Sync>;

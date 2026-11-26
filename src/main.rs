@@ -19,6 +19,10 @@ async fn main() -> ExitCode {
         println!("{USAGE}");
         #[cfg(feature = "stream")]
         println!("       logkeeper keeper --config FILE");
+        #[cfg(feature = "stream")]
+        println!(
+            "       logkeeper keeper recover-stream --config FILE --stream UUID --acknowledge-data-loss [--with KEEPER,KEEPER]"
+        );
         return ExitCode::SUCCESS;
     }
     match run(&args).await {
@@ -60,6 +64,9 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
                 .repair_snapshot(stream, std::path::Path::new(backup))
                 .await?;
             return Ok(());
+        }
+        if args.get(1).is_some_and(|action| action == "recover-stream") {
+            return recover_stream(&args[2..]).await;
         }
         let [_, flag, file] = args else {
             return Err("Usage: logkeeper keeper --config FILE".into());
@@ -135,6 +142,47 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
             signal?;
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "stream")]
+const RECOVER_USAGE: &str = "Usage: logkeeper keeper recover-stream --config FILE --stream UUID \
+     --acknowledge-data-loss [--with KEEPER,KEEPER]";
+
+/// Recovers a stream that lost two of its three voters from this stopped
+/// keeper's replica. Without `--acknowledge-data-loss` it prints what it
+/// would do and refuses.
+#[cfg(feature = "stream")]
+async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = None;
+    let mut stream = None;
+    let mut recovery = logkeeper::stream::consensus::Recovery::default();
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--config" => config = args.next(),
+            "--stream" => stream = args.next(),
+            "--acknowledge-data-loss" => recovery.acknowledge_data_loss = true,
+            "--with" => {
+                let keepers = args
+                    .next()
+                    .ok_or(RECOVER_USAGE)?
+                    .split(',')
+                    .map(uuid::Uuid::parse_str)
+                    .collect::<Result<Vec<_>, _>>()?;
+                recovery.with = Some(<[_; 2]>::try_from(keepers).map_err(|_| RECOVER_USAGE)?);
+            }
+            _ => return Err(RECOVER_USAGE.into()),
+        }
+    }
+    let (Some(config), Some(stream)) = (config, stream) else {
+        return Err(RECOVER_USAGE.into());
+    };
+    let stream = journal_contract::StreamId(uuid::Uuid::parse_str(stream)?.as_u128());
+    let recovered = logkeeper::stream::consensus::Config::read(std::path::Path::new(config))?
+        .recover_stream(stream, recovery)
+        .await?;
+    println!("{recovered}");
     Ok(())
 }
 

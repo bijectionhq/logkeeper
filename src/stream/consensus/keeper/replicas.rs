@@ -3,6 +3,7 @@
 use std::{fs, io, path::Path};
 
 use journal_contract::{JournalError, StreamId};
+use openraft::async_runtime::WatchReceiver;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -97,6 +98,64 @@ impl Engine {
             self.remember_pin(stream).await;
             self.disk
                 .maintenance(Record::Ownership(stream, Change::Stage(stage)))
+                .await?;
+            self.close_copy(stream).await;
+        }
+        let generation = self
+            .disk
+            .ownership(stream)
+            .and_then(|book| book.generation())
+            .ok_or_else(ownership::stale)?;
+        Ok(Reply::Generation(generation))
+    }
+
+    /// Stages an installed empty copy for an operator recovery. The
+    /// survivor's keeper, authenticated as `authority`, asks while it is
+    /// stopped for the recovery; no committed state can certify the move,
+    /// so the operator's acknowledgement on the survivor is the authority.
+    /// This keeper refuses when its own open replica votes in its
+    /// configuration, which means the survivor's view is stale.
+    pub(super) async fn stage_recovered(
+        &self,
+        authority: Uuid,
+        genesis: Genesis,
+        stage: Stage,
+    ) -> io::Result<Reply> {
+        let stream = genesis.stream;
+        if !self.placement.genesis(&genesis)
+            || !self.placement.stage(&stage)
+            || !stage.recovery()
+            || stage.stream != stream
+            || !stage.old.contains(&authority)
+            || !stage.target.contains(&authority)
+            || stage.old.contains(&self.id)
+            || !stage.target.contains(&self.id)
+        {
+            return Err(invalid("stage is outside the authenticated recovery"));
+        }
+        let opening = self.opening(stream).await?;
+        let _guard = opening.lock().await;
+        match self.disk.genesis(stream) {
+            Some(local) if local != genesis => return Err(invalid("staging would change genesis")),
+            Some(_) => (),
+            None => self.disk.maintenance(Record::Register(genesis)).await?,
+        }
+        let current = self.disk.ownership(stream).ok_or_else(ownership::stale)?;
+        if !(current.contains_stage(&stage) && current.installed()) {
+            if let Some(group) = self.groups.lock().await.get(&stream).cloned() {
+                let metrics = group.raft.metrics().borrow_watched().clone();
+                if metrics
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .any(|id| id == self.id.as_u128())
+                {
+                    return Err(invalid("keeper holds a voting replica of the stream"));
+                }
+            }
+            self.remember_pin(stream).await;
+            self.disk
+                .maintenance(Record::Ownership(stream, Change::Recover(stage)))
                 .await?;
             self.close_copy(stream).await;
         }

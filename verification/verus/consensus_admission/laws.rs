@@ -195,6 +195,68 @@ fn restart_never_restores_leadership(committed: bool, voted_for_self: bool) {
     assert(!voted_for_self ==> presented == committed);
 }
 
+// Recovery admission: a recovery runs only with the operator's
+// acknowledgement and a survivor that votes in the latest configuration,
+// and only when no other voter answers with a healthy replica. The
+// survivor alone is then fewer than the two voters a quorum of three needs,
+// so no live quorum can commit beside the recovered log.
+fn recovery_needs_acknowledgement_and_no_live_quorum(
+    acknowledged: bool, survivor_votes: bool, healthy_others: u64,
+) {
+    if allows_recovery(acknowledged, survivor_votes, healthy_others) {
+        assert(acknowledged && survivor_votes);
+        assert(1 + healthy_others < 2);
+    }
+    let unacknowledged = allows_recovery(false, survivor_votes, healthy_others);
+    assert(!unacknowledged);
+    if healthy_others >= 1 {
+        let alive = allows_recovery(acknowledged, survivor_votes, healthy_others);
+        assert(!alive);
+    }
+}
+
+// The recovery's vote and entries carry a term above every ballot and
+// entry of the survivor's history, and its fence an epoch above every
+// applied epoch, or the recovery is refused.
+fn recovery_outranks_the_lost_history(vote_term: u64, log_term: u64, epoch: u64) {
+    match recovery_term(vote_term, log_term) {
+        Some(term) => {
+            assert(term > vote_term && term > log_term);
+            assert(term as int - RECOVERY_TERM_GAP as int >= vote_term as int);
+        }
+        None => assert(vote_term > u64::MAX - RECOVERY_TERM_GAP
+            || log_term > u64::MAX - RECOVERY_TERM_GAP),
+    }
+    match recovery_epoch(epoch) {
+        Some(fence) => assert(fence > epoch),
+        None => assert(epoch == u64::MAX),
+    }
+}
+
+// A replica refuses a peer without a Raft answer only when the peer is
+// outside its effective membership and below its term: a member, or a peer
+// at or above its term, always gets an answer, so the refusal never hides a
+// newer history from this replica.
+fn only_superseded_outsiders_are_excluded(
+    configured: bool, known: bool, sender_term: u64, own_term: u64,
+) {
+    let excluded = excludes_sender(configured, known, sender_term, own_term);
+    assert(excluded ==> configured && !known && sender_term < own_term);
+    assert(known ==> !excluded);
+    assert(sender_term >= own_term ==> !excluded);
+}
+
+// Only installed replicas vote. Outside a recovery, a configured replica
+// votes only as a member and an unconfigured one only as a genesis voter.
+fn only_installed_members_vote(
+    installed: bool, configured: bool, member: bool, genesis_voter: bool, recovering: bool,
+) {
+    let vote = votes(installed, configured, member, genesis_voter, recovering);
+    assert(!installed ==> !vote);
+    assert(vote && configured && !recovering ==> member);
+    assert(vote && !configured && !recovering ==> genesis_voter);
+}
+
 // An accepted peer batch continues exactly after its previous entry, with
 // strictly increasing indices and terms bounded by the sender's vote.
 fn accepted_batches_are_consecutive(

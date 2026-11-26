@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 pub use super::transport::Credentials;
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
-pub use keeper::Config;
+pub use keeper::{Config, Recovery, RecoveryReport};
 pub use placement::Domains;
 pub use timed::TimedAuthority;
 
@@ -128,6 +128,20 @@ struct Stage {
     source: u64,
     old: [uuid::Uuid; 3],
     target: [uuid::Uuid; 3],
+}
+
+impl Stage {
+    /// Whether the stage is an operator recovery's: it keeps exactly one
+    /// voter, the survivor, and replaces the two lost ones.
+    fn recovery(&self) -> bool {
+        self.old != self.target
+            && self
+                .target
+                .iter()
+                .filter(|voter| self.old.contains(voter))
+                .count()
+                == 1
+    }
 }
 
 impl Genesis {

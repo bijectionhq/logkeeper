@@ -193,6 +193,35 @@ pub fn repair_roster(stream: StreamId, current: [Uuid; 3], view: &View<'_>) -> O
     Some(sorted([staying[0], staying[1], replacement]))
 }
 
+/// The roster of an operator recovery from `survivor`: the survivor and the
+/// two best-ranked live, accepting keepers outside the lost configuration
+/// `current`, in domains distinct from each other and from the survivor's.
+/// Prefers keepers under the load ceiling. `None` when no such pair exists.
+pub fn recovery_roster(
+    stream: StreamId,
+    survivor: Uuid,
+    current: [Uuid; 3],
+    view: &View<'_>,
+) -> Option<[Uuid; 3]> {
+    let survivor_domain = view.eligible.get(&survivor)?;
+    view.tiers().iter().find_map(|candidates| {
+        let mut chosen = vec![survivor];
+        let mut domains = BTreeSet::from([survivor_domain]);
+        for keeper in ranked(stream, candidates) {
+            if current.contains(&keeper) || !view.live(&keeper) {
+                continue;
+            }
+            if domains.insert(&candidates[&keeper]) {
+                chosen.push(keeper);
+                if chosen.len() == 3 {
+                    return Some(sorted([chosen[0], chosen[1], chosen[2]]));
+                }
+            }
+        }
+        None
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +369,58 @@ mod tests {
             health: &two_down,
         };
         assert_eq!(repair_roster(stream, current, &view), None);
+    }
+
+    #[test]
+    fn recovery_keeps_the_survivor_and_takes_two_live_keepers_in_free_domains() {
+        let eligible = domains(&[
+            (1, "a"),
+            (2, "b"),
+            (3, "c"),
+            (4, "a"),
+            (5, "b"),
+            (6, "d"),
+            (7, "e"),
+        ]);
+        let stream = StreamId(3);
+        let current = sorted([1, 2, 3].map(Uuid::from_u128));
+        let survivor = Uuid::from_u128(1);
+        // The lost voters 2 and 3 do not answer; keeper 7 is down.
+        let known = health(&[
+            (2, false, false, 0),
+            (3, false, false, 0),
+            (4, true, true, 1),
+            (5, true, true, 1),
+            (6, true, true, 1),
+            (7, false, true, 1),
+        ]);
+        let view = View {
+            eligible: &eligible,
+            health: &known,
+        };
+        let roster = recovery_roster(stream, survivor, current, &view).unwrap();
+        assert!(roster.contains(&survivor));
+        assert!(distinct(roster, &eligible));
+        assert!(
+            !roster.contains(&Uuid::from_u128(4)),
+            "4 shares the survivor's domain"
+        );
+        assert!(!roster.contains(&Uuid::from_u128(7)), "7 is down");
+        assert_eq!(roster, sorted([1, 5, 6].map(Uuid::from_u128)));
+        // Without two free live domains there is no recovery roster.
+        let few = health(&[
+            (2, false, false, 0),
+            (3, false, false, 0),
+            (4, true, true, 1),
+            (5, false, true, 1),
+            (6, true, true, 1),
+            (7, false, true, 1),
+        ]);
+        let view = View {
+            eligible: &eligible,
+            health: &few,
+        };
+        assert_eq!(recovery_roster(stream, survivor, current, &view), None);
     }
 
     #[test]

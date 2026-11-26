@@ -229,6 +229,100 @@ pub(super) fn demotes_vote(committed: bool, voted_for_self: bool) -> bool {
     committed && voted_for_self
 }
 
+/// Whether an operator may recover a stream from its surviving voter. The
+/// survivor must still vote in its stream's latest configuration, the
+/// operator must acknowledge the data loss, and no other voter of that
+/// configuration may answer with a healthy replica: together with the
+/// survivor it would form a quorum that can still commit.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (acknowledged && survivor_votes && healthy_others == 0)
+))]
+pub(super) fn allows_recovery(
+    acknowledged: bool,
+    survivor_votes: bool,
+    healthy_others: u64,
+) -> bool {
+    acknowledged && survivor_votes && healthy_others == 0
+}
+
+/// How far a recovery term jumps past the survivor's highest term. The lost
+/// voters may have reached terms the survivor never saw; with pre-vote they
+/// would need billions more elections than it saw to reach this one.
+pub const RECOVERY_TERM_GAP: u64 = 4_294_967_296; // 2^32
+
+/// The term of a recovery write: far above the survivor's vote and every
+/// term in its log, so no ballot or entry of the lost history can outrank it.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out matches Some(term) ==> term > vote_term && term > log_term
+            && term as int >= vote_term as int + RECOVERY_TERM_GAP as int
+            && term as int >= log_term as int + RECOVERY_TERM_GAP as int,
+        out is None ==> vote_term as int + RECOVERY_TERM_GAP as int > u64::MAX as int
+            || log_term as int + RECOVERY_TERM_GAP as int > u64::MAX as int,
+))]
+pub(super) fn recovery_term(vote_term: u64, log_term: u64) -> Option<u64> {
+    let highest = if vote_term > log_term {
+        vote_term
+    } else {
+        log_term
+    };
+    if highest > u64::MAX - RECOVERY_TERM_GAP {
+        None
+    } else {
+        Some(highest + RECOVERY_TERM_GAP)
+    }
+}
+
+/// The epoch of the recovery fence: above every epoch the survivor applied.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out matches Some(epoch) ==> epoch > current,
+        out is None ==> current == u64::MAX,
+))]
+pub(super) fn recovery_epoch(current: u64) -> Option<u64> {
+    if current == u64::MAX {
+        None
+    } else {
+        Some(current + 1)
+    }
+}
+
+/// Whether a replica refuses a peer's vote or append without answering it:
+/// the sender is outside the replica's effective membership and campaigns
+/// or leads in a term below the replica's vote. It belongs to a history
+/// this replica superseded, such as a voter an operator recovery lost, and
+/// an answer would teach it the newer term. The refusal tells the sender to
+/// check whether it was removed.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (configured && !known && sender_term < own_term)
+))]
+pub(super) fn excludes_sender(
+    configured: bool,
+    known: bool,
+    sender_term: u64,
+    own_term: u64,
+) -> bool {
+    configured && !known && sender_term < own_term
+}
+
+/// Whether a replica answers vote-class requests. An installed replica
+/// votes in its effective configuration, and before it holds one only as a
+/// genesis voter. A replacement an operator recovery installed also votes
+/// until it holds the recovered membership, which names it: `recovering`
+/// holds while its configuration is absent or still the lost one.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (installed && (recovering || if configured { member } else { genesis_voter }))
+))]
+pub(super) fn votes(
+    installed: bool,
+    configured: bool,
+    member: bool,
+    genesis_voter: bool,
+    recovering: bool,
+) -> bool {
+    installed && (recovering || if configured { member } else { genesis_voter })
+}
+
 #[cfg(verus_keep_ghost)]
 verus! {
     /// The limit relations the laws rely on.

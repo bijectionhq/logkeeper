@@ -45,6 +45,8 @@ impl Engine {
             .iter()
             .filter(|group| group.raft.metrics().borrow_watched().state == ServerState::Leader)
             .count();
+        // A parked or not yet opened replica still holds the stream: an
+        // operator recovery must not count it lost.
         let replica = if self.quarantined.read().contains(&stream) {
             Some(false)
         } else {
@@ -52,6 +54,12 @@ impl Engine {
                 .iter()
                 .find(|group| group.genesis.stream == stream)
                 .map(|group| group.state.healthy())
+                .or_else(|| {
+                    (self.disk.healthy()
+                        && !self.deleted.read().contains(&stream)
+                        && self.disk.installed(stream))
+                    .then_some(true)
+                })
         };
         KeeperStatus {
             keeper: self.id,
@@ -87,6 +95,7 @@ impl Engine {
         loop {
             tokio::select! {
                 () = self.stop.cancelled() => return,
+                () = self.retire_now.notified() => self.retire_removed().await,
                 _ = schedule.tick() => {
                     self.shed_leadership_when_full().await;
                     self.drop_stale_learners().await;
@@ -208,9 +217,12 @@ impl Engine {
     }
 
     /// Retires this keeper's copy of a stream that has heard from no leader
-    /// for the repair delay and whose current placement, certified by another
-    /// keeper, no longer names this keeper. That copy belongs to a voter
-    /// replaced while it was down or moved off by a drain.
+    /// for the repair delay, or that a peer refused as outside its placement,
+    /// and whose current placement, certified by another keeper, no longer
+    /// names this keeper. That copy belongs to a voter replaced while it was
+    /// down, moved off by a drain, or lost to an operator recovery. A peer
+    /// that refused the copy is asked first: a lost voter's old peers may
+    /// still certify the placement it lost.
     async fn retire_removed(&self) {
         let groups = self
             .groups
@@ -223,8 +235,9 @@ impl Engine {
         let orphaned = groups
             .iter()
             .filter(|(_, group)| {
-                group.raft.metrics().borrow_watched().state != ServerState::Leader
-                    && now.duration_since(*group.heard.lock()) >= self.repair_after
+                group.excluded.lock().is_some()
+                    || (group.raft.metrics().borrow_watched().state != ServerState::Leader
+                        && now.duration_since(*group.heard.lock()) >= self.repair_after)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -236,7 +249,12 @@ impl Engine {
             else {
                 continue;
             };
-            for authority in self.placement.domains().keys().copied() {
+            let excluder = *group.excluded.lock();
+            let authorities = excluder
+                .into_iter()
+                .chain(self.placement.domains().keys().copied())
+                .collect::<Vec<_>>();
+            for authority in authorities {
                 if authority == self.id {
                     continue;
                 }
@@ -245,7 +263,10 @@ impl Engine {
                 };
                 let named = proof.configuration.voters.contains(&self.id)
                     || proof.joint.is_some_and(|roster| roster.contains(&self.id));
-                if !named {
+                if named {
+                    // The refusal came from a stale or lagging peer.
+                    *group.excluded.lock() = None;
+                } else {
                     let result = self
                         .retire_copy(stream, authority, proof.configuration.revision, generation)
                         .await;

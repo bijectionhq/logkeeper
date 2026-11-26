@@ -180,6 +180,14 @@ pub(super) enum Request {
         stream: StreamId,
         keeper: uuid::Uuid,
     },
+    /// The survivor of an operator recovery stages an installed empty copy
+    /// on one of its two replacements.
+    StageRecovered {
+        genesis: Genesis,
+        stage: Stage,
+    },
+    /// An administrator clears the recovery fence of `stream`.
+    AcknowledgeRecovery(StreamId),
 }
 
 impl Request {
@@ -187,9 +195,9 @@ impl Request {
         match *self {
             Self::Claim(ref genesis) => genesis.stream,
             Self::ReadAt { ref genesis, .. } => genesis.stream,
-            Self::StageReplica { ref genesis, .. } | Self::InstallReplica { ref genesis, .. } => {
-                genesis.stream
-            }
+            Self::StageReplica { ref genesis, .. }
+            | Self::InstallReplica { ref genesis, .. }
+            | Self::StageRecovered { ref genesis, .. } => genesis.stream,
             Self::Locate(stream)
             | Self::Bootstrap(stream)
             | Self::Create(stream)
@@ -198,6 +206,7 @@ impl Request {
             | Self::LocalCopy(stream)
             | Self::Delete(stream)
             | Self::KeeperStatus(stream)
+            | Self::AcknowledgeRecovery(stream)
             | Self::Configuration(stream) => stream,
             Self::Stage(ref stage) => stage.stream,
             Self::Seal { stream, .. }
@@ -940,6 +949,10 @@ impl Rpc {
     }
 }
 
+/// The refusal a replica sends a peer that `decisions::excludes_sender`
+/// excludes, instead of an answer that carries its newer vote.
+pub(super) const EXCLUDED: &str = "sender is outside the receiver's placement";
+
 #[derive(Clone)]
 pub(super) struct Network {
     pub control: Rpc,
@@ -949,6 +962,19 @@ pub(super) struct Network {
     pub genesis: Genesis,
     pub state: StateMachine,
     pub split_vote: watch::Sender<Option<Vote>>,
+    /// The last peer that excluded this replica, and the keeper's wake-up
+    /// for an immediate retirement check.
+    pub excluded: Arc<Mutex<Option<uuid::Uuid>>>,
+    pub retire: Arc<tokio::sync::Notify>,
+}
+
+impl Network {
+    fn observe(&self, target: NodeId, error: &io::Error) {
+        if error.to_string().contains(EXCLUDED) {
+            *self.excluded.lock() = Some(uuid::Uuid::from_u128(target));
+            self.retire.notify_one();
+        }
+    }
 }
 
 pub(super) struct Peer {
@@ -1021,7 +1047,10 @@ impl Peer {
         let frame = Frame::Peer(self.network.genesis.clone(), request);
         rpc.call(uuid::Uuid::from_u128(self.target), frame, option.hard_ttl())
             .await
-            .map_err(|error| unreachable(&error).into())
+            .map_err(|error| {
+                self.network.observe(self.target, &error);
+                unreachable(&error).into()
+            })
     }
 
     /// Sends one AppendEntries that fits its lane.
@@ -1052,6 +1081,7 @@ impl Peer {
                 .into())
             }
             Err(error) => {
+                self.network.observe(self.target, &error);
                 super::metrics::count(&super::metrics::COUNTERS.peer_unreachable);
                 super::metrics::sample("peer.unreachable", || format!("{error:?}"));
                 Err(unreachable(&error).into())

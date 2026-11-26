@@ -1,5 +1,5 @@
 {
-  "summary": "Verify the shipped consensus admission, metering, classification, rotation, batch and restart decisions against the PeerBudget, Headroom and RestartRead laws.",
+  "summary": "Verify the shipped consensus admission, metering, classification, rotation, batch and restart and operator recovery decisions against the PeerBudget, Headroom and RestartRead laws.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 52,
+  "min_verified_functions": 62,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -25,7 +25,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "replicate-on-control": {
       "defect": "send application entries on the control lane",
@@ -43,7 +43,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "vote-on-replication": {
       "defect": "send votes on the replication lane",
@@ -61,7 +61,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "undercharge-body": {
       "defect": "charge a body once instead of for its copies",
@@ -79,7 +79,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "ignore-sender-bytes": {
       "defect": "let one sender spend the receiver budget",
@@ -97,7 +97,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "ignore-sender-frames": {
       "defect": "let one sender take every message slot",
@@ -115,7 +115,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "ignore-receiver-frames": {
       "defect": "admit bodies past the receiver frame limit",
@@ -133,7 +133,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "ignore-sender-control-cap": {
       "defect": "let one sender take all control work",
@@ -151,7 +151,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "inexact-release": {
       "defect": "release a message without its bytes",
@@ -169,7 +169,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "spend-the-floor": {
       "defect": "let a reservation spend its class floor",
@@ -187,7 +187,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "ignore-pending-suffix-slots": {
       "defect": "ignore suffix slots held by pending writes",
@@ -205,7 +205,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "stall-rotation": {
       "defect": "restart the scan at the served lane",
@@ -223,7 +223,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "probe-skips-a-lane": {
       "defect": "skip the lane at the scan start",
@@ -241,7 +241,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "split-without-shrinking": {
       "defect": "resend a split batch at its original size",
@@ -259,7 +259,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "resume-old-term": {
       "defect": "restore a restarted leader in its old term",
@@ -277,7 +277,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "accept-term-above-vote": {
       "defect": "accept entries from a term above the sender's vote",
@@ -295,7 +295,7 @@
           "category": "invariant not satisfied at end of loop body"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "accept-term-regression": {
       "defect": "accept a decreasing entry term",
@@ -318,7 +318,7 @@
           "category": "invariant not satisfied at end of loop body"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
     },
     "accept-index-gap": {
       "defect": "accept a gap after the previous entry",
@@ -336,7 +336,115 @@
           "category": "invariant not satisfied at end of loop body"
         }
       ],
-      "min_verified_functions": 51
+      "min_verified_functions": 61
+    },
+    "recover-beside-a-live-voter": {
+      "defect": "allow a recovery while another voter answers healthy",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    acknowledged && survivor_votes && healthy_others == 0\n}",
+          "replace": "    acknowledged && survivor_votes && healthy_others <= 1\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "allows_recovery",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 61
+    },
+    "recover-unacknowledged": {
+      "defect": "allow a recovery without the operator's acknowledgement",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    acknowledged && survivor_votes && healthy_others == 0\n}",
+          "replace": "    survivor_votes && healthy_others == 0\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "allows_recovery",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 61
+    },
+    "reuse-recovery-term": {
+      "defect": "step the recovery term by one instead of past any term the lost voters reached",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        Some(highest + RECOVERY_TERM_GAP)\n",
+          "replace": "        Some(highest + 1)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_term",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 61
+    },
+    "keep-recovery-epoch": {
+      "defect": "install the recovery fence at the current epoch",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        Some(current + 1)\n",
+          "replace": "        Some(current)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_epoch",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 61
+    },
+    "staged-copy-votes": {
+      "defect": "let an uninstalled recovery copy vote",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    installed && (recovering ||",
+          "replace": "    (recovering ||"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "votes",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 61
+    },
+    "exclude-a-member": {
+      "defect": "refuse a member of the effective membership without answering it",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    configured && !known && sender_term < own_term\n}",
+          "replace": "    configured && sender_term < own_term\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "excludes_sender",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 61
     }
   }
 }

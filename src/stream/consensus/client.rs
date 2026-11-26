@@ -226,6 +226,13 @@ impl Client {
         unit(self.operation(Request::Delete(stream)).await?)
     }
 
+    /// Clears the recovery fence an operator recovery left on `stream`, so
+    /// writers can seal again, and returns the head. Administrators only.
+    /// Idempotent: without a recovery fence it only returns the head.
+    pub async fn acknowledge_recovery(&self, stream: StreamId) -> Result<Lsn> {
+        position(self.operation(Request::AcknowledgeRecovery(stream)).await?)
+    }
+
     /// Stages a timed original on one signing voter and returns its signed
     /// sync sample. Stage on the first two voters of the sorted roster.
     pub(super) async fn stage_original(

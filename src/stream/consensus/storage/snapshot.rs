@@ -14,7 +14,7 @@ use std::{
 
 use bincode::Options;
 use futures::TryStreamExt;
-use journal_contract::{JournalError, Lsn, Page, StreamId};
+use journal_contract::{Epoch, JournalError, Lsn, Page, StreamId};
 use openraft::{
     EntryPayload, OptionalSend, RaftSnapshotBuilder,
     storage::{EntryResponder, RaftStateMachine},
@@ -92,6 +92,53 @@ impl Image {
         }
     }
 
+    /// Applies an operator recovery: stages the move from the current
+    /// configuration to the recovery target and fences the stream under the
+    /// recovery writer. The recovered membership entry that follows it is
+    /// accepted only while both hold.
+    fn recover(&mut self, stage: Stage, genesis: &Genesis, placement: &Placement) -> Outcome {
+        let head = match self.state.head() {
+            Ok(head) => head,
+            Err(error) => return Outcome::Refused(error),
+        };
+        if self.configuration
+            != Some(Configuration {
+                revision: stage.source,
+                voters: stage.old,
+            })
+            || self.membership.membership().get_joint_config().len() != 1
+            || stage.stream != genesis.stream
+            || !placement.stage(&stage)
+            || !stage.recovery()
+        {
+            return Outcome::Refused(JournalError::Conflict { head });
+        }
+        match self.state.recover() {
+            Ok(outcome) => {
+                self.stage = Some(stage);
+                self.stage_intent = true;
+                outcome
+            }
+            Err(error) => Outcome::Refused(error),
+        }
+    }
+
+    /// Whether `stable` may change to `target` in one step: only after an
+    /// applied operator recovery staged exactly this move.
+    fn recovers(
+        &self,
+        genesis: &Genesis,
+        stable: &std::collections::BTreeSet<u128>,
+        target: &std::collections::BTreeSet<u128>,
+    ) -> bool {
+        self.state.recovering()
+            && self.stage_intent
+            && self.has_stage(genesis, target)
+            && self.stage.as_ref().is_some_and(|stage| {
+                stage.recovery() && stable.iter().copied().eq(stage.old.map(|id| id.as_u128()))
+            })
+    }
+
     fn verify_placement(&self, placement: &Placement, genesis: &Genesis) -> io::Result<()> {
         let membership = self.membership.membership();
         let current = self
@@ -151,7 +198,9 @@ impl Image {
                     .iter()
                     .copied()
                     .eq(genesis.voters.map(|id| id.as_u128())),
-                ([stable], [unchanged]) => stable == unchanged,
+                ([stable], [unchanged]) => {
+                    stable == unchanged || self.recovers(genesis, stable, unchanged)
+                }
                 ([stable], [old, new]) => stable == old && self.has_stage(genesis, new),
                 ([_, target], [finalized]) => target == finalized,
                 _ => false,
@@ -854,6 +903,7 @@ impl Inner {
                     Command::StageOwned(stage) => {
                         image.stage(stage, &self.genesis, &self.placement, true)
                     }
+                    Command::Recover(stage) => image.recover(stage, &self.genesis, &self.placement),
                     Command::Admitted(..) => return Err(invalid("nested application ticket")),
                     command => {
                         let segment = self
@@ -1022,6 +1072,46 @@ fn read_selected(
         return Err(invalid("snapshot has the wrong included log"));
     }
     Ok((meta, image, index::Dependencies::legacy(selected.digest)))
+}
+
+/// A replica's state after applying its whole local log, including entries
+/// it never saw committed. An operator recovery commits exactly that log.
+pub(in crate::stream::consensus) struct Replayed {
+    pub configuration: Option<Configuration>,
+    pub uniform: bool,
+    pub head: journal_contract::Result<Lsn>,
+    pub epoch: Epoch,
+}
+
+pub(in crate::stream::consensus) async fn replay(
+    disk: &Disk,
+    genesis: Genesis,
+    placement: Placement,
+) -> io::Result<Replayed> {
+    let machine = StateMachine::open(disk, genesis, placement).await?;
+    let inner = machine.inner.clone();
+    blocking(move || {
+        let applied = inner.applied.read().applied;
+        let entries = inner.disk.log(inner.genesis.stream, |log| {
+            log.entries
+                .values()
+                .filter(|entry| applied.is_none_or(|applied| entry.log_id.index > applied.index))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        inner.apply(entries)?;
+        let image = inner.applied.read();
+        Ok(Replayed {
+            configuration: image.configuration,
+            uniform: image.membership.membership().get_joint_config().len() == 1,
+            head: image.state.head(),
+            epoch: image
+                .state
+                .writer()
+                .map_or(Epoch(0), |(fence, _)| fence.epoch),
+        })
+    })
+    .await
 }
 
 pub(in crate::stream::consensus) fn repair_snapshot(

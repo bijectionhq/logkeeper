@@ -2,6 +2,13 @@
 
 pub(super) const MAX_RETAINED_RECORDS: usize = 65_536;
 
+/// The writer of the fence an operator recovery installs. No client seals
+/// as this UUID with an empty principal, so the fence admits no append or
+/// trim, and ordinary seals are refused with `Recovered` until an
+/// administrator acknowledges the recovery.
+pub(super) const RECOVERY_WRITER: uuid::Uuid =
+    uuid::Uuid::from_u128(0x7265_636f_7665_7279_2d66_656e_6365_0000);
+
 use std::{
     collections::VecDeque,
     fs::File,
@@ -61,6 +68,14 @@ pub enum Command {
         at: Lsn,
         record: Bytes,
     },
+    /// An operator recovery: the stage from the survivor's configuration to
+    /// the survivor and two replacements, and the recovery fence above every
+    /// epoch applied before it. The recovered membership entry follows it.
+    /// Added after `AppendOriginal`, so older keepers refuse logs that hold
+    /// it instead of misreading them.
+    Recover(Stage),
+    /// An administrator's acknowledgement that clears the recovery fence.
+    AcknowledgeRecovery,
 }
 
 /// The most records one batch carries.
@@ -127,6 +142,8 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
             at: Lsn,
             record: Bytes,
         },
+        Recover(Stage),
+        AcknowledgeRecovery,
     }
     Application::deserialize(decoder).map(Box::new)
 }
@@ -173,6 +190,8 @@ impl std::fmt::Display for Command {
             Self::AppendOriginal { at, record, .. } => {
                 write!(f, "AppendOriginal({at:?}, {} bytes)", record.len())
             }
+            Self::Recover(stage) => write!(f, "Recover({})", stage.source),
+            Self::AcknowledgeRecovery => f.write_str("AcknowledgeRecovery"),
         }
     }
 }
@@ -496,10 +515,12 @@ impl State {
                 *self = Self::Deleted;
                 Ok(Outcome::Unit)
             }
+            Command::AcknowledgeRecovery => live.acknowledge_recovery(),
             Command::Create
             | Command::Append { .. }
             | Command::Stage(_)
             | Command::StageOwned(_)
+            | Command::Recover(_)
             | Command::Admitted(..)
             | Command::AppendBatch { .. }
             | Command::AppendOriginal { .. } => unreachable!(),
@@ -508,6 +529,28 @@ impl State {
 
     pub fn head(&self) -> Result<Lsn> {
         Ok(self.live()?.head)
+    }
+
+    /// Installs the recovery fence above the current epoch.
+    pub fn recover(&mut self) -> Result<Outcome> {
+        let live = self.live_mut()?;
+        let epoch = super::decisions::recovery_epoch(live.epoch().0)
+            .map(Epoch)
+            .ok_or(JournalError::Unavailable)?;
+        let fence = Fence {
+            epoch,
+            writer: RECOVERY_WRITER,
+        };
+        live.writer = Some((fence, String::new()));
+        Ok(Outcome::Sealed(Sealed {
+            fence,
+            head: live.head,
+        }))
+    }
+
+    /// Whether an unacknowledged operator recovery fences the stream.
+    pub fn recovering(&self) -> bool {
+        self.live().is_ok_and(Live::recovering)
     }
 
     pub fn read(&self, from: Lsn, limit: usize) -> Result<ReadPage> {
@@ -612,7 +655,30 @@ impl Live {
             .map_or(Epoch(0), |(fence, _)| fence.epoch)
     }
 
+    fn recovering(&self) -> bool {
+        self.writer
+            .as_ref()
+            .is_some_and(|(fence, _)| fence.writer == RECOVERY_WRITER)
+    }
+
+    /// Replaces the recovery fence with an ownerless fence at the same
+    /// epoch, which the next ordinary seal of that epoch replaces. Returns
+    /// the head, also when no recovery fence stands.
+    fn acknowledge_recovery(&mut self) -> Result<Outcome> {
+        if self.recovering() {
+            let fence = Fence {
+                epoch: self.epoch(),
+                writer: uuid::Uuid::nil(),
+            };
+            self.writer = Some((fence, String::new()));
+        }
+        Ok(Outcome::At(self.head))
+    }
+
     fn seal(&mut self, expected: Epoch, writer: uuid::Uuid, owner: String) -> Result<Outcome> {
+        if self.recovering() {
+            return Err(JournalError::Recovered { head: self.head });
+        }
         let epoch = expected
             .0
             .checked_add(1)

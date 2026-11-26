@@ -2,6 +2,7 @@ mod admission;
 mod catalog_stream;
 mod ingress;
 mod park;
+mod recovery;
 mod repair;
 mod replacement;
 mod replicas;
@@ -46,6 +47,7 @@ use super::{
 };
 use crate::stream::{transport, wire::KeeperId};
 use admission::ReplicationIngress;
+pub use recovery::{Recovery, RecoveryReport};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEAD_REQUESTS: usize = 256;
@@ -324,6 +326,7 @@ impl Config {
             activity: parking_lot::Mutex::default(),
             park_after: Duration::from_secs(self.park_after_secs),
             snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
+            retire_now: Arc::default(),
             stop: stop.child_token(),
             #[cfg(test)]
             reject_append: Default::default(),
@@ -383,6 +386,9 @@ struct Engine {
     activity: parking_lot::Mutex<HashMap<StreamId, (Option<u64>, Instant)>>,
     park_after: Duration,
     snapshot_rate: Arc<super::network::RateLimiter>,
+    /// Wakes the repair loop when a peer excluded one of this keeper's
+    /// replicas, so a removed copy retires at once.
+    retire_now: Arc<tokio::sync::Notify>,
     stop: CancellationToken,
     #[cfg(test)]
     reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
@@ -678,6 +684,7 @@ impl Engine {
             follower: follower.clone(),
         };
         let (split_vote, collisions) = watch::channel(None);
+        let excluded = Arc::new(parking_lot::Mutex::new(None));
         let raft = Raft::new(
             self.id.as_u128(),
             self.raft_config.clone(),
@@ -689,6 +696,8 @@ impl Engine {
                 genesis: genesis.clone(),
                 state: state.clone(),
                 split_vote,
+                excluded: excluded.clone(),
+                retire: self.retire_now.clone(),
             },
             store,
             state.clone(),
@@ -709,6 +718,7 @@ impl Engine {
             used: parking_lot::Mutex::new(Instant::now()),
             handoff: parking_lot::Mutex::new(None),
             heard: parking_lot::Mutex::new(Instant::now()),
+            excluded,
             stop: self.stop.child_token(),
         });
         self.groups
@@ -752,6 +762,7 @@ impl Engine {
                         | Request::PlacementProof(_)
                         | Request::StageReplica { .. }
                         | Request::InstallReplica { .. }
+                        | Request::StageRecovered { .. }
                 ) =>
             {
                 Ok(None)
@@ -785,7 +796,8 @@ impl Engine {
                     Request::ProveOriginal { .. } => admin || writer || reader,
                     Request::Stage(_)
                     | Request::StageReplica { .. }
-                    | Request::InstallReplica { .. } => false,
+                    | Request::InstallReplica { .. }
+                    | Request::StageRecovered { .. } => false,
                     _ => admin,
                 };
                 if allowed {
@@ -832,6 +844,13 @@ impl Engine {
                     return Err(invalid("invalid staging sender"));
                 };
                 self.stage_replica(uuid::Uuid::from_u128(*id), genesis, stage)
+                    .await
+            }
+            Request::StageRecovered { genesis, stage } => {
+                let Identity::Keeper(id) = identity else {
+                    return Err(invalid("invalid staging sender"));
+                };
+                self.stage_recovered(uuid::Uuid::from_u128(*id), genesis, stage)
                     .await
             }
             Request::InstallReplica {
@@ -1026,6 +1045,9 @@ impl Engine {
                         })
                         .await),
                     Request::Delete(_) => Ok(group.write(Command::Delete).await),
+                    Request::AcknowledgeRecovery(_) => {
+                        Ok(group.write(Command::AcknowledgeRecovery).await)
+                    }
                     _ => Err(invalid("invalid application request")),
                 }?;
                 group.require_healthy()?;
@@ -1235,6 +1257,8 @@ struct Group {
     pub(super) handoff: parking_lot::Mutex<Option<Instant>>,
     /// When this replica last received an append from a leader.
     heard: parking_lot::Mutex<Instant>,
+    /// The last peer that refused this replica as outside its placement.
+    excluded: Arc<parking_lot::Mutex<Option<uuid::Uuid>>>,
     stop: CancellationToken,
 }
 

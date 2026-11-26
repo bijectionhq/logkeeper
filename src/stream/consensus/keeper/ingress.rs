@@ -418,7 +418,7 @@ impl Engine {
     /// Serves one decoded peer message and returns its encoded reply.
     async fn peer(
         &self,
-        #[cfg_attr(not(test), allow(unused_variables))] sender: NodeId,
+        sender: NodeId,
         genesis: Genesis,
         request: PeerRequest,
         body: Option<Charge>,
@@ -448,6 +448,24 @@ impl Engine {
         }
         let group = self.group(genesis).await?;
         group.require_healthy()?;
+        let campaign = match &request {
+            PeerRequest::Append(append) => Some(append.vote),
+            PeerRequest::Vote(vote) | PeerRequest::PreVote(vote) => Some(vote.vote),
+            _ => None,
+        };
+        if let Some(vote) = campaign {
+            let metrics = group.raft.metrics();
+            let current = metrics.borrow_watched();
+            let membership = current.membership_config.membership();
+            if decisions::excludes_sender(
+                !membership.get_joint_config().is_empty(),
+                membership.get_node(&sender).is_some(),
+                vote.leader_id().term,
+                current.vote.leader_id().term,
+            ) {
+                return Err(invalid(network::EXCLUDED));
+            }
+        }
         match request {
             PeerRequest::Append(request) => {
                 #[cfg(test)]
@@ -476,18 +494,32 @@ impl Engine {
             | PeerRequest::PreVote(_)
             | PeerRequest::TransferLeader(_)
             | PeerRequest::Park { .. }) => {
-                if !self.disk.installed(group.genesis.stream) {
+                let stream = group.genesis.stream;
+                let installed = self.disk.installed(stream);
+                if !installed {
                     return Err(invalid("staged replica cannot vote"));
                 }
                 let eligible = {
                     let metrics = group.raft.server_metrics();
                     let current = metrics.borrow_watched();
                     let membership = current.membership_config.membership();
-                    if membership.get_joint_config().is_empty() {
-                        group.genesis.voters.contains(&self.id)
-                    } else {
-                        membership.voter_ids().any(|id| id == self.id.as_u128())
-                    }
+                    let configs = membership.get_joint_config();
+                    let recovering = self
+                        .disk
+                        .ownership(stream)
+                        .and_then(|book| book.recovery_stage(self.id).cloned())
+                        .is_some_and(|stage| match configs.as_slice() {
+                            [] => true,
+                            [lost] => lost.iter().copied().eq(stage.old.map(|id| id.as_u128())),
+                            _ => false,
+                        });
+                    decisions::votes(
+                        installed,
+                        !configs.is_empty(),
+                        membership.voter_ids().any(|id| id == self.id.as_u128()),
+                        group.genesis.voters.contains(&self.id),
+                        recovering,
+                    )
                 };
                 if !eligible {
                     return Err(invalid("vote is outside the effective placement"));
@@ -559,6 +591,11 @@ impl Engine {
                 openraft::EntryPayload::Normal(command) => match command.body() {
                     Command::Stage(stage) | Command::StageOwned(stage) => {
                         stage.stream == group.genesis.stream && self.placement.stage(stage)
+                    }
+                    Command::Recover(stage) => {
+                        stage.stream == group.genesis.stream
+                            && self.placement.stage(stage)
+                            && stage.recovery()
                     }
                     Command::Append { payload, .. } => payload.len() <= MAX_RECORD,
                     Command::AppendOriginal { record, .. } => {

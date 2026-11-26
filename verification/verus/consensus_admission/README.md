@@ -1,6 +1,6 @@
 # Consensus admission verification
 
-`proof.rs` imports the shipped `src/stream/consensus/decisions.rs`. The keeper-hosted consensus code calls these functions on its real paths. `network.rs` uses them to classify each decoded peer request and to split oversized AppendEntries batches. `keeper/admission.rs` uses them for replication message and control admission and for every meter update and release. `keeper/ingress.rs` uses them to check each received batch, `storage/space.rs` for disk floors and suffix slots, `storage/wal.rs` for durable lane rotation and `storage/mod.rs` for the restart vote. The harness uses no custom axioms, assumptions or external bodies.
+`proof.rs` imports the shipped `src/stream/consensus/decisions.rs`. The keeper-hosted consensus code calls these functions on its real paths. `network.rs` uses them to classify each decoded peer request and to split oversized AppendEntries batches. `keeper/admission.rs` uses them for replication message and control admission and for every meter update and release. `keeper/ingress.rs` uses them to check each received batch, `storage/space.rs` for disk floors and suffix slots, `storage/wal.rs` for durable lane rotation and `storage/mod.rs` for the restart vote. `keeper/recovery.rs` uses them to admit an operator recovery and to choose its term, and `state.rs` to choose its fence epoch. `keeper/ingress.rs` also uses them to decide which replicas vote and which peers it refuses without an answer. The harness uses no custom axioms, assumptions or external bodies.
 
 `laws.rs` states independent laws over the shipped functions. Each law names the checked Lean theorem it refines.
 
@@ -19,6 +19,10 @@
 | `oversized_batches_shrink` | Sender resize in the admission contract | `fit_append` |
 | `restart_never_restores_leadership` | `RestartRead.present_never_restores_leadership` | `demotes_vote` |
 | `accepted_batches_are_consecutive` | Decoded-cut validation before dispatch | `indices_follow`, `terms_ordered`, `consecutive_cut` |
+| `recovery_needs_acknowledgement_and_no_live_quorum` | Operator recovery admission (design section R) | `allows_recovery` |
+| `recovery_outranks_the_lost_history` | Recovery term and fence epoch above the survivor's history | `recovery_term`, `recovery_epoch` |
+| `only_superseded_outsiders_are_excluded` | A refusal never hides a newer history | `excludes_sender` |
+| `only_installed_members_vote` | Vote eligibility, with recovery replacements | `votes` |
 
 ## Scope
 
@@ -30,7 +34,9 @@ These proofs cover the decisions, not the stateful bookkeeping around them. Unve
 
 ## Controls
 
-`area.json` declares 18 production mutations. Each one removes or inverts one decision, such as sending application entries on control, charging a body once, ignoring the per-sender byte, message or control cap, releasing a message without its bytes, spending a class floor, stalling rotation, splitting without shrinking, restoring a restarted leader or accepting a term regression or index gap. The baseline verifies 52 functions. Each control fails exactly its declared contract or loop invariant and verifies the other 51.
+`area.json` declares 24 production mutations. Each one removes or inverts one decision, such as sending application entries on control, charging a body once, ignoring the per-sender byte, message or control cap, releasing a message without its bytes, spending a class floor, stalling rotation, splitting without shrinking, restoring a restarted leader, accepting a term regression or index gap, recovering beside a live voter or without the acknowledgement, stepping the recovery term or epoch too little, letting an uninstalled copy vote, or refusing a member without an answer. The baseline verifies 62 functions. Each control fails exactly its declared contract or loop invariant and verifies the other 61.
+
+The recovery laws cover the decisions only. That the recovery write is one durable WAL round, that the recovered membership follows only an applied `Command::Recover`, and that a lost voter retires only on a certified placement proof are unverified Rust covered by the keeper tests.
 
 Run the area from the repository root.
 

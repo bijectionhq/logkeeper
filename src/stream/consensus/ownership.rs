@@ -47,6 +47,11 @@ pub(super) enum Change {
         revision: u64,
         generation: u64,
     },
+    /// Stages an empty copy for a replacement that an operator recovery
+    /// names, installed at once: the recovered survivor is elected by its
+    /// replacements before any of them holds the log. Added last, so older
+    /// keepers refuse a WAL that holds it.
+    Recover(Stage),
 }
 
 impl Default for Ownership {
@@ -89,6 +94,15 @@ impl Ownership {
             .is_some_and(|copy| copy.stage.as_ref() == Some(stage))
     }
 
+    /// The recovery stage of the current copy, when it is an installed
+    /// replacement that an operator recovery staged for `keeper`.
+    pub fn recovery_stage(&self, keeper: uuid::Uuid) -> Option<&Stage> {
+        let copy = self.current.as_ref().filter(|copy| copy.installed)?;
+        copy.stage.as_ref().filter(|stage| {
+            stage.recovery() && stage.target.contains(&keeper) && !stage.old.contains(&keeper)
+        })
+    }
+
     pub fn was_retired(&self, revision: u64, generation: u64) -> bool {
         self.retired == Some((revision, generation))
     }
@@ -97,6 +111,21 @@ impl Ownership {
     // the replica. The durable vote remains at its enclosing log.
     pub fn apply(&mut self, change: Change, has_cut: impl Fn(LogId) -> bool) -> io::Result<bool> {
         match change {
+            Change::Recover(stage) => {
+                if let Some(copy) = self
+                    .current
+                    .as_mut()
+                    .filter(|copy| copy.stage.as_ref() == Some(&stage))
+                {
+                    copy.installed = true;
+                    return Ok(false);
+                }
+                let changed = self.apply(Change::Stage(stage), has_cut)?;
+                if let Some(copy) = self.current.as_mut() {
+                    copy.installed = true;
+                }
+                Ok(changed)
+            }
             Change::Stage(stage) => {
                 if self.contains_stage(&stage) {
                     return Ok(false);

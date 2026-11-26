@@ -44,6 +44,7 @@ LSN 1. The **head** is the last committed LSN, or 0 for an empty stream. A
 | `NotFound` | The stream does not exist at the responding authority. |
 | `Deleted` | The stream was deleted. |
 | `Unavailable` | Retry. A mutation's outcome may be unknown. |
+| `Recovered { head: Lsn }` | An operator recovered the stream from a minority after acknowledging data loss. The journal holds `head`, which may be below previously acknowledged positions. `seal` returns it until an administrator acknowledges the recovery. |
 
 Committed records are contiguous and immutable. Seal covers acknowledged
 appends and prevents lower epochs from committing new records. Head is

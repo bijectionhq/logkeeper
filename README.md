@@ -225,6 +225,85 @@ backup also needs its exact referenced index pages, extents and any legacy
 image. Restore those dependencies at their original names before repairing the
 root. An unverifiable basis requires a fresh keeper incarnation.
 
+### Recovering a stream that lost two of its three voters
+
+A stream commits and changes membership with two of its three voters, so it
+stops when two are lost and leader-driven repair cannot help. An operator can
+make the survivor's replica the stream's only history. This can lose
+acknowledged records: a committed record reached two voters, which may have
+been the two lost ones. Stop the surviving keeper, then run, on its host:
+
+```sh
+cargo run --locked --features stream -- keeper recover-stream --config keeper.json --stream STREAM_UUID --acknowledge-data-loss [--with KEEPER_UUID,KEEPER_UUID]
+```
+
+The command takes the keeper's media lock, so it refuses while the keeper
+runs. It replays the whole local log, including entries the survivor never
+saw committed, and asks every other keeper for its status.
+
+- **Refusals.** It refuses when the survivor is not a voter of the stream's
+  latest configuration, when that configuration is joint, and when any other
+  voter of it answers with a healthy replica, open or parked: the stream
+  still has a quorum, so restart the survivor instead. It also refuses the
+  replicated catalog stream. Without `--acknowledge-data-loss` it prints what
+  it would do and refuses.
+- **Replacements.** `--with` names two keepers. Without it the command takes
+  the two best-ranked live, accepting keepers outside the lost configuration,
+  in failure domains distinct from each other and from the survivor's. They
+  must answer.
+- **Staging.** It stages the move in the catalog, best effort, so clients see
+  the new voters first among the contacts. Each replacement then stages an
+  installed, empty copy of the stream. A replacement refuses when its own
+  open replica votes in its configuration, which means the survivor's view is
+  stale.
+- **The durable step.** One WAL round on the survivor, `Record::Recover`,
+  holds a vote for the survivor in a term 2^32 above every term it has seen
+  and two entries in that term. `Command::Recover` stages the move and seals
+  the stream under a reserved recovery writer at an epoch one above every
+  epoch the survivor applied. The membership entry names the survivor and the
+  two replacements. A crash before the round's boundary leaves no trace of it
+  and the command can run again. A crash after it, or a second run, reports
+  the recovery as already written.
+
+Then start the survivor. Its replacements vote for it with their empty logs,
+it becomes leader in the new membership and replicates its log to them, which
+commits the recovery. The stream's head is the survivor's.
+
+The recovery fence admits no append or trim. Every `seal` returns
+`JournalError::Recovered { head }` until an administrator calls
+`ConsensusJournal::acknowledge_recovery(stream)`, which returns the head and
+replaces the fence with an ownerless one at the same epoch. Writers then seal
+above it. A consumer that sees `Recovered`, or a head below what it was
+acknowledged, must treat it as data loss and rebuild from the journal instead
+of its own previous head.
+
+**Lost voters.** A lost voter that returns with its data finds a placement
+that no longer names it and retires its copy. It cannot win an election: its
+configuration's other members are the survivor, whose term and log are newer
+and whose leader lease refuses votes, and the other lost voter. The recovered
+voters do not answer a peer outside their membership whose term is below
+theirs, so a lost voter never learns the recovered term; the refusal makes it
+check the placement and retire at once. If both lost voters return together
+they form a quorum of the old configuration until one of them contacts a
+recovered voter, which is normally its first election round. Clients
+following the catalog and leader hints reach the recovered voters, but a
+client holding a cached route to a lost voter could read the lost history in
+that window. Prefer to start the lost keepers one at a time, or with their
+data removed.
+
+**Why readers cannot mix histories.** The recovered entries and every later
+entry carry terms above every term in the survivor's history and, with the
+2^32 gap, in the lost voters' histories. Raft's log matching then makes any
+log that holds a recovered entry agree with the survivor's log below it.
+Only the survivor and the replacements vote in the recovered membership; a
+replacement holds nothing but what the survivor sends it. A lost voter cannot
+reach a quorum that includes a recovered voter, and its copy retires on a
+placement proof certified by the recovered membership. So every committed
+record a reader sees after the recovery comes from the survivor's log or was
+appended after the recovery, never from the lost suffix. Writers before the
+recovery are fenced by the recovery epoch, so none of their appends commits
+after it.
+
 ### Keeper storage and upgrade
 
 Admission leaves 64 MiB free for durable protocol control (32 MiB), maintenance

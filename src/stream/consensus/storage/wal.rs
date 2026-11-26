@@ -65,6 +65,11 @@ pub(in crate::stream::consensus) enum Record {
     Contacts(StreamId, BTreeSet<Uuid>),
     Ownership(StreamId, Change),
     Owned(u64, Box<Record>),
+    /// An operator recovery's vote and entries, made durable in one round.
+    /// The entries end the frame body like an `Append`'s. Added after
+    /// `Owned`, so an older keeper refuses a WAL that holds it instead of
+    /// misreading it; checkpoints keep their format.
+    Recover(StreamId, Vote, Vec<Entry>),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -176,6 +181,10 @@ impl State {
                     log.entries
                         .extend(entries.into_iter().map(|entry| (entry.log_id.index, entry)));
                 }
+            }
+            Record::Recover(stream, vote, entries) => {
+                self.apply(Record::Vote(stream, vote))?;
+                self.apply(Record::Append(stream, entries))?;
             }
             Record::Truncate(stream, since) => {
                 let log = self.log_mut(stream)?;
@@ -306,7 +315,7 @@ impl State {
                 return Err(invalid("purge lacks an exact covered WAL cut"));
             }
         }
-        if let Record::Append(stream, entries) = payload
+        if let Record::Append(stream, entries) | Record::Recover(stream, _, entries) = payload
             && let Some(first) = entries.first()
         {
             let log = self.log_mut(*stream)?;
@@ -331,7 +340,7 @@ impl State {
 impl Record {
     fn entries(&self) -> Option<&[Entry]> {
         match self {
-            Self::Append(_, entries) => Some(entries),
+            Self::Append(_, entries) | Self::Recover(_, _, entries) => Some(entries),
             Self::Owned(_, inner) => inner.entries(),
             _ => None,
         }
@@ -340,7 +349,7 @@ impl Record {
     fn append_count(&self) -> usize {
         match self {
             Self::Owned(_, inner) => inner.append_count(),
-            Self::Append(_, entries) => entries.len(),
+            Self::Append(_, entries) | Self::Recover(_, _, entries) => entries.len(),
             _ => 0,
         }
     }
@@ -371,6 +380,7 @@ impl Record {
             | Self::Purge(stream, _)
             | Self::Snapshot(stream, _)
             | Self::Contacts(stream, _)
+            | Self::Recover(stream, ..)
             | Self::Ownership(stream, _) => *stream,
         }
     }
@@ -430,6 +440,9 @@ pub(in crate::stream::consensus) enum ReplicaFault {
         entered: oneshot::Sender<()>,
         resume: std::sync::mpsc::Receiver<()>,
     },
+    /// Fails the next round that holds a local write of the scope, at the
+    /// given WAL cut.
+    Interrupt(u8),
 }
 
 impl Disk {
@@ -520,6 +533,12 @@ impl Disk {
     #[cfg(test)]
     pub fn fail_replication_at(&self, scope: StreamId, fault: ReplicaFault) {
         *self.replica_fault.lock() = Some((scope, fault));
+    }
+
+    /// Fails the next local write of `scope` at WAL cut `cut`.
+    #[cfg(test)]
+    pub fn interrupt_next(&self, scope: StreamId, cut: u8) {
+        *self.replica_fault.lock() = Some((scope, ReplicaFault::Interrupt(cut)));
     }
 
     pub async fn write(&self, record: Record) -> io::Result<()> {
@@ -699,6 +718,9 @@ impl Disk {
                         Command::Stage(stage) | Command::StageOwned(stage) => {
                             !placement.stage(stage) || stage.stream != stream
                         }
+                        Command::Recover(stage) => {
+                            !placement.stage(stage) || stage.stream != stream || !stage.recovery()
+                        }
                         Command::Admitted(..) => true,
                         _ => false,
                     },
@@ -720,9 +742,64 @@ impl Disk {
         self.state.read().catalog.values().cloned().collect()
     }
 
+    /// What an operator recovery needs from this keeper's log of `stream`.
+    pub fn recovery_point(&self, stream: StreamId) -> RecoveryPoint {
+        self.log(stream, |log| {
+            let vote_term = log.vote.map_or(0, |vote| vote.leader_id().term);
+            let last = log.entries.last_key_value().map(|(_, entry)| entry.log_id);
+            let tip = last.or(log.purged);
+            let snapshot = log.snapshot.map(|selected| selected.log_id);
+            let log_term = [last, log.purged, snapshot]
+                .into_iter()
+                .flatten()
+                .map(|id| id.leader_id.term)
+                .max()
+                .unwrap_or(0);
+            // An earlier run wrote the recovery when the log ends with its
+            // entry and membership, alone in the survivor's vote term.
+            let mut tail = log.entries.values().rev();
+            let written = match (tail.next(), tail.next(), tail.next()) {
+                (Some(membership), Some(recover), before)
+                    if recover.log_id.leader_id.term == vote_term
+                        && membership.log_id.leader_id.term == vote_term
+                        && before.is_none_or(|entry| entry.log_id.leader_id.term < vote_term)
+                        && matches!(membership.payload, openraft::EntryPayload::Membership(_)) =>
+                {
+                    match &recover.payload {
+                        openraft::EntryPayload::Normal(Command::Recover(stage)) => {
+                            Some(stage.clone())
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            RecoveryPoint {
+                vote_term,
+                log_term,
+                tip,
+                snapshot_ahead: snapshot
+                    .is_some_and(|snapshot| tip.is_none_or(|tip| snapshot.index > tip.index)),
+                written,
+            }
+        })
+    }
+
     pub(super) fn log<T>(&self, stream: StreamId, read: impl FnOnce(&Log) -> T) -> T {
         read(&self.state.read().logs[&stream])
     }
+}
+
+/// The survivor's log as an operator recovery sees it.
+pub(in crate::stream::consensus) struct RecoveryPoint {
+    pub vote_term: u64,
+    /// The highest term of the last entry, purge cut or selected snapshot.
+    pub log_term: u64,
+    pub tip: Option<LogId>,
+    /// The selected snapshot covers entries past the log's tip.
+    pub snapshot_ahead: bool,
+    /// The stage of a recovery an earlier run already wrote.
+    pub written: Option<Stage>,
 }
 
 struct Queues {
@@ -856,7 +933,9 @@ fn rounds(
                 // ticket until reopen can verify the boundary and allocations.
                 reservation.hold_until_reconciled(true);
                 #[cfg(test)]
-                if let Some((_, fault)) = replica_fault.lock().take_if(|(id, _)| *id == scope) {
+                if let Some((_, fault)) = replica_fault.lock().take_if(|(id, fault)| {
+                    *id == scope && !matches!(fault, ReplicaFault::Interrupt(_))
+                }) {
                     match fault {
                         ReplicaFault::PartialSegment => wal.interrupt(6),
                         ReplicaFault::FailedSync => wal.interrupt(5),
@@ -865,10 +944,19 @@ fn rounds(
                         gate @ ReplicaFault::BeforeSettlement { .. } => {
                             before_settlement = Some(gate)
                         }
+                        ReplicaFault::Interrupt(_) => unreachable!("local write fault"),
                     }
                 }
             } else {
                 work.record.tickets(&mut tickets);
+                #[cfg(test)]
+                if let Some((_, ReplicaFault::Interrupt(cut))) =
+                    replica_fault.lock().take_if(|(id, fault)| {
+                        *id == scope && matches!(fault, ReplicaFault::Interrupt(_))
+                    })
+                {
+                    wal.interrupt(cut);
+                }
             }
             match working.apply_indexed(work.record, wal, objects) {
                 Ok(()) => {
