@@ -448,6 +448,12 @@ impl Disk {
         let (replication, follower) = mpsc::channel(REPLICATION_QUEUE);
         let healthy = Arc::new(AtomicBool::new(true));
         let writer_healthy = healthy.clone();
+        let watchdog = super::watchdog::Watchdog::new();
+        watchdog.spawn(
+            healthy.clone(),
+            super::watchdog::MAX_ROUND_DURATION,
+            super::watchdog::exit_on_stall,
+        )?;
         let (finished, stopped) = oneshot::channel();
         let writer_state = state.clone();
         let writer_objects = objects.clone();
@@ -474,6 +480,7 @@ impl Disk {
                     &writer_objects,
                     &writer_space,
                     &writer_healthy,
+                    &watchdog,
                     #[cfg(test)]
                     &writer_fault,
                 );
@@ -762,14 +769,16 @@ fn run(
     objects: &Objects,
     space: &Space,
     health: &AtomicBool,
+    watchdog: &super::watchdog::Watchdog,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
 ) -> io::Result<()> {
     let _gate = CloseGate(health);
     let mut finish = false;
     while let Some(Message::Write(first)) = queues.recv() {
+        let _round = watchdog.begin();
         let mut round = vec![first];
         let mut bytes = 0;
-        while round.len() < 16 {
+        while round.len() < MAX_ROUND_RECORDS {
             bytes += bincode::serialized_size(&round.last().unwrap().record)
                 .map_err(io::Error::other)?;
             if bytes >= MAX_ROUND_BYTES as u64 {

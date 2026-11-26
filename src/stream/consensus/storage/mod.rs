@@ -3,6 +3,7 @@ mod objects;
 mod snapshot;
 mod space;
 mod wal;
+mod watchdog;
 
 use std::{collections::BTreeMap, ops::RangeBounds, sync::Arc};
 
