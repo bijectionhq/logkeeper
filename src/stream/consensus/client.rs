@@ -85,6 +85,15 @@ impl Client {
         self
     }
 
+    #[cfg(test)]
+    pub(super) fn set_transport_filter(
+        &self,
+        source: uuid::Uuid,
+        filter: Option<super::network::TransportFilter>,
+    ) {
+        self.rpc.set_filter(source, filter);
+    }
+
     /// Assigns and initializes a stream's unique genesis. Use the same ID, voter
     /// set, and quota when retrying an uncertain create.
     pub async fn create(

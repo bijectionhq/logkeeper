@@ -235,7 +235,10 @@ impl Config {
         engine.serve([listener, control, bulk], acceptors).await
     }
 
-    async fn prepare(self, stop: CancellationToken) -> io::Result<(Arc<Engine>, [TlsAcceptor; 3])> {
+    pub(super) async fn prepare(
+        self,
+        stop: CancellationToken,
+    ) -> io::Result<(Arc<Engine>, [TlsAcceptor; 3])> {
         let placement = self.validate()?;
         let keeper = KeeperId(self.keeper.as_u128());
         let acceptors = [
@@ -364,6 +367,8 @@ impl Config {
             fail_repairs: Default::default(),
             #[cfg(test)]
             repair_attempts: Default::default(),
+            #[cfg(test)]
+            crash: std::sync::atomic::AtomicBool::new(false),
         });
         Ok((engine, acceptors))
     }
@@ -374,13 +379,13 @@ struct TimedState {
     stages: super::timed::Stages,
 }
 
-struct Engine {
+pub(super) struct Engine {
     timed: Option<Arc<TimedState>>,
-    id: uuid::Uuid,
+    pub(super) id: uuid::Uuid,
     catalog_id: uuid::Uuid,
     catalog: Option<Catalog>,
     catalog_stream: Option<catalog_stream::CatalogStream>,
-    disk: Disk,
+    pub(super) disk: Disk,
     /// The media incarnations of this keeper and its peers.
     recognition: incarnation::Recognition,
     rpc: Rpc,
@@ -402,17 +407,17 @@ struct Engine {
     led_since: parking_lot::Mutex<HashMap<StreamId, (u64, Instant)>>,
     /// When the leader first saw each learner of each stream it leads.
     learners_seen: parking_lot::Mutex<HashMap<(StreamId, NodeId), Instant>>,
-    groups: Mutex<BTreeMap<StreamId, Arc<Group>>>,
+    pub(super) groups: Mutex<BTreeMap<StreamId, Arc<Group>>>,
     deletions: parking_lot::Mutex<HashMap<StreamId, Instant>>,
     /// Deleted streams whose groups this keeper closed. Clients are answered
     /// `Deleted` and peers are refused instead of reopening the group.
-    deleted: parking_lot::RwLock<HashSet<StreamId>>,
+    pub(super) deleted: parking_lot::RwLock<HashSet<StreamId>>,
     /// Idle streams whose groups this keeper closed until the next request,
     /// and when each parked.
-    parked: parking_lot::RwLock<HashMap<StreamId, Instant>>,
+    pub(super) parked: parking_lot::RwLock<HashMap<StreamId, Instant>>,
     /// State machines of parked and deleted groups, kept so the reaper
     /// cannot delete what only they reference.
-    closed_states: parking_lot::Mutex<HashMap<StreamId, StateMachine>>,
+    pub(super) closed_states: parking_lot::Mutex<HashMap<StreamId, StateMachine>>,
     /// The last log index of each led stream and when it last changed.
     activity: parking_lot::Mutex<HashMap<StreamId, (Option<u64>, Instant)>>,
     /// When each other keeper last answered a ping, and what it reported.
@@ -426,7 +431,7 @@ struct Engine {
     /// Wakes the repair loop when a peer excluded one of this keeper's
     /// replicas, so a removed copy retires at once.
     retire_now: Arc<tokio::sync::Notify>,
-    stop: CancellationToken,
+    pub(super) stop: CancellationToken,
     #[cfg(test)]
     reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
     #[cfg(test)]
@@ -439,6 +444,8 @@ struct Engine {
     fail_repairs: parking_lot::RwLock<HashSet<StreamId>>,
     #[cfg(test)]
     repair_attempts: parking_lot::Mutex<HashMap<StreamId, u32>>,
+    #[cfg(test)]
+    pub(super) crash: std::sync::atomic::AtomicBool,
 }
 
 enum Identity {
@@ -447,7 +454,15 @@ enum Identity {
 }
 
 impl Engine {
-    async fn serve(
+    #[cfg(test)]
+    pub(super) fn set_transport_filter(&self, filter: Option<super::network::TransportFilter>) {
+        self.rpc.set_filter(self.id, filter.clone());
+        self.control.set_filter(self.id, filter.clone());
+        self.replication.set_filter(self.id, filter.clone());
+        self.bulk.set_filter(self.id, filter);
+    }
+
+    pub(super) async fn serve(
         self: Arc<Self>,
         listeners: [TcpListener; 3],
         acceptors: [TlsAcceptor; 3],
@@ -544,7 +559,13 @@ impl Engine {
         .await;
         self.stop.cancel();
         self.disk.disable_reaping();
-        self.evict_leaders(Duration::from_secs(3)).await;
+        #[cfg(test)]
+        let evict = !self.crash.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(not(test))]
+        let evict = true;
+        if evict {
+            self.evict_leaders(Duration::from_secs(3)).await;
+        }
         sockets.shutdown().await;
         for group in std::mem::take(&mut *self.groups.lock().await).into_values() {
             let _ = group.raft.shutdown().await;
@@ -1323,10 +1344,10 @@ impl Engine {
     }
 }
 
-struct Group {
-    genesis: Genesis,
-    raft: Raft,
-    state: StateMachine,
+pub(super) struct Group {
+    pub(super) genesis: Genesis,
+    pub(super) raft: Raft,
+    pub(super) state: StateMachine,
     membership: Mutex<()>,
     snapshot_receive: Mutex<Option<ingress::Incoming>>,
     append_order: Arc<Mutex<()>>,

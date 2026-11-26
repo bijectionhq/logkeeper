@@ -576,6 +576,27 @@ fn replies(mut body: &[u8]) -> io::Result<Vec<(u64, Result<&[u8], &[u8]>)>> {
     Ok(replies)
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RpcFault {
+    /// Deliver normally.
+    Allow,
+    /// Drop before sending (optional delay before returning error).
+    Drop(Duration),
+    /// Delay before sending.
+    Delay(Duration),
+    /// Deliver to the receiver, then discard the reply so the caller sees an
+    /// ambiguous transport failure.
+    DropReply(Duration),
+    /// Deliver normally, and also send a duplicate copy after `Duration` when
+    /// the frame is an idempotent peer message.
+    Duplicate(Duration),
+}
+
+#[cfg(test)]
+pub(super) type TransportFilter =
+    Arc<dyn Fn(uuid::Uuid, uuid::Uuid, Lane) -> RpcFault + Send + Sync>;
+
 #[derive(Clone)]
 pub(super) struct Rpc {
     inner: Arc<Connections>,
@@ -596,6 +617,9 @@ struct Connections {
     /// Replaces the TLS connection to every target in unit tests.
     #[cfg(test)]
     dial: Mutex<Option<Arc<dyn Fn() -> tokio::io::DuplexStream + Send + Sync>>>,
+    /// Fault filter `(sender_id, filter)` for fault-injection tests.
+    #[cfg(test)]
+    filter: Mutex<Option<(uuid::Uuid, TransportFilter)>>,
 }
 
 const PEER_IN_FLIGHT: usize = 16;
@@ -820,8 +844,15 @@ impl Rpc {
                 lane,
                 #[cfg(test)]
                 dial: Mutex::default(),
+                #[cfg(test)]
+                filter: Mutex::default(),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_filter(&self, source: uuid::Uuid, filter: Option<TransportFilter>) {
+        *self.inner.filter.lock() = filter.map(|f| (source, f));
     }
 
     pub fn keepers(&self) -> &Keepers {
@@ -834,7 +865,84 @@ impl Rpc {
         request: Frame,
         deadline: Duration,
     ) -> io::Result<T> {
+        #[cfg(test)]
+        let action = self
+            .inner
+            .filter
+            .lock()
+            .as_ref()
+            .map(|(source, filter)| filter(*source, target, self.inner.lane))
+            .unwrap_or(RpcFault::Allow);
+        #[cfg(test)]
+        match action {
+            RpcFault::Allow => {}
+            RpcFault::Drop(delay) => {
+                if !delay.is_zero() {
+                    timeout(deadline, tokio::time::sleep(delay)).await?;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "injected network drop",
+                ));
+            }
+            RpcFault::Delay(delay) => {
+                return timeout(deadline, async {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    self.exchange(target, request).await
+                })
+                .await?;
+            }
+            RpcFault::DropReply(delay) => {
+                let _ = timeout(deadline, async {
+                    let _ = self.exchange::<T>(target, request).await;
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                })
+                .await;
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "injected reply drop",
+                ));
+            }
+            RpcFault::Duplicate(delay) => {
+                if matches!(request, Frame::Peer(..))
+                    && let Ok(encoded) = encode(&request)
+                {
+                    let dup = self.clone();
+                    tokio::spawn(async move {
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let _ = timeout(deadline, dup.send_duplicate(target, encoded)).await;
+                    });
+                }
+            }
+        }
         timeout(deadline, self.exchange(target, request)).await?
+    }
+
+    #[cfg(test)]
+    async fn send_duplicate(&self, target: uuid::Uuid, encoded: Vec<u8>) -> io::Result<()> {
+        let frame: Frame = decode(&encoded)?;
+        let address = *self
+            .keepers()
+            .get(&target)
+            .ok_or_else(|| invalid("unknown keeper"))?;
+        match self.inner.lane {
+            Lane::Control | Lane::Replication => {
+                let _ = self.multiplexed(target, address, &frame).await;
+            }
+            Lane::Bulk => {
+                let _ = self.exchange::<ChunkReply>(target, frame).await;
+            }
+            Lane::Application => {
+                let _ = self.exchange::<Reply>(target, frame).await;
+            }
+        }
+        Ok(())
     }
 
     /// Batch frames this client has written on multiplexed channels.

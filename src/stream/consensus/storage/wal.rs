@@ -431,6 +431,8 @@ pub(in crate::stream::consensus) struct Disk {
     pub(super) objects: Objects,
     #[cfg(test)]
     replica_fault: Arc<parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>>,
+    #[cfg(test)]
+    wal_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(test)]
@@ -487,6 +489,10 @@ impl Disk {
         let replica_fault = Arc::new(parking_lot::Mutex::new(None));
         #[cfg(test)]
         let writer_fault = replica_fault.clone();
+        #[cfg(test)]
+        let wal_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        #[cfg(test)]
+        let writer_delay = wal_delay_ms.clone();
         std::thread::Builder::new()
             .name("logkeeper-raft-wal".into())
             .spawn(move || {
@@ -507,6 +513,8 @@ impl Disk {
                     &writer_watchdog,
                     #[cfg(test)]
                     &writer_fault,
+                    #[cfg(test)]
+                    &writer_delay,
                 );
                 drop(lock);
                 if let Err(error) = &result {
@@ -530,6 +538,8 @@ impl Disk {
             objects,
             #[cfg(test)]
             replica_fault,
+            #[cfg(test)]
+            wal_delay_ms,
         })
     }
 
@@ -551,6 +561,12 @@ impl Disk {
     #[cfg(test)]
     pub fn mark_slow(&self, hold: std::time::Duration) {
         self.watchdog.mark_slow(hold);
+    }
+
+    #[cfg(test)]
+    pub fn set_wal_delay(&self, delay: std::time::Duration) {
+        self.wal_delay_ms
+            .store(delay.as_millis() as u64, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -886,6 +902,7 @@ fn run(
     health: &AtomicBool,
     watchdog: &super::watchdog::Watchdog,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
+    #[cfg(test)] wal_delay_ms: &std::sync::atomic::AtomicU64,
 ) -> io::Result<()> {
     let _gate = CloseGate(health);
     let result = rounds(
@@ -897,6 +914,8 @@ fn run(
         watchdog,
         #[cfg(test)]
         replica_fault,
+        #[cfg(test)]
+        wal_delay_ms,
     );
     wal.finish();
     result
@@ -910,6 +929,7 @@ fn rounds(
     space: &Space,
     watchdog: &super::watchdog::Watchdog,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
+    #[cfg(test)] wal_delay_ms: &std::sync::atomic::AtomicU64,
 ) -> io::Result<()> {
     let mut finish = false;
     while let Some(Message::Write(first)) = queues.recv() {
@@ -1002,6 +1022,13 @@ fn rounds(
             }
         }
         if !changed.is_empty() {
+            #[cfg(test)]
+            {
+                let delay = wal_delay_ms.load(Ordering::Relaxed);
+                if delay > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
+            }
             wal.commit(objects, &changed)?;
             #[cfg(test)]
             if let Some(ReplicaFault::BeforeSettlement { entered, resume }) = before_settlement {
