@@ -1,5 +1,6 @@
 mod media;
 mod objects;
+mod segment;
 mod snapshot;
 mod space;
 mod wal;

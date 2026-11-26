@@ -2,7 +2,7 @@ use bytes::Bytes;
 use journal_contract::{Epoch, Lsn};
 use openraft::EntryPayload;
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
 };
@@ -37,6 +37,13 @@ fn entry(index: u64, payload: Bytes) -> Entry {
     }
 }
 
+fn payload_of(entry: &Entry) -> Bytes {
+    match &entry.payload {
+        EntryPayload::Normal(Command::Append { payload, .. }) => payload.clone(),
+        _ => panic!("not an append"),
+    }
+}
+
 fn install(dir: &Path, keeper: Uuid) -> impl Fn() -> Enrollment + '_ {
     let path = dir.join("data");
     let ledger = dir.join("registry");
@@ -46,8 +53,19 @@ fn install(dir: &Path, keeper: Uuid) -> impl Fn() -> Enrollment + '_ {
     enrollment
 }
 
+fn install_legacy(dir: &Path, keeper: Uuid) -> impl Fn() -> Enrollment + '_ {
+    let path = dir.join("data");
+    let ledger = dir.join("registry");
+    fs::create_dir(&ledger).unwrap();
+    let enrollment = move || Enrollment::test(path.clone(), ledger.clone(), keeper);
+    enrollment().initialize_legacy().unwrap();
+    enrollment
+}
+
 fn legacy(enrollment: Enrollment, records: &[Record]) -> PathBuf {
-    let (media, _lock, selected) = enrollment.open().unwrap();
+    let (media, _lock, Opened::Legacy(selected)) = enrollment.open().unwrap() else {
+        panic!("legacy media")
+    };
     let path = media.wal(selected.generation);
     let mut file = OpenOptions::new().append(true).open(&path).unwrap();
     let bytes = records
@@ -65,12 +83,66 @@ fn legacy(enrollment: Enrollment, records: &[Record]) -> PathBuf {
     path
 }
 
+fn segment_files(dir: &Path) -> BTreeMap<u64, PathBuf> {
+    fs::read_dir(dir.join("data").join(super::super::segment::DIRECTORY))
+        .unwrap()
+        .map(|item| item.unwrap().path())
+        .filter_map(|path| {
+            let id = super::super::segment::parse(path.file_name()?.to_str()?)?;
+            Some((id, path))
+        })
+        .collect()
+}
+
+fn segment_bytes(dir: &Path) -> u64 {
+    segment_files(dir)
+        .values()
+        .map(|path| fs::metadata(path).unwrap().len())
+        .sum()
+}
+
+fn checkpoint_files(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir.join("data").join("raft-checkpoints"))
+        .map(|items| items.map(|item| item.unwrap().path()).collect())
+        .unwrap_or_default()
+}
+
+fn eager() -> Tuning {
+    Tuning {
+        segment_bytes: 1,
+        checkpoint_bytes: 1,
+        synchronous: true,
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for item in fs::read_dir(from).unwrap() {
+        let item = item.unwrap();
+        let target = to.join(item.file_name());
+        if item.file_type().unwrap().is_dir() {
+            copy_tree(&item.path(), &target);
+        } else {
+            fs::copy(item.path(), target).unwrap();
+        }
+    }
+}
+
+async fn registered(disk: &Disk, genesis: Genesis) -> StreamId {
+    let stream = genesis.stream;
+    disk.protocol(Record::Register(genesis)).await.unwrap();
+    disk.protocol(Record::Vote(stream, Vote::new_committed(2, 1)))
+        .await
+        .unwrap();
+    stream
+}
+
 #[tokio::test]
 async fn legacy_framed_wal_migrates_a_large_batch_and_discards_unpublished_tail() {
     let dir = tempfile::tempdir().unwrap();
     let genesis = genesis();
     let stream = genesis.stream;
-    let enrollment = install(dir.path(), genesis.voters[0]);
+    let enrollment = install_legacy(dir.path(), genesis.voters[0]);
     let payload = Bytes::from(vec![77; MAX_RECORD]);
     let mut records = vec![
         Record::Register(genesis),
@@ -88,19 +160,15 @@ async fn legacy_framed_wal_migrates_a_large_batch_and_discards_unpublished_tail(
         assert_eq!(log.entries.len(), 9);
         assert_eq!(log.vote, Some(Vote::new_committed(2, 1)));
         for found in log.entries.values() {
-            assert!(
-                matches!(&found.payload, EntryPayload::Normal(Command::Append {
-                payload: restored, ..
-            }) if *restored == payload)
-            );
+            assert_eq!(payload_of(found), payload);
         }
+        assert!(log.segments.values().all(|object| object.key().is_none()));
     });
     restarted.shutdown().await.unwrap();
-    let (media, lock, selected) = enrollment().open().unwrap();
-    drop(lock);
+    let (_, newest) = segment_files(dir.path()).pop_last().unwrap();
     OpenOptions::new()
         .write(true)
-        .open(media.wal(selected.generation))
+        .open(newest)
         .unwrap()
         .set_len(0)
         .unwrap();
@@ -108,16 +176,123 @@ async fn legacy_framed_wal_migrates_a_large_batch_and_discards_unpublished_tail(
 }
 
 #[tokio::test]
-async fn a_detached_log_segment_is_retained_until_its_exact_last_pin() {
+async fn an_indexed_wal_written_by_the_old_code_path_migrates_once() {
     let dir = tempfile::tempdir().unwrap();
     let genesis = genesis();
     let stream = genesis.stream;
-    let enrollment = install(dir.path(), genesis.voters[0]);
-    let disk = Disk::open(enrollment()).unwrap();
-    disk.protocol(Record::Register(genesis)).await.unwrap();
-    disk.protocol(Record::Vote(stream, Vote::new_committed(2, 1)))
-        .await
+    let keeper = genesis.voters[0];
+    let enrollment = install_legacy(dir.path(), keeper);
+    let entries = (0..4)
+        .map(|index| entry(index, Bytes::from(format!("legacy {index}"))))
+        .collect::<Vec<_>>();
+    let selected = Selected {
+        log_id: entries[1].log_id,
+        digest: [9; 32],
+    };
+    {
+        let (media, _lock, Opened::Legacy(boundary)) = enrollment().open().unwrap() else {
+            panic!("legacy media")
+        };
+        let objects = Objects::open(media.data()).unwrap();
+        let mut state = legacy::open(&media, boundary, &objects).unwrap();
+        for record in [
+            Record::Register(genesis.clone()),
+            Record::Claim(genesis.clone()),
+            Record::Vote(stream, Vote::new_committed(2, 1)),
+            Record::Append(stream, entries.clone()),
+            Record::Snapshot(stream, selected),
+            Record::Purge(stream, entries[1].log_id),
+        ] {
+            state.apply(record).unwrap();
+        }
+        legacy::commit(&media, &objects, &mut state, boundary.generation).unwrap();
+        // A migration that stopped before its registry commit left these.
+        fs::write(enrollment().boundary_path(), [0; 1024]).unwrap();
+        fs::write(
+            objects
+                .segment_directory()
+                .join(super::super::segment::name(1)),
+            b"partial",
+        )
         .unwrap();
+    }
+    let registry = dir.path().join("registry");
+    let check = |disk: &Disk, count| {
+        disk.log(stream, |log| {
+            assert_eq!(log.vote, Some(Vote::new_committed(2, 1)));
+            assert_eq!(log.purged, Some(entries[1].log_id));
+            assert_eq!(
+                log.snapshot.map(|found| found.log_id),
+                Some(selected.log_id)
+            );
+            assert_eq!(log.entries.len(), count);
+            for index in 2..4 {
+                assert_eq!(log.entries[&index], entries[index as usize]);
+                assert!(log.segments[&index].key().is_some());
+            }
+        });
+        assert_eq!(disk.catalog(stream).unwrap().genesis, genesis);
+    };
+    let disk = Disk::open(enrollment()).unwrap();
+    check(&disk, 2);
+    assert!(!registry.join(format!("{keeper}.wal")).exists());
+    assert!(enrollment().boundary_path().exists());
+    let wal_files = |data: &Path| {
+        fs::read_dir(data)
+            .unwrap()
+            .filter(|item| {
+                item.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .unwrap()
+                    .ends_with(".wal")
+            })
+            .count()
+    };
+    let data = dir.path().join("data");
+    assert_eq!(wal_files(&data), 0);
+    disk.write(Record::Append(
+        stream,
+        vec![entry(4, Bytes::from_static(b"segmented"))],
+    ))
+    .await
+    .unwrap();
+    disk.shutdown().await.unwrap();
+
+    // The registry committed the migration but the data volume still says
+    // the old format.
+    let keeper_file = data.join("KEEPER");
+    let installed = fs::read_to_string(&keeper_file).unwrap();
+    assert!(installed.contains("logkeeper-raft-3"));
+    fs::write(
+        &keeper_file,
+        installed.replace("logkeeper-raft-3", "logkeeper-raft-2"),
+    )
+    .unwrap();
+    fs::write(data.join(format!("raft-{}.wal", Uuid::new_v4())), b"stale").unwrap();
+    let reopened = Disk::open(enrollment()).unwrap();
+    check(&reopened, 3);
+    reopened.log(stream, |log| {
+        assert_eq!(payload_of(&log.entries[&4]), &b"segmented"[..]);
+        assert!(log.segments[&4].key().is_none());
+    });
+    assert!(
+        fs::read_to_string(&keeper_file)
+            .unwrap()
+            .contains("logkeeper-raft-3")
+    );
+    assert_eq!(wal_files(&data), 0);
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_detached_log_segment_is_retained_until_its_exact_last_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let genesis = genesis();
+    let enrollment = install(dir.path(), genesis.voters[0]);
+    let disk = Disk::open_tuned(enrollment(), eager()).unwrap();
+    let stream = registered(&disk, genesis).await;
     disk.write(Record::Append(
         stream,
         vec![entry(0, Bytes::from_static(b"original"))],
@@ -134,6 +309,10 @@ async fn a_detached_log_segment_is_retained_until_its_exact_last_pin() {
     ))
     .await
     .unwrap();
+    assert_ne!(
+        disk.log(stream, |log| log.segments[&0].path().to_owned()),
+        path
+    );
     disk.reap_objects().await.unwrap();
     assert!(path.exists());
     assert!(pin.read().is_ok());
@@ -143,11 +322,7 @@ async fn a_detached_log_segment_is_retained_until_its_exact_last_pin() {
     disk.shutdown().await.unwrap();
     let restarted = Disk::open(enrollment()).unwrap();
     restarted.log(stream, |log| {
-        assert!(
-            matches!(&log.entries[&0].payload, EntryPayload::Normal(Command::Append {
-            payload, ..
-        }) if *payload == Bytes::from_static(b"replacement"))
-        );
+        assert_eq!(payload_of(&log.entries[&0]), &b"replacement"[..]);
         assert_eq!(log.vote, Some(Vote::new_committed(2, 1)));
     });
     restarted.shutdown().await.unwrap();
@@ -251,7 +426,7 @@ fn selected_log_without_its_vote_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let genesis = genesis();
     let stream = genesis.stream;
-    let enrollment = install(dir.path(), genesis.voters[0]);
+    let enrollment = install_legacy(dir.path(), genesis.voters[0]);
     legacy(
         enrollment(),
         &[
@@ -293,68 +468,65 @@ async fn the_protocol_queue_remains_open_when_application_and_maintenance_queues
 }
 
 #[test]
-fn a_restart_uses_the_complete_wal_index_on_either_side_of_publication() {
-    for cut in [1, 2, 3, 4] {
-        let dir = tempfile::tempdir().unwrap();
-        let genesis = genesis();
-        let stream = genesis.stream;
-        let enrollment = install(dir.path(), genesis.voters[0]);
-        let objects;
-        let space;
-        {
-            let (media, _lock, boundary) = enrollment().open().unwrap();
-            objects = Objects::open(media.data()).unwrap();
-            space = Space::new(media.data().to_owned()).unwrap();
-            let (mut indexed, mut state) =
-                Indexed::open(&media, boundary, &objects, &space).unwrap();
-            state
-                .apply_indexed(Record::Register(genesis), &objects)
-                .unwrap();
-            let vote = Vote::new_committed(2, 1);
-            state
-                .apply_indexed(Record::Vote(stream, vote), &objects)
-                .unwrap();
-            state
-                .apply_indexed(
-                    Record::Append(stream, vec![entry(0, Bytes::from_static(b"old"))]),
-                    &objects,
-                )
-                .unwrap();
-            indexed
-                .commit(&media, &objects, &state, &BTreeSet::from([stream]))
-                .unwrap();
-            let new = entry(1, Bytes::from_static(b"new"));
-            let selected = Selected {
-                log_id: new.log_id,
-                digest: [7; 32],
+fn a_restart_recovers_the_published_side_of_every_crash_point() {
+    // 2: after the data sync, before the boundary. 3: after the boundary.
+    // 5: failed data sync. 6: torn frame. A rolled round also leaves a
+    // segment no boundary names.
+    for roll in [false, true] {
+        for cut in [2, 3, 5, 6] {
+            let dir = tempfile::tempdir().unwrap();
+            let genesis = genesis();
+            let stream = genesis.stream;
+            let enrollment = install(dir.path(), genesis.voters[0]);
+            let tuning = Tuning {
+                segment_bytes: if roll { 1 } else { u64::MAX },
+                ..Tuning::default()
             };
-            state
-                .apply_indexed(Record::Append(stream, vec![new]), &objects)
-                .unwrap();
-            state
-                .apply_indexed(Record::Snapshot(stream, selected), &objects)
-                .unwrap();
-            indexed.interrupt(cut);
-            assert!(
-                indexed
-                    .commit(&media, &objects, &state, &BTreeSet::from([stream]))
-                    .is_err()
-            );
+            let objects;
+            let space;
+            let scopes = BTreeSet::from([stream]);
+            {
+                let (media, _lock, _) = enrollment().open().unwrap();
+                objects = Objects::open(media.data()).unwrap();
+                space = Space::new(media.data().to_owned()).unwrap();
+                let (mut wal, mut state) = Segmented::open(&media, &objects, tuning).unwrap();
+                for record in [
+                    Record::Register(genesis),
+                    Record::Vote(stream, Vote::new_committed(2, 1)),
+                    Record::Append(stream, vec![entry(0, Bytes::from_static(b"old"))]),
+                ] {
+                    state.apply_indexed(record, &mut wal, &objects).unwrap();
+                }
+                wal.commit(&objects, &scopes).unwrap();
+                let new = entry(1, Bytes::from_static(b"new"));
+                let selected = Selected {
+                    log_id: new.log_id,
+                    digest: [7; 32],
+                };
+                state
+                    .apply_indexed(Record::Append(stream, vec![new]), &mut wal, &objects)
+                    .unwrap();
+                state
+                    .apply_indexed(Record::Snapshot(stream, selected), &mut wal, &objects)
+                    .unwrap();
+                wal.interrupt(cut);
+                assert!(wal.commit(&objects, &scopes).is_err());
+            }
+            let (media, _lock, _) = enrollment().open().unwrap();
+            let (wal, recovered) = Segmented::open(&media, &objects, tuning).unwrap();
+            let survived = cut == 3;
+            let log = &recovered.logs[&stream];
+            assert_eq!(log.entries.len(), if survived { 2 } else { 1 });
+            assert_eq!(log.snapshot.is_some(), survived);
+            assert!(log.purged.is_none());
+            assert_eq!(log.vote, Some(Vote::new_committed(2, 1)));
+            assert_eq!(payload_of(&log.entries[&0]), &b"old"[..]);
+            let position = wal.position();
+            let (last, path) = segment_files(dir.path()).pop_last().unwrap();
+            assert_eq!(last, position.segment);
+            assert_eq!(fs::metadata(path).unwrap().len(), position.offset);
+            drop(space);
         }
-        let (media, _lock, boundary) = enrollment().open().unwrap();
-        let (_, recovered) = Indexed::open(&media, boundary, &objects, &space).unwrap();
-        assert_eq!(
-            recovered.logs[&stream].entries.len(),
-            if cut < 3 { 1 } else { 2 }
-        );
-        assert_eq!(recovered.logs[&stream].snapshot.is_some(), cut >= 3);
-        assert!(recovered.logs[&stream].purged.is_none());
-        assert_eq!(
-            recovered.logs[&stream].vote,
-            Some(Vote::new_committed(2, 1))
-        );
-        assert!(matches!(&recovered.logs[&stream].entries[&0].payload,
-            EntryPayload::Normal(Command::Append { payload, .. }) if *payload == b"old"[..]));
     }
 }
 
@@ -387,12 +559,11 @@ async fn failed_follower_writes_keep_the_ticket_and_recover_the_selected_cut() {
         let charge = disk.space.outstanding(stream);
         assert_eq!(charge.0, 1);
         assert!(charge.1 > 32 * 1024);
-        let objects = disk.path.join("objects");
-        let initial = fs::read_dir(&objects).unwrap().count();
+        let initial = segment_bytes(dir.path());
         disk.fail_replication_at(stream, fault);
         assert!(disk.replicate(record, ticket).await.is_err());
         assert_eq!(disk.space.outstanding(stream), charge);
-        assert!(fs::read_dir(&objects).unwrap().count() > initial);
+        assert!(segment_bytes(dir.path()) > initial);
         assert!(disk.shutdown().await.is_err());
         assert!(!disk.healthy());
 
@@ -405,12 +576,242 @@ async fn failed_follower_writes_keep_the_ticket_and_recover_the_selected_cut() {
                 assert_eq!(log.entries.get(&0), entries.first());
             }
         });
-        let unreconciled = fs::read_dir(&objects).unwrap().count();
-        reopened.enable_reaping();
-        reopened.reap_objects().await.unwrap();
-        assert!(fs::read_dir(&objects).unwrap().count() < unreconciled);
+        // An unacknowledged tail is cut back to the trusted boundary.
+        assert_eq!(segment_bytes(dir.path()) > initial, survived);
         reopened.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn a_torn_tail_past_the_boundary_is_truncated_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let genesis = genesis();
+    let enrollment = install(dir.path(), genesis.voters[0]);
+    let disk = Disk::open(enrollment()).unwrap();
+    let stream = registered(&disk, genesis).await;
+    disk.write(Record::Append(
+        stream,
+        vec![entry(0, Bytes::from_static(b"kept"))],
+    ))
+    .await
+    .unwrap();
+    disk.shutdown().await.unwrap();
+    let (_, active) = segment_files(dir.path()).pop_last().unwrap();
+    let published = fs::metadata(&active).unwrap().len();
+    let mut tail = OpenOptions::new().append(true).open(&active).unwrap();
+    // A whole frame the boundary never named, then a torn one.
+    let body = b"never acknowledged";
+    tail.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+    tail.write_all(&crc32fast::hash(body).to_le_bytes())
+        .unwrap();
+    tail.write_all(body).unwrap();
+    tail.write_all(&64_u32.to_le_bytes()).unwrap();
+    tail.write_all(&[1; 13]).unwrap();
+    drop(tail);
+
+    let reopened = Disk::open(enrollment()).unwrap();
+    assert_eq!(fs::metadata(&active).unwrap().len(), published);
+    reopened
+        .write(Record::Append(
+            stream,
+            vec![entry(1, Bytes::from_static(b"after"))],
+        ))
+        .await
+        .unwrap();
+    reopened.shutdown().await.unwrap();
+    let again = Disk::open(enrollment()).unwrap();
+    again.log(stream, |log| {
+        assert_eq!(payload_of(&log.entries[&0]), &b"kept"[..]);
+        assert_eq!(payload_of(&log.entries[&1]), &b"after"[..]);
+    });
+    again.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_data_volume_that_lost_acknowledged_writes_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let genesis = genesis();
+    let enrollment = install(dir.path(), genesis.voters[0]);
+    let disk = Disk::open(enrollment()).unwrap();
+    let stream = registered(&disk, genesis).await;
+    disk.write(Record::Append(
+        stream,
+        vec![entry(0, Bytes::from_static(b"first"))],
+    ))
+    .await
+    .unwrap();
+    disk.shutdown().await.unwrap();
+    let data = dir.path().join("data");
+    let older = dir.path().join("older");
+    copy_tree(&data, &older);
+    let disk = Disk::open(enrollment()).unwrap();
+    disk.write(Record::Append(
+        stream,
+        vec![entry(1, Bytes::from_static(b"second"))],
+    ))
+    .await
+    .unwrap();
+    disk.shutdown().await.unwrap();
+    let intact = dir.path().join("intact");
+    copy_tree(&data, &intact);
+    let restore = |from: &Path| {
+        fs::remove_dir_all(&data).unwrap();
+        copy_tree(from, &data);
+    };
+    let (_, active) = segment_files(dir.path()).pop_last().unwrap();
+    let len = fs::metadata(&active).unwrap().len();
+
+    // The last acknowledged frame is missing.
+    OpenOptions::new()
+        .write(true)
+        .open(&active)
+        .unwrap()
+        .set_len(len - 1)
+        .unwrap();
+    assert!(Disk::open(enrollment()).is_err());
+
+    // A byte of an acknowledged frame changed.
+    restore(&intact);
+    let mut bytes = fs::read(&active).unwrap();
+    bytes[len as usize - 3] ^= 1;
+    fs::write(&active, bytes).unwrap();
+    assert!(Disk::open(enrollment()).is_err());
+
+    // The whole volume went back to an earlier consistent state.
+    restore(&older);
+    assert!(Disk::open(enrollment()).is_err());
+
+    // The segment itself is gone.
+    restore(&intact);
+    fs::remove_file(&active).unwrap();
+    assert!(Disk::open(enrollment()).is_err());
+
+    restore(&intact);
+    let reopened = Disk::open(enrollment()).unwrap();
+    reopened.log(stream, |log| assert_eq!(log.entries.len(), 2));
+    reopened.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn purged_and_truncated_segments_are_deleted_and_stay_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let genesis = genesis();
+    let enrollment = install(dir.path(), genesis.voters[0]);
+    let disk = Disk::open_tuned(enrollment(), eager()).unwrap();
+    let stream = registered(&disk, genesis).await;
+    let mut held = BTreeMap::new();
+    for index in 0..6 {
+        disk.write(Record::Append(
+            stream,
+            vec![entry(index, Bytes::from(vec![index as u8; 1024]))],
+        ))
+        .await
+        .unwrap();
+        let path = disk.log(stream, |log| log.segments[&index].path().to_owned());
+        held.insert(index, path);
+    }
+    // Every round rolls, so each entry sits in a segment of its own.
+    assert_eq!(held.values().collect::<BTreeSet<_>>().len(), held.len());
+    let removed = fs::read(&held[&0]).unwrap();
+    let cut = disk.log(stream, |log| log.entries[&3].log_id);
+    disk.protocol(Record::Snapshot(
+        stream,
+        Selected {
+            log_id: cut,
+            digest: [3; 32],
+        },
+    ))
+    .await
+    .unwrap();
+    disk.covered(Record::Purge(stream, cut)).await.unwrap();
+    disk.protocol(Record::Truncate(stream, 5)).await.unwrap();
+    disk.enable_reaping();
+    disk.reap_objects().await.unwrap();
+    for (index, path) in &held {
+        assert_eq!(path.exists(), *index == 4, "entry {index}");
+    }
+    disk.shutdown().await.unwrap();
+
+    // An unlink that did not survive a crash is repeated.
+    fs::write(&held[&0], removed).unwrap();
+    let reopened = Disk::open(enrollment()).unwrap();
+    reopened.log(stream, |log| {
+        assert_eq!(log.purged, Some(cut));
+        assert_eq!(log.entries.keys().copied().collect::<Vec<_>>(), [4]);
+        assert_eq!(payload_of(&log.entries[&4]), vec![4; 1024]);
+    });
+    reopened.enable_reaping();
+    reopened.reap_objects().await.unwrap();
+    assert!(!held[&0].exists());
+    assert!(held[&4].exists());
+    reopened.shutdown().await.unwrap();
+}
+
+#[test]
+fn recovery_restores_the_checkpoint_and_replays_the_frames_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let genesis = genesis();
+    let stream = genesis.stream;
+    let enrollment = install(dir.path(), genesis.voters[0]);
+    let tuning = Tuning {
+        checkpoint_bytes: u64::MAX,
+        ..Tuning::default()
+    };
+    let scopes = BTreeSet::from([stream]);
+    let objects;
+    let space;
+    let checkpoint;
+    {
+        let (media, _lock, _) = enrollment().open().unwrap();
+        objects = Objects::open(media.data()).unwrap();
+        space = Space::new(media.data().to_owned()).unwrap();
+        let (mut wal, mut state) = Segmented::open(&media, &objects, tuning).unwrap();
+        for record in [
+            Record::Register(genesis.clone()),
+            Record::Vote(stream, Vote::new_committed(2, 1)),
+            Record::Append(stream, vec![entry(0, Bytes::from_static(b"before"))]),
+        ] {
+            state.apply_indexed(record, &mut wal, &objects).unwrap();
+        }
+        wal.commit(&objects, &scopes).unwrap();
+        wal.checkpoint_now(&state, &objects, &space).unwrap();
+        checkpoint = checkpoint_files(dir.path());
+        assert_eq!(checkpoint.len(), 1);
+        for record in [
+            Record::Append(stream, vec![entry(1, Bytes::from_static(b"after"))]),
+            Record::Vote(stream, Vote::new_committed(3, 1)),
+            Record::Truncate(stream, 1),
+            Record::Append(stream, vec![entry(1, Bytes::from_static(b"replaced"))]),
+        ] {
+            state.apply_indexed(record, &mut wal, &objects).unwrap();
+            wal.commit(&objects, &scopes).unwrap();
+        }
+        // A checkpoint that crashed before its boundary published it.
+        fs::write(
+            checkpoint[0].with_file_name(format!("{}.ckpt", Uuid::new_v4())),
+            b"LKRWAL04 torn",
+        )
+        .unwrap();
+    }
+    let (media, _lock, _) = enrollment().open().unwrap();
+    let (wal, recovered) = Segmented::open(&media, &objects, tuning).unwrap();
+    assert!(
+        wal.replayed() > 0,
+        "frames after the checkpoint were replayed"
+    );
+    assert_eq!(checkpoint_files(dir.path()), checkpoint);
+    let log = &recovered.logs[&stream];
+    assert_eq!(log.vote, Some(Vote::new_committed(3, 1)));
+    assert_eq!(payload_of(&log.entries[&0]), &b"before"[..]);
+    assert_eq!(payload_of(&log.entries[&1]), &b"replaced"[..]);
+    assert_eq!(recovered.catalog.len(), 0);
+    drop((wal, _lock));
+
+    // The checkpoint the boundary names is part of the trusted state.
+    fs::remove_file(&checkpoint[0]).unwrap();
+    let (media, _lock, _) = enrollment().open().unwrap();
+    assert!(Segmented::open(&media, &objects, tuning).is_err());
+    drop(space);
 }
 
 #[test]

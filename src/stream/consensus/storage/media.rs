@@ -1,22 +1,31 @@
 //! The enrollment registry survives loss of a keeper's journal directory.
+//!
+//! The registry also holds the trusted WAL boundary: two fixed-size slots
+//! written in place in turn. Each names the (segment, offset, chain hash) the
+//! data volume must still hold and the checkpoint recovery starts from, so a
+//! data volume that silently loses acknowledged writes is refused at open.
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use uuid::Uuid;
 
+use super::segment;
 use crate::stream::{
     consensus::{Domains, invalid},
-    keeper::durability::{sync_directory, sync_file},
+    keeper::durability::{sync_data, sync_directory, sync_file},
 };
 
-const FORMAT: &str = "logkeeper-raft-2";
+const FORMAT: &str = "logkeeper-raft-3";
+const LEGACY_FORMAT: &str = "logkeeper-raft-2";
+const SLOT_MAGIC: &[u8; 8] = b"LKRBND01";
+const SLOT_BYTES: usize = 512;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,7 +58,7 @@ pub(in crate::stream::consensus) struct Enrollment {
     catalog: Uuid,
 }
 
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct Identity {
     format: String,
     keeper: Uuid,
@@ -62,12 +71,41 @@ pub(super) struct Media {
     identity: Identity,
 }
 
+/// The boundary of the WAL format before segments, a JSON file replaced by
+/// rename on every round.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(super) struct Boundary {
     incarnation: Uuid,
     pub generation: Uuid,
     pub len: u64,
     pub digest: [u8; 32],
+}
+
+pub(super) enum Opened {
+    Legacy(Boundary),
+    Current,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct CheckpointRef {
+    pub id: Uuid,
+    pub len: u64,
+    pub digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(super) struct Slot {
+    pub sequence: u64,
+    pub segment: u64,
+    pub offset: u64,
+    pub chain: [u8; 32],
+    pub checkpoint: Option<CheckpointRef>,
+}
+
+pub(super) struct Boundaries {
+    file: File,
+    incarnation: Uuid,
+    last: Slot,
 }
 
 impl Enrollment {
@@ -103,28 +141,32 @@ impl Enrollment {
     }
 
     pub fn initialize(self) -> io::Result<()> {
-        match fs::create_dir(&self.data) {
-            Ok(()) => sync_directory(self.data.parent().unwrap())?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(error),
-        }
-        if fs::read_dir(&self.data)?.next().transpose()?.is_some() {
-            return Err(invalid("keeper initialization requires empty media"));
-        }
-        let identity = Identity {
-            format: FORMAT.into(),
-            keeper: self.keeper,
-            catalog: self.catalog,
-            incarnation: Uuid::new_v4(),
-        };
-        // The exclusive creation is the one-shot enrollment CAS. Once it has
-        // reached stable storage, a failed install needs a fresh keeper ID.
-        create_json(&self.enrolled(), &identity)?;
-        sync_directory(&self.registry)?;
-        let media = Media {
-            enrollment: self,
-            identity,
-        };
+        let media = self.enroll(FORMAT)?;
+        sync_file(
+            &OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(media.data().join("LOCK"))?,
+        )?;
+        let segments = media.data().join(segment::DIRECTORY);
+        fs::create_dir(&segments)?;
+        sync_directory(media.data())?;
+        segment::create(&segments, segment::FIRST, media.identity.incarnation)?;
+        media.create_boundaries(&Slot {
+            sequence: 1,
+            segment: segment::FIRST,
+            offset: segment::HEADER,
+            chain: segment::seed(media.identity.incarnation),
+            checkpoint: None,
+        })?;
+        create_json(&media.data().join("KEEPER"), &media.identity)?;
+        sync_directory(media.data())
+    }
+
+    /// Installs media in the format before segments, as older keepers did.
+    #[cfg(test)]
+    pub fn initialize_legacy(self) -> io::Result<()> {
+        let media = self.enroll(LEGACY_FORMAT)?;
         let generation = Uuid::new_v4();
         sync_file(
             &OpenOptions::new()
@@ -139,49 +181,90 @@ impl Enrollment {
                 .open(media.data().join("LOCK"))?,
         )?;
         sync_directory(media.data())?;
-        media.publish(generation, 0, Sha256::digest([]).into())?;
+        media.publish(generation, 0, sha2::Sha256::digest([]).into())?;
         create_json(&media.data().join("KEEPER"), &media.identity)?;
         sync_directory(media.data())
     }
 
-    pub(super) fn open(self) -> io::Result<(Media, File, Boundary)> {
+    fn enroll(self, format: &str) -> io::Result<Media> {
+        match fs::create_dir(&self.data) {
+            Ok(()) => sync_directory(self.data.parent().unwrap())?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(error),
+        }
+        if fs::read_dir(&self.data)?.next().transpose()?.is_some() {
+            return Err(invalid("keeper initialization requires empty media"));
+        }
+        let identity = Identity {
+            format: format.into(),
+            keeper: self.keeper,
+            catalog: self.catalog,
+            incarnation: Uuid::new_v4(),
+        };
+        // The exclusive creation is the one-shot enrollment CAS. Once it has
+        // reached stable storage, a failed install needs a fresh keeper ID.
+        create_json(&self.enrolled(), &identity)?;
+        sync_directory(&self.registry)?;
+        Ok(Media {
+            enrollment: self,
+            identity,
+        })
+    }
+
+    pub(super) fn open(self) -> io::Result<(Media, File, Opened)> {
         let lock = OpenOptions::new()
             .write(true)
             .open(self.data.join("LOCK"))?;
         lock.try_lock_exclusive()?;
         let identity: Identity = read_json(&self.enrolled())?;
         let installed: Identity = read_json(&self.data.join("KEEPER"))?;
-        if identity != installed
+        let legacy = identity.format == LEGACY_FORMAT;
+        let unfinished = installed.format == LEGACY_FORMAT;
+        if identity.keeper != installed.keeper
+            || identity.catalog != installed.catalog
+            || identity.incarnation != installed.incarnation
             || identity.keeper != self.keeper
             || identity.catalog != self.catalog
-            || identity.format != FORMAT
             || identity.incarnation.is_nil()
+            || !matches!(
+                (identity.format.as_str(), installed.format.as_str()),
+                (FORMAT, FORMAT) | (FORMAT, LEGACY_FORMAT) | (LEGACY_FORMAT, LEGACY_FORMAT)
+            )
         {
             return Err(invalid("missing or foreign installed keeper media"));
-        }
-        let boundary: Boundary = read_json(&self.boundary())?;
-        if boundary.incarnation != identity.incarnation || boundary.generation.is_nil() {
-            return Err(invalid("WAL boundary belongs to another media incarnation"));
         }
         // A warm restart can observe either side of an interrupted publication.
         sync_directory(&self.registry)?;
         sync_directory(&self.data)?;
-        Ok((
-            Media {
-                enrollment: self,
-                identity,
-            },
-            lock,
-            boundary,
-        ))
+        let media = Media {
+            enrollment: self,
+            identity,
+        };
+        if legacy {
+            let boundary: Boundary = read_json(&media.enrollment.legacy_boundary())?;
+            if boundary.incarnation != media.identity.incarnation || boundary.generation.is_nil() {
+                return Err(invalid("WAL boundary belongs to another media incarnation"));
+            }
+            return Ok((media, lock, Opened::Legacy(boundary)));
+        }
+        if unfinished {
+            // The registry committed a migration the data volume did not
+            // finish recording.
+            media.finish_migration()?;
+        }
+        Ok((media, lock, Opened::Current))
     }
 
     fn enrolled(&self) -> PathBuf {
         self.registry.join(format!("{}.enrolled", self.keeper))
     }
 
-    fn boundary(&self) -> PathBuf {
+    fn legacy_boundary(&self) -> PathBuf {
         self.registry.join(format!("{}.wal", self.keeper))
+    }
+
+    fn boundaries(&self) -> PathBuf {
+        self.registry.join(format!("{}.boundary", self.keeper))
     }
 
     #[cfg(test)]
@@ -193,6 +276,11 @@ impl Enrollment {
             catalog: keeper,
         }
     }
+
+    #[cfg(test)]
+    pub fn boundary_path(&self) -> PathBuf {
+        self.boundaries()
+    }
 }
 
 impl Media {
@@ -200,10 +288,104 @@ impl Media {
         &self.enrollment.data
     }
 
+    pub fn incarnation(&self) -> Uuid {
+        self.identity.incarnation
+    }
+
     pub fn wal(&self, generation: Uuid) -> PathBuf {
         self.data().join(format!("raft-{generation}.wal"))
     }
 
+    pub fn boundaries(&self) -> io::Result<(Boundaries, Slot)> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.enrollment.boundaries())?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(2 * SLOT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() != 2 * SLOT_BYTES {
+            return Err(invalid("WAL boundary slots have the wrong size"));
+        }
+        let incarnation = self.identity.incarnation;
+        let last = bytes
+            .chunks(SLOT_BYTES)
+            .enumerate()
+            .filter_map(|(index, slot)| Slot::decode(slot, incarnation, index * SLOT_BYTES))
+            .max_by_key(|slot| slot.sequence)
+            .ok_or_else(|| invalid("WAL boundary has no intact slot"))?;
+        Ok((
+            Boundaries {
+                file,
+                incarnation,
+                last,
+            },
+            last,
+        ))
+    }
+
+    fn create_boundaries(&self, slot: &Slot) -> io::Result<()> {
+        let mut bytes = vec![0; 2 * SLOT_BYTES];
+        let at = slot.index();
+        bytes[at..at + SLOT_BYTES].copy_from_slice(&slot.encode(self.identity.incarnation)?);
+        let target = self.enrollment.boundaries();
+        let temporary = target.with_extension("boundary.tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        sync_file(&file)?;
+        fs::rename(&temporary, &target)?;
+        sync_directory(&self.enrollment.registry)
+    }
+
+    /// Commits a migration from the format before segments. Until the
+    /// registry identity changes, a restart migrates again from the old WAL.
+    pub fn migrate(&self, slot: &Slot) -> io::Result<()> {
+        self.create_boundaries(slot)?;
+        let identity = Identity {
+            format: FORMAT.into(),
+            ..self.identity.clone()
+        };
+        replace_json(&self.enrollment.enrolled(), &identity)?;
+        self.finish_migration()
+    }
+
+    fn finish_migration(&self) -> io::Result<()> {
+        let identity = Identity {
+            format: FORMAT.into(),
+            ..self.identity.clone()
+        };
+        replace_json(&self.data().join("KEEPER"), &identity)?;
+        let legacy = self.enrollment.legacy_boundary();
+        remove_if_present(&legacy.with_extension("wal.tmp"))?;
+        remove_if_present(&legacy)?;
+        sync_directory(&self.enrollment.registry)?;
+        for item in fs::read_dir(self.data())? {
+            let item = item?;
+            if item
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("raft-") && name.ends_with(".wal"))
+            {
+                fs::remove_file(item.path())?;
+            }
+        }
+        sync_directory(self.data())
+    }
+
+    /// Removes what an interrupted migration wrote before its commit.
+    pub fn discard_unpublished_boundaries(&self) -> io::Result<()> {
+        let target = self.enrollment.boundaries();
+        remove_if_present(&target.with_extension("boundary.tmp"))?;
+        remove_if_present(&target)?;
+        sync_directory(&self.enrollment.registry)
+    }
+
+    #[cfg(test)]
     pub fn check_wal(&self, generation: Uuid, file: &File, len: u64) -> io::Result<()> {
         let named = fs::metadata(self.wal(generation))?;
         let opened = file.metadata()?;
@@ -220,19 +402,15 @@ impl Media {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn publish(&self, generation: Uuid, len: u64, digest: [u8; 32]) -> io::Result<()> {
-        self.prepare_boundary(generation, len, digest)?;
-        self.publish_boundary()
-    }
-
-    pub fn prepare_boundary(&self, generation: Uuid, len: u64, digest: [u8; 32]) -> io::Result<()> {
         let boundary = Boundary {
             incarnation: self.identity.incarnation,
             generation,
             len,
             digest,
         };
-        let target = self.enrollment.boundary();
+        let target = self.enrollment.legacy_boundary();
         let temporary = target.with_extension("wal.tmp");
         let mut file = OpenOptions::new()
             .write(true)
@@ -240,13 +418,69 @@ impl Media {
             .create(true)
             .open(&temporary)?;
         serde_json::to_writer(&mut file, &boundary)?;
-        sync_file(&file)
+        sync_file(&file)?;
+        fs::rename(temporary, target)?;
+        sync_directory(&self.enrollment.registry)
+    }
+}
+
+impl Slot {
+    fn index(&self) -> usize {
+        (self.sequence % 2) as usize * SLOT_BYTES
     }
 
-    pub fn publish_boundary(&self) -> io::Result<()> {
-        let target = self.enrollment.boundary();
-        fs::rename(target.with_extension("wal.tmp"), target)?;
-        sync_directory(&self.enrollment.registry)
+    // magic | incarnation | body length | body | crc32 of all before it
+    fn encode(&self, incarnation: Uuid) -> io::Result<Vec<u8>> {
+        let body = crate::stream::consensus::encode(self)?;
+        let mut bytes = SLOT_MAGIC.to_vec();
+        bytes.extend(incarnation.as_bytes());
+        bytes.extend((body.len() as u16).to_le_bytes());
+        bytes.extend(body);
+        bytes.extend(crc32fast::hash(&bytes).to_le_bytes());
+        if bytes.len() > SLOT_BYTES {
+            return Err(invalid("WAL boundary slot exceeds its size"));
+        }
+        bytes.resize(SLOT_BYTES, 0);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8], incarnation: Uuid, at: usize) -> Option<Self> {
+        let rest = bytes
+            .strip_prefix(SLOT_MAGIC)?
+            .strip_prefix(incarnation.as_bytes())?;
+        let len = u16::from_le_bytes(rest.get(..2)?.try_into().ok()?) as usize;
+        let end = SLOT_MAGIC.len() + 16 + 2 + len;
+        let crc = bytes.get(end..end + 4)?;
+        if crc32fast::hash(&bytes[..end]).to_le_bytes() != crc {
+            return None;
+        }
+        let slot: Self = crate::stream::consensus::decode(&rest[2..2 + len]).ok()?;
+        (slot.index() == at).then_some(slot)
+    }
+}
+
+impl Boundaries {
+    /// Publishes the next boundary over the older slot. A torn write leaves
+    /// the newer slot, which names a boundary the data volume still holds.
+    pub fn write(
+        &mut self,
+        segment: u64,
+        offset: u64,
+        chain: [u8; 32],
+        checkpoint: Option<CheckpointRef>,
+    ) -> io::Result<()> {
+        let slot = Slot {
+            sequence: self.last.sequence + 1,
+            segment,
+            offset,
+            chain,
+            checkpoint,
+        };
+        self.file.seek(SeekFrom::Start(slot.index() as u64))?;
+        self.file.write_all(&slot.encode(self.incarnation)?)?;
+        sync_data(&self.file)?;
+        self.last = slot;
+        Ok(())
     }
 }
 
@@ -289,8 +523,28 @@ fn create_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     sync_file(&file)
 }
 
+fn replace_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let temporary = path.with_extension("tmp");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(&temporary)?;
+    serde_json::to_writer(&mut file, value)?;
+    sync_file(&file)?;
+    fs::rename(&temporary, path)?;
+    sync_directory(path.parent().unwrap())
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
 pub(in crate::stream::consensus) fn sha256(mut source: impl Read) -> io::Result<[u8; 32]> {
-    let mut digest = Sha256::new();
+    let mut digest = sha2::Sha256::new();
     io::copy(&mut source, &mut digest)?;
     Ok(digest.finalize().into())
 }

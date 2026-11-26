@@ -22,6 +22,21 @@ pub fn sync_file(file: &File) -> std::io::Result<()> {
     }
 }
 
+/// Flushes a file's data and the metadata needed to read it back, such as a
+/// grown length, but not timestamps.
+pub fn sync_data(file: &File) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        sync_file(file)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        #[cfg(test)]
+        SYNCS.with(|count| count.set(count.get() + 1));
+        file.sync_data()
+    }
+}
+
 /// Flushes the directory entries that publish or remove durable files.
 pub fn sync_directory(path: &Path) -> std::io::Result<()> {
     sync_file(&open_for_sync(path)?)

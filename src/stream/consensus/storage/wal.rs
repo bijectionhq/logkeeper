@@ -3,7 +3,6 @@
 use crate::stream::consensus::decisions;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
     io::{self, BufReader, Read},
     path::PathBuf,
     sync::{
@@ -19,21 +18,22 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-mod indexed;
-use indexed::{Indexed, store_entry};
+mod legacy;
+mod segmented;
+use segmented::{Segmented, Tuning};
 #[cfg(test)]
 mod tests;
 
 use super::{
     Entry, Genesis, Log, LogId, Vote,
-    media::{Boundary, Enrollment, Media},
+    media::{Boundary, Enrollment, Media, Opened},
     objects::Objects,
     snapshot::Selected,
     space::{Admission, Reservation, Space, WAL_METADATA_BYTES},
 };
 use crate::stream::{
     consensus::{
-        Stage, decode, encode, invalid,
+        Stage, decode, invalid,
         network::{Lane, has_application_entries},
         ownership::{self, Change, Ownership},
         placement::Placement,
@@ -49,7 +49,7 @@ const MAX_ENTRY_OVERHEAD: u64 = 16 * 1024;
 const MAX_ROUND_RECORDS: usize = 128;
 const MAINTENANCE_QUEUE: usize = 16;
 const REPLICATION_QUEUE: usize = 16;
-const FOLLOWER_SUFFIX_LIMIT: usize = indexed::MAX_SUFFIX - 16;
+const FOLLOWER_SUFFIX_LIMIT: usize = segmented::MAX_SUFFIX - 16;
 const MAX_CONTACTS: usize = 128;
 
 #[derive(Serialize, Deserialize)]
@@ -272,7 +272,20 @@ impl State {
         }
     }
 
-    fn apply_indexed(&mut self, record: Record, objects: &Objects) -> io::Result<()> {
+    fn scope_ids(&self) -> BTreeSet<StreamId> {
+        self.genesis
+            .keys()
+            .chain(self.catalog.keys())
+            .copied()
+            .collect()
+    }
+
+    fn apply_indexed(
+        &mut self,
+        record: Record,
+        wal: &mut Segmented,
+        objects: &Objects,
+    ) -> io::Result<()> {
         if let Record::Owned(generation, scoped) = &record
             && self.log_mut(scoped.stream())?.ownership.generation() != Some(*generation)
         {
@@ -293,25 +306,23 @@ impl State {
                 return Err(invalid("purge lacks an exact covered WAL cut"));
             }
         }
-        let segments = if let Record::Append(stream, entries) = payload {
-            if let Some(first) = entries.first() {
-                let log = self.log_mut(*stream)?;
-                let prefix = log.entries.range(..first.log_id.index).count();
-                if prefix.saturating_add(entries.len()) > indexed::MAX_SUFFIX {
-                    return Err(invalid("WAL append exceeds its accepted suffix geometry"));
-                }
+        if let Record::Append(stream, entries) = payload
+            && let Some(first) = entries.first()
+        {
+            let log = self.log_mut(*stream)?;
+            let prefix = log.entries.range(..first.log_id.index).count();
+            if prefix.saturating_add(entries.len()) > segmented::MAX_SUFFIX {
+                return Err(invalid("WAL append exceeds its accepted suffix geometry"));
             }
-            let segments = entries
-                .iter()
-                .map(|entry| Ok((entry.log_id.index, store_entry(objects, *stream, entry)?)))
-                .collect::<io::Result<Vec<_>>>()?;
-            Some((*stream, segments))
-        } else {
-            None
-        };
-        self.apply(record)?;
-        if let Some((stream, segments)) = segments {
-            self.log_mut(stream)?.segments.extend(segments);
+        }
+        let mut staged = wal.stage(&record, objects)?;
+        let slices = staged.slices.take();
+        if let Err(error) = self.apply(record) {
+            wal.discard(staged);
+            return Err(error);
+        }
+        if let Some((stream, slices)) = slices {
+            self.log_mut(stream)?.segments.extend(slices);
         }
         Ok(())
     }
@@ -423,23 +434,19 @@ pub(in crate::stream::consensus) enum ReplicaFault {
 
 impl Disk {
     pub fn open(enrollment: Enrollment) -> io::Result<Self> {
-        let (media, lock, boundary) = enrollment.open()?;
+        Self::open_tuned(enrollment, Tuning::default())
+    }
+
+    fn open_tuned(enrollment: Enrollment, tuning: Tuning) -> io::Result<Self> {
+        let (media, lock, opened) = enrollment.open()?;
         let path = media.data().to_path_buf();
         let space = Space::new(path.clone())?;
         let objects = Objects::open(&path)?;
-        let (indexed, state) = Indexed::open(&media, boundary, &objects, &space)?;
-        let selected = media.wal(indexed.generation());
-        for item in fs::read_dir(&path)? {
-            let item = item?;
-            if item.path() != selected
-                && item
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("raft-") && name.ends_with(".wal"))
-            {
-                fs::remove_file(item.path())?;
-            }
+        if let Opened::Legacy(boundary) = opened {
+            Segmented::migrate(&media, boundary, &objects, &space)?;
         }
+        let (wal, state) = Segmented::open(&media, &objects, tuning)?;
+        drop(media);
         let state = Arc::new(RwLock::new(state));
         let (work, incoming) = mpsc::channel(MAX_ROUND_RECORDS);
         let (maintenance, housekeeping) = mpsc::channel(MAINTENANCE_QUEUE);
@@ -466,8 +473,7 @@ impl Disk {
             .name("logkeeper-raft-wal".into())
             .spawn(move || {
                 let result = run(
-                    indexed,
-                    &media,
+                    wal,
                     &writer_state,
                     Queues {
                         peer,
@@ -762,8 +768,7 @@ impl Queues {
 }
 
 fn run(
-    mut wal: Indexed,
-    media: &Media,
+    mut wal: Segmented,
     state: &RwLock<State>,
     mut queues: Queues,
     objects: &Objects,
@@ -773,6 +778,29 @@ fn run(
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
 ) -> io::Result<()> {
     let _gate = CloseGate(health);
+    let result = rounds(
+        &mut wal,
+        state,
+        &mut queues,
+        objects,
+        space,
+        watchdog,
+        #[cfg(test)]
+        replica_fault,
+    );
+    wal.finish();
+    result
+}
+
+fn rounds(
+    wal: &mut Segmented,
+    state: &RwLock<State>,
+    queues: &mut Queues,
+    objects: &Objects,
+    space: &Space,
+    watchdog: &super::watchdog::Watchdog,
+    #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
+) -> io::Result<()> {
     let mut finish = false;
     while let Some(Message::Write(first)) = queues.recv() {
         let _round = watchdog.begin();
@@ -807,7 +835,7 @@ fn run(
         for mut work in round {
             let scope = work.record.stream();
             let new = !wal.contains_scope(scope) && !changed.contains(&scope);
-            if new && wal.scope_count() + added >= indexed::MAX_SCOPES {
+            if new && wal.scope_count() + added >= segmented::MAX_SCOPES {
                 let _ = work.done.send(Err(io::Error::new(
                     io::ErrorKind::StorageFull,
                     "keeper WAL scope limit reached",
@@ -824,7 +852,7 @@ fn run(
                 #[cfg(test)]
                 if let Some((_, fault)) = replica_fault.lock().take_if(|(id, _)| *id == scope) {
                     match fault {
-                        ReplicaFault::PartialSegment => objects.interrupt_next_put(scope),
+                        ReplicaFault::PartialSegment => wal.interrupt(6),
                         ReplicaFault::FailedSync => wal.interrupt(5),
                         ReplicaFault::BeforeSelection => wal.interrupt(2),
                         ReplicaFault::AfterSelection => wal.interrupt(3),
@@ -836,7 +864,7 @@ fn run(
             } else {
                 work.record.tickets(&mut tickets);
             }
-            match working.apply_indexed(work.record, objects) {
+            match working.apply_indexed(work.record, wal, objects) {
                 Ok(()) => {
                     changed.insert(scope);
                     added += usize::from(new);
@@ -853,7 +881,7 @@ fn run(
             }
         }
         if !changed.is_empty() {
-            wal.commit(media, objects, &working, &changed)?;
+            wal.commit(objects, &changed)?;
             #[cfg(test)]
             if let Some(ReplicaFault::BeforeSettlement { entered, resume }) = before_settlement {
                 let _ = entered.send(());
@@ -865,6 +893,7 @@ fn run(
                 installed.catalog.extend(working.catalog);
                 installed.logs.extend(working.logs);
             });
+            wal.maybe_checkpoint(&state.read(), objects, space);
         }
         for (reply, _reservation) in replies {
             let _ = reply.send(Ok(()));
@@ -886,7 +915,7 @@ impl Drop for CloseGate<'_> {
 
 #[cfg(test)]
 fn write_record(file: &mut impl std::io::Write, record: &Record) -> io::Result<u64> {
-    let body = encode(record)?;
+    let body = super::super::encode(record)?;
     file.write_all(&(body.len() as u32).to_be_bytes())?;
     file.write_all(&crc32fast::hash(&body).to_be_bytes())?;
     file.write_all(&body)?;

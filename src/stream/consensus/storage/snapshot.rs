@@ -559,10 +559,20 @@ impl StateMachine {
             .map(|active| active.selected.path(&self.inner.directory))
     }
 
+    /// The file holding the first retained record, and where in it the
+    /// record's last byte sits.
     #[cfg(test)]
-    pub fn payload_path(&self) -> Option<PathBuf> {
+    pub fn payload_path(&self) -> Option<(PathBuf, u64)> {
         match self.inner.applied.read().state.records().next()? {
-            Payload::Extent { object, .. } => Some(object.path().to_owned()),
+            Payload::Extent {
+                object,
+                offset,
+                len,
+                ..
+            } => Some((
+                object.path().to_owned(),
+                object.position() + offset + u64::from(*len) - 1,
+            )),
             Payload::Snapshot { .. } => None,
         }
     }

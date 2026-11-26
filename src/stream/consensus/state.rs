@@ -352,13 +352,9 @@ impl State {
                 );
             }
             let len = payload.len() as u32;
-            let offset = segment
-                .key()
-                .len
-                .checked_sub(u64::from(len))
-                .ok_or_else(|| {
-                    super::invalid("accepted WAL extent does not contain the payload")
-                })?;
+            let offset = segment.len().checked_sub(u64::from(len)).ok_or_else(|| {
+                super::invalid("accepted WAL extent does not contain the payload")
+            })?;
             let retained = Payload::Extent {
                 object: segment,
                 offset,
@@ -411,8 +407,7 @@ impl State {
             }
             let len = record.len() as u32;
             let offset = segment
-                .key()
-                .len
+                .len()
                 .checked_sub(u64::from(len))
                 .ok_or_else(|| super::invalid("accepted WAL extent does not contain the record"))?;
             let retained = Payload::Extent {
@@ -443,7 +438,7 @@ impl State {
             }
             // The fixed-width encoding places an 8-byte length before each
             // payload, and the payloads end the durable entry.
-            let mut end = segment.key().len;
+            let mut end = segment.len();
             let mut extents = Vec::with_capacity(payloads.len());
             for payload in payloads.iter().rev() {
                 let offset = end.checked_sub(payload.len() as u64).ok_or_else(|| {

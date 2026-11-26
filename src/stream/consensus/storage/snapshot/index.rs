@@ -16,7 +16,7 @@ use super::{Genesis, Image, Payload, Selected, SnapshotMeta, invalid, sha256};
 use crate::stream::consensus::{
     decode, encode,
     state::{MAX_RETAINED_RECORDS, TIMED_RECORD},
-    storage::objects::{Key, Object, Objects},
+    storage::objects::{Key, Location, Object, Objects, Reference},
 };
 
 pub(super) const MAGIC: &[u8; 8] = b"LKRIDX01";
@@ -79,6 +79,7 @@ struct Span {
 enum Source {
     Object(Key),
     Legacy([u8; 32]),
+    Segment(Location),
 }
 
 pub(super) fn build(
@@ -123,7 +124,9 @@ pub(super) fn build(
         pages.push(PageRef {
             first,
             count: count as u32,
-            object: leaf.key(),
+            object: leaf
+                .key()
+                .ok_or_else(|| invalid("snapshot page is not a standalone object"))?,
         });
         dependencies.pages.insert(first, (count, leaf));
         first += count as u64;
@@ -239,7 +242,10 @@ impl Span {
                 crc,
                 timed,
             } => Self {
-                source: Source::Object(object.key()),
+                source: match object.reference() {
+                    Reference::Object(key) => Source::Object(key),
+                    Reference::Segment(location) => Source::Segment(location),
+                },
                 offset: *offset,
                 len: *len | if *timed { TIMED_RECORD } else { 0 },
                 crc: *crc,
@@ -283,6 +289,13 @@ impl Span {
         let payload = match source {
             Source::Object(key) if key.scope == scope => Payload::Extent {
                 object: objects.pin(key)?,
+                offset,
+                len,
+                crc,
+                timed,
+            },
+            Source::Segment(location) if location.scope == scope => Payload::Extent {
+                object: objects.slice(location)?,
                 offset,
                 len,
                 crc,

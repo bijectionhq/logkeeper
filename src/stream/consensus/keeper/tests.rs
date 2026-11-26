@@ -841,11 +841,7 @@ async fn catalog_outage_requires_a_retained_exact_stage_and_cold_clients_use_inv
         Ok(placed)
     );
     let directory = &cluster.configs[&catalog];
-    let catalog_log = std::fs::read_dir(&directory.data)
-        .unwrap()
-        .map(|item| item.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
-        .unwrap();
+    let catalog_log = newest_segment(&directory.data);
     std::fs::OpenOptions::new()
         .write(true)
         .open(catalog_log)
@@ -864,6 +860,14 @@ async fn catalog_outage_requires_a_retained_exact_stage_and_cold_clients_use_inv
         Ok(Lsn(0))
     );
     cluster.stop_all().await;
+}
+
+fn newest_segment(data: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(data.join("raft-segments"))
+        .unwrap()
+        .map(|item| item.unwrap().path())
+        .max()
+        .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -908,21 +912,21 @@ async fn damaged_snapshot_is_scoped_and_only_the_selected_bytes_repair_it() {
     let selected = group.state.snapshot_path().unwrap();
     let backup = cluster._dir.path().join("exact-snapshot");
     std::fs::copy(&selected, &backup).unwrap();
-    let payload_file = group.state.payload_path().unwrap();
-    let exact_payload = std::fs::read(&payload_file).unwrap();
-    {
+    let (payload_file, last_byte) = group.state.payload_path().unwrap();
+    let flip = || {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&payload_file)
             .unwrap();
-        file.seek(SeekFrom::End(-1)).unwrap();
+        file.seek(SeekFrom::Start(last_byte)).unwrap();
         let mut byte = [0];
         file.read_exact(&mut byte).unwrap();
-        file.seek(SeekFrom::End(-1)).unwrap();
+        file.seek(SeekFrom::Start(last_byte)).unwrap();
         file.write_all(&[byte[0] ^ 1]).unwrap();
         file.sync_all().unwrap();
-    }
+    };
+    flip();
     let engine = &cluster.running[&victim].engine;
     let identity = Identity::Client(journal_contract::Identity::from(OWNER));
     let read = |stream| Request::Read {
@@ -940,7 +944,7 @@ async fn damaged_snapshot_is_scoped_and_only_the_selected_bytes_repair_it() {
     assert_eq!(journal.head(damaged).await, Ok(Lsn(145)));
 
     cluster.running.remove(&victim).unwrap().stop().await;
-    std::fs::write(&payload_file, exact_payload).unwrap();
+    flip();
     std::fs::write(&selected, b"damaged selected root").unwrap();
     cluster.restart(victim).await;
     let victim_engine = &cluster.running[&victim].engine;
@@ -978,11 +982,7 @@ async fn damaged_snapshot_is_scoped_and_only_the_selected_bytes_repair_it() {
     cluster.running.remove(&victim).unwrap().stop().await;
 
     let config = &cluster.configs[&victim];
-    let wal = std::fs::read_dir(&config.data)
-        .unwrap()
-        .map(|item| item.unwrap().path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "wal"))
-        .unwrap();
+    let wal = newest_segment(&config.data);
     std::fs::OpenOptions::new()
         .write(true)
         .open(wal)
@@ -1698,7 +1698,7 @@ async fn seekable_transfer_pins_its_exact_old_extents_until_close() {
         .metrics(|m| m.snapshot.is_some(), "selected index")
         .await
         .unwrap();
-    let extent = source.state.payload_path().unwrap();
+    let (extent, _) = source.state.payload_path().unwrap();
     let path = source.state.snapshot_path().unwrap();
     assert!(std::fs::read(path).unwrap().starts_with(b"LKRIDX01"));
     let mut wire = source.raft.get_snapshot().await.unwrap().unwrap().snapshot;
@@ -1744,8 +1744,24 @@ async fn seekable_transfer_pins_its_exact_old_extents_until_close() {
     wire.read_exact(&mut retried).await.unwrap();
     assert_eq!(retried, old);
     drop(wire);
+    // The extent shares a WAL segment with other frames. Other traffic rolls
+    // the segment and checkpoints past it, so only a pin could keep it.
+    let filler = StreamId(141);
+    journal.create(filler, [a, b, c], 64 << 20).await.unwrap();
+    let filling = journal
+        .seal(filler, Epoch(0), Uuid::new_v4())
+        .await
+        .unwrap()
+        .fence;
+    let mut at = 0;
     timeout(WAIT, async {
         while extent.exists() {
+            at += 1;
+            journal
+                .append(filler, filling, Lsn(at), Bytes::from(vec![7; 64 * 1024]))
+                .await
+                .unwrap();
+            journal.trim(filler, filling, Lsn(at)).await.unwrap();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
