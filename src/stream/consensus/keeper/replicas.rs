@@ -195,6 +195,17 @@ impl Engine {
         }
     }
 
+    /// Closes a parked or deleted stream's group while keeping its replica.
+    /// The closed state machine stays referenced, because its snapshot and
+    /// applied records are the only references to objects and segments the
+    /// reaper would otherwise delete; the reopened group takes them over.
+    pub(super) async fn close_retaining(&self, scope: StreamId) {
+        if let Some(group) = self.groups.lock().await.get(&scope) {
+            self.closed_states.lock().insert(scope, group.state.clone());
+        }
+        self.close_copy(scope).await;
+    }
+
     pub(super) async fn close_copy(&self, scope: StreamId) {
         if let Some(group) = self.groups.lock().await.remove(&scope) {
             group.state.suspend();

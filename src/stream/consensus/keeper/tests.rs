@@ -2740,3 +2740,70 @@ async fn the_leader_removes_a_learner_left_by_an_aborted_replacement() {
     );
     cluster.stop_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_stream_keeps_its_snapshot_and_retained_extents() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    cluster.stop_all().await;
+    for config in cluster.configs.values_mut() {
+        config.park_after_secs = 2;
+    }
+    for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
+        cluster.restart(id).await;
+    }
+    let journal = cluster.client(&cluster.credentials);
+    let record = |at: u64| Bytes::from(vec![(at % 251) as u8; 2048]);
+    let (parked, busy) = (StreamId(58), StreamId(59));
+    let mut fences = Vec::new();
+    for stream in [parked, busy] {
+        journal.create(stream, [a, b, c], 1 << 30).await.unwrap();
+        let sealed = journal
+            .seal(stream, Epoch(0), uuid::Uuid::from_u128(9))
+            .await
+            .unwrap();
+        fences.push(sealed.fence);
+    }
+    // More than one snapshot interval of entries, so the parked stream's
+    // early records live only in its snapshot and applied state.
+    for at in 1..=200 {
+        journal
+            .append(parked, fences[0], Lsn(at), record(at))
+            .await
+            .unwrap();
+    }
+    // The busy stream keeps writing, rolling and checkpointing segments,
+    // while the other one parks and the reaper runs.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut at = 1;
+    while tokio::time::Instant::now() < deadline {
+        journal
+            .append(busy, fences[1], Lsn(at), record(at))
+            .await
+            .unwrap();
+        at += 1;
+    }
+    for id in [a, b, c] {
+        assert!(
+            !cluster.running[&id]
+                .engine
+                .groups
+                .lock()
+                .await
+                .contains_key(&parked),
+            "the idle stream parked"
+        );
+    }
+    let page = timeout(WAIT, async {
+        loop {
+            match journal.read(parked, Lsn(1), 1, Duration::ZERO).await {
+                Ok(page) => return page,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(page.records, [(Lsn(1), record(1))]);
+    cluster.stop_all().await;
+}

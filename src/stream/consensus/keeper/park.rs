@@ -102,7 +102,7 @@ impl Engine {
         super::super::metrics::count(&super::super::metrics::COUNTERS.parked);
         self.parked.write().insert(stream);
         self.activity.lock().remove(&stream);
-        self.close_copy(stream).await;
+        self.close_retaining(stream).await;
     }
 
     /// A follower parks when it is idle itself and holds exactly the

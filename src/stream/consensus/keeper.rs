@@ -301,6 +301,7 @@ impl Config {
             deletions: parking_lot::Mutex::default(),
             deleted: parking_lot::RwLock::default(),
             parked: parking_lot::RwLock::default(),
+            closed_states: parking_lot::Mutex::default(),
             activity: parking_lot::Mutex::default(),
             park_after: Duration::from_secs(self.park_after_secs),
             snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
@@ -355,6 +356,9 @@ struct Engine {
     deleted: parking_lot::RwLock<HashSet<StreamId>>,
     /// Idle streams whose groups this keeper closed until the next request.
     parked: parking_lot::RwLock<HashSet<StreamId>>,
+    /// State machines of parked and deleted groups, kept so the reaper
+    /// cannot delete what only they reference.
+    closed_states: parking_lot::Mutex<HashMap<StreamId, StateMachine>>,
     /// The last log index of each led stream and when it last changed.
     activity: parking_lot::Mutex<HashMap<StreamId, (Option<u64>, Instant)>>,
     park_after: Duration,
@@ -583,7 +587,7 @@ impl Engine {
         }
         for stream in closing {
             self.deleted.write().insert(stream);
-            self.close_copy(stream).await;
+            self.close_retaining(stream).await;
         }
     }
 
@@ -684,6 +688,8 @@ impl Engine {
             .lock()
             .await
             .insert(group.genesis.stream, group.clone());
+        // The reopened group references its snapshot and records itself.
+        self.closed_states.lock().remove(&group.genesis.stream);
         let resume = group.clone();
         let stop = group.stop.clone();
         let id = self.id.as_u128();
