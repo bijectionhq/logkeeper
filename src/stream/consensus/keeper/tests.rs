@@ -121,6 +121,7 @@ impl Cluster {
                 max_streams: default_max_streams(),
                 repair_after_secs: 2,
                 park_after_secs: 3600,
+                snapshot_send_bytes_per_second: 0,
                 timed_original: None,
                 timed_authority: None,
             };

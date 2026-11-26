@@ -84,7 +84,7 @@ impl Client {
             view.record(outcome.outcome, limit)
         };
         let mut tried = BTreeSet::new();
-        let preferred = route.ordered_preferred();
+        let preferred = route.ordered_preferred(&self.local);
         if let Some(&first) = preferred.first() {
             tried.insert(first);
             let mut pending = FuturesUnordered::new();
@@ -248,17 +248,14 @@ impl Client {
 }
 
 impl Route {
-    fn ordered_preferred(&self) -> Vec<Uuid> {
+    /// The voters to read from, in order: a voter in the client's own failure
+    /// domain, then the keeper that answered last, then the rest.
+    fn ordered_preferred(&self, local: &BTreeSet<Uuid>) -> Vec<Uuid> {
         self.preferred
             .map_or_else(Vec::new, |(configuration, preferred)| {
-                std::iter::once(preferred)
-                    .chain(
-                        configuration
-                            .voters
-                            .into_iter()
-                            .filter(|id| *id != preferred),
-                    )
-                    .collect()
+                let mut voters = configuration.voters.to_vec();
+                voters.sort_by_key(|id| (!local.contains(id), *id != preferred));
+                voters
             })
     }
 }
@@ -363,6 +360,26 @@ impl Seen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_try_a_voter_in_the_clients_domain_first() {
+        let [a, b, c] = [1, 2, 3].map(Uuid::from_u128);
+        let route = Route {
+            genesis: None,
+            preferred: Some((
+                Configuration {
+                    revision: 1,
+                    voters: [a, b, c],
+                },
+                b,
+            )),
+            contacts: Vec::new(),
+            leader: None,
+        };
+        assert_eq!(route.ordered_preferred(&BTreeSet::new())[0], b);
+        assert_eq!(route.ordered_preferred(&BTreeSet::from([c])), vec![c, b, a]);
+        assert_eq!(route.ordered_preferred(&BTreeSet::from([b])), vec![b, a, c]);
+    }
     use bytes::Bytes;
 
     #[test]

@@ -475,6 +475,13 @@ fails on a pooled connection the receiver had closed retries once on a
 fresh one, since peer messages are idempotent. A control frame over its
 sender's share waits up to 100 ms for a slot before it is refused.
 
+A keeper paces the bytes it sends in snapshot transfers, across all its
+streams, to `snapshot_send_bytes_per_second` (64 MiB/s by default; zero
+disables pacing), so catch-up and repair do not saturate a cross-zone link.
+A `JournalConfig` with a `placement` may name the consumer's own `domain`;
+reads then go first to a voter in that domain, then to the keeper that
+answered last.
+
 A keeper with `timed_original` in its configuration, in the stream keeper's
 mount format, holds installed keeper trust and, when signing, a commissioned
 clock and attestation key. `ConsensusJournal::with_timed_original` installs

@@ -173,6 +173,7 @@ impl LocalCluster {
                 max_streams: 128,
                 repair_after_secs: 600,
                 park_after_secs,
+                snapshot_send_bytes_per_second: 0,
                 timed_original: None,
                 timed_authority: keys.get(&id).map(|key| TimedAuthority {
                     verifier: verifier.clone(),
@@ -223,6 +224,7 @@ impl LocalCluster {
             quota_bytes,
             max_record_bytes,
             deadline_ms: 10_000,
+            domain: None,
         }
     }
 

@@ -55,6 +55,10 @@ pub struct JournalConfig {
     /// Deadline for each client operation, in milliseconds.
     #[serde(default = "default_deadline_ms")]
     pub deadline_ms: u64,
+    /// This consumer's own failure domain. With a `placement`, reads go first
+    /// to a voter in this domain, which avoids a cross-zone round trip.
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 fn default_max_record_bytes() -> usize {
@@ -175,12 +179,21 @@ struct TimedReader {
 impl ConsensusJournal {
     pub fn new(credentials: &Credentials, config: &JournalConfig) -> io::Result<Self> {
         config.validate()?;
+        let local = match (&config.domain, &config.placement) {
+            (Some(domain), Some(placement)) => placement
+                .iter()
+                .filter(|(_, keeper_domain)| *keeper_domain == domain)
+                .map(|(keeper, _)| *keeper)
+                .collect(),
+            _ => BTreeSet::new(),
+        };
         let client = Client::new(
             credentials,
             config.keepers.clone(),
             config.catalog,
             Duration::from_millis(config.deadline_ms),
-        )?;
+        )?
+        .with_local_keepers(local);
         Ok(Self {
             client,
             placement: Arc::new(RwLock::new(Placement::new(config))),

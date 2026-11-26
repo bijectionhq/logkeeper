@@ -70,6 +70,10 @@ fn default_park_after_secs() -> u64 {
     600
 }
 
+fn default_snapshot_send_bytes_per_second() -> u64 {
+    64 * 1024 * 1024
+}
+
 /// Installed, authenticated keeper inventory and local service settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,6 +100,10 @@ pub struct Config {
     /// voters park it.
     #[serde(default = "default_park_after_secs")]
     pub park_after_secs: u64,
+    /// Bytes per second this keeper sends in snapshot transfers across all
+    /// its streams; zero sends without pacing.
+    #[serde(default = "default_snapshot_send_bytes_per_second")]
+    pub snapshot_send_bytes_per_second: u64,
     /// Installed timed-original trust and, on a signing keeper, its clock
     /// and attestation key, in the stream keeper's mount format.
     #[serde(default)]
@@ -292,6 +300,7 @@ impl Config {
             parked: parking_lot::RwLock::default(),
             activity: parking_lot::Mutex::default(),
             park_after: Duration::from_secs(self.park_after_secs),
+            snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
             stop: stop.child_token(),
             #[cfg(test)]
             reject_append: Default::default(),
@@ -344,6 +353,7 @@ struct Engine {
     /// The last log index of each led stream and when it last changed.
     activity: parking_lot::Mutex<HashMap<StreamId, (Option<u64>, Instant)>>,
     park_after: Duration,
+    snapshot_rate: Arc<super::network::RateLimiter>,
     stop: CancellationToken,
     #[cfg(test)]
     reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
@@ -636,6 +646,7 @@ impl Engine {
             self.id.as_u128(),
             self.raft_config.clone(),
             Network {
+                snapshot_rate: self.snapshot_rate.clone(),
                 control: self.control.clone(),
                 bulk: self.bulk.clone(),
                 replication: self.replication.clone(),

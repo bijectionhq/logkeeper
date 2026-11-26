@@ -549,6 +549,7 @@ pub(super) struct Network {
     pub control: Rpc,
     pub replication: Rpc,
     pub bulk: Rpc,
+    pub snapshot_rate: Arc<RateLimiter>,
     pub genesis: Genesis,
     pub state: StateMachine,
     pub split_vote: watch::Sender<Option<Vote>>,
@@ -557,6 +558,38 @@ pub(super) struct Network {
 pub(super) struct Peer {
     network: Network,
     target: NodeId,
+}
+
+/// Paces the bytes a keeper sends in snapshot transfers, across all its
+/// streams, so catch-up and repair cannot saturate a cross-zone link. A
+/// rate of zero sends without pacing.
+pub(super) struct RateLimiter {
+    bytes_per_second: u64,
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl RateLimiter {
+    pub fn new(bytes_per_second: u64) -> Arc<Self> {
+        Arc::new(Self {
+            bytes_per_second,
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        })
+    }
+
+    /// Waits until `bytes` more fit under the rate.
+    pub async fn take(&self, bytes: u64) {
+        if self.bytes_per_second == 0 || bytes == 0 {
+            return;
+        }
+        let cost = Duration::from_secs_f64(bytes as f64 / self.bytes_per_second as f64);
+        let start = {
+            let mut next = self.next.lock().await;
+            let start = (*next).max(tokio::time::Instant::now());
+            *next = start + cost;
+            start
+        };
+        tokio::time::sleep_until(start).await;
+    }
 }
 
 impl RaftNetworkFactory<RaftTypes> for Network {
@@ -812,6 +845,7 @@ impl RaftNetworkV2<RaftTypes> for Peer {
             }
             let read = data.len() as u64;
             let done = offset + read == end;
+            self.network.snapshot_rate.take(read).await;
             let chunk = SnapshotChunk {
                 vote,
                 meta: meta.clone(),
@@ -866,6 +900,20 @@ impl RaftNetworkV2<RaftTypes> for Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_sends_are_paced_across_streams() {
+        let limiter = RateLimiter::new(1024);
+        let started = tokio::time::Instant::now();
+        limiter.take(1024).await;
+        limiter.take(1024).await;
+        limiter.take(1024).await;
+        // The first kilobyte goes at once; each later one waits a second.
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        let unpaced = RateLimiter::new(0);
+        unpaced.take(u64::MAX).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+    }
 
     #[test]
     fn refused_peer_appends_back_off_briefly_then_up_to_half_a_second() {

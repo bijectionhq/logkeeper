@@ -31,6 +31,8 @@ pub struct Client {
     catalog: uuid::Uuid,
     deadline: Duration,
     routes: Arc<Mutex<BTreeMap<StreamId, Route>>>,
+    /// Keepers in this client's failure domain, tried first for reads.
+    local: Arc<BTreeSet<uuid::Uuid>>,
 }
 
 #[derive(Clone)]
@@ -57,7 +59,15 @@ impl Client {
             catalog,
             deadline,
             routes: Arc::default(),
+            local: Arc::default(),
         })
+    }
+
+    /// Reads go first to a voter among `keepers`, those in the client's own
+    /// failure domain.
+    pub fn with_local_keepers(mut self, keepers: BTreeSet<uuid::Uuid>) -> Self {
+        self.local = Arc::new(keepers);
+        self
     }
 
     /// Assigns and initializes a stream's unique genesis. Use the same ID, voter
