@@ -522,7 +522,10 @@ impl Engine {
                     | Request::Configuration(_)
                     | Request::Read { .. }
                     | Request::ReadAt { .. } => admin || writer || reader,
-                    Request::Seal { .. } | Request::Append { .. } | Request::Trim { .. } => writer,
+                    Request::Seal { .. }
+                    | Request::Append { .. }
+                    | Request::AppendBatch { .. }
+                    | Request::Trim { .. } => writer,
                     Request::Stage(_)
                     | Request::StageReplica { .. }
                     | Request::InstallReplica { .. } => false,
@@ -663,6 +666,26 @@ impl Engine {
                                 owner: owner.unwrap(),
                                 at,
                                 payload,
+                            })
+                            .await)
+                    }
+                    Request::AppendBatch {
+                        fence,
+                        at,
+                        payloads,
+                        ..
+                    } => {
+                        if !super::state::valid_batch(&payloads) {
+                            return Ok(failure(JournalError::TooLarge {
+                                max: super::MAX_RECORD,
+                            }));
+                        }
+                        Ok(group
+                            .write(Command::AppendBatch {
+                                fence,
+                                owner: owner.unwrap(),
+                                at,
+                                payloads,
                             })
                             .await)
                     }

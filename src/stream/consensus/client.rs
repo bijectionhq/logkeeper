@@ -159,6 +159,30 @@ impl Client {
         )
     }
 
+    /// Appends a contiguous group from `at` in one committed entry and
+    /// returns its last LSN. The keeper applies the whole group or none of
+    /// it. Use at most 256 records and 4 MiB of payload per call.
+    pub async fn append_batch(
+        &self,
+        stream: StreamId,
+        fence: Fence,
+        at: Lsn,
+        payloads: Vec<Bytes>,
+    ) -> Result<Lsn> {
+        if !super::state::valid_batch(&payloads) {
+            return Err(JournalError::TooLarge { max: MAX_RECORD });
+        }
+        position(
+            self.operation(Request::AppendBatch {
+                stream,
+                fence,
+                at,
+                payloads,
+            })
+            .await?,
+        )
+    }
+
     pub async fn head(&self, stream: StreamId) -> Result<Lsn> {
         position(self.operation(Request::Head(stream)).await?)
     }

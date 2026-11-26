@@ -9,7 +9,10 @@ use bytes::Bytes;
 use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, Result, StreamId};
 use serde::Deserialize;
 
-use super::{Client, Credentials, Fence, Keepers, MAX_RECORD};
+use super::{
+    Client, Credentials, Fence, Keepers, MAX_RECORD,
+    state::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS},
+};
 
 /// The writer UUID every contract seal uses. The contract identifies a
 /// writer by its authenticated principal, and the keeper checks that
@@ -84,8 +87,10 @@ impl ConsensusJournal {
     }
 
     /// Commits a contiguous group in LSN order and returns its last LSN.
-    /// Records commit one at a time, so an error can leave a committed
-    /// prefix. The caller recovers that prefix from the journal.
+    /// The group is sent as keeper batches of at most 256 records and 4 MiB.
+    /// Each batch commits atomically, so an error can leave a committed
+    /// prefix of whole batches. The caller recovers that prefix from the
+    /// journal.
     pub async fn append_batch(
         &self,
         stream: StreamId,
@@ -101,8 +106,30 @@ impl ConsensusJournal {
         {
             return Err(JournalError::Unavailable);
         }
-        for (at, payload) in records {
-            self.append(stream, epoch, at, payload).await?;
+        if records
+            .iter()
+            .any(|(_, payload)| payload.len() > self.max_record_bytes)
+        {
+            return Err(JournalError::TooLarge {
+                max: self.max_record_bytes,
+            });
+        }
+        let mut records = records.into_iter().peekable();
+        while let Some(&(at, _)) = records.peek() {
+            let mut payloads = Vec::new();
+            let mut bytes = 0usize;
+            while let Some((_, payload)) = records.peek() {
+                if payloads.len() == MAX_BATCH_RECORDS
+                    || bytes.saturating_add(payload.len()) > MAX_BATCH_BYTES
+                {
+                    break;
+                }
+                bytes += payload.len();
+                payloads.push(records.next().unwrap().1);
+            }
+            self.client
+                .append_batch(stream, Self::fence(epoch), at, payloads)
+                .await?;
         }
         Ok(last)
     }

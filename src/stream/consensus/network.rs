@@ -130,6 +130,12 @@ pub(super) enum Request {
         limit: usize,
         wait_ms: u32,
     },
+    AppendBatch {
+        stream: StreamId,
+        fence: Fence,
+        at: Lsn,
+        payloads: Vec<bytes::Bytes>,
+    },
 }
 
 impl Request {
@@ -151,6 +157,7 @@ impl Request {
             Self::Stage(ref stage) => stage.stream,
             Self::Seal { stream, .. }
             | Self::Append { stream, .. }
+            | Self::AppendBatch { stream, .. }
             | Self::Read { stream, .. }
             | Self::Trim { stream, .. }
             | Self::RetireCopy { stream, .. }

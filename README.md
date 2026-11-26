@@ -409,8 +409,13 @@ fenced. The keeper's seal installs the epoch after the expected one, so a
 seal that jumps ahead installs each intermediate epoch in turn as separate
 compare-and-set steps. Epoch zero is never a sealed writer epoch. `head` is
 the keeper's fresh quorum-confirmed head, and `read` returns one keeper's
-applied page, which may lag. `append_batch` commits a contiguous group one
-record at a time and can leave a committed prefix on error.
+applied page, which may lag. `append_batch` sends a contiguous group as
+keeper batches of at most 256 records and 4 MiB of payload. The keeper
+validates each batch's writer, positions, record sizes and quota before it
+applies any record, then commits the batch as one Raft entry. A retry of
+records already retained with identical bytes returns the batch's last LSN.
+An error can leave a committed prefix of whole batches. `Client::append_batch`
+exposes one batch directly.
 
 The `consensus-testing` feature exports `testing::LocalCluster`. It starts
 three voter keepers in distinct failure domains and a catalog keeper on

@@ -413,6 +413,9 @@ impl Engine {
                         stage.stream == group.genesis.stream && self.placement.stage(stage)
                     }
                     Command::Append { payload, .. } => payload.len() <= MAX_RECORD,
+                    Command::AppendBatch { payloads, .. } => {
+                        crate::stream::consensus::state::valid_batch(payloads)
+                    }
                     Command::Admitted(..) => false,
                     _ => true,
                 },

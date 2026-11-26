@@ -43,6 +43,32 @@ pub enum Command {
         uuid::Uuid,
         #[serde(deserialize_with = "unticketed_command")] Box<Command>,
     ),
+    /// A contiguous group appended atomically from `at`. The payloads are the
+    /// last field, so each record's retained extent ends a fixed distance
+    /// before the end of the durable entry.
+    AppendBatch {
+        fence: Fence,
+        owner: String,
+        at: Lsn,
+        payloads: Vec<Bytes>,
+    },
+}
+
+/// The most records one batch carries.
+pub(super) const MAX_BATCH_RECORDS: usize = 256;
+/// The most payload bytes one batch carries, so a batch entry is no larger
+/// than one maximum record.
+pub(super) const MAX_BATCH_BYTES: usize = MAX_RECORD;
+
+/// Whether a batch fits its count and byte bounds and each record fits.
+pub(super) fn valid_batch(payloads: &[Bytes]) -> bool {
+    !payloads.is_empty()
+        && payloads.len() <= MAX_BATCH_RECORDS
+        && payloads.iter().all(|payload| payload.len() <= MAX_RECORD)
+        && payloads
+            .iter()
+            .try_fold(0usize, |total, payload| total.checked_add(payload.len()))
+            .is_some_and(|total| total <= MAX_BATCH_BYTES)
 }
 
 fn unticketed_command<'de, D: serde::Deserializer<'de>>(
@@ -75,8 +101,25 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
         Delete,
         Stage(Stage),
         StageOwned(Stage),
+        // Holds the wrapper's position. Its body is refused before decoding.
+        Admitted(
+            uuid::Uuid,
+            #[serde(deserialize_with = "refuse_nested")] Box<Command>,
+        ),
+        AppendBatch {
+            fence: Fence,
+            owner: String,
+            at: Lsn,
+            payloads: Vec<Bytes>,
+        },
     }
     Application::deserialize(decoder).map(Box::new)
+}
+
+fn refuse_nested<'de, D: serde::Deserializer<'de>>(
+    _decoder: D,
+) -> std::result::Result<Box<Command>, D::Error> {
+    Err(serde::de::Error::custom("nested application ticket"))
 }
 
 impl Command {
@@ -253,6 +296,41 @@ impl State {
             };
             return Ok(live.append(at, retained, genesis.quota_bytes).into());
         }
+        if let Command::AppendBatch {
+            fence,
+            owner,
+            at,
+            payloads,
+        } = command
+        {
+            let live = match self.live_mut() {
+                Ok(live) => live,
+                Err(error) => return Ok(Outcome::Refused(error)),
+            };
+            if let Err(error) = live.require_writer(fence, &owner) {
+                return Ok(Outcome::Refused(error));
+            }
+            if !valid_batch(&payloads) {
+                return Ok(Outcome::Refused(JournalError::TooLarge { max: MAX_RECORD }));
+            }
+            // The fixed-width encoding places an 8-byte length before each
+            // payload, and the payloads end the durable entry.
+            let mut end = segment.key().len;
+            let mut extents = Vec::with_capacity(payloads.len());
+            for payload in payloads.iter().rev() {
+                let offset = end.checked_sub(payload.len() as u64).ok_or_else(|| {
+                    super::invalid("accepted WAL extent does not contain the batch")
+                })?;
+                extents.push(offset);
+                end = offset.checked_sub(8).ok_or_else(|| {
+                    super::invalid("accepted WAL extent does not contain the batch")
+                })?;
+            }
+            extents.reverse();
+            return Ok(live
+                .append_batch(at, payloads, &extents, &segment, genesis.quota_bytes)?
+                .into());
+        }
         Ok(self.decide(command).into())
     }
 
@@ -299,7 +377,8 @@ impl State {
             | Command::Append { .. }
             | Command::Stage(_)
             | Command::StageOwned(_)
-            | Command::Admitted(..) => unreachable!(),
+            | Command::Admitted(..)
+            | Command::AppendBatch { .. } => unreachable!(),
         }
     }
 
@@ -430,6 +509,66 @@ impl Live {
         self.bytes = used;
         self.head = at;
         Ok(Outcome::At(at))
+    }
+
+    /// Appends a contiguous group atomically. Records already retained must
+    /// match exactly, and every new record must fit before any is applied.
+    fn append_batch(
+        &mut self,
+        at: Lsn,
+        payloads: Vec<Bytes>,
+        extents: &[u64],
+        segment: &Arc<super::storage::Object>,
+        quota_bytes: u64,
+    ) -> io::Result<Result<Outcome>> {
+        let conflict = JournalError::Conflict { head: self.head };
+        let Some(last) =
+            at.0.checked_add(payloads.len() as u64 - 1)
+                .filter(|last| *last != u64::MAX)
+        else {
+            return Ok(Err(conflict));
+        };
+        if at < self.floor {
+            return Ok(Err(JournalError::Trimmed { floor: self.floor }));
+        }
+        let retained = self.head.0.min(last).saturating_sub(at.0.saturating_sub(1)) as usize;
+        let retained = if at > self.head { 0 } else { retained };
+        for (index, payload) in payloads.iter().take(retained).enumerate() {
+            let record = &self.records[(at.0 - self.floor.0) as usize + index];
+            if record.len() != payload.len() || record.load()? != *payload {
+                return Ok(Err(conflict));
+            }
+        }
+        let fresh = &payloads[retained..];
+        if fresh.is_empty() {
+            return Ok(Ok(Outcome::At(Lsn(last))));
+        }
+        if self.head.0.checked_add(1) != Some(at.0 + retained as u64) {
+            return Ok(Err(conflict));
+        }
+        if self.records.len().saturating_add(fresh.len()) > MAX_RETAINED_RECORDS {
+            return Ok(Err(JournalError::Full { floor: self.floor }));
+        }
+        let Some(used) = fresh
+            .iter()
+            .try_fold(self.bytes, |used, payload| {
+                used.checked_add(record_charge(payload.len()))
+            })
+            .filter(|used| *used <= quota_bytes)
+        else {
+            return Ok(Err(JournalError::Full { floor: self.floor }));
+        };
+        for (payload, offset) in fresh.iter().zip(&extents[retained..]) {
+            self.records.push_back(Payload::Extent {
+                object: segment.clone(),
+                offset: *offset,
+                len: payload.len() as u32,
+                crc: crc32fast::hash(payload),
+            });
+        }
+        self.bytes = used;
+        self.head = Lsn(last);
+        Ok(Ok(Outcome::At(Lsn(last))))
     }
 
     fn trim(&mut self, through: Lsn) -> Result<Outcome> {

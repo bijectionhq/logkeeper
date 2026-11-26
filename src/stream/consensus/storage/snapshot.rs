@@ -564,7 +564,7 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
     {
         let entries = entries.into_iter().collect::<Vec<_>>();
         let may_read_snapshot = self.head().is_ok_and(|head| entries.iter().any(|entry| {
-            matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } if *at <= head))
+            matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } if *at <= head))
         }));
         let outcomes = if may_read_snapshot {
             let inner = self.inner.clone();
