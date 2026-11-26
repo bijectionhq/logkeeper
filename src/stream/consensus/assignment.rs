@@ -63,7 +63,7 @@ pub fn next_roster(stream: StreamId, current: [Uuid; 3], eligible: &Domains) -> 
     for voter in current {
         let fits = eligible
             .get(&voter)
-            .is_some_and(|domain| kept.iter().all(|other| eligible[other] != *domain));
+            .is_some_and(|domain| kept.iter().all(|other| eligible.get(other) != Some(domain)));
         if fits {
             kept.push(voter);
         } else if leaving.is_none() {
@@ -165,6 +165,16 @@ mod tests {
         assert!(distinct(second, &two));
         assert!(second.iter().all(|voter| two.contains_key(voter)));
         assert_eq!(next_roster(stream, second, &two), None);
+
+        // Two leading ineligible voters must not panic the domain check.
+        let mut first_two = all.clone();
+        first_two.remove(&current[0]);
+        first_two.remove(&current[1]);
+        let moved = next_roster(stream, current, &first_two).unwrap();
+        assert_eq!(
+            moved.iter().filter(|voter| current.contains(voter)).count(),
+            2
+        );
 
         // Without a keeper in the missing domain the roster stays.
         let stuck = domains(&[(1, "a"), (2, "b"), (4, "a")]);
