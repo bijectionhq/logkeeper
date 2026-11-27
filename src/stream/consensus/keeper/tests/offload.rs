@@ -730,3 +730,52 @@ async fn offload_to_minio_is_idempotent_and_serves_reads_below_the_local_floor()
     assert_eq!(plan.run, Some((Lsn(1), Lsn(40))));
     cluster.stop_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_immutable_stream_offloads_and_reads_below_its_local_floor_but_refuses_restore() {
+    let store = tempfile::tempdir().unwrap();
+    let mut config = offload_config(store.path());
+    config.retain_local_bytes = Some(1000);
+    let mut cluster = Cluster::start_offloaded(&config).await;
+    let journal = cluster.client(&cluster.credentials);
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(49);
+    journal
+        .create_immutable(stream, [a, b, c], 1 << 24)
+        .await
+        .unwrap();
+    let session = journal_contract::WriterSessionId(77);
+    let seal = journal
+        .seal_session(stream, Epoch(0), session)
+        .await
+        .unwrap();
+    let fence = Fence {
+        epoch: seal.fence.writer_epoch,
+        writer: Uuid::from_u128(session.0),
+    };
+    append_range(&journal, stream, fence, 1, 40).await;
+    flushed(&journal, stream, 40).await;
+    timeout(WAIT, async {
+        while journal
+            .offload_status(stream, false)
+            .await
+            .unwrap()
+            .local_floor
+            <= Lsn(20)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("retention dropped offloaded records");
+    check(&read_all(&journal, stream, 1, 40).await, 1, 40);
+    // A same-stream restore would rewrite an immutable history; the
+    // supported path is restore-stream into a fresh stream ID.
+    assert_eq!(
+        journal
+            .restore_from_offload(stream, Lsn(1), Lsn(40), Epoch(1))
+            .await,
+        Err(JournalError::Conflict { head: Lsn(40) })
+    );
+    cluster.stop_all().await;
+}

@@ -486,6 +486,16 @@ its log, Neon-style, and records how far it got through Raft:
   objects, backpressured appends, locally trimmed records, upload duration,
   and the lag gauges `logkeeper_offload_lag_bytes` and
   `logkeeper_offload_lag_seconds`.
+- **Measured** (`consensus-streams --streams 8 --active 8 --batch 16
+  --record 256 --seconds 20`, one Mac shared with other builds, load average
+  15 to 20, three alternating runs each, 1 s batches): records per second
+  without offload 2,985 / 1,867 / 2,319 (median 2,319), offloading to a
+  directory 2,619 / 1,112 / 2,208 (median 2,208), offloading to MinIO on
+  loopback 2,845 / 2,046 / 1,027 (median 2,046). The run-to-run spread is
+  larger than the difference, so the cost is within noise on that machine;
+  rerun on an idle host before quoting a number. The largest lag sampled was
+  2,576 records (about one batch interval of writes), and the leaders
+  uploaded everything within 150 to 1,050 ms of the writers stopping.
 
 ### Keeper storage and upgrade
 
