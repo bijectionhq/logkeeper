@@ -250,20 +250,16 @@ async fn deleting_a_stream_forgets_its_preferred_leader() {
     );
 
     journal.delete(stream).await.unwrap();
+    let engine = &cluster.running[&b].engine;
     timeout(WAIT, async {
-        while !cluster.running[&b].engine.deleted.read().contains(&stream) {
+        while !engine.deleted.read().contains(&stream)
+            || engine.preferred.lock().contains_key(&stream)
+        {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("deleted stream closed on b");
-    assert!(
-        !cluster.running[&b]
-            .engine
-            .preferred
-            .lock()
-            .contains_key(&stream)
-    );
+    .expect("deleted stream closed and released its leader preference on b");
     cluster.stop_all().await;
 }
 
