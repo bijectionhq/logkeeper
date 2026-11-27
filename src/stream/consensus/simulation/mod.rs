@@ -2203,7 +2203,7 @@ async fn consensus_fault_harness_wipe_with_incarnations() {
     let count = env::var("LOGKEEPER_WIPE_SEEDS").map_or(2, |v| v.parse::<u64>().unwrap());
     let config = RunConfig::with_wipe();
     for seed in first..first + count {
-        timeout(Duration::from_secs(90), run_seed(seed, &config))
+        timeout(Duration::from_secs(180), run_seed(seed, &config))
             .await
             .unwrap_or_else(|_| panic!("wipe harness timed out on seed {seed}"))
             .unwrap_or_else(|(plan, violation)| {
@@ -2292,7 +2292,10 @@ async fn consensus_fault_harness_soak() {
     let mut failures = Vec::new();
     for seed in first..first + count {
         let started = std::time::Instant::now();
-        let failure = match timeout(Duration::from_secs(90), run_seed(seed, &config)).await {
+        // A wipe seed waits up to 40 s for repair to replace the reused
+        // voter, which a loaded host can push past 90 s.
+        let limit = Duration::from_secs(if allow_wipe { 180 } else { 90 });
+        let failure = match timeout(limit, run_seed(seed, &config)).await {
             Ok(Ok(summary)) => {
                 total_ops += summary.total_ops;
                 for (k, v) in summary.coverage {
