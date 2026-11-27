@@ -2,6 +2,8 @@ mod admin;
 mod admission;
 mod bundle;
 mod catalog_stream;
+#[cfg(test)]
+pub(super) use catalog_stream::trace_catalog_change;
 mod certify;
 mod checkpoint_trim;
 mod compaction;
@@ -584,11 +586,18 @@ impl Config {
                  logkeeper_consensus_catalog_voters reports the live membership: five once grown"
             );
         }
-        let lease = Arc::new(lease::Lease::open(
+        let lease = lease::Lease::open(
             &self.data,
             Duration::from_millis(self.lease_millis),
             Duration::from_millis(self.lease_drift_margin_millis),
-        )?);
+        )?;
+        #[cfg(test)]
+        let lease = {
+            let mut lease = lease;
+            lease.trace = disk.trace.clone();
+            lease
+        };
+        let lease = Arc::new(lease);
         let catalog = if id == self.catalog && self.catalog_voters.is_none() {
             Some(Catalog::new(disk.clone(), &self.data)?)
         } else {
@@ -1578,6 +1587,10 @@ impl Engine {
         };
         let (split_vote, collisions) = watch::channel(None);
         let excluded = Arc::new(parking_lot::Mutex::new(None));
+        #[cfg(test)]
+        if let Some(trace) = &self.disk.trace {
+            trace.event("OpenGroup", genesis.stream, serde_json::json!({}));
+        }
         let raft = Raft::new(
             self.id.as_u128(),
             self.raft_config.clone(),

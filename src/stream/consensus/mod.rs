@@ -23,6 +23,8 @@ mod storage;
 #[cfg(feature = "consensus-testing")]
 pub mod testing;
 mod timed;
+#[cfg(test)]
+mod trace;
 mod voters;
 
 use std::{collections::BTreeMap, io, net::SocketAddr};

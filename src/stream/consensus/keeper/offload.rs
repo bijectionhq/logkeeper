@@ -396,6 +396,19 @@ impl Engine {
             } else {
                 crate::stream::consensus::metrics::count(&metrics.existing_objects);
             }
+            #[cfg(test)]
+            if let Some(trace) = &self.disk.trace {
+                trace.event(
+                    "Upload",
+                    stream,
+                    serde_json::json!({
+                        "lineage": lineage, "previous": view.offload.through.0,
+                        "floor": view.logical_floor.0, "head": view.head.0,
+                        "first": records[0].lsn.0, "last": last.0,
+                        "positions": records.iter().map(|record| record.lsn.0).collect::<Vec<_>>(),
+                    }),
+                );
+            }
             through = last;
         }
         let retain_from = offloader

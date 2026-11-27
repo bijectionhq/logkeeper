@@ -732,7 +732,26 @@ impl Config {
         // The recovered configuration serves only after every lease the lost
         // voters held when the catalog committed has ended on their clocks.
         // The survivor stays stopped under this command's media lock.
+        #[cfg(test)]
+        let started_wait = std::time::Instant::now();
         lease::wait_for_expiry(wait).await?;
+        #[cfg(test)]
+        if let Some(trace) = &disk.trace {
+            trace.event(
+                "RecoveryReady",
+                stream,
+                serde_json::json!({
+                    "authority": record.is_some(), "old": super::super::trace::voters(stage.old),
+                    "target": super::super::trace::voters(stage.target), "fenced": &fenced,
+                    "epoch": record.map_or(stage.source + 1, |record| record.epoch),
+                    "loss": record.map_or(loss_point.0, |record| record.loss_point.0),
+                    "knownHead": known.0,
+                    "offloaded": offload.as_ref().map_or(0, |(_, report)| report.kept_through.0),
+                    "exact": exact || restored, "wait": wait.as_millis(),
+                    "elapsed": super::super::trace::measured_ms(started_wait),
+                }),
+            );
+        }
         let log_id = |index| {
             LogId::new(
                 openraft::vote::leader_id_std::CommittedLeaderId::new(term),

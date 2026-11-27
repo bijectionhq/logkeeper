@@ -130,7 +130,11 @@ impl Running {
         faults: &FaultNetwork,
         ignore_reused_ids: bool,
     ) -> Self {
-        let engine = config.prepare(CancellationToken::new()).await.unwrap();
+        let keeper = config.keeper;
+        let engine = config
+            .prepare(CancellationToken::new())
+            .await
+            .unwrap_or_else(|error| panic!("prepare harness keeper {keeper}: {error}"));
         if ignore_reused_ids {
             engine.ignore_reused_ids();
         }
@@ -174,6 +178,7 @@ pub(super) struct SimCluster {
     creds_b: Credentials,
     creds_r: Credentials,
     _dir: tempfile::TempDir,
+    _trace: Option<super::super::trace::Registration>,
 }
 
 /// The harness's offload store: small objects and batches, a lag bound a
@@ -190,17 +195,25 @@ fn offload_config(directory: &std::path::Path) -> crate::stream::consensus::Offl
 }
 
 impl SimCluster {
-    /// Takes the offload store away (its directory becomes a file) or
-    /// brings it back.
+    /// Blocks offload operations without making the configured store root
+    /// invalid. A keeper can restart while the objects are unavailable.
     pub fn store_outage(&self, down: bool) {
-        let store = self._dir.path().join("offload");
-        let away = self._dir.path().join("offload-away");
-        if down && store.is_dir() {
-            std::fs::rename(&store, &away).unwrap();
-            std::fs::write(&store, b"store outage").unwrap();
+        if !self.options.offload {
+            return;
+        }
+        let root = self._dir.path().join("offload");
+        let objects = root.join("streams");
+        let away = root.join("streams-away");
+        if down && !objects.is_file() {
+            if objects.is_dir() {
+                std::fs::rename(&objects, &away).unwrap();
+            } else {
+                std::fs::create_dir(&away).unwrap();
+            }
+            std::fs::write(&objects, b"store outage").unwrap();
         } else if !down && away.is_dir() {
-            std::fs::remove_file(&store).unwrap();
-            std::fs::rename(&away, &store).unwrap();
+            std::fs::remove_file(&objects).unwrap();
+            std::fs::rename(&away, &objects).unwrap();
         }
     }
 
@@ -230,8 +243,17 @@ impl SimCluster {
     }
 
     pub async fn start(seed: u64, options: ClusterOptions) -> Self {
+        Self::start_traced(seed, options, None).await
+    }
+
+    pub async fn start_traced(
+        seed: u64,
+        options: ClusterOptions,
+        trace: Option<&super::super::trace::Capture>,
+    ) -> Self {
         let faults = FaultNetwork::new(seed);
         let dir = tempfile::tempdir().unwrap();
+        let registration = trace.map(|trace| trace.register(dir.path()));
         let roots = dir.path().join("ca.pem");
         let ca = ca(&roots);
         let data_ids = [1, 2, 3, 4].map(Uuid::from_u128);
@@ -363,6 +385,7 @@ impl SimCluster {
             creds_b,
             creds_r,
             _dir: dir,
+            _trace: registration,
         }
     }
 
@@ -869,6 +892,31 @@ impl SimCluster {
                 Err(snaps)
             }
         }
+    }
+
+    pub async fn trace_snapshot(&self, stream: StreamId) {
+        let Some(leader) = self.leader(stream).await else {
+            return;
+        };
+        let Some(group) = self.running[&leader]
+            .engine
+            .groups
+            .lock()
+            .await
+            .get(&stream)
+            .cloned()
+        else {
+            return;
+        };
+        let cut = group.raft.metrics().borrow_watched().last_applied;
+        group.raft.trigger().snapshot().await.unwrap();
+        timeout(WAIT, async {
+            while group.raft.metrics().borrow_watched().snapshot < cut {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("snapshot for trace");
     }
 
     pub async fn stop_all(&mut self) {

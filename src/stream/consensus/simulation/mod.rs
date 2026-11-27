@@ -22,6 +22,7 @@ mod bugs;
 mod cluster;
 mod faults;
 mod history;
+mod trace_validation;
 
 use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 
@@ -1002,12 +1003,20 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
 /// Executes `plan` on a fresh `SimCluster`, heals faults, verifies
 /// cross-voter convergence and all safety/linearizability/durability invariants.
 async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
-    let mut cluster = SimCluster::start(plan.seed, plan.options.clone()).await;
+    execute_plan_traced(plan, None).await
+}
+
+async fn execute_plan_traced(
+    plan: &Plan,
+    trace: Option<&super::trace::Capture>,
+) -> Result<RunSummary, Violation> {
+    let mut cluster = SimCluster::start_traced(plan.seed, plan.options.clone(), trace).await;
     // `LOGKEEPER_CONSENSUS_LEASES=1` finalizes the cluster first, so every
     // fault runs under enforced liveness leases from the catalog. Five-voter
     // streams need the finalized version, which also enforces leases.
     if plan.options.replication == 5
         || plan.options.offload
+        || trace.is_some()
         || env::var("LOGKEEPER_CONSENSUS_LEASES")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     {
@@ -1672,6 +1681,15 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                 break;
             }
         }
+    }
+    if trace.is_some() && plan.profile == Profile::ReplicatedCatalog {
+        cluster.trace_snapshot(plan.streams[0].stream).await;
+        cluster
+            .journal(WRITER_A, plan.streams[0].initial_voters)
+            .client()
+            .fence_keeper(*cluster.all_ids.last().unwrap())
+            .await
+            .expect("catalog fence for trace");
     }
     let coverage = cluster.faults.coverage();
     let check_result = history.check_all(&converged);

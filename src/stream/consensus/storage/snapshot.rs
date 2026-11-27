@@ -1237,6 +1237,14 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
             return Err(invalid("snapshot would roll back applied state"));
         }
         inner.select(&temporary.path, selected, true).await?;
+        #[cfg(test)]
+        if let Some(trace) = &inner.disk.trace {
+            trace.event(
+                "InstallSnapshot",
+                inner.genesis.stream,
+                super::super::trace::cut(meta.last_log_id),
+            );
+        }
         *inner.applied.write() = image.clone();
         inner.installed(ActiveSnapshot {
             meta,
@@ -1438,6 +1446,48 @@ impl Inner {
         let mut image = self.applied.write();
         let mut outcomes = Vec::with_capacity(entries.len());
         for entry in entries {
+            #[cfg(test)]
+            let observation = self.disk.trace.as_ref().map(|_| {
+                let command = match &entry.payload {
+                    EntryPayload::Normal(command) => Some(command.body()),
+                    _ => None,
+                };
+                let catalog = match command {
+                    Some(Command::Append { at, payload, .. })
+                        if self.genesis.stream == super::super::CATALOG_STREAM =>
+                    {
+                        super::super::keeper::trace_catalog_change(payload)
+                            .map(|change| super::super::trace::catalog(&change, at.0))
+                    }
+                    _ => None,
+                };
+                let offload = match command {
+                    Some(Command::Offloaded {
+                        lineage, through, ..
+                    }) => Some((*lineage, through.0, image.state.offload_view())),
+                    _ => None,
+                };
+                let marker = match command {
+                    Some(Command::RecoveryEntry { at, entry, .. }) => {
+                        journal_contract::RecoveryEntry::decode(entry).map(|marker| {
+                            serde_json::json!({
+                                "at": at.0, "fenceHead": marker.fence.head.0,
+                                "epoch": marker.configuration_epoch, "loss": marker.loss_point.0,
+                            })
+                        })
+                    }
+                    _ => None,
+                };
+                (
+                    serde_json::json!({
+                        "entry": super::super::trace::entry(entry.log_id, &entry.payload),
+                        "previous": super::super::trace::cut(image.applied),
+                    }),
+                    catalog,
+                    offload,
+                    marker,
+                )
+            });
             let outcome = match entry.payload {
                 EntryPayload::Blank => Outcome::Unit,
                 EntryPayload::Normal(command) => match command.into_body() {
@@ -1523,6 +1573,30 @@ impl Inner {
                 }
             };
             image.applied = Some(entry.log_id);
+            #[cfg(test)]
+            if let (Some(trace), Some((entry, catalog, offload, marker))) =
+                (&self.disk.trace, observation)
+            {
+                let stream = self.genesis.stream;
+                let mut events = vec![super::super::trace::event("Apply", stream, entry)];
+                if matches!(&outcome, Outcome::At(_)) {
+                    events.extend(catalog);
+                    if let (Some((lineage, requested, Some(before))), Some(after)) =
+                        (offload, image.state.offload_view())
+                    {
+                        events.push(super::super::trace::event("Offload", stream, serde_json::json!({
+                            "lineage": lineage, "requested": requested,
+                            "beforeLineage": before.offload.lineage, "afterLineage": after.offload.lineage,
+                            "beforeThrough": before.offload.through.0, "afterThrough": after.offload.through.0,
+                            "head": before.head.0, "floor": after.logical_floor.0, "localFloor": after.local_floor.0,
+                        })));
+                    }
+                    if let Some(marker) = marker {
+                        events.push(super::super::trace::event("RecoveryMarker", stream, marker));
+                    }
+                }
+                trace.batch(events);
+            }
             outcomes.push(outcome);
         }
         drop(image);
@@ -1614,6 +1688,14 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
         // serialized worker until selection, but do not book them twice.
         drop(reserved);
         inner.select(&temporary, active.selected, false).await?;
+        #[cfg(test)]
+        if let Some(trace) = &inner.disk.trace {
+            trace.event(
+                "BuildSnapshot",
+                inner.genesis.stream,
+                super::super::trace::cut(active.meta.last_log_id),
+            );
+        }
         inner.installed(active);
         if let Some(moved) = moved {
             inner

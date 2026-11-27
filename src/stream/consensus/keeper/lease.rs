@@ -87,6 +87,8 @@ pub(in crate::stream::consensus) struct Lease {
     pub suspended: AtomicBool,
     #[cfg(test)]
     test_clock: Option<Box<dyn Fn() -> Option<u64> + Send + Sync>>,
+    #[cfg(test)]
+    pub(super) trace: Option<super::super::trace::Node>,
 }
 
 impl Lease {
@@ -115,6 +117,8 @@ impl Lease {
             suspended: AtomicBool::new(false),
             #[cfg(test)]
             test_clock: None,
+            #[cfg(test)]
+            trace: None,
         })
     }
 
@@ -174,13 +178,35 @@ impl Lease {
             return true;
         }
         let below = self.fenced_below(stream);
-        let revision = if below.is_some() { revision() } else { 0 };
-        decisions::holds_authority(
+        #[cfg(test)]
+        let observe_revision = self.trace.is_some();
+        #[cfg(not(test))]
+        let observe_revision = false;
+        let revision = if below.is_some() || observe_revision {
+            revision()
+        } else {
+            0
+        };
+        let valid = self.valid();
+        let current = self.current.load(Ordering::Acquire);
+        let permitted = decisions::holds_authority(
             enforced,
-            self.valid(),
-            self.current.load(Ordering::Acquire),
+            valid,
+            current,
             decisions::copy_fenced(below, revision),
-        )
+        );
+        #[cfg(test)]
+        if let Some(trace) = &self.trace {
+            trace.event(
+                "LeaseGate",
+                stream,
+                serde_json::json!({
+                    "revision": revision, "below": below.unwrap_or(0), "valid": valid,
+                    "current": current, "permitted": permitted,
+                }),
+            );
+        }
+        permitted
     }
 
     /// The epoch of the current lease, zero before the keeper enrolled.
@@ -312,6 +338,16 @@ impl Engine {
                 tokio::spawn(async move { engine.apply_authority().await });
             }
             if valid && !now_valid {
+                #[cfg(test)]
+                if let Some(trace) = &self.disk.trace {
+                    trace.event(
+                        "LeaseExpiry",
+                        StreamId(0),
+                        serde_json::json!({
+                            "epoch": self.lease.epoch(), "enforced": self.lease.enforced(),
+                        }),
+                    );
+                }
                 super::super::metrics::count(&self.lease.lapses);
                 if self.lease.enforced() {
                     tracing::warn!(
@@ -515,6 +551,24 @@ impl Engine {
         lease
             .renewed
             .store(now.saturating_add(1), Ordering::Release);
+        #[cfg(test)]
+        if let Some(trace) = &self.disk.trace {
+            let fences = lease.fenced.read().iter().map(|(stream, revision)| {
+                serde_json::json!({"stream": format!("{:032x}", stream.0), "revision": revision})
+            }).collect::<Vec<_>>();
+            trace.event(
+                "LeaseGrant",
+                StreamId(0),
+                serde_json::json!({
+                    "epoch": grant.epoch, "asked": asked, "enforced": grant.enforced,
+                    "incarnation": self.recognition.own(),
+                    "duration": duration / 1_000_000, "margin": margin / 1_000_000,
+                    "age": now.saturating_sub(sent) / 1_000_000,
+                    "valid": decisions::lease_valid(sent, duration, margin, now),
+                    "fences": fences,
+                }),
+            );
+        }
         decisions::lease_valid(sent, duration, margin, now)
     }
 }

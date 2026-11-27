@@ -343,6 +343,10 @@ impl Engine {
         {
             *entry = Closed::Pinned(pin);
         }
+        #[cfg(test)]
+        if persist && let Some(trace) = &self.disk.trace {
+            trace.event("Park", scope, serde_json::json!({}));
+        }
         true
     }
 

@@ -172,6 +172,20 @@ impl Engine {
             self.idle(group, Instant::now()),
         );
         if ready {
+            #[cfg(test)]
+            if let Some(trace) = &self.disk.trace {
+                use super::super::trace::{cut, vote as ballot};
+                trace.event(
+                    "AcceptPark",
+                    group.genesis.stream,
+                    serde_json::json!({
+                        "leaderVote": ballot(vote), "localVote": ballot(metrics.vote),
+                        "leaderCut": cut(last), "localCut": cut(metrics.last_applied),
+                        "lastIndex": metrics.last_log_index.map_or(0, |index| index + 1),
+                        "follower": metrics.state == ServerState::Follower,
+                    }),
+                );
+            }
             self.park(group.genesis.stream).await;
         }
         ready

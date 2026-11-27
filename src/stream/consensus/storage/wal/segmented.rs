@@ -884,6 +884,7 @@ impl Segmented {
         objects: &Objects,
         scopes: &BTreeSet<StreamId>,
         metrics: &crate::stream::consensus::metrics::Metrics,
+        #[cfg(test)] at_boundary: impl FnOnce(),
     ) -> io::Result<u64> {
         #[cfg(test)]
         let cut = self.cut.replace(0);
@@ -931,6 +932,8 @@ impl Segmented {
         if let Some((reference, ready)) = ready {
             self.adopt(reference, ready, objects);
         }
+        #[cfg(test)]
+        at_boundary();
         #[cfg(test)]
         if cut == 3 {
             return Err(io::Error::other("interrupted after the WAL boundary"));

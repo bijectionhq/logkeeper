@@ -536,6 +536,8 @@ pub(in crate::stream::consensus) struct Disk {
     stopped: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<io::Result<()>>>>>,
     media_lock: Weak<File>,
     pub path: Arc<PathBuf>,
+    #[cfg(test)]
+    pub(in crate::stream::consensus) trace: Option<crate::stream::consensus::trace::Node>,
     /// The incarnation of the installed media, new at each installation.
     pub incarnation: Uuid,
     pub space: Space,
@@ -606,6 +608,10 @@ impl Disk {
         }
         let (wal, state) = Segmented::open(&media, &objects, tuning)?;
         let incarnation = media.incarnation();
+        #[cfg(test)]
+        let trace = crate::stream::consensus::trace::Node::open(&path, keeper_id, incarnation);
+        #[cfg(test)]
+        let writer_trace = trace.clone();
         drop(media);
         let initial_version = state.cluster_version;
         let state = Arc::new(RwLock::new(state));
@@ -668,6 +674,8 @@ impl Disk {
                     &writer_fault,
                     #[cfg(test)]
                     &writer_delay,
+                    #[cfg(test)]
+                    writer_trace.as_ref(),
                 );
                 drop(lock);
                 if let Err(error) = &result {
@@ -699,6 +707,8 @@ impl Disk {
             stopped: Arc::new(tokio::sync::Mutex::new(Some(stopped))),
             media_lock,
             path: Arc::new(path),
+            #[cfg(test)]
+            trace,
             incarnation,
             space,
             objects,
@@ -1353,6 +1363,7 @@ fn run(
     metrics: &crate::stream::consensus::metrics::Metrics,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
     #[cfg(test)] wal_delay_ms: &std::sync::atomic::AtomicU64,
+    #[cfg(test)] trace: Option<&crate::stream::consensus::trace::Node>,
 ) -> io::Result<()> {
     let _gate = CloseGate(health);
     let result = rounds(
@@ -1369,6 +1380,8 @@ fn run(
         replica_fault,
         #[cfg(test)]
         wal_delay_ms,
+        #[cfg(test)]
+        trace,
     );
     wal.finish();
     result
@@ -1387,6 +1400,7 @@ fn rounds(
     metrics: &crate::stream::consensus::metrics::Metrics,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
     #[cfg(test)] wal_delay_ms: &std::sync::atomic::AtomicU64,
+    #[cfg(test)] trace: Option<&crate::stream::consensus::trace::Node>,
 ) -> io::Result<()> {
     let mut finish = false;
     // When the last round with frames committed.
@@ -1449,6 +1463,8 @@ fn rounds(
         let mut before_settlement = None;
         #[cfg(test)]
         let mut held = None;
+        #[cfg(test)]
+        let mut events = Vec::new();
         for mut work in round {
             if work.application {
                 applications += 1;
@@ -1510,8 +1526,33 @@ fn rounds(
                     _ => (),
                 }
             }
+            #[cfg(test)]
+            let observed = trace.and_then(|_| crate::stream::consensus::trace::wal(&work.record));
+            #[cfg(test)]
+            let generation = trace.and_then(|_| {
+                working
+                    .logs
+                    .get(&scope)
+                    .and_then(|log| log.ownership.generation())
+            });
             match working.apply_indexed(work.record, wal, objects) {
                 Ok(moved) => {
+                    #[cfg(test)]
+                    if trace.is_some() {
+                        events.extend(observed);
+                        if working.logs.get(&scope).is_some_and(|log| {
+                            generation != log.ownership.generation()
+                                && log.entries.is_empty()
+                                && log.snapshot.is_none()
+                                && log.purged.is_none()
+                        }) {
+                            events.push(crate::stream::consensus::trace::event(
+                                "ResetCopy",
+                                scope,
+                                serde_json::json!({}),
+                            ));
+                        }
+                    }
                     moves.extend(moved);
                     changed.insert(scope);
                     added += usize::from(new);
@@ -1556,7 +1597,20 @@ fn rounds(
                 }
             }
             let round_records = replies.len() as u64;
-            let round_bytes = wal.commit(objects, &changed, metrics)?;
+            let round_bytes = wal.commit(
+                objects,
+                &changed,
+                metrics,
+                #[cfg(test)]
+                || {
+                    if let Some(trace) = trace {
+                        events.extend(committed.iter().filter_map(|&(stream, _, id)| {
+                            crate::stream::consensus::trace::wal(&Record::Committed(stream, id))
+                        }));
+                        trace.batch(events);
+                    }
+                },
+            )?;
             last_round = std::time::Instant::now();
             metrics.wal_round_records.observe(round_records);
             metrics.wal_round_bytes.observe(round_bytes);

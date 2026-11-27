@@ -74,6 +74,16 @@ const ATTEMPT: Duration = Duration::from_secs(2);
 /// Keeper records per checkpoint record.
 const KEEPERS_PER_RECORD: usize = 64;
 
+#[cfg(test)]
+pub(in crate::stream::consensus) fn trace_catalog_change(
+    payload: &[u8],
+) -> Option<authority::Change> {
+    match crate::stream::consensus::decode(payload).expect("applied catalog record") {
+        CatalogRecord::Authority(change) => Some(change),
+        _ => None,
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 enum CatalogRecord {
     Claim(Genesis),
