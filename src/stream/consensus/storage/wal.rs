@@ -22,6 +22,55 @@ mod legacy;
 pub(super) mod segmented;
 pub use segmented::SalvageReport;
 use segmented::{Segmented, Tuning};
+
+/// One thing the background scrubber reads back and checks.
+pub(in crate::stream::consensus) struct ScrubTarget(Target);
+
+enum Target {
+    /// A retained log slice or object, checked against its checksum.
+    Object(std::sync::Arc<super::objects::Object>),
+    /// A selected snapshot, checked against its digest with every object
+    /// it names.
+    Snapshot {
+        directory: PathBuf,
+        selected: Selected,
+        genesis: Genesis,
+        objects: Objects,
+    },
+}
+
+impl ScrubTarget {
+    /// The bytes the check reads, for pacing.
+    pub fn len(&self) -> u64 {
+        match &self.0 {
+            Target::Object(object) => object.len(),
+            Target::Snapshot {
+                directory,
+                selected,
+                ..
+            } => std::fs::metadata(selected.path(directory)).map_or(0, |meta| meta.len()),
+        }
+    }
+
+    /// Reads the target back. `InvalidData` means it failed its checksum or
+    /// digest; another error, such as a file a trim removed meanwhile, says
+    /// nothing about the data.
+    pub fn verify(&self) -> io::Result<()> {
+        match &self.0 {
+            Target::Object(object) => object.read().map(drop),
+            Target::Snapshot {
+                directory,
+                selected,
+                genesis,
+                objects,
+            } => {
+                let file = std::fs::File::open(selected.path(directory))?;
+                super::snapshot::verify_selected_file(file, directory, genesis, *selected, objects)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -643,6 +692,39 @@ impl Disk {
     /// Whether the media is healthy and keeps up with its WAL rounds.
     pub fn responsive(&self) -> bool {
         self.healthy() && self.watchdog.responsive()
+    }
+
+    /// Whether the media is near its slow-round gate, when background work
+    /// should wait.
+    pub fn near_slow(&self) -> bool {
+        self.watchdog.near_slow()
+    }
+
+    /// What the scrubber verifies for `stream`: every retained slice of its
+    /// log, then its selected snapshot and the objects that snapshot names.
+    pub fn scrub_targets(&self, stream: StreamId) -> Vec<ScrubTarget> {
+        let state = self.state.read();
+        let (Some(log), Some(genesis)) = (state.logs.get(&stream), state.genesis.get(&stream))
+        else {
+            return Vec::new();
+        };
+        let mut targets = log
+            .segments
+            .values()
+            .cloned()
+            .map(|object| ScrubTarget(Target::Object(object)))
+            .collect::<Vec<_>>();
+        if let (Some(selected), Some(generation)) = (log.snapshot, log.ownership.generation()) {
+            targets.push(ScrubTarget(Target::Snapshot {
+                directory: crate::stream::consensus::ownership::directory(
+                    &self.path, stream, generation,
+                ),
+                selected,
+                genesis: genesis.clone(),
+                objects: self.objects.clone(),
+            }));
+        }
+        targets
     }
 
     /// Resolves once a WAL round runs past the slow-round limit.

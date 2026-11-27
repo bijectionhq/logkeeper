@@ -254,6 +254,16 @@ administrator clears a marker online (`Client::clear_quarantine`,
 it only once repair has replaced or restored the replica: a cleared copy
 votes again with whatever it still holds.
 
+A background scrubber reads every retained slice and selected snapshot back,
+on open, parked and unopened copies alike, so damage in data nobody reads is
+found too. It paces itself at `scrub_bytes_per_second` (default 2 MiB/s, 0
+turns it off) with a fifth of jitter, pauses while a WAL round runs past half
+the 2.5 s slow-round limit, and quarantines a copy that fails a check exactly
+as a failed read does. A quarantined copy that repair has replaced retires on
+its own and its marker goes. The `logkeeper_consensus_scrub_*_total` metrics
+count the bytes, slices and snapshots checked, the passes and the corrupt
+copies found.
+
 ```sh
 cargo run --locked --features stream -- keeper clear-quarantine --config keeper.json --stream STREAM_UUID
 ```

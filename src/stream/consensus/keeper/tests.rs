@@ -187,6 +187,7 @@ impl Cluster {
                 repair_after_secs: 2,
                 park_after_secs: 3600,
                 snapshot_send_bytes_per_second: 0,
+                scrub_bytes_per_second: 0,
                 async_append: std::env::var("LOGKEEPER_ASYNC_APPEND")
                     .map_or(true, |value| value != "0"),
                 timed_original: None,

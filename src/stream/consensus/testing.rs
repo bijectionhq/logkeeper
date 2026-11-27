@@ -193,6 +193,7 @@ impl LocalCluster {
                 repair_after_secs: 600,
                 park_after_secs,
                 snapshot_send_bytes_per_second: 0,
+                scrub_bytes_per_second: 0,
                 // `LOGKEEPER_ASYNC_APPEND=0` measures the synchronous leader append.
                 async_append: std::env::var("LOGKEEPER_ASYNC_APPEND")
                     .map_or(true, |value| value != "0"),

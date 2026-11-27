@@ -13,6 +13,7 @@ mod recovery;
 mod repair;
 mod replacement;
 mod replicas;
+mod scrub;
 #[cfg(test)]
 mod tests;
 pub(super) mod tls;
@@ -88,6 +89,10 @@ fn default_repair_after_secs() -> u64 {
 
 fn default_park_after_secs() -> u64 {
     600
+}
+
+fn default_scrub_bytes_per_second() -> u64 {
+    scrub::DEFAULT_BYTES_PER_SECOND
 }
 
 fn default_snapshot_send_bytes_per_second() -> u64 {
@@ -168,6 +173,10 @@ pub struct Config {
     /// its streams; zero sends without pacing.
     #[serde(default = "default_snapshot_send_bytes_per_second")]
     pub snapshot_send_bytes_per_second: u64,
+    /// How fast the background scrubber reads back retained slices and
+    /// snapshots to check them, in bytes per second; 0 disables it.
+    #[serde(default = "default_scrub_bytes_per_second")]
+    pub scrub_bytes_per_second: u64,
     /// A leader replicates its own appends while its WAL write of them is
     /// still in flight, and counts itself toward commit once it lands.
     #[serde(default = "default_async_append")]
@@ -546,6 +555,7 @@ impl Config {
             park_after: Duration::from_secs(self.park_after_secs),
             async_append: self.async_append,
             snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
+            scrub_rate: self.scrub_bytes_per_second,
             retire_now: Arc::default(),
             placement_confirmed: parking_lot::Mutex::default(),
             certification: Arc::default(),
@@ -636,6 +646,8 @@ pub(super) struct Engine {
     preferred: parking_lot::Mutex<HashMap<StreamId, String>>,
     park_after: Duration,
     snapshot_rate: Arc<super::network::RateLimiter>,
+    /// The scrubber's pace in bytes per second; 0 disables it.
+    scrub_rate: u64,
     /// Wakes the repair loop when a peer excluded one of this keeper's
     /// replicas, so a removed copy retires at once.
     retire_now: Arc<tokio::sync::Notify>,
@@ -815,6 +827,11 @@ impl Engine {
             let compacting = self.clone();
             sockets.spawn(async move {
                 compacting.compaction_loop().await;
+                Ok(())
+            });
+            let scrubbing = self.clone();
+            sockets.spawn(async move {
+                scrubbing.scrub_loop().await;
                 Ok(())
             });
             let certifying = self.clone();

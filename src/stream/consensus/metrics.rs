@@ -198,6 +198,10 @@ pub(super) struct Metrics {
     pub evicted: AtomicU64,
     pub compacted_bytes: AtomicU64,
     pub placement_violation: AtomicU64,
+    pub scrub_bytes: AtomicU64,
+    pub scrub_objects: AtomicU64,
+    pub scrub_passes: AtomicU64,
+    pub scrub_corrupt: AtomicU64,
     // Election counters
     pub elections_started: AtomicU64,
     pub elections_won: AtomicU64,
@@ -272,6 +276,10 @@ impl Metrics {
             evicted: AtomicU64::new(0),
             compacted_bytes: AtomicU64::new(0),
             placement_violation: AtomicU64::new(0),
+            scrub_bytes: AtomicU64::new(0),
+            scrub_objects: AtomicU64::new(0),
+            scrub_passes: AtomicU64::new(0),
+            scrub_corrupt: AtomicU64::new(0),
             elections_started: AtomicU64::new(0),
             elections_won: AtomicU64::new(0),
             votes_granted: AtomicU64::new(0),
@@ -362,6 +370,10 @@ impl Metrics {
                 "placement.violation",
                 self.placement_violation.load(Ordering::Relaxed),
             ),
+            ("scrub.bytes", self.scrub_bytes.load(Ordering::Relaxed)),
+            ("scrub.objects", self.scrub_objects.load(Ordering::Relaxed)),
+            ("scrub.passes", self.scrub_passes.load(Ordering::Relaxed)),
+            ("scrub.corrupt", self.scrub_corrupt.load(Ordering::Relaxed)),
         ]
     }
 
@@ -539,6 +551,52 @@ impl Metrics {
             out,
             "logkeeper_consensus_placement_violations_total {}",
             self.placement_violation.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_scrub_bytes_total Bytes the background scrubber read back and checked."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_scrub_bytes_total counter");
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_scrub_bytes_total {}",
+            self.scrub_bytes.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_scrub_objects_total Retained slices and snapshots the background scrubber checked."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_scrub_objects_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_scrub_objects_total {}",
+            self.scrub_objects.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_scrub_passes_total Complete passes of the background scrubber over every hosted copy."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_scrub_passes_total counter");
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_scrub_passes_total {}",
+            self.scrub_passes.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_scrub_corrupt_total Copies the background scrubber found corrupt and quarantined."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_scrub_corrupt_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_scrub_corrupt_total {}",
+            self.scrub_corrupt.load(Ordering::Relaxed)
         );
 
         // Elections & votes

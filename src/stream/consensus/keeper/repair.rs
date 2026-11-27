@@ -940,23 +940,14 @@ impl Engine {
     }
 
     /// Retires a copy quarantined for corrupt data once repair replaced it.
-    /// Such a copy opens no group, so it never hears that it was removed:
+    /// Such a copy serves nothing, open or not, so it never hears that it
+    /// was removed:
     /// it asks the other keepers for placement proofs, as an orphaned copy
     /// does, and when the highest certifies that no configuration names it,
     /// detaches it and clears its marker, so its objects are reclaimed. A
     /// copy still named stays quarantined until repair moves it.
     async fn retire_quarantined(&self) {
-        let open = self
-            .groups
-            .lock()
-            .await
-            .keys()
-            .copied()
-            .collect::<BTreeSet<_>>();
         for stream in self.disk.quarantined_streams().into_keys() {
-            if open.contains(&stream) {
-                continue;
-            }
             let (Some(genesis), Some(generation)) = (
                 self.disk.genesis(stream),
                 self.disk
