@@ -1519,16 +1519,16 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
     drop(bulk);
     disk.space.set_available(u64::MAX);
     cluster.restart(away).await;
-    let restored = cluster.group(away, stream).await;
-    restored
-        .raft
-        .wait(Some(WAIT))
-        .metrics(
-            |_| restored.state.head() == Ok(Lsn(2)),
-            "original member catches up after admission pressure",
-        )
-        .await
-        .unwrap();
+    // The copy may close and reopen while it catches up (a vote refused
+    // below the protocol floor stops its core), so look it up each time
+    // rather than holding one group.
+    timeout(WAIT, async {
+        while cluster.group(away, stream).await.state.head() != Ok(Lsn(2)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("original member catches up after admission pressure");
     cluster.stop_all().await;
 }
 
