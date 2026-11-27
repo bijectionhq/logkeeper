@@ -607,7 +607,10 @@ impl Segmented {
                 None
             }
             Err(_) => {
-                tracing::error!(keeper = %self.keeper, "WAL checkpoint writer panicked");
+                crate::stream::consensus::logging::critical!(
+                    "keeper {} WAL checkpoint writer panicked",
+                    self.keeper
+                );
                 self.retired.extend(retired);
                 None
             }

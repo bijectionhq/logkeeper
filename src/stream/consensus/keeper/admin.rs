@@ -210,13 +210,11 @@ impl Engine {
                 _ = self.stop.cancelled() => return Ok(()),
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     if let Some(Err(error)) = result
-                        && let Some(dropped) = rate_limit("admin.request_panicked", None)
+                        && error.is_panic()
                     {
-                        tracing::error!(
-                            keeper = %self.id,
-                            error = %error,
-                            dropped = dropped,
-                            "admin request failed"
+                        crate::stream::consensus::logging::critical!(
+                            "keeper {} admin request panicked: {error}",
+                            self.id
                         );
                     }
                 }

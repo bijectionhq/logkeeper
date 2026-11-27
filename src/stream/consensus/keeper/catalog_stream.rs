@@ -299,11 +299,14 @@ impl Engine {
                 Ok(page) => {
                     for (at, bytes) in page.records {
                         let Ok(record) = decode::<CatalogRecord>(&bytes) else {
-                            tracing::error!(
-                                keeper = %self.id,
-                                stream = %crate::stream::consensus::logging::stream_uuid(STREAM),
-                                lsn = at.0,
-                                "catalog record is unreadable"
+                            // Only keepers write the catalog, and its records
+                            // are checksummed, so a committed record that does
+                            // not decode is a keeper bug or a version skew.
+                            crate::stream::consensus::logging::critical!(
+                                "keeper {} cannot read catalog record {} of stream {}",
+                                self.id,
+                                at.0,
+                                crate::stream::consensus::logging::stream_uuid(STREAM)
                             );
                             return Err(JournalError::Unavailable);
                         };

@@ -24,6 +24,29 @@ use tracing::{
 };
 use uuid::Uuid;
 
+/// Reports a violated internal invariant: a state the keeper's own logic
+/// should never reach, as opposed to a fault of the disk, the network or a
+/// peer. Under `cfg(test)` it panics, so a test that reaches one fails. In
+/// production it logs at error level under target `logkeeper::critical`
+/// and counts in `logkeeper_consensus_critical_total`, which pages, and the
+/// caller goes on with its own recovery.
+macro_rules! critical {
+    ($($arg:tt)+) => {{
+        $crate::stream::consensus::metrics::CRITICAL
+            .fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        if cfg!(test) {
+            panic!("critical invariant violation: {}", format_args!($($arg)+));
+        }
+        ::tracing::error!(
+            target: "logkeeper::critical",
+            critical = true,
+            "{}",
+            format_args!($($arg)+)
+        );
+    }};
+}
+pub(crate) use critical;
+
 /// Default window for suppressing repeated noisy warnings on the same key.
 pub(super) const REPEAT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RATE_KEYS: usize = 1024;
@@ -658,6 +681,15 @@ mod tests {
         assert_eq!(parsed["stream"], stream_uuid(stream).to_string());
         assert_eq!(parsed["dropped"], 7);
         assert!(parsed["timestamp"].as_str().unwrap().ends_with('Z'));
+    }
+
+    #[test]
+    #[should_panic(expected = "critical invariant violation: broken 7")]
+    fn critical_panics_under_test() {
+        let before = crate::stream::consensus::metrics::CRITICAL.load(Ordering::Relaxed);
+        let result = std::panic::catch_unwind(|| critical!("broken {}", 7));
+        assert!(crate::stream::consensus::metrics::CRITICAL.load(Ordering::Relaxed) > before);
+        std::panic::resume_unwind(result.unwrap_err());
     }
 
     #[test]
