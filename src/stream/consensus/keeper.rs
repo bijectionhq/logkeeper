@@ -454,6 +454,13 @@ enum Identity {
 }
 
 impl Engine {
+    /// Accepts keeper IDs reused on new media, as keepers did before media
+    /// incarnations, so the fault harness can show it still finds amnesia.
+    #[cfg(test)]
+    pub(super) fn ignore_reused_ids(&self) {
+        self.recognition.ignore_reuse();
+    }
+
     #[cfg(test)]
     pub(super) fn set_transport_filter(&self, filter: Option<super::network::TransportFilter>) {
         self.rpc.set_filter(self.id, filter.clone());

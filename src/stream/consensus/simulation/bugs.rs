@@ -1,8 +1,8 @@
 //! Minimal failing reproductions of bugs discovered by the randomized
 //! consensus fault-injection harness.
 //!
-//! Each test is marked `#[ignore]` so `cargo test --workspace --all-features`
-//! stays green until the underlying bug is fixed. Run them explicitly with:
+//! A test stays `#[ignore]`d until its bug is fixed, then guards the fix.
+//! Run the ignored ones with:
 //! `cargo test --locked --features stream --lib stream::consensus::simulation::bugs -- --ignored --nocapture`
 
 use std::{
@@ -38,7 +38,7 @@ use super::{
 /// the competing `Seal` returned that committed LSN. No valid linearization
 /// exists for this history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces unfixed linearizability bug found on soak seed 24; see HARNESS-REPORT.md"]
+#[ignore = "reproduces unfixed linearizability bug found on soak seed 24"]
 async fn bug_repro_append_retry_after_dropped_reply_returns_fenced_after_committing() {
     let options = ClusterOptions {
         park_after_secs: 3600,
@@ -152,7 +152,7 @@ async fn bug_repro_append_retry_after_dropped_reply_returns_fenced_after_committ
 /// disk space returns. The voter never replicates again and automatic repair
 /// never replaces it, causing permanent cross-voter divergence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces unfixed zombie-replica bug found on soak seed 14; see HARNESS-REPORT.md"]
+#[ignore = "reproduces unfixed zombie-replica bug found on soak seed 14"]
 async fn bug_repro_zero_disk_space_leaves_voter_as_zombie_replica() {
     let options = ClusterOptions {
         park_after_secs: 3600,
@@ -228,7 +228,7 @@ async fn bug_repro_zero_disk_space_leaves_voter_as_zombie_replica() {
 /// configuration `[a, b, c]`. A client holding a cached route to `[a, b, c]`
 /// then observes `head() == Lsn(3)` after `Lsn(5)` was already acknowledged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces post-recovery split-brain residual risk found on soak seed 16; see HARNESS-REPORT.md"]
+#[ignore = "reproduces post-recovery split-brain residual risk found on soak seed 16"]
 async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_head() {
     let options = ClusterOptions {
         park_after_secs: 3600,
@@ -324,7 +324,7 @@ async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_h
 /// `Epoch(2)` appending identical bytes at an LSN written under `Epoch(1)`
 /// receives `Ok(at)` instead of `Err(JournalError::Conflict { head })`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces unfixed contract-conformance bug found on soak seed 25; see HARNESS-REPORT.md"]
+#[ignore = "reproduces unfixed contract-conformance bug found on soak seed 25"]
 async fn bug_repro_cross_epoch_identical_payload_retry_violates_contract() {
     let options = ClusterOptions {
         park_after_secs: 3600,

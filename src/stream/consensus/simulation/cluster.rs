@@ -47,6 +47,9 @@ pub(super) struct ClusterOptions {
     pub quota_bytes: u64,
     pub max_record_bytes: usize,
     pub client_deadline_ms: u64,
+    /// Keepers accept a keeper ID reused on new media, as before media
+    /// incarnations, which reopens the Raft amnesia bug.
+    pub ignore_reused_ids: bool,
 }
 
 impl Default for ClusterOptions {
@@ -59,6 +62,7 @@ impl Default for ClusterOptions {
             quota_bytes: 512 * 1024,
             max_record_bytes: 4096,
             client_deadline_ms: 4_000,
+            ignore_reused_ids: false,
         }
     }
 }
@@ -108,8 +112,16 @@ struct Running {
 }
 
 impl Running {
-    async fn spawn(config: Config, listeners: [TcpListener; 3], faults: &FaultNetwork) -> Self {
+    async fn spawn(
+        config: Config,
+        listeners: [TcpListener; 3],
+        faults: &FaultNetwork,
+        ignore_reused_ids: bool,
+    ) -> Self {
         let (engine, acceptor) = config.prepare(CancellationToken::new()).await.unwrap();
+        if ignore_reused_ids {
+            engine.ignore_reused_ids();
+        }
         engine.set_transport_filter(Some(faults.filter()));
         let task = tokio::spawn(engine.clone().serve(listeners, acceptor));
         Self { engine, task }
@@ -140,6 +152,8 @@ pub(super) struct SimCluster {
     pub all_ids: [Uuid; 7],
     pub catalog: Uuid,
     pub catalog_voters: Option<[Uuid; 3]>,
+    /// Keepers wiped and initialized again under their old IDs.
+    pub wiped: BTreeSet<Uuid>,
     pub faults: FaultNetwork,
     pub options: ClusterOptions,
     creds_a: Credentials,
@@ -227,7 +241,10 @@ impl SimCluster {
             };
             provision(&config);
             config.initialize().unwrap();
-            running.insert(id, Running::spawn(config.clone(), listener, &faults).await);
+            running.insert(
+                id,
+                Running::spawn(config.clone(), listener, &faults, options.ignore_reused_ids).await,
+            );
             configs.insert(id, config);
         }
 
@@ -258,6 +275,7 @@ impl SimCluster {
             all_ids,
             catalog,
             catalog_voters,
+            wiped: BTreeSet::new(),
             faults,
             options,
             creds_a,
@@ -357,8 +375,16 @@ impl SimCluster {
             TcpListener::bind(config.peers[&id]).await.unwrap(),
             TcpListener::bind(config.bulk[&id]).await.unwrap(),
         ];
-        self.running
-            .insert(id, Running::spawn(config, listeners, &self.faults).await);
+        self.running.insert(
+            id,
+            Running::spawn(
+                config,
+                listeners,
+                &self.faults,
+                self.options.ignore_reused_ids,
+            )
+            .await,
+        );
         self.faults.hit("fault:restart");
     }
 
@@ -450,7 +476,7 @@ impl SimCluster {
         }
         let config = self.configs[&id].clone();
         let _ = std::fs::remove_dir_all(&config.data);
-        for suffix in ["enrolled", "wal", "boundary"] {
+        for suffix in ["enrolled", "wal", "boundary", "incarnations.json"] {
             let _ = std::fs::remove_file(
                 config
                     .enrollment
@@ -458,6 +484,7 @@ impl SimCluster {
             );
         }
         config.initialize().unwrap();
+        self.wiped.insert(id);
         self.faults.hit("fault:wipe_and_reinit");
         self.restart(id).await;
     }

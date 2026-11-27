@@ -58,7 +58,9 @@ seeded faults over the `Network`/`Rpc`, `Disk`, `Space` and `Engine` seams.
 ### Running
 
 ```sh
-# Default CI run (6 seeds, large-batch fault test, and autonomous amnesia detector)
+# Default run, part of the normal suite: 6 seeds across all non-wipe profiles,
+# the large-batch test, 2 wipe-and-reinitialize seeds, the 6d75fec amnesia
+# schedule with reused-ID recognition off and on, and the bug reproductions
 cargo test --locked --features stream --lib stream::consensus::simulation -- --nocapture
 
 # Replay and shrink a single seed
@@ -69,6 +71,15 @@ LOGKEEPER_CONSENSUS_SEED=1 LOGKEEPER_CONSENSUS_ALLOW_WIPE=1 LOGKEEPER_CONSENSUS_
 LOGKEEPER_CONSENSUS_FIRST_SEED=0 LOGKEEPER_CONSENSUS_SEEDS=50 \
   cargo test --locked --features stream --lib consensus_fault_harness_soak -- --ignored --nocapture
 ```
+
+The fault hooks are `#[cfg(test)]`: release builds carry no filter, delay or
+crash flag. Wipe runs stop the keeper, delete its data volume and its
+registry files (enrollment, WAL and boundary records, incarnation record),
+initialize it under the same keeper ID and restart it. With keepers that
+recognize the reused ID, the leader replaces that voter and the run checks
+the replacement converged; with recognition off
+(`LOGKEEPER_CONSENSUS_IGNORE_REUSE=1`), the amnesia schedule and random
+seed 3 regress the head.
 
 ### Faults and operations mixed by seed
 

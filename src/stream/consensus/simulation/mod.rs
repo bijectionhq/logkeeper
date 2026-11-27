@@ -73,9 +73,11 @@ impl Profile {
 
 #[derive(Clone, Copy, Debug)]
 struct RunConfig {
-    /// Allow `wipe_and_reinitialize` of a keeper under its old ID (triggers
-    /// the known unfixed Raft amnesia bug on this branch).
+    /// Allow `wipe_and_reinitialize` of a keeper under its old ID.
     allow_wipe: bool,
+    /// Keepers accept a reused keeper ID, as before media incarnations,
+    /// which reopens the Raft amnesia bug.
+    ignore_reused_ids: bool,
     /// Optional forced profile override.
     profile: Option<Profile>,
     /// Number of randomized steps to generate.
@@ -86,6 +88,7 @@ impl RunConfig {
     fn standard() -> Self {
         Self {
             allow_wipe: false,
+            ignore_reused_ids: false,
             profile: None,
             steps: 18,
         }
@@ -94,6 +97,7 @@ impl RunConfig {
     fn with_wipe() -> Self {
         Self {
             allow_wipe: true,
+            ignore_reused_ids: false,
             profile: None,
             steps: 14,
         }
@@ -283,11 +287,18 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
     let options = ClusterOptions {
         replicated_catalog,
         park_after_secs,
-        repair_after_secs: if config.allow_wipe { 60 } else { 2 },
+        // Keepers that recognize a reused ID report no replica on it, and
+        // leader repair replaces it.
+        repair_after_secs: if config.allow_wipe && config.ignore_reused_ids {
+            60
+        } else {
+            2
+        },
         max_streams: 32,
         quota_bytes: 512 * 1024,
         max_record_bytes: 4096,
         client_deadline_ms: if config.allow_wipe { 2_500 } else { 4_000 },
+        ignore_reused_ids: config.ignore_reused_ids,
     };
 
     let data_ids = [1, 2, 3, 4].map(Uuid::from_u128);
@@ -895,18 +906,32 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
     for (idx, spec) in plan.streams.iter().enumerate() {
         let j = cluster.journal(WRITER_A, spec.initial_voters);
         let caller = WriterKind::A.identity();
-        let inv = history.tick();
-        let res = j.create(spec.stream).await;
-        let resp = history.tick();
-        history.record_create(spec.stream, &caller, inv, resp, &res);
-        total_ops += 1;
-        res.expect("initial create succeeds with healthy cluster");
+        // A loaded machine can time a fresh cluster's first calls out, so
+        // retry them for a while; each attempt is recorded.
+        let setup = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let inv = history.tick();
+            let res = j.create(spec.stream).await;
+            let resp = history.tick();
+            history.record_create(spec.stream, &caller, inv, resp, &res);
+            total_ops += 1;
+            match res {
+                Err(JournalError::Unavailable) if tokio::time::Instant::now() < setup => {}
+                res => break res.expect("initial create succeeds with healthy cluster"),
+            }
+        }
 
-        let inv = history.tick();
-        let res = j.seal(spec.stream, Epoch(1)).await;
-        let resp = history.tick();
-        history.record_seal(spec.stream, &caller, Epoch(1), inv, resp, &res);
-        total_ops += 1;
+        let res = loop {
+            let inv = history.tick();
+            let res = j.seal(spec.stream, Epoch(1)).await;
+            let resp = history.tick();
+            history.record_seal(spec.stream, &caller, Epoch(1), inv, resp, &res);
+            total_ops += 1;
+            match res {
+                Err(JournalError::Unavailable) if tokio::time::Instant::now() < setup => {}
+                res => break res,
+            }
+        };
         if let Ok(head) = res {
             let mut lock = trackers.lock();
             lock[idx].current_epoch = Epoch(1);
@@ -1351,11 +1376,24 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
             total_ops += 1;
         }
 
-        // Discover the latest finalized voters (auto-repair may have moved a voter).
-        let final_voters = match probe.configuration(stream).await {
-            Ok(cfg) => cfg.voters,
-            Err(_) => fallback_voters,
-        };
+        // Discover the latest finalized voters (auto-repair may have moved a
+        // voter). A keeper reused on new media holds no replica until repair
+        // replaces it, so wait for that first.
+        let mut final_voters = fallback_voters;
+        let replaced = tokio::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            if let Ok(cfg) = probe.configuration(stream).await {
+                final_voters = cfg.voters;
+            }
+            if plan.options.ignore_reused_ids
+                || deleted
+                || !final_voters.iter().any(|id| cluster.wiped.contains(id))
+                || tokio::time::Instant::now() >= replaced
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         let conv = cluster.wait_converged(stream, &final_voters, WAIT).await;
         converged.insert(stream, (final_voters, conv));
     }
@@ -1895,6 +1933,7 @@ async fn consensus_fault_harness_large_batches() {
         quota_bytes: 32 * 1024 * 1024,
         max_record_bytes: 4096,
         client_deadline_ms: 8_000,
+        ignore_reused_ids: false,
     };
     let mut cluster = SimCluster::start(seed, options.clone()).await;
     let limits = Limits {
@@ -1912,15 +1951,29 @@ async fn consensus_fault_harness_large_batches() {
     let stream = StreamId(80_000 + seed as u128);
     let caller = WriterKind::A.identity();
 
-    let inv = history.tick();
-    let res = journal.create(stream).await;
-    history.record_create(stream, &caller, inv, history.tick(), &res);
-    res.unwrap();
-
-    let inv = history.tick();
-    let res = journal.seal(stream, Epoch(1)).await;
-    history.record_seal(stream, &caller, Epoch(1), inv, history.tick(), &res);
-    res.unwrap();
+    // A loaded machine can time a fresh cluster's first calls out.
+    let setup = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let inv = history.tick();
+        let res = journal.create(stream).await;
+        history.record_create(stream, &caller, inv, history.tick(), &res);
+        match res {
+            Err(JournalError::Unavailable) if tokio::time::Instant::now() < setup => {}
+            res => break res.unwrap(),
+        }
+    }
+    loop {
+        let inv = history.tick();
+        let res = journal.seal(stream, Epoch(1)).await;
+        history.record_seal(stream, &caller, Epoch(1), inv, history.tick(), &res);
+        match res {
+            Err(JournalError::Unavailable) if tokio::time::Instant::now() < setup => {}
+            res => {
+                res.unwrap();
+                break;
+            }
+        }
+    }
 
     let mut next_lsn = 1u64;
     // 140 batches crossing OpenRaft's 128-entry snapshot policy, mixing 256-record
@@ -1987,8 +2040,13 @@ async fn consensus_fault_harness_large_batches() {
     );
     assert!(head_res.is_ok(), "final head failed: {head_res:?}");
 
+    // Repair may have replaced the crashed voter while it was down.
+    let voters = match cluster.probe_client().configuration(stream).await {
+        Ok(configuration) => configuration.voters,
+        Err(_) => voters,
+    };
     let conv = cluster
-        .wait_converged(stream, &voters, Duration::from_secs(20))
+        .wait_converged(stream, &voters, Duration::from_secs(60))
         .await;
     let mut converged = BTreeMap::new();
     converged.insert(stream, (voters, conv));
@@ -1999,28 +2057,112 @@ async fn consensus_fault_harness_large_batches() {
     }
 }
 
-/// Acceptance test: proves that on this branch (without the keeper incarnation
-/// fix), the unscripted seeded harness discovers the Raft amnesia bug on its
-/// own within a small seed budget as a durability/linearizability violation.
-///
-/// Once the incarnation fix lands, flip this assertion to require `Ok(())` across
-/// all seeds.
+fn amnesia_violation(violation: &Violation) -> bool {
+    matches!(
+        violation,
+        Violation::DurabilityLoss { .. }
+            | Violation::HeadRegression { .. }
+            | Violation::Linearizability { .. }
+    )
+}
+
+/// The 6d75fec amnesia schedule as a harness plan: LSN 1 commits on every
+/// voter, the laggard (slot 2) misses LSNs 2 and 3, the leader (slot 0)
+/// crashes, and the witness (slot 1) loses its media and comes back under its
+/// old keeper ID while the laggard is reachable again.
+fn amnesia_plan(ignore_reused_ids: bool) -> Plan {
+    let mut voters = [1, 2, 3].map(Uuid::from_u128);
+    voters.sort_unstable();
+    let head = || Step::Ops(vec![ClientOp::Head { stream_idx: 0 }]);
+    Plan {
+        seed: 3_000_003,
+        profile: Profile::StorageAndCrash,
+        options: ClusterOptions {
+            park_after_secs: 3600,
+            repair_after_secs: if ignore_reused_ids { 60 } else { 2 },
+            client_deadline_ms: 2_500,
+            ignore_reused_ids,
+            ..ClusterOptions::default()
+        },
+        streams: vec![StreamSpec {
+            stream: StreamId(3_000_003),
+            initial_voters: voters,
+        }],
+        steps: vec![
+            Step::Ops(vec![ClientOp::Append {
+                stream_idx: 0,
+                writer: WriterKind::A,
+                stale_epoch: false,
+                retry_previous: false,
+            }]),
+            head(),
+            Step::PartitionSymmetric {
+                keeper_slot: 2,
+                lanes: vec![LaneKey::Replication],
+            },
+            Step::Ops(vec![ClientOp::AppendBatch {
+                stream_idx: 0,
+                writer: WriterKind::A,
+                count: 2,
+            }]),
+            head(),
+            Step::StopKeeper {
+                keeper_slot: 0,
+                crash: true,
+            },
+            Step::HealNetwork,
+            Step::WipeAndReinit { keeper_slot: 1 },
+            Step::PauseMs(1_200),
+            head(),
+            Step::PauseMs(800),
+            head(),
+        ],
+    }
+}
+
+/// Keepers that accept a keeper ID reused on new media, as they did before
+/// media incarnations (`6d75fec`), regress the head on the amnesia
+/// schedule; keepers that recognize the reuse keep every acknowledged
+/// record and replace the wiped voter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consensus_fault_harness_finds_amnesia_without_incarnations() {
+    let unguarded = timeout(Duration::from_secs(90), execute_plan(&amnesia_plan(true)))
+        .await
+        .expect("amnesia plan timed out");
+    match unguarded {
+        Err(violation) if amnesia_violation(&violation) => {
+            eprintln!("amnesia found without incarnations: {violation}");
+        }
+        Err(violation) => panic!("the amnesia plan found another violation: {violation}"),
+        Ok(_) => panic!("the amnesia plan no longer finds the bug without incarnations"),
+    }
+    let guarded = timeout(Duration::from_secs(90), execute_plan(&amnesia_plan(false)))
+        .await
+        .expect("amnesia plan timed out");
+    if let Err(violation) = guarded {
+        panic!("the amnesia plan failed with incarnations: {violation}");
+    }
+}
+
+/// Acceptance test: with keepers that accept a keeper ID reused on new
+/// media, the unscripted seeded harness finds the Raft amnesia bug on its
+/// own within a small seed budget, as a durability, head or linearizability
+/// violation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "searches up to 20 wipe seeds; about 80 s"]
 async fn consensus_fault_harness_detects_amnesia_bug() {
     let max_seeds = env::var("LOGKEEPER_AMNESIA_BUDGET").map_or(20, |v| v.parse::<u64>().unwrap());
-    let config = RunConfig::with_wipe();
+    let config = RunConfig {
+        ignore_reused_ids: true,
+        ..RunConfig::with_wipe()
+    };
     let started = std::time::Instant::now();
     let mut detected = None;
     for seed in 0..max_seeds {
         match timeout(Duration::from_secs(45), run_seed(seed, &config)).await {
             Ok(Ok(_)) => continue,
             Ok(Err((plan, violation))) => {
-                if matches!(
-                    violation,
-                    Violation::DurabilityLoss { .. }
-                        | Violation::HeadRegression { .. }
-                        | Violation::Linearizability { .. }
-                ) {
+                if amnesia_violation(&violation) {
                     detected = Some((seed, plan, violation));
                     break;
                 }
@@ -2028,28 +2170,39 @@ async fn consensus_fault_harness_detects_amnesia_bug() {
                     "seed {seed} also hit secondary amnesia symptom ({violation}); continuing search for durability/linearizability violation..."
                 );
             }
-            Err(_) => continue,
+            Err(_) => eprintln!("seed {seed} timed out; continuing"),
         }
     }
     let (seed, plan, violation) = detected.unwrap_or_else(|| {
-        panic!(
-            "expected randomized harness to detect the unfixed amnesia bug within {max_seeds} seeds"
-        )
+        panic!("expected randomized harness to detect the amnesia bug within {max_seeds} seeds")
     });
-    assert!(
-        matches!(
-            violation,
-            Violation::DurabilityLoss { .. }
-                | Violation::HeadRegression { .. }
-                | Violation::Linearizability { .. }
-        ),
-        "seed {seed} hit unexpected violation class instead of amnesia/durability/linearizability: {violation}"
-    );
     eprintln!(
         "AMNESIA DETECTED autonomously on seed {seed} in {:?} ({} steps): {violation}",
         started.elapsed(),
         plan.steps.len(),
     );
+}
+
+/// The same wipe-and-reinitialize schedules against keepers that recognize
+/// reused keeper IDs (`6d75fec`) find no violation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consensus_fault_harness_wipe_with_incarnations() {
+    let first = env::var("LOGKEEPER_WIPE_FIRST_SEED").map_or(0, |v| v.parse::<u64>().unwrap());
+    let count = env::var("LOGKEEPER_WIPE_SEEDS").map_or(2, |v| v.parse::<u64>().unwrap());
+    let config = RunConfig::with_wipe();
+    for seed in first..first + count {
+        timeout(Duration::from_secs(90), run_seed(seed, &config))
+            .await
+            .unwrap_or_else(|_| panic!("wipe harness timed out on seed {seed}"))
+            .unwrap_or_else(|(plan, violation)| {
+                panic!(
+                    "wipe harness FAILED on seed {seed}: {violation}\n\
+                     replay with: LOGKEEPER_CONSENSUS_SEED={seed} LOGKEEPER_CONSENSUS_ALLOW_WIPE=1 cargo test --locked --features stream --lib consensus_fault_harness_replay_seed -- --ignored --nocapture\n\
+                     steps: {:#?}",
+                    plan.steps
+                )
+            });
+    }
 }
 
 /// Replays a single seed (and optionally shrinks a failure).
@@ -2065,11 +2218,13 @@ async fn consensus_fault_harness_replay_seed() {
         .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
     let do_shrink = env::var("LOGKEEPER_CONSENSUS_SHRINK")
         .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let config = if allow_wipe {
+    let mut config = if allow_wipe {
         RunConfig::with_wipe()
     } else {
         RunConfig::standard()
     };
+    config.ignore_reused_ids = env::var("LOGKEEPER_CONSENSUS_IGNORE_REUSE")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     match run_seed(seed, &config).await {
         Ok(summary) => {
             eprintln!(
@@ -2110,11 +2265,13 @@ async fn consensus_fault_harness_soak() {
     let count = env::var("LOGKEEPER_CONSENSUS_SEEDS").map_or(50, |v| v.parse::<u64>().unwrap());
     let allow_wipe = env::var("LOGKEEPER_CONSENSUS_ALLOW_WIPE")
         .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
-    let config = if allow_wipe {
+    let mut config = if allow_wipe {
         RunConfig::with_wipe()
     } else {
         RunConfig::standard()
     };
+    config.ignore_reused_ids = env::var("LOGKEEPER_CONSENSUS_IGNORE_REUSE")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let mut coverage = Coverage::new();
     let mut total_ops = 0usize;
     for seed in first..first + count {

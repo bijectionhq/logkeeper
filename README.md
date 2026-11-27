@@ -790,7 +790,9 @@ heads, writer fencing, ambiguous `append_batch` atomicity, delete permanence
 and post-run cross-voter convergence.
 
 ```sh
-# Default CI suite (6 seeds across all non-wipe profiles) + large-batch test + amnesia detector
+# Default run, part of the normal suite: 6 seeds across all non-wipe profiles,
+# the large-batch test, 2 wipe-and-reinitialize seeds, the 6d75fec amnesia
+# schedule with reused-ID recognition off and on, and the bug reproductions
 cargo test --locked --features stream --lib stream::consensus::simulation -- --nocapture
 
 # Replay a specific failing seed (optionally with wipe-and-reinitialize and automatic shrinking)
@@ -800,7 +802,15 @@ LOGKEEPER_CONSENSUS_SEED=1 LOGKEEPER_CONSENSUS_ALLOW_WIPE=1 LOGKEEPER_CONSENSUS_
 # Extended randomized soak run (default 50 seeds; override with LOGKEEPER_CONSENSUS_FIRST_SEED / LOGKEEPER_CONSENSUS_SEEDS)
 LOGKEEPER_CONSENSUS_SEEDS=50 \
   cargo test --locked --features stream --lib consensus_fault_harness_soak -- --ignored --nocapture
+
+# Search wipe seeds for Raft amnesia with reused-ID recognition turned off
+cargo test --locked --features stream --lib consensus_fault_harness_detects_amnesia_bug -- --ignored --nocapture
 ```
+
+`LOGKEEPER_CONSENSUS_ALLOW_WIPE=1` adds wipe-and-reinitialize steps to replay
+and soak runs. `LOGKEEPER_CONSENSUS_IGNORE_REUSE=1` makes the keepers accept a
+keeper ID reused on new media, as they did before media incarnations, so a
+run shows the harness still finds that bug.
 
 See [verification/simulation/README.md](verification/simulation/README.md#consensus-keeper-fault-injection-harness)
 for the fault model and checked invariants.

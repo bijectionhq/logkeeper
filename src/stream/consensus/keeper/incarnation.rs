@@ -46,6 +46,10 @@ pub(super) struct Recognition {
     reused: AtomicBool,
     /// Serializes the pings that wait for confirmation.
     checking: tokio::sync::Mutex<()>,
+    /// Ignores reused keeper IDs, as keepers did before incarnations, so
+    /// the fault harness can show it still finds Raft amnesia.
+    #[cfg(test)]
+    ignore_reuse: AtomicBool,
 }
 
 impl Recognition {
@@ -62,7 +66,26 @@ impl Recognition {
             reused: AtomicBool::new(record.reused),
             record: tokio::sync::Mutex::new((record, false)),
             checking: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            ignore_reuse: AtomicBool::new(false),
         })
+    }
+
+    /// Stops recognizing reused keeper IDs: no peer is marked reincarnated
+    /// and this keeper never marks itself reused.
+    #[cfg(test)]
+    pub fn ignore_reuse(&self) {
+        self.ignore_reuse.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn ignoring_reuse(&self) -> bool {
+        self.ignore_reuse.load(Ordering::Acquire)
+    }
+
+    #[cfg(not(test))]
+    fn ignoring_reuse(&self) -> bool {
+        false
     }
 
     pub fn own(&self) -> Uuid {
@@ -118,6 +141,7 @@ impl Recognition {
         if let Some((peer, _, known)) = answers.iter().find(|(_, _, known)| {
             decisions::reincarnated(known.map(|known| known.as_u128()), self.own.as_u128())
         }) && !record.reused
+            && !self.ignoring_reuse()
         {
             record.reused = true;
             *unsaved = true;
@@ -147,6 +171,7 @@ impl Recognition {
             incarnation
         });
         if decisions::reincarnated(Some(first.as_u128()), incarnation.as_u128())
+            && !self.ignoring_reuse()
             && record.reincarnated.insert(peer)
         {
             changed = true;

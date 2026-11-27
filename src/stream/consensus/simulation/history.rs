@@ -483,7 +483,9 @@ impl History {
                     entry.calls_complete = false;
                 }
             }
-            Err(JournalError::Unavailable) => {
+            // A call of several keeper batches may fail after committing a
+            // prefix of whole batches, whatever its error.
+            Err(err) if matches!(err, JournalError::Unavailable) || chunks.len() > 1 => {
                 entry.ambiguous_batches.push(AmbiguousBatch {
                     era: entry.era,
                     chunks,
