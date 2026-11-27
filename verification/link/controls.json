@@ -308,8 +308,8 @@
     "theorem": "link_publication",
     "edits": [
       {
-        "find": "    sync_file(file.get_ref())?;\n    drop(file);\n    fs::rename(temporary, path)?;",
-        "replace": "    fs::rename(temporary, path)?;\n    sync_file(file.get_ref())?;\n    drop(file);"
+        "find": "    sync_file(file.get_ref())?;\n    let (file, _) = file.into_parts();\n    fs::rename(temporary, path)?;",
+        "replace": "    fs::rename(temporary, path)?;\n    sync_file(file.get_ref())?;\n    let (file, _) = file.into_parts();"
       }
     ]
   },
@@ -320,8 +320,8 @@
     "theorem": "link_publication",
     "edits": [
       {
-        "find": "    fs::rename(temporary, path)?;\n    sync_directory(path.parent().expect(\"file has parent\"))",
-        "replace": "    sync_directory(path.parent().expect(\"file has parent\"))?;\n    fs::rename(temporary, path)?;\n    Ok(())"
+        "find": "    fs::rename(temporary, path)?;\n    sync_directory(path.parent().expect(\"file has parent\"))?;",
+        "replace": "    sync_directory(path.parent().expect(\"file has parent\"))?;\n    fs::rename(temporary, path)?;"
       }
     ]
   },
