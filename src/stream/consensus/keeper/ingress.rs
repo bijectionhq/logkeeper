@@ -483,10 +483,15 @@ impl Engine {
         }
         let group = self.group(genesis).await?;
         group.require_healthy()?;
+        // Every frame that carries the sender's vote is checked, because
+        // every answer to one carries this replica's vote or reveals it: a
+        // snapshot chunk's reply holds it, and a refused hand-off names it.
         let campaign = match &request {
             PeerRequest::Append(append) => Some(append.vote),
             PeerRequest::Vote(vote) | PeerRequest::PreVote(vote) => Some(vote.vote),
-            _ => None,
+            PeerRequest::Snapshot(chunk, _) => Some(chunk.vote),
+            PeerRequest::TransferLeader(transfer) => Some(*transfer.from_leader()),
+            PeerRequest::Park { vote, .. } => Some(*vote),
         };
         if let Some(vote) = campaign {
             let metrics = group.raft.metrics();

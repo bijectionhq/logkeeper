@@ -656,15 +656,15 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
 /// the survivor: that is what keeps it from campaigning above the recovery
 /// entries. Votes, pre-votes and appends from a sender outside the
 /// survivor's membership and below its term are refused without an answer
-/// (`decisions::excludes_sender`), but a snapshot chunk is not: the
-/// survivor answers it with its own vote, at the recovery term. A lost
-/// voter that leads the old configuration, as when both lost voters return
-/// together, and sends the survivor a snapshot therefore learns the
-/// recovery term instead of being told it was excluded. Found while proving
+/// (`decisions::excludes_sender`). A snapshot chunk was not: the survivor
+/// answered it with its own vote, at the recovery term, so a lost voter
+/// that leads the old configuration, as when both lost voters return
+/// together, learned the recovery term instead of being told it was
+/// excluded. Every frame that carries a vote now goes through the same
+/// refusal, including leadership hand-offs and parks. Found while proving
 /// `RecoveryFence.lost_replicas_stay_below_the_recovery_term`, which assumes
 /// every contact from a lost voter is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a snapshot chunk from an excluded lost voter is answered with the recovery term"]
 async fn the_survivor_refuses_a_lost_voters_snapshot_without_its_term() {
     use crate::stream::consensus::{
         SnapshotMeta,

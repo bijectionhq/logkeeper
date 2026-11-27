@@ -27,12 +27,11 @@ answers a read from its own applied state without a barrier, which the TLA+
 model found as CE-3).
 
 The `contact` step refuses every message a lost voter sends the survivor.
-The shipped keeper refuses votes, pre-votes and appends, but answers a
-snapshot chunk with its own vote, at the recovery term (the ignored test
-`the_survivor_refuses_a_lost_voters_snapshot_without_its_term`). Only a
-leader sends snapshots, and a lost voter leads only with the other lost
-voter's vote, so the theorems for one returning voter still describe the
-keeper; with both returning, that answer teaches them the recovery term.
+So does the shipped keeper: every peer frame that carries the sender's
+vote, including snapshot chunks, leadership hand-offs and parks, goes
+through `excludes_sender` (the test
+`the_survivor_refuses_a_lost_voters_snapshot_without_its_term`). Snapshot
+chunks used to be answered with the survivor's vote, at the recovery term.
 -/
 
 namespace Logkeeper.ConsensusAdditions.RecoveryFence
