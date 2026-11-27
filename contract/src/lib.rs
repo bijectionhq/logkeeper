@@ -312,7 +312,10 @@ pub enum JournalError {
     /// after acknowledging data loss. The journal now holds `head`, which may
     /// be below positions it acknowledged before. Seals are refused until an
     /// administrator acknowledges the recovery; consumers must then rebuild
-    /// from the journal instead of trusting their previous head.
+    /// from the journal instead of trusting their previous head. A retried
+    /// append also returns it, with the loss point of a recovery that may
+    /// have erased an earlier attempt that committed: its outcome is
+    /// unknown, not refused.
     Recovered { head: Lsn },
     /// The target keeper or cluster version does not support this request or
     /// feature.
@@ -342,7 +345,9 @@ pub trait Journal: Send + Sync {
     /// writer acknowledges it with `acknowledge_recovery`.
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, Result<Lsn>>;
     /// Commits `payload` at `at` iff `epoch` is sealed by this caller and `at` is the next LSN.
-    /// An identical retry returns `at`.
+    /// An identical retry returns `at`. A retry whose earlier attempt may
+    /// have committed before an operator recovery that kept less than `at`
+    /// returns `Recovered` or `Unavailable`, never a definite refusal.
     fn append(
         &self,
         stream: StreamId,

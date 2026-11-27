@@ -823,6 +823,22 @@ async fn export_import_round_trips_and_a_stream_restores_with_no_survivor() {
     append_range(&journal, imported, fence2.fence, 41, 45).await;
     flushed(&journal, imported, 45).await;
     check(&read_all(&journal, imported, 6, 45).await, 6, 45);
+    // The import counts as a recovery that kept the exported head: a
+    // writer of the exported epoch may have committed above it, so its
+    // retry there is not refused definitely.
+    assert_eq!(
+        cluster.group(b, imported).await.state.recoveries(),
+        Some(crate::stream::consensus::state::Recoveries {
+            epoch: Epoch(2),
+            loss_point: Lsn(40),
+        })
+    );
+    assert_eq!(
+        journal
+            .append_after(imported, fence, Lsn(41), Bytes::from_static(b"lost"), true)
+            .await,
+        Err(JournalError::Recovered { head: Lsn(40) })
+    );
 
     // Every voter of the source is lost; restore it from the store alone.
     append_range(&journal, source, fence, 41, 50).await;
@@ -878,6 +894,13 @@ async fn export_import_round_trips_and_a_stream_restores_with_no_survivor() {
     assert_eq!(outcome.report["kept"], "records 6..=50");
     let journal = cluster.client(&cluster.credentials);
     check(&read_all(&journal, restored, 6, 50).await, 6, 50);
+    // The source's writer retries an append above the restored head.
+    assert_eq!(
+        journal
+            .append_after(restored, fence, Lsn(51), Bytes::from_static(b"lost"), true)
+            .await,
+        Err(JournalError::Recovered { head: Lsn(50) })
+    );
     cluster.stop_all().await;
 }
 

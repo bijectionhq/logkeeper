@@ -1449,6 +1449,97 @@ pub(super) fn recovery_entry_step(
     }
 }
 
+/// A stream's recovery summary after it also absorbs a recovery whose fence
+/// is at `epoch` and which kept the records through `loss_point`: the
+/// latest fence epoch and the lowest loss point of any recovery. `held`
+/// says a summary exists, of `held_epoch` and `held_loss_point`.
+///
+/// These two numbers decide `written_step` for every recovery the stream
+/// ever had (`summary_covers_every_erasing_recovery` in
+/// JournalContract.lean), so they survive trims and snapshots where the
+/// typed recovery entries do not.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        !held ==> out.0 == epoch && out.1 == loss_point,
+        held ==> out.0 >= held_epoch && out.1 <= held_loss_point,
+        out.0 >= epoch && out.1 <= loss_point,
+        out.0 == epoch || (held && out.0 == held_epoch),
+        out.1 == loss_point || (held && out.1 == held_loss_point),
+))]
+pub(super) fn absorb_recovery(
+    held: bool,
+    held_epoch: u64,
+    held_loss_point: u64,
+    epoch: u64,
+    loss_point: u64,
+) -> (u64, u64) {
+    let latest = if held && held_epoch > epoch {
+        held_epoch
+    } else {
+        epoch
+    };
+    let lowest = if held && held_loss_point < loss_point {
+        held_loss_point
+    } else {
+        loss_point
+    };
+    (latest, lowest)
+}
+
+/// How the keeper answers `Request::Written` for an attempt of a writer of
+/// `writer_epoch` whose last position is `last`.
+pub(super) enum WrittenStep {
+    /// Answer what the retained history says.
+    Lookup,
+    /// Answer `Recovered` with the summary's loss point: a recovery since
+    /// the writer's epoch kept less than the attempt, so the attempt may
+    /// have committed and been erased.
+    Recovered,
+    /// Answer `Unavailable` for the same case below
+    /// `CLUSTER_VERSION_RETRY_RECOVERY`, whose summary is not yet durable.
+    Unavailable,
+}
+
+/// Decides `Request::Written`. `missing` says the retained history alone
+/// holds none of the attempt's records (the lookup's `Conflict`);
+/// `summarized` that the stream knows a recovery summary of
+/// `recovery_epoch`, the latest recovery's fence epoch, and `loss_point`,
+/// the lowest loss point of any recovery; `durable` that the cluster
+/// finalized the level that keeps the summary in snapshots.
+///
+/// Without a recovery since the writer's epoch the history the attempt ran
+/// against is the retained one, so a miss is conclusive and the refusal of
+/// the retry stands. A recovery fenced at an epoch above the writer's that
+/// kept less than the attempt may have erased a committed attempt, so the
+/// answer is never a definite refusal (`committed_attempt_retry_is_indefinite`
+/// in JournalContract.lean).
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out is Lookup <==> !(missing && summarized && writer_epoch < recovery_epoch
+            && loss_point < last),
+        out is Recovered <==> missing && summarized && writer_epoch < recovery_epoch
+            && loss_point < last && durable,
+        out is Unavailable <==> missing && summarized && writer_epoch < recovery_epoch
+            && loss_point < last && !durable,
+))]
+pub(super) fn written_step(
+    missing: bool,
+    summarized: bool,
+    recovery_epoch: u64,
+    loss_point: u64,
+    writer_epoch: u64,
+    last: u64,
+    durable: bool,
+) -> WrittenStep {
+    if !missing || !summarized || writer_epoch >= recovery_epoch || loss_point >= last {
+        WrittenStep::Lookup
+    } else if durable {
+        WrittenStep::Recovered
+    } else {
+        WrittenStep::Unavailable
+    }
+}
+
 /// The boundary slot a restart trusts: the intact slot with the higher
 /// sequence, 0 or 1, preferring the second on a tie. `None` when neither
 /// slot is intact.

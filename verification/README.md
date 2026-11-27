@@ -217,7 +217,7 @@ checks cover what Logkeeper adds on top of Raft, each at its own level.
 | Catalog first claim wins, one genesis per stream | Not local | `first_claim_wins`, `at_most_one_genesis_per_stream`, `replicas_agree`, `checkpoint_then_suffix` | `CatalogSafety` (`AtMostOneGenesisPerStream`) | Replicated catalog outages |
 | WAL boundary slot and rollback detection | `newest_slot`, `checkpoint_within`, `replay_step` | Studies 25 and 26 (`SelectionFence`), `crash_replays_whole_published_rounds`, `rollback_rejected` | Not modeled | WAL crash cuts |
 | Durable commit index (`Record::Committed`, LKRWAL06) | Not local | `commit_index_follows_its_round`, `crash_replays_a_sound_commit_index` | Not modeled | Not targeted |
-| An ambiguous retry is never refused definitely, across a recovery too | Not local | `committed_attempt_retry_is_indefinite` (with the recovery check the keeper lacks: `keeper_lookup_refuses_an_erased_attempt`) | Not modeled | Lost replies (`bugs.rs`); ignored repro in `keeper/tests/authority.rs` |
+| An ambiguous retry is never refused definitely, across a recovery too | `written_step`, `absorb_recovery` (`consensus_admission`) | `committed_attempt_retry_is_indefinite`, `summary_covers_every_erasing_recovery` (the keeper before the summary: `keeper_lookup_refuses_an_erased_attempt`) | Not modeled | Lost replies (`bugs.rs`); retries across a recovery, trim, snapshot, restart, import and restore in `keeper/tests/authority.rs` and `keeper/tests/offload.rs` |
 | An RTDB follower never resumes across an unseen recovery | Not local | `recheck_keeps_the_applied_prefix`, `follower_never_resumes_across_an_unseen_recovery` | Not modeled | Not targeted |
 
 The Lean recovery theorem is exact about its scope. While at most one lost

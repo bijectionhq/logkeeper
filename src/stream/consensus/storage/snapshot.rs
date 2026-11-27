@@ -34,11 +34,13 @@ use crate::stream::consensus::Voters;
 use crate::stream::{
     consensus::{
         Configuration, Entry, Genesis, LogId, MAX_MESSAGE, Membership, RaftTypes, SnapshotMeta,
-        Stage, invalid, options, ownership,
+        Stage,
+        decisions::WrittenStep,
+        invalid, options, ownership,
         placement::Placement,
         state::{
-            Command, EpochRuns, MAX_RETAINED_WITH_HEADROOM, Outcome, Payload, RecordKind, State,
-            quota_with_headroom,
+            Command, EpochRuns, MAX_RETAINED_WITH_HEADROOM, Outcome, Payload, RecordKind,
+            Recoveries, State, quota_with_headroom,
         },
     },
     keeper::durability::{sync_directory, sync_file},
@@ -748,6 +750,13 @@ impl StateMachine {
         Ok(self.inner.applied.read().state.recorded_recovery())
     }
 
+    /// The summary of the stream's operator recoveries, from the applied
+    /// image.
+    #[cfg(test)]
+    pub fn recoveries(&self) -> Option<Recoveries> {
+        self.inner.applied.read().state.recoveries()
+    }
+
     pub async fn page(&self, from: Lsn, limit: usize) -> journal_contract::Result<Page> {
         if self.is_quarantined() {
             return Err(JournalError::Corrupted);
@@ -924,7 +933,12 @@ impl StateMachine {
     /// The retained timed record at `at`, from the applied image.
     /// Whether a writer of `epoch` appended exactly `payloads` from `at`:
     /// the last LSN when it did, `Conflict` when it did not, and
-    /// `Unavailable` when this replica cannot tell.
+    /// `Unavailable` when this replica cannot tell. When the retained
+    /// history misses the attempt but an operator recovery since `epoch`
+    /// kept less than it, the attempt may have committed before that
+    /// recovery erased it: `Recovered` with the lowest loss point once the
+    /// cluster keeps the recovery summary durably, `Unavailable` before
+    /// (`decisions::written_step`).
     pub async fn written(
         &self,
         epoch: journal_contract::Epoch,
@@ -935,30 +949,88 @@ impl StateMachine {
             return Err(JournalError::Unavailable);
         }
         let count = payloads.len() as u64;
-        let (records, head) = {
+        let durable = self
+            .inner
+            .disk
+            .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_RETRY_RECOVERY);
+        let (lookup, head, mut summary, entries) = {
             let image = self.inner.applied.read();
+            let summary = image.state.recoveries();
+            // A standing recovery fence kept exactly the head.
+            let summary = match image.state.recovery_fence()? {
+                Some(fence) => Some(Recoveries::absorb(summary, fence.epoch, fence.head)),
+                None => summary,
+            };
             (
-                image.state.written(epoch, at, payloads.len())?,
+                image.state.written(epoch, at, payloads.len()),
                 image.state.head()?,
+                summary,
+                // Below the level, a summary from before a restart may be
+                // gone: the retained typed entries still tell.
+                if durable {
+                    Vec::new()
+                } else {
+                    image.state.retained_recovery_entries()
+                },
             )
         };
-        let matches = tokio::task::spawn_blocking(move || {
-            records
+        let records = match lookup {
+            Ok(records) => Some(records),
+            Err(JournalError::Conflict { .. }) => None,
+            Err(error) => return Err(error),
+        };
+        let (matches, retained) = tokio::task::spawn_blocking(move || {
+            let matches =
+                match &records {
+                    Some(records) => records.iter().zip(&payloads).try_fold(
+                        true,
+                        |same, (record, payload)| {
+                            Ok::<_, io::Error>(
+                                same && record.len() == payload.len() && record.load()? == *payload,
+                            )
+                        },
+                    )?,
+                    None => false,
+                };
+            let retained = entries
                 .iter()
-                .zip(&payloads)
-                .try_fold(true, |same, (record, payload)| {
-                    Ok::<_, io::Error>(
-                        same && record.len() == payload.len() && record.load()? == *payload,
-                    )
+                .map(|record| {
+                    journal_contract::RecoveryEntry::decode(&record.load()?)
+                        .ok_or_else(|| invalid("retained recovery entry does not decode"))
                 })
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok::<_, io::Error>((matches, retained))
         })
         .await
         .map_err(|_| JournalError::Unavailable)?
         .map_err(|_| JournalError::Unavailable)?;
         if matches {
-            Ok(Lsn(at.0 + count - 1))
-        } else {
-            Err(JournalError::Conflict { head })
+            return Ok(Lsn(at.0 + count - 1));
+        }
+        for entry in retained {
+            summary = Some(Recoveries::absorb(
+                summary,
+                entry.fence.epoch,
+                entry.loss_point,
+            ));
+        }
+        let Some(last) = at.0.checked_add(count).and_then(|end| end.checked_sub(1)) else {
+            return Err(JournalError::Conflict { head });
+        };
+        match crate::stream::consensus::decisions::written_step(
+            true,
+            summary.is_some(),
+            summary.map_or(0, |summary| summary.epoch.0),
+            summary.map_or(0, |summary| summary.loss_point.0),
+            epoch.0,
+            last,
+            durable,
+        ) {
+            WrittenStep::Lookup => Err(JournalError::Conflict { head }),
+            WrittenStep::Recovered => Err(JournalError::Recovered {
+                head: summary.map_or(head, |summary| summary.loss_point),
+            }),
+            WrittenStep::Unavailable => Err(JournalError::Unavailable),
         }
     }
 
@@ -1349,6 +1421,9 @@ impl Inner {
             let with_epochs = inner
                 .disk
                 .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_V2);
+            let with_recoveries = inner
+                .disk
+                .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_RETRY_RECOVERY);
             let epochs = with_epochs.then(|| active.image.state.epoch_runs());
             let metadata = options()
                 .serialized_size(&(&inner.genesis, &active.meta, &active.image))
@@ -1362,7 +1437,8 @@ impl Inner {
                         + options().serialized_size(&active.image.state.recorded())?
                         + options().serialized_size(
                             &active.image.state.checkpoint_custody().ok().flatten(),
-                        )?)
+                        )?
+                        + options().serialized_size(&active.image.state.recoveries())?)
                 })
                 .map_err(io::Error::other)?;
             transfer.grow(
@@ -1392,6 +1468,7 @@ impl Inner {
                 &active.meta,
                 &active.image,
                 with_epochs,
+                with_recoveries,
                 |reason| inner.quarantine_corrupt(reason),
             )?;
             temporary.transfer.account(&file.metadata()?);
@@ -1654,6 +1731,11 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
         let with_epochs = inner
             .disk
             .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_V2);
+        // The recovery summary in the root is an N format too
+        // (`CLUSTER_VERSION_RETRY_RECOVERY`).
+        let with_recoveries = inner
+            .disk
+            .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_RETRY_RECOVERY);
         let scratch = inner.disk.space.scratch(index::SCRATCH).await?;
         let temporary = inner
             .directory
@@ -1673,6 +1755,7 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
                 &image,
                 &previous,
                 with_epochs,
+                with_recoveries,
             )?;
             let selected = prepare_selection(file, &meta)?;
             Ok((
@@ -2131,6 +2214,11 @@ const MAGIC_WITH_OFFLOAD: &[u8; 8] = b"LKRIMG05";
 /// finalized `CLUSTER_VERSION_RECOVERY_ENTRY`.
 const MAGIC_WITH_RECOVERY: &[u8; 8] = b"LKRIMG06";
 const MAGIC_WITH_CUSTODY: &[u8; 8] = b"LKRIMG07";
+/// Images that also carry the stream's recovery summary: after the offload
+/// progress, the recorded recovery and the checkpoint custody, each as an
+/// option, then the summary. Written only for a stream that had an operator
+/// recovery once the cluster finalized `CLUSTER_VERSION_RETRY_RECOVERY`.
+const MAGIC_WITH_RECOVERIES: &[u8; 8] = b"LKRIMG08";
 const STAGED_IMAGE: &str = "lk-stage-";
 const HEADER_BYTES: u64 = 12;
 
@@ -2142,6 +2230,7 @@ fn write_image(
     meta: &SnapshotMeta,
     image: &Image,
     with_epochs: bool,
+    with_recoveries: bool,
     quarantine: impl Fn(&str),
 ) -> io::Result<()> {
     let offload = image.state.offload();
@@ -2152,12 +2241,16 @@ fn write_image(
             "immutable checkpoint custody cannot carry a recovery fence",
         ));
     }
+    let recoveries = image.state.recoveries().filter(|_| with_recoveries);
     let with_recovery = recorded.is_some();
     let with_offload = with_recovery
         || custody.is_some()
+        || recoveries.is_some()
         || offload != crate::stream::consensus::state::Offload::default();
     let with_epochs = with_epochs || with_offload;
-    file.write_all(if custody.is_some() {
+    file.write_all(if recoveries.is_some() {
+        MAGIC_WITH_RECOVERIES
+    } else if custody.is_some() {
         MAGIC_WITH_CUSTODY
     } else if with_recovery {
         MAGIC_WITH_RECOVERY
@@ -2190,15 +2283,21 @@ fn write_image(
                 .serialize_into(&mut writer, &offload)
                 .map_err(io::Error::other)?;
         }
-        if let Some(recorded) = &recorded {
+        if let Some(recoveries) = &recoveries {
             options()
-                .serialize_into(&mut writer, recorded)
+                .serialize_into(&mut writer, &(&recorded, &custody, recoveries))
                 .map_err(io::Error::other)?;
-        }
-        if let Some(custody) = &custody {
-            options()
-                .serialize_into(&mut writer, custody)
-                .map_err(io::Error::other)?;
+        } else {
+            if let Some(recorded) = &recorded {
+                options()
+                    .serialize_into(&mut writer, recorded)
+                    .map_err(io::Error::other)?;
+            }
+            if let Some(custody) = &custody {
+                options()
+                    .serialize_into(&mut writer, custody)
+                    .map_err(io::Error::other)?;
+            }
         }
         for payload in image.state.records() {
             let bytes = payload
@@ -2229,14 +2328,16 @@ fn read_image(
     let mut file = BufReader::new(file);
     let mut header = [0; 12];
     file.read_exact(&mut header)?;
-    let (with_epochs, with_offload, with_recovery, with_custody) = match &header[..8] {
-        magic if magic == MAGIC => (false, false, false, false),
-        magic if magic == MAGIC_WITH_EPOCHS => (true, false, false, false),
-        magic if magic == MAGIC_WITH_OFFLOAD => (true, true, false, false),
-        magic if magic == MAGIC_WITH_RECOVERY => (true, true, true, false),
-        magic if magic == MAGIC_WITH_CUSTODY => (true, true, false, true),
-        _ => return Err(invalid("invalid snapshot format")),
-    };
+    let (with_epochs, with_offload, with_recovery, with_custody, with_recoveries) =
+        match &header[..8] {
+            magic if magic == MAGIC => (false, false, false, false, false),
+            magic if magic == MAGIC_WITH_EPOCHS => (true, false, false, false, false),
+            magic if magic == MAGIC_WITH_OFFLOAD => (true, true, false, false, false),
+            magic if magic == MAGIC_WITH_RECOVERY => (true, true, true, false, false),
+            magic if magic == MAGIC_WITH_CUSTODY => (true, true, false, true, false),
+            magic if magic == MAGIC_WITH_RECOVERIES => (true, true, false, false, true),
+            _ => return Err(invalid("invalid snapshot format")),
+        };
     let mut crc = crc32fast::Hasher::new();
     let mut reader = HashReader {
         reader: &mut file,
@@ -2263,6 +2364,21 @@ fn read_image(
     } else {
         Default::default()
     };
+    type Summarized = (
+        Option<crate::stream::consensus::state::Recorded>,
+        Option<journal_contract::CheckpointCustody>,
+        Recoveries,
+    );
+    let summarized: Option<Summarized> = if with_recoveries {
+        Some(
+            options()
+                .with_limit(MAX_MESSAGE)
+                .deserialize_from(&mut reader)
+                .map_err(io::Error::other)?,
+        )
+    } else {
+        None
+    };
     let recorded: Option<crate::stream::consensus::state::Recorded> = if with_recovery {
         Some(
             options()
@@ -2282,6 +2398,10 @@ fn read_image(
         )
     } else {
         None
+    };
+    let (recorded, custody, recoveries) = match summarized {
+        Some((recorded, custody, recoveries)) => (recorded, custody, Some(recoveries)),
+        None => (recorded, custody, None),
     };
     image.stage_intent = meta.snapshot_id.starts_with(STAGED_IMAGE);
     if &found != genesis
@@ -2337,6 +2457,7 @@ fn read_image(
     if let Some(custody) = custody {
         image.state.restore_checkpoint_custody(custody)?;
     }
+    image.state.restore_recoveries(recoveries)?;
     Ok((meta, image))
 }
 

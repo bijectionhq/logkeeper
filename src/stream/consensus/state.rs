@@ -486,6 +486,42 @@ pub(super) struct Live {
     recorded: Option<Recorded>,
     #[serde(skip)]
     checkpoint_custody: Option<CheckpointCustody>,
+    /// What a retry's `Written` lookup needs of every operator recovery
+    /// the stream had. Snapshots store it beside the image once the
+    /// cluster finalized `CLUSTER_VERSION_RETRY_RECOVERY`.
+    #[serde(skip)]
+    recoveries: Option<Recoveries>,
+}
+
+/// The summary of every operator recovery of a stream that decides a
+/// retry across them (`decisions::written_step`): unlike the typed entries,
+/// it survives trims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recoveries {
+    /// The fence epoch of the latest recovery. Every writer below it sealed
+    /// before some recovery.
+    pub epoch: Epoch,
+    /// The lowest loss point of any recovery: records above it that a
+    /// writer below `epoch` was acknowledged may have been erased.
+    pub loss_point: Lsn,
+}
+
+impl Recoveries {
+    /// The summary `held` after also absorbing a recovery fenced at `epoch`
+    /// that kept the records through `loss_point`.
+    pub fn absorb(held: Option<Self>, epoch: Epoch, loss_point: Lsn) -> Self {
+        let (epoch, loss_point) = super::decisions::absorb_recovery(
+            held.is_some(),
+            held.map_or(0, |held| held.epoch.0),
+            held.map_or(0, |held| held.loss_point.0),
+            epoch.0,
+            loss_point.0,
+        );
+        Self {
+            epoch: Epoch(epoch),
+            loss_point: Lsn(loss_point),
+        }
+    }
 }
 
 /// A recorded recovery waiting for its typed entry: the catalog's record and
@@ -1025,6 +1061,7 @@ impl State {
                         offload: Offload::default(),
                         recorded: None,
                         checkpoint_custody: None,
+                        recoveries: None,
                     };
                     *self = if genesis.immutable {
                         Self::Immutable {
@@ -1195,6 +1232,7 @@ impl State {
             writer: RECOVERY_WRITER,
         };
         live.writer = Some((fence, String::new()));
+        live.recoveries = Some(Recoveries::absorb(live.recoveries, epoch, live.head));
         Ok(Outcome::Sealed(Sealed {
             fence,
             head: live.head,
@@ -1205,8 +1243,40 @@ impl State {
     /// record of the recovery, which the fence's typed entry carries.
     pub fn recover_recorded(&mut self, recorded: Recorded) -> Result<Outcome> {
         let outcome = self.recover()?;
-        self.live_mut()?.recorded = Some(recorded);
+        let live = self.live_mut()?;
+        live.recorded = Some(recorded);
+        live.recoveries = Some(Recoveries::absorb(
+            live.recoveries,
+            live.epoch(),
+            recorded.record.loss_point,
+        ));
         Ok(outcome)
+    }
+
+    /// The summary of the stream's operator recoveries, if it had any.
+    pub fn recoveries(&self) -> Option<Recoveries> {
+        self.live().ok()?.recoveries
+    }
+
+    /// Restores the recovery summary a snapshot stored beside its image.
+    pub fn restore_recoveries(&mut self, recoveries: Option<Recoveries>) -> io::Result<()> {
+        match (self.live_mut(), recoveries) {
+            (_, None) => Ok(()),
+            (Ok(live), Some(recoveries)) if recoveries.loss_point <= live.head => {
+                live.recoveries = Some(recoveries);
+                Ok(())
+            }
+            _ => Err(super::invalid("invalid recovery summary")),
+        }
+    }
+
+    /// Every retained typed recovery entry, for a `Written` lookup below
+    /// the level that keeps the recovery summary durable.
+    pub fn retained_recovery_entries(&self) -> Vec<Payload> {
+        self.records()
+            .filter(|record| record.kind() == RecordKind::Recovery)
+            .cloned()
+            .collect()
     }
 
     /// The standing recovery fence and the catalog's record of it, when a
@@ -1644,6 +1714,17 @@ impl Live {
             self.epochs = EpochRuns::default();
             self.offload.floor = Some(floor).filter(|floor| *floor < self.floor);
             self.offload.through = restore.head;
+            // The store's run replaces the history: a writer of the epoch
+            // it was taken at, or below, may have committed above its
+            // head, so the restore counts as a recovery fenced just above.
+            // A restore with no survivor knows only the epochs the store
+            // holds: a writer sealed above all of them whose records never
+            // reached the store keeps the lookup's earlier answer.
+            self.recoveries = Some(Recoveries::absorb(
+                self.recoveries,
+                Epoch(restore.epoch.0.saturating_add(1)),
+                restore.head,
+            ));
             if restore.epoch > self.epoch() {
                 self.writer = Some((
                     Fence {

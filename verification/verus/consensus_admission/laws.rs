@@ -1051,4 +1051,52 @@ fn a_stale_epoch_or_replaced_media_never_renews(replaced: bool, requested: u64, 
     assert(!replaced && requested == current ==> granted);
 }
 
+// RetryAcrossRecovery.summary_covers_every_erasing_recovery: once the
+// summary absorbed a recovery fenced above the writer's epoch that kept
+// less than the attempt, a retry the retained history misses is never
+// refused definitely, whatever the summary held before: `Recovered` once
+// the summary is durable, `Unavailable` before.
+fn an_erasing_recovery_never_leaves_a_definite_refusal(
+    held: bool, held_epoch: u64, held_loss_point: u64, epoch: u64, loss_point: u64,
+    writer_epoch: u64, last: u64, durable: bool,
+)
+    requires writer_epoch < epoch, loss_point < last,
+{
+    let summary = absorb_recovery(held, held_epoch, held_loss_point, epoch, loss_point);
+    let step = written_step(true, true, summary.0, summary.1, writer_epoch, last, durable);
+    assert(!(step is Lookup));
+    assert(durable ==> step is Recovered);
+    assert(!durable ==> step is Unavailable);
+}
+
+// RetryAcrossRecovery.summary_is_monotone: absorbing a later recovery
+// never forgets an earlier erasing one.
+fn absorbing_a_recovery_keeps_an_erasing_summary(
+    held_epoch: u64, held_loss_point: u64, epoch: u64, loss_point: u64, writer_epoch: u64,
+    last: u64, durable: bool,
+)
+    requires writer_epoch < held_epoch, held_loss_point < last,
+{
+    let summary = absorb_recovery(true, held_epoch, held_loss_point, epoch, loss_point);
+    let step = written_step(true, true, summary.0, summary.1, writer_epoch, last, durable);
+    assert(!(step is Lookup));
+}
+
+// RetryAcrossRecovery.exact_without_recovery: a matching lookup, a stream
+// without a recovery, a writer that sealed at or after the latest
+// recovery's fence, and a retry at or below every loss point are all
+// answered by the retained history, as before.
+fn without_an_erasing_recovery_the_lookup_decides(
+    missing: bool, summarized: bool, recovery_epoch: u64, loss_point: u64, writer_epoch: u64,
+    last: u64, durable: bool,
+) {
+    let step = written_step(
+        missing, summarized, recovery_epoch, loss_point, writer_epoch, last, durable,
+    );
+    assert(!missing ==> step is Lookup);
+    assert(!summarized ==> step is Lookup);
+    assert(writer_epoch >= recovery_epoch ==> step is Lookup);
+    assert(last <= loss_point ==> step is Lookup);
+}
+
 }

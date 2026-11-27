@@ -348,7 +348,9 @@ impl Engine {
         if target > CLUSTER_VERSION_CURRENT {
             return Err(JournalError::Unsupported);
         }
-        let custody_feature = if target >= super::super::CLUSTER_VERSION_CHECKPOINT_CUSTODY {
+        let custody_feature = if target >= super::super::CLUSTER_VERSION_RETRY_RECOVERY {
+            features::RETRY_RECOVERY | features::CHECKPOINT_CUSTODY
+        } else if target >= super::super::CLUSTER_VERSION_CHECKPOINT_CUSTODY {
             features::CHECKPOINT_CUSTODY
         } else {
             0

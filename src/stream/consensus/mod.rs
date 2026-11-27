@@ -112,8 +112,15 @@ pub const CLUSTER_VERSION_V10: u32 = 10;
 pub const CLUSTER_VERSION_RECOVERY_ENTRY: u32 = CLUSTER_VERSION_V10;
 /// Enables durable custody of a selected immutable checkpoint.
 pub const CLUSTER_VERSION_CHECKPOINT_CUSTODY: u32 = 11;
+/// Cluster feature level at which a stream's recovery summary is durable:
+/// the snapshot formats that carry it (`LKRIMG08`, `LKRIDX06`), so a retry
+/// across an operator recovery that may have erased its attempt answers
+/// `Recovered` (`decisions::written_step`).
+pub const CLUSTER_VERSION_V12: u32 = 12;
+/// The level the durable recovery summary waits for.
+pub const CLUSTER_VERSION_RETRY_RECOVERY: u32 = CLUSTER_VERSION_V12;
 /// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_CHECKPOINT_CUSTODY;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_RETRY_RECOVERY;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -152,6 +159,9 @@ pub mod features {
     pub const RECOVERY_ENTRY: u64 = 1 << 12;
     /// Applies exact recovery holds to the selected checkpoint and its suffix.
     pub const CHECKPOINT_CUSTODY: u64 = 1 << 13;
+    /// Keeps each stream's recovery summary and reads the snapshot formats
+    /// that carry it (`CLUSTER_VERSION_RETRY_RECOVERY`).
+    pub const RETRY_RECOVERY: u64 = 1 << 14;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 = VERSION_NEGOTIATION
@@ -166,7 +176,8 @@ pub mod features {
         | CHECKPOINT_INSTALL
         | RECOVERY_EXCLUSION
         | RECOVERY_ENTRY
-        | CHECKPOINT_CUSTODY;
+        | CHECKPOINT_CUSTODY
+        | RETRY_RECOVERY;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;

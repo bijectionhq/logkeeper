@@ -154,7 +154,12 @@ journal.append(stream, sealed.fence, at, Bytes::from_static(b"first")).await?;
 
 Retain the stream ID across create retries and the writer UUID across seal
 retries. An unavailable append has an unknown outcome. Retry the same fence,
-LSN and bytes while that fence and record are still retained. A fresh `head`
+LSN and bytes while that fence and record are still retained. A retry that
+an operator recovery since the writer's epoch may have erased, because the
+recovery kept less than the retried records, answers
+`Recovered { head: loss point }` instead of `Fenced`: the attempt may have
+committed and been lost, so the writer must not take the refusal as
+"never happened". A fresh `head`
 confirms a quorum after invocation and waits for local application. A `read`
 returns one keeper's applied page and may lag. Use `read_at_least` to supply a
 minimum head, for example a position returned by an append. The client remembers
@@ -994,6 +999,29 @@ maintenance to resume.
 Reserve the custodian credential for the service that checks the owning
 recovery's terminal decision before releasing its hold.
 Snapshots that carry held or released custody use `LKRIMG07` and `LKRIDX05`.
+
+**Retries across a recovery.** Finalize level 12
+(`CLUSTER_VERSION_RETRY_RECOVERY`) after every keeper advertises
+`RETRY_RECOVERY` (bit 14). Every keeper of this build keeps a summary of
+each stream's operator recoveries, applied from `Recover`,
+`RecoverRecorded` and a replacing `Restore` (an import or a restore with no
+survivor counts as a recovery that kept the restored head): the latest
+fence epoch and the lowest loss point. `Request::Written`, the lookup a
+client makes when a retried append is refused `Fenced` or `Trimmed`, then
+answers `Recovered { head: loss point }` when the retained history misses
+the attempt and a recovery fenced above the writer's epoch kept less than
+it (`decisions::written_step`); the client returns that to the writer
+instead of the definite `Fenced`. From level 12 a stream that had a
+recovery snapshots as `LKRIMG08`/`LKRIDX06`, which carry the summary, so it
+survives trims, snapshots, restarts and snapshot installs; an older binary
+refuses them, so do not roll back past level 12. Below level 12 the summary
+is in memory only: a lookup the keeper can still decide from it, from a
+standing recovery fence or from a retained typed entry answers
+`Unavailable`, and one it cannot, such as after a restart from an older
+snapshot once the typed entry was trimmed, keeps the earlier `Fenced`
+answer. A recovery made before level 12 is covered after it only while one
+of those holds. No wire variant changes: `Recovered` was already a
+`JournalError`, and an older client maps it to `Unavailable`.
 
 **Wire variants.** Variants of `Frame`, `Request`, `PeerRequest`, `Reply`,
 `Outcome` and `JournalError` are only ever appended, and each is classified

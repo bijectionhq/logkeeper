@@ -92,6 +92,22 @@ marker of its own. Journals without operator recovery leave
 `Page::recoveries` empty; the conformance suite checks that appends never
 produce an entry.
 
+A recovery can erase records a writer committed, so a retry of an append
+whose reply was lost cannot be judged against the history that survives. A
+retried append whose earlier attempt may have committed before a recovery
+answers `Recovered { head }`, where `head` is the loss point of a recovery
+that may have erased it, or `Unavailable`. It never answers `Ok` and never
+refuses definitely (`Fenced`, `Conflict`). "May have been erased" means some
+recovery fenced at an epoch above the writer's kept less than the attempt's
+last position. The typed entry alone cannot decide it once it is trimmed, so
+the journal keeps two numbers per stream across trims and snapshots: the
+latest recovery's fence epoch and the lowest loss point of any recovery
+(`committed_attempt_retry_is_indefinite` and
+`summary_covers_every_erasing_recovery` in
+`verification/lean/Logkeeper/ConsensusAdditions/JournalContract.lean`). A
+consumer that gets `Recovered` from an append treats the write's outcome as
+unknown and rebuilds from the journal as after a `Recovered` seal.
+
 Failures panic with the check name. A seeded history failure includes the seed
 and the recorded calls, intervals, and results. The suite uses 24 seeds with
 41 calls each, plus directed scenarios for errors, retries, fencing, trim

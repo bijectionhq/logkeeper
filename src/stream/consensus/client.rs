@@ -291,6 +291,10 @@ impl Client {
     /// none can, so the refusal stands. When they do, the outcome is unknown,
     /// not a success: an earlier, identical call may have written them, and
     /// a call that began after the fencing seal cannot have taken effect.
+    /// When an operator recovery since this writer's epoch kept less than
+    /// the records, an attempt may have committed and been erased by it: the
+    /// keeper answers `Recovered` with the lowest loss point, which this
+    /// returns, or `Unavailable`, and never a definite refusal.
     async fn write_records(
         &self,
         request: Request,
@@ -327,6 +331,7 @@ impl Client {
             .and_then(position)
         {
             Err(JournalError::Conflict { .. }) => Err(refusal),
+            Err(recovered @ JournalError::Recovered { .. }) => Err(recovered),
             Ok(_) | Err(_) => Err(JournalError::Unavailable),
         }
     }

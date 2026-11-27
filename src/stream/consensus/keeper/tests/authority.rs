@@ -867,8 +867,9 @@ async fn a_recovery_leaves_one_typed_entry_that_no_append_can_forge() {
         Some(JournalError::Recovered { head: Lsn(3) })
     );
 
-    // The recorded recovery waits in the snapshot formats that carry it,
-    // and a restart from the snapshot keeps it.
+    // The recorded recovery waits in the snapshot formats that carry it
+    // beside the recovery summary, and a restart from the snapshot keeps
+    // it.
     let group = snapshot(&cluster, a, stream).await;
     let active = group.state.recorded_recovery().unwrap().unwrap().0;
     assert_eq!(
@@ -881,9 +882,9 @@ async fn a_recovery_leaves_one_typed_entry_that_no_append_can_forge() {
     assert!(
         std::fs::read(group.state.snapshot_path().unwrap())
             .unwrap()
-            .starts_with(b"LKRIDX04")
+            .starts_with(b"LKRIDX06")
     );
-    assert_eq!(&wire_magic(&group).await, b"LKRIMG06");
+    assert_eq!(&wire_magic(&group).await, b"LKRIMG08");
     drop(group);
     cluster.running.remove(&a).unwrap().stop().await;
     cluster.restart(a).await;
@@ -977,8 +978,9 @@ async fn a_recovery_leaves_one_typed_entry_that_no_append_can_forge() {
     .await
     .unwrap();
     drop(survivor);
+    // The summary outlives the entry's fence.
     let group = snapshot(&cluster, a, stream).await;
-    assert_eq!(&wire_magic(&group).await, b"LKRIMG04");
+    assert_eq!(&wire_magic(&group).await, b"LKRIMG08");
     drop(group);
     cluster.running.remove(&a).unwrap().stop().await;
     cluster.restart(a).await;
@@ -1760,25 +1762,30 @@ async fn the_survivor_that_knows_the_later_commit_recovers_over_a_longer_log() {
     cluster.stop_all().await;
 }
 
-/// An append whose reply was lost, retried across an operator recovery
-/// that erased it. The attempt committed at LSN 3 on the voters the
-/// recovery lost, and the survivor never learned it: the recovery keeps
-/// LSN 2 and reports that loss point exactly. The retry is refused
-/// `Fenced`, and the writer's `Written` lookup finds no matching record at
-/// LSN 3, first because the head is 2 and then because the typed recovery
-/// entry sits there. Both answers say only what survives now, not whether
-/// an attempt committed before the recovery erased it, so the refusal is
-/// not definite. The client must answer `Unavailable` or `Recovered`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "bug: a Written lookup treats the history a recovery rewrote as the one the attempt \
-            ran against, so a retry across the recovery is refused Fenced as if it never \
-            committed (VERIFY-LEAN-REPORT, JournalContract.lean)"]
-async fn a_retry_across_a_recovery_that_erased_its_attempt_is_not_refused_definitely() {
+/// What `erased_attempt` leaves: the writer's fence of the erased attempt
+/// and the recovery that erased it.
+struct Erased {
+    cluster: Cluster,
+    journal: Client,
+    stream: StreamId,
+    writer: Fence,
+    report: crate::stream::consensus::keeper::recovery::RecoveryReport,
+    survivor: Uuid,
+}
+
+fn record(at: u64) -> Bytes {
+    Bytes::from(format!("record-{at}"))
+}
+
+/// A writer at epoch 1 commits LSN 1-2 on `[a, b, c]`; `c` stops and `a`
+/// and `b` commit LSN 3, whose reply the writer loses; `a` and `b` stop and
+/// an operator recovers the stream from `c`, keeping LSN 2 (loss point 2,
+/// exact). The cluster runs at `version`.
+async fn erased_attempt(version: u32, stream: StreamId) -> Erased {
     let mut cluster = Cluster::start_replicated().await;
-    cluster.finalize().await;
+    cluster.finalize_to(version).await;
     leased(&cluster).await;
     let [a, b, c, _] = cluster.ids;
-    let stream = StreamId(0xA8);
     let journal = cluster.client(&cluster.credentials);
     journal
         .create(stream, Voters::from([a, b, c]), 1 << 20)
@@ -1788,7 +1795,6 @@ async fn a_retry_across_a_recovery_that_erased_its_attempt_is_not_refused_defini
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
         .unwrap();
-    let record = |at: u64| Bytes::from(format!("record-{at}"));
     for at in 1..=2 {
         journal
             .append(stream, sealed.fence, Lsn(at), record(at))
@@ -1836,10 +1842,43 @@ async fn a_retry_across_a_recovery_that_erased_its_attempt_is_not_refused_defini
     );
     cluster.restart(c).await;
     configured(&journal, stream, report.voters).await;
+    Erased {
+        cluster,
+        journal,
+        stream,
+        writer: sealed.fence,
+        report,
+        survivor: c,
+    }
+}
 
+/// An append whose reply was lost, retried across an operator recovery
+/// that erased it. The attempt committed at LSN 3 on the voters the
+/// recovery lost, and the survivor never learned it: the recovery keeps
+/// LSN 2 and reports that loss point exactly. The retry is refused
+/// `Fenced`, and the writer's `Written` lookup finds no matching record at
+/// LSN 3, first because the head is 2 and then because the typed recovery
+/// entry sits there. Both answers say only what survives now, not whether
+/// an attempt committed before the recovery erased it, so the refusal is
+/// not definite. The keeper's recovery summary says that a recovery since
+/// the writer's epoch kept less than LSN 3, so both retries answer
+/// `Recovered` with the loss point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_across_a_recovery_that_erased_its_attempt_is_not_refused_definitely() {
+    let Erased {
+        mut cluster,
+        journal,
+        stream,
+        writer,
+        ..
+    } = erased_attempt(
+        crate::stream::consensus::CLUSTER_VERSION_CURRENT,
+        StreamId(0xA8),
+    )
+    .await;
     // While the recovery fence stands.
     let fenced = journal
-        .append_after(stream, sealed.fence, Lsn(3), record(3), true)
+        .append_after(stream, writer, Lsn(3), record(3), true)
         .await;
     // Once the administrator acknowledged it: LSN 3 is the typed entry.
     assert_eq!(journal.acknowledge_recovery(stream).await, Ok(Lsn(2)));
@@ -1849,7 +1888,7 @@ async fn a_retry_across_a_recovery_that_erased_its_attempt_is_not_refused_defini
         .unwrap();
     assert!(page.recovery(Lsn(3)).is_some(), "{page:?}");
     let acknowledged = journal
-        .append_after(stream, sealed.fence, Lsn(3), record(3), true)
+        .append_after(stream, writer, Lsn(3), record(3), true)
         .await;
     let indefinite = |result: &Result<Lsn, JournalError>| {
         matches!(
@@ -1861,6 +1900,179 @@ async fn a_retry_across_a_recovery_that_erased_its_attempt_is_not_refused_defini
         indefinite(&fenced) && indefinite(&acknowledged),
         "a retry whose attempt the recovery erased was answered {fenced:?} under the fence \
          and {acknowledged:?} after it"
+    );
+    assert_eq!(fenced, Err(JournalError::Recovered { head: Lsn(2) }));
+    assert_eq!(acknowledged, Err(JournalError::Recovered { head: Lsn(2) }));
+    cluster.stop_all().await;
+}
+
+/// The typed entry alone cannot decide a retry once it is trimmed: the
+/// writer whose LSN 3 the recovery erased retries a batch of LSN 3-4 after
+/// a later writer trimmed the entry, and LSN 4 now holds that writer's
+/// record. The recovery summary still decides it, and it survives the
+/// snapshot formats that carry it and a restart from them. A writer that
+/// sealed after the recovery is not affected: its own retry across a later
+/// seal is refused definitely, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_across_an_erasing_recovery_stays_recovered_past_trim_snapshot_and_restart() {
+    let Erased {
+        mut cluster,
+        journal,
+        stream,
+        writer,
+        report,
+        survivor,
+    } = erased_attempt(
+        crate::stream::consensus::CLUSTER_VERSION_CURRENT,
+        StreamId(0xA9),
+    )
+    .await;
+    assert_eq!(journal.acknowledge_recovery(stream).await, Ok(Lsn(2)));
+    let later = journal
+        .seal(stream, report.epoch, Uuid::from_u128(100))
+        .await
+        .unwrap();
+    for at in 4..=5 {
+        journal
+            .append(stream, later.fence, Lsn(at), record(at + 100))
+            .await
+            .unwrap();
+    }
+    journal.trim(stream, later.fence, Lsn(3)).await.unwrap();
+    let page = journal
+        .read(stream, Lsn(4), 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(page.recoveries.is_empty(), "{page:?}");
+    let retry = |journal: Client| async move {
+        journal
+            .append_batch_after(stream, writer, Lsn(3), vec![record(3), record(4)], true)
+            .await
+    };
+    // LSN 3 is below the floor now, so the lookup cannot tell.
+    assert_eq!(retry(journal.clone()).await, Err(JournalError::Unavailable));
+    let past_floor = journal
+        .append_after(stream, writer, Lsn(4), record(4), true)
+        .await;
+    assert_eq!(past_floor, Err(JournalError::Recovered { head: Lsn(2) }));
+
+    // The summary is in the snapshot formats of this level, and a restart
+    // from the snapshot keeps it.
+    let survivor_group = cluster.group(survivor, stream).await;
+    timeout(WAIT, async {
+        while survivor_group.state.head() != Ok(Lsn(5)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(survivor_group);
+    let group = snapshot(&cluster, survivor, stream).await;
+    assert!(
+        std::fs::read(group.state.snapshot_path().unwrap())
+            .unwrap()
+            .starts_with(b"LKRIDX06")
+    );
+    assert_eq!(&wire_magic(&group).await, b"LKRIMG08");
+    assert_eq!(
+        group.state.recoveries(),
+        Some(crate::stream::consensus::state::Recoveries {
+            epoch: report.epoch,
+            loss_point: Lsn(2),
+        })
+    );
+    drop(group);
+    cluster.running.remove(&survivor).unwrap().stop().await;
+    cluster.restart(survivor).await;
+    configured(&journal, stream, report.voters).await;
+    let group = cluster.group(survivor, stream).await;
+    assert_eq!(
+        group.state.recoveries().map(|summary| summary.loss_point),
+        Some(Lsn(2))
+    );
+    drop(group);
+    assert_eq!(
+        journal
+            .append_after(stream, writer, Lsn(4), record(4), true)
+            .await,
+        Err(JournalError::Recovered { head: Lsn(2) })
+    );
+
+    // A writer that sealed after the recovery, fenced by a newer seal.
+    let newest = journal
+        .seal(stream, later.fence.epoch, Uuid::from_u128(101))
+        .await
+        .unwrap();
+    assert_eq!(
+        journal
+            .append_after(stream, later.fence, Lsn(6), record(106), true)
+            .await,
+        Err(JournalError::Fenced {
+            current: newest.fence.epoch
+        })
+    );
+    cluster.stop_all().await;
+}
+
+/// Below `CLUSTER_VERSION_RETRY_RECOVERY` the summary is not durable, so a
+/// retry the keeper can still tell an erasing recovery for, from its
+/// standing fence or a retained typed entry, answers `Unavailable`, also
+/// after a restart from a snapshot of the older formats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn below_the_retry_level_a_retry_across_an_erasing_recovery_is_unavailable() {
+    let Erased {
+        mut cluster,
+        journal,
+        stream,
+        writer,
+        report,
+        survivor,
+    } = erased_attempt(
+        crate::stream::consensus::CLUSTER_VERSION_RETRY_RECOVERY - 1,
+        StreamId(0xAA),
+    )
+    .await;
+    assert_eq!(
+        journal
+            .append_after(stream, writer, Lsn(3), record(3), true)
+            .await,
+        Err(JournalError::Unavailable)
+    );
+    // The older formats carry the recorded recovery but no summary.
+    let group = snapshot(&cluster, survivor, stream).await;
+    assert!(
+        std::fs::read(group.state.snapshot_path().unwrap())
+            .unwrap()
+            .starts_with(b"LKRIDX04")
+    );
+    assert_eq!(&wire_magic(&group).await, b"LKRIMG06");
+    drop(group);
+    assert_eq!(journal.acknowledge_recovery(stream).await, Ok(Lsn(2)));
+    assert_eq!(
+        journal
+            .append_after(stream, writer, Lsn(3), record(3), true)
+            .await,
+        Err(JournalError::Unavailable)
+    );
+    let group = snapshot(&cluster, survivor, stream).await;
+    assert!(
+        std::fs::read(group.state.snapshot_path().unwrap())
+            .unwrap()
+            .starts_with(b"LKRIDX02")
+    );
+    assert_eq!(&wire_magic(&group).await, b"LKRIMG04");
+    drop(group);
+    cluster.running.remove(&survivor).unwrap().stop().await;
+    cluster.restart(survivor).await;
+    configured(&journal, stream, report.voters).await;
+    let group = cluster.group(survivor, stream).await;
+    assert_eq!(group.state.recoveries(), None);
+    drop(group);
+    assert_eq!(
+        journal
+            .append_after(stream, writer, Lsn(3), record(3), true)
+            .await,
+        Err(JournalError::Unavailable)
     );
     cluster.stop_all().await;
 }

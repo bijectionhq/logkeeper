@@ -209,6 +209,15 @@ store), the time, and RTDB's marker inside it. Both RTDB's acknowledgement
 and the administrator's below write it, so the stream always records the
 recovery, and no client append can forge it. `head` stays the last record
 kept.
+
+A writer that retries an append whose reply it lost before the recovery
+gets `JournalError::Recovered { head }` with the loss point, not `Fenced`:
+the append may have committed and been erased. RTDB reports it as an
+interrupted write (`rtdb/journal-recovered`, outcome unknown) and withdraws
+the writer when its next seal meets the recovery. From finalized cluster
+version 12 the keeper keeps this answer across trims, snapshots and
+restarts; below it the answer is `Unavailable` where the keeper can still
+tell.
 On a stopped keeper, `logkeeper keeper inspect --config FILE --stream UUID`
 prints the recorded recovery as `recovery: fence=epoch:E head:H
 configuration_epoch=C loss_point=L exact=… source=… entry_at=H+1

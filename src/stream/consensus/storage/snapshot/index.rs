@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::{Genesis, Image, Payload, Selected, SnapshotMeta, invalid, sha256};
 use crate::stream::consensus::{
     decode, encode,
-    state::{EpochRuns, MAX_RETAINED_WITH_HEADROOM, Offload, RecordKind, Recorded},
+    state::{EpochRuns, MAX_RETAINED_WITH_HEADROOM, Offload, RecordKind, Recorded, Recoveries},
     storage::objects::{Key, Location, Object, Objects, Reference},
 };
 
@@ -34,6 +34,11 @@ const MAGIC_WITH_OFFLOAD: &[u8; 8] = b"LKRIDX03";
 /// `CLUSTER_VERSION_RECOVERY_ENTRY`.
 const MAGIC_WITH_RECOVERY: &[u8; 8] = b"LKRIDX04";
 const MAGIC_WITH_CUSTODY: &[u8; 8] = b"LKRIDX05";
+/// Roots that also store the stream's recovery summary, beside an optional
+/// recorded recovery and an optional checkpoint custody. Written only for a
+/// stream that had an operator recovery once the cluster finalized
+/// `CLUSTER_VERSION_RETRY_RECOVERY`.
+const MAGIC_WITH_RECOVERIES: &[u8; 8] = b"LKRIDX06";
 
 /// Whether a selected snapshot starts with an index root.
 pub(in crate::stream::consensus::storage) fn indexed(magic: &[u8; 8]) -> bool {
@@ -42,6 +47,7 @@ pub(in crate::stream::consensus::storage) fn indexed(magic: &[u8; 8]) -> bool {
         || magic == MAGIC_WITH_OFFLOAD
         || magic == MAGIC_WITH_RECOVERY
         || magic == MAGIC_WITH_CUSTODY
+        || magic == MAGIC_WITH_RECOVERIES
 }
 const PAGE: usize = 128;
 // A partial first page and the recovery headroom each add at most a page.
@@ -120,6 +126,7 @@ pub(super) fn build(
     image: &Image,
     previous: &Dependencies,
     with_epochs: bool,
+    with_recoveries: bool,
 ) -> io::Result<Dependencies> {
     let mut dependencies = Dependencies::default();
     let mut first = image.state.retained_floor().0;
@@ -175,12 +182,26 @@ pub(super) fn build(
         legacy: dependencies.legacy.clone(),
     };
     let offload = image.state.offload();
-    let (magic, root) = if let Some(custody) = image.state.checkpoint_custody().ok().flatten() {
-        if image.state.recorded().is_some() {
-            return Err(invalid(
-                "immutable checkpoint custody cannot carry a recovery fence",
-            ));
-        }
+    let custody = image.state.checkpoint_custody().ok().flatten();
+    if custody.is_some() && image.state.recorded().is_some() {
+        return Err(invalid(
+            "immutable checkpoint custody cannot carry a recovery fence",
+        ));
+    }
+    let recoveries = image.state.recoveries().filter(|_| with_recoveries);
+    let (magic, root) = if let Some(recoveries) = recoveries {
+        (
+            MAGIC_WITH_RECOVERIES,
+            encode(&(
+                root,
+                image.state.epoch_runs(),
+                offload,
+                image.state.recorded(),
+                custody,
+                recoveries,
+            ))?,
+        )
+    } else if let Some(custody) = custody {
         (
             MAGIC_WITH_CUSTODY,
             encode(&(root, image.state.epoch_runs(), offload, custody))?,
@@ -220,7 +241,7 @@ pub(super) fn open(
     if bytes.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("invalid indexed snapshot root"));
     }
-    let (mut root, epochs, offload, recorded, custody) = decode_root(&bytes)?;
+    let (mut root, epochs, offload, recorded, custody, recoveries) = decode_root(&bytes)?;
     root.image.stage_intent = root.meta.snapshot_id.starts_with(super::STAGED_IMAGE);
     if &root.genesis != genesis
         || root.meta.last_log_id != Some(selected.log_id)
@@ -293,6 +314,7 @@ pub(super) fn open(
     if let Some(custody) = custody {
         root.image.state.restore_checkpoint_custody(custody)?;
     }
+    root.image.state.restore_recoveries(recoveries)?;
     Ok((root.meta, root.image, dependencies))
 }
 
@@ -302,6 +324,7 @@ type DecodedRoot = (
     Offload,
     Option<Recorded>,
     Option<journal_contract::CheckpointCustody>,
+    Option<Recoveries>,
 );
 
 fn decode_root(bytes: &[u8]) -> io::Result<DecodedRoot> {
@@ -310,21 +333,25 @@ fn decode_root(bytes: &[u8]) -> io::Result<DecodedRoot> {
     }
     if let Some(body) = bytes.strip_prefix(MAGIC) {
         let (root, epochs) = decode(body)?;
-        Ok((root, epochs, Offload::default(), None, None))
+        Ok((root, epochs, Offload::default(), None, None, None))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_OFFLOAD) {
         let (root, epochs, offload) = decode(body)?;
-        Ok((root, epochs, offload, None, None))
+        Ok((root, epochs, offload, None, None, None))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_RECOVERY) {
         let (root, epochs, offload, recorded) = decode(body)?;
-        Ok((root, epochs, offload, Some(recorded), None))
+        Ok((root, epochs, offload, Some(recorded), None, None))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_CUSTODY) {
         let (root, epochs, offload, custody) = decode(body)?;
-        Ok((root, epochs, offload, None, Some(custody)))
+        Ok((root, epochs, offload, None, Some(custody), None))
+    } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_RECOVERIES) {
+        let (root, epochs, offload, recorded, custody, recoveries) = decode(body)?;
+        Ok((root, epochs, offload, recorded, custody, Some(recoveries)))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITHOUT_EPOCHS) {
         Ok((
             decode(body)?,
             EpochRuns::default(),
             Offload::default(),
+            None,
             None,
             None,
         ))

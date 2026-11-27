@@ -1,5 +1,5 @@
 {
-  "summary": "Verify the shipped consensus admission, metering, classification, rotation, batch and restart, operator recovery, recovery restage and recovery fence, keeper incarnation, slow media, parking, repair queue, placement load, leader preference, retirement, stale-vote, WAL boundary, offload and typed recovery entry decisions against the PeerBudget, Headroom, RestartRead, Parking, RetireOnProof, RecoveryFence and RecoveryEntry laws.",
+  "summary": "Verify the shipped consensus admission, metering, classification, rotation, batch and restart, operator recovery, recovery restage and recovery fence, keeper incarnation, slow media, parking, repair queue, placement load, leader preference, retirement, stale-vote, WAL boundary, offload, typed recovery entry and retry-across-recovery decisions against the PeerBudget, Headroom, RestartRead, Parking, RetireOnProof, RecoveryFence, RecoveryEntry and RetryAcrossRecovery laws.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 177,
+  "min_verified_functions": 182,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -1823,6 +1823,121 @@
         {
           "file": "src/stream/consensus/decisions.rs",
           "function": "retains_record",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "trust-the-surviving-history": {
+      "defect": "judge a retry across an erasing recovery against the surviving history alone",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    if !missing || !summarized || writer_epoch >= recovery_epoch || loss_point >= last {",
+          "replace": "    if true || !summarized || writer_epoch >= recovery_epoch || loss_point >= last {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "written_step",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "written_step",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "written_step",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "erase-for-a-newer-writer": {
+      "defect": "treat a writer that sealed at the latest recovery's fence epoch as predating it",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "writer_epoch >= recovery_epoch || loss_point >= last {",
+          "replace": "writer_epoch > recovery_epoch || loss_point >= last {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "written_step",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "written_step",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "written_step",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "recovered-below-the-level": {
+      "defect": "answer Recovered before the summary is durable",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    } else if durable {\n        WrittenStep::Recovered",
+          "replace": "    } else if true {\n        WrittenStep::Recovered"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "written_step",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "written_step",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "keep-the-latest-loss-point": {
+      "defect": "keep the latest recovery's loss point instead of the lowest",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    let lowest = if held && held_loss_point < loss_point {",
+          "replace": "    let lowest = if false && held_loss_point < loss_point {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "absorb_recovery",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "keep-the-first-recovery-epoch": {
+      "defect": "keep the first recovery's fence epoch instead of the latest",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    let latest = if held && held_epoch > epoch {",
+          "replace": "    let latest = if held {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "absorb_recovery",
           "category": "postcondition not satisfied"
         }
       ],
