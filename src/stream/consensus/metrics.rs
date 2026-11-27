@@ -786,6 +786,29 @@ impl Metrics {
         );
         let _ = writeln!(
             out,
+            "# HELP logkeeper_consensus_media_responsive Whether the WAL is healthy and no recent round ran past the slow-round limit (1) or not (0)."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_media_responsive gauge");
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_media_responsive {}",
+            u8::from(scrape.media_responsive)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_wal_slow_round_seconds WAL round duration past which the keeper marks its media slow and hands off leadership."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_wal_slow_round_seconds gauge"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_wal_slow_round_seconds {}",
+            super::storage::SLOW_ROUND.as_secs_f64()
+        );
+        let _ = writeln!(
+            out,
             "# HELP logkeeper_consensus_wal_round_limit_seconds WAL round duration at which the watchdog ends the keeper."
         );
         let _ = writeln!(
@@ -1070,6 +1093,7 @@ pub(super) struct ScrapeSnapshot {
     pub keeper: Uuid,
     pub domain: String,
     pub wal_healthy: bool,
+    pub media_responsive: bool,
     pub accepting: bool,
     pub streams_hosted: usize,
     pub streams_open: usize,
@@ -1219,6 +1243,7 @@ mod tests {
             keeper: k1,
             domain: "zone-a".into(),
             wal_healthy: true,
+            media_responsive: true,
             accepting: true,
             streams_hosted: 5,
             streams_open: 4,

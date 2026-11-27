@@ -145,11 +145,13 @@ impl Recognition {
         {
             record.reused = true;
             *unsaved = true;
-            eprintln!(
-                "logkeeper keeper {peer} knows this keeper under incarnation {known:?}, not {}: \
-                 its media was installed again under a used keeper ID, so it registers no \
-                 replica it does not hold; give it a new keeper ID",
-                self.own
+            tracing::error!(
+                peer = %peer,
+                known = ?known,
+                incarnation = %self.own,
+                "a peer knows this keeper under another incarnation: its media was installed \
+                 again under a used keeper ID, so it registers no replica it does not hold; \
+                 give it a new keeper ID"
             );
         }
         // Reuse is recorded before it takes effect, and takes effect before
@@ -176,9 +178,11 @@ impl Recognition {
         {
             changed = true;
             self.reincarnated.write().insert(peer.as_u128());
-            eprintln!(
-                "logkeeper keeper {peer} answered under incarnation {incarnation}, not {first}: \
-                 its votes no longer count"
+            tracing::warn!(
+                peer = %peer,
+                incarnation = %incarnation,
+                first = %first,
+                "peer answered under a new incarnation: its votes no longer count"
             );
         }
         changed
@@ -194,8 +198,10 @@ impl Recognition {
         let current = record.clone();
         match tokio::task::spawn_blocking(move || current.store(&path)).await {
             Ok(Ok(())) => *unsaved = false,
-            Ok(Err(error)) => eprintln!("logkeeper could not record peer incarnations: {error}"),
-            Err(error) => eprintln!("logkeeper could not record peer incarnations: {error}"),
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not record peer incarnations")
+            }
+            Err(error) => tracing::warn!(error = %error, "could not record peer incarnations"),
         }
     }
 

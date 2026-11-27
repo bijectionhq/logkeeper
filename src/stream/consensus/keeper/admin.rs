@@ -949,7 +949,7 @@ impl Engine {
         }
 
         let wal_healthy = self.disk.healthy();
-        let accepting = wal_healthy && self.disk.space.accepts_streams();
+        let accepting = self.disk.responsive() && self.disk.space.accepts_streams();
         let liveness = self.liveness_snapshot(accepting);
         let replication_lag = follower_lags
             .into_iter()
@@ -974,6 +974,7 @@ impl Engine {
             keeper: self.id,
             domain: domains.get(&self.id).cloned().unwrap_or_default(),
             wal_healthy,
+            media_responsive: self.disk.responsive(),
             accepting,
             streams_hosted: total_hosted,
             streams_open,

@@ -138,9 +138,9 @@ impl Watchdog {
                     let round = watchdog.started.load(Ordering::Acquire);
                     if running > SLOW_ROUND && flagged != round {
                         flagged = round;
-                        eprintln!(
-                            "logkeeper consensus WAL round slow for {running:?}; \
-                             handing off leadership"
+                        tracing::warn!(
+                            running_ms = running.as_millis() as u64,
+                            "consensus WAL round slow; handing off leadership"
                         );
                         watchdog.hold_slow(watchdog.now());
                         watchdog.slowed.notify_one();
