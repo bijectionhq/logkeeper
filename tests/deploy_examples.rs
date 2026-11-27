@@ -51,14 +51,6 @@ fn check_keeper(config: &Config) {
     {
         assert!(uri.starts_with("urn:logkeeper:client:"), "{uri}");
     }
-    // The Dockerfile healthcheck and the Kubernetes probes and preStop hook
-    // call this plain loopback admin listener.
-    let admin = config
-        .admin
-        .as_ref()
-        .expect("examples serve the admin listener");
-    assert_eq!(admin.listen, "127.0.0.1:5741".parse().unwrap());
-    assert!(!admin.mtls);
     assert!(config.async_append);
     assert!(!config.data.starts_with(&config.enrollment));
     assert!(!config.enrollment.starts_with(&config.data));
@@ -80,6 +72,9 @@ fn check_authority(config: &Config, placement: &Value, provision: &Value) {
 fn keeper_example_parses_and_matches_its_authority() {
     let config = Config::read(&deploy("keeper.example.json")).unwrap();
     check_keeper(&config);
+    let admin = config.admin.as_ref().expect("image healthcheck uses admin");
+    assert_eq!(admin.listen, "127.0.0.1:5741".parse().unwrap());
+    assert!(!admin.mtls);
     check_authority(
         &config,
         &json("placement.example.json"),
@@ -90,11 +85,21 @@ fn keeper_example_parses_and_matches_its_authority() {
 #[test]
 fn kubernetes_keepers_share_one_inventory() {
     let placement = json("kubernetes/keepers/placement.json");
-    let configs = (0..3)
+    let configs = (0..6)
         .map(|n| {
             let config =
                 Config::read(&deploy(&format!("kubernetes/keepers/keeper-{n}.json"))).unwrap();
             check_keeper(&config);
+            let admin = config.admin.as_ref().expect("keeper admin and probes");
+            assert_eq!(admin.listen.ip(), config.listen.ip());
+            assert_eq!(admin.listen.port(), 5741);
+            assert!(admin.mtls);
+            assert_eq!(admin.probe_listen, Some("127.0.0.1:5742".parse().unwrap()));
+            for peer in &admin.cluster {
+                assert_eq!(peer.1.ip(), config.keepers[peer.0].ip());
+                assert_eq!(peer.1.port(), 5741);
+            }
+            assert_eq!(admin.cluster.len(), 5);
             check_authority(
                 &config,
                 &placement,
@@ -120,8 +125,17 @@ fn kubernetes_keepers_share_one_inventory() {
         .iter()
         .map(|config| config.keeper)
         .collect::<Vec<_>>();
-    assert_eq!(ids.len(), 3);
+    assert_eq!(ids.len(), 6);
+    assert_eq!(
+        ids.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        6
+    );
     assert!(ids.iter().all(|id| configs[0].keepers.contains_key(id)));
+    let mut domain_counts = std::collections::BTreeMap::new();
+    for domain in configs[0].domains.values() {
+        *domain_counts.entry(domain).or_insert(0) += 1;
+    }
+    assert_eq!(domain_counts.into_values().collect::<Vec<_>>(), [2, 2, 2]);
 }
 
 #[test]

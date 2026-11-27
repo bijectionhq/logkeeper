@@ -33,9 +33,12 @@ For each keeper, one at a time:
    refused`, the keeper still uses its previous credentials. Correct the
    files and send SIGHUP again.
 
-On Kubernetes, ensure the mounted files and provision digest have updated
-before sending HUP to the keeper process. Applying a ConfigMap change that
-updates the pod template uses the StatefulSet's rolling restart instead.
+On Kubernetes, stage a new versioned Secret for that keeper using `tls.crt`,
+`tls.key` and `ca.crt`, then update its workload's Secret reference and the
+provision digest in its ConfigMap. This keeps the live certificate available
+for the safe-to-stop preflight. Apply the staged configuration and use the
+[guarded rollover procedure](rolling-upgrade.md#kubernetes) to load the new
+files. Verify mTLS before removing the previous Secret.
 
 ## Client certificates (RTDB, operators)
 

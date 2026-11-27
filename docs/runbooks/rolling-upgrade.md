@@ -153,23 +153,33 @@ restart with writes in flight.
 
 ## Kubernetes
 
-The StatefulSet carries out steps 6 to 9 by itself:
-- The `preStop` hook waits for `/safe-to-stop`, for at most 240 s.
-- SIGTERM hands off leadership.
-- The next pod is replaced only after `/ready` has held for
-  `minReadySeconds`.
-
-Stage the rollout with `partition`, so you can stop it between pods:
+Stage the digest in the Kustomization for both `keeper` and `install` and
+apply it to the staging context. The StatefulSets use `OnDelete`, so
+applying a template leaves running pods in place. Serialize voluntary
+maintenance across all keepers, including node drains. The operator running
+this procedure needs `get` on pods, StatefulSets and PodDisruptionBudgets,
+`create` on `pods/exec` and `pods/eviction`, and permission to apply the staged
+template. Keep direct pod deletion out of routine operator permissions.
 
 ```sh
-kubectl -n logkeeper patch statefulset logkeeper --type merge \
-  -p '{"spec":{"updateStrategy":{"rollingUpdate":{"partition":2}}}}'
-kubectl -n logkeeper set image statefulset/logkeeper keeper=IMAGE:NEW install=IMAGE:NEW
-kubectl -n logkeeper rollout status statefulset/logkeeper   # only logkeeper-2 is replaced
-# check probes and /problems, then partition 1, then 0
+kubectl --context "$STAGING_CONTEXT" apply -k deploy/consensus/kubernetes
+python3 deploy/consensus/kubernetes/roll-keeper.py \
+  --context "$STAGING_CONTEXT" --namespace logkeeper logkeeper-0 --evict
 ```
 
-**Abort** by setting `partition` back to 3 (which freezes the rollout) and
-restoring the previous image on the replaced pods. If a preStop hook gave up
-after 240 s, the pod logs show `safe-to-stop still refused after 240 s`. Treat
-that as an abort signal for the remaining pods.
+Omit `--evict` to check without replacing a pod. With `--evict`, the guard
+queries the selected keeper's mTLS `/safe-to-stop` endpoint immediately
+before requesting eviction of that exact pod UID. An unsafe report, probe
+failure or rejected eviction stops the command. The Eviction API observes
+the shared PodDisruptionBudget. After the replacement reaches `Ready` at the
+expected controller revision, verify cluster health and the workload's live
+image digest before proceeding to the next keeper. Follow the mixed-version
+checks and finalization steps above. Use the same once-per-keeper checks for
+planned node maintenance, and apply the preflight at the point of eviction.
+
+If a replacement fails to become ready, stop the rollout. Inspect the
+replacement and the event log. To roll back while the on-disk version still
+allows it, restore the previous pinned digest, apply the templates and follow
+the guarded procedure for healthy keepers that changed. If the target cannot
+serve preflight, handle that keeper as an incident and check the remaining
+stream quorums before any direct recovery action.

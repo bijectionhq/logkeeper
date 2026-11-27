@@ -15,7 +15,7 @@ Packaging lives in [`deploy/consensus/`](../deploy/consensus/):
 | --- | --- |
 | `Dockerfile` | Multi-stage image, non-root (uid 10001), media and registry volumes, healthcheck on `/live` |
 | `logkeeper-consensus.service` | Hardened systemd unit with a 30 s stop timeout |
-| `kubernetes/` | Kustomize base: StatefulSet, pre-bound local volumes, PodDisruptionBudget, generated keeper configs |
+| `kubernetes/` | Kustomize bundle for six single-keeper StatefulSets across three zones |
 | `keeper.example.json`, `placement.example.json`, `provision.example.json` | One keeper's config and its registry authority files |
 | `rtdb-journal.example.json` | The RTDB side: a Logkeeper `JournalConfig` |
 | `operator.example.json` | What `logkeeper admin` reads: the operator's credentials and every keeper's application and admin address |
@@ -405,49 +405,65 @@ keepers are up.
 
 ### Kubernetes
 
-[`deploy/consensus/kubernetes/`](../deploy/consensus/kubernetes/) is a
-Kustomize base. Render it with `kubectl kustomize`, and validate it with
-`deploy/consensus/tests/validate.sh`. The design choices follow from the
-keeper's rules:
+The [Kustomize bundle](../deploy/consensus/kubernetes/) is a staging template
+for six keepers on six dedicated nodes, with two nodes per zone. Each keeper
+has its own singleton StatefulSet, node IP, and TLS Secret. Its two retained
+local PVs bind to the same host and point to separate media and enrollment
+filesystems. All six pods have required hostname anti-affinity. Zone selectors
+put two keepers in each zone, and the three initial catalog voters occupy three
+different zones. Clients and peers connect to the node addresses in the
+inventory. The headless Service provides StatefulSet identity.
 
-- **Host network, pre-bound local volumes.** The inventory is `IP:port` and
-  the keeper binds its own inventory addresses. So each pod runs on the host
-  network, and its address is its node's IP. `volumes.yaml` pre-binds pod N's
-  claims (`media-logkeeper-N`, `registry-logkeeper-N`) to local volumes on
-  node N, which pins pod N to the node whose IP is in keeper N's config.
-- **Stable keeper ID per pod.** The `install` init container takes the pod
-  ordinal from the pod name. It copies `keepers/keeper-N.json` to the config
-  path, and `placement.json` and `keeper-N.provision.json` into the registry
-  volume. It installs media only if the media has no `KEEPER` file *and* the
-  keeper's UUID is listed in the `logkeeper-initialize` ConfigMap. Otherwise
-  it fails, which is the never-reuse rule.
-- **Zones:** required anti-affinity on `topology.kubernetes.io/zone` and on
-  `kubernetes.io/hostname`.
-- **Probes:** a startup and liveness probe on `/live`, and readiness on
-  `/ready`. Both use `curl` on loopback inside the pod, because a
-  plain admin listener only binds loopback.
-- **Rolling updates:** `podManagementPolicy: Parallel`, so the three pods can
-  find each other at first start. `RollingUpdate` with `maxUnavailable: 1`
-  and `minReadySeconds: 30` replaces one pod at a time and waits for `/ready`.
-- **PodDisruptionBudget:** `maxUnavailable: 1`.
-- **preStop:** waits up to 240 s for `/safe-to-stop`. SIGTERM then
-  hands off leadership. `terminationGracePeriodSeconds: 300` covers both.
-- **Certificates:** one Secret, `logkeeper-tls`, holds every keeper's
-  `keeper-N.pem` and `keeper-N.key`, plus `ca.pem`. A plain StatefulSet cannot
-  mount a different Secret per pod. Use the cert-manager CSI driver, or
-  similar, to give each pod only its own key.
+1. Prepare six dedicated staging nodes. Provide the host networking permission
+   required by the namespace, set the zone labels, mount their two filesystems,
+   and verify that UID/GID `10001` can write to both mounts. Set the hostname,
+   path and storage size for each PV in `volumes.yaml`. Keep registry storage
+   and its recovery copies independent of keeper media.
+2. Set each workload's zone selector and the corresponding keeper's node IP
+   in **every** inventory. Keep `placement.json`, each provision document and
+   the RTDB journal and operator configs in agreement. Allow application port
+   `5441` from approved clients and keepers, control and bulk ports `5541` and
+   `5641` between keepers, and admin port `5741` from approved operators,
+   scrapers and keepers. Restrict these host-network listeners with node or
+   network controls. The probe listener on loopback port `5742` serves only
+   `/live` and `/ready`.
+3. In the staging namespace, create six Secrets named `logkeeper-tls-0`
+   through `logkeeper-tls-5`. Give each Secret keys `tls.crt`, `tls.key` and
+   `ca.crt` for that keeper only. Give the leaf both client and server usages,
+   the keeper's URI SAN, and its node IP as an IP SAN so that the rollover
+   guard can verify the admin server. Set the `certificate_sha256` of each
+   provision document to the SHA-256 hash of its `tls.crt` file. Set the
+   metrics principal in `admin.metrics_readers` if enabling metrics collection.
+4. In the staging Kustomization, set an `images` mapping for
+   `logkeeper-consensus` to the pinned registry image name and digest. List
+   only the six new UUIDs in `logkeeper-initialize` for first bring-up.
+   The init container selects its public config by keeper ordinal. It refuses
+   to start on media with no `KEEPER` marker unless the UUID is explicitly
+   authorized to initialize. Use the [disk replacement runbook](runbooks/replace-disk.md)
+   for lost media.
+5. Render the staged configuration and run `deploy/consensus/tests/validate.sh`
+   with `kubeconform` available. Apply to the staging context and check all
+   six workloads.
 
-Create the Secret, set the node IPs, node names and certificate digests, and
-set `logkeeper-initialize` to the three UUIDs for the first rollout. Then run:
+   ```sh
+   kubectl --context "$STAGING_CONTEXT" apply -k deploy/consensus/kubernetes
+   for keeper in logkeeper-0 logkeeper-1 logkeeper-2 logkeeper-3 logkeeper-4 logkeeper-5; do
+     kubectl --context "$STAGING_CONTEXT" -n logkeeper rollout status "statefulset/$keeper" --timeout=15m || break
+   done
+   kubectl --context "$STAGING_CONTEXT" -n logkeeper get pods,poddisruptionbudgets
+   ```
 
-```sh
-kubectl apply -k deploy/consensus/kubernetes
-kubectl -n logkeeper rollout status statefulset/logkeeper
-```
+6. Empty `logkeeper-initialize` and reapply immediately after bring-up. It is
+   a stable-name ConfigMap so clearing the bootstrap authorization leaves
+   the pod templates alone. Keep the authorization empty during normal
+   operation.
 
-Because the ConfigMap is generated with a hash suffix, empty the
-`logkeeper-initialize` literal in `kustomization.yaml` and apply again once
-all keepers are ready.
+Use the [guarded rollover procedure](runbooks/rolling-upgrade.md#kubernetes)
+for voluntary restarts. StatefulSets use `OnDelete` and the shared
+PodDisruptionBudget permits a single voluntary disruption through the
+Eviction API. The rollover guard checks the keeper's `/safe-to-stop` report
+before submitting the eviction. Node failure and liveness-triggered restarts
+can happen independently of these controls.
 
 ### systemd
 

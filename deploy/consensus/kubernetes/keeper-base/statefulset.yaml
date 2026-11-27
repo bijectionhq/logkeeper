@@ -1,22 +1,3 @@
-# Headless service for the StatefulSet's identity. Clients and peers do not
-# use it: the keeper inventory is IP:port, so keepers run on the host network
-# and are addressed by their node IPs.
-apiVersion: v1
-kind: Service
-metadata:
-  name: logkeeper
-  labels:
-    app.kubernetes.io/name: logkeeper
-spec:
-  clusterIP: None
-  publishNotReadyAddresses: true
-  selector:
-    app.kubernetes.io/name: logkeeper
-  ports:
-    - { name: application, port: 5441 }
-    - { name: control, port: 5541 }
-    - { name: bulk, port: 5641 }
----
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -25,14 +6,11 @@ metadata:
     app.kubernetes.io/name: logkeeper
 spec:
   serviceName: logkeeper
-  replicas: 3
-  # Keepers become ready only once they reach a peer, so they start together.
-  # Rolling updates still replace one pod at a time, waiting for /ready.
-  podManagementPolicy: Parallel
+  replicas: 1
+  # Each keeper has its own workload and Secret. Deliver template updates
+  # by evicting one keeper at a time after the quorum preflight.
   updateStrategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 1
+    type: OnDelete
   minReadySeconds: 30
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: Retain
@@ -46,10 +24,10 @@ spec:
         app.kubernetes.io/name: logkeeper
     spec:
       hostNetwork: true
+      automountServiceAccountToken: false
       dnsPolicy: ClusterFirstWithHostNet
-      # preStop waits up to 240 s for /safe-to-stop; SIGTERM then hands off
-      # leadership (at most 3 s) and flushes the WAL.
-      terminationGracePeriodSeconds: 300
+      # SIGTERM hands off leadership and flushes the WAL.
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -60,10 +38,6 @@ spec:
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
-            - topologyKey: topology.kubernetes.io/zone
-              labelSelector:
-                matchLabels:
-                  app.kubernetes.io/name: logkeeper
             - topologyKey: kubernetes.io/hostname
               labelSelector:
                 matchLabels:
@@ -75,7 +49,7 @@ spec:
           command: [/bin/sh, -ec]
           args:
             - |
-              ordinal="${POD_NAME##*-}"
+              ordinal="$KEEPER_ORDINAL"
               id="$(cat "/etc/logkeeper/keepers/keeper-$ordinal.id")"
               cp "/etc/logkeeper/keepers/keeper-$ordinal.json" /run/logkeeper/keeper.json
               cp /etc/logkeeper/keepers/placement.json /var/lib/logkeeper/registry/placement.json
@@ -94,8 +68,9 @@ spec:
                 "a keeper ID is never reused on new media (docs/runbooks/replace-disk.md)" >&2
               exit 1
           env:
-            - name: POD_NAME
-              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: KEEPER_ORDINAL
+              valueFrom:
+                fieldRef: { fieldPath: "metadata.labels['logkeeper.bijectionhq.com/keeper-ordinal']" }
             - name: LOGKEEPER_INITIALIZE
               valueFrom: { configMapKeyRef: { name: logkeeper-initialize, key: keepers } }
           securityContext:
@@ -121,35 +96,19 @@ spec:
             requests: { cpu: "2", memory: 4Gi }
             limits: { memory: 8Gi }
           startupProbe:
-            exec: { command: [curl, -fsS, -o, /dev/null, "http://127.0.0.1:5741/live"] }
+            exec: { command: [curl, -fsS, -o, /dev/null, "http://127.0.0.1:5742/live"] }
             periodSeconds: 5
             failureThreshold: 120
           livenessProbe:
-            exec: { command: [curl, -fsS, -o, /dev/null, "http://127.0.0.1:5741/live"] }
+            exec: { command: [curl, -fsS, -o, /dev/null, "http://127.0.0.1:5742/live"] }
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 6
           readinessProbe:
-            exec: { command: [curl, -fsS, -o, /dev/null, "http://127.0.0.1:5741/ready"] }
+            exec: { command: [curl, -fsS, -o, /dev/null, "http://127.0.0.1:5742/ready"] }
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 2
-          lifecycle:
-            preStop:
-              exec:
-                command:
-                  - /bin/sh
-                  - -c
-                  - |
-                    i=0
-                    until curl -fsS -o /dev/null http://127.0.0.1:5741/safe-to-stop; do
-                      i=$((i + 1))
-                      if [ "$i" -ge 240 ]; then
-                        echo "safe-to-stop still refused after 240 s; stopping anyway" >&2
-                        exit 0
-                      fi
-                      sleep 1
-                    done
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -162,11 +121,8 @@ spec:
       volumes:
         - name: keepers
           configMap: { name: logkeeper-keepers }
-        # Holds keeper-N.pem, keeper-N.key for every N and ca.pem. Every pod
-        # mounts all keys; issue per-pod certificates (for example with the
-        # cert-manager CSI driver) to give each pod only its own.
         - name: tls
-          secret: { secretName: logkeeper-tls, defaultMode: 0400 }
+          secret: { secretName: logkeeper-tls, defaultMode: 0440 }
         - name: config
           emptyDir: { medium: Memory, sizeLimit: 1Mi }
   volumeClaimTemplates:

@@ -31,11 +31,12 @@ probe() { curl -sS -o /dev/stderr -w '%{http_code}\n' "$ADMIN/$1"; }
 holds an administrator certificate and every keeper's application and admin
 address (see `deploy/consensus/operator.example.json`).
 
-`probe ready` prints the JSON body and then the HTTP status: `200` means
-yes, and `503` means no. On Kubernetes, run the same commands inside the pod
-with `kubectl -n logkeeper exec logkeeper-N -c keeper -- curl -sS
-http://127.0.0.1:5741/ready`. Stop and start keepers by deleting the pod or
-updating the StatefulSet, never with `kubectl exec ... kill`.
+`probe ready` prints the JSON body and then the HTTP status. `200` means
+ready, and `503` means unready. The Kubernetes loopback probe endpoint is
+available through `kubectl --context "$STAGING_CONTEXT" -n logkeeper exec
+logkeeper-N-0 -c keeper -- curl -sS http://127.0.0.1:5742/ready`.
+For planned Kubernetes pod replacements, use the
+[guarded rollover procedure](rolling-upgrade.md#kubernetes).
 
 **General abort rule.** Stop any procedure, and change nothing else, if any
 of these appears on a keeper:

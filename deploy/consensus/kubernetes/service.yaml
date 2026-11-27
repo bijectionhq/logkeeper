@@ -1,0 +1,18 @@
+# Headless service for the StatefulSet's identity. Clients and peers do not
+# use it: the keeper inventory is IP:port, so keepers run on the host network
+# and are addressed by their node IPs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: logkeeper
+  labels:
+    app.kubernetes.io/name: logkeeper
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: logkeeper
+  ports:
+    - { name: application, port: 5441 }
+    - { name: control, port: 5541 }
+    - { name: bulk, port: 5641 }

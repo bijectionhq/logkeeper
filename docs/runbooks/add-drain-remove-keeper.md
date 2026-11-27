@@ -45,10 +45,13 @@ Both modes survive restart and block new replica registration on the keeper.
    ```
 
    On Kubernetes:
-   - Add a fourth `keepers/keeper-3.*` set and the PVs for node 3.
-   - Set `replicas: 4`.
-   - List the new UUID in `logkeeper-initialize`.
-   - Apply, then empty `logkeeper-initialize` again.
+   - Add a singleton keeper StatefulSet and matching config, dedicated TLS
+     Secret, and two retained local PVs. Give the new keeper a new ordinal
+     and pin it to the node and zone in its inventory.
+   - List the new UUID in `logkeeper-initialize`, apply and wait for readiness,
+     then clear `logkeeper-initialize` and apply again.
+   - Use the [guarded rollover procedure](rolling-upgrade.md#kubernetes) for
+     existing keepers that need to reload their inventory.
 
 5. **Make it eligible for new streams.** Add the UUID to `placement`, with
    its domain, in every RTDB `JournalConfig` file, and to `keepers`. RTDB
