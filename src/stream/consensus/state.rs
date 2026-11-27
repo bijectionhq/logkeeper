@@ -1844,14 +1844,16 @@ impl Live {
     }
 
     fn offloaded(&mut self, lineage: u64, through: Lsn, retain_from: Lsn) -> Outcome {
-        if lineage != self.offload.lineage {
-            return Outcome::Refused(JournalError::Conflict { head: self.head });
-        }
-        self.offload.through = Lsn(super::decisions::offloaded_through(
+        let Some(through) = super::decisions::lineage_offload(
+            self.offload.lineage,
+            lineage,
             self.offload.through.0,
             through.0,
             self.head.0,
-        ));
+        ) else {
+            return Outcome::Refused(JournalError::Conflict { head: self.head });
+        };
+        self.offload.through = Lsn(through);
         self.drop_local(Lsn(super::decisions::local_floor(
             self.floor.0,
             retain_from.0,

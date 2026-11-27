@@ -101,7 +101,10 @@ impl Placement {
                 None => return false,
             }
         }
-        decisions::spread_allows(voters.len(), counts.into_values().max().unwrap_or(0))
+        decisions::spread_allows(
+            voters.len(),
+            counts.into_values().fold(0, decisions::largest_domain),
+        )
     }
 
     /// Structural check: three or five sorted known keepers (active or

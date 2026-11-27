@@ -146,15 +146,16 @@ impl Lease {
     /// Whether this keeper holds a valid lease now.
     pub fn valid(&self) -> bool {
         let sent = self.sent.load(Ordering::Acquire);
-        sent != 0
-            && self.now().is_some_and(|now| {
-                decisions::lease_valid(
-                    sent - 1,
-                    self.granted_duration.load(Ordering::Acquire),
-                    self.granted_margin.load(Ordering::Acquire),
-                    now,
-                )
-            })
+        if sent == 0 {
+            return false;
+        }
+        let now = self.now();
+        decisions::sampled_lease_valid(
+            sent,
+            self.granted_duration.load(Ordering::Acquire),
+            self.granted_margin.load(Ordering::Acquire),
+            now,
+        )
     }
 
     /// The configuration revision below which the catalog fences this

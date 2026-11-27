@@ -72,7 +72,7 @@ fn complete(
             }
         }
     }
-    let spread = counts.values().copied().max().unwrap_or(0);
+    let spread = counts.into_values().fold(0, decisions::largest_domain);
     (chosen.len() == factor && decisions::spread_allows(factor, spread))
         .then(|| Voters::sorted(&chosen))
         .flatten()

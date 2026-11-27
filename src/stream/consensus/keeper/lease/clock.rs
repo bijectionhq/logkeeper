@@ -2,6 +2,8 @@ use std::{io, time::Duration};
 
 use tokio::time::{Instant, sleep};
 
+use crate::stream::consensus::decisions;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn now() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -50,9 +52,9 @@ pub(super) async fn wait_for_expiry(
     loop {
         let elapsed = now()
             .and_then(|sample| sample.checked_sub(started))
-            .map(Duration::from_nanos)
             .ok_or_else(unavailable)?;
-        let remaining = window.saturating_sub(elapsed.min(running.elapsed()));
+        let elapsed = decisions::recovery_elapsed(elapsed, running.elapsed().as_nanos());
+        let remaining = window.saturating_sub(Duration::from_nanos(elapsed));
         if remaining.is_zero() {
             return Ok(());
         }

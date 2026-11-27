@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 182,
+  "min_verified_functions": 197,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -1942,6 +1942,114 @@
         }
       ],
       "min_verified_functions": 150
+    },
+    "forget-a-longer-prior-grant": {
+      "defect": "shorten a keeper's recorded lease to a smaller new grant",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "if prior > granted { prior } else { granted }",
+          "replace": "granted"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "longest_grant",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 191
+    },
+    "recover-on-the-faster-clock": {
+      "defect": "end the recovery wait on the faster of the two clocks",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "if (continuous as u128) <= running {",
+          "replace": "if (continuous as u128) < running {\n        return running as u64;\n    }\n    if (continuous as u128) <= running {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_elapsed",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 191
+    },
+    "undercount-a-failure-domain": {
+      "defect": "ignore a domain larger than those counted before",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "if largest > count { largest } else { count }",
+          "replace": "largest"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "largest_domain",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 191
+    },
+    "keep-authority-without-a-clock": {
+      "defect": "count a lease valid when the continuous clock cannot be read",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "Some(sample) if encoded_sent > 0 => lease_valid(encoded_sent - 1, duration, margin, sample),\n        _ => false,",
+          "replace": "Some(sample) if encoded_sent > 0 => lease_valid(encoded_sent - 1, duration, margin, sample),\n        _ => true,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "sampled_lease_valid",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 191
+    },
+    "accept-progress-from-a-deposed-lineage": {
+      "defect": "apply offload progress uploaded under an older lineage",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "if lineage == uploaded_lineage {",
+          "replace": "if lineage <= uploaded_lineage {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "lineage_offload",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 191
+    },
+    "wait-only-the-current-configuration": {
+      "defect": "leave a fenced keeper's lease out of the recovery wait",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "Some(wait) => longest_grant(accumulated, wait),",
+          "replace": "Some(_) => accumulated,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "include_recovery_wait",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 191
     }
   }
 }

@@ -1099,4 +1099,96 @@ fn without_an_erasing_recovery_the_lookup_decides(
     assert(last <= loss_point ==> step is Lookup);
 }
 
+// Endgame rule 2 on the holder's continuous clock, which keeps counting
+// while the machine is suspended: the lease ends once that clock has run the
+// lease less the margin past the send sample, and a keeper that cannot read
+// the clock holds no lease.
+fn a_suspended_holder_expires_from_the_continuous_sample(
+    sent: u64, duration: u64, margin: u64, now: u64,
+) {
+    let valid = sampled_lease_valid(sent, duration, margin, Some(now));
+    assert(valid ==> sent > 0 && now as int >= sent as int - 1);
+    assert(now as int >= sent as int - 1 + duration as int - margin as int ==> !valid);
+    let missing = sampled_lease_valid(sent, duration, margin, None);
+    assert(!missing);
+}
+
+// The recovery wait ends only once both the continuous clock and the
+// runtime's monotonic clock have run the whole window, so a suspension that
+// one of them misses never shortens it.
+fn recovery_must_finish_both_clocks(continuous: u64, running: u128, window: u128) {
+    let elapsed = recovery_elapsed(continuous, running);
+    assert((elapsed as int >= window as int) <==>
+        (continuous as int >= window as int && running as int >= window as int));
+}
+
+// Endgame rule 4. The wait does not shorten when the catalog changes its
+// settings, a keeper rejoins under a new epoch, or the lost set grows.
+fn the_recovery_wait_dominates_each_grant(
+    own: u64, old_duration: u64, old_margin: u64, new_duration: u64, new_margin: u64,
+    other_duration: u64, other_margin: u64,
+) {
+    let duration = longest_grant(old_duration, new_duration);
+    let margin = longest_grant(old_margin, new_margin);
+    let first = include_recovery_wait(own, duration, margin);
+    let wait = include_recovery_wait(first, other_duration, other_margin);
+    assert(wait >= own);
+    assert(duration as int + margin as int <= u64::MAX ==>
+        wait as int >= old_duration as int + old_margin as int
+        && wait as int >= new_duration as int + new_margin as int);
+    assert(other_duration as int + other_margin as int <= u64::MAX ==>
+        wait as int >= other_duration as int + other_margin as int);
+}
+
+// Cross-multiply holder (slow) and recovery (fast) real-time bounds using
+// rates (duration - drift)/duration and (duration + drift)/duration.
+proof fn drift_margin_covers_the_slowest_holder_and_fastest_recovery(duration: int, margin: int, drift: int)
+    requires 0 <= drift <= margin < duration,
+    ensures (duration - margin) * (duration + drift) <= (duration + margin) * (duration - drift),
+{
+    assert(0 <= duration * (margin - drift)) by(nonlinear_arith)
+        requires 0 <= duration, 0 <= margin - drift;
+    assert((duration + margin) * (duration - drift) - (duration - margin) * (duration + drift)
+        == 2 * (duration * (margin - drift))) by(nonlinear_arith);
+}
+
+fn offload_updates_never_cross_lineage_or_commit(
+    lineage: u64, reported: u64, through: u64, proposed: u64, head: u64,
+)
+    requires through <= head,
+{
+    let updated = lineage_offload(lineage, reported, through, proposed, head);
+    assert((updated is None) <==> lineage != reported);
+    if let Some(updated) = updated {
+        assert(through <= updated <= head);
+    }
+}
+
+// Placement folds `largest_domain` over every failure domain's voter count,
+// starting at zero, and admits the roster with `spread_allows`. Then losing
+// any one domain, whichever, leaves a quorum: 1+1+1 for three voters, at most
+// two per domain for five.
+fn an_admitted_roster_survives_the_loss_of_any_domain(
+    voters: usize, counts: &[usize], lost: usize,
+)
+    requires lost < counts@.len(),
+{
+    let mut largest: usize = 0;
+    let mut i: usize = 0;
+    while i < counts.len()
+        invariant
+            i <= counts@.len(),
+            forall|j: int| 0 <= j < i ==> #[trigger] counts@[j] <= largest,
+        decreases counts@.len() - i,
+    {
+        largest = largest_domain(largest, counts[i]);
+        i += 1;
+    }
+    if spread_allows(voters, largest) {
+        assert(counts@[lost as int] <= largest);
+        assert(voters == 3 || voters == 5);
+        assert(voters - counts@[lost as int] >= voters / 2 + 1);
+    }
+}
+
 }

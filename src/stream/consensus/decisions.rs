@@ -1638,3 +1638,91 @@ verus! {
         if average + bump > u32::MAX as int { u32::MAX as int } else { average + bump }
     }
 }
+
+/// Lease samples use zero for no grant and otherwise store the send sample plus one.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (encoded_sent > 0 && (now matches Some(sample) && margin < duration
+        && (encoded_sent as int - 1) <= sample as int
+        && (sample as int - (encoded_sent as int - 1)) < duration as int - margin as int)),
+))]
+pub(super) fn sampled_lease_valid(
+    encoded_sent: u64,
+    duration: u64,
+    margin: u64,
+    now: Option<u64>,
+) -> bool {
+    match now {
+        Some(sample) if encoded_sent > 0 => lease_valid(encoded_sent - 1, duration, margin, sample),
+        _ => false,
+    }
+}
+
+/// Recovery waits on the slower of its two measured elapsed times. The
+/// continuous sample is already in nanoseconds and bounds the result.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out as int == if continuous as int <= running as int {
+        continuous as int
+    } else {
+        running as int
+    },
+))]
+pub(super) fn recovery_elapsed(continuous: u64, running: u128) -> u64 {
+    if (continuous as u128) <= running {
+        continuous
+    } else {
+        running as u64
+    }
+}
+
+/// Keep the maximum of each grant parameter, including across epoch bumps.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out >= prior && out >= granted && (out == prior || out == granted),
+))]
+pub(super) fn longest_grant(prior: u64, granted: u64) -> u64 {
+    if prior > granted { prior } else { granted }
+}
+
+/// Include one fenced keeper's persisted lease bound in the wait-out.
+/// The legacy reducer skips an unrepresentable sum.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out >= accumulated,
+        (duration as int + margin as int <= u64::MAX) ==> (
+            out as int >= duration as int + margin as int
+            && (out == accumulated || out as int == duration as int + margin as int)
+        ),
+        (duration as int + margin as int > u64::MAX) ==> out == accumulated,
+))]
+pub(super) fn include_recovery_wait(accumulated: u64, duration: u64, margin: u64) -> u64 {
+    match recovery_wait(duration, margin) {
+        Some(wait) => longest_grant(accumulated, wait),
+        None => accumulated,
+    }
+}
+
+/// Apply offload progress only within the lineage that uploaded it.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures (out is None) == (lineage != uploaded_lineage),
+        out matches Some(new) ==> new >= current && (new <= head || new == current)
+            && (new == current || new == proposed),
+))]
+pub(super) fn lineage_offload(
+    lineage: u64,
+    uploaded_lineage: u64,
+    current: u64,
+    proposed: u64,
+    head: u64,
+) -> Option<u64> {
+    if lineage == uploaded_lineage {
+        Some(offloaded_through(current, proposed, head))
+    } else {
+        None
+    }
+}
+
+/// Extend the maximum population used by the placement check.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out >= largest && out >= count && (out == largest || out == count),
+))]
+pub(super) fn largest_domain(largest: usize, count: usize) -> usize {
+    if largest > count { largest } else { count }
+}

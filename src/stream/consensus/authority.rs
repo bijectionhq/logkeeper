@@ -200,8 +200,8 @@ impl Records {
                 margin_ms,
             } => {
                 let record = self.record(*keeper);
-                record.lease_ms = record.lease_ms.max(*lease_ms);
-                record.margin_ms = record.margin_ms.max(*margin_ms);
+                record.lease_ms = decisions::longest_grant(record.lease_ms, *lease_ms);
+                record.margin_ms = decisions::longest_grant(record.margin_ms, *margin_ms);
             }
             Change::Fence { keeper } => {
                 let record = self.record(*keeper);
@@ -287,8 +287,9 @@ impl Records {
         keepers
             .iter()
             .filter_map(|keeper| self.keepers.get(keeper))
-            .filter_map(|record| decisions::recovery_wait(record.lease_ms, record.margin_ms))
-            .fold(own_ms, u64::max)
+            .fold(own_ms, |wait, record| {
+                decisions::include_recovery_wait(wait, record.lease_ms, record.margin_ms)
+            })
     }
 
     /// Answers a renewal from `keeper` under `incarnation` and `epoch`, zero
