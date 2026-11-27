@@ -446,6 +446,8 @@ filesystems. All six pods have required hostname anti-affinity. Zone selectors
 put two keepers in each zone, and the three initial catalog voters occupy three
 different zones. Clients and peers connect to the node addresses in the
 inventory. The headless Service provides StatefulSet identity.
+DNS names also work in keeper inventories. For this template use the stable
+node addresses that match the workload placement and server certificates.
 
 1. Prepare six dedicated staging nodes. Provide the host networking permission
    required by the namespace, set the zone labels, mount their two filesystems,

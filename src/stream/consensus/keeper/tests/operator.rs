@@ -13,7 +13,7 @@ pub(super) fn operator_config(
         keepers: cluster.keepers.clone(),
         catalog: cluster.catalog,
         catalog_voters: cluster.catalog_voters,
-        admin: admin.clone(),
+        admin: admin.iter().map(|(id, at)| (*id, (*at).into())).collect(),
         admin_mtls: true,
         placement: None,
         deadline_ms: 10_000,

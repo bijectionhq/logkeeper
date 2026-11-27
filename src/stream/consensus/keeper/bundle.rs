@@ -235,7 +235,7 @@ async fn fetch(
     tls: Option<TlsConnector>,
     path: &str,
 ) -> io::Result<(u16, Vec<u8>)> {
-    crate::stream::consensus::operator::admin_request(at, tls, None, "GET", path).await
+    crate::stream::consensus::operator::admin_request(&at.to_string(), tls, None, "GET", path).await
 }
 
 /// A minimal ustar writer: regular files only, names under 100 bytes.

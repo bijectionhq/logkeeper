@@ -20,8 +20,7 @@ use super::{
 };
 use crate::stream::consensus::{invalid, ownership};
 
-const CHUNK: usize = 64 * 1024;
-const BYTES_PER_PASS: usize = 4 * 1024 * 1024;
+pub(in crate::stream::consensus) const CHUNK: usize = 64 * 1024;
 const ITEMS_PER_PASS: usize = 128;
 
 #[derive(Default)]
@@ -78,11 +77,10 @@ impl Failure {
 }
 
 impl Scrub {
-    pub fn pass(&mut self, disk: &Disk) -> Option<Failure> {
+    pub fn pass(&mut self, disk: &Disk, mut budget: usize) -> (Option<Failure>, bool) {
         let mut scratch = vec![0; CHUNK];
-        let mut budget = BYTES_PER_PASS;
         for _ in 0..ITEMS_PER_PASS {
-            if budget < CHUNK || !disk.responsive() {
+            if budget < CHUNK || !disk.responsive() || disk.near_slow() {
                 break;
             }
             if let Some(scan) = &mut self.scan {
@@ -101,18 +99,18 @@ impl Scrub {
                             error,
                         };
                         self.scan = None;
-                        return Some(failure);
+                        return (Some(failure), false);
                     }
                 }
             } else {
                 self.cursor = disk.next_log_scope(self.cursor);
                 let Some(scope) = self.cursor else {
-                    break;
+                    return (None, true);
                 };
                 self.scan = Scan::start(disk, scope);
             }
         }
-        None
+        (None, false)
     }
 }
 
@@ -153,9 +151,10 @@ impl Scan {
             *budget -= len;
             let complete = check.read(&mut scratch[..len])?;
             disk.metrics
-                .scrub_read_bytes
+                .scrub_bytes
                 .fetch_add(len as u64, Ordering::Relaxed);
             if complete {
+                crate::stream::consensus::metrics::count(&disk.metrics.scrub_objects);
                 let check = self.check.take().unwrap();
                 match check.kind {
                     Kind::Root(Some(bytes)) => {

@@ -8,17 +8,24 @@ three voters throughout. The [rolling-upgrade
 test](../../tests/rolling_upgrade.rs) runs this sequence in process under
 write load.
 
-**What to expect.** The test was run ten times (40 restarts) on one loaded
-Mac, at Logkeeper `55e94a5` with asynchronous leader append. It uses four
-keepers with a replicated catalog, and four streams that each append a record
-every few milliseconds. Results:
-- No acknowledged record was lost (79,079 checked).
-- The worst append stall during a restart was 2.35 s, and the mean 0.66 s.
-- A keeper was ready again at most 2.3 s after it started.
+**What to expect.** The test uses four keepers with a replicated catalog, and
+four streams that each append a record every few milliseconds. Before the
+drain and shutdown paths paused writes for their hand-off (`55e94a5`, ten
+runs, 40 restarts), the worst append stall during a restart was 2.35 s and the
+mean 0.66 s, because 16 of 40 hand-offs found no follower matched under
+constant writes and waited out a lease and an election. With the pause
+(Logkeeper `8273aab`, one Mac at load average 3 to 5):
+- three runs of this test, 12 restarts with a drain: worst stall 0.063 s,
+  mean about 0.02 s; every acknowledged record was there afterwards;
+- the [hand-off test](../../tests/leader_handoff.rs), 16 restarts by plain
+  SIGTERM with no drain: every restart handed off, worst stall 0.065 s, mean
+  0.02 s;
+- a keeper was ready again at most 0.23 s after it started.
 
-The drain and shutdown paths now pause writes briefly while a target voter
-catches up. The mixed-binary qualification also runs a complete rolling
-restart with writes in flight.
+The [compatibility tests](../../tests/upgrade_compatibility.rs) run this
+procedure across real binaries: four keepers move from the previous release
+to this one, catalog keepers first, under writes, then
+`logkeeper admin finalize-version` finalizes.
 
 ## Before you start
 
@@ -71,7 +78,13 @@ restart with writes in flight.
    A previous binary may predate the admin listener. In that case check the
    other voters of each hosted stream with `lk admin status --stream UUID
    --config operator.json`, and proceed only when both are reachable and
-   report healthy. Start the new binary with the admin listener enabled.
+   report healthy. Start the new binary with the admin listener enabled. Add
+   the `admin` section to the keeper's configuration together with the new
+   binary, not before: a previous binary that predates the admin listener
+   refuses its configuration with `unknown field admin`. A rollback to such
+   a binary must remove the section again. From this release on, a keeper
+   ignores an unknown top-level field with a warning, so later releases can
+   add settings ahead of their binary.
 
 7. **Drain leaders, stop, upgrade, start:**
 
@@ -148,6 +161,14 @@ restart with writes in flight.
     lk admin finalize-version --config operator.json
     # cluster_version: 3
     ```
+
+    It is refused with `Unsupported` while a keeper in the inventory,
+    draining or retired ones still listed in `keepers` included, runs a
+    binary without the gate, and with `Unavailable` while one does not
+    answer; retry the latter. Once finalized, keepers write the formats the
+    previous binary cannot read (`LKRWAL05` checkpoints, compaction's
+    `Relocate` frames, durable park marks), and a previous binary refuses
+    the media at startup.
 
     Schedule finalization after the rollback window has ended.
 

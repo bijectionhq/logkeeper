@@ -102,6 +102,16 @@ impl Watchdog {
         Round(self)
     }
 
+    /// Whether the media is near its slow-round gate: a round has run past
+    /// half of `SLOW_ROUND`, or the media is not responsive. Background work
+    /// such as the scrubber waits while it is.
+    pub fn near_slow(&self) -> bool {
+        !self.responsive()
+            || self
+                .running()
+                .is_some_and(|running| running > SLOW_ROUND / 2)
+    }
+
     /// How long the current round has run, if one is in progress.
     fn running(&self) -> Option<Duration> {
         let started = self.started.load(Ordering::Acquire);

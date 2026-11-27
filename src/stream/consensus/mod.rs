@@ -1,6 +1,7 @@
 //! Keeper-hosted stream consensus. Each stream has a Raft group, and each
 //! keeper shares one durable log across all of its groups.
 
+mod address;
 mod assignment;
 mod catalog;
 mod client;
@@ -29,6 +30,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub use super::transport::Credentials;
 pub use crate::server::durability::SyncMode;
+pub use address::Address;
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
 pub use keeper::{AdminConfig, Config, FenceProof, Recovery, RecoveryReport};
@@ -128,7 +130,9 @@ impl SnapshotMeta {
 /// incarnation they first saw each keeper under, and a keeper whose media
 /// was installed again under its old ID registers no replica it does not
 /// hold and casts no counted vote.
-pub type Keepers = BTreeMap<uuid::Uuid, SocketAddr>;
+///
+/// An address is `IP:port` or `name:port`; a name resolves at each connect.
+pub type Keepers = BTreeMap<uuid::Uuid, Address>;
 
 /// The right to write as one incarnation of an authenticated principal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

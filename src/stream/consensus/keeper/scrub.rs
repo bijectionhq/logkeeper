@@ -5,12 +5,24 @@ use tokio::time::{Instant, MissedTickBehavior};
 use super::Engine;
 use crate::stream::consensus::{
     invalid, logging, metrics,
-    storage::scrub::{Failure, Scrub},
+    storage::scrub::{CHUNK, Failure, Scrub},
 };
+
+pub(super) const DEFAULT_BYTES_PER_SECOND: u64 = 2 * 1024 * 1024;
+#[cfg(not(test))]
+const PASS_PAUSE: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const PASS_PAUSE: Duration = Duration::from_millis(200);
 
 impl Engine {
     pub(super) async fn scrub_loop(self: &Arc<Self>) {
-        let interval = Duration::from_secs(1);
+        if self.scrub_rate == 0 {
+            self.stop.cancelled().await;
+            return;
+        }
+        let seconds = (CHUNK as f64 / self.scrub_rate as f64).max(0.05);
+        let interval = Duration::from_secs_f64(seconds);
+        let budget = ((self.scrub_rate as f64 * seconds) as usize).clamp(CHUNK, 4 << 20);
         let mut schedule = tokio::time::interval_at(Instant::now() + interval, interval);
         schedule.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut scrub = Scrub::default();
@@ -19,16 +31,16 @@ impl Engine {
                 () = self.stop.cancelled() => return,
                 _ = schedule.tick() => {}
             }
-            if !self.disk.responsive() {
+            if !self.disk.responsive() || self.disk.near_slow() {
                 continue;
             }
             let disk = self.disk.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let failure = scrub.pass(&disk);
-                (scrub, failure)
+                let (failure, complete) = scrub.pass(&disk, budget);
+                (scrub, failure, complete)
             })
             .await;
-            let (next, failure) = match result {
+            let (next, failure, complete) = match result {
                 Ok(result) => result,
                 Err(error) => {
                     tracing::error!(keeper = %self.id, %error, "online integrity scrub worker stopped");
@@ -38,6 +50,13 @@ impl Engine {
             scrub = next;
             if let Some(failure) = failure {
                 self.scrub_failure(failure).await;
+            }
+            if complete {
+                metrics::count(&self.disk.metrics.scrub_passes);
+                tokio::select! {
+                    () = self.stop.cancelled() => return,
+                    () = tokio::time::sleep(PASS_PAUSE) => schedule.reset(),
+                }
             }
         }
     }
@@ -78,7 +97,7 @@ impl Engine {
                 scope,
                 &invalid(format!("integrity scrub: {}", failure.error)),
             );
-            metrics::count(&engine.disk.metrics.scrub_corruptions);
+            metrics::count(&engine.disk.metrics.scrub_corrupt);
             guard
         })
         .await;

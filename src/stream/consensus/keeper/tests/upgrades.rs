@@ -229,7 +229,9 @@ async fn version_mismatch_counts_as_alive_and_does_not_trigger_repair() {
         .tls
         .server_protocols(KeeperId(c.as_u128()), &[future_alpn])
         .unwrap();
-    let control_listener = TcpListener::bind(c_cfg.peers[&c]).await.unwrap();
+    let control_listener = TcpListener::bind(c_cfg.peers[&c].bind_addr())
+        .await
+        .unwrap();
     let app_acceptor = c_cfg
         .tls
         .server_protocols(KeeperId(c.as_u128()), &[b"logkeeper-consensus/99"])
@@ -510,6 +512,13 @@ async fn scrub_quarantines_a_parked_snapshot_without_serving_a_read() {
 
     let leader = cluster.leader(stream).await;
     let victim = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    cluster.running.remove(&victim).unwrap().stop().await;
+    cluster
+        .configs
+        .get_mut(&victim)
+        .unwrap()
+        .scrub_bytes_per_second = 2 << 20;
+    cluster.restart(victim).await;
     let group = cluster.group(victim, stream).await;
     group
         .raft
@@ -667,6 +676,23 @@ async fn checksum_failure_quarantines_durably_survives_restart_triggers_repair_a
     .await
     .expect("repair replaced quarantined replica");
     assert!(!repaired.voters.contains(&victim));
+    // The replaced copy then retires on its own: the victim detaches it on
+    // the new placement and clears its marker, with no operator action.
+    timeout(Duration::from_secs(30), async {
+        while marker.exists() || cluster.running[&victim].engine.is_quarantined(stream) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the replaced quarantined copy retired and cleared its marker");
+    assert!(
+        cluster.running[&victim]
+            .engine
+            .disk
+            .ownership(stream)
+            .is_some_and(|book| book.generation().is_none()),
+        "the copy is detached"
+    );
     // Reads from the healthy quorum still return the intact record.
     let page = client
         .read(stream, Lsn(1), 1, Duration::ZERO)
@@ -1311,5 +1337,131 @@ async fn retired_keepers_do_not_quarantine_and_repair_moves_streams_off_them() {
         .unwrap();
     assert_eq!(updated_client.head(stream).await, Ok(Lsn(2)));
 
+    cluster.stop_all().await;
+}
+
+/// The background scrubber finds a corrupt retained slice that nobody
+/// reads, quarantines the copy durably and counts it; repair replaces the
+/// copy, which then retires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_scrubber_quarantines_a_corrupt_slice_nobody_reads() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(236);
+    client.create(stream, [a, b, c], 4096).await.unwrap();
+    let fence = client
+        .seal(stream, Epoch(0), Uuid::from_u128(91))
+        .await
+        .unwrap()
+        .fence;
+    client
+        .append(stream, fence, Lsn(1), Bytes::from_static(b"never-read"))
+        .await
+        .unwrap();
+    let leader = cluster.leader(stream).await;
+    let victim = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    // The victim restarts with its scrubber on, fast for the test.
+    cluster.running.remove(&victim).unwrap().stop().await;
+    cluster
+        .configs
+        .get_mut(&victim)
+        .unwrap()
+        .scrub_bytes_per_second = 64 << 20;
+    cluster.restart(victim).await;
+    let group = cluster.group(victim, stream).await;
+    group
+        .raft
+        .wait(Some(WAIT))
+        .metrics(|_| group.state.head() == Ok(Lsn(1)), "victim applied LSN 1")
+        .await
+        .unwrap();
+    let engine = cluster.running[&victim].engine.clone();
+    let checked = || {
+        engine
+            .disk
+            .metrics
+            .scrub_objects
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    // The scrubber reads the healthy copy back without complaint first.
+    timeout(WAIT, async {
+        while checked() == 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the scrubber checked the copy");
+    assert!(!engine.is_quarantined(stream));
+    // It waits while the media nears its slow-round gate: at most a check
+    // already under way finishes.
+    engine.disk.mark_slow(Duration::from_secs(3));
+    assert!(engine.disk.near_slow());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let paused = checked();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(checked() <= paused + 1, "the scrubber paused at the gate");
+
+    let (payload_file, last_byte) = group.state.payload_path().unwrap();
+    drop(group);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&payload_file)
+            .unwrap();
+        file.seek(SeekFrom::Start(last_byte)).unwrap();
+        let mut byte = [0];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(last_byte)).unwrap();
+        file.write_all(&[byte[0] ^ 0xff]).unwrap();
+        file.sync_all().unwrap();
+    }
+    let marker = cluster.configs[&victim]
+        .enrollment
+        .join(format!("{victim}.quarantine.json"));
+    timeout(WAIT, async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the scrubber quarantined the corrupt copy");
+    assert_eq!(
+        engine
+            .disk
+            .metrics
+            .scrub_corrupt
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        client.keeper_status(victim, stream).await.unwrap().replica,
+        Some(false)
+    );
+    // Repair replaces it, and the replaced copy retires on its own.
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(configuration) = client.configuration(stream).await
+                && !configuration.voters.contains(&victim)
+                && !marker.exists()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("repair replaced the copy and it retired");
+    assert_eq!(
+        client
+            .read(stream, Lsn(1), 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        vec![(Lsn(1), Bytes::from_static(b"never-read"))]
+    );
     cluster.stop_all().await;
 }

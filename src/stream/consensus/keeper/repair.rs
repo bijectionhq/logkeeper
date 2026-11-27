@@ -829,6 +829,7 @@ impl Engine {
     }
 
     async fn retire_removed(&self) {
+        self.retire_quarantined().await;
         let groups = self
             .groups
             .lock()
@@ -934,6 +935,81 @@ impl Engine {
                         "retiring removed replica copy failed"
                     );
                 }
+            }
+        }
+    }
+
+    /// Retires a copy quarantined for corrupt data once repair replaced it.
+    /// Such a copy serves nothing, open or not, so it never hears that it
+    /// was removed:
+    /// it asks the other keepers for placement proofs, as an orphaned copy
+    /// does, and when the highest certifies that no configuration names it,
+    /// detaches it and clears its marker, so its objects are reclaimed. A
+    /// copy still named stays quarantined until repair moves it.
+    async fn retire_quarantined(&self) {
+        for stream in self.disk.quarantined_streams().into_keys() {
+            let (Some(genesis), Some(generation)) = (
+                self.disk.genesis(stream),
+                self.disk
+                    .ownership(stream)
+                    .and_then(|book| book.generation()),
+            ) else {
+                continue;
+            };
+            let authorities = self
+                .placement
+                .all_domains()
+                .keys()
+                .copied()
+                .filter(|keeper| *keeper != self.id)
+                .collect::<Vec<_>>();
+            let proofs = futures::future::join_all(authorities.into_iter().map(|authority| {
+                let genesis = &genesis;
+                async move { (authority, self.verified_proof(authority, genesis).await) }
+            }))
+            .await;
+            let Some((authority, proof)) = proofs
+                .into_iter()
+                .filter_map(|(authority, proof)| Some((authority, proof.ok()?)))
+                .max_by_key(|(_, proof)| proof.configuration.revision)
+            else {
+                continue;
+            };
+            if !decisions::certifies_exclusion(
+                true,
+                proof.configuration.voters.contains(&self.id),
+                proof.joint.is_some_and(|roster| roster.contains(&self.id)),
+            ) {
+                continue;
+            }
+            let result = self
+                .retire_copy(stream, authority, proof.configuration.revision, generation)
+                .await
+                .and_then(|_| self.disk.clear_quarantine(stream));
+            let outcome = match &result {
+                Ok(_) => "retired".to_owned(),
+                Err(error) => error.to_string(),
+            };
+            crate::stream::consensus::logging::audit_retire(
+                self.id,
+                stream,
+                "retire-quarantined",
+                authority,
+                proof.configuration.revision,
+                generation,
+                &outcome,
+            );
+            if result.is_ok() {
+                self.quarantined.write().remove(&stream);
+                // The detached copy's objects go with its directory.
+                self.disk.unprotect_objects(stream);
+                tracing::info!(
+                    keeper = %self.id,
+                    stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                    authority = %authority,
+                    revision = proof.configuration.revision,
+                    "retired a quarantined copy that repair replaced"
+                );
             }
         }
     }

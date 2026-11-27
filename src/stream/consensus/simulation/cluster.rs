@@ -200,9 +200,9 @@ impl SimCluster {
             let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let control = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let snapshot = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            keepers.insert(id, app.local_addr().unwrap());
-            peers.insert(id, control.local_addr().unwrap());
-            bulk.insert(id, snapshot.local_addr().unwrap());
+            keepers.insert(id, app.local_addr().unwrap().into());
+            peers.insert(id, control.local_addr().unwrap().into());
+            bulk.insert(id, snapshot.local_addr().unwrap().into());
             listeners.insert(id, [app, control, snapshot]);
         }
 
@@ -219,7 +219,7 @@ impl SimCluster {
             );
             let config = Config {
                 keeper: id,
-                listen: keepers[&id],
+                listen: keepers[&id].socket_addr().unwrap(),
                 data: dir.path().join(format!("data-{id}")),
                 tls,
                 keepers: keepers.clone(),
@@ -236,6 +236,7 @@ impl SimCluster {
                 repair_after_secs: options.repair_after_secs,
                 park_after_secs: options.park_after_secs,
                 snapshot_send_bytes_per_second: 0,
+                scrub_bytes_per_second: 0,
                 async_append: std::env::var("LOGKEEPER_ASYNC_APPEND")
                     .map_or(true, |value| value != "0"),
                 timed_original: None,
@@ -379,8 +380,12 @@ impl SimCluster {
         let config = self.configs[&id].clone();
         let listeners = [
             TcpListener::bind(config.listen).await.unwrap(),
-            TcpListener::bind(config.peers[&id]).await.unwrap(),
-            TcpListener::bind(config.bulk[&id]).await.unwrap(),
+            TcpListener::bind(config.peers[&id].bind_addr())
+                .await
+                .unwrap(),
+            TcpListener::bind(config.bulk[&id].bind_addr())
+                .await
+                .unwrap(),
         ];
         self.running.insert(
             id,

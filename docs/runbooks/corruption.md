@@ -14,10 +14,10 @@ The replica reports itself unhealthy, so its stream's leader can replace it.
 
 Online integrity scrubbing checks selected snapshots, their index pages and
 retained extents, and the local WAL suffix payloads. It includes parked copies
-without opening them and reads up to 4 MiB per keeper per second while the
-WAL is responsive. A verified failure quarantines the affected copy and
-increments `logkeeper_consensus_scrub_corruptions_total`. Progress is visible
-in `logkeeper_consensus_scrub_read_bytes_total`. Use offline verification
+without opening them and runs at `scrub_bytes_per_second` (2 MiB/s
+by default) while the WAL is responsive. A verified failure quarantines the affected copy and
+increments `logkeeper_consensus_scrub_corrupt_total`. Progress is visible
+in `logkeeper_consensus_scrub_bytes_total`. Use offline verification
 for WAL framing, the trusted boundary and the shared segment chain.
 
 **First rule:** a corrupted replica is not needed while its stream's other two

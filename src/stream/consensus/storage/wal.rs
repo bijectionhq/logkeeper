@@ -23,6 +23,7 @@ mod legacy;
 pub(super) mod segmented;
 pub use segmented::SalvageReport;
 use segmented::{Segmented, Tuning};
+
 #[cfg(test)]
 mod tests;
 
@@ -656,6 +657,12 @@ impl Disk {
     /// Whether the media is healthy and keeps up with its WAL rounds.
     pub fn responsive(&self) -> bool {
         self.healthy() && self.watchdog.responsive()
+    }
+
+    /// Whether the media is near its slow-round gate, when background work
+    /// should wait.
+    pub fn near_slow(&self) -> bool {
+        self.watchdog.near_slow()
     }
 
     /// Resolves once a WAL round runs past the slow-round limit.

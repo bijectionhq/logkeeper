@@ -6,7 +6,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
-    net::SocketAddr,
     path::Path,
     time::Duration,
 };
@@ -22,7 +21,7 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 
-use super::{Client, Configuration, Credentials, Domains, Keepers, assignment, invalid};
+use super::{Address, Client, Configuration, Credentials, Domains, Keepers, assignment, invalid};
 use crate::stream::transport;
 
 /// One admin HTTP request, connect to last byte.
@@ -60,7 +59,7 @@ pub struct OperatorConfig {
     /// Every keeper's admin listener. Status, problems, drain and
     /// decommission read them.
     #[serde(default)]
-    pub admin: BTreeMap<Uuid, SocketAddr>,
+    pub admin: BTreeMap<Uuid, Address>,
     /// Whether the admin listeners require mutual TLS (the default). Plain
     /// HTTP only reaches loopback listeners.
     #[serde(default = "default_admin_mtls")]
@@ -479,13 +478,19 @@ impl Operator {
         method: &str,
         path: &str,
     ) -> io::Result<(u16, Value)> {
-        let at = *self.config.admin.get(&keeper).ok_or_else(|| {
+        let at = self.config.admin.get(&keeper).ok_or_else(|| {
             invalid(format!(
                 "no admin listener for keeper {keeper} in the operator configuration"
             ))
         })?;
-        let (status, body) =
-            admin_request(at, self.admin_tls.clone(), Some(keeper), method, path).await?;
+        let (status, body) = admin_request(
+            at.as_str(),
+            self.admin_tls.clone(),
+            Some(keeper),
+            method,
+            path,
+        )
+        .await?;
         let value = serde_json::from_slice(&body).map_err(|error| {
             invalid(format!(
                 "keeper {keeper} answered {path} with {status}: {error}"
@@ -503,7 +508,7 @@ fn journal_error(error: JournalError) -> io::Error {
 /// body. Over mutual TLS the listener must present `keeper`'s certificate
 /// when `keeper` is given.
 pub(super) async fn admin_request(
-    at: SocketAddr,
+    at: &str,
     tls: Option<TlsConnector>,
     keeper: Option<Uuid>,
     method: &str,

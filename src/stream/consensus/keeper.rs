@@ -93,6 +93,10 @@ fn default_park_after_secs() -> u64 {
     600
 }
 
+fn default_scrub_bytes_per_second() -> u64 {
+    scrub::DEFAULT_BYTES_PER_SECOND
+}
+
 fn default_snapshot_send_bytes_per_second() -> u64 {
     64 * 1024 * 1024
 }
@@ -171,6 +175,10 @@ pub struct Config {
     /// its streams; zero sends without pacing.
     #[serde(default = "default_snapshot_send_bytes_per_second")]
     pub snapshot_send_bytes_per_second: u64,
+    /// How fast the background scrubber reads back retained slices and
+    /// snapshots to check them, in bytes per second; 0 disables it.
+    #[serde(default = "default_scrub_bytes_per_second")]
+    pub scrub_bytes_per_second: u64,
     /// A leader replicates its own appends while its WAL write of them is
     /// still in flight, and counts itself toward commit once it lands.
     #[serde(default = "default_async_append")]
@@ -385,8 +393,14 @@ impl Config {
             }
             if admin.listen.port() != 0
                 && (admin.listen == self.listen
-                    || self.peers.get(&self.keeper) == Some(&admin.listen)
-                    || self.bulk.get(&self.keeper) == Some(&admin.listen))
+                    || self
+                        .peers
+                        .get(&self.keeper)
+                        .is_some_and(|peer| peer.bind_addr() == admin.listen)
+                    || self
+                        .bulk
+                        .get(&self.keeper)
+                        .is_some_and(|bulk| bulk.bind_addr() == admin.listen))
             {
                 return Err(invalid(
                     "admin listener address must be separate from consensus listeners",
@@ -413,8 +427,10 @@ impl Config {
             .bulk
             .get(&self.keeper)
             .ok_or_else(|| invalid("missing local bulk address"))?;
-        let control = TcpListener::bind(peer).await?;
-        let bulk = TcpListener::bind(bulk).await?;
+        // An IP address binds as given; a DNS name binds every interface
+        // on its port, since the keeper may not know its IP for the name.
+        let control = TcpListener::bind(peer.bind_addr()).await?;
+        let bulk = TcpListener::bind(bulk.bind_addr()).await?;
         let admin_listener = match &self.admin {
             Some(admin) => Some((TcpListener::bind(admin.listen).await?, admin.mtls)),
             None => None,
@@ -541,6 +557,7 @@ impl Config {
             park_after: Duration::from_secs(self.park_after_secs),
             async_append: self.async_append,
             snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
+            scrub_rate: self.scrub_bytes_per_second,
             retire_now: Arc::default(),
             placement_confirmed: parking_lot::Mutex::default(),
             certification: Arc::default(),
@@ -631,6 +648,8 @@ pub(super) struct Engine {
     preferred: parking_lot::Mutex<HashMap<StreamId, String>>,
     park_after: Duration,
     snapshot_rate: Arc<super::network::RateLimiter>,
+    /// The scrubber's pace in bytes per second; 0 disables it.
+    scrub_rate: u64,
     /// Wakes the repair loop when a peer excluded one of this keeper's
     /// replicas, so a removed copy retires at once.
     retire_now: Arc<tokio::sync::Notify>,
