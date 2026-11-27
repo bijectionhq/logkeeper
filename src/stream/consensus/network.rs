@@ -13,8 +13,8 @@ use std::{
 use bincode::Options;
 use futures::FutureExt;
 use journal_contract::{
-    CheckpointAnchor, CheckpointInstallation, Epoch, Lsn, RecoveryFence, StreamId, WriterFence,
-    WriterSessionId,
+    CheckpointAnchor, CheckpointCustody, CheckpointInstallation, Epoch, Lsn, RecoveryFence,
+    StreamId, WriterFence, WriterSessionId,
 };
 use openraft::{
     BasicNode, EntryPayload, OptionalSend,
@@ -376,6 +376,10 @@ pub(super) enum Request {
         lost: Vec<uuid::Uuid>,
         revision: u64,
     },
+    CheckpointCustody {
+        stream: StreamId,
+        change: Option<CheckpointCustody>,
+    },
 }
 
 impl Request {
@@ -425,6 +429,7 @@ impl Request {
             | Self::Trim { stream, .. }
             | Self::TrimCheckpoint { stream, .. }
             | Self::InstallCheckpoint { stream, .. }
+            | Self::CheckpointCustody { stream, .. }
             | Self::RetireCopy { stream, .. }
             | Self::PreferLeader { stream, .. }
             | Self::Written { stream, .. }

@@ -1729,6 +1729,7 @@ impl Engine {
                     | Request::ClusterVersion
                     | Request::Head(_)
                     | Request::SelectedCheckpoint(_)
+                    | Request::CheckpointCustody { change: None, .. }
                     | Request::RecoveryFence(_)
                     | Request::Configuration(_)
                     | Request::Read { .. }
@@ -2104,6 +2105,9 @@ impl Engine {
                 let reply = match request {
                     Request::Head(_) => Ok(group.head().await),
                     Request::SelectedCheckpoint(_) => Ok(group.selected_checkpoint().await),
+                    Request::CheckpointCustody { change, .. } => {
+                        Ok(self.checkpoint_custody(&group, change).await)
+                    }
                     Request::RecoveryFence(_) => Ok(group.recovery_fence().await),
                     Request::OffloadStatus { flush, .. } => {
                         Ok(self.offload_status(&group, flush).await)

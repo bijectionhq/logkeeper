@@ -13,8 +13,9 @@ use std::{
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use journal_contract::{
-    CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, JournalError, Lsn,
-    RecoveryFence, Result, SealReceipt, StreamId, WriterFence, WriterSessionId,
+    CheckpointAnchor, CheckpointCustody, CheckpointHold, CheckpointInstallation, CheckpointReceipt,
+    Epoch, JournalError, Lsn, RecoveryFence, Result, SealReceipt, StreamId, WriterFence,
+    WriterSessionId,
 };
 use parking_lot::Mutex;
 use tokio::time::{Instant, sleep};
@@ -427,6 +428,68 @@ impl Client {
     pub async fn selected_checkpoint(&self, stream: StreamId) -> Result<Option<CheckpointReceipt>> {
         match self.operation(Request::SelectedCheckpoint(stream)).await? {
             Outcome::Checkpoint(receipt) => Ok(receipt),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
+    pub async fn checkpoint_custody(&self, stream: StreamId) -> Result<Option<CheckpointCustody>> {
+        self.request_checkpoint_custody(stream, None).await
+    }
+
+    pub async fn retain_checkpoint(
+        &self,
+        stream: StreamId,
+        hold: CheckpointHold,
+    ) -> Result<CheckpointCustody> {
+        self.change_checkpoint_custody(
+            stream,
+            CheckpointCustody {
+                hold,
+                released: false,
+            },
+        )
+        .await
+    }
+
+    pub async fn release_checkpoint(
+        &self,
+        stream: StreamId,
+        hold: CheckpointHold,
+    ) -> Result<CheckpointCustody> {
+        self.change_checkpoint_custody(
+            stream,
+            CheckpointCustody {
+                hold,
+                released: true,
+            },
+        )
+        .await
+    }
+
+    async fn change_checkpoint_custody(
+        &self,
+        stream: StreamId,
+        order: CheckpointCustody,
+    ) -> Result<CheckpointCustody> {
+        match self.request_checkpoint_custody(stream, Some(order)).await? {
+            Some(custody) if custody == order => Ok(custody),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
+    async fn request_checkpoint_custody(
+        &self,
+        stream: StreamId,
+        change: Option<CheckpointCustody>,
+    ) -> Result<Option<CheckpointCustody>> {
+        if self.cluster_version().await? < super::CLUSTER_VERSION_CHECKPOINT_CUSTODY {
+            return Err(JournalError::Unsupported);
+        }
+        match self
+            .operation(Request::CheckpointCustody { stream, change })
+            .await?
+        {
+            Outcome::CheckpointCustody(custody) => Ok(custody),
             _ => Err(JournalError::Unavailable),
         }
     }

@@ -226,6 +226,23 @@ pub struct CheckpointReceipt {
     pub logical_floor_lsn: Lsn,
 }
 
+/// One recovery's custody of an exact selected checkpoint on its destination
+/// stream. The installation digest binds the issuing authority and operation.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointHold {
+    pub operation_id: u128,
+    pub installation_sha256: [u8; 32],
+    pub anchor: CheckpointAnchor,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointCustody {
+    pub hold: CheckpointHold,
+    pub released: bool,
+}
+
 /// The fence and the committed head chosen at the instant of sealing.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -413,6 +430,32 @@ pub trait Journal: Send + Sync {
         &self,
         _stream: StreamId,
     ) -> BoxFuture<'_, Result<Option<CheckpointReceipt>>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Pins the exact selected checkpoint and its retained journal suffix.
+    fn retain_checkpoint(
+        &self,
+        _stream: StreamId,
+        _hold: CheckpointHold,
+    ) -> BoxFuture<'_, Result<CheckpointCustody>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Observes durable custody from a quorum-confirmed stream view.
+    fn checkpoint_custody(
+        &self,
+        _stream: StreamId,
+    ) -> BoxFuture<'_, Result<Option<CheckpointCustody>>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Releases the original hold. An exact retry returns the released custody.
+    fn release_checkpoint(
+        &self,
+        _stream: StreamId,
+        _hold: CheckpointHold,
+    ) -> BoxFuture<'_, Result<CheckpointCustody>> {
         Box::pin(async { Err(JournalError::Unsupported) })
     }
 

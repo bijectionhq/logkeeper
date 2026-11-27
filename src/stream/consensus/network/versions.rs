@@ -84,6 +84,7 @@ impl Request {
             | Self::TrimCheckpoint { .. }
             | Self::InstallCheckpoint { .. }
             | Self::SelectedCheckpoint(_)
+            | Self::CheckpointCustody { .. }
             | Self::LocalProgress(_) => WireVersion::Current,
         }
     }
@@ -163,9 +164,8 @@ pub(in crate::stream::consensus) fn outcome_introduced(outcome: &Outcome) -> Wir
         Outcome::RecoveryFence(_)
         | Outcome::Offload(_)
         | Outcome::Checkpoint(_)
-        | Outcome::RecoveryPage(_) => {
-            WireVersion::Current
-        }
+        | Outcome::CheckpointCustody(_)
+        | Outcome::RecoveryPage(_) => WireVersion::Current,
         Outcome::Refused(error) => error_introduced(error),
     }
 }

@@ -7,9 +7,9 @@ use std::{collections::BTreeSet, io, path::Path, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use journal_contract::{
-    BoxFuture, CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, Journal,
-    JournalError, Lsn, Page, RecoveryFence, Result, SealReceipt, StreamId, WriterFence,
-    WriterSessionId,
+    BoxFuture, CheckpointAnchor, CheckpointCustody, CheckpointHold, CheckpointInstallation,
+    CheckpointReceipt, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, Result, SealReceipt,
+    StreamId, WriterFence, WriterSessionId,
 };
 use parking_lot::RwLock;
 
@@ -777,6 +777,29 @@ impl Journal for ConsensusJournal {
         stream: StreamId,
     ) -> BoxFuture<'_, Result<Option<CheckpointReceipt>>> {
         Box::pin(self.client.selected_checkpoint(stream))
+    }
+
+    fn retain_checkpoint(
+        &self,
+        stream: StreamId,
+        hold: CheckpointHold,
+    ) -> BoxFuture<'_, Result<CheckpointCustody>> {
+        Box::pin(self.client.retain_checkpoint(stream, hold))
+    }
+
+    fn checkpoint_custody(
+        &self,
+        stream: StreamId,
+    ) -> BoxFuture<'_, Result<Option<CheckpointCustody>>> {
+        Box::pin(self.client.checkpoint_custody(stream))
+    }
+
+    fn release_checkpoint(
+        &self,
+        stream: StreamId,
+        hold: CheckpointHold,
+    ) -> BoxFuture<'_, Result<CheckpointCustody>> {
+        Box::pin(self.client.release_checkpoint(stream, hold))
     }
 
     fn read_page(

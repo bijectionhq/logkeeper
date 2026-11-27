@@ -108,8 +108,10 @@ pub const CLUSTER_VERSION_EXCLUSION: u32 = CLUSTER_VERSION_V9;
 pub const CLUSTER_VERSION_V10: u32 = 10;
 /// The level the typed recovery entry waits for.
 pub const CLUSTER_VERSION_RECOVERY_ENTRY: u32 = CLUSTER_VERSION_V10;
+/// Enables durable custody of a selected immutable checkpoint.
+pub const CLUSTER_VERSION_CHECKPOINT_CUSTODY: u32 = 11;
 /// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V10;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_CHECKPOINT_CUSTODY;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -146,6 +148,8 @@ pub mod features {
     /// Applies `Command::RecoverRecorded` and `Command::RecoveryEntry` and
     /// reads typed recovery entries in snapshots and offloaded objects.
     pub const RECOVERY_ENTRY: u64 = 1 << 12;
+    /// Applies exact recovery holds to the selected checkpoint and its suffix.
+    pub const CHECKPOINT_CUSTODY: u64 = 1 << 13;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 = VERSION_NEGOTIATION
@@ -159,7 +163,8 @@ pub mod features {
         | REPLICATION_FACTOR
         | CHECKPOINT_INSTALL
         | RECOVERY_EXCLUSION
-        | RECOVERY_ENTRY;
+        | RECOVERY_ENTRY
+        | CHECKPOINT_CUSTODY;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;

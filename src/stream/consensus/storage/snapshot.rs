@@ -486,6 +486,12 @@ impl StateMachine {
         self.inner.applied.read().state.selected_checkpoint()
     }
 
+    pub fn checkpoint_custody(
+        &self,
+    ) -> journal_contract::Result<Option<journal_contract::CheckpointCustody>> {
+        self.inner.applied.read().state.checkpoint_custody()
+    }
+
     pub fn reserve_command(
         &self,
         command: &Command,
@@ -1342,7 +1348,10 @@ impl Inner {
                 .and_then(|size| {
                     Ok(size
                         + options().serialized_size(&active.image.state.offload())?
-                        + options().serialized_size(&active.image.state.recorded())?)
+                        + options().serialized_size(&active.image.state.recorded())?
+                        + options().serialized_size(
+                            &active.image.state.checkpoint_custody().ok().flatten(),
+                        )?)
                 })
                 .map_err(io::Error::other)?;
             transfer.grow(
@@ -1996,6 +2005,7 @@ const MAGIC_WITH_OFFLOAD: &[u8; 8] = b"LKRIMG05";
 /// Written only while a recorded recovery's fence stands, which needs the
 /// finalized `CLUSTER_VERSION_RECOVERY_ENTRY`.
 const MAGIC_WITH_RECOVERY: &[u8; 8] = b"LKRIMG06";
+const MAGIC_WITH_CUSTODY: &[u8; 8] = b"LKRIMG07";
 const STAGED_IMAGE: &str = "lk-stage-";
 const HEADER_BYTES: u64 = 12;
 
@@ -2011,11 +2021,20 @@ fn write_image(
 ) -> io::Result<()> {
     let offload = image.state.offload();
     let recorded = image.state.recorded();
+    let custody = image.state.checkpoint_custody().ok().flatten();
+    if custody.is_some() && recorded.is_some() {
+        return Err(invalid(
+            "immutable checkpoint custody cannot carry a recovery fence",
+        ));
+    }
     let with_recovery = recorded.is_some();
-    let with_offload =
-        with_recovery || offload != crate::stream::consensus::state::Offload::default();
+    let with_offload = with_recovery
+        || custody.is_some()
+        || offload != crate::stream::consensus::state::Offload::default();
     let with_epochs = with_epochs || with_offload;
-    file.write_all(if with_recovery {
+    file.write_all(if custody.is_some() {
+        MAGIC_WITH_CUSTODY
+    } else if with_recovery {
         MAGIC_WITH_RECOVERY
     } else if with_offload {
         MAGIC_WITH_OFFLOAD
@@ -2051,6 +2070,11 @@ fn write_image(
                 .serialize_into(&mut writer, recorded)
                 .map_err(io::Error::other)?;
         }
+        if let Some(custody) = &custody {
+            options()
+                .serialize_into(&mut writer, custody)
+                .map_err(io::Error::other)?;
+        }
         for payload in image.state.records() {
             let bytes = payload
                 .load()
@@ -2080,11 +2104,12 @@ fn read_image(
     let mut file = BufReader::new(file);
     let mut header = [0; 12];
     file.read_exact(&mut header)?;
-    let (with_epochs, with_offload, with_recovery) = match &header[..8] {
-        magic if magic == MAGIC => (false, false, false),
-        magic if magic == MAGIC_WITH_EPOCHS => (true, false, false),
-        magic if magic == MAGIC_WITH_OFFLOAD => (true, true, false),
-        magic if magic == MAGIC_WITH_RECOVERY => (true, true, true),
+    let (with_epochs, with_offload, with_recovery, with_custody) = match &header[..8] {
+        magic if magic == MAGIC => (false, false, false, false),
+        magic if magic == MAGIC_WITH_EPOCHS => (true, false, false, false),
+        magic if magic == MAGIC_WITH_OFFLOAD => (true, true, false, false),
+        magic if magic == MAGIC_WITH_RECOVERY => (true, true, true, false),
+        magic if magic == MAGIC_WITH_CUSTODY => (true, true, false, true),
         _ => return Err(invalid("invalid snapshot format")),
     };
     let mut crc = crc32fast::Hasher::new();
@@ -2114,6 +2139,16 @@ fn read_image(
         Default::default()
     };
     let recorded: Option<crate::stream::consensus::state::Recorded> = if with_recovery {
+        Some(
+            options()
+                .with_limit(MAX_MESSAGE)
+                .deserialize_from(&mut reader)
+                .map_err(io::Error::other)?,
+        )
+    } else {
+        None
+    };
+    let custody: Option<journal_contract::CheckpointCustody> = if with_custody {
         Some(
             options()
                 .with_limit(MAX_MESSAGE)
@@ -2174,6 +2209,9 @@ fn read_image(
     image.state.restore_epochs(epochs)?;
     image.state.restore_offload(offload)?;
     image.state.restore_recorded(recorded)?;
+    if let Some(custody) = custody {
+        image.state.restore_checkpoint_custody(custody)?;
+    }
     Ok((meta, image))
 }
 

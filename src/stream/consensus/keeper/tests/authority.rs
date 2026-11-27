@@ -626,6 +626,142 @@ async fn snapshot(cluster: &Cluster, keeper: Uuid, stream: StreamId) -> Arc<Grou
     group
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_custody_pins_the_exact_cut_across_snapshot_and_restart() {
+    use journal_contract::{
+        CheckpointAnchor, CheckpointHold, CheckpointInstallation, WriterSessionId,
+    };
+    use sha2::{Digest, Sha256};
+
+    let mut cluster = Cluster::start_replicated().await;
+    let stream = StreamId(0xAC);
+    let journal = cluster.client(&cluster.credentials);
+    assert!(matches!(
+        journal.checkpoint_custody(stream).await,
+        Err(JournalError::Unsupported)
+    ));
+    cluster.finalize().await;
+    leased(&cluster).await;
+    let [a, b, c, _] = cluster.ids;
+    journal
+        .create_immutable(stream, Voters::from([a, b, c]), 1 << 20)
+        .await
+        .unwrap();
+    let sealed = journal
+        .seal_session(stream, Epoch(0), WriterSessionId(44))
+        .await
+        .unwrap();
+    let fence = Fence {
+        epoch: sealed.fence.writer_epoch,
+        writer: Uuid::from_u128(44),
+    };
+    let original = CheckpointInstallation {
+        operation_id: 4,
+        checkpoint_lsn: Lsn(1),
+        covered_through_lsn: Lsn(0),
+        record: Bytes::from_static(b"restored checkpoint"),
+    };
+    let receipt = journal
+        .install_checkpoint(stream, fence, original.clone())
+        .await
+        .unwrap();
+    let hold = CheckpointHold {
+        operation_id: 101,
+        installation_sha256: [9; 32],
+        anchor: CheckpointAnchor {
+            announced_at: receipt.checkpoint_lsn,
+            covered_through: receipt.covered_through_lsn,
+            record_sha256: Sha256::digest(&original.record).into(),
+        },
+    };
+    let foreign = CheckpointHold {
+        installation_sha256: [3; 32],
+        ..hold
+    };
+    assert!(
+        journal
+            .retain_checkpoint(
+                stream,
+                CheckpointHold {
+                    anchor: CheckpointAnchor {
+                        record_sha256: [3; 32],
+                        ..hold.anchor
+                    },
+                    ..hold
+                }
+            )
+            .await
+            .is_err()
+    );
+    let retained = journal.retain_checkpoint(stream, hold).await.unwrap();
+    assert!(!retained.released);
+    let writer = cluster.client(&cluster.other);
+    assert_eq!(
+        writer.checkpoint_custody(stream).await.unwrap(),
+        Some(retained)
+    );
+    assert!(writer.release_checkpoint(stream, hold).await.is_err());
+    assert_eq!(
+        journal.retain_checkpoint(stream, hold).await.unwrap(),
+        retained
+    );
+    assert!(journal.release_checkpoint(stream, foreign).await.is_err());
+    assert!(journal.delete(stream).await.is_err());
+    assert_eq!(
+        journal
+            .install_checkpoint(stream, fence, original)
+            .await
+            .unwrap(),
+        receipt
+    );
+
+    let next = CheckpointInstallation {
+        operation_id: 5,
+        checkpoint_lsn: Lsn(2),
+        covered_through_lsn: Lsn(1),
+        record: Bytes::from_static(b"new checkpoint"),
+    };
+    assert!(
+        journal
+            .install_checkpoint(stream, fence, next.clone())
+            .await
+            .is_err()
+    );
+    let leader = cluster.leader_after_head(&journal, stream).await;
+    let group = snapshot(&cluster, leader, stream).await;
+    assert!(
+        std::fs::read(group.state.snapshot_path().unwrap())
+            .unwrap()
+            .starts_with(b"LKRIDX05")
+    );
+    assert_eq!(&wire_magic(&group).await, b"LKRIMG07");
+    drop(group);
+    cluster.running.remove(&leader).unwrap().stop().await;
+    cluster.restart(leader).await;
+    let group = cluster.group(leader, stream).await;
+    assert_eq!(group.state.checkpoint_custody().unwrap(), Some(retained));
+    assert_eq!(
+        journal.checkpoint_custody(stream).await.unwrap(),
+        Some(retained)
+    );
+
+    let released = journal.release_checkpoint(stream, hold).await.unwrap();
+    assert!(released.released);
+    assert_eq!(
+        journal.release_checkpoint(stream, hold).await.unwrap(),
+        released
+    );
+    assert!(journal.retain_checkpoint(stream, hold).await.is_err());
+    journal
+        .install_checkpoint(stream, fence, next)
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.checkpoint_custody(stream).await.unwrap(),
+        Some(released)
+    );
+}
+
 /// At the finalized level a recovery leaves one typed entry in the stream,
 /// right after the last record kept, as the first entry of the recovered
 /// epoch: written when the fence clears, with the consumer's marker inside

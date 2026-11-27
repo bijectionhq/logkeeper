@@ -45,9 +45,84 @@ impl Selection {
     fn outcome(self) -> Outcome {
         Outcome::Checkpoint(Some(self.receipt))
     }
+
+    fn matches(self, anchor: CheckpointAnchor) -> bool {
+        self.receipt.checkpoint_lsn == anchor.announced_at
+            && self.receipt.covered_through_lsn == anchor.covered_through
+            && self.record_sha256 == anchor.record_sha256
+    }
+}
+
+impl Live {
+    pub(super) fn holds_checkpoint(&self) -> bool {
+        self.checkpoint_custody
+            .is_some_and(|custody| !custody.released)
+    }
+}
+
+fn valid_hold(hold: CheckpointHold) -> bool {
+    hold.operation_id != 0
+        && hold.installation_sha256 != [0; 32]
+        && hold.anchor.covered_through < hold.anchor.announced_at
 }
 
 impl State {
+    pub(in crate::stream::consensus) fn checkpoint_custody(
+        &self,
+    ) -> Result<Option<CheckpointCustody>> {
+        Ok(self.immutable_live()?.checkpoint_custody)
+    }
+
+    pub(in crate::stream::consensus) fn restore_checkpoint_custody(
+        &mut self,
+        custody: CheckpointCustody,
+    ) -> io::Result<()> {
+        let valid = valid_hold(custody.hold)
+            && self.immutable_live().is_ok_and(|live| {
+                if custody.released {
+                    custody.hold.anchor.announced_at <= live.head
+                } else {
+                    self.has_held_cut(live, custody.hold)
+                }
+            });
+        if !valid {
+            return Err(super::super::invalid(
+                "invalid checkpoint custody in snapshot",
+            ));
+        }
+        self.live_mut()
+            .expect("checked immutable history")
+            .checkpoint_custody = Some(custody);
+        Ok(())
+    }
+
+    fn has_held_cut(&self, live: &Live, hold: CheckpointHold) -> bool {
+        self.selection().is_some_and(|selected| {
+            selected.matches(hold.anchor) && selected.receipt.logical_floor_lsn == live.floor
+        })
+    }
+
+    pub(super) fn change_checkpoint_custody(
+        &mut self,
+        order: CheckpointCustody,
+    ) -> Result<Outcome> {
+        let live = self.immutable_live()?;
+        let conflict = || JournalError::Conflict { head: live.head };
+        if !valid_hold(order.hold) {
+            return Err(conflict());
+        }
+        match live.checkpoint_custody {
+            Some(prior) if prior.hold == order.hold && prior.released == order.released => {
+                return Ok(Outcome::CheckpointCustody(Some(prior)));
+            }
+            Some(prior) if order.released && prior.hold == order.hold && !prior.released => (),
+            None if !order.released && self.has_held_cut(live, order.hold) => (),
+            _ => return Err(conflict()),
+        }
+        self.live_mut()?.checkpoint_custody = Some(order);
+        Ok(Outcome::CheckpointCustody(Some(order)))
+    }
+
     pub(in crate::stream::consensus) fn selected_checkpoint(
         &self,
     ) -> Result<Option<CheckpointReceipt>> {
@@ -136,7 +211,8 @@ impl State {
                 conflict()
             });
         }
-        if checkpoint_lsn.0 == u64::MAX
+        if live.holds_checkpoint()
+            || checkpoint_lsn.0 == u64::MAX
             || live.head.0.checked_add(1) != Some(checkpoint_lsn.0)
             || selection.receipt.logical_floor_lsn < live.logical_floor()
         {
@@ -213,7 +289,7 @@ impl State {
                 return Err(conflict);
             }
         }
-        if selection.receipt.logical_floor_lsn < live.logical_floor() {
+        if live.holds_checkpoint() || selection.receipt.logical_floor_lsn < live.logical_floor() {
             return Err(conflict);
         }
         self.live_mut()?.trim(anchor.covered_through)?;

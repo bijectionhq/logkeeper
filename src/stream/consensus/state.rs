@@ -18,8 +18,8 @@ use std::{
 
 use bytes::Bytes;
 use journal_contract::{
-    CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, JournalError, Lsn, Page,
-    RecoveryEntry, RecoveryFence, Result, WriterSessionId,
+    CheckpointAnchor, CheckpointCustody, CheckpointHold, CheckpointInstallation, CheckpointReceipt,
+    Epoch, JournalError, Lsn, Page, RecoveryEntry, RecoveryFence, Result, WriterSessionId,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -144,6 +144,7 @@ pub enum Command {
         at: Lsn,
         entry: Bytes,
     },
+    CheckpointCustody(CheckpointCustody),
 }
 
 /// A new offload lineage: see `Command::Restore`.
@@ -262,6 +263,7 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
             at: Lsn,
             entry: Bytes,
         },
+        CheckpointCustody(CheckpointCustody),
     }
     Application::deserialize(decoder).map(Box::new)
 }
@@ -331,6 +333,11 @@ impl std::fmt::Display for Command {
             }
             Self::RecoverRecorded { stage, .. } => write!(f, "RecoverRecorded({})", stage.source),
             Self::RecoveryEntry { fence, .. } => write!(f, "RecoveryEntry({fence:?})"),
+            Self::CheckpointCustody(custody) => write!(
+                f,
+                "CheckpointCustody({}, {})",
+                custody.hold.operation_id, custody.released
+            ),
         }
     }
 }
@@ -357,6 +364,7 @@ pub enum Outcome {
     /// page with recovery entries as this and `from_wire` turns it back.
     /// Added last.
     RecoveryPage(Page),
+    CheckpointCustody(Option<CheckpointCustody>),
 }
 
 impl Outcome {
@@ -463,6 +471,8 @@ pub(super) struct Live {
     /// typed entry is written. Snapshots store it beside the image.
     #[serde(skip)]
     recorded: Option<Recorded>,
+    #[serde(skip)]
+    checkpoint_custody: Option<CheckpointCustody>,
 }
 
 /// A recorded recovery waiting for its typed entry: the catalog's record and
@@ -801,6 +811,11 @@ impl State {
         genesis: &Genesis,
         segment: Arc<super::storage::Object>,
     ) -> io::Result<Outcome> {
+        if let Command::CheckpointCustody(custody) = command {
+            return Ok(self
+                .change_checkpoint_custody(custody)
+                .unwrap_or_else(Outcome::Refused));
+        }
         if let Command::InstallCheckpoint {
             fence,
             owner,
@@ -986,6 +1001,7 @@ impl State {
                         epochs: EpochRuns::default(),
                         offload: Offload::default(),
                         recorded: None,
+                        checkpoint_custody: None,
                     };
                     *self = if genesis.immutable {
                         Self::Immutable {
@@ -1029,6 +1045,14 @@ impl State {
             return Err(JournalError::Unsupported);
         }
         let live = self.live_mut()?;
+        if live.holds_checkpoint()
+            && matches!(
+                command,
+                Command::Delete | Command::Trim { .. } | Command::Offloaded { .. }
+            )
+        {
+            return Err(JournalError::Conflict { head: live.head });
+        }
         match command {
             Command::Seal {
                 expected,
@@ -1081,7 +1105,8 @@ impl State {
             | Command::InstallCheckpoint { .. }
             | Command::SelectCheckpoint { .. }
             | Command::RecoverRecorded { .. }
-            | Command::RecoveryEntry { .. } => unreachable!(),
+            | Command::RecoveryEntry { .. }
+            | Command::CheckpointCustody(_) => unreachable!(),
         }
     }
 

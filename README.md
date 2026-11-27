@@ -975,6 +975,20 @@ level 10 a recovery writes `Command::RecoverRecorded`, its fence clears by
 snapshots as `LKRIMG06`/`LKRIDX04`. An older binary refuses all of them, so
 do not roll back past level 10.
 
+**Checkpoint custody.** Finalize level 11
+(`CLUSTER_VERSION_CHECKPOINT_CUSTODY`) after every keeper advertises
+`CHECKPOINT_CUSTODY` (bit 13).
+The custodian uses an administrator credential to retain the exact selected
+checkpoint and locally retained suffix of a staged immutable stream.
+The stream orders retention with checkpoint publication and deletion.
+While the hold stands, replacement checkpoints, deletion, and offload
+advancement are refused.
+Readers can reopen the committed hold, and an exact release allows
+maintenance to resume.
+Reserve the custodian credential for the service that checks the owning
+recovery's terminal decision before releasing its hold.
+Snapshots that carry held or released custody use `LKRIMG07` and `LKRIDX05`.
+
 **Wire variants.** Variants of `Frame`, `Request`, `PeerRequest`, `Reply`,
 `Outcome` and `JournalError` are only ever appended, and each is classified
 by the wire version that introduced it in `network/versions.rs`, an

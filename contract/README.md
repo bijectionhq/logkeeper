@@ -57,6 +57,18 @@ async fn check_writers(writers: [Arc<dyn Journal>; 3]) {
 After a takeover, the consumer must apply the stream through the head
 returned by `seal` before serving requests.
 
+## Staged checkpoint custody
+
+`retain_checkpoint` takes the recovery operation, installation digest, and
+exact committed checkpoint anchor.
+The provider serializes it with changes to the selected checkpoint and its
+retention floor.
+`checkpoint_custody` observes that decision from a quorum-confirmed read.
+`release_checkpoint` settles the original hold and supports exact retries
+while the stream exists.
+An immutable successor stream reserves one custody hold for its installation.
+Backends without checkpoint custody return `Unsupported`.
+
 ## Operator recovery
 
 A journal with operator recovery may rebuild a stream from fewer replicas
