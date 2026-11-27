@@ -31,6 +31,7 @@ use super::{
     Entry, Genesis, Log, LogId, Vote,
     media::{Boundary, Enrollment, Media, Opened, QuarantineStore},
     objects::{Location, Objects},
+    rules,
     snapshot::Selected,
     space::{Admission, Reservation, Space, WAL_METADATA_BYTES},
 };
@@ -220,13 +221,15 @@ impl State {
                     log.segments.split_off(&first);
                     log.entries
                         .extend(entries.into_iter().map(|entry| (entry.log_id.index, entry)));
-                    if log.committed.is_some_and(|known| {
-                        known.index >= first
-                            && log
-                                .entries
+                    if let Some(known) = log.committed
+                        && rules::loses_commit(
+                            Some(known.index),
+                            first,
+                            log.entries
                                 .get(&known.index)
-                                .is_none_or(|entry| entry.log_id != known)
-                    }) {
+                                .is_some_and(|entry| entry.log_id == known),
+                        )
+                    {
                         log.committed = None;
                     }
                 }
@@ -245,10 +248,7 @@ impl State {
             Record::Relocate(..) => (),
             Record::Committed(stream, committed) => {
                 let log = self.log_mut(stream)?;
-                if log
-                    .committed
-                    .is_none_or(|known| known.index < committed.index)
-                {
+                if rules::advance_commit(log.committed.map(|known| known.index), committed.index) {
                     log.committed = Some(committed);
                 }
             }
@@ -261,7 +261,7 @@ impl State {
                 log.segments.split_off(&since);
                 // Raft never truncates a committed entry. A frame that names
                 // one anyway no longer describes this log.
-                if log.committed.is_some_and(|known| known.index >= since) {
+                if rules::loses_commit(log.committed.map(|known| known.index), since, false) {
                     log.committed = None;
                 }
             }

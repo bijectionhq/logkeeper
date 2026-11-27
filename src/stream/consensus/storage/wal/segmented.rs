@@ -39,6 +39,7 @@ use crate::stream::{
         storage::{
             media::{Boundaries, Boundary, CheckpointRef, Slot},
             objects::{Location, Object, Objects, Pins, Reference, Segment},
+            rules,
             segment::{self, FIRST, FRAME_HEADER, Frame, HEADER, MAX_FRAME, SalvageFrame},
             space::Space,
         },
@@ -155,7 +156,7 @@ impl State {
     /// Restores the commit indexes a checkpoint carries, after its leaves.
     fn restore_committed(&mut self, committed: BTreeMap<StreamId, LogId>) {
         for (stream, id) in committed {
-            if let Some(log) = self.logs.get_mut(&stream) {
+            if let Some((log, id)) = rules::checkpoint_commit(self.logs.get_mut(&stream), id) {
                 log.committed = Some(id);
             }
         }
@@ -639,21 +640,20 @@ impl Segmented {
         }
         // Intact frames that do not chain to the published boundary mean a
         // frame is missing or was replaced.
-        if !unattributed && chain != slot.chain {
+        if !unattributed && !rules::matches_boundary(chain, slot.chain) {
             damaged_segments.extend(from.segment..=slot.segment);
             unattributed = true;
         }
-        if unattributed {
-            // A keeper that held the single catalog may have lost a claim or a
-            // stage of a stream it does not host, which no quarantine covers.
-            if !state.catalog.is_empty() {
+        match rules::salvage_scope(unattributed, !state.catalog.is_empty()) {
+            rules::SalvageScope::Attributed => (),
+            rules::SalvageScope::AllStreams => quarantined.extend(state.genesis.keys().copied()),
+            rules::SalvageScope::Refuse => {
                 return Err(invalid(
                     "WAL salvage refused: frames past the checkpoint are damaged on a keeper \
                      that holds catalog records, so a lost claim or stage cannot be ruled out; \
                      replace this keeper",
                 ));
             }
-            quarantined.extend(state.genesis.keys().copied());
         }
 
         // Verify every surviving stream's retained slices and selected snapshot.
@@ -1185,7 +1185,7 @@ fn replay(
             }
         }
     }
-    if chain != slot.chain {
+    if !rules::matches_boundary(chain, slot.chain) {
         return Err(invalid("WAL segments do not match their trusted boundary"));
     }
     Ok(replayed)
@@ -1341,7 +1341,13 @@ pub(in crate::stream::consensus::storage) fn open_readonly(
         segment: slot.segment,
         offset: slot.offset,
     };
-    if position > boundary || position.offset < HEADER || boundary.offset < HEADER {
+    if !decisions::checkpoint_within(
+        position.segment,
+        position.offset,
+        boundary.segment,
+        boundary.offset,
+        HEADER,
+    ) {
         return Err(invalid("WAL checkpoint lies past its trusted boundary"));
     }
     replay(
@@ -1471,7 +1477,7 @@ impl Leaf {
                     Reference::Object(key) => key.scope,
                     Reference::Segment(location) => location.scope,
                 };
-                if index != next || owner != scope {
+                if !rules::checkpoint_entry(index, next, owner.0, scope.0) {
                     return Err(invalid("noncontiguous or foreign WAL entry"));
                 }
                 let object = objects.resolve(reference)?;

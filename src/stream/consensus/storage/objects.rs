@@ -22,7 +22,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::segment;
+use super::{
+    rules::{self, LiveBytes},
+    segment,
+};
 use crate::stream::{
     consensus::invalid,
     keeper::durability::{sync_directory, sync_file},
@@ -91,7 +94,7 @@ struct Segments {
     // Every live slice, by segment and offset, so two holders of the same
     // bytes share one object and each segment's live bytes are exact.
     slices: BTreeMap<(u64, u64), Weak<Object>>,
-    bytes: BTreeMap<u64, (u64, usize)>,
+    bytes: BTreeMap<u64, LiveBytes>,
     // Segments whose slices moved, kept until each scope that held them
     // selects a snapshot built after the move: until then its selected
     // snapshot may still name them. Numbered so a build knows which moves
@@ -142,16 +145,14 @@ impl std::fmt::Display for Usage {
 
 impl Segments {
     fn add(&mut self, location: Location) {
-        let (bytes, count) = self.bytes.entry(location.segment).or_default();
-        *bytes += location.len;
-        *count += 1;
+        let usage = self.bytes.entry(location.segment).or_default();
+        *usage = usage.add(location.len);
     }
 
     fn remove(&mut self, location: Location) {
-        if let Some((bytes, count)) = self.bytes.get_mut(&location.segment) {
-            *bytes = bytes.saturating_sub(location.len);
-            *count = count.saturating_sub(1);
-            if *count == 0 {
+        if let Some(usage) = self.bytes.get_mut(&location.segment) {
+            *usage = usage.remove(location.len);
+            if usage.slices == 0 {
                 self.bytes.remove(&location.segment);
             }
         }
@@ -353,7 +354,7 @@ impl Objects {
                 let live = segments
                     .bytes
                     .get(&id)
-                    .map_or(0, |(bytes, _)| *bytes)
+                    .map_or(0, |usage| usage.bytes)
                     .min(size);
                 usage.add(live, size);
             }
@@ -373,7 +374,7 @@ impl Objects {
             .segments
             .bytes
             .get(&id)
-            .map_or(0, |(bytes, _)| *bytes)
+            .map_or(0, |usage| usage.bytes)
     }
 
     /// The segments before the published checkpoint, other than the newest
@@ -384,24 +385,26 @@ impl Objects {
         let state = self.0.state.lock();
         let segments = &state.segments;
         let mut cold = Vec::new();
-        for (&id, segment) in segments.live.range(..segments.floor.saturating_sub(keep)) {
+        for (&id, segment) in segments
+            .live
+            .range(..rules::cold_before(segments.floor, keep))
+        {
             let Some(segment) = segment.upgrade() else {
                 continue;
             };
-            let (live, count) = segments.bytes.get(&id).copied().unwrap_or((0, 0));
+            let usage = segments.bytes.get(&id).copied().unwrap_or_default();
             let Ok(size) = segment.file.metadata().map(|meta| meta.len()) else {
                 upgraded.push(segment);
                 continue;
             };
             // This upgrade and one per slice; anything else is a pin of a
             // closed copy, a quarantine or a relocation hold.
-            let pinned = Arc::strong_count(&segment) > count + 1
-                || segments
-                    .scopes
-                    .get(&id)
-                    .is_some_and(|scopes| !scopes.is_disjoint(&state.protected));
-            if count > 0 && !pinned && live.saturating_mul(100) < size.saturating_mul(share) {
-                cold.push((live, id));
+            let protected = segments
+                .scopes
+                .get(&id)
+                .is_some_and(|scopes| !scopes.is_disjoint(&state.protected));
+            if rules::compactable(usage, size, share, Arc::strong_count(&segment), protected) {
+                cold.push((usage.bytes, id));
             }
             upgraded.push(segment);
         }

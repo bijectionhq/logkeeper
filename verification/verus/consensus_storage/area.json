@@ -1,0 +1,257 @@
+{
+  "summary": "Verify the shipped segmented-WAL storage rules: live-byte accounting, cold compaction selection (below the published checkpoint, under half live, unpinned and unprotected), salvage scope after unattributable damage, checkpoint leaf ownership, commit-index restore and replay, and the replayed chain against the trusted boundary.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 22,
+  "controls": {
+    "miss-a-live-slice": {
+      "defect": "count a new slice without its handle",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "slices: self.slices + 1",
+          "replace": "slices: self.slices"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "add",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "keep-retired-live-bytes": {
+      "defect": "keep a dropped slice's bytes live",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "bytes: self.bytes.saturating_sub(len)",
+          "replace": "bytes: self.bytes"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "remove",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "include-the-newest-segments": {
+      "defect": "compact the newest segments before the checkpoint, which the scan keeps",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "floor.saturating_sub(keep)",
+          "replace": "floor"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "cold_before",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "compact-at-half-live": {
+      "defect": "compact a segment exactly half live",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "usage.bytes.saturating_mul(100) < size.saturating_mul(share)\n}",
+          "replace": "usage.bytes.saturating_mul(100) <= size.saturating_mul(share)\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "compactable",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "compact-a-pinned-segment": {
+      "defect": "compact a segment pinned by a closed copy or a hold",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "        && strong <= usage.slices + 1\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "compactable",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "compact-a-protected-segment": {
+      "defect": "compact a segment a protected scope holds",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "        && !protected\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "compactable",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "guess-a-frame-owner": {
+      "defect": "quarantine only the known streams after unattributable damage",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "(true, false) => SalvageScope::AllStreams",
+          "replace": "(true, false) => SalvageScope::Attributed"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "salvage_scope",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "salvage_scope",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "salvage-a-possibly-lost-claim": {
+      "defect": "salvage a catalog keeper after unattributable damage",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "(true, true) => SalvageScope::Refuse",
+          "replace": "(true, true) => SalvageScope::AllStreams"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "salvage_scope",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "salvage_scope",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "accept-a-foreign-checkpoint-entry": {
+      "defect": "restore a checkpoint leaf entry another scope owns",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "    index == next && owner == scope\n}",
+          "replace": "    index == next\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "checkpoint_entry",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "lose-a-saved-commit-index": {
+      "defect": "drop the commit index a checkpoint carries",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "Some(log) => Some((log, saved)),\n        None => None,",
+          "replace": "Some(_) => None,\n        None => None,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "checkpoint_commit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "replace-a-commit-at-the-same-index": {
+      "defect": "let a replayed commit at the same index replace the restored one",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "Some(known) => known < replayed,\n        None",
+          "replace": "Some(known) => known <= replayed,\n        None"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "advance_commit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "keep-a-truncated-commit": {
+      "defect": "keep a commit index a truncation removed",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "matches!(current, Some(known) if known >= since)",
+          "replace": "matches!(current, Some(known) if known > since)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "loses_commit",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 21
+    },
+    "ignore-the-first-chain-byte": {
+      "defect": "accept a replayed chain that differs in its first byte",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "find": "if replayed[at] != boundary[at] {",
+          "replace": "if at > 0 && replayed[at] != boundary[at] {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/storage/rules.rs",
+          "function": "matches_boundary",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 21
+    }
+  }
+}
