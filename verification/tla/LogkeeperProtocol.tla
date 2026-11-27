@@ -120,7 +120,8 @@ Min(a, b) == IF a <= b THEN a ELSE b
 InitVote == [term |-> 0, votedFor |-> Nil, committed |-> FALSE]
 
 \* OpenRaft 0.10 standard Raft vote partial order (leader_id_std):
-\* within the same term, distinct candidates are incomparable.
+\* within the same term, a committed leader supersedes an uncommitted
+\* candidate, including a different one (OpenRaft RefVote).
 TermLess(a, b) == a < b
 VoteLeq(v1, v2) == RaftVoteLeq(v1, v2, Nil, TermLess)
 
