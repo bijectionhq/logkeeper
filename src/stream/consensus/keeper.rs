@@ -286,6 +286,17 @@ impl Config {
         enrollment.quarantine_store()?.clear(stream)
     }
 
+    /// Offline operator command that walks past damaged WAL spans, durably
+    /// quarantines every stream with slices in a damaged span, and publishes a
+    /// clean checkpoint so unaffected streams can boot and serve.
+    pub fn salvage(&self) -> io::Result<storage::SalvageReport> {
+        self.validate()?;
+        self.tls
+            .peer_protocol(KeeperId(self.keeper.as_u128()), Lane::Control.alpn())?;
+        let enrollment = self.enrollment()?;
+        Disk::salvage(enrollment)
+    }
+
     /// Every path that writes this keeper's media opens its enrollment
     /// first, so installing the sync mode here covers them all.
     fn enrollment(&self) -> io::Result<Enrollment> {

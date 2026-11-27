@@ -39,7 +39,7 @@ use crate::stream::{
         storage::{
             media::{Boundaries, Boundary, CheckpointRef, Slot},
             objects::{Location, Object, Objects, Pins, Reference, Segment},
-            segment::{self, FIRST, FRAME_HEADER, Frame, HEADER, MAX_FRAME},
+            segment::{self, FIRST, FRAME_HEADER, Frame, HEADER, MAX_FRAME, SalvageFrame},
             space::Space,
         },
     },
@@ -83,6 +83,36 @@ impl Default for Tuning {
             #[cfg(test)]
             synchronous: false,
         }
+    }
+}
+
+/// Summary returned by offline `logkeeper keeper salvage`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SalvageReport {
+    pub damaged_segments: BTreeSet<u64>,
+    pub quarantined: BTreeSet<StreamId>,
+    pub preserved: BTreeSet<StreamId>,
+    /// False when no damage was found and the keeper media was left untouched.
+    pub salvaged: bool,
+}
+
+impl std::fmt::Display for SalvageReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.salvaged {
+            return write!(
+                f,
+                "WAL is healthy: {} stream(s) intact, no salvage needed.",
+                self.preserved.len()
+            );
+        }
+        write!(
+            f,
+            "salvaged WAL past {} damaged segment(s) {:?}: quarantined {} stream(s), preserved {} stream(s).",
+            self.damaged_segments.len(),
+            self.damaged_segments,
+            self.quarantined.len(),
+            self.preserved.len()
+        )
     }
 }
 
@@ -425,6 +455,304 @@ impl Segmented {
             },
             state,
         ))
+    }
+
+    /// Offline salvage: walks past damaged WAL spans, durably quarantines
+    /// every stream with slices in a damaged segment or failing verification,
+    /// writes a fresh checkpoint and boundary for the intact streams, and
+    /// leaves strict startup (`Segmented::open`) unchanged.
+    pub fn salvage(
+        media: &Media,
+        objects: &Objects,
+        space: &Space,
+        quarantine: &crate::stream::consensus::storage::media::QuarantineStore,
+    ) -> io::Result<SalvageReport> {
+        let (mut boundaries, slot) = media.boundaries()?;
+        let incarnation = media.incarnation();
+        let checkpoints = media.data().join(CHECKPOINTS);
+        if !checkpoints.exists() {
+            fs::create_dir(&checkpoints)?;
+            sync_directory(media.data())?;
+        }
+        let directory = objects.segment_directory().to_owned();
+        let mut damaged_segments = BTreeSet::new();
+        let mut quarantined = BTreeSet::new();
+        let mut segment_scopes: BTreeMap<u64, BTreeSet<StreamId>> = BTreeMap::new();
+
+        let (mut state, from, mut chain) = match slot.checkpoint {
+            Some(reference) => {
+                let (checkpoint, cluster_version) = read_checkpoint(&checkpoints, reference)?;
+                segment_scopes = checkpoint.segments.clone();
+                objects.restore_segment_scopes(checkpoint.segments.clone());
+                // Check every segment header the checkpoint knows about.
+                for (&seg_id, scopes) in &segment_scopes {
+                    let ok = File::open(directory.join(segment::name(seg_id)))
+                        .and_then(|mut file| segment::check_header(&mut file, seg_id, incarnation))
+                        .is_ok();
+                    if !ok {
+                        damaged_segments.insert(seg_id);
+                        quarantined.extend(scopes.iter().copied());
+                    }
+                }
+                let mut state = State {
+                    cluster_version,
+                    ..State::default()
+                };
+                for (scope, leaf) in checkpoint.leaves {
+                    let (leaf_bad, bad_segs) =
+                        leaf.restore_salvage(scope, objects, &damaged_segments, &mut state)?;
+                    if leaf_bad {
+                        quarantined.insert(scope);
+                        for seg in bad_segs {
+                            damaged_segments.insert(seg);
+                            if let Some(scopes) = segment_scopes.get(&seg) {
+                                quarantined.extend(scopes.iter().copied());
+                            }
+                        }
+                    }
+                }
+                (state, checkpoint.position, checkpoint.chain)
+            }
+            None => (
+                State::default(),
+                Position {
+                    segment: FIRST,
+                    offset: HEADER,
+                },
+                segment::seed(incarnation),
+            ),
+        };
+
+        // Replay segments from the checkpoint to the published boundary.
+        // A frame that decodes names its stream. A frame that fails its
+        // checksum, does not decode, or is missing could hold any stream's
+        // vote, trim, deletion or registration, so its loss is attributed to
+        // no stream in particular, and every stream is quarantined below:
+        // guessing would let a lost record's stream serve without it.
+        let mut unattributed = false;
+        for id in from.segment..=slot.segment {
+            let mut file = match File::open(directory.join(segment::name(id))) {
+                Ok(file) => BufReader::with_capacity(1024 * 1024, file),
+                Err(_) => {
+                    damaged_segments.insert(id);
+                    unattributed = true;
+                    continue;
+                }
+            };
+            if segment::check_header(&mut file, id, incarnation).is_err() {
+                damaged_segments.insert(id);
+                unattributed = true;
+                continue;
+            }
+            let mut offset = HEADER;
+            if id == from.segment && from.offset != HEADER {
+                if file.seek(SeekFrom::Start(from.offset)).is_err() {
+                    damaged_segments.insert(id);
+                    unattributed = true;
+                    continue;
+                }
+                offset = from.offset;
+            }
+            let end = (id == slot.segment).then_some(slot.offset);
+            while Some(offset) != end {
+                let remaining = end.map(|e| e.saturating_sub(offset));
+                match segment::next_salvage(&mut file, remaining)? {
+                    SalvageFrame::Complete { header, body } => {
+                        let next = offset + FRAME_HEADER + body.len() as u64;
+                        if !unattributed {
+                            chain = segment::chain(&chain, &header, &body);
+                        }
+                        let decoded: io::Result<Record> = options()
+                            .with_limit(MAX_FRAME)
+                            .deserialize(&body)
+                            .map_err(io::Error::other);
+                        match decoded {
+                            // Every record that decodes is applied, also for a
+                            // stream already quarantined, so its votes stay
+                            // current in the salvaged checkpoint.
+                            Ok(record) => {
+                                let scope = record.stream();
+                                let applied =
+                                    slices(&record, &body, id, offset + FRAME_HEADER, objects)
+                                        .and_then(|built| {
+                                            state.apply(record)?;
+                                            if let Some((stream, slices)) = built {
+                                                state.log_mut(stream)?.segments.extend(slices);
+                                            }
+                                            Ok(())
+                                        });
+                                if applied.is_err() {
+                                    quarantined.insert(scope);
+                                    damaged_segments.insert(id);
+                                }
+                            }
+                            Err(_) => {
+                                damaged_segments.insert(id);
+                                unattributed = true;
+                            }
+                        }
+                        offset = next;
+                    }
+                    SalvageFrame::BadCrc { len } => {
+                        damaged_segments.insert(id);
+                        unattributed = true;
+                        offset += FRAME_HEADER + u64::from(len);
+                    }
+                    SalvageFrame::End if end.is_none() => break,
+                    SalvageFrame::End | SalvageFrame::Torn => {
+                        damaged_segments.insert(id);
+                        unattributed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        // Intact frames that do not chain to the published boundary mean a
+        // frame is missing or was replaced.
+        if !unattributed && chain != slot.chain {
+            damaged_segments.extend(from.segment..=slot.segment);
+            unattributed = true;
+        }
+        if unattributed {
+            // A keeper that held the single catalog may have lost a claim or a
+            // stage of a stream it does not host, which no quarantine covers.
+            if !state.catalog.is_empty() {
+                return Err(invalid(
+                    "WAL salvage refused: frames past the checkpoint are damaged on a keeper \
+                     that holds catalog records, so a lost claim or stage cannot be ruled out; \
+                     replace this keeper",
+                ));
+            }
+            quarantined.extend(state.genesis.keys().copied());
+        }
+
+        // Verify every surviving stream's retained slices and selected snapshot.
+        let check_streams: Vec<StreamId> = state.genesis.keys().copied().collect();
+        for stream in check_streams {
+            if quarantined.contains(&stream) {
+                continue;
+            }
+            if let Some(log) = state.logs.get(&stream) {
+                let mut stream_bad = false;
+                for object in log.segments.values() {
+                    if let Reference::Segment(loc) = object.reference()
+                        && damaged_segments.contains(&loc.segment)
+                    {
+                        stream_bad = true;
+                    }
+                    if object.read().is_err() {
+                        stream_bad = true;
+                        if let Reference::Segment(loc) = object.reference() {
+                            damaged_segments.insert(loc.segment);
+                        }
+                    }
+                }
+                if let Some(selected) = log.snapshot
+                    && let Some(generation) = log.ownership.generation()
+                {
+                    let snap_dir = crate::stream::consensus::ownership::directory(
+                        media.data(),
+                        stream,
+                        generation,
+                    );
+                    let genesis = &state.genesis[&stream];
+                    let snap_ok = File::open(selected.path(&snap_dir)).and_then(|file| {
+                        crate::stream::consensus::storage::snapshot::verify_selected_file(
+                            file, &snap_dir, genesis, selected, objects,
+                        )
+                    });
+                    if snap_ok.is_err() {
+                        stream_bad = true;
+                    }
+                }
+                if stream_bad {
+                    quarantined.insert(stream);
+                }
+            }
+        }
+
+        // Propagate every damaged segment to every stream the checkpoint knew
+        // held slices in that segment.
+        for seg in &damaged_segments {
+            if let Some(scopes) = segment_scopes.get(seg) {
+                quarantined.extend(scopes.iter().copied());
+            }
+        }
+        // Only treat registered streams (nonzero) as quarantined streams.
+        quarantined.retain(|stream| state.genesis.contains_key(stream));
+
+        let preserved: BTreeSet<StreamId> = state
+            .genesis
+            .keys()
+            .copied()
+            .filter(|stream| !quarantined.contains(stream))
+            .collect();
+
+        if damaged_segments.is_empty() && quarantined.is_empty() && state.check_hard_state().is_ok()
+        {
+            return Ok(SalvageReport {
+                damaged_segments,
+                quarantined,
+                preserved,
+                salvaged: false,
+            });
+        }
+
+        // Durably quarantine every affected stream in the registry and strip
+        // its unreadable log suffix from the salvaged checkpoint so strict
+        // startup succeeds for the preserved streams.
+        let reason = format!(
+            "WAL salvage skipped damaged segment(s) {:?}",
+            damaged_segments
+        );
+        for &stream in &quarantined {
+            quarantine.mark(stream, &reason)?;
+            objects.protect(stream);
+            if let Some(log) = state.logs.get_mut(&stream) {
+                log.entries.clear();
+                log.segments.clear();
+                log.snapshot = None;
+                log.purged = None;
+            }
+        }
+        state.check_hard_state()?;
+
+        // Remove any unpublished segments past `slot.segment`, then start a
+        // clean segment and publish a fresh checkpoint + boundary.
+        let mut removed = false;
+        for item in fs::read_dir(&directory)? {
+            let item = item?;
+            if item
+                .file_name()
+                .to_str()
+                .and_then(segment::parse)
+                .is_some_and(|id| id > slot.segment)
+            {
+                fs::remove_file(item.path())?;
+                removed = true;
+            }
+        }
+        if removed {
+            sync_directory(&directory)?;
+        }
+
+        let next_segment = slot.segment + 1;
+        let _fresh = segment::create(&directory, next_segment, incarnation)?;
+        let fresh_position = Position {
+            segment: next_segment,
+            offset: HEADER,
+        };
+        let fresh_chain = segment::seed(incarnation);
+        let (checkpoint, _pins) = capture(&state, objects, fresh_position, fresh_chain)?;
+        let reference = write_checkpoint(&checkpoints, &checkpoint, space, state.cluster_version)?;
+        boundaries.write(next_segment, HEADER, fresh_chain, Some(reference))?;
+
+        Ok(SalvageReport {
+            damaged_segments,
+            quarantined,
+            preserved,
+            salvaged: true,
+        })
     }
 
     /// Rewrites media in the format before segments as one segment and a
@@ -1089,5 +1417,87 @@ impl Leaf {
             state.catalog.insert(scope, catalog);
         }
         Ok(())
+    }
+
+    /// Best-effort leaf restore for offline salvage. Returns `(damaged,
+    /// bad_segments)` where `damaged` is true if this stream's state could not
+    /// be cleanly restored and `bad_segments` lists any WAL segments whose
+    /// slices failed verification.
+    fn restore_salvage(
+        self,
+        scope: StreamId,
+        objects: &Objects,
+        damaged_segments: &BTreeSet<u64>,
+        state: &mut State,
+    ) -> io::Result<(bool, BTreeSet<u64>)> {
+        let mut bad = BTreeSet::new();
+        let mut failed = false;
+        if let Some(genesis) = self.genesis {
+            if genesis.stream != scope || self.entries.len() > MAX_SUFFIX {
+                return Err(invalid("WAL leaf scope or suffix bound differs"));
+            }
+            let ownership = self
+                .ownership
+                .ok_or_else(|| invalid("WAL leaf lacks replica ownership"))?;
+            let mut log = Log {
+                vote: self.vote,
+                purged: self.purged,
+                snapshot: self.snapshot,
+                ownership,
+                ..Log::default()
+            };
+            let mut next = self.purged.map_or(0, |purged| purged.index + 1);
+            for (index, reference) in self.entries {
+                let expected = next;
+                next = next
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("WAL index exhausted"))?;
+                if let Reference::Segment(location) = reference
+                    && damaged_segments.contains(&location.segment)
+                {
+                    bad.insert(location.segment);
+                    failed = true;
+                    continue;
+                }
+                let loaded = objects.resolve(reference).and_then(|object| {
+                    let bytes = object.read()?;
+                    let entry: Entry = options()
+                        .with_limit(MAX_FRAME)
+                        .deserialize(&bytes)
+                        .map_err(io::Error::other)?;
+                    if index != expected || index != entry.log_id.index {
+                        return Err(invalid("WAL entry log position differs"));
+                    }
+                    Ok((object, entry))
+                });
+                match loaded {
+                    Ok((object, entry)) => {
+                        log.entries.insert(index, entry);
+                        log.segments.insert(index, object);
+                    }
+                    Err(_) => {
+                        failed = true;
+                        if let Reference::Segment(location) = reference {
+                            bad.insert(location.segment);
+                        }
+                    }
+                }
+            }
+            if failed {
+                log.entries.clear();
+                log.segments.clear();
+                log.snapshot = None;
+                log.purged = None;
+            }
+            state.genesis.insert(scope, genesis);
+            state.logs.insert(scope, log);
+        }
+        if let Some(catalog) = self.catalog {
+            if catalog.genesis.stream != scope {
+                return Err(invalid("catalog leaf scope differs"));
+            }
+            state.catalog.insert(scope, catalog);
+        }
+        Ok((failed, bad))
     }
 }

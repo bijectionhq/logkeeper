@@ -121,6 +121,55 @@ pub(super) enum Frame {
     Torn,
 }
 
+/// Frame outcome for offline WAL salvage, distinguishing a body CRC failure
+/// (whose length header is still intact so later frames can be inspected) from
+/// a torn/unparseable frame.
+pub(super) enum SalvageFrame {
+    Complete { header: [u8; 8], body: Vec<u8> },
+    BadCrc { len: u32 },
+    End,
+    Torn,
+}
+
+/// Reads the next frame during offline salvage. `remaining` bounds the unread
+/// bytes up to the published boundary when on the active segment.
+pub(super) fn next_salvage(
+    file: &mut impl Read,
+    remaining: Option<u64>,
+) -> io::Result<SalvageFrame> {
+    if remaining == Some(0) {
+        return Ok(SalvageFrame::End);
+    }
+    let mut header = [0; FRAME_HEADER as usize];
+    let mut read = 0;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) if read == 0 => return Ok(SalvageFrame::End),
+            Ok(0) => return Ok(SalvageFrame::Torn),
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error),
+        }
+    }
+    let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+    let crc = u32::from_le_bytes(header[4..].try_into().unwrap());
+    if len == 0
+        || u64::from(len) > MAX_FRAME
+        || remaining.is_some_and(|rem| FRAME_HEADER + u64::from(len) > rem)
+    {
+        return Ok(SalvageFrame::Torn);
+    }
+    let mut body = Vec::new();
+    file.take(u64::from(len)).read_to_end(&mut body)?;
+    if body.len() != len as usize {
+        return Ok(SalvageFrame::Torn);
+    }
+    if crc32fast::hash(&body) != crc {
+        return Ok(SalvageFrame::BadCrc { len });
+    }
+    Ok(SalvageFrame::Complete { header, body })
+}
+
 /// Reads the next frame. A short or damaged frame is torn; recovery decides
 /// whether that is an unacknowledged tail or lost acknowledged bytes.
 pub(super) fn next(file: &mut impl Read) -> io::Result<Frame> {

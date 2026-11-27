@@ -40,6 +40,8 @@ async fn main() -> ExitCode {
         );
         #[cfg(feature = "stream")]
         println!("       logkeeper keeper clear-quarantine --config FILE --stream UUID");
+        #[cfg(feature = "stream")]
+        println!("       logkeeper keeper salvage --config FILE");
         return ExitCode::SUCCESS;
     }
     match run(&args).await {
@@ -114,6 +116,21 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
             } else {
                 println!("stream {:032x} was not quarantined", stream.0);
             }
+            return Ok(());
+        }
+        if let [_, action, flag, file] = args
+            && action == "salvage"
+            && flag == "--config"
+        {
+            let report = logkeeper::stream::consensus::Config::read(std::path::Path::new(file))?
+                .salvage()?;
+            println!(
+                "salvaged={} damaged_segments={} quarantined={} preserved={}",
+                report.salvaged,
+                report.damaged_segments.len(),
+                report.quarantined.len(),
+                report.preserved.len()
+            );
             return Ok(());
         }
         if args.get(1).is_some_and(|action| action == "inspect") {

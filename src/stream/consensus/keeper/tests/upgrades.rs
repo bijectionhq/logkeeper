@@ -634,3 +634,325 @@ async fn checksum_failure_quarantines_durably_survives_restart_triggers_repair_a
 
     cluster.stop_all().await;
 }
+
+/// Damage in a segment that lies wholly before the checkpoint costs only
+/// the streams whose payload slices it holds: the checkpoint names them, and
+/// every vote and ownership change is in the checkpoint itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn salvage_of_a_checkpointed_segment_quarantines_only_the_streams_it_holds() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let client = cluster.client(&cluster.credentials);
+    let (lost, kept) = (StreamId(234), StreamId(235));
+    // `lost` fills the first 256 KiB test segment before `kept` exists, so
+    // segment 1 holds entries of `lost` only.
+    let chunk = Bytes::from(vec![b'L'; 64 * 1024]);
+    let mut last = BTreeMap::new();
+    let mut victim = None;
+    for (stream, writer) in [(lost, 81), (kept, 82)] {
+        client
+            .create(stream, [a, b, c], 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        if victim.is_none() {
+            let leader = cluster.leader(lost).await;
+            victim = [a, b, c].into_iter().find(|id| *id != leader);
+        }
+        let fence = client
+            .seal(stream, Epoch(0), Uuid::from_u128(writer))
+            .await
+            .unwrap()
+            .fence;
+        for lsn in 1..=5 {
+            client
+                .append(stream, fence, Lsn(lsn), chunk.clone())
+                .await
+                .unwrap();
+        }
+        last.insert(stream, fence);
+    }
+    let victim = victim.unwrap();
+    for stream in [lost, kept] {
+        let group = cluster.group(victim, stream).await;
+        group
+            .raft
+            .wait(Some(WAIT))
+            .metrics(|_| group.state.head() == Ok(Lsn(5)), "victim applied LSN 5")
+            .await
+            .unwrap();
+    }
+    let disk = cluster.running[&victim].engine.disk.clone();
+    disk.checkpoint_now().await.unwrap();
+    cluster.running.remove(&victim).unwrap().stop().await;
+    drop(disk);
+
+    let seg1 = cluster.configs[&victim]
+        .data
+        .join("raft-segments")
+        .join("00000000000000000001.seg");
+    {
+        let mut file = std::fs::OpenOptions::new().write(true).open(&seg1).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"CORRUPT!").unwrap();
+        file.sync_all().unwrap();
+    }
+    let report = cluster.configs[&victim].salvage().unwrap();
+    assert!(report.salvaged);
+    assert!(report.damaged_segments.contains(&1));
+    assert!(report.quarantined.contains(&lost));
+    assert!(!report.quarantined.contains(&kept), "{report}");
+    assert!(report.preserved.contains(&kept));
+
+    cluster.restart(victim).await;
+    assert_eq!(
+        client.keeper_status(victim, lost).await.unwrap().replica,
+        Some(false)
+    );
+    assert_eq!(
+        client.keeper_status(victim, kept).await.unwrap().replica,
+        Some(true)
+    );
+    // `kept` still serves from the salvaged keeper's own copy.
+    let group = cluster.group(victim, kept).await;
+    group
+        .raft
+        .wait(Some(WAIT))
+        .metrics(
+            |_| group.state.head() == Ok(Lsn(5)),
+            "kept reopened at LSN 5",
+        )
+        .await
+        .unwrap();
+    let page = group.state.page(Lsn(1), 5).await.unwrap();
+    assert_eq!(page.records.len(), 5);
+    assert_eq!(page.records[4], (Lsn(5), chunk.clone()));
+    // Repair replaces the quarantined copy of `lost` without an operator.
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(configuration) = client.configuration(lost).await
+                && !configuration.voters.contains(&victim)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("repair replaced the salvaged quarantined replica");
+    let fence = last[&lost];
+    client
+        .append(lost, fence, Lsn(6), Bytes::from_static(b"after"))
+        .await
+        .unwrap();
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_salvage_boots_past_damaged_wal_quarantines_affected_streams_and_serves_rest() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let client = cluster.client(&cluster.credentials);
+
+    // Create two streams on voters [a, b, c]. Write `healthy` into segment 1
+    // and checkpoint it, then write enough data to `damaged` to roll into
+    // segment >= 2 so the two streams hold slices in distinct segments.
+    let healthy = StreamId(231);
+    let damaged = StreamId(232);
+    client
+        .create(healthy, [a, b, c], 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    client
+        .create(damaged, [a, b, c], 4 * 1024 * 1024)
+        .await
+        .unwrap();
+
+    // Pick a follower of `damaged` so the other two voters keep quorum for repair.
+    let leader_d = cluster.leader(damaged).await;
+    let victim = [a, b, c].into_iter().find(|id| *id != leader_d).unwrap();
+
+    let healthy_payload = Bytes::from(vec![b'H'; 4096]);
+    let fence_h = client
+        .seal(healthy, Epoch(0), Uuid::from_u128(71))
+        .await
+        .unwrap()
+        .fence;
+    client
+        .append(healthy, fence_h, Lsn(1), healthy_payload.clone())
+        .await
+        .unwrap();
+
+    // Wait for `victim` to apply healthy LSN 1, then checkpoint it so its
+    // slices are recorded in checkpoint.segments under segment 1.
+    let group_h = cluster.group(victim, healthy).await;
+    group_h
+        .raft
+        .wait(Some(WAIT))
+        .metrics(
+            |_| group_h.state.head() == Ok(Lsn(1)),
+            "victim applied healthy LSN 1",
+        )
+        .await
+        .unwrap();
+    cluster.running[&victim]
+        .engine
+        .disk
+        .checkpoint_now()
+        .await
+        .unwrap();
+
+    // Write ~384 KiB to `damaged` (exceeding test SEGMENT_BYTES = 256 KiB)
+    // so `damaged` rolls into segment >= 2.
+    let fence_d = client
+        .seal(damaged, Epoch(0), Uuid::from_u128(72))
+        .await
+        .unwrap()
+        .fence;
+    let chunk = Bytes::from(vec![b'D'; 64 * 1024]);
+    for i in 1..=6u64 {
+        client
+            .append(damaged, fence_d, Lsn(i), chunk.clone())
+            .await
+            .unwrap();
+    }
+    let group_d = cluster.group(victim, damaged).await;
+    group_d
+        .raft
+        .wait(Some(WAIT))
+        .metrics(
+            |_| group_d.state.head() == Ok(Lsn(6)),
+            "victim applied damaged LSN 6",
+        )
+        .await
+        .unwrap();
+
+    // Stop `victim` cleanly. Running salvage on a healthy WAL must be a no-op.
+    cluster.running.remove(&victim).unwrap().stop().await;
+    let noop = cluster.configs[&victim].salvage().unwrap();
+    assert!(!noop.salvaged);
+    assert!(noop.damaged_segments.is_empty());
+    assert!(noop.quarantined.is_empty());
+    assert!(noop.preserved.contains(&healthy));
+    assert!(noop.preserved.contains(&damaged));
+
+    // Corrupt the newest WAL segment (which holds `damaged` frames, not
+    // `healthy` slices) in its frame payload to simulate a damaged WAL span.
+    let seg_dir = cluster.configs[&victim].data.join("raft-segments");
+    let mut seg_files: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(&seg_dir)
+        .unwrap()
+        .filter_map(|e| {
+            let entry = e.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            let num = name.strip_suffix(".seg")?.parse::<u64>().ok()?;
+            Some((num, entry.path()))
+        })
+        .collect();
+    seg_files.sort_by_key(|(id, _)| *id);
+    assert!(
+        seg_files.len() >= 2,
+        "expected segment rollover, found {:?}",
+        seg_files
+    );
+    let (bad_seg_id, bad_seg_path) = seg_files.last().unwrap().clone();
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&bad_seg_path)
+            .unwrap();
+        let len = file.metadata().unwrap().len();
+        assert!(len > 64);
+        let pos = len / 2;
+        file.seek(SeekFrom::Start(pos)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(pos)).unwrap();
+        file.write_all(&[byte[0] ^ 0xff]).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    // Strict default startup MUST still refuse to boot on the damaged WAL.
+    let strict_boot = cluster.configs[&victim]
+        .clone()
+        .prepare(CancellationToken::new())
+        .await;
+    assert!(
+        strict_boot.is_err(),
+        "strict boot must fail on a damaged WAL span before salvage"
+    );
+
+    // Offline salvage walks past the damaged frame. The frame lies past the
+    // checkpoint and fails its checksum, so it could have been any stream's
+    // vote, trim or deletion: salvage quarantines every stream on `victim`
+    // rather than serve one without a record it lost, and writes a clean
+    // checkpoint so strict boot works.
+    let report = cluster.configs[&victim].salvage().unwrap();
+    assert!(report.salvaged);
+    assert!(report.damaged_segments.contains(&bad_seg_id));
+    assert!(report.quarantined.contains(&damaged));
+    assert!(report.quarantined.contains(&healthy));
+    assert!(report.preserved.is_empty());
+
+    // Victim now boots strictly.
+    cluster.restart(victim).await;
+
+    // Both copies on `victim` return typed Corrupted and report unhealthy,
+    // so repair replaces them.
+    let identity = Identity::Client(journal_contract::Identity::from(OWNER));
+    let read_damaged = Request::Read {
+        stream: damaged,
+        from: Lsn(1),
+        limit: 1,
+        wait_ms: 0,
+    };
+    assert!(matches!(
+        cluster.running[&victim]
+            .engine
+            .request(&identity, read_damaged)
+            .await,
+        Ok(Reply::Decision(Outcome::Refused(JournalError::Corrupted)))
+    ));
+    for stream in [damaged, healthy] {
+        assert_eq!(
+            client.keeper_status(victim, stream).await.unwrap().replica,
+            Some(false)
+        );
+    }
+
+    // Repair replaces `victim` on `damaged`, while `healthy` keeps working.
+    let repaired = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(cfg) = client.configuration(damaged).await
+                && !cfg.voters.contains(&victim)
+            {
+                return cfg;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("repair replaced salvaged quarantined replica");
+    assert!(!repaired.voters.contains(&victim));
+
+    // Appending to `healthy` still succeeds across the cluster.
+    client
+        .append(
+            healthy,
+            fence_h,
+            Lsn(2),
+            Bytes::from_static(b"after-salvage"),
+        )
+        .await
+        .unwrap();
+    let page = client
+        .read(healthy, Lsn(1), 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.records.len(), 2);
+
+    cluster.stop_all().await;
+}

@@ -38,7 +38,7 @@ pub use operator::{
     admin_command, render as render_report,
 };
 pub use placement::Domains;
-pub use storage::{InspectReport, SegmentDump, VerifyReport, dump_segment_file};
+pub use storage::{InspectReport, SalvageReport, SegmentDump, VerifyReport, dump_segment_file};
 pub use timed::TimedAuthority;
 
 pub(super) const ALPN: &[u8] = b"logkeeper-consensus/2";

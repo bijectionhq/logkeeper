@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod legacy;
 pub(super) mod segmented;
+pub use segmented::SalvageReport;
 use segmented::{Segmented, Tuning};
 #[cfg(test)]
 mod tests;
@@ -509,6 +510,22 @@ pub(in crate::stream::consensus) enum ReplicaFault {
 impl Disk {
     pub fn open(enrollment: Enrollment) -> io::Result<Self> {
         Self::open_tuned(enrollment, Tuning::default())
+    }
+
+    /// Offline salvage on a stopped keeper: walks past damaged WAL spans,
+    /// durably quarantines affected streams, and publishes a clean boundary.
+    pub fn salvage(enrollment: Enrollment) -> io::Result<SalvageReport> {
+        let quarantine = enrollment.quarantine_store()?;
+        let (media, _lock, opened) = enrollment.open()?;
+        let path = media.data().to_path_buf();
+        let space = Space::new(path.clone())?;
+        let objects = Objects::open(&path)?;
+        if let Opened::Legacy(_) = opened {
+            return Err(invalid(
+                "salvage requires the segmented WAL format; migrate before salvaging",
+            ));
+        }
+        Segmented::salvage(&media, &objects, &space, &quarantine)
     }
 
     fn open_tuned(enrollment: Enrollment, tuning: Tuning) -> io::Result<Self> {

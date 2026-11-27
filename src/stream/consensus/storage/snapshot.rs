@@ -226,8 +226,19 @@ pub(in crate::stream::consensus) struct Selected {
     pub(super) digest: [u8; 32],
 }
 
+pub(super) fn verify_selected_file(
+    file: File,
+    directory: &Path,
+    genesis: &Genesis,
+    selected: Selected,
+    objects: &super::objects::Objects,
+) -> io::Result<()> {
+    read_selected(file, directory, genesis, selected, objects)?;
+    Ok(())
+}
+
 impl Selected {
-    fn path(self, directory: &Path) -> PathBuf {
+    pub(super) fn path(self, directory: &Path) -> PathBuf {
         directory.join(format!("snapshot-{}", hex(&self.digest)))
     }
 }
