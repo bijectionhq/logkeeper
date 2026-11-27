@@ -424,10 +424,13 @@ impl LocalCluster {
         Ok(())
     }
 
-    /// Runs `logkeeper keeper recover-stream --acknowledge-data-loss --lost
-    /// LOST` on the stopped keeper `survivor`, which then has to be
-    /// restarted. The two replacements are chosen among the live keepers in
-    /// free domains, such as the spares of [`LocalCluster::start_spared`].
+    /// Retires the two stopped keepers `lost` with `logkeeper keeper
+    /// fence-recovery`, then runs `logkeeper keeper recover-stream
+    /// --acknowledge-data-loss --lost LOST --fence-proof ...` with their
+    /// retirement proofs on the stopped keeper `survivor`, which then has to
+    /// be restarted. The retired keepers refuse to start again. The two
+    /// replacements are chosen among the live keepers in free domains, such
+    /// as the spares of [`LocalCluster::start_spared`].
     #[allow(clippy::field_reassign_with_default)]
     pub async fn recover_stream(
         &self,
@@ -435,14 +438,29 @@ impl LocalCluster {
         stream: journal_contract::StreamId,
         mut lost: [Uuid; 2],
     ) -> io::Result<RecoveryReport> {
-        if self.running.contains_key(&survivor) {
-            return Err(io::Error::other("stop the surviving keeper first"));
+        if [survivor, lost[0], lost[1]]
+            .iter()
+            .any(|keeper| self.running.contains_key(keeper))
+        {
+            return Err(io::Error::other(
+                "stop the surviving keeper and both lost keepers first",
+            ));
         }
         lost.sort_unstable();
+        let fence_proofs = lost
+            .iter()
+            .map(|keeper| {
+                self.configs
+                    .get(keeper)
+                    .ok_or_else(|| io::Error::other("unknown keeper"))?
+                    .fence_recovery(*keeper)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         // Built by assignment: the struct has a field private to unit tests.
         let mut recovery = Recovery::default();
         recovery.acknowledge_data_loss = true;
         recovery.lost = Some(lost);
+        recovery.fence_proofs = fence_proofs;
         self.configs
             .get(&survivor)
             .ok_or_else(|| io::Error::other("unknown keeper"))?
