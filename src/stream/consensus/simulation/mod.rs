@@ -2265,6 +2265,9 @@ async fn consensus_fault_harness_soak() {
     let count = env::var("LOGKEEPER_CONSENSUS_SEEDS").map_or(50, |v| v.parse::<u64>().unwrap());
     let allow_wipe = env::var("LOGKEEPER_CONSENSUS_ALLOW_WIPE")
         .map_or(false, |v| v == "1" || v.eq_ignore_ascii_case("true"));
+    // Keep going past a failing seed and report every failure at the end.
+    let keep_going = env::var("LOGKEEPER_CONSENSUS_KEEP_GOING")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let mut config = if allow_wipe {
         RunConfig::with_wipe()
     } else {
@@ -2274,23 +2277,39 @@ async fn consensus_fault_harness_soak() {
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
     let mut coverage = Coverage::new();
     let mut total_ops = 0usize;
+    let mut failures = Vec::new();
     for seed in first..first + count {
-        let summary = timeout(Duration::from_secs(90), run_seed(seed, &config))
-            .await
-            .unwrap_or_else(|_| panic!("soak timed out on seed {seed}"))
-            .unwrap_or_else(|(plan, violation)| {
-                panic!(
-                    "soak FAILED on seed {seed} (profile {:?}): {violation}\nsteps: {:#?}",
-                    plan.profile, plan.steps
-                )
-            });
-        total_ops += summary.total_ops;
-        for (k, v) in summary.coverage {
-            *coverage.entry(k).or_default() += v;
+        let started = std::time::Instant::now();
+        let failure = match timeout(Duration::from_secs(90), run_seed(seed, &config)).await {
+            Ok(Ok(summary)) => {
+                total_ops += summary.total_ops;
+                for (k, v) in summary.coverage {
+                    *coverage.entry(k).or_default() += v;
+                }
+                None
+            }
+            Ok(Err((plan, violation))) => Some(format!(
+                "soak FAILED on seed {seed} (profile {:?}): {violation}\nsteps: {:#?}",
+                plan.profile, plan.steps
+            )),
+            Err(_) => Some(format!("soak timed out on seed {seed}")),
+        };
+        eprintln!(
+            "soak seed {seed}: {} in {:?}",
+            if failure.is_some() { "FAILED" } else { "ok" },
+            started.elapsed()
+        );
+        if let Some(failure) = failure {
+            if !keep_going {
+                panic!("{failure}");
+            }
+            eprintln!("{failure}");
+            failures.push(seed);
         }
     }
     eprintln!(
-        "consensus soak seeds {first}..{} PASSED ({total_ops} ops): {coverage:?}",
+        "consensus soak seeds {first}..{} ({total_ops} ops, failed {failures:?}): {coverage:?}",
         first + count
     );
+    assert!(failures.is_empty(), "soak failed on seeds {failures:?}");
 }
