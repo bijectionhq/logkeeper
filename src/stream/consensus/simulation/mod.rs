@@ -229,7 +229,7 @@ struct StreamTracker {
     current_epoch: Epoch,
     current_owner: Option<WriterKind>,
     next_lsn: Lsn,
-    last_append: Option<(Lsn, Bytes)>,
+    last_append: Option<(Epoch, Lsn, Bytes)>,
     trimmed_to: Lsn,
     deleted: bool,
     recovered: bool,
@@ -1440,7 +1440,8 @@ async fn run_concurrent_ops(
                         t.current_epoch.max(Epoch(1))
                     };
                     let (at, payload) = if retry_previous
-                        && let Some((prev_lsn, prev_bytes)) = t.last_append.clone()
+                        && let Some((prev_epoch, prev_lsn, prev_bytes)) = t.last_append.clone()
+                        && prev_epoch == epoch
                     {
                         (prev_lsn, prev_bytes)
                     } else {
@@ -1591,7 +1592,7 @@ async fn run_concurrent_ops(
                             if pos.0 >= t.next_lsn.0 {
                                 t.next_lsn = Lsn(pos.0 + 1);
                             }
-                            t.last_append = Some((*pos, payload));
+                            t.last_append = Some((epoch, *pos, payload));
                         }
                         Err(JournalError::Conflict { head }) => {
                             let mut lock = trackers.lock();
@@ -1637,7 +1638,7 @@ async fn run_concurrent_ops(
                                 t.next_lsn = Lsn(last.0 + 1);
                             }
                             if let Some((lsn, bytes)) = records.last() {
-                                t.last_append = Some((*lsn, bytes.clone()));
+                                t.last_append = Some((epoch, *lsn, bytes.clone()));
                             }
                         }
                         Err(JournalError::Conflict { head }) => {

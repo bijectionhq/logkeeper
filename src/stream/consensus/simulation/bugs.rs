@@ -312,3 +312,96 @@ async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_h
         report.voters
     );
 }
+
+/// Minimal reproduction of the contract-conformance bug found on soak seed 25
+/// (`Profile::ReplicatedCatalog`).
+///
+/// The `journal_contract` reference (`contract/src/state.rs:109-116`) and
+/// linearizability checker (`contract/src/conformance/history.rs:356`) require
+/// an idempotent retry at `at <= head` to match both the committing `Epoch`
+/// and the `payload` bytes. Because `src/stream/consensus/state.rs` does not
+/// record the committing epoch per retained record, a new writer under
+/// `Epoch(2)` appending identical bytes at an LSN written under `Epoch(1)`
+/// receives `Ok(at)` instead of `Err(JournalError::Conflict { head })`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "reproduces unfixed contract-conformance bug found on soak seed 25; see HARNESS-REPORT.md"]
+async fn bug_repro_cross_epoch_identical_payload_retry_violates_contract() {
+    let options = ClusterOptions {
+        park_after_secs: 3600,
+        repair_after_secs: 60,
+        ..ClusterOptions::default()
+    };
+    let mut cluster = SimCluster::start(250_001, options.clone()).await;
+    let voters = [
+        cluster.data_ids[0],
+        cluster.data_ids[1],
+        cluster.data_ids[2],
+    ];
+    let stream = StreamId(250_001);
+    let writer_a = cluster.journal(WRITER_A, voters);
+    let writer_b = cluster.journal(WRITER_B, voters);
+    let id_a = Identity::from_static(WRITER_A);
+    let id_b = Identity::from_static(WRITER_B);
+
+    writer_a.create(stream).await.unwrap();
+    assert_eq!(writer_a.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
+    let payload = Bytes::from_static(b"same-bytes");
+    assert_eq!(
+        writer_a
+            .append(stream, Epoch(1), Lsn(1), payload.clone())
+            .await,
+        Ok(Lsn(1))
+    );
+    assert_eq!(writer_b.seal(stream, Epoch(2)).await, Ok(Lsn(1)));
+    let cross_epoch = writer_b
+        .append(stream, Epoch(2), Lsn(1), payload.clone())
+        .await;
+    cluster.stop_all().await;
+
+    let calls = vec![
+        Call {
+            identity: id_a.clone(),
+            op: Op::Create,
+            invocation: 0,
+            response: 1,
+            result: Ok(Value::Unit),
+        },
+        Call {
+            identity: id_a.clone(),
+            op: Op::Seal(Epoch(1)),
+            invocation: 2,
+            response: 3,
+            result: Ok(Value::Position(Lsn(0))),
+        },
+        Call {
+            identity: id_a,
+            op: Op::Append(Epoch(1), Lsn(1), payload.clone()),
+            invocation: 4,
+            response: 5,
+            result: Ok(Value::Position(Lsn(1))),
+        },
+        Call {
+            identity: id_b.clone(),
+            op: Op::Seal(Epoch(2)),
+            invocation: 6,
+            response: 7,
+            result: Ok(Value::Position(Lsn(1))),
+        },
+        Call {
+            identity: id_b,
+            op: Op::Append(Epoch(2), Lsn(1), payload),
+            invocation: 8,
+            response: 9,
+            result: cross_epoch.clone().map(Value::Position),
+        },
+    ];
+    let limits = Limits {
+        max_record_bytes: options.max_record_bytes,
+        stream_quota_bytes: options.quota_bytes,
+    };
+    assert!(
+        linearizable(&calls, limits),
+        "contract violated: cross-epoch append of identical bytes at Lsn(1) under Epoch(2) \
+         returned {cross_epoch:?} instead of Err(Conflict {{ head: Lsn(1) }})"
+    );
+}

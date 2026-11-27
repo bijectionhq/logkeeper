@@ -509,11 +509,30 @@ impl SimCluster {
     }
 
     /// Reads the complete applied state of `stream` directly from `keeper`'s
-    /// local `StateMachine` (open or parked/closed).
+    /// local `StateMachine` (open, closed-deleted, or parked).
     pub async fn inspect_voter(&self, keeper: Uuid, stream: StreamId) -> Option<VoterSnapshot> {
         let server = self.running.get(&keeper)?;
         if !server.engine.disk.healthy() {
             return None;
+        }
+        // Once a deleted stream's group closes after DELETED_GROUP_GRACE, its
+        // closed_states handle is suspended (`state.healthy() == false`) while
+        // `engine.deleted` holds the tombstone.
+        if server.engine.deleted.read().contains(&stream) {
+            let configuration = server
+                .engine
+                .closed_states
+                .lock()
+                .get(&stream)
+                .and_then(|s| s.finalized());
+            return Some(VoterSnapshot {
+                keeper,
+                deleted: true,
+                floor: Lsn(1),
+                head: Lsn(0),
+                records: Vec::new(),
+                configuration,
+            });
         }
         let state = {
             let groups = server.engine.groups.lock().await;
