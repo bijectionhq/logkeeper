@@ -98,3 +98,25 @@ state updates are checked against production and the remaining adapter work.
 consensus design and its proof boundary. The package checks the model alongside
 the shipped stream journal, whose proposer and publication protocol has its
 own refinement and trace checker.
+
+## Consensus keeper additions
+
+`Logkeeper.ConsensusAdditions` proves what the keeper-hosted consensus
+streams add on top of Raft, as state-machine theorems over any number of
+steps. OpenRaft's election, log matching and commit rules are trusted and
+enter as step guards or hypotheses.
+
+| Module | Result |
+| --- | --- |
+| [RecoveryFence](Logkeeper/ConsensusAdditions/RecoveryFence.lean) | The recovery term `max + 2^32` outranks the survivor's history and any lost voter that ran fewer than `2^32` elections it never saw. The survivor refuses every lost voter (`excludes_sender`), so lost voters never learn the recovery term and recovered replicas never hold a lost-suffix entry. While at most one lost voter runs, it cannot gather a quorum, so every commit and every read behind a quorum barrier observes only the recovered history. Two witnesses state the residual risks: both lost voters returning together form the old quorum and serve the lost suffix, and one returning voter answering from its own applied state without a barrier serves it too. The seal step refuses every seal while the recovery fence stands. |
+| [Parking](Logkeeper/ConsensusAdditions/Parking.lean) | Under log matching, a follower that accepts a park holds exactly the leader's applied log, and so every committed entry. Accepting, parking, the busy answer and reopening keep each replica's vote, log and applied index, so any interleaving of them preserves the committed log. |
+| [RetireOnProof](Logkeeper/ConsensusAdditions/RetireOnProof.lean) | A copy retired on a certified proof is outside the proof's configuration and its joint target, so removing it leaves every quorum of that configuration a quorum. A proof of another revision retires nothing, nor does a request for a copy staged again under a new generation. |
+| [CatalogClaim](Logkeeper/ConsensusAdditions/CatalogClaim.lean) | A stream's genesis is its first committed claim, every claim reply names it, replicas holding prefixes of the committed log agree on it, and a checkpoint followed by its suffix reaches the same catalog. |
+
+Run `python3 run_consensus_additions.py` from this directory to build the
+package, check the 27 theorems' axioms and run the ten negative controls.
+The local decisions these theorems rely on are checked against the shipped
+Rust in the [consensus admission area](../verus/consensus_admission/README.md).
+The bounded TLA+ model of the same additions is on the `protocol-model`
+branch; the [verification README](../README.md#consensus-keeper-additions)
+compares the tools.
