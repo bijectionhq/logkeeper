@@ -45,7 +45,7 @@
  * lengthens leases, and a delayed reply is simulated by a later grant
  * (README.md, "Epoch leases").
  *)
-EXTENDS Integers, Sequences, FiniteSets, TLC
+EXTENDS Integers, Sequences, FiniteSets, TLC, KeeperSafety
 
 CONSTANTS
     Procs,            \* processes; one per keeper ID, plus ReusedProc
@@ -149,7 +149,7 @@ IsPrefix(a, b) == Len(a) <= Len(b) /\ SubSeq(b, 1, Len(a)) = a
 \* A log of the recovered world extends the survivors' recovery round.
 NewWorld(lg) == recovered /\ IsPrefix(survHist, lg)
 
-Quorum(S, mem) == mem # {} /\ 2 * Cardinality(S \cap mem) > Cardinality(mem)
+Quorum(S, mem) == Majority(S, mem)
 
 -----------------------------------------------------------------------------
 (* Network, leases and gating *)
@@ -166,9 +166,7 @@ RunWait == [st |-> "run", le |-> 0, d |-> 0]
 \* recovered configuration (decisions::copy_fenced): a lost voter never does,
 \* and a fenced other survivor does once it caught up from the writer.
 LeaseValid(p) ==
-    /\ lease[p].on
-    /\ lease[p].epoch = myEpoch[p]
-    /\ ~(lease[p].fenced /\ ~Finalized(p))
+    CurrentLease(lease[p].on, myEpoch[p], lease[p].epoch, lease[p].fenced /\ ~Finalized(p))
 
 \* One wait-out clock stands for every recovered member's: the one that
 \* finishes first. Letting every member act once it finishes only adds
@@ -428,7 +426,7 @@ SurvivorProcs == {p \in Procs : IdOf(p) \in Survivors /\ p # ReusedProc}
 ReplacementProcs == {p \in Procs : IdOf(p) \in Replacements}
 
 FenceSet(named) ==
-    IF FenceRule = "AllOld" \/ named = {} THEN OldVoters \ NewVoters ELSE named
+    IF FenceRule = "AllOld" \/ named = {} THEN RemovedVoters(OldVoters, NewVoters) ELSE named
 
 \* With OnlyWriterRecovers (the code), the recovery round goes to the most
 \* advanced survivor only. Every other survivor keeps running, with its log,

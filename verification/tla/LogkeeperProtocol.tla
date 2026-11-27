@@ -24,7 +24,7 @@
  *     acknowledgement, returning 1 or 2 lost voters, and client read
  *     observations (keeper/recovery.rs, decisions.rs, client/reading.rs).
  *)
-EXTENDS Naturals, Sequences, FiniteSets, TLC
+EXTENDS Naturals, Sequences, FiniteSets, TLC, KeeperSafety
 
 CONSTANTS
     Keepers,          \* Finite set of keeper IDs (e.g. {"k1","k2","k3","k4"})
@@ -121,10 +121,8 @@ InitVote == [term |-> 0, votedFor |-> Nil, committed |-> FALSE]
 
 \* OpenRaft 0.10 standard Raft vote partial order (leader_id_std):
 \* within the same term, distinct candidates are incomparable.
-VoteLeq(v1, v2) ==
-    \/ v1.term < v2.term
-    \/ (v1.term = v2.term /\ v1.votedFor = Nil)
-    \/ (v1.term = v2.term /\ v1.votedFor = v2.votedFor /\ (~v1.committed \/ v2.committed))
+TermLess(a, b) == a < b
+VoteLeq(v1, v2) == RaftVoteLeq(v1, v2, Nil, TermLess)
 
 \* decisions::demotes_vote (decisions.rs:228, storage/mod.rs:136)
 DemoteVote(k, v) ==
@@ -160,7 +158,7 @@ AppliedMembership(k)   == MembershipIn(log[k], appliedIdx[k])
 AllVoters(m) == m.voters1 \cup m.voters2
 AllNodes(m)  == m.voters1 \cup m.voters2 \cup m.learners
 
-IsMajority(S, V) == V # {} /\ 2 * Cardinality(S \cap V) > Cardinality(V)
+IsMajority(S, V) == Majority(S, V)
 
 IsQuorum(S, m) ==
     /\ m.configured
@@ -748,8 +746,7 @@ ParkStream(l) ==
                      /\ \/ groupState[f] = "Parked"
                         \/ ( /\ groupState[f] = "Open"
                              /\ role[f] = "Follower"
-                             /\ vote[f] = vote[l]
-                             /\ appliedIdx[f] = Len(log[l])
+                             /\ MatchingParkCut(vote[f], vote[l], appliedIdx[f], Len(log[l]))
                              /\ log[f] = log[l] )
                 /\ LET toPark == liveFollowers \cup {l}
                    IN /\ groupState' = [k \in Keepers |-> IF k \in toPark THEN "Parked" ELSE groupState[k]]
