@@ -21,9 +21,9 @@ use std::{
 };
 
 /// A WAL round longer than this ends the keeper process.
-pub(super) const MAX_ROUND_DURATION: Duration = Duration::from_secs(20);
+pub(in crate::stream::consensus) const MAX_ROUND_DURATION: Duration = Duration::from_secs(20);
 /// A WAL round longer than this marks the media slow.
-pub(super) const SLOW_ROUND: Duration = Duration::from_millis(2_500);
+pub(in crate::stream::consensus) const SLOW_ROUND: Duration = Duration::from_millis(2_500);
 /// How long the media stays slow after its last slow round.
 pub(super) const SLOW_HOLD: Duration = Duration::from_secs(10);
 const CHECK_INTERVAL: Duration = Duration::from_millis(500);

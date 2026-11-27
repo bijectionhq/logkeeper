@@ -667,6 +667,11 @@ impl Engine {
         let preferred = self.preferred.lock().clone();
         let led_since = self.led_since.lock().clone();
         let repairs_in_flight = self.repairs_in_flight();
+        let (repair_pending, repair_oldest, repair_backoff) = self.repair_queue();
+        let (disk_available, disk_reserved) = match self.disk.space.headroom() {
+            Ok((available, reserved)) => (Some(available), reserved),
+            Err(_) => (None, 0),
+        };
         let silence_limit = self.heartbeat_silence_limit();
         let now = Instant::now();
         let domains = self.placement.domains();
@@ -987,6 +992,11 @@ impl Engine {
             problem_streams: problem_counts,
             slow_proposals,
             oldest_proposal_secs: oldest_proposal.as_secs_f64(),
+            disk_available,
+            disk_reserved,
+            repair_pending,
+            repair_oldest_secs: repair_oldest.as_secs_f64(),
+            repair_backoff,
         };
         (report, scrape)
     }

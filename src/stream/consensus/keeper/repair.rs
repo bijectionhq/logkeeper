@@ -73,6 +73,9 @@ pub(super) struct RepairQueue {
     backoff: HashMap<StreamId, (u32, Instant)>,
     /// The stream the last pass started last; the next pass starts after it.
     cursor: Option<StreamId>,
+    /// Since when each led stream has needed a repair, for the queue-age
+    /// gauge. A pass drops the streams that no longer need one.
+    pending: HashMap<StreamId, Instant>,
 }
 
 /// One unit of repair work, in priority order.
@@ -104,6 +107,19 @@ impl Engine {
 
     pub(super) fn repairs_in_flight(&self) -> usize {
         self.repairs.lock().running.len()
+    }
+
+    /// The streams waiting for a repair, how long the oldest has waited,
+    /// and how many wait out a backoff after a failed repair.
+    pub(super) fn repair_queue(&self) -> (usize, Duration, usize) {
+        let queue = self.repairs.lock();
+        let oldest = queue
+            .pending
+            .values()
+            .map(Instant::elapsed)
+            .max()
+            .unwrap_or_default();
+        (queue.pending.len(), oldest, queue.backoff.len())
     }
 
     /// This keeper's status without a replica.
@@ -285,6 +301,12 @@ impl Engine {
             queue
                 .backoff
                 .retain(|stream, _| groups.iter().any(|(open, _)| open == stream));
+            queue
+                .pending
+                .retain(|stream, _| work.iter().any(|(needed, _, _)| needed == stream));
+            for (stream, _, _) in &work {
+                queue.pending.entry(*stream).or_insert(now);
+            }
             let cursor = queue.cursor;
             // Higher priority first; within one priority, the streams after
             // the last one started, then the rest.

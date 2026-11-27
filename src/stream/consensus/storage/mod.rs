@@ -35,6 +35,7 @@ pub(super) use space::{Admission, MAX_TRANSFER_FILE};
 #[cfg(test)]
 pub(super) use wal::ReplicaFault;
 pub(super) use wal::{CatalogEntry, Disk, Record};
+pub(super) use watchdog::MAX_ROUND_DURATION;
 
 #[derive(Clone, Default)]
 struct Log {

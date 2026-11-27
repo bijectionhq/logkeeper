@@ -192,6 +192,13 @@ impl Space {
         })
     }
 
+    /// The volume's free bytes and the bytes this keeper has reserved but
+    /// not yet allocated, for the headroom gauges.
+    pub fn headroom(&self) -> io::Result<(u64, u64)> {
+        let pending = self.0.state.lock().pending;
+        Ok((self.measured_space()?, pending))
+    }
+
     /// Whether ordinary writes still have room above the ordinary floor,
     /// with headroom for 64 MiB more.
     pub fn accepts_streams(&self) -> bool {

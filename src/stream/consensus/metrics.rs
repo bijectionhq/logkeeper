@@ -37,8 +37,10 @@ const LATENCY_BUCKETS_NS: &[u64] = &[
     250_000_000,    // 0.25 s
     500_000_000,    // 0.5 s
     1_000_000_000,  // 1 s
+    2_500_000_000,  // 2.5 s
     5_000_000_000,  // 5 s
-    20_000_000_000, // 20 s
+    10_000_000_000, // 10 s
+    20_000_000_000, // 20 s, the WAL round watchdog limit
 ];
 
 /// Lock-free fixed-bucket histogram over unsigned integer counts/sizes.
@@ -750,6 +752,93 @@ impl Metrics {
             CRITICAL.load(Ordering::Relaxed)
         );
 
+        // Disk headroom and the WAL health gate
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_disk_available_bytes Free bytes on the keeper data volume."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_disk_available_bytes gauge");
+        if let Some(available) = scrape.disk_available {
+            let _ = writeln!(out, "logkeeper_consensus_disk_available_bytes {available}");
+        }
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_disk_reserved_bytes Bytes reserved for writes in flight and not yet allocated."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_disk_reserved_bytes gauge");
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_disk_reserved_bytes {}",
+            scrape.disk_reserved
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_disk_ordinary_floor_bytes Free bytes below which the keeper refuses ordinary writes."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_disk_ordinary_floor_bytes gauge"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_disk_ordinary_floor_bytes {}",
+            super::decisions::ORDINARY_FLOOR
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_wal_round_limit_seconds WAL round duration at which the watchdog ends the keeper."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_wal_round_limit_seconds gauge"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_wal_round_limit_seconds {}",
+            super::storage::MAX_ROUND_DURATION.as_secs_f64()
+        );
+
+        // Repair queue
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_repair_pending_streams Led streams that need a repair."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_repair_pending_streams gauge"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_repair_pending_streams {}",
+            scrape.repair_pending
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_repair_oldest_pending_seconds How long the oldest pending repair has waited, or zero."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_repair_oldest_pending_seconds gauge"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_repair_oldest_pending_seconds {:.3}",
+            scrape.repair_oldest_secs
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_repair_backoff_streams Streams whose last repair failed and that wait out a backoff."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_repair_backoff_streams gauge"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_repair_backoff_streams {}",
+            scrape.repair_backoff
+        );
+
         // Hosted stream counts & aggregated retention
         let _ = writeln!(
             out,
@@ -999,6 +1088,16 @@ pub(super) struct ScrapeSnapshot {
     pub problem_streams: BTreeMap<&'static str, u64>,
     pub slow_proposals: u64,
     pub oldest_proposal_secs: f64,
+    /// Free bytes on the keeper volume, when it could be measured.
+    pub disk_available: Option<u64>,
+    /// Bytes reserved for writes in flight but not yet allocated.
+    pub disk_reserved: u64,
+    /// Streams this keeper leads that need repair, and how long the oldest
+    /// of them has waited.
+    pub repair_pending: usize,
+    pub repair_oldest_secs: f64,
+    /// Streams whose last repair failed and wait out a backoff.
+    pub repair_backoff: usize,
 }
 
 fn escape_label(value: &str) -> String {
@@ -1158,6 +1257,11 @@ mod tests {
             problem_streams: problems,
             slow_proposals: 0,
             oldest_proposal_secs: 0.0,
+            disk_available: Some(1 << 30),
+            disk_reserved: 0,
+            repair_pending: 1,
+            repair_oldest_secs: 12.0,
+            repair_backoff: 0,
         };
 
         let text = metrics.render_prometheus(&scrape);
