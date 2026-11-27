@@ -104,6 +104,10 @@ def keeper_group(check, binary, work, logs):
                 check=check, stdout=subprocess.PIPE, stderr=None, timeout=60,
             )
 
+        def stop(self, keeper, kill=False):
+            stop_process(self.processes[keeper], kill)
+            del self.processes[keeper]
+
     return RecoveryKeepers()
 
 
@@ -129,6 +133,17 @@ def refuse_restart(keepers, keeper):
     (keepers.logs / f"retired-{keeper}.log").write_bytes(result.stdout)
     if result.returncode == 0:
         raise RuntimeError(f"retired keeper {keeper} restarted")
+
+
+def stop_process(process, kill=False):
+    if process is None or process.poll() is not None:
+        return
+    process.send_signal(signal.SIGKILL if kill else signal.SIGTERM)
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def finalize(keepers):
@@ -181,7 +196,7 @@ def rehearse(args, check, work, logs, report):
             {key: value.hex() if isinstance(value, bytes) else value for key, value in item.items()}
             for item in receipts
         ])
-        rtdb.stop(kill=True)
+        stop_process(rtdb.process, kill=True)
         outage = time.monotonic()
         survivor, *lost = keepers.voters
         for keeper in lost:
@@ -223,7 +238,7 @@ def rehearse(args, check, work, logs, report):
         if len(receipts) <= report["pre_recovery_receipts"]:
             raise RuntimeError("no acknowledged transactions after recovery")
         check.recheck(rtdb, "final-recheck", phases, receipts)
-        rtdb.stop(kill=True)
+        stop_process(rtdb.process, kill=True)
         rtdb.start()
         check.recheck(rtdb, "after-second-rtdb-restart", phases, receipts)
         report["total_receipts"] = len(receipts)
@@ -231,17 +246,11 @@ def rehearse(args, check, work, logs, report):
         if report["rto_seconds"] > args.max_rto_seconds:
             raise RuntimeError("recovery exceeded the configured RTO")
     finally:
-        if rtdb.process is not None and rtdb.process.poll() is None:
-            rtdb.stop()
-        for keeper in list(keepers.processes):
-            process = keepers.processes[keeper]
-            if process.poll() is None:
-                process.send_signal(signal.SIGTERM)
-                try:
-                    process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
+        try:
+            stop_process(rtdb.process)
+        finally:
+            for keeper in list(keepers.processes):
+                keepers.stop(keeper)
 
 
 def positive(value):

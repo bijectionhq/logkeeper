@@ -123,9 +123,14 @@ until probe ready | grep -qx 200; do sleep 5; done
 
 The stream is sealed under a recovery fence. Every `seal` returns
 `JournalError::Recovered { head }`, which RTDB reports as the fault
-`rtdb/journal-recovered`. RTDB Multi normally acknowledges and records the recovery before writing.
-With `multiJournal.holdWritesAfterRecovery: true`, acknowledge with an
-administrator or writer principal:
+`rtdb/journal-recovered`. The RTDB build with atomic recovery markers and
+finalized keeper cluster version 3 commits its marker at the next LSN
+together with clearing the fence. Keep writers held during a mixed RTDB
+rollout. A legacy RTDB writer can clear the fence without that marker.
+
+With `multiJournal.holdWritesAfterRecovery: true`, an operator can
+explicitly clear the fence with an administrator principal. Record that
+decision in the incident, since this path bypasses the RTDB marker:
 
 ```sh
 lk admin acknowledge-recovery --config operator.json --stream UUID
@@ -134,6 +139,11 @@ lk admin acknowledge-recovery --config operator.json --stream UUID
 ```
 
 From a program, `ConsensusJournal::acknowledge_recovery(stream)` does the same.
+
+Automatic recovery leaves the fence intact if it cannot write its marker,
+including when the surviving checkpoint requires an immediate key-rotation
+record or the stream has no capacity for the marker. Diagnose the blocked
+case before exercising the operator override.
 
 RTDB's writer then seals above the fence. It reports
 `rtdb/journal-shortened` with the lost range if the head is below what it had
