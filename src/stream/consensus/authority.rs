@@ -50,6 +50,11 @@ pub(super) struct KeeperRecord {
     /// a recovery installed: a copy that finalized an older revision may not
     /// campaign, lead or serve.
     pub fenced: BTreeMap<StreamId, u64>,
+    /// The longest lease and drift margin any catalog keeper granted this
+    /// keeper, in milliseconds. Never shrinks, across epochs too, so a
+    /// recovery waits out the longest lease the keeper may still hold.
+    pub lease_ms: u64,
+    pub margin_ms: u64,
 }
 
 /// A durable change to the authority's records.
@@ -62,6 +67,13 @@ pub(super) enum Change {
     /// An operator fenced the keeper, or it finished decommissioning: bump
     /// its epoch.
     Fence { keeper: Uuid },
+    /// A catalog keeper grants `keeper` a lease or margin longer than the
+    /// record holds, so it records them before granting.
+    Lease {
+        keeper: Uuid,
+        lease_ms: u64,
+        margin_ms: u64,
+    },
     /// An operator recovery: the stage's target becomes the stream's
     /// membership at revision `stage.source + 1`, its configuration epoch,
     /// the stream is fenced for every voter of the old configuration outside
@@ -175,6 +187,15 @@ impl Records {
                     Some(_) => (),
                 }
             }
+            Change::Lease {
+                keeper,
+                lease_ms,
+                margin_ms,
+            } => {
+                let record = self.record(*keeper);
+                record.lease_ms = record.lease_ms.max(*lease_ms);
+                record.margin_ms = record.margin_ms.max(*margin_ms);
+            }
             Change::Fence { keeper } => {
                 let record = self.record(*keeper);
                 record.epoch = record.epoch.saturating_add(1);
@@ -215,6 +236,38 @@ impl Records {
             keeper,
             incarnation,
         })
+    }
+
+    /// The change a renewal must commit before it is granted a lease of
+    /// `lease_ms` with `margin_ms`: the enrollment first, then a record of a
+    /// longer lease than the record holds.
+    pub fn pending(
+        &self,
+        keeper: Uuid,
+        incarnation: Uuid,
+        lease_ms: u64,
+        margin_ms: u64,
+    ) -> Option<Change> {
+        if let Some(enroll) = self.enrollment(keeper, incarnation) {
+            return Some(enroll);
+        }
+        let record = self.keepers.get(&keeper)?;
+        (record.lease_ms < lease_ms || record.margin_ms < margin_ms).then_some(Change::Lease {
+            keeper,
+            lease_ms,
+            margin_ms,
+        })
+    }
+
+    /// How long a recovery that fences `keepers` waits after it commits:
+    /// the longest lease plus margin any of them was granted, and never less
+    /// than `own_ms`.
+    pub fn recovery_wait(&self, keepers: &[Uuid], own_ms: u64) -> u64 {
+        keepers
+            .iter()
+            .filter_map(|keeper| self.keepers.get(keeper))
+            .filter_map(|record| decisions::recovery_wait(record.lease_ms, record.margin_ms))
+            .fold(own_ms, u64::max)
     }
 
     /// Answers a renewal from `keeper` under `incarnation` and `epoch`, zero
@@ -383,6 +436,32 @@ mod tests {
                 .grant(ids[2], ids[2], 0, false, 30_000, 3_000)
                 .granted
         );
+    }
+
+    #[test]
+    fn a_recovery_waits_the_longest_lease_ever_granted() {
+        let [keeper, other, ..] = ids();
+        let mut records = Records::default();
+        records.apply(&records.pending(keeper, keeper, 30_000, 3_000).unwrap());
+        // A catalog keeper later configured with a shorter lease records
+        // nothing; a longer one is recorded before it grants.
+        assert_eq!(
+            records.pending(keeper, keeper, 30_000, 3_000),
+            Some(Change::Lease {
+                keeper,
+                lease_ms: 30_000,
+                margin_ms: 3_000
+            })
+        );
+        records.apply(&records.pending(keeper, keeper, 30_000, 3_000).unwrap());
+        assert_eq!(records.pending(keeper, keeper, 10_000, 1_000), None);
+        records.apply(&records.pending(keeper, keeper, 60_000, 6_000).unwrap());
+        // The lease shrinks back in configuration; the record does not.
+        assert_eq!(records.pending(keeper, keeper, 10_000, 1_000), None);
+        assert_eq!(records.recovery_wait(&[keeper, other], 11_000), 66_000);
+        records.apply(&Change::Fence { keeper });
+        assert_eq!(records.recovery_wait(&[keeper], 11_000), 66_000);
+        assert_eq!(records.recovery_wait(&[other], 11_000), 11_000);
     }
 
     #[test]

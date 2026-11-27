@@ -736,7 +736,10 @@ impl Engine {
                 return Ok(failure(JournalError::Unavailable));
             }
             let enforced = fold.enforced();
-            match fold.authority.enrollment(keeper, incarnation) {
+            match fold
+                .authority
+                .pending(keeper, incarnation, lease.0, lease.1)
+            {
                 Some(change) if enforced => change,
                 _ => {
                     return Ok(Reply::Lease(fold.authority.grant(
@@ -750,9 +753,21 @@ impl Engine {
                 }
             }
         };
-        match self.authority_write(catalog, group, enrollment).await? {
-            Reply::Decision(Outcome::Unit) => (),
-            reply => return Ok(reply),
+        let mut change = Some(enrollment);
+        // An enrollment may be followed by a record of this lease.
+        while let Some(pending) = change.take() {
+            match self.authority_write(catalog, group, pending).await? {
+                Reply::Decision(Outcome::Unit) => (),
+                reply => return Ok(reply),
+            }
+            let (fold, _) = self
+                .caught_up(catalog, group)
+                .await
+                .map_err(|_| invalid("enrolled keeper record is not readable"))?;
+            change = fold
+                .authority
+                .pending(keeper, incarnation, lease.0, lease.1)
+                .filter(|next| matches!(next, authority::Change::Lease { .. }));
         }
         let (fold, _) = self
             .caught_up(catalog, group)
@@ -872,6 +887,7 @@ impl Engine {
             .caught_up(catalog, group)
             .await
             .map_err(|_| invalid("recovered catalog entry is not readable"))?;
+        let wait_ms = fold.authority.recovery_wait(&fenced, wait_ms);
         Ok(Reply::Recovered(authority::Recovered {
             record: fold
                 .authority

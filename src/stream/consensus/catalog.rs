@@ -96,7 +96,8 @@ impl Catalog {
         self.require_trusted()?;
         let enforced = self.enforced();
         let mut records = self.records.lock().await;
-        if enforced && let Some(change) = records.enrollment(keeper, incarnation) {
+        while enforced && let Some(change) = records.pending(keeper, incarnation, lease.0, lease.1)
+        {
             self.change(&mut records, change).await?;
         }
         Ok(Reply::Lease(records.grant(
@@ -170,6 +171,7 @@ impl Catalog {
             }
         }
         let fenced = authority::fenced_by(&stage);
+        let wait_ms = records.recovery_wait(&fenced, wait_ms);
         Ok(Reply::Recovered(authority::Recovered {
             record: records
                 .recoveries
