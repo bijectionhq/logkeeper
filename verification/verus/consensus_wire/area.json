@@ -1,0 +1,126 @@
+{
+  "summary": "Verify the shipped wire version gate: a value introduced in N never reaches an N-1 connection unchanged, a five-voter roster never reaches N-1, a ping reaches N-1 only as liveness, and an N-only nested outcome is replaced by its legacy fallback.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 13,
+  "controls": {
+    "send-current-on-a-previous-connection": {
+      "defect": "treat every value as known on an N-1 connection",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "find": "matches!(self, Self::Previous) || matches!(connection, Self::Current)",
+          "replace": "true"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "function": "supported_on",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "send-a-current-nested-outcome": {
+      "defect": "pass an N-only nested outcome to an N-1 peer",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "find": "        fallback\n    }",
+          "replace": "        value\n    }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "function": "legacy_payload",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "send-an-n-only-frame-to-n-1": {
+      "defect": "encode an N-only frame on an N-1 connection",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "find": "    introduced.supported_on(WireVersion::Previous) && legacy\n",
+          "replace": "    legacy\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "function": "legacy_sends",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "send-a-five-voter-roster-to-n-1": {
+      "defect": "send a five-voter roster to an N-1 peer",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "find": "    introduced.supported_on(WireVersion::Previous) && legacy\n",
+          "replace": "    introduced.supported_on(WireVersion::Previous)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "function": "legacy_sends",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "forward-a-ping-verbatim": {
+      "defect": "send an N ping unchanged to an N-1 peer",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "find": "WireVersion::Previous if ping => FrameSend::Liveness,",
+          "replace": "WireVersion::Previous if ping => FrameSend::Encode,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "function": "frame_send",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "function": "frame_send",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    },
+    "refuse-every-legacy-frame": {
+      "defect": "refuse frames an N-1 peer reads",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "find": "WireVersion::Previous if legacy_sends(introduced, legacy) => FrameSend::Encode,",
+          "replace": "WireVersion::Previous if legacy_sends(introduced, legacy) => FrameSend::Refuse,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/network/version_gate.rs",
+          "function": "frame_send",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 12
+    }
+  }
+}

@@ -49,18 +49,12 @@ use super::{
 use crate::stream::consensus::Voters;
 use crate::stream::transport::{Channel, connect_protocols, is_alpn_mismatch};
 
+mod version_gate;
 mod versions;
+use version_gate::FrameSend;
+pub(super) use version_gate::WireVersion;
 
 pub(super) use versions::outcome_introduced;
-
-/// Wire protocol version negotiated via TLS ALPN. Rolling upgrades support
-/// adjacent versions `Previous` (N-1) and `Current` (N) only. Ordered, so a
-/// variant introduced in `v` is known on every version at least `v`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum WireVersion {
-    Previous,
-    Current,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Lane {
@@ -587,7 +581,7 @@ pub(super) fn decode_frame(bytes: &[u8], version: WireVersion) -> io::Result<Dec
         }
     }
     let frame: Frame = decode(bytes)?;
-    if frame.introduced() > version {
+    if !frame.introduced().supported_on(version) {
         return Err(unsupported("frame requires a newer keeper protocol"));
     }
     Ok(DecodedFrame::Frame(frame))
@@ -597,7 +591,7 @@ impl Request {
     /// Whether a peer speaking `version` knows this request. One added
     /// since N-1 is refused locally on an N-1 connection.
     pub(super) fn supported_on(&self, version: WireVersion) -> bool {
-        self.introduced() <= version
+        self.introduced().supported_on(version)
     }
 }
 
@@ -621,7 +615,7 @@ impl Request {
 
 impl PeerRequest {
     pub(super) fn supported_on(&self, version: WireVersion) -> bool {
-        self.introduced() <= version
+        self.introduced().supported_on(version)
     }
 }
 
@@ -629,29 +623,38 @@ impl Frame {
     /// Encodes `self` for a peer speaking `version`, never emitting a variant
     /// that an N-1 peer cannot decode.
     pub(super) fn encode_for(&self, version: WireVersion) -> io::Result<Vec<u8>> {
-        match version {
-            WireVersion::Current => encode(self),
-            WireVersion::Previous => match self {
+        let legacy = || match self {
+            Self::Peer(genesis, _) => genesis.voters.legacy(),
+            Self::Client(request) => request.legacy_roster(),
+            Self::Liveness(_) | Self::Ping { .. } => true,
+        };
+        let ping = matches!(self, Self::Ping { .. });
+        let legacy = version == WireVersion::Previous && legacy();
+        match version_gate::frame_send(version, self.introduced(), ping, legacy) {
+            FrameSend::Encode => encode(self),
+            FrameSend::Liveness => match self {
                 Self::Ping { incarnation, .. } => encode(&Self::Liveness(*incarnation)),
-                Self::Client(request) if !request.supported_on(WireVersion::Previous) => {
-                    Err(unsupported("request requires a newer keeper protocol"))
-                }
-                Self::Peer(genesis, request)
-                    if genesis.immutable || !request.supported_on(WireVersion::Previous) =>
-                {
-                    Err(unsupported("peer request requires a newer keeper protocol"))
-                }
-                frame if frame.introduced() > WireVersion::Previous => {
-                    Err(unsupported("frame requires a newer keeper protocol"))
-                }
-                Self::Peer(genesis, _) if !genesis.voters.legacy() => Err(unsupported(
-                    "five-voter streams require a newer keeper protocol",
-                )),
-                Self::Client(request) if !request.legacy_roster() => Err(unsupported(
-                    "five-voter streams require a newer keeper protocol",
-                )),
-                frame => encode(frame),
+                _ => unreachable!("only a ping travels as liveness"),
             },
+            FrameSend::Refuse => Err(unsupported(self.legacy_refusal())),
+        }
+    }
+
+    /// Why an N-1 peer cannot receive this frame.
+    fn legacy_refusal(&self) -> &'static str {
+        match self {
+            Self::Client(request) if !request.supported_on(WireVersion::Previous) => {
+                "request requires a newer keeper protocol"
+            }
+            Self::Peer(genesis, request)
+                if genesis.immutable || !request.supported_on(WireVersion::Previous) =>
+            {
+                "peer request requires a newer keeper protocol"
+            }
+            frame if !frame.introduced().supported_on(WireVersion::Previous) => {
+                "frame requires a newer keeper protocol"
+            }
+            _ => "five-voter streams require a newer keeper protocol",
         }
     }
 }
@@ -880,23 +883,25 @@ pub(super) enum ReplyV1 {
 /// `outcome` for an N-1 peer: a refusal it does not know becomes
 /// `Unavailable`.
 fn outcome_v1(outcome: Outcome) -> Outcome {
-    if outcome_introduced(&outcome) > WireVersion::Previous {
-        Outcome::Refused(journal_contract::JournalError::Unavailable)
-    } else {
-        outcome
-    }
+    version_gate::legacy_payload(
+        outcome_introduced(&outcome),
+        outcome,
+        Outcome::Refused(journal_contract::JournalError::Unavailable),
+    )
 }
 
 impl ReplyV1 {
     pub(super) fn from_reply(reply: Reply) -> io::Result<Self> {
         // Whatever is newer than N-1, including a reply that carries an
         // immutable genesis, is refused rather than sent undecodable.
-        if reply.introduced() > WireVersion::Previous {
-            return Err(unsupported("reply requires a newer keeper protocol"));
-        }
-        if !reply.legacy_roster() {
+        let introduced = reply.introduced();
+        if !version_gate::legacy_sends(introduced, reply.legacy_roster()) {
             return Err(unsupported(
-                "five-voter streams require a newer keeper protocol",
+                if !introduced.supported_on(WireVersion::Previous) {
+                    "reply requires a newer keeper protocol"
+                } else {
+                    "five-voter streams require a newer keeper protocol"
+                },
             ));
         }
         Ok(match reply {
