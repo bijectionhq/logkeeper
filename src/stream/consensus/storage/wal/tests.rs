@@ -9,7 +9,8 @@ use std::{
 use uuid::Uuid;
 
 use super::*;
-use crate::stream::consensus::{Fence, MAX_RECORD, state::Command};
+use crate::stream::consensus::{Fence, MAX_RECORD, state::Command, storage::objects::Reference};
+use bincode::Options as _;
 
 fn genesis() -> Genesis {
     Genesis {
@@ -857,4 +858,51 @@ fn saturated_durable_lanes_rotate_without_overtaking_an_admitted_replica() {
             enqueue(lane, sequence + 2);
         }
     }
+}
+
+#[tokio::test]
+async fn each_segment_counts_the_exact_bytes_its_live_slices_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let genesis = genesis();
+    let enrollment = install(dir.path(), genesis.voters[0]);
+    let disk = Disk::open_tuned(enrollment(), eager()).unwrap();
+    let stream = registered(&disk, genesis).await;
+    let mut slices = Vec::new();
+    for index in 0..4 {
+        let entry = entry(index, Bytes::from(vec![index as u8; 1000 + index as usize]));
+        let len = crate::stream::consensus::options()
+            .serialized_size(&entry)
+            .unwrap();
+        disk.write(Record::Append(stream, vec![entry]))
+            .await
+            .unwrap();
+        let slice = disk.log(stream, |log| log.segments[&index].clone());
+        let Reference::Segment(location) = slice.reference() else {
+            panic!("segment slice");
+        };
+        assert_eq!(location.len, len);
+        assert_eq!(disk.objects.live_bytes(location.segment), len);
+        // A second holder of the same bytes shares the slice.
+        let again = disk.objects.slice(location).unwrap();
+        assert!(Arc::ptr_eq(&again, &slice));
+        assert_eq!(disk.objects.live_bytes(location.segment), len);
+        slices.push(location);
+    }
+    let usage = disk.segment_usage();
+    assert!(usage.buckets.iter().sum::<u32>() >= 3, "{usage}");
+    let cut = disk.log(stream, |log| log.entries[&1].log_id);
+    disk.protocol(Record::Snapshot(
+        stream,
+        Selected {
+            log_id: cut,
+            digest: [1; 32],
+        },
+    ))
+    .await
+    .unwrap();
+    disk.covered(Record::Purge(stream, cut)).await.unwrap();
+    assert_eq!(disk.objects.live_bytes(slices[0].segment), 0);
+    assert_eq!(disk.objects.live_bytes(slices[1].segment), 0);
+    assert_eq!(disk.objects.live_bytes(slices[2].segment), slices[2].len);
+    disk.shutdown().await.unwrap();
 }

@@ -72,9 +72,16 @@ fn changed(previous: &[(&'static str, u64)], current: &[(&'static str, u64)]) ->
         .collect()
 }
 
-/// Prints the counters that changed every `interval` until `stop`.
-pub(super) async fn report(keeper: uuid::Uuid, interval: Duration, stop: CancellationToken) {
+/// Prints the counters that changed every `interval` until `stop`, and the
+/// keeper's gauges whenever their summary changes.
+pub(super) async fn report(
+    keeper: uuid::Uuid,
+    interval: Duration,
+    stop: CancellationToken,
+    gauges: impl Fn() -> String,
+) {
     let mut previous = COUNTERS.snapshot();
+    let mut summary = String::new();
     loop {
         tokio::select! {
             () = stop.cancelled() => return,
@@ -89,6 +96,11 @@ pub(super) async fn report(keeper: uuid::Uuid, interval: Duration, stop: Cancell
             );
         }
         previous = current;
+        let current = gauges();
+        if current != summary {
+            eprintln!("logkeeper consensus {keeper} segments: {current}");
+            summary = current;
+        }
     }
 }
 

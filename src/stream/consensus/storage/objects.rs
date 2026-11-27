@@ -83,9 +83,50 @@ struct Segments {
     live: BTreeMap<u64, Weak<Segment>>,
     dead: VecDeque<u64>,
     scopes: BTreeMap<u64, BTreeSet<StreamId>>,
+    // Every live slice, by segment and offset, so two holders of the same
+    // bytes share one object and each segment's live bytes are exact.
+    slices: BTreeMap<(u64, u64), Weak<Object>>,
+    bytes: BTreeMap<u64, u64>,
     // Recovery replays segments from here on.
     floor: u64,
     scan: Option<ReadDir>,
+}
+
+/// Segments before the published checkpoint by the share of their bytes
+/// that slices still hold.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::stream::consensus) struct Usage {
+    /// Below 10%, 25%, 50%, 75%, and the rest.
+    pub buckets: [u32; 5],
+    pub live: u64,
+    pub total: u64,
+}
+
+impl Usage {
+    const BOUNDS: [u64; 4] = [10, 25, 50, 75];
+
+    fn add(&mut self, live: u64, size: u64) {
+        let percent = live.saturating_mul(100) / size.max(1);
+        let bucket = Self::BOUNDS
+            .iter()
+            .position(|bound| percent < *bound)
+            .unwrap_or(Self::BOUNDS.len());
+        self.buckets[bucket] += 1;
+        self.live += live;
+        self.total += size;
+    }
+}
+
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let [a, b, c, d, e] = self.buckets;
+        write!(
+            f,
+            "<10%={a} <25%={b} <50%={c} <75%={d} rest={e} live={}MiB of {}MiB",
+            self.live >> 20,
+            self.total >> 20
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -194,14 +235,57 @@ impl Objects {
             return Err(invalid("invalid WAL segment reference"));
         }
         let mut state = self.0.state.lock();
+        let key = (location.segment, location.offset);
+        if let Some(found) = state.segments.slices.get(&key).and_then(Weak::upgrade) {
+            drop(state);
+            if found.reference() != Reference::Segment(location) {
+                return Err(invalid("WAL segment reference changed"));
+            }
+            return Ok(found);
+        }
         let segment = self.open_segment(&mut state, location.segment)?;
-        state
-            .segments
+        let segments = &mut state.segments;
+        segments
             .scopes
             .entry(location.segment)
             .or_default()
             .insert(location.scope);
-        Ok(Arc::new(Object(Body::Slice { segment, location })))
+        *segments.bytes.entry(location.segment).or_default() += location.len;
+        let object = Arc::new(Object(Body::Slice { segment, location }));
+        segments.slices.insert(key, Arc::downgrade(&object));
+        Ok(object)
+    }
+
+    /// How full the segments before the published checkpoint are with
+    /// bytes some slice still holds.
+    pub fn usage(&self) -> Usage {
+        let state = self.0.state.lock();
+        let segments = &state.segments;
+        let mut usage = Usage::default();
+        for (&id, segment) in segments.live.range(..segments.floor) {
+            let Some(segment) = segment.upgrade() else {
+                continue;
+            };
+            let Ok(size) = segment.file.metadata().map(|meta| meta.len()) else {
+                continue;
+            };
+            let live = segments.bytes.get(&id).copied().unwrap_or(0).min(size);
+            usage.add(live, size);
+        }
+        usage
+    }
+
+    /// The live bytes some slice holds in segment `id`.
+    #[cfg(test)]
+    pub fn live_bytes(&self, id: u64) -> u64 {
+        self.0
+            .state
+            .lock()
+            .segments
+            .bytes
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn open_segment(&self, state: &mut State, id: u64) -> io::Result<Arc<Segment>> {
@@ -457,8 +541,29 @@ impl Object {
 
 impl Drop for Object {
     fn drop(&mut self) {
-        let Body::File { key, store, .. } = &self.0 else {
-            return;
+        let (key, store) = match &self.0 {
+            Body::File { key, store, .. } => (key, store),
+            Body::Slice { segment, location } => {
+                if let Some(store) = segment.store.upgrade() {
+                    let mut state = store.state.lock();
+                    let segments = &mut state.segments;
+                    let key = (location.segment, location.offset);
+                    if segments
+                        .slices
+                        .get(&key)
+                        .is_some_and(|slice| slice.strong_count() == 0)
+                    {
+                        segments.slices.remove(&key);
+                    }
+                    if let Some(bytes) = segments.bytes.get_mut(&location.segment) {
+                        *bytes = bytes.saturating_sub(location.len);
+                        if *bytes == 0 {
+                            segments.bytes.remove(&location.segment);
+                        }
+                    }
+                }
+                return;
+            }
         };
         if let Some(store) = store.upgrade() {
             let mut state = store.state.lock();

@@ -522,10 +522,12 @@ impl Engine {
                     Ok(())
                 });
             }
+            let gauges = self.disk.clone();
             tokio::spawn(super::metrics::report(
                 self.id,
                 Duration::from_secs(5),
                 self.stop.clone(),
+                move || gauges.segment_usage().to_string(),
             ));
             let engine = self.clone();
             let stop = self.stop.clone();

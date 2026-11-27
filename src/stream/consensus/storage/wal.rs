@@ -682,6 +682,11 @@ impl Disk {
         self.objects.unprotect(stream);
     }
 
+    /// How much of each segment before the published checkpoint is live.
+    pub fn segment_usage(&self) -> super::objects::Usage {
+        self.objects.usage()
+    }
+
     pub fn enable_reaping(&self) {
         self.objects.enable_reaping();
     }
