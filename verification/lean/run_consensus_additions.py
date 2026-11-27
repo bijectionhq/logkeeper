@@ -14,7 +14,7 @@ from study_tools import check_lean_mutation, check_lean_theorems
 
 MODULES = {
     "RecoveryFence": 10, "Parking": 7, "RetireOnProof": 4, "CatalogClaim": 6,
-    "EpochLease": 10, "OffloadPrefix": 11, "SegmentedWAL": 13,
+    "EpochLease": 10, "OffloadPrefix": 11, "SegmentedWAL": 13, "JournalContract": 13,
 }
 
 CONTROLS = [
@@ -137,6 +137,24 @@ CONTROLS = [
         "    (∀ id, frame.record = .committed id → state.entries[id.index]? = some id) ∧",
         "    True ∧",
         "    exact prior _ (sound_step _ _ sound disciplined.1) disciplined.2",
+    ),
+    (
+        "JournalContract", "trust-the-surviving-history",
+        "  | .missing, some record => .erased record.lossPoint",
+        "  | .missing, some _ => .missing",
+        "    | some record => simp [written, refused, found] at missing",
+    ),
+    (
+        "JournalContract", "acknowledge-again-with-another-marker",
+        "        if record.fence = fence ∧ original = marker then (state, .at lsn)",
+        "        if record.fence = fence ∧ original = original then (state, .at lsn)",
+        "            simpa [apply, pending, kept, same] using Contract.refuseRetainedAck pending above noMatch",
+    ),
+    (
+        "JournalContract", "summary-keeps-the-latest-loss",
+        "(max held.1 record.fence.epoch, min held.2 record.lossPoint)",
+        "(max held.1 record.fence.epoch, record.lossPoint)",
+        "    · exact Or.inl ⟨_, _, rfl, by omega, by omega⟩",
     ),
 ]
 
