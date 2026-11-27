@@ -13,6 +13,7 @@ mod recovery;
 mod repair;
 mod replacement;
 mod replicas;
+mod scrub;
 #[cfg(test)]
 mod tests;
 pub(super) mod tls;
@@ -807,6 +808,11 @@ impl Engine {
             let compacting = self.clone();
             sockets.spawn(async move {
                 compacting.compaction_loop().await;
+                Ok(())
+            });
+            let scrubbing = self.clone();
+            sockets.spawn(async move {
+                scrubbing.scrub_loop().await;
                 Ok(())
             });
             let certifying = self.clone();

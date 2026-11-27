@@ -1037,6 +1037,17 @@ impl Disk {
         self.state.read().genesis.values().cloned().collect()
     }
 
+    pub(super) fn next_log_scope(&self, after: Option<StreamId>) -> Option<StreamId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        self.state
+            .read()
+            .logs
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .next()
+            .map(|(&scope, _)| scope)
+    }
+
     pub fn suffix_len(&self, stream: StreamId) -> usize {
         self.state
             .read()
@@ -1130,6 +1141,10 @@ impl Disk {
 
     pub(super) fn log<T>(&self, stream: StreamId, read: impl FnOnce(&Log) -> T) -> T {
         read(&self.state.read().logs[&stream])
+    }
+
+    pub(super) fn maybe_log<T>(&self, stream: StreamId, read: impl FnOnce(&Log) -> T) -> Option<T> {
+        self.state.read().logs.get(&stream).map(read)
     }
 }
 

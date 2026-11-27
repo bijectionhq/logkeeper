@@ -12,6 +12,14 @@ A replica checksum failure persists a marker in
 `<registry>/<uuid>.quarantine.json` and returns a typed `Corrupted` error.
 The replica reports itself unhealthy, so its stream's leader can replace it.
 
+Online integrity scrubbing checks selected snapshots, their index pages and
+retained extents, and the local WAL suffix payloads. It includes parked copies
+without opening them and reads up to 4 MiB per keeper per second while the
+WAL is responsive. A verified failure quarantines the affected copy and
+increments `logkeeper_consensus_scrub_corruptions_total`. Progress is visible
+in `logkeeper_consensus_scrub_read_bytes_total`. Use offline verification
+for WAL framing, the trusted boundary and the shared segment chain.
+
 **First rule:** a corrupted replica is not needed while its stream's other two
 voters are healthy. Check that before doing anything else. If they are not
 healthy, protect the survivor's copy and go to [lose two

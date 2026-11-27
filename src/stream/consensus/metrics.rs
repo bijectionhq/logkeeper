@@ -197,6 +197,8 @@ pub(super) struct Metrics {
     pub reopened_stopped: AtomicU64,
     pub evicted: AtomicU64,
     pub compacted_bytes: AtomicU64,
+    pub scrub_read_bytes: AtomicU64,
+    pub scrub_corruptions: AtomicU64,
     pub placement_violation: AtomicU64,
     // Election counters
     pub elections_started: AtomicU64,
@@ -271,6 +273,8 @@ impl Metrics {
             reopened_stopped: AtomicU64::new(0),
             evicted: AtomicU64::new(0),
             compacted_bytes: AtomicU64::new(0),
+            scrub_read_bytes: AtomicU64::new(0),
+            scrub_corruptions: AtomicU64::new(0),
             placement_violation: AtomicU64::new(0),
             elections_started: AtomicU64::new(0),
             elections_won: AtomicU64::new(0),
@@ -357,6 +361,14 @@ impl Metrics {
             (
                 "segments.compacted_bytes",
                 self.compacted_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "scrub.read_bytes",
+                self.scrub_read_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "scrub.corruptions",
+                self.scrub_corruptions.load(Ordering::Relaxed),
             ),
             (
                 "placement.violation",
@@ -527,6 +539,23 @@ impl Metrics {
             "logkeeper_consensus_wal_compacted_bytes_total {}",
             self.compacted_bytes.load(Ordering::Relaxed)
         );
+        for (name, help, counter) in [
+            (
+                "read_bytes",
+                "Bytes read by online integrity scrubbing.",
+                &self.scrub_read_bytes,
+            ),
+            (
+                "corruptions",
+                "Stream copies quarantined by online integrity scrubbing.",
+                &self.scrub_corruptions,
+            ),
+        ] {
+            let metric = format!("logkeeper_consensus_scrub_{name}_total");
+            let _ = writeln!(out, "# HELP {metric} {help}");
+            let _ = writeln!(out, "# TYPE {metric} counter");
+            let _ = writeln!(out, "{metric} {}", counter.load(Ordering::Relaxed));
+        }
         let _ = writeln!(
             out,
             "# HELP logkeeper_consensus_placement_violations_total Finalized configurations a leader found outside the current placement rules and queued for repair."

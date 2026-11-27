@@ -1,5 +1,5 @@
 mod file;
-mod index;
+pub(super) mod index;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -220,7 +220,7 @@ pub(in crate::stream::consensus) struct StateMachine {
     inner: Arc<Inner>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(in crate::stream::consensus) struct Selected {
     pub log_id: LogId,
     pub(super) digest: [u8; 32],
