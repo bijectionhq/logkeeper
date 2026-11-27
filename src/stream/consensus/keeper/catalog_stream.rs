@@ -644,6 +644,7 @@ pub(super) fn internal(request: &Request) -> bool {
                 | Request::Trim { .. }
                 | Request::Delete(_)
                 | Request::AcknowledgeRecovery(_)
+                | Request::Written { .. }
         )
 }
 

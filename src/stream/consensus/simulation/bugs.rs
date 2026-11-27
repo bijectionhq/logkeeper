@@ -56,7 +56,6 @@ macro_rules! settle {
 /// the competing `Seal` returned that committed LSN. No valid linearization
 /// exists for this history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces unfixed linearizability bug found on soak seed 24"]
 async fn bug_repro_append_retry_after_dropped_reply_returns_fenced_after_committing() {
     let options = ClusterOptions {
         park_after_secs: 3600,

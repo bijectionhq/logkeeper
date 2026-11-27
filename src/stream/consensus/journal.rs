@@ -163,17 +163,21 @@ pub struct ConsensusJournal {
 /// Retries an idempotent append while the keepers report `Unavailable`, for
 /// example while write admission or the log suffix is momentarily full.
 /// Definitive refusals return at once. The last error returns at `deadline`.
+/// Each attempt learns whether an earlier one returned `Unavailable`, and so
+/// may have taken effect.
 async fn retry_unavailable<T, F: Future<Output = Result<T>>>(
     deadline: Duration,
-    mut attempt: impl FnMut() -> F,
+    mut attempt: impl FnMut(bool) -> F,
 ) -> Result<T> {
     let end = tokio::time::Instant::now() + deadline;
     let mut backoff = Duration::from_millis(5);
+    let mut retried = false;
     loop {
-        match attempt().await {
+        match attempt(retried).await {
             Err(JournalError::Unavailable) if tokio::time::Instant::now() + backoff < end => {
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_millis(200));
+                retried = true;
             }
             result => return result,
         }
@@ -440,9 +444,14 @@ impl ConsensusJournal {
                 bytes += payload.len();
                 payloads.push(records.next().unwrap().1);
             }
-            retry_unavailable(self.deadline, || {
-                self.client
-                    .append_batch(stream, Self::fence(epoch), at, payloads.clone())
+            retry_unavailable(self.deadline, |retried| {
+                self.client.append_batch_after(
+                    stream,
+                    Self::fence(epoch),
+                    at,
+                    payloads.clone(),
+                    retried,
+                )
             })
             .await?;
         }
@@ -560,9 +569,9 @@ impl Journal for ConsensusJournal {
                     max: self.max_record_bytes,
                 });
             }
-            retry_unavailable(self.deadline, || {
+            retry_unavailable(self.deadline, |retried| {
                 self.client
-                    .append(stream, Self::fence(epoch), at, payload.clone())
+                    .append_after(stream, Self::fence(epoch), at, payload.clone(), retried)
             })
             .await
         })

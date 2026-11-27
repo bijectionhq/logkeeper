@@ -3,7 +3,10 @@ mod reading;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -142,8 +145,9 @@ impl Client {
             while calls.next().await.is_some() {}
             std::future::pending::<Result<Outcome>>().await
         };
+        let uncertain = AtomicBool::default();
         let outcome = tokio::select! {
-            result = self.decide(Request::Create(stream), end, ATTEMPT) => result?,
+            result = self.decide(Request::Create(stream), end, ATTEMPT, &uncertain) => result?,
             result = bootstrap => result?,
         };
         unit(outcome)
@@ -178,18 +182,78 @@ impl Client {
         at: Lsn,
         payload: Bytes,
     ) -> Result<Lsn> {
+        self.append_after(stream, fence, at, payload, false).await
+    }
+
+    /// Appends like `append`; `retried` says that an earlier call of the
+    /// same append returned `Unavailable`, so it may have taken effect.
+    pub(super) async fn append_after(
+        &self,
+        stream: StreamId,
+        fence: Fence,
+        at: Lsn,
+        payload: Bytes,
+        retried: bool,
+    ) -> Result<Lsn> {
         if payload.len() > MAX_RECORD {
             return Err(JournalError::TooLarge { max: MAX_RECORD });
         }
-        position(
-            self.operation(Request::Append {
-                stream,
-                fence,
-                at,
-                payload,
-            })
-            .await?,
-        )
+        let request = Request::Append {
+            stream,
+            fence,
+            at,
+            payload: payload.clone(),
+        };
+        self.write_records(request, stream, fence, at, vec![payload], retried)
+            .await
+    }
+
+    /// Sends an append or a batch. An attempt that went unanswered may have
+    /// committed the records before a competing seal or a trim, and then a
+    /// retry is refused `Fenced` or `Trimmed` although the records are in
+    /// the stream: such a refusal is not definite. The keeper then says
+    /// whether this writer's epoch wrote exactly these records; if it did
+    /// the append succeeded, if another writer's records or none hold them
+    /// the refusal stands, and otherwise the outcome is unknown.
+    async fn write_records(
+        &self,
+        request: Request,
+        stream: StreamId,
+        fence: Fence,
+        at: Lsn,
+        payloads: Vec<Bytes>,
+        retried: bool,
+    ) -> Result<Lsn> {
+        let uncertain = AtomicBool::new(retried);
+        let end = Instant::now() + self.deadline;
+        let refusal = match self
+            .decide(request, end, ATTEMPT, &uncertain)
+            .await
+            .and_then(position)
+        {
+            Err(refusal @ (JournalError::Fenced { .. } | JournalError::Trimmed { .. }))
+                if uncertain.load(Ordering::Relaxed) =>
+            {
+                refusal
+            }
+            result => return result,
+        };
+        let written = Request::Written {
+            stream,
+            fence,
+            at,
+            payloads,
+        };
+        let check = Instant::now() + self.deadline;
+        match self
+            .decide(written, check, ATTEMPT, &AtomicBool::default())
+            .await
+            .and_then(position)
+        {
+            Ok(last) => Ok(last),
+            Err(JournalError::Conflict { .. }) => Err(refusal),
+            Err(_) => Err(JournalError::Unavailable),
+        }
     }
 
     /// Appends a contiguous group from `at` in one committed entry and
@@ -202,33 +266,57 @@ impl Client {
         at: Lsn,
         payloads: Vec<Bytes>,
     ) -> Result<Lsn> {
+        self.append_batch_after(stream, fence, at, payloads, false)
+            .await
+    }
+
+    /// Appends like `append_batch`; `retried` says that an earlier call of
+    /// the same batch returned `Unavailable`.
+    pub(super) async fn append_batch_after(
+        &self,
+        stream: StreamId,
+        fence: Fence,
+        at: Lsn,
+        payloads: Vec<Bytes>,
+        retried: bool,
+    ) -> Result<Lsn> {
         if !super::state::valid_batch(&payloads) {
             return Err(JournalError::TooLarge { max: MAX_RECORD });
         }
-        position(
-            self.operation(Request::AppendBatch {
-                stream,
-                fence,
-                at,
-                payloads,
-            })
-            .await?,
-        )
+        let request = Request::AppendBatch {
+            stream,
+            fence,
+            at,
+            payloads: payloads.clone(),
+        };
+        self.write_records(request, stream, fence, at, payloads, retried)
+            .await
     }
 
     pub async fn head(&self, stream: StreamId) -> Result<Lsn> {
         position(self.operation(Request::Head(stream)).await?)
     }
 
+    /// Discards records through `through`. A trim whose attempt went
+    /// unanswered may have taken effect before a competing seal, so a
+    /// `Fenced` refusal of its retry leaves the outcome unknown.
     pub async fn trim(&self, stream: StreamId, fence: Fence, through: Lsn) -> Result<()> {
-        unit(
-            self.operation(Request::Trim {
-                stream,
-                fence,
-                through,
-            })
-            .await?,
-        )
+        let uncertain = AtomicBool::default();
+        let request = Request::Trim {
+            stream,
+            fence,
+            through,
+        };
+        match self
+            .decide(request, Instant::now() + self.deadline, ATTEMPT, &uncertain)
+            .await
+            .and_then(unit)
+        {
+            Err(JournalError::Fenced { .. }) if uncertain.load(Ordering::Relaxed) => {
+                Err(JournalError::Unavailable)
+            }
+            result => result,
+        }
     }
 
     pub async fn delete(&self, stream: StreamId) -> Result<()> {
@@ -427,11 +515,25 @@ impl Client {
     }
 
     async fn operation(&self, request: Request) -> Result<Outcome> {
-        self.decide(request, Instant::now() + self.deadline, ATTEMPT)
-            .await
+        self.decide(
+            request,
+            Instant::now() + self.deadline,
+            ATTEMPT,
+            &AtomicBool::default(),
+        )
+        .await
     }
 
-    async fn decide(&self, request: Request, end: Instant, attempt: Duration) -> Result<Outcome> {
+    /// Sends `request` until a keeper decides it. Sets `uncertain` when an
+    /// attempt went unanswered or was answered `Unavailable`, so it may
+    /// have taken effect before the deciding one.
+    async fn decide(
+        &self,
+        request: Request,
+        end: Instant,
+        attempt: Duration,
+        uncertain: &AtomicBool,
+    ) -> Result<Outcome> {
         let stream = request.stream();
         let mut route = self.route(stream, end).await?;
         while !remaining(end).is_zero() {
@@ -474,7 +576,10 @@ impl Client {
                         {
                             calls.push(call(leader));
                         }
-                        Ok(Reply::Decision(Outcome::Refused(JournalError::Unavailable))) => (),
+                        Ok(Reply::Decision(Outcome::Refused(JournalError::Unavailable)))
+                        | Err(_) => {
+                            uncertain.store(true, Ordering::Relaxed);
+                        }
                         Ok(Reply::Decision(outcome)) => {
                             self.routes
                                 .lock()

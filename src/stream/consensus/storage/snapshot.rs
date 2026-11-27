@@ -543,6 +543,43 @@ impl StateMachine {
     }
 
     /// The retained timed record at `at`, from the applied image.
+    /// Whether a writer of `epoch` appended exactly `payloads` from `at`:
+    /// the last LSN when it did, `Conflict` when it did not, and
+    /// `Unavailable` when this replica cannot tell.
+    pub async fn written(
+        &self,
+        epoch: journal_contract::Epoch,
+        at: Lsn,
+        payloads: Vec<bytes::Bytes>,
+    ) -> journal_contract::Result<Lsn> {
+        if !self.healthy() {
+            return Err(JournalError::Unavailable);
+        }
+        let count = payloads.len() as u64;
+        let (records, head) = {
+            let image = self.inner.applied.read();
+            (
+                image.state.written(epoch, at, payloads.len())?,
+                image.state.head()?,
+            )
+        };
+        let matches = tokio::task::spawn_blocking(move || {
+            records.iter().zip(&payloads).try_fold(true, |same, (record, payload)| {
+                Ok::<_, io::Error>(
+                    same && record.len() == payload.len() && record.load()? == *payload,
+                )
+            })
+        })
+        .await
+        .map_err(|_| JournalError::Unavailable)?
+        .map_err(|_| JournalError::Unavailable)?;
+        if matches {
+            Ok(Lsn(at.0 + count - 1))
+        } else {
+            Err(JournalError::Conflict { head })
+        }
+    }
+
     pub fn timed_record(&self, at: Lsn) -> journal_contract::Result<Payload> {
         if !self.healthy() {
             return Err(JournalError::Unavailable);

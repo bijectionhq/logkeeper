@@ -694,6 +694,39 @@ impl State {
         Ok(())
     }
 
+    /// The retained records from `at` that a writer of `epoch` appended, for
+    /// checking whether an append whose reply was lost took effect.
+    /// `Conflict` when another writer's records, or none, hold one of those
+    /// positions; `Unavailable` when a record is trimmed or of unknown
+    /// epoch, so the outcome stays unknown.
+    pub fn written(&self, epoch: Epoch, at: Lsn, count: usize) -> Result<Vec<Payload>> {
+        let live = self.live()?;
+        let conflict = JournalError::Conflict { head: live.head };
+        let last =
+            at.0.checked_add(count as u64)
+                .and_then(|end| end.checked_sub(1))
+                .ok_or(conflict.clone())?;
+        if count == 0 || at.0 == 0 {
+            return Err(conflict);
+        }
+        if at < live.floor {
+            return Err(JournalError::Unavailable);
+        }
+        if last > live.head.0 {
+            return Err(conflict);
+        }
+        let mut records = Vec::with_capacity(count);
+        for lsn in at.0..=last {
+            let record = &live.records[(lsn - live.floor.0) as usize];
+            match live.epochs.epoch(Lsn(lsn)) {
+                None => return Err(JournalError::Unavailable),
+                Some(written) if written != epoch || record.timed() => return Err(conflict),
+                Some(_) => records.push(record.clone()),
+            }
+        }
+        Ok(records)
+    }
+
     /// The epochs of the retained records, for a snapshot.
     pub fn epoch_runs(&self) -> EpochRuns {
         self.live()

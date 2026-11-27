@@ -917,6 +917,7 @@ impl Engine {
                     | Request::StageOriginal { .. }
                     | Request::AppendOriginal { .. }
                     | Request::PreferLeader { .. }
+                    | Request::Written { .. }
                     | Request::Trim { .. } => writer,
                     // An administrator may acknowledge a recovery, but only a
                     // writer may write to the stream.
@@ -1058,6 +1059,12 @@ impl Engine {
                 group.require_healthy()?;
                 let reply = match request {
                     Request::Head(_) => Ok(group.head().await),
+                    Request::Written {
+                        fence,
+                        at,
+                        payloads,
+                        ..
+                    } => Ok(group.written(fence, at, payloads).await),
                     Request::PlacementProof(_) => Ok(group.proof().await),
                     Request::Configuration(_) => Ok(group.configuration().await),
                     Request::Read {
@@ -1656,6 +1663,21 @@ impl Group {
             )),
             Err(_) => Err(failure(JournalError::Unavailable)),
         }
+    }
+
+    /// Answers `Request::Written` from state that includes every entry
+    /// committed before the request, like a linearizable head.
+    async fn written(&self, fence: Fence, at: Lsn, payloads: Vec<Bytes>) -> Reply {
+        if let Err(reply) = self.barrier(Instant::now() + REQUEST_TIMEOUT).await {
+            return reply;
+        }
+        Reply::Decision(
+            self.state
+                .written(fence.epoch, at, payloads)
+                .await
+                .map(Outcome::At)
+                .into(),
+        )
     }
 
     async fn read(&self, from: Lsn, limit: usize, wait_ms: u32, minimum_head: Lsn) -> Outcome {

@@ -189,6 +189,16 @@ pub(super) enum Request {
     },
     /// An administrator clears the recovery fence of `stream`.
     AcknowledgeRecovery(StreamId),
+    /// A writer whose append went unanswered and whose retry was refused
+    /// asks whether a writer of `fence`'s epoch committed exactly
+    /// `payloads` from `at`. Added last, so an older keeper refuses it
+    /// and the writer reports the outcome unknown.
+    Written {
+        stream: StreamId,
+        fence: Fence,
+        at: Lsn,
+        payloads: Vec<bytes::Bytes>,
+    },
 }
 
 impl Request {
@@ -220,6 +230,7 @@ impl Request {
             | Self::Trim { stream, .. }
             | Self::RetireCopy { stream, .. }
             | Self::PreferLeader { stream, .. }
+            | Self::Written { stream, .. }
             | Self::Replace { stream, .. } => stream,
         }
     }
