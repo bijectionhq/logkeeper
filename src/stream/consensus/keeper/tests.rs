@@ -2806,6 +2806,62 @@ async fn a_leader_without_space_hands_its_streams_to_a_follower() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_with_slow_media_hands_off_refuses_votes_and_accepts_nothing() {
+    use openraft::{Vote, raft::VoteRequest};
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(57);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let leader = cluster.leader_after_head(&journal, stream).await;
+    let slow = cluster.running[&leader].engine.clone();
+    assert!(slow.keeper_status().await.accepting);
+    slow.disk.mark_slow(Duration::from_secs(60));
+    assert!(!slow.disk.responsive());
+    assert!(slow.disk.healthy(), "slow media stays in service");
+    assert!(!slow.keeper_status().await.accepting);
+    let others = [a, b, c]
+        .into_iter()
+        .filter(|id| *id != leader)
+        .collect::<Vec<_>>();
+    let mut moved = false;
+    for target in &others {
+        moved |= wait_for_leader(&cluster, stream, *target).await;
+        if moved {
+            break;
+        }
+    }
+    assert!(moved, "the slow leader handed its stream away");
+    assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
+    // The slow keeper refuses a vote and a pre-vote from a fellow voter.
+    let group = cluster.group(leader, stream).await;
+    let term = group.raft.metrics().borrow_watched().current_term + 10;
+    let candidate = others[0].as_u128();
+    for request in [
+        PeerRequest::Vote(VoteRequest::new(
+            Vote::new(term, candidate),
+            group.state.applied(),
+        )),
+        PeerRequest::PreVote(VoteRequest::new(
+            Vote::new(term, candidate),
+            group.state.applied(),
+        )),
+    ] {
+        let refused = slow
+            .peer(candidate, group.genesis.clone(), request, None)
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("slow"), "{refused}");
+    }
+    assert!(
+        group.raft.metrics().borrow_watched().current_term < term,
+        "the refused vote left no trace"
+    );
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_leader_removes_a_learner_left_by_an_aborted_replacement() {
     let mut cluster = Cluster::start().await;
     let [a, b, c, d] = cluster.ids;

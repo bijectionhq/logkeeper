@@ -359,6 +359,22 @@ pub(super) fn counts_grant(granted: bool, reincarnated: bool) -> bool {
     granted && !reincarnated
 }
 
+/// Whether a keeper's media keeps up: its current WAL round, `running_ms`
+/// long or zero when none runs, is within `soft_ms`, and the hold after the
+/// last slow round has passed. A keeper whose media does not keep up hands
+/// off the streams it leads, refuses votes and accepts no streams.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (running_ms <= soft_ms && now_ms >= slow_until_ms)
+))]
+pub(super) fn media_responsive(
+    running_ms: u64,
+    slow_until_ms: u64,
+    now_ms: u64,
+    soft_ms: u64,
+) -> bool {
+    running_ms <= soft_ms && now_ms >= slow_until_ms
+}
+
 /// Whether a keeper silent for `silent_ms` is dead: it has not answered a
 /// liveness ping for the repair delay. Repair replaces a dead keeper's
 /// voters, parked streams that name it wake, and parking no longer waits

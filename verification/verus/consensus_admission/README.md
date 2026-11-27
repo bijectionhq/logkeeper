@@ -28,6 +28,7 @@
 | `only_another_incarnation_is_a_reuse` | A keeper ID is reused only when a peer saw it under another media incarnation first | `reincarnated` |
 | `a_reused_keeper_never_registers` | A keeper with reinstalled media never votes with an empty log | `registers` |
 | `a_reused_keeper_grants_nothing` | A grant from a reused keeper ID never counts toward a campaign | `counts_grant` |
+| `slow_media_is_never_responsive` | A keeper whose WAL round runs past the soft limit, or within the hold after one, never votes, leads on or accepts streams | `media_responsive` |
 
 ## Scope
 
@@ -39,7 +40,7 @@ These proofs cover the decisions, not the stateful bookkeeping around them. Unve
 
 ## Controls
 
-`area.json` declares 30 production mutations. Each one removes or inverts one decision, such as sending application entries on control, charging a body once, ignoring the per-sender byte, message or control cap, releasing a message without its bytes, spending a class floor, stalling rotation, splitting without shrinking, restoring a restarted leader, accepting a term regression or index gap, recovering beside a live voter or without the acknowledgement, stepping the recovery term or epoch too little, letting an uninstalled copy vote, refusing a member without an answer, counting a keeper live at the repair delay, growing a repair backoff by one millisecond, trusting a peer's new incarnation, registering a replica on a reused or unconfirmed keeper, or counting a reused keeper's grant. The baseline verifies 76 functions. Each control fails exactly its declared contract or loop invariant and verifies the other 75.
+`area.json` declares 32 production mutations. Each one removes or inverts one decision, such as sending application entries on control, charging a body once, ignoring the per-sender byte, message or control cap, releasing a message without its bytes, spending a class floor, stalling rotation, splitting without shrinking, restoring a restarted leader, accepting a term regression or index gap, recovering beside a live voter or without the acknowledgement, stepping the recovery term or epoch too little, letting an uninstalled copy vote, refusing a member without an answer, counting a keeper live at the repair delay, growing a repair backoff by one millisecond, trusting a peer's new incarnation, registering a replica on a reused or unconfirmed keeper, counting a reused keeper's grant, or counting media responsive past the soft round limit or during the hold after a slow round. The baseline verifies 78 functions. Each control fails exactly its declared contract or loop invariant and verifies the other 77.
 
 The incarnation laws cover the decisions only. That each keeper stores the incarnations it first saw durably before it answers with them, and marks itself reused before that mark could be outrun by a confirmation, is unverified Rust covered by the keeper tests. So is the trust on first contact itself: a keeper whose peers never saw its old incarnation is not recognized.
 

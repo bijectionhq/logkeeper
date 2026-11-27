@@ -437,7 +437,7 @@ impl Engine {
     }
 
     /// Serves one decoded peer message and returns its encoded reply.
-    async fn peer(
+    pub(super) async fn peer(
         &self,
         sender: NodeId,
         genesis: Genesis,
@@ -544,6 +544,11 @@ impl Engine {
                 };
                 if !eligible {
                     return Err(invalid("vote is outside the effective placement"));
+                }
+                // Slow media would make this keeper a slow leader: it
+                // neither votes nor takes leadership until it keeps up.
+                if !matches!(request, PeerRequest::Park { .. }) && !self.disk.responsive() {
+                    return Err(invalid("keeper media is slow"));
                 }
                 match request {
                     PeerRequest::Vote(request) => {

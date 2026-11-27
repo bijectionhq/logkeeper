@@ -315,6 +315,17 @@ fn dead_only_after_the_repair_delay(silent_ms: u64, repair_after_ms: u64) {
     assert(silent_ms >= repair_after_ms ==> dead);
 }
 
+// A keeper whose WAL round runs past the soft limit, or whose last slow
+// round is still held, never counts its media responsive; one with no slow
+// round in progress or held does.
+fn slow_media_is_never_responsive(running_ms: u64, slow_until_ms: u64, now_ms: u64, soft_ms: u64) {
+    let responsive = media_responsive(running_ms, slow_until_ms, now_ms, soft_ms);
+    assert(running_ms > soft_ms ==> !responsive);
+    assert(now_ms < slow_until_ms ==> !responsive);
+    let idle = media_responsive(0, now_ms, now_ms, soft_ms);
+    assert(idle);
+}
+
 proof fn grown_is_bounded(wait: int, cap: int, n: nat)
     requires 0 <= wait <= cap,
     ensures wait <= grown(wait, cap, n) <= cap,

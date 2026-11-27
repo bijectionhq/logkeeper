@@ -422,6 +422,7 @@ pub(in crate::stream::consensus) struct Disk {
     control: mpsc::Sender<Message>,
     replication: mpsc::Sender<Message>,
     healthy: Arc<AtomicBool>,
+    watchdog: Arc<super::watchdog::Watchdog>,
     stopped: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<io::Result<()>>>>>,
     pub path: Arc<PathBuf>,
     /// The incarnation of the installed media, new at each installation.
@@ -478,6 +479,7 @@ impl Disk {
             super::watchdog::exit_on_stall,
         )?;
         let (finished, stopped) = oneshot::channel();
+        let writer_watchdog = watchdog.clone();
         let writer_state = state.clone();
         let writer_objects = objects.clone();
         let writer_space = space.clone();
@@ -502,7 +504,7 @@ impl Disk {
                     &writer_objects,
                     &writer_space,
                     &writer_healthy,
-                    &watchdog,
+                    &writer_watchdog,
                     #[cfg(test)]
                     &writer_fault,
                 );
@@ -520,6 +522,7 @@ impl Disk {
             control,
             replication,
             healthy,
+            watchdog,
             stopped: Arc::new(tokio::sync::Mutex::new(Some(stopped))),
             path: Arc::new(path),
             incarnation,
@@ -532,6 +535,22 @@ impl Disk {
 
     pub fn healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
+    }
+
+    /// Whether the media is healthy and keeps up with its WAL rounds.
+    pub fn responsive(&self) -> bool {
+        self.healthy() && self.watchdog.responsive()
+    }
+
+    /// Resolves once a WAL round runs past the slow-round limit.
+    pub async fn slowed(&self) {
+        self.watchdog.slowed().await;
+    }
+
+    /// Marks the media slow for `hold`, as a slow WAL round would.
+    #[cfg(test)]
+    pub fn mark_slow(&self, hold: std::time::Duration) {
+        self.watchdog.mark_slow(hold);
     }
 
     #[cfg(test)]

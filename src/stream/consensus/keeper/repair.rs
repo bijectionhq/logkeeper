@@ -99,7 +99,7 @@ impl Engine {
             .count();
         KeeperStatus {
             keeper: self.id,
-            accepting: self.disk.healthy() && self.disk.space.accepts_streams(),
+            accepting: self.disk.responsive() && self.disk.space.accepts_streams(),
             streams: groups.len() as u32,
             led: led as u32,
             replica: None,
@@ -136,7 +136,7 @@ impl Engine {
         };
         KeeperStatus {
             keeper: self.id,
-            accepting: self.disk.healthy() && self.disk.space.accepts_streams(),
+            accepting: self.disk.responsive() && self.disk.space.accepts_streams(),
             streams: groups.len() as u32,
             led: led as u32,
             replica,
@@ -169,6 +169,7 @@ impl Engine {
             tokio::select! {
                 () = self.stop.cancelled() => return,
                 () = self.retire_now.notified() => self.retire_removed().await,
+                () = self.disk.slowed() => self.shed_leadership_when_full().await,
                 _ = schedule.tick() => {
                     self.repair_pass().await;
                     self.shed_leadership_when_full().await;
@@ -430,12 +431,12 @@ impl Engine {
         replaced
     }
 
-    /// A keeper whose media is unhealthy or full cannot accept the writes of
-    /// the streams it leads, even when their followers have room. It hands
-    /// each to a follower that has matched its log and whose keeper accepts
-    /// streams.
-    async fn shed_leadership_when_full(&self) {
-        if self.disk.healthy() && self.disk.space.accepts_streams() {
+    /// A keeper whose media is unhealthy, slow or full cannot accept the
+    /// writes of the streams it leads, even when their followers have room.
+    /// It hands each to a follower that has matched its log and whose keeper
+    /// accepts streams. Slow media sheds at once, not at the next pass.
+    pub(super) async fn shed_leadership_when_full(&self) {
+        if self.disk.responsive() && self.disk.space.accepts_streams() {
             return;
         }
         let groups = self
