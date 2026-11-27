@@ -457,8 +457,12 @@ impl Engine {
                         return Err(error);
                     }
                     // Past the stream limit a replica opens on its first
-                    // request instead of being quarantined.
-                    if error.kind() != io::ErrorKind::QuotaExceeded {
+                    // request instead of being quarantined. Until then no
+                    // state machine pins its snapshot's objects and
+                    // segments, so the reaper must leave them.
+                    if error.kind() == io::ErrorKind::QuotaExceeded {
+                        self.disk.protect_objects(genesis.stream);
+                    } else {
                         self.quarantine(genesis.stream, &error);
                     }
                 }
@@ -714,7 +718,12 @@ impl Engine {
         }
         .await;
         let state = match startup {
-            Ok(state) => state,
+            // The open state machine pins what its replica references, so
+            // a copy protected while it could not open no longer needs to be.
+            Ok(state) => {
+                self.disk.unprotect_objects(genesis.stream);
+                state
+            }
             Err(error) => {
                 self.quarantine(genesis.stream, &error);
                 return Err(error);
@@ -951,8 +960,8 @@ impl Engine {
                             _ => Reply::Decision(refused),
                         });
                     }
-                    // Reopen the parked stream; it elects a leader at once
-                    // and the client retries.
+                    // Reopen a parked or never opened copy; it elects a
+                    // leader at once and the client retries.
                     if self.unpark(stream).await.is_some() {
                         super::metrics::count(&super::metrics::COUNTERS.unparked_by_client);
                     }

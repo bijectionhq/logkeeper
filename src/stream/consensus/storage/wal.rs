@@ -662,6 +662,10 @@ impl Disk {
         self.objects.protect(stream);
     }
 
+    pub fn unprotect_objects(&self, stream: StreamId) {
+        self.objects.unprotect(stream);
+    }
+
     pub fn enable_reaping(&self) {
         self.objects.enable_reaping();
     }

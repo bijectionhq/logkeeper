@@ -227,10 +227,7 @@ impl Engine {
                         && !parked.contains(&stream)
                         && !deleted.contains(&stream)
                         && !quarantined.contains(&stream)
-                        && self
-                            .disk
-                            .ownership(stream)
-                            .is_some_and(|book| book.generation().is_some())
+                        && self.attached(stream)
                 })
                 .map(|genesis| (genesis.stream, genesis.voters));
             parked_copies.chain(unopened).collect::<Vec<_>>()
@@ -275,14 +272,28 @@ impl Engine {
         }
     }
 
-    /// Reopens a parked stream, and campaigns at once when this keeper is
-    /// the voter that should lead it, instead of waiting an election
-    /// timeout. `None` when the stream was not parked or did not open.
+    /// Reopens a parked stream, or one that never opened because startup
+    /// found the keeper past its stream limit, and campaigns at once when
+    /// this keeper is the voter that should lead it, instead of waiting an
+    /// election timeout. `None` when this keeper holds no such closed copy
+    /// or it did not open.
     pub(super) async fn unpark(&self, stream: StreamId) -> Option<std::sync::Arc<Group>> {
-        if !self.parked.write().remove(&stream) {
+        let parked = self.parked.write().remove(&stream);
+        if !parked
+            && (self.deleted.read().contains(&stream)
+                || self.quarantined.read().contains(&stream)
+                || !self.attached(stream))
+        {
             return None;
         }
         self.wake(stream).await
+    }
+
+    /// Whether this keeper holds a current copy of `stream`.
+    fn attached(&self, stream: StreamId) -> bool {
+        self.disk
+            .ownership(stream)
+            .is_some_and(|book| book.generation().is_some())
     }
 
     /// Opens a closed copy and campaigns when this keeper should lead it.

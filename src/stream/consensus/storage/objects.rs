@@ -240,6 +240,12 @@ impl Objects {
         self.0.state.lock().protected.insert(scope);
     }
 
+    /// Lets the reaper reclaim `scope`'s objects again, once an open state
+    /// machine pins the ones it still references.
+    pub fn unprotect(&self, scope: StreamId) {
+        self.0.state.lock().protected.remove(&scope);
+    }
+
     pub fn enable_reaping(&self) {
         self.0.state.lock().ready = true;
     }
