@@ -41,7 +41,7 @@ use super::{Config, FenceProof, Reply, Request, catalog_stream, failure};
 use crate::stream::{
     consensus::{
         Entry, LogId, Stage, Vote, assignment,
-        authority::Recovered,
+        authority::{Recovered, RecoveryRecord, RecoverySource},
         catalog::{self, Catalog},
         decisions, invalid,
         network::{Lane, Rpc},
@@ -480,8 +480,23 @@ impl Config {
         // So the recovery refuses without the catalog. It commits after the
         // replacements, so a refused replacement leaves the old
         // configuration unfenced.
+        let record = RecoveryRecord {
+            stream,
+            epoch: stage.source.saturating_add(1),
+            loss_point: offload
+                .as_ref()
+                .map_or(head, |(_, report)| report.kept_through),
+            source: if offload.as_ref().is_some_and(|(_, report)| report.restored) {
+                RecoverySource::ObjectStore
+            } else {
+                RecoverySource::Survivor
+            },
+            time_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis() as u64),
+        };
         let (fenced, wait) = match self
-            .recover_in_catalog(disk, rpc, placement, &stage, &dead)
+            .recover_in_catalog(disk, rpc, placement, &stage, &dead, record)
             .await
             .map_err(|error| {
                 invalid(format!(
@@ -676,10 +691,12 @@ impl Config {
         placement: &Placement,
         stage: &Stage,
         dead: &[Uuid],
+        record: RecoveryRecord,
     ) -> io::Result<Option<Recovered>> {
         let request = Request::RecoverStream {
             stage: stage.clone(),
             dead: dead.to_vec(),
+            record,
         };
         let reply = match self.catalog_voters {
             None if self.catalog == self.keeper => {
@@ -687,7 +704,7 @@ impl Config {
                     decisions::recovery_wait(self.lease_millis, self.lease_drift_margin_millis)
                         .ok_or_else(|| invalid("lease duration overflows"))?;
                 Catalog::new(disk.clone(), &self.data)?
-                    .recover(stage.clone(), dead.to_vec(), placement, wait)
+                    .recover(stage.clone(), dead.to_vec(), record, placement, wait)
                     .await?
             }
             None => {

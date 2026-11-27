@@ -128,6 +128,7 @@ impl Catalog {
         &self,
         stage: Stage,
         dead: Vec<uuid::Uuid>,
+        record: authority::RecoveryRecord,
         placement: &Placement,
         wait_ms: u64,
     ) -> io::Result<Reply> {
@@ -135,7 +136,8 @@ impl Catalog {
         if !self.enforced() {
             return Ok(Reply::Decision(Outcome::Refused(JournalError::Unsupported)));
         }
-        if !stage.recovery()
+        if !authority::describes(&record, &stage)
+            || !stage.recovery()
             || !placement.stage(&stage)
             || dead
                 .iter()
@@ -159,6 +161,7 @@ impl Catalog {
                 authority::Change::Recover {
                     stage: stage.clone(),
                     dead,
+                    record,
                 },
             )
             .await?;
@@ -168,6 +171,11 @@ impl Catalog {
         }
         let fenced = authority::fenced_by(&stage);
         Ok(Reply::Recovered(authority::Recovered {
+            record: records
+                .recoveries
+                .get(&stage.stream)
+                .copied()
+                .unwrap_or(record),
             unleased: records.unleased(&fenced),
             fenced,
             wait_ms,

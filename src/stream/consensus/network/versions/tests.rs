@@ -300,6 +300,13 @@ fn request(tag: usize) -> Option<Request> {
         41 => Request::RecoverStream {
             stage: stage(),
             dead: Vec::new(),
+            record: crate::stream::consensus::authority::RecoveryRecord {
+                stream: STREAM,
+                epoch: 2,
+                loss_point: Lsn(1),
+                source: crate::stream::consensus::authority::RecoverySource::Survivor,
+                time_unix_ms: 0,
+            },
         },
         _ => return None,
     })
@@ -384,6 +391,13 @@ fn reply(tag: usize) -> Option<Reply> {
             margin_ms: 3_000,
         }),
         12 => Reply::Recovered(crate::stream::consensus::Recovered {
+            record: crate::stream::consensus::authority::RecoveryRecord {
+                stream: STREAM,
+                epoch: 2,
+                loss_point: Lsn(1),
+                source: crate::stream::consensus::authority::RecoverySource::Survivor,
+                time_unix_ms: 0,
+            },
             fenced: Vec::new(),
             unleased: Vec::new(),
             wait_ms: 33_000,

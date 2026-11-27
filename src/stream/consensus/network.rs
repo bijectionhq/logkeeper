@@ -321,6 +321,7 @@ pub(super) enum Request {
     RecoverStream {
         stage: Stage,
         dead: Vec<uuid::Uuid>,
+        record: super::authority::RecoveryRecord,
     },
 }
 

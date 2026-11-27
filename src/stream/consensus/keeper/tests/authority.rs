@@ -548,6 +548,13 @@ fn authority_requests_and_replies_stay_off_n_minus_1() {
         Request::RecoverStream {
             stage,
             dead: vec![],
+            record: crate::stream::consensus::authority::RecoveryRecord {
+                stream: StreamId(9),
+                epoch: 2,
+                loss_point: Lsn(0),
+                source: crate::stream::consensus::authority::RecoverySource::Survivor,
+                time_unix_ms: 0,
+            },
         },
     ] {
         let frame = Frame::Client(request);

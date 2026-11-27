@@ -93,6 +93,8 @@ enum CatalogRecord {
     /// Keeper records as they stood when a checkpoint was taken; each
     /// replaces the records it holds. Only appended with leases finalized.
     Keepers(Vec<(Uuid, authority::KeeperRecord)>),
+    /// The latest recovery of each stream, as a checkpoint held them.
+    Recoveries(Vec<authority::RecoveryRecord>),
 }
 
 struct Fold {
@@ -175,6 +177,11 @@ impl Fold {
             }
             CatalogRecord::Keepers(records) => {
                 self.authority.keepers.extend(records);
+            }
+            CatalogRecord::Recoveries(records) => {
+                self.authority
+                    .recoveries
+                    .extend(records.into_iter().map(|record| (record.stream, record)));
             }
         }
     }
@@ -292,8 +299,13 @@ impl Engine {
                 self.authority_write(catalog, &group, authority::Change::Fence { keeper })
                     .await
             }
-            Request::RecoverStream { stage, dead } => {
-                self.recover_replicated(catalog, &group, stage, dead).await
+            Request::RecoverStream {
+                stage,
+                dead,
+                record,
+            } => {
+                self.recover_replicated(catalog, &group, stage, dead, record)
+                    .await
             }
             _ => Err(invalid("invalid catalog request")),
         }
@@ -780,9 +792,11 @@ impl Engine {
         group: &Group,
         stage: Stage,
         dead: Vec<Uuid>,
+        record: authority::RecoveryRecord,
     ) -> io::Result<Reply> {
         let fenced = authority::fenced_by(&stage);
         if stage.stream == STREAM
+            || !authority::describes(&record, &stage)
             || !stage.recovery()
             || !self.placement.stage(&stage)
             || dead.iter().any(|keeper| !fenced.contains(keeper))
@@ -819,6 +833,7 @@ impl Engine {
                     authority::Change::Recover {
                         stage: stage.clone(),
                         dead,
+                        record,
                     },
                 )
                 .await?
@@ -832,6 +847,12 @@ impl Engine {
             .await
             .map_err(|_| invalid("recovered catalog entry is not readable"))?;
         Ok(Reply::Recovered(authority::Recovered {
+            record: fold
+                .authority
+                .recoveries
+                .get(&stage.stream)
+                .copied()
+                .unwrap_or(record),
             unleased: fold.authority.unleased(&fenced),
             fenced,
             wait_ms,
@@ -936,8 +957,9 @@ impl Engine {
                 .iter()
                 .map(|(keeper, record)| (*keeper, record.clone()))
                 .collect::<Vec<_>>();
+            let recoveries = fold.authority.recoveries.values().copied().collect();
             drop(fold);
-            self.compact(&group, head, entries, keepers, cluster_version)
+            self.compact(&group, head, entries, keepers, recoveries, cluster_version)
                 .await;
         }
     }
@@ -993,6 +1015,7 @@ impl Engine {
         head: Lsn,
         entries: Vec<CatalogEntry>,
         keepers: Vec<(Uuid, authority::KeeperRecord)>,
+        recoveries: Vec<authority::RecoveryRecord>,
         cluster_version: u32,
     ) {
         let compacted = async {
@@ -1001,6 +1024,11 @@ impl Engine {
             for part in keepers.chunks(KEEPERS_PER_RECORD) {
                 last = self
                     .append_catalog(group, last, &CatalogRecord::Keepers(part.to_vec()))
+                    .await?;
+            }
+            for part in recoveries.chunks(KEEPERS_PER_RECORD) {
+                last = self
+                    .append_catalog(group, last, &CatalogRecord::Recoveries(part.to_vec()))
                     .await?;
             }
             if cluster_version > crate::stream::consensus::CLUSTER_VERSION_V1 {

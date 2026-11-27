@@ -63,10 +63,39 @@ pub(super) enum Change {
     /// its epoch.
     Fence { keeper: Uuid },
     /// An operator recovery: the stage's target becomes the stream's
-    /// membership at revision `stage.source + 1`, the stream is fenced for
-    /// every voter of the old configuration outside the target, and the
-    /// keepers the operator declared dead have their epochs bumped.
-    Recover { stage: Stage, dead: Vec<Uuid> },
+    /// membership at revision `stage.source + 1`, its configuration epoch,
+    /// the stream is fenced for every voter of the old configuration outside
+    /// the target, and the keepers the operator declared dead have their
+    /// epochs bumped. `record` describes what the recovery kept.
+    Recover {
+        stage: Stage,
+        dead: Vec<Uuid>,
+        record: RecoveryRecord,
+    },
+}
+
+/// Where a recovered history's last kept record came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecoverySource {
+    /// The surviving voter's log.
+    Survivor,
+    /// The object store's committed run, longer than the survivor's log.
+    ObjectStore,
+}
+
+/// The catalog's record of one recovery of a stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryRecord {
+    pub stream: StreamId,
+    /// The configuration epoch the recovery installed: its revision, which
+    /// is also the stream's offload lineage from the recovery on.
+    pub epoch: u64,
+    /// The last record the recovered history kept. Records a writer was
+    /// acknowledged above it are lost.
+    pub loss_point: journal_contract::Lsn,
+    pub source: RecoverySource,
+    /// When the survivor committed the recovery, in Unix milliseconds.
+    pub time_unix_ms: u64,
 }
 
 /// What the authority answers a lease renewal.
@@ -93,6 +122,8 @@ pub struct Grant {
 /// What a recovery's catalog transaction answers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recovered {
+    /// The recovery as the catalog recorded it.
+    pub record: RecoveryRecord,
     /// The keepers the stream is now fenced for.
     pub fenced: Vec<Uuid>,
     /// Fenced keepers that never enrolled: no lease of theirs ends by time,
@@ -109,6 +140,9 @@ pub struct Recovered {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Records {
     pub keepers: BTreeMap<Uuid, KeeperRecord>,
+    /// The latest recovery of each stream.
+    #[serde(default)]
+    pub recoveries: BTreeMap<StreamId, RecoveryRecord>,
 }
 
 impl Records {
@@ -145,8 +179,19 @@ impl Records {
                 let record = self.record(*keeper);
                 record.epoch = record.epoch.saturating_add(1);
             }
-            Change::Recover { stage, dead } => {
+            Change::Recover {
+                stage,
+                dead,
+                record,
+            } => {
                 let revision = stage.source.saturating_add(1);
+                if self
+                    .recoveries
+                    .get(&stage.stream)
+                    .is_none_or(|latest| latest.epoch <= record.epoch)
+                {
+                    self.recoveries.insert(stage.stream, *record);
+                }
                 for keeper in fenced_by(stage) {
                     let floor = self.record(keeper).fenced.entry(stage.stream).or_default();
                     *floor = (*floor).max(revision);
@@ -228,6 +273,12 @@ impl Records {
     }
 }
 
+/// Whether `record` describes the recovery `stage` stages: its stream and
+/// the configuration epoch, the revision the stage installs.
+pub(super) fn describes(record: &RecoveryRecord, stage: &Stage) -> bool {
+    record.stream == stage.stream && Some(record.epoch) == stage.source.checked_add(1)
+}
+
 /// The keepers a recovery fences its stream for: every voter of the old
 /// configuration outside the target. Fencing a voter the recovered
 /// membership no longer names costs nothing, since its copy can only
@@ -297,10 +348,19 @@ mod tests {
         let stage = recovery();
         assert!(!records.recovered(&stage));
         assert_eq!(records.unleased(&fenced_by(&stage)), [ids[2]]);
+        let record = RecoveryRecord {
+            stream: StreamId(9),
+            epoch: 5,
+            loss_point: journal_contract::Lsn(7),
+            source: RecoverySource::Survivor,
+            time_unix_ms: 1,
+        };
         records.apply(&Change::Recover {
             stage: stage.clone(),
             dead: vec![ids[2]],
+            record,
         });
+        assert_eq!(records.recoveries[&StreamId(9)], record);
         assert!(records.recovered(&stage));
         assert_eq!(fenced_by(&stage), [ids[1], ids[2]]);
         for keeper in [ids[1], ids[2]] {

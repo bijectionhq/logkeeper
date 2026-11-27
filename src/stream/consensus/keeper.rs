@@ -1809,9 +1809,19 @@ impl Engine {
                     .await
             }
             Request::FenceKeeper(keeper) => self.catalog()?.fence(keeper).await,
-            Request::RecoverStream { stage, dead } => {
+            Request::RecoverStream {
+                stage,
+                dead,
+                record,
+            } => {
                 self.catalog()?
-                    .recover(stage, dead, &self.placement, self.recovery_wait_ms()?)
+                    .recover(
+                        stage,
+                        dead,
+                        record,
+                        &self.placement,
+                        self.recovery_wait_ms()?,
+                    )
                     .await
             }
             Request::Claim(genesis) => self.catalog()?.claim(genesis, &self.placement).await,

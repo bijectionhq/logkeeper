@@ -37,7 +37,7 @@ use serde::{
 pub use super::transport::Credentials;
 pub use crate::server::durability::SyncMode;
 pub use address::Address;
-pub use authority::{Grant, Recovered};
+pub use authority::{Grant, Recovered, RecoveryRecord, RecoverySource};
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
 pub use keeper::{AdminConfig, Config, FenceProof, OffloadStatus, Recovery, RecoveryReport};
