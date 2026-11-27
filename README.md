@@ -997,10 +997,10 @@ for the fault model and checked invariants.
 
 ### Operations
 
-The admin listener (metrics, probes, problem report, status), structured logs
-and audit records, the offline tools that read a stopped data directory, and
-the debug bundle that collects all of them are read-only. `logkeeper admin`
-is the operator's client for the administrative requests. Alert rules and a dashboard live in
+The admin listener exposes metrics, probes, status, and operator mode changes.
+`logkeeper admin` runs administrative requests. The debug bundle collects
+diagnostics from the admin listener and the offline inspection tools.
+Alert rules and a dashboard live in
 `deploy/prometheus/logkeeper-alerts.yml` and `deploy/grafana/logkeeper.json`.
 
 #### Admin listener
@@ -1024,10 +1024,12 @@ configuration:
 - Plain HTTP (`"mtls": false`, the default) may only bind a loopback address.
   To scrape from another host, set `"mtls": true`: the listener then serves TLS
   1.3 with the keeper's credentials and requires a client certificate signed by
-  the cluster CA. It serves principals listed in `administrators` and the other
-  keepers of the cluster (so `debug-bundle` can run on any keeper), and answers
-  every other client `403 Forbidden`. Kubernetes HTTP probes cannot present a
-  client certificate, so with mTLS probe through a sidecar or an exec probe.
+  the cluster CA. It serves administrators and cluster keepers, and gives
+  principals in `admin.metrics_readers` access to `/metrics`, `/live`, and
+  `/ready`.
+- `admin.probe_listen` optionally serves `/live` and `/ready` over plain HTTP
+  on a separate loopback address. A Kubernetes exec probe can call it from
+  inside the pod.
 - `cluster` names the admin listeners of the other keepers. Only
   `logkeeper keeper debug-bundle` reads it.
 - The listener serves at most 16 connections at once and sheds the next one
@@ -1058,7 +1060,12 @@ draining keeper:
 
 Do not drain all three voters of a stream at once: none of them would
 campaign. `GET /drain` reports `mode`, `led`, `hosted`, `voter_streams` and
-`drained` (draining and leading nothing).
+`drained` (draining and leading nothing). A decommissioning keeper also moves
+its replicas through quorum repair. Wait for `safe_to_delete` before stopping
+it for permanent removal.
+
+On Unix, SIGHUP reloads authorized TLS credentials for new connections.
+See the [certificate rotation runbook](docs/runbooks/certificate-rotation.md).
 
 #### Admin CLI
 
@@ -1084,8 +1091,10 @@ report is incomplete.
 | `problems` | Every keeper's `/problems`, merged by stream, and which keepers did not answer |
 | `drain --keeper K [--wait-secs N]` | Marks `K` draining and waits (120 s by default) until it leads nothing; non-zero exit if it still leads some |
 | `undrain --keeper K` | Clears the mark: `K` elects, leads and takes placements again |
+| `decommission --keeper K [--wait-secs N]` | Moves leadership and replicas off `K` and waits until it is safe to delete |
 | `drain-status --keeper K` | `K`'s mode, the streams it leads and hosts, and those it votes in |
-| `clear-quarantine`, `finalize-version` | Reserved for the upgrades work; refused on this build |
+| `clear-quarantine --keeper K --stream UUID` | Clears the replica's quarantine marker after repair |
+| `finalize-version` | Enables the new write format after the rolling upgrade |
 
 Administrators may now also send `PreferLeader`, which used to be a writer's
 request; it moves leadership and writes nothing.
