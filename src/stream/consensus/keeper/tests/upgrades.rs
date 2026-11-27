@@ -593,6 +593,23 @@ async fn checksum_failure_quarantines_durably_survives_restart_triggers_repair_a
     .await
     .expect("repair replaced quarantined replica");
     assert!(!repaired.voters.contains(&victim));
+    // The replaced copy then retires on its own: the victim detaches it on
+    // the new placement and clears its marker, with no operator action.
+    timeout(Duration::from_secs(30), async {
+        while marker.exists() || cluster.running[&victim].engine.is_quarantined(stream) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the replaced quarantined copy retired and cleared its marker");
+    assert!(
+        cluster.running[&victim]
+            .engine
+            .disk
+            .ownership(stream)
+            .is_some_and(|book| book.generation().is_none()),
+        "the copy is detached"
+    );
     // Reads from the healthy quorum still return the intact record.
     let page = client
         .read(stream, Lsn(1), 1, Duration::ZERO)
