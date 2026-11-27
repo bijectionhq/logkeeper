@@ -73,26 +73,32 @@ impl LocalCluster {
     /// Starts the keepers. Every listed principal may read, write and
     /// administer streams.
     pub async fn start(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false, 600, false, false).await
+        Self::start_with(principals, false, 600, false, false, 0).await
     }
 
     /// Starts the keepers with a replicated catalog on voters 1 and 2 and
     /// the catalog keeper, which seeds it.
     pub async fn start_replicated_catalog(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false, 600, true, false).await
+        Self::start_with(principals, false, 600, true, false, 0).await
+    }
+
+    /// Starts a replicated catalog with keeper identities disjoint from other fixtures.
+    pub async fn start_independent_catalog(principals: &[&str]) -> io::Result<Self> {
+        let identity_prefix = Uuid::new_v4().as_u128() & !0xff;
+        Self::start_with(principals, false, 600, true, false, identity_prefix).await
     }
 
     /// Starts the keepers so that a stream idle for `park_after_secs` is
     /// parked on every voter.
     pub async fn start_parking(principals: &[&str], park_after_secs: u64) -> io::Result<Self> {
-        Self::start_with(principals, false, park_after_secs, false, false).await
+        Self::start_with(principals, false, park_after_secs, false, false, 0).await
     }
 
     /// Starts the keepers with timed-original authority: each keeper signs
     /// with its own Ed25519 key and samples a wall clock shifted by
     /// [`LocalCluster::shift_timed_clock`].
     pub async fn start_timed(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, true, 600, false, false).await
+        Self::start_with(principals, true, 600, false, false, 0).await
     }
 
     /// Starts the keepers and two spares: keepers 5 and 6, in the domains of
@@ -100,7 +106,7 @@ impl LocalCluster {
     /// keeper, are enough to recover a stream that lost voters 2 and 3 onto
     /// voter 1 and the spares.
     pub async fn start_spared(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false, 600, false, true).await
+        Self::start_with(principals, false, 600, false, true, 0).await
     }
 
     /// Starts the keepers of [`LocalCluster::start_spared`] with streams on
@@ -108,7 +114,7 @@ impl LocalCluster {
     /// one in zone a, the spread placement allows over three domains. The
     /// cluster version is finalized, which five-voter streams need.
     pub async fn start_five_voters(principals: &[&str]) -> io::Result<Self> {
-        let mut cluster = Self::start_with(principals, false, 600, false, true).await?;
+        let mut cluster = Self::start_with(principals, false, 600, false, true, 0).await?;
         let mut five = cluster.voters.to_vec();
         five.append(&mut cluster.spares);
         cluster.voters = Voters::sorted(&five).expect("five voters");
@@ -124,15 +130,17 @@ impl LocalCluster {
         park_after_secs: u64,
         replicated: bool,
         spared: bool,
+        identity_prefix: u128,
     ) -> io::Result<Self> {
         let dir = tempfile::tempdir()?;
         let roots = dir.path().join("ca.pem");
         let issuer = authority(&roots)?;
-        let voters = [1, 2, 3].map(Uuid::from_u128);
-        let catalog = Uuid::from_u128(4);
+        let keeper_id = |number| Uuid::from_u128(identity_prefix | number);
+        let voters = [1, 2, 3].map(keeper_id);
+        let catalog = keeper_id(4);
         let catalog_voters = replicated.then_some(Voters::from([voters[0], voters[1], catalog]));
         let spares = if spared {
-            vec![Uuid::from_u128(5), Uuid::from_u128(6)]
+            vec![keeper_id(5), keeper_id(6)]
         } else {
             Vec::new()
         };
