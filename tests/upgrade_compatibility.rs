@@ -880,8 +880,10 @@ async fn rolling_restart_one_at_a_time_under_load() {
     );
     assert_eq!(client.cluster_version().await, Ok(CLUSTER_VERSION_CURRENT));
 
-    // Once finalized, keepers write N formats, here an LKRWAL05 checkpoint,
-    // and an N-1 binary refuses the media rather than misreading it.
+    // Once finalized, keepers write N formats, here the checkpoint of the
+    // finalized level: LKRWAL06, which also carries each stream's commit
+    // index from CLUSTER_VERSION_LEASES on. An N-1 binary refuses the media
+    // rather than misreading it.
     let victim = cluster.voters[0];
     let checkpoints = cluster.data_dir(victim).join("raft-checkpoints");
     let n_checkpoint = || {
@@ -889,7 +891,7 @@ async fn rolling_restart_one_at_a_time_under_load() {
             .into_iter()
             .flatten()
             .flatten()
-            .any(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes.starts_with(b"LKRWAL05")))
+            .any(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes.starts_with(b"LKRWAL06")))
     };
     let mut next = client.head(stream).await.unwrap().0 + 1;
     timeout(Duration::from_secs(150), async {
