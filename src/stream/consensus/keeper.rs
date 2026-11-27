@@ -2767,15 +2767,31 @@ impl Group {
                 }
                 continue;
             }
-            if let Some(remote) = self.state.remote(from) {
-                return match offload {
-                    Some(offload) => offload
+            if self.state.remote(from).is_some() {
+                // The store still holds records the writer trimmed, and a
+                // follower may not have applied the latest trim. Only the
+                // leader, after a read barrier that applies every committed
+                // trim, serves from the store; it then checks the floor
+                // again. Others answer `Unavailable`, and the client asks
+                // the leader.
+                let Some(offload) = offload else {
+                    return Outcome::Refused(JournalError::Unavailable);
+                };
+                if self.raft.metrics().borrow_watched().state != openraft::ServerState::Leader
+                    || self
+                        .barrier(Instant::now() + REQUEST_TIMEOUT)
+                        .await
+                        .is_err()
+                {
+                    return Outcome::Refused(JournalError::Unavailable);
+                }
+                if let Some(remote) = self.state.remote(from) {
+                    return offload
                         .read(self.genesis.stream, remote, limit)
                         .await
                         .map(Outcome::Page)
-                        .into(),
-                    None => Outcome::Refused(JournalError::Unavailable),
-                };
+                        .into();
+                }
             }
             let page = self.state.page(from, limit).await;
             if !page

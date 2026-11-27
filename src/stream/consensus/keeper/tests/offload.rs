@@ -630,27 +630,55 @@ impl Minio {
             .local_addr()
             .unwrap()
             .port();
-        let console = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         let child = std::process::Command::new(binary)
             .arg("server")
             .arg(dir.path().join("data"))
             .args(["--address", &format!("127.0.0.1:{port}")])
-            .args(["--console-address", &format!("127.0.0.1:{console}")])
+            // No console, so no second port to race for.
+            .env("MINIO_BROWSER", "off")
             .env("MINIO_ROOT_USER", "logkeeper")
             .env("MINIO_ROOT_PASSWORD", "logkeeper-secret")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .ok()?;
-        Some(Self {
+        let mut minio = Self {
             child,
             port,
             _dir: dir,
-        })
+        };
+        // A loaded machine can take tens of seconds to start MinIO: poll
+        // its liveness endpoint, and skip rather than fail if it never
+        // comes up or exits.
+        let deadline = std::time::Instant::now() + Duration::from_secs(90);
+        while std::time::Instant::now() < deadline {
+            if minio.child.try_wait().ok().flatten().is_some() {
+                eprintln!("skipped: MinIO exited during startup");
+                return None;
+            }
+            if minio.live() {
+                return Some(minio);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("skipped: MinIO did not become live within 90 s");
+        None
+    }
+
+    fn live(&self) -> bool {
+        use std::io::{Read, Write};
+        let Ok(mut socket) = std::net::TcpStream::connect(("127.0.0.1", self.port)) else {
+            return false;
+        };
+        let _ = socket.set_read_timeout(Some(Duration::from_secs(2)));
+        let request = format!(
+            "GET /minio/health/live HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            self.port
+        );
+        let mut answer = [0; 12];
+        socket.write_all(request.as_bytes()).is_ok()
+            && socket.read_exact(&mut answer).is_ok()
+            && answer.ends_with(b"200")
     }
 
     fn config(&self, bucket: &str) -> OffloadConfig {
@@ -692,11 +720,14 @@ async fn offload_to_minio_is_idempotent_and_serves_reads_below_the_local_floor()
             bytes: payload(lsn),
         })
         .collect::<Vec<_>>();
-    let created = timeout(WAIT, async {
+    let created = timeout(Duration::from_secs(60), async {
         loop {
             match store.upload(StreamId(99), 0, &records, Vec::new()).await {
                 Ok((created, _)) => return created,
-                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(error) => {
+                    eprintln!("minio upload: {error}");
+                    tokio::time::sleep(Duration::from_millis(1000)).await
+                }
             }
         }
     })
@@ -912,5 +943,86 @@ async fn an_immutable_stream_restores_and_imports_as_immutable() {
         flushed(&journal, stream, 35).await;
         check(&read_all(&journal, stream, 1, 35).await, 1, 35);
     }
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_that_missed_a_trim_never_serves_trimmed_records_from_the_store() {
+    let store = tempfile::tempdir().unwrap();
+    let mut config = offload_config(store.path());
+    config.retain_local_bytes = Some(500);
+    let mut cluster = Cluster::start_offloaded(&config).await;
+    let journal = cluster.client(&cluster.credentials);
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(50);
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 24)
+        .await
+        .unwrap();
+    let fence = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap()
+        .fence;
+    append_range(&journal, stream, fence, 1, 40).await;
+    flushed(&journal, stream, 40).await;
+    let leader = cluster.leader_after_head(&journal, stream).await;
+    let laggard = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    let group = cluster.group(laggard, stream).await;
+    // The laggard applied the upload and dropped its local copies of 1..=20.
+    timeout(WAIT, async {
+        while group
+            .state
+            .offload_view()
+            .is_none_or(|view| view.local_floor <= Lsn(20))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the laggard applied retention");
+    let applied = group.raft.metrics().borrow_watched().last_log_index;
+    // From now on it accepts no append, so it never learns of the trim.
+    *cluster.running[&laggard].engine.reject_append.write() =
+        Some(Box::new(move |scope, sender, request| {
+            scope == stream && sender == leader.as_u128() && !request.entries.is_empty()
+        }));
+    journal.trim(stream, fence, Lsn(30)).await.unwrap();
+    assert_eq!(
+        group.raft.metrics().borrow_watched().last_log_index,
+        applied
+    );
+    let offloader = cluster.running[&laggard].engine.offload.clone();
+    assert_eq!(group.state.offload_view().unwrap().logical_floor, Lsn(1));
+    // The laggard still believes 5 is readable, but does not serve it.
+    assert!(matches!(
+        group
+            .read(Lsn(5), 10, 0, Lsn(0), offloader.as_deref())
+            .await,
+        Outcome::Refused(JournalError::Unavailable)
+    ));
+    let leading = cluster.group(leader, stream).await;
+    let offloader = cluster.running[&leader].engine.offload.clone();
+    assert!(matches!(
+        leading
+            .read(Lsn(5), 10, 0, Lsn(0), offloader.as_deref())
+            .await,
+        Outcome::Refused(JournalError::Trimmed { floor: Lsn(31) })
+    ));
+    // Between the trim floor and the local floor, the leader reads the store.
+    match leading
+        .read(Lsn(31), 2, 0, Lsn(0), offloader.as_deref())
+        .await
+    {
+        Outcome::Page(page) => check(&page.records, 31, 32),
+        other => panic!("{other:?}"),
+    }
+    for _ in 0..20 {
+        assert_eq!(
+            journal.read(stream, Lsn(5), 10, Duration::ZERO).await,
+            Err(JournalError::Trimmed { floor: Lsn(31) })
+        );
+    }
+    *cluster.running[&laggard].engine.reject_append.write() = None;
     cluster.stop_all().await;
 }
