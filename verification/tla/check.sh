@@ -126,6 +126,11 @@ fi
 run_case "OffloadRetention"           "OffloadRetention.tla" "OffloadRetention.cfg"           pass liveness
 run_case "OffloadRetentionNoBarrier"  "OffloadRetention.tla" "OffloadRetentionNoBarrier.cfg"  invariant:NoPostTrimRemoteRead
 run_case "OffloadRetentionNoRecheck"  "OffloadRetention.tla" "OffloadRetentionNoRecheck.cfg"  invariant:NoPostTrimRemoteRead
+run_case "ScopedSessions"             "ScopedSessions.tla" "ScopedSessions.cfg"             pass liveness
+run_case "ScopedSessionsNoScope"      "ScopedSessions.tla" "ScopedSessionsNoScope.cfg"      invariant:ScopedDecision
+run_case "ScopedSessionsNoSession"    "ScopedSessions.tla" "ScopedSessionsNoSession.cfg"    invariant:ScopedDecision
+run_case "ScopedSessionsNoReplyGate"  "ScopedSessions.tla" "ScopedSessionsNoReplyGate.cfg"  invariant:LeaseGatesReply
+run_case "ScopedSessionsInPlace"      "ScopedSessions.tla" "ScopedSessionsInPlace.cfg"      invariant:ImmutablePrefix
 
 if [[ "$MODE" == "additions" ]]; then
   echo

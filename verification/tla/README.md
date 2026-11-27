@@ -489,6 +489,34 @@ quorum.
 | `OffloadRetentionNoBarrier` | any keeper serves from the store, as before 3f15f877 | `NoPostTrimRemoteRead` violated |
 | `OffloadRetentionNoRecheck` | no floor check after the barrier | `NoPostTrimRemoteRead` violated |
 
+### `ScopedSessions.tla`: immutable streams and scoped writer sessions
+
+Codex's design (4a944c0 and later; README "Cluster levels", level 4, and
+the lose-two-voters runbook): an immutable stream and the successor a
+recovery creates, two principals and two writer sessions. `SealSession`
+advances the expected epoch and binds the fence to the principal and the
+session, capturing the head; a retry with the same expected epoch by the
+same principal and session gets the original receipt, and any other is
+refused (`State::seal_session`, `require_writer`). Appends, trims and
+reservations carry a `WriterFence {stream, writer_epoch,
+writer_session_id}`; the request goes to the fence's stream. The keeper's
+lease gates the decision and again the reply (`holds_authority`, checked
+before the answer leaves), and a configuration revision change refuses a
+request queued under the old one. An immutable stream that loses its quorum
+is never cut in place: the verified cut goes to a fresh stream ID.
+
+| Config | Rule dropped | Result |
+| --- | --- | --- |
+| `ScopedSessions` | none | `ImmutablePrefix`, `ScopedDecision` (an accepted request carries the stream's current fence, session and principal), `LeaseGatesReply`, `ExactSealReceipt`, `RequestsSettle`, `RecoveryStartsSuccessor` pass, 1,782,955 states, 56 s on 4 workers |
+| `ScopedSessionsNoScope` | a fence is accepted on another stream | `ScopedDecision` violated |
+| `ScopedSessionsNoSession` | a seal retry ignores the session | `ScopedDecision` violated: a second session of the principal gets a fence and appends |
+| `ScopedSessionsNoReplyGate` | the reply is not gated on the lease again | `LeaseGatesReply` violated |
+| `ScopedSessionsInPlace` | the recovery cuts the stream in place | `ImmutablePrefix` violated |
+
+Abstractions: the lease and revision are one gate per stream (the epoch
+lease mechanics are `EpochLeases`'), and a fence's stream scope stands for
+the structural routing of `append_session_batch` by `fence.stream`.
+
 ## Fidelity review
 
 Changes made to the first version of the model when it was checked against
