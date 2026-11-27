@@ -24,6 +24,7 @@
 //! the uploaded prefix is a prefix of the committed log.
 
 pub(super) mod format;
+mod rules;
 pub(super) mod transfer;
 
 use std::{
@@ -665,51 +666,34 @@ impl Store {
     ) -> io::Result<Plan> {
         let mut plan = Plan::default();
         for (index, &(lineage, start)) in lineages.iter().enumerate() {
-            let end = lineages
-                .get(index + 1)
-                .map_or(Lsn(u64::MAX - 1), |(_, next)| Lsn(next.0.saturating_sub(1)));
-            if end < start || end < floor {
+            let successor = lineages.get(index + 1).map(|(_, next)| next.0);
+            let Some((low, end)) = rules::restore_window(start.0, floor.0, successor) else {
                 continue;
-            }
-            let objects = self.list(stream, lineage).await?;
-            let low = Lsn(start.0.max(floor.0));
-            // Continue the run when it reached this lineage's start.
-            let mut next = match plan.run {
-                Some((_, last)) if last.0 + 1 >= low.0 => Lsn(last.0 + 1),
-                _ => {
-                    plan = Plan::default();
-                    low
-                }
             };
-            loop {
-                if next > end {
-                    break;
-                }
-                let best = objects
-                    .iter()
-                    .filter(|object| object.first <= next && next <= object.last)
-                    .max_by_key(|object| object.last);
-                let object = match best {
-                    Some(object) => object,
-                    None => {
-                        // A gap: an earlier run cannot reach the head, so a
-                        // later one replaces it.
-                        let Some(after) = objects
-                            .iter()
-                            .filter(|object| object.first > next && object.first <= end)
-                            .min_by_key(|object| object.first)
-                        else {
-                            break;
-                        };
+            let objects = self.list(stream, lineage).await?;
+            let ranges = objects
+                .iter()
+                .map(|object| (object.first.0, object.last.0))
+                .collect::<Vec<_>>();
+            let (mut next, keep_run) = rules::restore_cursor(plan.end().map(|last| last.0), low);
+            if !keep_run {
+                plan = Plan::default();
+            }
+            while next <= end {
+                let object = match rules::select_restore_object(&ranges, next, end) {
+                    rules::Selection::Object(index) => &objects[index],
+                    rules::Selection::Gap(first) => {
+                        // A later run replaces one that cannot reach the head.
                         plan = Plan::default();
-                        next = after.first;
+                        next = first;
                         continue;
                     }
+                    rules::Selection::End => break,
                 };
-                let last = Lsn(object.last.0.min(end.0));
-                plan.parts.push((object.clone(), next, last));
-                plan.run = Some((plan.run.map_or(next, |(first, _)| first), last));
-                next = Lsn(last.0 + 1);
+                let (last, after) = rules::restore_cut(next, object.last.0, end);
+                plan.parts.push((object.clone(), Lsn(next), Lsn(last)));
+                plan.run = Some((plan.run.map_or(Lsn(next), |(first, _)| first), Lsn(last)));
+                next = after;
             }
         }
         Ok(plan)

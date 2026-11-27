@@ -1,0 +1,113 @@
+{
+  "summary": "Verify the shipped offload restore planning: each lineage serves only its own window below its successor, a run is extended only across no gap, every cut stays inside its object and lineage, and object selection takes the farthest-reaching cover or the nearest object after a gap.",
+  "flags": [
+    "--no-external-by-default",
+    "--verify-module",
+    "production",
+    "--verify-module",
+    "laws"
+  ],
+  "min_verified_functions": 8,
+  "controls": {
+    "use-the-old-lineage-at-the-cut": {
+      "defect": "read the successor lineage's first record from the deposed lineage",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "find": "Some(next) => next.saturating_sub(1)",
+          "replace": "Some(next) => next.min(u64::MAX - 1)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "function": "restore_window",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "extend-a-run-across-a-gap": {
+      "defect": "extend a restore run across a one-record gap",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "find": "Some(last) if last + 1 >= first",
+          "replace": "Some(last) if last + 1 >= first.saturating_sub(1)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "function": "restore_cursor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "let-an-object-cross-the-lineage-cap": {
+      "defect": "restore an object past its lineage's window",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "find": "let last = object_end.min(window_end);",
+          "replace": "let last = object_end.min(u64::MAX - 1);"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "function": "restore_cut",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "function": "restore_cut",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "skip-an-object-starting-at-the-cursor": {
+      "defect": "miss an object that starts exactly at the cursor",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "find": "if first <= cursor && cursor <= last {",
+          "replace": "if first < cursor && cursor <= last {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "function": "select_restore_object",
+          "category": "invariant not satisfied at end of loop body"
+        },
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "function": "select_restore_object",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 7
+    },
+    "skip-the-nearest-run-after-a-gap": {
+      "defect": "resume after a gap at a later object than the nearest",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "find": "Some(current) => first < current,",
+          "replace": "Some(current) => first > current,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/offload/rules.rs",
+          "function": "select_restore_object",
+          "category": "invariant not satisfied at end of loop body"
+        }
+      ],
+      "min_verified_functions": 7
+    }
+  }
+}
