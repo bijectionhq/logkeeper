@@ -649,9 +649,14 @@ impl Engine {
                 if !eligible {
                     return Err(invalid("vote is outside the effective placement"));
                 }
-                // Slow media would make this keeper a slow leader: it
-                // neither votes nor takes leadership until it keeps up.
-                if !matches!(request, PeerRequest::Park { .. }) && !self.disk.responsive() {
+                // Slow media would make this keeper a slow leader, so it
+                // takes no hand-off until it keeps up, and sheds what it
+                // leads. It still votes: refusing a vote cannot stop it
+                // leading, it only keeps responsive candidates from a
+                // majority, and when several voters' media stall together
+                // (one storage backend, one loaded machine) no candidate
+                // could win until the slow hold ended.
+                if matches!(request, PeerRequest::TransferLeader(_)) && !self.disk.responsive() {
                     return Err(invalid("keeper media is slow"));
                 }
                 match request {

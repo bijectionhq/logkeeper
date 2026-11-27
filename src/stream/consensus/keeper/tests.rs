@@ -3013,9 +3013,7 @@ async fn a_leader_that_crashes_before_its_own_sync_keeps_the_replicated_commit()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_leader_with_slow_media_hands_off_refuses_votes_and_accepts_nothing() {
-    use openraft::{Vote, raft::VoteRequest};
-
+async fn a_leader_with_slow_media_hands_off_refuses_hand_offs_and_accepts_nothing() {
     let mut cluster = Cluster::start().await;
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
@@ -3041,30 +3039,60 @@ async fn a_leader_with_slow_media_hands_off_refuses_votes_and_accepts_nothing() 
     }
     assert!(moved, "the slow leader handed its stream away");
     assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
-    // The slow keeper refuses a vote and a pre-vote from a fellow voter.
+    // The slow keeper refuses to take the stream back by hand-off.
     let group = cluster.group(leader, stream).await;
-    let term = group.raft.metrics().borrow_watched().current_term + 10;
-    let candidate = others[0].as_u128();
-    for request in [
-        PeerRequest::Vote(VoteRequest::new(
-            Vote::new(term, candidate),
-            group.state.applied(),
-        )),
-        PeerRequest::PreVote(VoteRequest::new(
-            Vote::new(term, candidate),
-            group.state.applied(),
-        )),
-    ] {
-        let refused = slow
-            .peer(candidate, group.genesis.clone(), request, None)
-            .await
-            .unwrap_err();
-        assert!(refused.to_string().contains("slow"), "{refused}");
+    let current = group.raft.metrics().borrow_watched().clone();
+    let from = current.current_leader.unwrap();
+    let refused = slow
+        .peer(
+            from,
+            group.genesis.clone(),
+            PeerRequest::TransferLeader(openraft::raft::TransferLeaderRequest::new(
+                current.vote,
+                leader.as_u128(),
+                current.last_log_index.and(group.state.applied()),
+            )),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("slow"), "{refused}");
+    cluster.stop_all().await;
+}
+
+/// Slow keepers still vote. When the media of two of three voters stall
+/// together and the third, responsive, leader stops, the two slow voters
+/// still elect one of themselves; if they refused each other's votes, the
+/// stream would have no leader until their slow hold ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voters_with_slow_media_still_elect_a_leader() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(58);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal.prefer_leader(stream, c).await.unwrap();
+    assert!(wait_for_leader(&cluster, stream, c).await);
+    for id in [a, b] {
+        cluster.running[&id]
+            .engine
+            .disk
+            .mark_slow(Duration::from_secs(600));
     }
-    assert!(
-        group.raft.metrics().borrow_watched().current_term < term,
-        "the refused vote left no trace"
-    );
+    cluster.running.remove(&c).unwrap().stop().await;
+    assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
+    let mut led = false;
+    for id in [a, b] {
+        led |= cluster
+            .group(id, stream)
+            .await
+            .raft
+            .metrics()
+            .borrow_watched()
+            .state
+            == openraft::ServerState::Leader;
+    }
+    assert!(led, "a slow voter leads while no responsive voter is left");
     cluster.stop_all().await;
 }
 
