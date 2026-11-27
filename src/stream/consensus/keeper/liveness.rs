@@ -350,6 +350,13 @@ impl Engine {
         }
         let required_feature = if target >= super::super::CLUSTER_VERSION_RECOVERY_ENTRY {
             features::RECOVERY_ENTRY
+                | features::RECOVERY_EXCLUSION
+                | features::CHECKPOINT_INSTALL
+                | features::REPLICATION_FACTOR
+                | features::LEASES
+                | features::OFFLOAD
+        } else if target >= super::super::CLUSTER_VERSION_EXCLUSION {
+            features::RECOVERY_EXCLUSION
                 | features::CHECKPOINT_INSTALL
                 | features::REPLICATION_FACTOR
                 | features::LEASES

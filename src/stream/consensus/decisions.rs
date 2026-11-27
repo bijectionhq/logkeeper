@@ -476,22 +476,71 @@ pub(super) fn offload_backpressure(enforced: bool, waiting: u64, limit: u64) -> 
     enforced && waiting > limit
 }
 
-/// Whether a replica refuses a peer's vote or append without answering it:
-/// the sender is outside the replica's effective membership and campaigns
-/// or leads in a term below the replica's vote. It belongs to a history
-/// this replica superseded, such as a voter an operator recovery lost, and
-/// an answer would teach it the newer term. The refusal tells the sender to
-/// check whether it was removed.
+/// Whether a replica refuses a peer's vote, pre-vote, append, snapshot or
+/// hand-off without answering it. Either an operator recovery this copy
+/// holds fenced the sender (`recovery_excludes`), whatever its term and
+/// even while the copy's own configuration still names it, or the sender is
+/// outside the replica's effective membership and campaigns or leads in a
+/// term below the replica's vote. Either way it belongs to a history this
+/// replica superseded, and an answer would teach it the newer term. With
+/// five voters and two survivors a lost leader may run terms past the
+/// recovery's, so only its identity tells it apart; and the second
+/// survivor, still in the configuration the recovery leaves, refuses the
+/// lost voters from before the recovery reads its last entry. The refusal
+/// tells the sender to check whether it was removed.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (configured && !known && sender_term < own_term)
+    ensures out == (recovery_fenced || (configured && !known && sender_term < own_term))
 ))]
 pub(super) fn excludes_sender(
     configured: bool,
     known: bool,
+    recovery_fenced: bool,
     sender_term: u64,
     own_term: u64,
 ) -> bool {
-    configured && !known && sender_term < own_term
+    recovery_fenced || (configured && !known && sender_term < own_term)
+}
+
+/// Whether a recovery's identity fence on a keeper still holds for a copy:
+/// the keeper voted in the configuration the recovery left, the recovered
+/// configuration does not name it, and no later ordinary move the copy
+/// applied names it again (a staged move that targets it, or a finalized
+/// revision above the recovery's).
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (fenced && !restaged && finalized_revision <= recovery_revision)
+))]
+pub(super) fn exclusion_holds(
+    fenced: bool,
+    restaged: bool,
+    finalized_revision: u64,
+    recovery_revision: u64,
+) -> bool {
+    fenced && !restaged && finalized_revision <= recovery_revision
+}
+
+/// Whether a copy that holds an operator recovery refuses a keeper by
+/// identity: the keeper voted in the configuration the recovery left and
+/// the recovered configuration does not name it.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (in_old && !in_target)
+))]
+pub(super) fn recovery_excludes(in_old: bool, in_target: bool) -> bool {
+    in_old && !in_target
+}
+
+/// Whether an operator recovery's catalog transaction fences its stream for
+/// a keeper below the recovered revision: every voter of the configuration
+/// it leaves, and every other survivor than the one that writes the
+/// recovery. A survivor that keeps running through the wait-out may follow
+/// a lost leader there, so its copy campaigns, leads and serves again only
+/// once it finalized the recovered configuration from the writer. The
+/// writer finalizes that configuration only by leading it, so it is never
+/// fenced.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (in_old && !(in_target && writer))
+))]
+pub(super) fn recovery_fences(in_old: bool, in_target: bool, writer: bool) -> bool {
+    in_old && !(in_target && writer)
 }
 
 /// Whether a replica answers vote-class requests. An installed replica

@@ -365,6 +365,31 @@ survivor keeps its seat in the recovered configuration and catches up from
 the recovering one like any follower. Whatever it holds past the recovered
 history is replaced, and it never knew any of that committed.
 
+Once the cluster finalized level 9 (`CLUSTER_VERSION_EXCLUSION`), the other
+survivor is fenced twice, because it keeps running through the wait-out and
+the lost leader may still hold a lease there:
+
+- **By identity, before it reports its progress.** The command asks with
+  `Request::LocalProgressFencing`: the survivor refuses the lost voters'
+  votes, pre-votes, appends, snapshots and hand-offs at any term, and sends
+  them none, so the lost leader cannot overwrite it with entries the
+  recovery does not keep, and it cannot lead the old configuration with
+  their votes. Every copy that holds the recovery refuses them the same
+  way: one that applied it, a replacement staged by it, and a copy the
+  certifier finds the catalog's latest recovery goes on from
+  (`decisions::excludes_sender`, `keeper/ingress.rs`, `Exclusions`). The
+  refusal lapses once a later move names the keeper again.
+- **In the catalog.** The recovery's transaction (`Request::RecoverStreamFrom`,
+  `authority::Change::RecoverFrom`) also fences the stream for every survivor
+  but the one that writes it, below the recovered revision, so its copy
+  campaigns, leads and serves again only once it finalized the recovered
+  configuration from the writer.
+
+Without either, a lost leader above the recovery term could overwrite the
+second survivor during the wait-out, which could then lead the old
+configuration with the lost voters' votes and overwrite the writer; only the
+`2^32` term gap prevented it. Below level 9 the recovery behaves as before.
+
 The command takes the keeper's media lock, so it refuses while the keeper
 runs, and asks every other keeper for its status.
 
@@ -964,7 +989,10 @@ leases authoritative and lets the catalog write keeper records
 `Record::Committed` frames (appended last to the record enum) and the
 `LKRWAL06` checkpoint, which carries each stream's commit index. An older
 binary refuses both, so do not roll back past level 6. Finalizing level 6 also needs
-every keeper to advertise the `LEASES` feature bit (bit 8). The authority's requests (`RenewLease`, `FenceKeeper`, `RecoverStream`,
+every keeper to advertise the `LEASES` feature bit (bit 8). Level 9,
+`CLUSTER_VERSION_EXCLUSION`, adds `RecoverStreamFrom`,
+`LocalProgressFencing` and the catalog's `Change::RecoverFrom` (feature bit
+11, `RECOVERY_EXCLUSION`), also without a new ALPN. The authority's requests (`RenewLease`, `FenceKeeper`, `RecoverStream`,
 `LocalTip`, `LocalProgress`) and replies (`Lease`, `Recovered`, `Tip`,
 `Progress`) are appended without a new ALPN: an N
 keeper that predates them answers their tags with a typed `Unsupported`, and

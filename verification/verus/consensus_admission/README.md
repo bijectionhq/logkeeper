@@ -26,6 +26,8 @@
 | `the_catalog_fences_only_superseded_configurations` | The catalog's latest move fences a recovery's lost configuration and any configuration older than a move, never the one the stream goes on from (TLA+ CE-4, `RecoveryBothReturn`) | `fences_copy` |
 | `an_aborted_move_restages_only_for_the_same_source` | A copy an aborted move staged is restaged only by another ordinary move from the same source (TLA+ `AbortedJointRestageSafety`) | `restages_replacement` |
 | `only_superseded_outsiders_are_excluded` | A refusal never hides a newer history | `excludes_sender` |
+| `recovery_fenced_voters_are_refused_at_any_term` | A copy holding a recovery refuses the voters it lost, whatever their term and its membership, until a later move names them again | `recovery_excludes`, `exclusion_holds`, `excludes_sender` |
+| `a_recovery_fences_all_but_its_writer` | A recovery fences every voter it leaves and every survivor but its writer | `recovery_fences` |
 | `only_installed_members_vote` | Vote eligibility, with recovery replacements | `votes` |
 | `dead_only_after_the_repair_delay` | A keeper that answered within the repair delay is never treated as dead | `keeper_dead` |
 | `backoff_is_bounded_and_grows` | Repair and wake backoff stays within its cap and never shrinks with another failure | `backoff` |

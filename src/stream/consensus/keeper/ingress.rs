@@ -568,15 +568,32 @@ impl Engine {
             PeerRequest::Park { vote, .. } => Some(*vote),
         };
         if let Some(vote) = campaign {
-            let metrics = group.raft.metrics();
-            let current = metrics.borrow_watched();
-            let membership = current.membership_config.membership();
+            let (configured, known, own_term) = {
+                let metrics = group.raft.metrics();
+                let current = metrics.borrow_watched();
+                let membership = current.membership_config.membership();
+                (
+                    !membership.get_joint_config().is_empty(),
+                    membership.get_node(&sender).is_some(),
+                    current.vote.leader_id().term,
+                )
+            };
+            let recovery_fenced = self.recovery_fences(&group, sender);
             if decisions::excludes_sender(
-                !membership.get_joint_config().is_empty(),
-                membership.get_node(&sender).is_some(),
+                configured,
+                known,
+                recovery_fenced,
                 vote.leader_id().term,
-                current.vote.leader_id().term,
+                own_term,
             ) {
+                if recovery_fenced {
+                    tracing::debug!(
+                        keeper = %self.id,
+                        stream = %crate::stream::consensus::logging::stream_uuid(group.genesis.stream),
+                        sender = %uuid::Uuid::from_u128(sender),
+                        "refused a voter an operator recovery fenced"
+                    );
+                }
                 return Err(invalid(network::EXCLUDED));
             }
         }
@@ -596,7 +613,7 @@ impl Engine {
                 }
                 self.check_entries(&group, &request)?;
                 *group.heard.lock() = tokio::time::Instant::now();
-                let reply = self.append(group.clone(), request, body).await?;
+                let reply = self.append(group.clone(), sender, request, body).await?;
                 // The leader campaigned certified, so its append certifies
                 // this copy unless this copy's vote outranks it.
                 if let AppendReply::Raft(Ok(response)) = &reply
@@ -718,6 +735,13 @@ impl Engine {
         }
     }
 
+    /// Whether an operator recovery this copy holds fenced `sender` by
+    /// identity (`Exclusions::fences`).
+    pub(super) fn recovery_fences(&self, group: &Group, sender: NodeId) -> bool {
+        self.exclusions
+            .fences(&self.disk, self.id, &group.genesis, &group.state, sender)
+    }
+
     fn check_entries(
         &self,
         group: &Group,
@@ -788,6 +812,7 @@ impl Engine {
     async fn append(
         &self,
         group: Arc<Group>,
+        sender: NodeId,
         request: AppendEntriesRequest<RaftTypes>,
         body: Option<Charge>,
     ) -> io::Result<AppendReply> {
@@ -804,6 +829,11 @@ impl Engine {
             let Ok(ordered) = group.append_order.clone().try_lock_owned() else {
                 return Ok(AppendReply::Busy);
             };
+            // A recovery may have fenced the sender while this append
+            // waited: `Request::LocalProgressFencing` orders itself after it.
+            if self.recovery_fences(&group, sender) {
+                return Err(invalid(network::EXCLUDED));
+            }
             let Some(body) = body else {
                 let _ordered = ordered;
                 let reply = raft_reply(group.raft.append_entries(request).await);
@@ -877,4 +907,74 @@ fn raft_reply(
     result: Result<openraft::raft::AppendResult<RaftTypes>, RaftError<RaftTypes>>,
 ) -> AppendReply {
     AppendReply::Raft(result.map(AppendEntriesResponse::from))
+}
+
+/// The voters operator recoveries fenced by identity, for the copies this
+/// keeper holds. A copy refuses such a voter's votes, pre-votes, appends,
+/// snapshots and hand-offs whatever its term, and sends it none
+/// (`decisions::excludes_sender`). Three sources:
+///
+/// - recoveries the copy's state machine applied, or holds staged
+///   (`StateMachine::recovery_excludes`);
+/// - the recovery that staged this copy as a replacement, from its durable
+///   ownership, before the copy holds the recovered log;
+/// - this table, in memory: a second surviving voter of five installs the
+///   lost voters when the recovery asks for its last entry
+///   (`Request::LocalProgressFencing`), so the lost leader cannot overwrite it
+///   with entries the recovery will not keep, and the certifier installs
+///   the catalog's latest recovery for a copy that reopened.
+///
+/// Each fence lapses once the copy applies a later move that names the
+/// keeper again (`decisions::exclusion_holds`).
+#[derive(Default)]
+pub(in crate::stream::consensus) struct Exclusions {
+    streams: parking_lot::RwLock<
+        std::collections::HashMap<
+            journal_contract::StreamId,
+            std::collections::BTreeMap<Uuid, u64>,
+        >,
+    >,
+}
+
+impl Exclusions {
+    /// Fences `keepers` for `stream`, lost by a recovery that installs
+    /// `revision`.
+    pub fn install(&self, stream: journal_contract::StreamId, keepers: &[Uuid], revision: u64) {
+        let mut streams = self.streams.write();
+        let fenced = streams.entry(stream).or_default();
+        for keeper in keepers {
+            let floor = fenced.entry(*keeper).or_default();
+            *floor = (*floor).max(revision);
+        }
+    }
+
+    /// Whether a recovery fences `sender` for this keeper's copy of the
+    /// stream of `genesis`, whose state machine is `state`.
+    pub fn fences(
+        &self,
+        disk: &crate::stream::consensus::storage::Disk,
+        keeper: Uuid,
+        genesis: &Genesis,
+        state: &crate::stream::consensus::storage::StateMachine,
+        sender: NodeId,
+    ) -> bool {
+        let sender = Uuid::from_u128(sender);
+        if state.recovery_excludes(sender) {
+            return true;
+        }
+        let installed = self
+            .streams
+            .read()
+            .get(&genesis.stream)
+            .and_then(|fenced| fenced.get(&sender).copied());
+        if installed.is_some_and(|revision| state.excludes_at(sender, revision)) {
+            return true;
+        }
+        disk.ownership(genesis.stream)
+            .and_then(|book| book.recovery_target(keeper).cloned())
+            .is_some_and(|stage| {
+                crate::stream::consensus::storage::recovery_fenced(&stage).contains(&sender)
+                    && state.excludes_at(sender, stage.source.saturating_add(1))
+            })
+    }
 }

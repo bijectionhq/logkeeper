@@ -130,6 +130,7 @@ impl Catalog {
         stage: Stage,
         dead: Vec<uuid::Uuid>,
         record: authority::RecoveryRecord,
+        writer: Option<uuid::Uuid>,
         placement: &Placement,
         wait_ms: u64,
     ) -> io::Result<Reply> {
@@ -137,15 +138,17 @@ impl Catalog {
         if !self.enforced() {
             return Ok(Reply::Decision(Outcome::Refused(JournalError::Unsupported)));
         }
+        let lost = authority::fenced_by(&stage);
+        let fenced = authority::fenced_from(&stage, writer);
         if !authority::describes(&record, &stage)
             || !stage.recovery()
             || !placement.stage(&stage)
-            || dead
-                .iter()
-                .any(|keeper| !authority::fenced_by(&stage).contains(keeper))
+            || dead.iter().any(|keeper| !lost.contains(keeper))
         {
             return Err(invalid("invalid recovery stage"));
         }
+        let change = authority::recovery_change(stage.clone(), dead, record, writer)
+            .ok_or_else(|| invalid("a recovery's writer must be one of its survivors"))?;
         let _guard = self.claim.lock().await;
         let entry = self
             .disk
@@ -155,22 +158,14 @@ impl Catalog {
             return Ok(stage_conflict());
         }
         let mut records = self.records.lock().await;
-        let written = !(records.recovered(&stage) && entry.staged.as_ref() == Some(&stage));
+        let written =
+            !(records.recovered(&stage, &fenced) && entry.staged.as_ref() == Some(&stage));
         if written {
-            self.change(
-                &mut records,
-                authority::Change::Recover {
-                    stage: stage.clone(),
-                    dead,
-                    record,
-                },
-            )
-            .await?;
+            self.change(&mut records, change).await?;
             if entry.staged.as_ref() != Some(&stage) {
                 self.disk.write(Record::Stage(stage.clone())).await?;
             }
         }
-        let fenced = authority::fenced_by(&stage);
         let wait_ms = records.recovery_wait(&fenced, wait_ms);
         Ok(Reply::Recovered(authority::Recovered {
             record: records
@@ -178,7 +173,9 @@ impl Catalog {
                 .get(&stage.stream)
                 .copied()
                 .unwrap_or(record),
-            unleased: records.unleased(&fenced),
+            // Another survivor answered this recovery, so only the lost
+            // voters need the operator's word when they never held a lease.
+            unleased: records.unleased(&lost),
             fenced,
             wait_ms,
             written,

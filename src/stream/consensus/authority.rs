@@ -84,6 +84,17 @@ pub(super) enum Change {
         dead: Vec<Uuid>,
         record: RecoveryRecord,
     },
+    /// `Recover`, written by survivor `writer`: the stream is also fenced
+    /// below the recovered revision for every other survivor, until its copy
+    /// finalizes the recovered configuration (`fenced_from`). Written only
+    /// once the cluster finalized `CLUSTER_VERSION_EXCLUSION`, so every
+    /// catalog voter decodes it. Added last.
+    RecoverFrom {
+        stage: Stage,
+        dead: Vec<Uuid>,
+        record: RecoveryRecord,
+        writer: Uuid,
+    },
 }
 
 /// Where a recovered history's last kept record came from. The journal
@@ -200,24 +211,38 @@ impl Records {
                 stage,
                 dead,
                 record,
-            } => {
-                let revision = stage.source.saturating_add(1);
-                if self
-                    .recoveries
-                    .get(&stage.stream)
-                    .is_none_or(|latest| latest.epoch <= record.epoch)
-                {
-                    self.recoveries.insert(stage.stream, *record);
-                }
-                for keeper in fenced_by(stage) {
-                    let floor = self.record(keeper).fenced.entry(stage.stream).or_default();
-                    *floor = (*floor).max(revision);
-                }
-                for keeper in dead {
-                    let record = self.record(*keeper);
-                    record.epoch = record.epoch.saturating_add(1);
-                }
-            }
+            } => self.recover(stage, dead, record, fenced_by(stage)),
+            Change::RecoverFrom {
+                stage,
+                dead,
+                record,
+                writer,
+            } => self.recover(stage, dead, record, fenced_from(stage, Some(*writer))),
+        }
+    }
+
+    fn recover(
+        &mut self,
+        stage: &Stage,
+        dead: &[Uuid],
+        record: &RecoveryRecord,
+        fenced: Vec<Uuid>,
+    ) {
+        let revision = stage.source.saturating_add(1);
+        if self
+            .recoveries
+            .get(&stage.stream)
+            .is_none_or(|latest| latest.epoch <= record.epoch)
+        {
+            self.recoveries.insert(stage.stream, *record);
+        }
+        for keeper in fenced {
+            let floor = self.record(keeper).fenced.entry(stage.stream).or_default();
+            *floor = (*floor).max(revision);
+        }
+        for keeper in dead {
+            let record = self.record(*keeper);
+            record.epoch = record.epoch.saturating_add(1);
         }
     }
 
@@ -297,10 +322,10 @@ impl Records {
     }
 
     /// Whether `stage` is already recorded as a committed recovery: every
-    /// keeper it fences is fenced at its revision.
-    pub fn recovered(&self, stage: &Stage) -> bool {
+    /// keeper in `fenced` is fenced at its revision.
+    pub fn recovered(&self, stage: &Stage, fenced: &[Uuid]) -> bool {
         let revision = stage.source.saturating_add(1);
-        fenced_by(stage).into_iter().all(|keeper| {
+        fenced.iter().all(|keeper| {
             self.keepers
                 .get(&keeper)
                 .and_then(|record| record.fenced.get(&stage.stream))
@@ -328,16 +353,59 @@ pub(super) fn describes(record: &RecoveryRecord, stage: &Stage) -> bool {
     record.stream == stage.stream && Some(record.epoch) == stage.source.checked_add(1)
 }
 
+/// The catalog change of a recovery: `Change::RecoverFrom` when survivor
+/// `writer` named itself, else `Change::Recover`. `None` when `writer` is
+/// not one of the stage's survivors.
+pub(super) fn recovery_change(
+    stage: Stage,
+    dead: Vec<Uuid>,
+    record: RecoveryRecord,
+    writer: Option<Uuid>,
+) -> Option<Change> {
+    match writer {
+        None => Some(Change::Recover {
+            stage,
+            dead,
+            record,
+        }),
+        Some(writer) if stage.survivors().contains(&writer) => Some(Change::RecoverFrom {
+            stage,
+            dead,
+            record,
+            writer,
+        }),
+        Some(_) => None,
+    }
+}
+
 /// The keepers a recovery fences its stream for: every voter of the old
 /// configuration outside the target. Fencing a voter the recovered
 /// membership no longer names costs nothing, since its copy can only
 /// retire, so the fence never needs the operator to name the lost voters.
 pub(super) fn fenced_by(stage: &Stage) -> Vec<Uuid> {
+    fenced_from(stage, None)
+}
+
+/// The keepers a recovery written by survivor `writer` fences its stream
+/// for: the voters it leaves (`fenced_by`), and every other survivor
+/// (`decisions::recovery_fences`). A second survivor of five keeps running
+/// through the wait-out and may follow a lost leader there: fenced below
+/// the recovered revision, it campaigns, leads and serves again only once
+/// it finalized the recovered configuration from the writer, so it never
+/// leads the old configuration with the lost voters' votes. Without a
+/// writer only the voters it leaves are fenced.
+pub(super) fn fenced_from(stage: &Stage, writer: Option<Uuid>) -> Vec<Uuid> {
     stage
         .old
         .iter()
         .copied()
-        .filter(|voter| !stage.target.contains(voter))
+        .filter(|voter| {
+            decisions::recovery_fences(
+                true,
+                stage.target.contains(voter),
+                writer.is_none_or(|writer| writer == *voter),
+            )
+        })
         .collect()
 }
 
@@ -395,7 +463,7 @@ mod tests {
             });
         }
         let stage = recovery();
-        assert!(!records.recovered(&stage));
+        assert!(!records.recovered(&stage, &fenced_by(&stage)));
         assert_eq!(records.unleased(&fenced_by(&stage)), [ids[2]]);
         let record = RecoveryRecord {
             stream: StreamId(9),
@@ -410,7 +478,7 @@ mod tests {
             record,
         });
         assert_eq!(records.recoveries[&StreamId(9)], record);
-        assert!(records.recovered(&stage));
+        assert!(records.recovered(&stage, &fenced_by(&stage)));
         assert_eq!(fenced_by(&stage), [ids[1], ids[2]]);
         for keeper in [ids[1], ids[2]] {
             assert_eq!(records.keepers[&keeper].fenced[&StreamId(9)], 5);
@@ -432,6 +500,51 @@ mod tests {
                 .grant(ids[2], ids[2], 0, false, 30_000, 3_000)
                 .granted
         );
+    }
+
+    #[test]
+    fn a_recovery_from_one_of_two_survivors_fences_the_other_until_it_catches_up() {
+        let ids = (1..=8).map(Uuid::from_u128).collect::<Vec<_>>();
+        let voters = |list: &[usize]| {
+            crate::stream::consensus::Voters::new(&list.iter().map(|i| ids[*i]).collect::<Vec<_>>())
+                .unwrap()
+        };
+        // Survivors 0 and 1 of five; 2, 3 and 4 are lost.
+        let stage = Stage {
+            stream: StreamId(9),
+            source: 4,
+            old: voters(&[0, 1, 2, 3, 4]),
+            target: voters(&[0, 1, 5, 6, 7]),
+        };
+        assert_eq!(stage.survivors(), [ids[0], ids[1]]);
+        assert_eq!(fenced_by(&stage), [ids[2], ids[3], ids[4]]);
+        assert_eq!(
+            fenced_from(&stage, Some(ids[0])),
+            [ids[1], ids[2], ids[3], ids[4]]
+        );
+        let record = RecoveryRecord {
+            stream: StreamId(9),
+            epoch: 5,
+            loss_point: journal_contract::Lsn(7),
+            source: RecoverySource::Survivor,
+            time_unix_ms: 1,
+        };
+        // Only a survivor writes a recovery.
+        assert!(recovery_change(stage.clone(), Vec::new(), record, Some(ids[5])).is_none());
+        let change = recovery_change(stage.clone(), Vec::new(), record, Some(ids[0])).unwrap();
+        let mut records = Records::default();
+        records.apply(&change);
+        let fenced = fenced_from(&stage, Some(ids[0]));
+        assert!(records.recovered(&stage, &fenced));
+        // The other survivor's copy is fenced below the recovered revision,
+        // which it finalizes by following the writer; the writer is not.
+        assert_eq!(records.keepers[&ids[1]].fenced[&StreamId(9)], 5);
+        assert!(!records.keepers.contains_key(&ids[0]));
+        // A recovery recorded without its writer fenced the lost voters only.
+        let mut legacy = Records::default();
+        legacy.apply(&recovery_change(stage.clone(), Vec::new(), record, None).unwrap());
+        assert!(legacy.recovered(&stage, &fenced_by(&stage)));
+        assert!(!legacy.recovered(&stage, &fenced));
     }
 
     #[test]

@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 161,
+  "min_verified_functions": 166,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -451,14 +451,104 @@
       "mutate": [
         {
           "file": "src/stream/consensus/decisions.rs",
-          "find": "    configured && !known && sender_term < own_term\n}",
-          "replace": "    configured && sender_term < own_term\n}"
+          "find": "    recovery_fenced || (configured && !known && sender_term < own_term)\n}",
+          "replace": "    recovery_fenced || (configured && sender_term < own_term)\n}"
         }
       ],
       "expect": [
         {
           "file": "src/stream/consensus/decisions.rs",
           "function": "excludes_sender",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "answer-a-fenced-voter-above-the-term": {
+      "defect": "answer a voter a recovery fenced once it campaigns above the replica's term",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    recovery_fenced || (configured && !known && sender_term < own_term)\n}",
+          "replace": "    configured && !known && sender_term < own_term\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "excludes_sender",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "keep-a-lost-voter": {
+      "defect": "let a copy that holds a recovery answer the voters it lost",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    in_old && !in_target\n}",
+          "replace": "    false\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_excludes",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "exclude-a-readmitted-keeper": {
+      "defect": "keep refusing a lost voter after a later move named it again",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    fenced && !restaged && finalized_revision <= recovery_revision\n}",
+          "replace": "    fenced\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "exclusion_holds",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "fence-the-writer": {
+      "defect": "fence the survivor that writes the recovery, so the recovered configuration never elects",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    in_old && !(in_target && writer)\n}",
+          "replace": "    in_old\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_fences",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "spare-the-other-survivor": {
+      "defect": "leave a second survivor unfenced, so a lost leader's follower leads the old configuration after the wait-out",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    in_old && !(in_target && writer)\n}",
+          "replace": "    in_old && !in_target\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_fences",
           "category": "postcondition not satisfied"
         }
       ],

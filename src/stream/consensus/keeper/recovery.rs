@@ -426,17 +426,46 @@ impl Config {
                  so the stream still has a quorum; restart this keeper instead"
             )));
         }
+        // Once every keeper decodes them, the other survivor refuses the lost
+        // voters by identity before it reports its progress, so a lost
+        // leader that still holds a lease cannot overwrite it with entries
+        // this recovery will not keep, and the catalog fences the stream for
+        // it until it holds the recovered configuration.
+        let writer = decisions::write_version_allows(
+            disk.cluster_version()
+                .max(self.catalog_version(disk, rpc).await),
+            crate::stream::consensus::CLUSTER_VERSION_EXCLUSION,
+        )
+        .then_some(self.keeper);
+        let lost = others
+            .iter()
+            .copied()
+            .filter(|voter| !peers.contains(voter))
+            .collect::<Vec<_>>();
         // With two survivors of five, one recovers, so two runs can never
         // write rival recoveries: the one that knows the later commit, then
         // the more advanced log. The other keeps only what the recovered
         // history keeps, so it never knew a later commit than the recovery
         // keeps. A survivor of an older build reports only its tip.
         for peer in &peers {
-            let progress = match rpc
-                .call_application(*peer, Request::LocalProgress(stream), STATUS_TIMEOUT)
-                .await
-            {
+            let ask = match writer {
+                Some(_) => Request::LocalProgressFencing {
+                    stream,
+                    lost: lost.clone(),
+                    revision: configuration.revision.saturating_add(1),
+                },
+                None => Request::LocalProgress(stream),
+            };
+            let progress = match rpc.call_application(*peer, ask, STATUS_TIMEOUT).await {
                 Ok(Reply::Progress { tip, committed }) => Some((tip, committed)),
+                // Every keeper fences once the level is finalized: no
+                // fallback that would leave the other survivor unfenced.
+                _ if writer.is_some() => {
+                    return Err(invalid(format!(
+                        "refused: surviving voter {peer} did not fence the lost voters and \
+                         report its progress; retry"
+                    )));
+                }
                 _ => None,
             };
             let (tip, committed) = match progress {
@@ -649,7 +678,7 @@ impl Config {
                 .map_or(0, |since| since.as_millis() as u64),
         };
         let (fenced, wait, record) = match self
-            .recover_in_catalog(disk, rpc, placement, &stage, &dead, record)
+            .recover_in_catalog(disk, rpc, placement, &stage, &dead, record, writer)
             .await
             .map_err(|error| {
                 invalid(format!(
@@ -860,11 +889,20 @@ impl Config {
         stage: &Stage,
         dead: &[Uuid],
         record: RecoveryRecord,
+        writer: Option<Uuid>,
     ) -> io::Result<Option<Recovered>> {
-        let request = Request::RecoverStream {
-            stage: stage.clone(),
-            dead: dead.to_vec(),
-            record,
+        let request = match writer {
+            Some(writer) => Request::RecoverStreamFrom {
+                stage: stage.clone(),
+                dead: dead.to_vec(),
+                record,
+                writer,
+            },
+            None => Request::RecoverStream {
+                stage: stage.clone(),
+                dead: dead.to_vec(),
+                record,
+            },
         };
         let reply = match self.catalog_voters {
             None if self.catalog == self.keeper => {
@@ -872,7 +910,14 @@ impl Config {
                     decisions::recovery_wait(self.lease_millis, self.lease_drift_margin_millis)
                         .ok_or_else(|| invalid("lease duration overflows"))?;
                 Catalog::new(disk.clone(), &self.data)?
-                    .recover(stage.clone(), dead.to_vec(), record, placement, wait)
+                    .recover(
+                        stage.clone(),
+                        dead.to_vec(),
+                        record,
+                        writer,
+                        placement,
+                        wait,
+                    )
                     .await?
             }
             None => {

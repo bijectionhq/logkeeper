@@ -103,6 +103,16 @@ impl Ownership {
         })
     }
 
+    /// The recovery stage of the current copy, when an operator recovery
+    /// staged it with `keeper` in its target: a replacement, or a survivor's
+    /// copy that a later recovery staged again.
+    pub fn recovery_target(&self, keeper: uuid::Uuid) -> Option<&Stage> {
+        let copy = self.current.as_ref().filter(|copy| copy.installed)?;
+        copy.stage
+            .as_ref()
+            .filter(|stage| stage.recovery() && stage.target.contains(&keeper))
+    }
+
     pub fn was_retired(&self, revision: u64, generation: u64) -> bool {
         self.retired == Some((revision, generation))
     }

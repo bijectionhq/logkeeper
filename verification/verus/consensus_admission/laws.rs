@@ -289,17 +289,48 @@ fn the_catalog_fences_only_superseded_configurations(
     assert(configured && !recovery && !at_old && !at_target && !joint_of_move ==> fenced);
 }
 
-// A replica refuses a peer without a Raft answer only when the peer is
-// outside its effective membership and below its term: a member, or a peer
-// at or above its term, always gets an answer, so the refusal never hides a
+// A replica refuses a peer without a Raft answer only when a recovery it
+// holds fenced the peer, or the peer is outside its effective membership
+// and below its term: an unfenced member always gets an answer, and so
+// does an unfenced peer at or above its term, so the refusal never hides a
 // newer history from this replica.
 fn only_superseded_outsiders_are_excluded(
-    configured: bool, known: bool, sender_term: u64, own_term: u64,
+    configured: bool, known: bool, recovery_fenced: bool, sender_term: u64, own_term: u64,
 ) {
-    let excluded = excludes_sender(configured, known, sender_term, own_term);
-    assert(excluded ==> configured && !known && sender_term < own_term);
-    assert(known ==> !excluded);
-    assert(sender_term >= own_term ==> !excluded);
+    let excluded = excludes_sender(configured, known, recovery_fenced, sender_term, own_term);
+    assert(excluded ==> recovery_fenced || (configured && !known && sender_term < own_term));
+    assert(known && !recovery_fenced ==> !excluded);
+    assert(!recovery_fenced && sender_term >= own_term ==> !excluded);
+    assert(!recovery_fenced && !configured ==> !excluded);
+}
+
+// A voter a recovery lost is refused by every copy that holds the recovery,
+// at any term, whether or not the copy's configuration still names it,
+// until a later move the copy applied names it again.
+fn recovery_fenced_voters_are_refused_at_any_term(
+    configured: bool, known: bool, in_old: bool, in_target: bool, restaged: bool,
+    finalized: u64, revision: u64, sender_term: u64, own_term: u64,
+) {
+    let fenced = recovery_excludes(in_old, in_target);
+    assert(fenced == (in_old && !in_target));
+    assert(in_target ==> !fenced);
+    let holds = exclusion_holds(fenced, restaged, finalized, revision);
+    assert(holds ==> fenced);
+    assert(restaged ==> !holds);
+    assert(finalized > revision ==> !holds);
+    assert(fenced && !restaged && finalized <= revision ==> holds);
+    let excluded = excludes_sender(configured, known, holds, sender_term, own_term);
+    assert(holds ==> excluded);
+}
+
+// A recovery fences every voter it leaves and every survivor but the one
+// that writes it, and never a keeper outside the configuration it leaves.
+fn a_recovery_fences_all_but_its_writer(in_old: bool, in_target: bool, writer: bool) {
+    let fenced = recovery_fences(in_old, in_target, writer);
+    assert(!in_old ==> !fenced);
+    assert(in_old && !in_target ==> fenced);
+    assert(in_old && in_target && !writer ==> fenced);
+    assert(in_target && writer ==> !fenced);
 }
 
 // Only installed replicas vote. Outside a recovery, a configured replica

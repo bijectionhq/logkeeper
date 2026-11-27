@@ -160,6 +160,19 @@ impl Engine {
         if self.certification.certified(stream, generation) {
             return;
         }
+        // A copy the catalog's latest recovery goes on from refuses
+        // the voters it lost, also once a restart compacted the recovery away
+        // from its own log.
+        if let Some(stage) = staged
+            .as_ref()
+            .filter(|stage| stage.target.contains(&self.id))
+        {
+            self.exclusions.install(
+                stream,
+                &crate::stream::consensus::storage::recovery_fenced(stage),
+                stage.source.saturating_add(1),
+            );
+        }
         let fenced = staged.as_ref().is_some_and(|stage| {
             let metrics = group.raft.metrics();
             let current = metrics.borrow_watched();

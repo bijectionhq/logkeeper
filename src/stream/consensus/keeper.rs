@@ -675,6 +675,7 @@ impl Config {
             snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
             scrub_rate: self.scrub_bytes_per_second,
             retire_now: Arc::default(),
+            exclusions: Arc::default(),
             placement_confirmed: parking_lot::Mutex::default(),
             certification: Arc::default(),
             replayed: std::sync::atomic::AtomicBool::new(false),
@@ -773,6 +774,9 @@ pub(super) struct Engine {
     /// Wakes the repair loop when a peer excluded one of this keeper's
     /// replicas, so a removed copy retires at once.
     retire_now: Arc<tokio::sync::Notify>,
+    /// Voters operator recoveries fenced by identity, per stream
+    /// (`ingress::Exclusions`).
+    exclusions: Arc<ingress::Exclusions>,
     /// Streams whose copy no other keeper's newer configuration excludes,
     /// checked since this keeper started, and when a check some keeper did
     /// not answer ran; see `confirm_placement`.
@@ -1589,6 +1593,16 @@ impl Engine {
                         (self.lease.clone(), genesis.stream, state.clone());
                     Arc::new(move || lease::permits(&lease, stream, &state))
                 },
+                fenced: {
+                    let (exclusions, disk, id, genesis, state) = (
+                        self.exclusions.clone(),
+                        self.disk.clone(),
+                        self.id,
+                        genesis.clone(),
+                        state.clone(),
+                    );
+                    Arc::new(move |target| exclusions.fences(&disk, id, &genesis, &state, target))
+                },
             },
             store,
             state.clone(),
@@ -1686,7 +1700,11 @@ impl Engine {
                     || matches!(request, Request::NamedStreams(keeper)
                     if keeper.as_u128() == *id)
                     || matches!(request, Request::RecoverStream { stage, .. }
-                    if stage.survivors().iter().any(|survivor| survivor.as_u128() == *id)) =>
+                    if stage.survivors().iter().any(|survivor| survivor.as_u128() == *id))
+                    || matches!(request, Request::RecoverStreamFrom { stage, writer, .. }
+                    if writer.as_u128() == *id && stage.survivors().contains(writer))
+                    || matches!(request, Request::LocalProgressFencing { lost, .. }
+                    if !lost.iter().any(|keeper| keeper.as_u128() == *id)) =>
             {
                 Ok(None)
             }
@@ -1729,7 +1747,9 @@ impl Engine {
                     | Request::InstallReplica { .. }
                     | Request::StageRecovered { .. }
                     | Request::RenewLease { .. }
-                    | Request::RecoverStream { .. } => false,
+                    | Request::RecoverStream { .. }
+                    | Request::RecoverStreamFrom { .. }
+                    | Request::LocalProgressFencing { .. } => false,
                     _ => admin,
                 };
                 if allowed {
@@ -1789,6 +1809,34 @@ impl Engine {
                 Ok(Reply::Configured(configuration))
             }
             Request::ClearQuarantine(stream) => self.clear_quarantine(stream).await,
+            Request::LocalProgressFencing { lost, revision, .. } => {
+                self.exclusions.install(stream, &lost, revision);
+                let open = self.groups.lock().await.get(&stream).cloned();
+                if let Some(group) = open {
+                    // An append admitted before the fence finishes first, so
+                    // the tip reported covers it, and every later one is
+                    // refused (`ingress::Engine::append`).
+                    // A leader of the configuration the recovery leaves sends
+                    // the lost voters nothing more, so it commits nothing and
+                    // steps down once its quorum check fails.
+                    drop(group.append_order.clone().lock_owned().await);
+                }
+                tracing::warn!(
+                    keeper = %self.id,
+                    stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                    lost = ?lost,
+                    revision,
+                    "an operator recovery fenced the lost voters of this copy by identity"
+                );
+                let point = self
+                    .disk
+                    .genesis(stream)
+                    .map(|_| self.disk.recovery_point(stream));
+                Ok(Reply::Progress {
+                    tip: point.as_ref().and_then(|point| point.tip),
+                    committed: point.and_then(|point| point.committed),
+                })
+            }
             Request::LocalTip(stream) => Ok(Reply::Tip(
                 self.disk
                     .genesis(stream)
@@ -1911,6 +1959,7 @@ impl Engine {
             | Request::FenceKeeper(_)
             | Request::NamedStreams(_)
             | Request::RecoverStream { .. }
+            | Request::RecoverStreamFrom { .. }
                 if self.catalog_stream.is_some() =>
             {
                 self.serve_catalog_stream(request).await
@@ -1936,6 +1985,24 @@ impl Engine {
                         stage,
                         dead,
                         record,
+                        None,
+                        &self.placement,
+                        self.recovery_wait_ms()?,
+                    )
+                    .await
+            }
+            Request::RecoverStreamFrom {
+                stage,
+                dead,
+                record,
+                writer,
+            } => {
+                self.catalog()?
+                    .recover(
+                        stage,
+                        dead,
+                        record,
+                        Some(writer),
                         &self.placement,
                         self.recovery_wait_ms()?,
                     )

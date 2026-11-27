@@ -354,6 +354,28 @@ pub(super) enum Request {
     /// Keepers only; added last, after `LocalTip`, which an older survivor
     /// still answers.
     LocalProgress(StreamId),
+    /// `RecoverStream`, from survivor `writer`, which writes the recovery:
+    /// the catalog also fences the stream for every other survivor until its
+    /// copy finalizes the recovered configuration. Sent only once the
+    /// cluster finalized `CLUSTER_VERSION_EXCLUSION`. Added last.
+    RecoverStreamFrom {
+        stage: Stage,
+        dead: Vec<uuid::Uuid>,
+        record: super::authority::RecoveryRecord,
+        writer: uuid::Uuid,
+    },
+    /// `LocalProgress` from the survivor that recovers, to another surviving
+    /// voter of five: before it reports its progress, the copy refuses
+    /// the voters in `lost`, which the recovery that installs `revision`
+    /// leaves, by identity, and sends them nothing, so a lost leader cannot
+    /// overwrite it with entries the recovery will not keep. Sent only once
+    /// the cluster finalized `CLUSTER_VERSION_EXCLUSION`. Keepers only;
+    /// added last.
+    LocalProgressFencing {
+        stream: StreamId,
+        lost: Vec<uuid::Uuid>,
+        revision: u64,
+    },
 }
 
 impl Request {
@@ -381,8 +403,11 @@ impl Request {
             | Self::ClearQuarantine(stream)
             | Self::LocalTip(stream)
             | Self::LocalProgress(stream)
+            | Self::LocalProgressFencing { stream, .. }
             | Self::Configuration(stream) => stream,
-            Self::Stage(ref stage) | Self::RecoverStream { ref stage, .. } => stage.stream,
+            Self::Stage(ref stage)
+            | Self::RecoverStream { ref stage, .. }
+            | Self::RecoverStreamFrom { ref stage, .. } => stage.stream,
             Self::ClusterVersion
             | Self::FinalizeVersion(_)
             | Self::RenewLease { .. }
@@ -1752,6 +1777,9 @@ impl Rpc {
     }
 }
 
+/// Why a copy sends nothing to a peer an operator recovery fenced.
+const FENCED_PEER: &str = "peer is fenced by an operator recovery this copy holds";
+
 /// The refusal a replica sends a peer that `decisions::excludes_sender`
 /// excludes, instead of an answer that carries its newer vote.
 pub(super) const EXCLUDED: &str = "sender is outside the receiver's placement";
@@ -1788,6 +1816,11 @@ pub(super) struct Network {
     /// (`keeper/lease.rs`). Without it the copy sends no vote, pre-vote,
     /// append or snapshot, so it neither campaigns nor leads.
     pub authority: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Whether an operator recovery this copy holds fenced a peer by
+    /// identity (`keeper/ingress.rs`, `Exclusions`). The copy sends such a
+    /// peer no vote, pre-vote, append, snapshot or hand-off, so it neither
+    /// counts the peer's vote nor commits with its acknowledgement.
+    pub fenced: Arc<dyn Fn(NodeId) -> bool + Send + Sync>,
 }
 
 impl Network {
@@ -2015,6 +2048,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         if !(self.network.authority)() {
             return Err(unreachable(&invalid(UNAUTHORIZED)).into());
         }
+        if (self.network.fenced)(self.target) {
+            return Err(unreachable(&invalid(FENCED_PEER)).into());
+        }
         let mut request = request;
         let mut rest = Vec::new();
         let mut accepted = None;
@@ -2073,6 +2109,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         if !(self.network.authority)() {
             return Err(unreachable(&invalid(UNAUTHORIZED)).into());
         }
+        if (self.network.fenced)(self.target) {
+            return Err(unreachable(&invalid(FENCED_PEER)).into());
+        }
         let proposed = request.vote;
         let last_log = request.last_log_id;
         let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
@@ -2110,6 +2149,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         if !(self.network.authority)() {
             return Err(unreachable(&invalid(UNAUTHORIZED)).into());
         }
+        if (self.network.fenced)(self.target) {
+            return Err(unreachable(&invalid(FENCED_PEER)).into());
+        }
         let proposed = request.vote;
         let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
             self.request(PeerRequest::PreVote(request), &option).await?;
@@ -2125,6 +2167,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         request: openraft::raft::TransferLeaderRequest<RaftTypes>,
         option: RPCOption,
     ) -> Result<openraft::raft::TransferLeaderResponse<RaftTypes>, RPCError<RaftTypes>> {
+        if (self.network.fenced)(self.target) {
+            return Err(unreachable(&invalid(FENCED_PEER)).into());
+        }
         let response: Result<
             openraft::raft::TransferLeaderResponse<RaftTypes>,
             openraft::errors::Fatal<RaftTypes>,
@@ -2146,6 +2191,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
     ) -> Result<SnapshotResponse<RaftTypes>, StreamingError<RaftTypes>> {
         if !(self.network.authority)() {
             return Err(unreachable(&invalid(UNAUTHORIZED)).into());
+        }
+        if (self.network.fenced)(self.target) {
+            return Err(unreachable(&invalid(FENCED_PEER)).into());
         }
         let mut cancel = Box::pin(cancel);
         let mut file = snapshot.snapshot;

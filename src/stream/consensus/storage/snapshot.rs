@@ -269,6 +269,13 @@ struct Inner {
     disk: Disk,
     directory: PathBuf,
     applied: RwLock<Image>,
+    /// The voters every operator recovery this copy applied in this
+    /// process fenced (`decisions::recovery_excludes`), with the revision
+    /// each recovery installed. A recovery still staged in the image, or in
+    /// the WAL a reopened copy replays, counts too; one compacted away
+    /// before a restart is covered by the catalog's fences and by
+    /// certification.
+    excluded: RwLock<BTreeMap<uuid::Uuid, u64>>,
     snapshot: Mutex<Option<ActiveSnapshot>>,
     wire: Mutex<BTreeMap<String, Weak<[u8; 32]>>>,
     publishing: tokio::sync::Mutex<()>,
@@ -616,6 +623,7 @@ impl StateMachine {
                     disk,
                     directory,
                     applied: RwLock::new(applied),
+                    excluded: RwLock::default(),
                     snapshot: Mutex::new(snapshot),
                     wire: Mutex::default(),
                     stopped: AtomicBool::new(false),
@@ -963,6 +971,39 @@ impl StateMachine {
 
     pub fn finalized(&self) -> Option<Configuration> {
         self.inner.applied.read().configuration
+    }
+
+    /// Whether an operator recovery this copy applied, or still holds
+    /// staged, fenced `keeper` by identity (`decisions::excludes_sender`),
+    /// and no later move named it again (`excludes_at`).
+    pub fn recovery_excludes(&self, keeper: uuid::Uuid) -> bool {
+        let staged = self.inner.applied.read().stage.as_ref().and_then(|stage| {
+            recovery_fenced(stage)
+                .contains(&keeper)
+                .then(|| stage.source.saturating_add(1))
+        });
+        let applied = self.inner.excluded.read().get(&keeper).copied();
+        staged
+            .into_iter()
+            .chain(applied)
+            .any(|revision| self.excludes_at(keeper, revision))
+    }
+
+    /// Whether a recovery that installed `revision` and fenced `keeper`
+    /// still fences it for this copy: no ordinary move the copy applied
+    /// stages `keeper` again, and the copy finalized no later revision.
+    pub fn excludes_at(&self, keeper: uuid::Uuid, revision: u64) -> bool {
+        let image = self.inner.applied.read();
+        crate::stream::consensus::decisions::exclusion_holds(
+            true,
+            image.stage.as_ref().is_some_and(|stage| {
+                !stage.recovery() && stage.target.contains(&keeper) && stage.source >= revision
+            }),
+            image
+                .configuration
+                .map_or(0, |configuration| configuration.revision),
+            revision,
+        )
     }
 
     pub fn serves_applied_pages(&self, keeper: u128) -> bool {
@@ -1371,6 +1412,19 @@ impl Inner {
         }
     }
 
+    /// Records the voters an applied recovery fenced by identity, with the
+    /// revision it installed, unless the recovery was refused.
+    fn exclude_applied(&self, outcome: &Outcome, fenced: Vec<uuid::Uuid>, revision: u64) {
+        if matches!(outcome, Outcome::Refused(_)) {
+            return;
+        }
+        let mut excluded = self.excluded.write();
+        for keeper in fenced {
+            let floor = excluded.entry(keeper).or_default();
+            *floor = (*floor).max(revision);
+        }
+    }
+
     fn apply(&self, entries: Vec<Entry>) -> io::Result<Vec<Outcome>> {
         let mut image = self.applied.write();
         let mut outcomes = Vec::with_capacity(entries.len());
@@ -1385,18 +1439,28 @@ impl Inner {
                         image.stage(stage, &self.genesis, &self.placement, true)
                     }
                     Command::Recover(stage) => {
-                        image.recover(stage, None, &self.genesis, &self.placement)
+                        let fenced = recovery_fenced(&stage);
+                        let revision = stage.source.saturating_add(1);
+                        let outcome = image.recover(stage, None, &self.genesis, &self.placement);
+                        self.exclude_applied(&outcome, fenced, revision);
+                        outcome
                     }
                     Command::RecoverRecorded {
                         stage,
                         record,
                         exact,
-                    } => image.recover(
-                        stage,
-                        Some(crate::stream::consensus::state::Recorded { record, exact }),
-                        &self.genesis,
-                        &self.placement,
-                    ),
+                    } => {
+                        let fenced = recovery_fenced(&stage);
+                        let revision = stage.source.saturating_add(1);
+                        let outcome = image.recover(
+                            stage,
+                            Some(crate::stream::consensus::state::Recorded { record, exact }),
+                            &self.genesis,
+                            &self.placement,
+                        );
+                        self.exclude_applied(&outcome, fenced, revision);
+                        outcome
+                    }
                     Command::Admitted(..) => return Err(invalid("nested application ticket")),
                     command => {
                         let segment = self
@@ -1894,6 +1958,26 @@ async fn blocking<T: Send + 'static>(
         .await
         .map_err(io::Error::other)
         .and_then(|result| result)
+}
+
+/// The voters an operator recovery `stage` fences by identity: those of the
+/// configuration it leaves that the recovered one does not name. None for
+/// an ordinary move.
+pub(in crate::stream::consensus) fn recovery_fenced(stage: &Stage) -> Vec<uuid::Uuid> {
+    if !stage.recovery() {
+        return Vec::new();
+    }
+    stage
+        .old
+        .iter()
+        .copied()
+        .filter(|voter| {
+            crate::stream::consensus::decisions::recovery_excludes(
+                true,
+                stage.target.contains(voter),
+            )
+        })
+        .collect()
 }
 
 /// Images without the epochs of their records. Written until the cluster

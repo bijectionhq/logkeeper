@@ -94,10 +94,17 @@ pub const CLUSTER_VERSION_V7: u32 = 7;
 pub const CLUSTER_VERSION_REPLICATION: u32 = CLUSTER_VERSION_V7;
 /// Enables atomic checkpoint selection and removes unchecked immutable trim.
 pub const CLUSTER_VERSION_CHECKPOINT_INSTALL: u32 = 8;
+/// Cluster feature level at which an operator recovery from one of two
+/// surviving voters also fences the other survivor, both in the catalog
+/// (`authority::Change::RecoverFrom`, `Request::RecoverStreamFrom`) and by
+/// identity on that survivor (`Request::LocalProgressFencing`), which older
+/// keepers cannot decode.
+pub const CLUSTER_VERSION_V9: u32 = 9;
+/// The level the survivor fence waits for.
+pub const CLUSTER_VERSION_EXCLUSION: u32 = CLUSTER_VERSION_V9;
 /// Cluster feature level of the typed recovery entry:
 /// `Command::RecoverRecorded`, `Command::RecoveryEntry`, the record kind
-/// bit and the snapshot formats that carry a recorded recovery. Level 9 is
-/// claimed for recovery exclusion (AGENTS-COORDINATION.md).
+/// bit and the snapshot formats that carry a recorded recovery.
 pub const CLUSTER_VERSION_V10: u32 = 10;
 /// The level the typed recovery entry waits for.
 pub const CLUSTER_VERSION_RECOVERY_ENTRY: u32 = CLUSTER_VERSION_V10;
@@ -132,6 +139,10 @@ pub mod features {
     pub const REPLICATION_FACTOR: u64 = 1 << 9;
     /// Supports checkpoint installation and its durable selection.
     pub const CHECKPOINT_INSTALL: u64 = 1 << 10;
+    /// Decodes the catalog's survivor fence of a recovery
+    /// (`CLUSTER_VERSION_EXCLUSION`) and refuses recovery-fenced voters by
+    /// identity.
+    pub const RECOVERY_EXCLUSION: u64 = 1 << 11;
     /// Applies `Command::RecoverRecorded` and `Command::RecoveryEntry` and
     /// reads typed recovery entries in snapshots and offloaded objects.
     pub const RECOVERY_ENTRY: u64 = 1 << 12;
@@ -147,6 +158,7 @@ pub mod features {
         | LEASES
         | REPLICATION_FACTOR
         | CHECKPOINT_INSTALL
+        | RECOVERY_EXCLUSION
         | RECOVERY_ENTRY;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;

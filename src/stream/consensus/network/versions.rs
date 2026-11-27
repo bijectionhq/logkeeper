@@ -77,6 +77,8 @@ impl Request {
             | Self::RenewLease { .. }
             | Self::FenceKeeper(_)
             | Self::RecoverStream { .. }
+            | Self::RecoverStreamFrom { .. }
+            | Self::LocalProgressFencing { .. }
             | Self::LocalTip(_)
             | Self::NamedStreams(_)
             | Self::TrimCheckpoint { .. }

@@ -333,6 +333,23 @@ fn request(tag: usize) -> Option<Request> {
         },
         46 => Request::SelectedCheckpoint(STREAM),
         47 => Request::LocalProgress(STREAM),
+        48 => Request::RecoverStreamFrom {
+            stage: stage(),
+            dead: Vec::new(),
+            record: crate::stream::consensus::authority::RecoveryRecord {
+                stream: STREAM,
+                epoch: 2,
+                loss_point: Lsn(1),
+                source: crate::stream::consensus::authority::RecoverySource::Survivor,
+                time_unix_ms: 0,
+            },
+            writer: uuid::Uuid::from_u128(1),
+        },
+        49 => Request::LocalProgressFencing {
+            stream: STREAM,
+            lost: vec![uuid::Uuid::from_u128(3)],
+            revision: 2,
+        },
         _ => return None,
     })
 }

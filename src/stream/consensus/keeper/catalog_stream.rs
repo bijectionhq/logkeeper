@@ -322,7 +322,16 @@ impl Engine {
                 dead,
                 record,
             } => {
-                self.recover_replicated(catalog, &group, stage, dead, record)
+                self.recover_replicated(catalog, &group, stage, dead, record, None)
+                    .await
+            }
+            Request::RecoverStreamFrom {
+                stage,
+                dead,
+                record,
+                writer,
+            } => {
+                self.recover_replicated(catalog, &group, stage, dead, record, Some(writer))
                     .await
             }
             _ => Err(invalid("invalid catalog request")),
@@ -825,8 +834,9 @@ impl Engine {
     }
 
     /// An operator recovery's catalog transaction, in one record: the
-    /// recovered membership, the fence of every voter it leaves, and the
-    /// epoch bumps of the keepers the operator declared dead.
+    /// recovered membership, the fence of every voter it leaves (and, from
+    /// `writer`, of every other survivor), and the epoch bumps of the
+    /// keepers the operator declared dead.
     async fn recover_replicated(
         &self,
         catalog: &CatalogStream,
@@ -834,16 +844,20 @@ impl Engine {
         stage: Stage,
         dead: Vec<Uuid>,
         record: authority::RecoveryRecord,
+        writer: Option<Uuid>,
     ) -> io::Result<Reply> {
-        let fenced = authority::fenced_by(&stage);
+        let lost = authority::fenced_by(&stage);
+        let fenced = authority::fenced_from(&stage, writer);
         if stage.stream == STREAM
             || !authority::describes(&record, &stage)
             || !stage.recovery()
             || !self.placement.stage(&stage)
-            || dead.iter().any(|keeper| !fenced.contains(keeper))
+            || dead.iter().any(|keeper| !lost.contains(keeper))
         {
             return Err(invalid("invalid recovery stage"));
         }
+        let change = authority::recovery_change(stage.clone(), dead, record, writer)
+            .ok_or_else(|| invalid("a recovery's writer must be one of its survivors"))?;
         let wait_ms = decisions::recovery_wait(
             self.lease.duration().as_millis() as u64,
             self.lease.margin().as_millis() as u64,
@@ -864,21 +878,10 @@ impl Engine {
             if !catalog::admits_stage(entry, &stage) {
                 return Ok(catalog::stage_conflict());
             }
-            entry.staged.as_ref() == Some(&stage) && fold.authority.recovered(&stage)
+            entry.staged.as_ref() == Some(&stage) && fold.authority.recovered(&stage, &fenced)
         };
         if !done {
-            match self
-                .authority_write(
-                    catalog,
-                    group,
-                    authority::Change::Recover {
-                        stage: stage.clone(),
-                        dead,
-                        record,
-                    },
-                )
-                .await?
-            {
+            match self.authority_write(catalog, group, change).await? {
                 Reply::Decision(Outcome::Unit) => (),
                 reply => return Ok(reply),
             }
@@ -895,7 +898,7 @@ impl Engine {
                 .get(&stage.stream)
                 .copied()
                 .unwrap_or(record),
-            unleased: fold.authority.unleased(&fenced),
+            unleased: fold.authority.unleased(&lost),
             fenced,
             wait_ms,
             written: !done,

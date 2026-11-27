@@ -3,7 +3,9 @@
 //! lost voters' leases before the recovered configuration serves.
 
 use super::*;
-use crate::stream::consensus::{Configuration, Stage, keeper::Recovery, network::RpcFault};
+use crate::stream::consensus::{
+    Configuration, Stage, decisions, keeper::Recovery, network, network::RpcFault,
+};
 
 /// The tests' lease (2 s) plus its drift margin (200 ms).
 const LEASE_WAIT: Duration = Duration::from_millis(2_200);
@@ -73,7 +75,9 @@ async fn read_from(rpc: &Rpc, keeper: Uuid, stream: StreamId) -> Option<Vec<(Lsn
         )
         .await
     {
-        Ok(Reply::Decision(Outcome::Page(page))) => Some(page.records),
+        Ok(Reply::Decision(Outcome::Page(page) | Outcome::RecoveryPage(page))) => {
+            Some(page.records)
+        }
         _ => None,
     }
 }
@@ -868,5 +872,577 @@ async fn a_recovery_leaves_one_typed_entry_that_no_append_can_forge() {
     let local = survivor.state.page(Lsn(4), 2).await.unwrap();
     assert_eq!(local.recoveries, vec![(Lsn(4), entry)]);
     drop(survivor);
+    cluster.stop_all().await;
+}
+
+/// `records` without the typed recovery entry at `at`, the first entry of
+/// the recovered epoch.
+fn without_entry(records: Option<Vec<(Lsn, Bytes)>>, at: Lsn) -> Option<Vec<(Lsn, Bytes)>> {
+    records.map(|records| records.into_iter().filter(|(lsn, _)| *lsn != at).collect())
+}
+
+/// Whether `keeper` refuses a vote and an append from `sender` at `term`
+/// for `stream` by identity, before Raft sees them.
+async fn refuses_by_identity(
+    cluster: &Cluster,
+    keeper: Uuid,
+    sender: Uuid,
+    stream: StreamId,
+    term: u64,
+) -> bool {
+    let engine = &cluster.running[&keeper].engine;
+    let genesis = cluster.group(keeper, stream).await.genesis.clone();
+    let vote = crate::stream::consensus::Vote::new(term, sender.as_u128());
+    let requests = [
+        PeerRequest::Vote(openraft::raft::VoteRequest::new(vote, None)),
+        PeerRequest::Append(AppendEntriesRequest {
+            vote,
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        }),
+    ];
+    for request in requests {
+        match engine
+            .peer(sender.as_u128(), genesis.clone(), request, None)
+            .await
+        {
+            Err(error) if error.to_string().contains(network::EXCLUDED) => (),
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Model finding 4, with five voters: three lost voters, a quorum of the old
+/// configuration, keep running cut off from the survivors and the catalog,
+/// and their leader keeps leading on its last lease after the catalog
+/// commits the recovery. The second survivor keeps running through the
+/// wait-out and may follow that leader there. The catalog fences it below
+/// the recovered revision, so it never campaigns, leads or serves the old
+/// configuration again; it catches up from the survivor that wrote the
+/// recovery, whose history it then holds. Every copy that holds the
+/// recovery refuses the lost voters by identity at any term, and no reader
+/// sees a lost record after the recovered configuration served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_leader_of_five_never_overwrites_the_recovered_history() {
+    // Voters 1, 2, 3, 4 and 6; spares 5 (the catalog), 7, 8 and 9.
+    let mut cluster = Cluster::start_wide(2).await;
+    cluster.finalize().await;
+    leased(&cluster).await;
+    let [writer, other, x, y] = cluster.ids;
+    let lost = [x, y, Uuid::from_u128(6)];
+    let voters = Voters::sorted(&[writer, other, x, y, lost[2]]).unwrap();
+    let stream = StreamId(0xA5);
+    let journal = cluster.client(&cluster.credentials);
+    journal.create(stream, voters, 1 << 20).await.unwrap();
+    let sealed = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap();
+    for at in 1..=3 {
+        journal
+            .append(
+                stream,
+                sealed.fence,
+                Lsn(at),
+                Bytes::from(format!("record-{at}")),
+            )
+            .await
+            .unwrap();
+    }
+    for id in voters {
+        let group = cluster.group(id, stream).await;
+        timeout(WAIT, async {
+            while group.state.head() != Ok(Lsn(3)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    let tip_before = cluster.running[&other]
+        .engine
+        .disk
+        .recovery_point(stream)
+        .tip;
+    // The second survivor takes nothing from the lost voters until the
+    // catalog committed the recovery, so both survivors report the same
+    // last entry and the lower keeper ID writes the recovery.
+    let gate = Arc::new(AtomicBool::new(true));
+    {
+        let gate = gate.clone();
+        *cluster.running[&other].engine.reject_append.write() =
+            Some(Box::new(move |group, sender, _| {
+                group == stream
+                    && gate.load(Ordering::Acquire)
+                    && lost.iter().any(|id| id.as_u128() == sender)
+            }));
+    }
+    // The lost voters reach each other, the catalog and the second
+    // survivor; nothing else reaches them.
+    let catalog = cluster.catalog;
+    for running in cluster.running.values() {
+        let inside = lost.contains(&running.engine.id);
+        running
+            .engine
+            .set_transport_filter(Some(Arc::new(move |_, target, _| {
+                let allowed = if inside {
+                    lost.contains(&target) || target == catalog || target == other
+                } else {
+                    !lost.contains(&target)
+                };
+                if allowed {
+                    RpcFault::Allow
+                } else {
+                    RpcFault::Drop(Duration::ZERO)
+                }
+            })));
+    }
+    cluster.running.remove(&writer).unwrap().stop().await;
+
+    // The lost quorum commits a record neither survivor holds.
+    let rpc = direct(&cluster);
+    let lost_append = |at: u64| {
+        let rpc = rpc.clone();
+        async move {
+            for keeper in lost {
+                if matches!(
+                    append_to(&rpc, keeper, stream, sealed.fence, Lsn(at)).await,
+                    Reply::Decision(Outcome::At(_))
+                ) {
+                    return true;
+                }
+            }
+            false
+        }
+    };
+    timeout(WAIT, async {
+        while !lost_append(4).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the lost quorum led the old configuration");
+
+    // A reader asks every keeper directly and records what each served;
+    // a watcher records whether the second survivor led the stream while
+    // the catalog fenced its copy.
+    let stop = Arc::new(AtomicBool::new(false));
+    let served = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let reader = {
+        let (rpc, stop, served) = (rpc.clone(), stop.clone(), served.clone());
+        let keepers = cluster.keepers.keys().copied().collect::<Vec<_>>();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                for keeper in &keepers {
+                    if let Some(records) = read_from(&rpc, *keeper, stream).await {
+                        served
+                            .lock()
+                            .push((tokio::time::Instant::now(), *keeper, records));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    };
+    let fenced_lead = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let (stop, fenced_lead) = (stop.clone(), fenced_lead.clone());
+        let engine = cluster.running[&other].engine.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                if let Some(group) = engine.groups.lock().await.get(&stream).cloned() {
+                    let leading = group.raft.metrics().borrow_watched().state
+                        == openraft::ServerState::Leader;
+                    let revision = group.state.finalized().map_or(0, |c| c.revision);
+                    if leading
+                        && decisions::copy_fenced(engine.lease.fenced_below(stream), revision)
+                        && engine.lease.valid()
+                    {
+                        fenced_lead.store(true, Ordering::Release);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    // Once the catalog commits, the lost voters stop renewing: their leader
+    // keeps leading on the lease it already holds, and the second survivor
+    // takes its appends, as a running survivor may during the wait-out.
+    let recovery = {
+        let config = cluster.configs[&writer].clone();
+        tokio::spawn(async move {
+            config
+                .recover_stream(
+                    stream,
+                    Recovery {
+                        acknowledge_data_loss: true,
+                        unreachable: lost.to_vec(),
+                        ..Recovery::default()
+                    },
+                )
+                .await
+        })
+    };
+    let catalog_rpc = direct(&cluster);
+    timeout(WAIT, async {
+        loop {
+            if let Ok(Reply::Staged(stage)) = catalog_rpc
+                .call::<Reply>(
+                    catalog,
+                    Frame::Client(Request::Staging(stream)),
+                    Duration::from_millis(500),
+                )
+                .await
+                && stage.recovery()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the catalog committed the recovery");
+    for id in lost {
+        cluster.running[&id]
+            .engine
+            .lease
+            .suspended
+            .store(true, Ordering::Release);
+    }
+    gate.store(false, Ordering::Release);
+    let overwritten = lost_append(5).await;
+    let report = recovery.await.unwrap().unwrap();
+    let recovered = tokio::time::Instant::now();
+    assert!(report.written);
+    let mut fenced = report.fenced.clone();
+    fenced.sort_unstable();
+    let mut expected = vec![other];
+    expected.extend(lost);
+    expected.sort_unstable();
+    assert_eq!(fenced, expected, "every voter but the writer is fenced");
+    assert!(report.waited >= LEASE_WAIT, "{:?}", report.waited);
+    assert!(report.voters.contains(&writer) && report.voters.contains(&other));
+    let engine = cluster.running[&other].engine.clone();
+    assert_eq!(engine.lease.fenced_below(stream), Some(report.revision));
+    // The second survivor refused the lost leader from before its last
+    // entry was read: it holds nothing the recovery does not keep.
+    assert_eq!(cluster.group(other, stream).await.state.head(), Ok(Lsn(3)));
+    assert_eq!(
+        engine.disk.recovery_point(stream).tip,
+        tip_before,
+        "the second survivor took the lost leader's entries"
+    );
+    for id in lost {
+        assert!(!cluster.running[&id].engine.lease.valid());
+    }
+
+    // The recovered configuration serves: the writer leads, the second
+    // survivor catches up from it, finalizes the recovered revision and is
+    // no longer fenced.
+    cluster.restart(writer).await;
+    configured(&journal, stream, report.voters).await;
+    journal.acknowledge_recovery(stream).await.unwrap();
+    let resealed = journal
+        .seal(stream, report.epoch, Uuid::from_u128(100))
+        .await
+        .unwrap();
+    // Record 3 is the last kept; the typed recovery entry follows it.
+    assert_eq!(resealed.head, Lsn(4));
+    journal
+        .append(stream, resealed.fence, Lsn(5), Bytes::from_static(b"new-5"))
+        .await
+        .unwrap();
+    let first_served = tokio::time::Instant::now();
+    let expected = (1..=3)
+        .map(|at| (Lsn(at), Bytes::from(format!("record-{at}"))))
+        .chain([(Lsn(5), Bytes::from_static(b"new-5"))])
+        .collect::<Vec<_>>();
+    for id in report.voters {
+        timeout(WAIT, async {
+            while without_entry(read_from(&rpc, id, stream).await, Lsn(4)).as_ref()
+                != Some(&expected)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{id} serves the recovered history"));
+    }
+    let survivor = cluster.group(other, stream).await;
+    assert_eq!(
+        survivor.state.finalized().map(|c| c.revision),
+        Some(report.revision)
+    );
+    assert!(engine.lease.permits(stream, || report.revision));
+
+    // Every copy that holds the recovery refuses the lost voters by
+    // identity at any term, and still answers its members.
+    let term = survivor.raft.metrics().borrow_watched().current_term + 1_000;
+    for keeper in report.voters {
+        for sender in lost {
+            assert!(
+                refuses_by_identity(&cluster, keeper, sender, stream, term).await,
+                "{keeper} refused {sender}"
+            );
+        }
+    }
+    let genesis = survivor.genesis.clone();
+    let prevote = PeerRequest::PreVote(openraft::raft::VoteRequest::new(
+        crate::stream::consensus::Vote::new(term, other.as_u128()),
+        None,
+    ));
+    assert!(
+        cluster.running[&writer]
+            .engine
+            .peer(other.as_u128(), genesis, prevote, None)
+            .await
+            .is_ok()
+    );
+
+    // Healed, the lost voters stay out, and readers see only the recovered
+    // history.
+    heal(&cluster);
+    for id in lost {
+        cluster.running[&id]
+            .engine
+            .lease
+            .suspended
+            .store(false, Ordering::Release);
+    }
+    tokio::time::sleep(LEASE_WAIT).await;
+    let page = journal
+        .read(stream, Lsn(1), 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(without_entry(Some(page.records), Lsn(4)), Some(expected));
+    stop.store(true, Ordering::Release);
+    reader.await.unwrap();
+    watcher.await.unwrap();
+    assert!(
+        !fenced_lead.load(Ordering::Acquire),
+        "the fenced second survivor led the stream"
+    );
+    let served = served.lock().clone();
+    for (at, keeper, records) in &served {
+        let lost_record = records
+            .iter()
+            .any(|(_, payload)| payload.starts_with(b"lost-"));
+        assert!(
+            !(lost_record && *at >= first_served),
+            "{keeper} served a lost record after the recovered history"
+        );
+        if lost_record {
+            assert!(*at < recovered, "{keeper} served a lost record late");
+        }
+    }
+    eprintln!(
+        "{} reads served; the lost leader committed during the wait-out: \
+         {overwritten}",
+        served.len()
+    );
+    cluster.stop_all().await;
+}
+
+/// With five voters and two survivors, the recovery runs on the survivor
+/// that knows the later commit even when the other holds the later last
+/// entry, and the recovered history keeps every record the first applied.
+/// The leader commits record 4 with two voters that then never learn it was
+/// committed; one of them leads next and hands record 4 and its own entry to
+/// the other survivor under the older commit. Ranked by last entry alone,
+/// that survivor would recover without record 4, which the first survivor
+/// applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_survivor_that_knows_the_later_commit_recovers_over_a_longer_log() {
+    // Voters 1, 2, 3, 4 and 6; spares 5 (the catalog), 7, 8 and 9.
+    let mut cluster = Cluster::start_wide(2).await;
+    cluster.finalize().await;
+    leased(&cluster).await;
+    let [a, b, c, d] = cluster.ids;
+    let voters = Voters::sorted(&[a, b, c, d, Uuid::from_u128(6)]).unwrap();
+    let stream = StreamId(0xA6);
+    let journal = cluster.client(&cluster.credentials);
+    journal.create(stream, voters, 1 << 20).await.unwrap();
+    let sealed = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap();
+    let record = |at: u64| Bytes::from(format!("record-{at}"));
+    for at in 1..=3 {
+        journal
+            .append(stream, sealed.fence, Lsn(at), record(at))
+            .await
+            .unwrap();
+    }
+    for id in voters {
+        let group = cluster.group(id, stream).await;
+        timeout(WAIT, async {
+            while group.state.head() != Ok(Lsn(3)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let committer = timeout(WAIT, async {
+        loop {
+            for id in voters {
+                if leads(&cluster, id, stream).await {
+                    return id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stream has a leader");
+    let others = voters
+        .iter()
+        .copied()
+        .filter(|id| *id != committer)
+        .collect::<Vec<_>>();
+    let (longer, lost) = (others[0], [others[1], others[2], others[3]]);
+    cluster.running.remove(&lost[2]).unwrap().stop().await;
+
+    // Record 4 lands at index `k`. The other survivor takes nothing from
+    // the leader; the two running lost voters take record 4 but never the
+    // commit that covers it.
+    let k = cluster
+        .group(committer, stream)
+        .await
+        .raft
+        .metrics()
+        .borrow_watched()
+        .last_log_index
+        .unwrap()
+        + 1;
+    // Nor does it learn a commit that covers record 4 from anyone.
+    *cluster.running[&longer].engine.reject_append.write() =
+        Some(Box::new(move |group, sender, request| {
+            group == stream
+                && (sender == committer.as_u128()
+                    || request
+                        .leader_commit
+                        .is_some_and(|commit| commit.index >= k))
+        }));
+    for id in [lost[0], lost[1]] {
+        *cluster.running[&id].engine.reject_append.write() =
+            Some(Box::new(move |group, sender, request| {
+                group == stream
+                    && sender == committer.as_u128()
+                    && request
+                        .leader_commit
+                        .is_some_and(|commit| commit.index >= k)
+            }));
+    }
+    journal
+        .append(stream, sealed.fence, Lsn(4), record(4))
+        .await
+        .unwrap();
+    let applied = cluster.group(committer, stream).await;
+    timeout(WAIT, async {
+        while applied.state.head() != Ok(Lsn(4)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(applied);
+    cluster.running.remove(&committer).unwrap().stop().await;
+
+    // A lost voter leads and hands record 4 and its own entry to the other
+    // survivor under the commit it knows, below record 4.
+    for id in [lost[0], lost[1]] {
+        *cluster.running[&id].engine.reject_append.write() = None;
+    }
+    timeout(WAIT, async {
+        while cluster.running[&longer]
+            .engine
+            .disk
+            .recovery_point(stream)
+            .tip
+            .is_none_or(|tip| tip.index <= k)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a lost voter led and replicated past record 4");
+    let point = cluster.running[&longer].engine.disk.recovery_point(stream);
+    assert!(
+        point.committed.is_none_or(|committed| committed.index < k),
+        "k {k}: tip {:?} committed {:?}",
+        point.tip,
+        point.committed
+    );
+    for id in [lost[0], lost[1]] {
+        cluster.running.remove(&id).unwrap().stop().await;
+    }
+    cluster.restart(committer).await;
+    let ahead = cluster.running[&committer]
+        .engine
+        .disk
+        .recovery_point(stream);
+    assert!(
+        ahead
+            .committed
+            .is_some_and(|committed| committed.index >= k)
+    );
+    assert!(ahead.tip < point.tip, "{:?} {:?}", ahead.tip, point.tip);
+
+    // The survivor with the longer log refuses and names the other.
+    let recovery = || Recovery {
+        acknowledge_data_loss: true,
+        ..Recovery::default()
+    };
+    cluster.running.remove(&longer).unwrap().stop().await;
+    let refused = cluster.configs[&longer]
+        .recover_stream(stream, recovery())
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains(&committer.to_string()),
+        "{refused}"
+    );
+    cluster.restart(longer).await;
+    cluster.running.remove(&committer).unwrap().stop().await;
+    let report = cluster.configs[&committer]
+        .recover_stream(stream, recovery())
+        .await
+        .unwrap();
+    assert!(report.written);
+    assert_eq!(report.head, Lsn(4));
+    cluster.restart(committer).await;
+    configured(&journal, stream, report.voters).await;
+    journal.acknowledge_recovery(stream).await.unwrap();
+    let resealed = journal
+        .seal(stream, report.epoch, Uuid::from_u128(100))
+        .await
+        .unwrap();
+    // Record 4 is the last kept; the typed recovery entry follows it.
+    assert_eq!(resealed.head, Lsn(5));
+    journal
+        .append(stream, resealed.fence, Lsn(6), record(6))
+        .await
+        .unwrap();
+    let expected = (1..=4)
+        .chain([6])
+        .map(|at| (Lsn(at), record(at)))
+        .collect::<Vec<_>>();
+    let rpc = direct(&cluster);
+    for id in report.voters {
+        timeout(WAIT, async {
+            while without_entry(read_from(&rpc, id, stream).await, Lsn(5)).as_ref()
+                != Some(&expected)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{id} serves the recovered history"));
+    }
     cluster.stop_all().await;
 }

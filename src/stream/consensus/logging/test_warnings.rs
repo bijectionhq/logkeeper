@@ -78,6 +78,7 @@ const ALLOWED: &[&str] = &[
     "liveness lease lapsed",
     "the catalog bumped this keeper's epoch",
     "the catalog fenced this copy",
+    "an operator recovery fenced the lost voters of this copy by identity",
     "the catalog knows this keeper under another incarnation",
     // Offload tests: an injected corrupt object, and a store not yet
     // reachable.
