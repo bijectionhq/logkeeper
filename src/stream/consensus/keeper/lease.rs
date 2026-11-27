@@ -293,7 +293,7 @@ impl Engine {
     }
 
     /// Renews this keeper's lease until it stops.
-    pub(super) async fn lease_loop(&self) {
+    pub(super) async fn lease_loop(self: &Arc<Self>) {
         let mut valid = false;
         loop {
             #[cfg(test)]
@@ -312,7 +312,9 @@ impl Engine {
             };
             let now_valid = self.lease.valid();
             if valid != now_valid && self.lease.enforced() {
-                self.apply_authority().await;
+                // Stepping down waits on each group; renewals go on meanwhile.
+                let engine = self.clone();
+                tokio::spawn(async move { engine.apply_authority().await });
             }
             if valid && !now_valid {
                 super::super::metrics::count(&self.lease.lapses);
@@ -352,16 +354,19 @@ impl Engine {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        for group in groups {
-            if group.genesis.stream == catalog_stream::STREAM {
-                continue;
-            }
-            if self.holds_authority(&group) {
-                self.apply_mode(&group);
-            } else {
-                self.step_down(&group).await;
-            }
-        }
+        futures::future::join_all(
+            groups
+                .iter()
+                .filter(|group| group.genesis.stream != catalog_stream::STREAM)
+                .map(|group| async move {
+                    if self.holds_authority(group) {
+                        self.apply_mode(group);
+                    } else {
+                        self.step_down(group).await;
+                    }
+                }),
+        )
+        .await;
     }
 
     /// Makes this keeper step down from `group` and start no election. A
