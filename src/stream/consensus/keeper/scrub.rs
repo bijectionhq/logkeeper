@@ -3,7 +3,10 @@ use std::{io, sync::Arc, time::Duration};
 use tokio::time::{Instant, MissedTickBehavior};
 
 use super::Engine;
-use crate::stream::consensus::{invalid, logging, metrics, storage::scrub::Scrub};
+use crate::stream::consensus::{
+    invalid, logging, metrics,
+    storage::scrub::{Failure, Scrub},
+};
 
 impl Engine {
     pub(super) async fn scrub_loop(self: &Arc<Self>) {
@@ -39,10 +42,7 @@ impl Engine {
         }
     }
 
-    async fn scrub_failure(
-        self: &Arc<Self>,
-        failure: crate::stream::consensus::storage::scrub::Failure,
-    ) {
+    async fn scrub_failure(self: &Arc<Self>, failure: Failure) {
         let scope = failure.scope;
         let Ok(opening) = self.opening(scope).await else {
             return;
@@ -57,15 +57,23 @@ impl Engine {
             failure.error.kind(),
             io::ErrorKind::InvalidData | io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof
         ) {
-            tracing::warn!(keeper = %self.id, stream = %logging::stream_uuid(scope),
-                error = %failure.error, "online integrity scrub could not read selected data");
+            if let Some(dropped) = logging::rate_limit("keeper.scrub_read", Some(scope)) {
+                tracing::warn!(keeper = %self.id, stream = %logging::stream_uuid(scope),
+                    error = %failure.error, dropped, "online integrity scrub could not read selected data");
+            }
             return;
         }
+        let Ok(media) = self.disk.hold_media_lock() else {
+            return;
+        };
         if let Some(group) = self.groups.lock().await.get(&scope) {
             group.state.suspend();
         }
         let engine = self.clone();
         let marked = tokio::task::spawn_blocking(move || {
+            // A serving task may be cancelled during fsync. Keep the
+            // enrollment locked until the write completes.
+            let _media = media;
             engine.quarantine(
                 scope,
                 &invalid(format!("integrity scrub: {}", failure.error)),

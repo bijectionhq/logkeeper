@@ -363,14 +363,6 @@ impl Metrics {
                 self.compacted_bytes.load(Ordering::Relaxed),
             ),
             (
-                "scrub.read_bytes",
-                self.scrub_read_bytes.load(Ordering::Relaxed),
-            ),
-            (
-                "scrub.corruptions",
-                self.scrub_corruptions.load(Ordering::Relaxed),
-            ),
-            (
                 "placement.violation",
                 self.placement_violation.load(Ordering::Relaxed),
             ),
