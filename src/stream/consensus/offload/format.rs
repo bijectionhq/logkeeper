@@ -5,7 +5,8 @@
 //!
 //! ```text
 //! "LKOFF001" | u32 header length | header | frames | SHA-256 of all before
-//! frame = u32 length (bit 31 marks a timed record) | u32 CRC-32 | record
+//! frame = u32 length (bit 31 marks a timed record, bit 30 a typed
+//!         recovery entry) | u32 CRC-32 | record
 //! ```
 //!
 //! The header names the stream, lineage, first and last LSN, the record
@@ -24,7 +25,7 @@ use journal_contract::{Epoch, Lsn, StreamId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::stream::consensus::{MAX_RECORD, decode, encode, invalid, state::TIMED_RECORD};
+use crate::stream::consensus::{decode, encode, invalid, state::RecordKind};
 
 const SEGMENT_MAGIC: &[u8; 8] = b"LKOFF001";
 const LINEAGE_MAGIC: &[u8; 8] = b"LKLIN001";
@@ -32,11 +33,11 @@ const TRAILER: usize = 32;
 const MAX_HEADER: usize = 1024 * 1024;
 
 /// One committed record as uploaded: its position, its retained bytes
-/// (with the evidence prefix of a timed record) and whether it is timed.
+/// (with the evidence prefix of a timed record) and its kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub lsn: Lsn,
-    pub timed: bool,
+    pub kind: RecordKind,
     pub bytes: Bytes,
 }
 
@@ -103,10 +104,10 @@ pub fn encode_segment(
     out.extend_from_slice(&(header.len() as u32).to_be_bytes());
     out.extend_from_slice(&header);
     for record in records {
-        if record.bytes.len() > MAX_RECORD {
+        if !record.kind.fits(record.bytes.len()) {
             return Err(invalid("offloaded record exceeds the record bound"));
         }
-        let len = record.bytes.len() as u32 | if record.timed { TIMED_RECORD } else { 0 };
+        let len = record.bytes.len() as u32 | record.kind.flag();
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&crc32fast::hash(&record.bytes).to_be_bytes());
         out.extend_from_slice(&record.bytes);
@@ -158,11 +159,10 @@ pub fn decode_segment(bytes: &Bytes) -> io::Result<Segment> {
             .ok_or_else(|| invalid("offloaded segment frame is short"))?;
         let len = u32::from_be_bytes(frame[..4].try_into().unwrap());
         let crc = u32::from_be_bytes(frame[4..].try_into().unwrap());
-        let timed = len & TIMED_RECORD != 0;
-        let len = (len & !TIMED_RECORD) as usize;
-        if len > MAX_RECORD {
-            return Err(invalid("offloaded record exceeds the record bound"));
-        }
+        let (kind, len) = RecordKind::split(len)
+            .map(|(kind, len)| (kind, len as usize))
+            .filter(|(kind, len)| kind.fits(*len))
+            .ok_or_else(|| invalid("offloaded record exceeds the record bound"))?;
         let payload = body
             .get(at + 8..at + 8 + len)
             .ok_or_else(|| invalid("offloaded record is short"))?;
@@ -172,7 +172,7 @@ pub fn decode_segment(bytes: &Bytes) -> io::Result<Segment> {
         let offset = SEGMENT_MAGIC.len() + at + 8;
         records.push(Record {
             lsn: Lsn(header.first.0 + index),
-            timed,
+            kind,
             bytes: bytes.slice(offset..offset + len),
         });
         at += 8 + len;
@@ -228,10 +228,35 @@ mod tests {
 
     fn records(first: u64, count: u64) -> Vec<Record> {
         (first..first + count)
-            .map(|lsn| Record {
-                lsn: Lsn(lsn),
-                timed: lsn % 3 == 0,
-                bytes: Bytes::from(format!("record {lsn}")),
+            .map(|lsn| {
+                let (kind, bytes) = match lsn % 3 {
+                    0 => (
+                        RecordKind::Timed,
+                        Bytes::from(vec![lsn as u8; crate::stream::timed::EVIDENCE_BYTES + 1]),
+                    ),
+                    1 => (
+                        RecordKind::Recovery,
+                        journal_contract::RecoveryEntry {
+                            fence: journal_contract::RecoveryFence {
+                                epoch: Epoch(4),
+                                head: Lsn(lsn - 1),
+                            },
+                            configuration_epoch: 2,
+                            loss_point: Lsn(lsn - 1),
+                            exact: true,
+                            source: journal_contract::RecoverySource::Survivor,
+                            time_unix_ms: lsn,
+                            marker: Some(Bytes::from(format!("marker {lsn}"))),
+                        }
+                        .encode(),
+                    ),
+                    _ => (RecordKind::Data, Bytes::from(format!("record {lsn}"))),
+                };
+                Record {
+                    lsn: Lsn(lsn),
+                    kind,
+                    bytes,
+                }
             })
             .collect()
     }

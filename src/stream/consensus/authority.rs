@@ -86,14 +86,10 @@ pub(super) enum Change {
     },
 }
 
-/// Where a recovered history's last kept record came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RecoverySource {
-    /// The surviving voter's log.
-    Survivor,
-    /// The object store's committed run, longer than the survivor's log.
-    ObjectStore,
-}
+/// Where a recovered history's last kept record came from. The journal
+/// contract's type, so the stream's recovery entry carries the catalog's
+/// value; its encoding is the variant index, as before.
+pub use journal_contract::RecoverySource;
 
 /// The catalog's record of one recovery of a stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

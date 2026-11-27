@@ -227,10 +227,6 @@ impl Live {
                 .map(|(index, (_, payload))| (Lsn(from.0 + index as u64), payload.clone()))
                 .collect()
         };
-        Page {
-            floor: self.floor,
-            records,
-            head: self.head,
-        }
+        Page::new(self.floor, records, self.head)
     }
 }

@@ -140,15 +140,17 @@ async fn within<F: Future, Timer: Future<Output = ()>>(
     .await
 }
 
+// Every expected page holds client data only: no append yields a typed
+// recovery entry, so each compared read also checks `Page::recoveries`.
 fn page(floor: u64, head: u64, entries: &[(u64, &'static [u8])]) -> crate::Result<Page> {
-    Ok(Page {
-        floor: Lsn(floor),
-        records: entries
+    Ok(Page::new(
+        Lsn(floor),
+        entries
             .iter()
             .map(|&(at, bytes)| (Lsn(at), Bytes::from_static(bytes)))
             .collect(),
-        head: Lsn(head),
-    })
+        Lsn(head),
+    ))
 }
 
 // The healthy fixture must eventually make each append visible on the read path.

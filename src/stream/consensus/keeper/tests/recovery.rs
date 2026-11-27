@@ -79,7 +79,7 @@ pub(super) async fn remember_peers(cluster: &Cluster, keeper: Uuid, peers: [Uuid
     .unwrap();
 }
 
-fn contract_journal(
+pub(super) fn contract_journal(
     cluster: &Cluster,
     credentials: &Credentials,
     voters: Voters,

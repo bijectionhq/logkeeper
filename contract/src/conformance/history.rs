@@ -403,6 +403,7 @@ mod tests {
                     floor: at,
                     head: at,
                     records: vec![(at, chosen)],
+                    recoveries: Vec::new(),
                 })),
             ),
         ]

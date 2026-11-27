@@ -463,11 +463,7 @@ fn outcome(tag: usize) -> Option<Outcome> {
             head: Lsn(0),
         }),
         2 => Outcome::At(Lsn(1)),
-        3 => Outcome::Page(Page {
-            floor: Lsn(1),
-            records: Vec::new(),
-            head: Lsn(0),
-        }),
+        3 => Outcome::Page(Page::new(Lsn(1), Vec::new(), Lsn(0))),
         4 => Outcome::Refused(JournalError::NotFound),
         5 => Outcome::Configuration(configuration()),
         6 => Outcome::OriginalSample(Vec::new()),
@@ -488,8 +484,77 @@ fn outcome(tag: usize) -> Option<Outcome> {
             covered_through_lsn: Lsn(1),
             logical_floor_lsn: Lsn(2),
         })),
+        11 => Outcome::RecoveryPage(recovery_page()),
         _ => return None,
     })
+}
+
+/// A page holding one typed recovery entry after one client record.
+fn recovery_page() -> Page {
+    let entry = journal_contract::RecoveryEntry {
+        fence: RecoveryFence {
+            epoch: Epoch(2),
+            head: Lsn(1),
+        },
+        configuration_epoch: 2,
+        loss_point: Lsn(1),
+        exact: true,
+        source: journal_contract::RecoverySource::Survivor,
+        time_unix_ms: 7,
+        marker: Some(Bytes::from_static(b"marker")),
+    };
+    Page {
+        floor: Lsn(1),
+        records: vec![
+            (Lsn(1), Bytes::from_static(b"one")),
+            (Lsn(2), entry.encode()),
+        ],
+        head: Lsn(2),
+        recoveries: vec![(Lsn(2), entry)],
+    }
+}
+
+#[test]
+fn a_page_of_recovery_entries_keeps_them_on_the_current_wire_only() {
+    let page = recovery_page();
+    let plain = Page::new(page.floor, page.records.clone(), page.head);
+    // A page of client data keeps the N-1 bytes on both wires.
+    assert_eq!(
+        encode_reply(
+            Reply::Decision(Outcome::Page(plain.clone())),
+            WireVersion::Current
+        )
+        .unwrap(),
+        encode(&ReplyV1::Decision(Outcome::Page(plain))).unwrap()
+    );
+    for reply in [
+        Reply::Decision(Outcome::Page(page.clone())),
+        Reply::ScopedPage {
+            genesis: genesis(),
+            configuration: None,
+            outcome: Outcome::Page(page.clone()),
+        },
+    ] {
+        let bytes = encode_reply(reply.clone(), WireVersion::Current).unwrap();
+        let decoded = super::super::decode_reply(&bytes, WireVersion::Current).unwrap();
+        let outcome = match decoded {
+            Reply::Decision(outcome) | Reply::ScopedPage { outcome, .. } => outcome,
+            _ => panic!("another reply"),
+        };
+        assert!(matches!(outcome, Outcome::Page(decoded) if decoded == page));
+        // N-1 knows no entry kinds: it gets `Unavailable`, never the
+        // entry's bytes as client data.
+        let previous = encode_reply(reply, WireVersion::Previous).unwrap();
+        let previous = super::super::decode_reply(&previous, WireVersion::Previous).unwrap();
+        let outcome = match previous {
+            Reply::Decision(outcome) | Reply::ScopedPage { outcome, .. } => outcome,
+            _ => panic!("another reply"),
+        };
+        assert!(matches!(
+            outcome,
+            Outcome::Refused(JournalError::Unavailable)
+        ));
+    }
 }
 
 /// Checks one wire enum: its variants only ever grow after the N-1 list,

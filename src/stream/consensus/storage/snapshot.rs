@@ -31,13 +31,12 @@ use super::{
     media::{hex, sha256},
 };
 use crate::stream::consensus::Voters;
-use crate::stream::timed::EVIDENCE_BYTES;
 use crate::stream::{
     consensus::{
-        Configuration, Entry, Genesis, LogId, MAX_MESSAGE, MAX_RECORD, Membership, RaftTypes,
-        SnapshotMeta, Stage, invalid, options, ownership,
+        Configuration, Entry, Genesis, LogId, MAX_MESSAGE, Membership, RaftTypes, SnapshotMeta,
+        Stage, invalid, options, ownership,
         placement::Placement,
-        state::{Command, EpochRuns, MAX_RETAINED_RECORDS, Outcome, Payload, State, TIMED_RECORD},
+        state::{Command, EpochRuns, MAX_RETAINED_RECORDS, Outcome, Payload, RecordKind, State},
     },
     keeper::durability::{sync_directory, sync_file},
 };
@@ -97,7 +96,13 @@ impl Image {
     /// configuration to the recovery target and fences the stream under the
     /// recovery writer. The recovered membership entry that follows it is
     /// accepted only while both hold.
-    fn recover(&mut self, stage: Stage, genesis: &Genesis, placement: &Placement) -> Outcome {
+    fn recover(
+        &mut self,
+        stage: Stage,
+        recorded: Option<crate::stream::consensus::state::Recorded>,
+        genesis: &Genesis,
+        placement: &Placement,
+    ) -> Outcome {
         let head = match self.state.head() {
             Ok(head) => head,
             Err(error) => return Outcome::Refused(error),
@@ -111,10 +116,18 @@ impl Image {
             || stage.stream != genesis.stream
             || !placement.structural_stage(&stage)
             || !stage.recovery()
+            || recorded.is_some_and(|recorded| {
+                recorded.record.stream != genesis.stream
+                    || Some(recorded.record.epoch) != stage.source.checked_add(1)
+            })
         {
             return Outcome::Refused(JournalError::Conflict { head });
         }
-        match self.state.recover() {
+        let recovered = match recorded {
+            Some(recorded) => self.state.recover_recorded(recorded),
+            None => self.state.recover(),
+        };
+        match recovered {
             Ok(outcome) => {
                 self.stage = Some(stage);
                 self.stage_intent = true;
@@ -708,6 +721,16 @@ impl StateMachine {
         self.inner.applied.read().state.recovery_fence()
     }
 
+    /// The standing fence of a recorded recovery and the catalog's record
+    /// of it, from the applied image.
+    pub fn recorded_recovery(
+        &self,
+    ) -> journal_contract::Result<Option<(RecoveryFence, crate::stream::consensus::state::Recorded)>>
+    {
+        self.head()?;
+        Ok(self.inner.applied.read().state.recorded_recovery())
+    }
+
     pub async fn page(&self, from: Lsn, limit: usize) -> journal_contract::Result<Page> {
         if self.is_quarantined() {
             return Err(JournalError::Corrupted);
@@ -767,7 +790,7 @@ impl StateMachine {
                 .map(|(lsn, payload)| {
                     Ok(crate::stream::consensus::offload::Record {
                         lsn,
-                        timed: payload.timed(),
+                        kind: payload.kind(),
                         bytes: payload.load()?,
                     })
                 })
@@ -1276,7 +1299,9 @@ impl Inner {
                     None => Ok(size),
                 })
                 .and_then(|size| {
-                    Ok(size + options().serialized_size(&active.image.state.offload())?)
+                    Ok(size
+                        + options().serialized_size(&active.image.state.offload())?
+                        + options().serialized_size(&active.image.state.recorded())?)
                 })
                 .map_err(io::Error::other)?;
             transfer.grow(
@@ -1359,7 +1384,19 @@ impl Inner {
                     Command::StageOwned(stage) => {
                         image.stage(stage, &self.genesis, &self.placement, true)
                     }
-                    Command::Recover(stage) => image.recover(stage, &self.genesis, &self.placement),
+                    Command::Recover(stage) => {
+                        image.recover(stage, None, &self.genesis, &self.placement)
+                    }
+                    Command::RecoverRecorded {
+                        stage,
+                        record,
+                        exact,
+                    } => image.recover(
+                        stage,
+                        Some(crate::stream::consensus::state::Recorded { record, exact }),
+                        &self.genesis,
+                        &self.placement,
+                    ),
                     Command::Admitted(..) => return Err(invalid("nested application ticket")),
                     command => {
                         let segment = self
@@ -1591,12 +1628,14 @@ pub(super) fn inspect_stream_readonly(
 ) -> io::Result<StreamStateView> {
     if !placement.structural_genesis(genesis)
         || log.entries.values().any(|entry| match &entry.payload {
-            EntryPayload::Membership(membership) => !placement.structural_membership(genesis.stream, membership),
+            EntryPayload::Membership(membership) => {
+                !placement.structural_membership(genesis.stream, membership)
+            }
             EntryPayload::Normal(command) => match command.body() {
                 Command::Stage(stage) | Command::StageOwned(stage) => {
                     !placement.structural_stage(stage) || stage.stream != genesis.stream
                 }
-                Command::Recover(stage) => {
+                Command::Recover(stage) | Command::RecoverRecorded { stage, .. } => {
                     !placement.structural_stage(stage)
                         || stage.stream != genesis.stream
                         || !stage.recovery()
@@ -1650,7 +1689,19 @@ pub(super) fn inspect_stream_readonly(
                     image.stage(stage, genesis, placement, true);
                 }
                 Command::Recover(stage) => {
-                    image.recover(stage, genesis, placement);
+                    image.recover(stage, None, genesis, placement);
+                }
+                Command::RecoverRecorded {
+                    stage,
+                    record,
+                    exact,
+                } => {
+                    image.recover(
+                        stage,
+                        Some(crate::stream::consensus::state::Recorded { record, exact }),
+                        genesis,
+                        placement,
+                    );
                 }
                 Command::Admitted(..) => return Err(invalid("nested application ticket")),
                 command => {
@@ -1857,6 +1908,10 @@ const MAGIC_WITH_EPOCHS: &[u8; 8] = b"LKRIMG04";
 /// only for a stream that offloaded, which needs the finalized
 /// `CLUSTER_VERSION_OFFLOAD`, so N-1 receivers never meet it.
 const MAGIC_WITH_OFFLOAD: &[u8; 8] = b"LKRIMG05";
+/// Images that also carry a recorded recovery after the offload progress.
+/// Written only while a recorded recovery's fence stands, which needs the
+/// finalized `CLUSTER_VERSION_RECOVERY_ENTRY`.
+const MAGIC_WITH_RECOVERY: &[u8; 8] = b"LKRIMG06";
 const STAGED_IMAGE: &str = "lk-stage-";
 const HEADER_BYTES: u64 = 12;
 
@@ -1871,9 +1926,14 @@ fn write_image(
     quarantine: impl Fn(&str),
 ) -> io::Result<()> {
     let offload = image.state.offload();
-    let with_offload = offload != crate::stream::consensus::state::Offload::default();
+    let recorded = image.state.recorded();
+    let with_recovery = recorded.is_some();
+    let with_offload =
+        with_recovery || offload != crate::stream::consensus::state::Offload::default();
     let with_epochs = with_epochs || with_offload;
-    file.write_all(if with_offload {
+    file.write_all(if with_recovery {
+        MAGIC_WITH_RECOVERY
+    } else if with_offload {
         MAGIC_WITH_OFFLOAD
     } else if with_epochs {
         MAGIC_WITH_EPOCHS
@@ -1902,11 +1962,16 @@ fn write_image(
                 .serialize_into(&mut writer, &offload)
                 .map_err(io::Error::other)?;
         }
+        if let Some(recorded) = &recorded {
+            options()
+                .serialize_into(&mut writer, recorded)
+                .map_err(io::Error::other)?;
+        }
         for payload in image.state.records() {
             let bytes = payload
                 .load()
                 .inspect_err(|error| quarantine(&error.to_string()))?;
-            let len = bytes.len() as u32 | if payload.timed() { TIMED_RECORD } else { 0 };
+            let len = bytes.len() as u32 | payload.kind().flag();
             let crc = crc32fast::hash(&bytes);
             writer.write_all(&len.to_be_bytes())?;
             writer.write_all(&crc.to_be_bytes())?;
@@ -1931,10 +1996,11 @@ fn read_image(
     let mut file = BufReader::new(file);
     let mut header = [0; 12];
     file.read_exact(&mut header)?;
-    let (with_epochs, with_offload) = match &header[..8] {
-        magic if magic == MAGIC => (false, false),
-        magic if magic == MAGIC_WITH_EPOCHS => (true, false),
-        magic if magic == MAGIC_WITH_OFFLOAD => (true, true),
+    let (with_epochs, with_offload, with_recovery) = match &header[..8] {
+        magic if magic == MAGIC => (false, false, false),
+        magic if magic == MAGIC_WITH_EPOCHS => (true, false, false),
+        magic if magic == MAGIC_WITH_OFFLOAD => (true, true, false),
+        magic if magic == MAGIC_WITH_RECOVERY => (true, true, true),
         _ => return Err(invalid("invalid snapshot format")),
     };
     let mut crc = crc32fast::Hasher::new();
@@ -1963,6 +2029,16 @@ fn read_image(
     } else {
         Default::default()
     };
+    let recorded: Option<crate::stream::consensus::state::Recorded> = if with_recovery {
+        Some(
+            options()
+                .with_limit(MAX_MESSAGE)
+                .deserialize_from(&mut reader)
+                .map_err(io::Error::other)?,
+        )
+    } else {
+        None
+    };
     image.stage_intent = meta.snapshot_id.starts_with(STAGED_IMAGE);
     if &found != genesis
         || image.applied != meta.last_log_id
@@ -1983,19 +2059,17 @@ fn read_image(
         let mut frame = [0; 8];
         reader.read_exact(&mut frame)?;
         let len = u32::from_be_bytes(frame[..4].try_into().unwrap());
-        let timed = len & TIMED_RECORD != 0;
-        let len = len & !TIMED_RECORD;
+        let (kind, len) = RecordKind::split(len)
+            .filter(|(kind, len)| kind.fits(*len as usize))
+            .ok_or_else(|| invalid("invalid snapshot record length"))?;
         let crc = u32::from_be_bytes(frame[4..].try_into().unwrap());
-        if len as usize > MAX_RECORD || timed && (len as usize) <= EVIDENCE_BYTES {
-            return Err(invalid("invalid snapshot record length"));
-        }
         records.push_back(Payload::Snapshot {
             file: extent.clone(),
             digest,
             offset: reader.position,
             len,
             crc,
-            timed,
+            kind,
         });
         let mut remaining = len as usize;
         let mut payload = crc32fast::Hasher::new();
@@ -2015,6 +2089,7 @@ fn read_image(
     image.state.restore_records(records, genesis.quota_bytes)?;
     image.state.restore_epochs(epochs)?;
     image.state.restore_offload(offload)?;
+    image.state.restore_recorded(recorded)?;
     Ok((meta, image))
 }
 

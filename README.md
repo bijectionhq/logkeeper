@@ -455,14 +455,39 @@ commits the recovery. The stream's head is the loss point.
 
 The recovery fence refuses ordinary appends and trims.
 Every `seal` returns `JournalError::Recovered { head }` until someone acknowledges the fence.
+`head`, here and in `RecoveryFence`, is the last record the recovery kept.
 At finalized cluster version 3, a writer can read the active fence with `Journal::recovery_fence` and call `Journal::acknowledge_recovery_with_marker`.
-One committed entry appends its opaque marker at the position after the survivor's head and clears that exact fence.
-A repeated request with identical bytes can recover the marker's position while it is retained.
-A refusal to append leaves the fence in place.
+A repeated request with identical bytes can recover the entry's position while it is retained.
+A refusal leaves the fence in place.
 An older request cannot clear a different recovery epoch.
 `Journal::acknowledge_recovery` still clears a recovery fence explicitly for an operator-directed handoff.
 Writers seal above the recovery epoch to resume.
 A consumer that sees `Recovered` or a head below a position it already acknowledged must rebuild from the journal.
+
+**The typed recovery entry** (finalized cluster version 10,
+`CLUSTER_VERSION_RECOVERY_ENTRY`, feature bit `RECOVERY_ENTRY`). The
+recovery's WAL round writes `Command::RecoverRecorded`, which installs the
+fence and also records the catalog's `RecoveryRecord`: the configuration
+epoch, the loss point and whether it is exact, the source (survivor or
+object store) and the time.
+That fence clears only by writing one typed entry,
+`journal_contract::RecoveryEntry`, at `fence.head + 1`, the first entry of
+the recovered epoch, in the same committed command (`Command::RecoveryEntry`).
+Both acknowledgements write it: `acknowledge_recovery` without a marker, and
+`acknowledge_recovery_with_marker` with the consumer's marker inside the
+entry rather than as a separate record. `acknowledge_recovery` still returns
+the last record kept; `acknowledge_recovery_with_marker` returns the entry's
+position. Readers see the kind in `Page::recoveries`; `Page::records` holds
+the entry's canonical encoding (`RecoveryEntry::encode`) at that position.
+No append produces the kind, whatever its bytes, and no client may seal as
+the reserved recovery writer, so a consumer can trust the kind. The kind is a
+bit of the record's framed length in snapshots (`LKRIMG`, `LKRIDX`) and in
+offloaded objects (`LKOFF001`), so snapshots, offload, reads below the local
+floor, export, import and restore carry the entry intact; a pending recorded
+recovery travels in the `LKRIMG06` and `LKRIDX04` snapshot formats. On the
+wire, a page with recovery entries travels as `Outcome::RecoveryPage`; an
+N-1 peer gets `Unavailable` instead. Below version 10 the recovery and both
+acknowledgements behave as before, and the marker is an opaque record.
 
 **Lost voters and placement certification.** Two lost voters are a quorum
 of the configuration the recovery left, and a lost voter may still hold the
@@ -909,6 +934,15 @@ state in WAL replay and snapshots. An immutable stream refuses unchecked
 trim once the catalog finalizes this level. A checked selection of an
 existing announcement remains available for a staged checkpoint. Level 8
 preserves unchecked trim for legacy mutable streams.
+
+**Typed recovery entries.** Finalize level 10
+(`CLUSTER_VERSION_RECOVERY_ENTRY`) after every keeper advertises
+`RECOVERY_ENTRY` (bit 12). Level 9 is claimed for recovery exclusion. From
+level 10 a recovery writes `Command::RecoverRecorded`, its fence clears by
+`Command::RecoveryEntry`, retained records may carry the recovery kind bit
+(bit 30 of the framed length), and a stream with a pending recorded recovery
+snapshots as `LKRIMG06`/`LKRIDX04`. An older binary refuses all of them, so
+do not roll back past level 10.
 
 **Wire variants.** Variants of `Frame`, `Request`, `PeerRequest`, `Reply`,
 `Outcome` and `JournalError` are only ever appended, and each is classified

@@ -90,6 +90,11 @@ A stale token or a different payload cannot change the result of an earlier ackn
 An identical retry returns the retained marker position.
 An operator-directed acknowledgement can still lift the fence without appending a marker.
 
+At finalized cluster version 10 the recovery records the catalog's record of itself, and its fence clears only by committing one typed `RecoveryEntry` at `fence.head + 1`, the first entry of the recovered epoch.
+The entry carries the fence, the configuration epoch, the loss point and whether it is exact, the source and the time, and the payload of `acknowledge_recovery_with_marker` as its marker; an operator-directed acknowledgement writes it without a marker.
+`fence.head` and `Recovered { head }` stay the last record kept.
+Readers see the entry's kind in `Page::recoveries`. No append produces that kind, so an append of the same bytes stays client data.
+
 ## 3. The keeper protocol
 
 A stream's **ensemble** is its ordered array of three `KeeperId(u128)` values,

@@ -259,14 +259,16 @@ async fn running_lost_voters_stop_serving_before_the_recovered_configuration_doe
     // The recovered configuration serves and goes on.
     cluster.restart(a).await;
     configured(&journal, stream, report.voters).await;
-    journal.acknowledge_recovery(stream).await.unwrap();
+    // The acknowledgement returns the last record kept and writes the
+    // recovery's typed entry right after it, the first of the new epoch.
+    assert_eq!(journal.acknowledge_recovery(stream).await, Ok(Lsn(3)));
     let resealed = journal
         .seal(stream, report.epoch, Uuid::from_u128(100))
         .await
         .unwrap();
-    assert_eq!(resealed.head, Lsn(3));
+    assert_eq!(resealed.head, Lsn(4));
     journal
-        .append(stream, resealed.fence, Lsn(4), Bytes::from_static(b"new-4"))
+        .append(stream, resealed.fence, Lsn(5), Bytes::from_static(b"new-4"))
         .await
         .unwrap();
     let page = journal
@@ -276,8 +278,14 @@ async fn running_lost_voters_stop_serving_before_the_recovered_configuration_doe
     let first_served = tokio::time::Instant::now();
     assert_eq!(
         page.records.last(),
-        Some(&(Lsn(4), Bytes::from_static(b"new-4")))
+        Some(&(Lsn(5), Bytes::from_static(b"new-4")))
     );
+    let entry = page.recovery(Lsn(4)).expect("the recovery's typed entry");
+    assert_eq!(page.recoveries.len(), 1);
+    assert_eq!(entry.fence.head, Lsn(3));
+    assert_eq!(entry.loss_point, Lsn(3));
+    assert_eq!(entry.configuration_epoch, report.revision);
+    assert_eq!(entry.marker, None);
     // Still cut off, the lost voters serve nothing; the reader saw them
     // serve only before the recovery finished.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -317,10 +325,10 @@ async fn running_lost_voters_stop_serving_before_the_recovered_configuration_doe
     }
     for _ in 0..5 {
         let page = journal
-            .read(stream, Lsn(4), 1, Duration::ZERO)
+            .read(stream, Lsn(5), 1, Duration::ZERO)
             .await
             .unwrap();
-        assert_eq!(page.records, [(Lsn(4), Bytes::from_static(b"new-4"))]);
+        assert_eq!(page.records, [(Lsn(5), Bytes::from_static(b"new-4"))]);
     }
     cluster.stop_all().await;
 }
@@ -591,4 +599,274 @@ fn authority_requests_and_replies_stay_off_n_minus_1() {
         margin_ms: 3_000,
     };
     assert!(ReplyV1::from_reply(Reply::Lease(grant)).is_err());
+}
+
+/// The first bytes of the snapshot `group` would send a follower.
+async fn wire_magic(group: &Group) -> [u8; 8] {
+    use tokio::io::AsyncReadExt;
+    let mut wire = group.raft.get_snapshot().await.unwrap().unwrap().snapshot;
+    let mut magic = [0; 8];
+    wire.read_exact(&mut magic).await.unwrap();
+    magic
+}
+
+/// Snapshots `keeper`'s copy of `stream` and waits for it to be selected.
+async fn snapshot(cluster: &Cluster, keeper: Uuid, stream: StreamId) -> Arc<Group> {
+    let group = cluster.group(keeper, stream).await;
+    let index = group.state.applied().unwrap();
+    group.raft.trigger().snapshot().await.unwrap();
+    timeout(WAIT, group.state.wait_for_snapshot(index))
+        .await
+        .unwrap()
+        .unwrap();
+    group
+}
+
+/// At the finalized level a recovery leaves one typed entry in the stream,
+/// right after the last record kept, as the first entry of the recovered
+/// epoch: written when the fence clears, with the consumer's marker inside
+/// it, the catalog's record of the recovery, and a kind no append can
+/// produce. The recorded recovery and the entry's kind survive snapshots
+/// and restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_leaves_one_typed_entry_that_no_append_can_forge() {
+    use journal_contract::{Journal, RecoveryEntry, RecoveryFence, RecoverySource};
+
+    let mut cluster = Cluster::start_replicated().await;
+    cluster.finalize().await;
+    leased(&cluster).await;
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(0xA7);
+    let journal = cluster.client(&cluster.credentials);
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 20)
+        .await
+        .unwrap();
+    let sealed = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap();
+    // A writer appends the exact bytes of a recovery entry: they stay
+    // client data, whatever they say.
+    let forged = RecoveryEntry {
+        fence: RecoveryFence {
+            epoch: Epoch(2),
+            head: Lsn(2),
+        },
+        configuration_epoch: 1,
+        loss_point: Lsn(2),
+        exact: true,
+        source: RecoverySource::Survivor,
+        time_unix_ms: 1,
+        marker: Some(Bytes::from_static(b"forged")),
+    };
+    for (at, payload) in [
+        Bytes::from_static(b"record-1"),
+        Bytes::from_static(b"record-2"),
+        forged.encode(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        journal
+            .append(stream, sealed.fence, Lsn(at as u64 + 1), payload)
+            .await
+            .unwrap();
+    }
+    // No client seals as the recovery writer to stand in its fence.
+    assert!(
+        journal
+            .seal(
+                stream,
+                Epoch(1),
+                crate::stream::consensus::state::RECOVERY_WRITER
+            )
+            .await
+            .is_err()
+    );
+    let page = journal
+        .read(stream, Lsn(1), 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.records[2], (Lsn(3), forged.encode()));
+    assert!(page.recoveries.is_empty());
+    let survivor = cluster.group(a, stream).await;
+    timeout(WAIT, async {
+        while survivor.state.head() != Ok(Lsn(3)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(survivor);
+
+    for keeper in [a, b, c] {
+        cluster.running.remove(&keeper).unwrap().stop().await;
+    }
+    let report = cluster.configs[&a]
+        .recover_stream(
+            stream,
+            Recovery {
+                acknowledge_data_loss: true,
+                lost: Some(vec![b, c]),
+                unreachable: vec![b, c],
+                ..Recovery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(report.written);
+    assert_eq!(report.head, Lsn(3));
+    cluster.restart(a).await;
+    configured(&journal, stream, report.voters).await;
+    assert_eq!(
+        journal
+            .seal(stream, Epoch(3), Uuid::from_u128(100))
+            .await
+            .err(),
+        Some(JournalError::Recovered { head: Lsn(3) })
+    );
+
+    // The recorded recovery waits in the snapshot formats that carry it,
+    // and a restart from the snapshot keeps it.
+    let group = snapshot(&cluster, a, stream).await;
+    let active = group.state.recorded_recovery().unwrap().unwrap().0;
+    assert_eq!(
+        active,
+        RecoveryFence {
+            epoch: report.epoch,
+            head: Lsn(3),
+        }
+    );
+    assert!(
+        std::fs::read(group.state.snapshot_path().unwrap())
+            .unwrap()
+            .starts_with(b"LKRIDX04")
+    );
+    assert_eq!(&wire_magic(&group).await, b"LKRIMG06");
+    drop(group);
+    cluster.running.remove(&a).unwrap().stop().await;
+    cluster.restart(a).await;
+    let group = cluster.group(a, stream).await;
+    timeout(WAIT, async {
+        while !group
+            .state
+            .recorded_recovery()
+            .is_ok_and(|recorded| recorded.is_some_and(|(fence, _)| fence == active))
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the restarted survivor kept the recorded recovery");
+    drop(group);
+    configured(&journal, stream, report.voters).await;
+
+    // The writer's acknowledgement writes the entry with its marker inside
+    // and clears exactly that fence.
+    let contract = super::recovery::contract_journal(&cluster, &cluster.credentials, report.voters);
+    let generic: &dyn Journal = &contract;
+    assert_eq!(generic.recovery_fence(stream).await, Ok(Some(active)));
+    let stale = RecoveryFence {
+        epoch: Epoch(active.epoch.0 - 1),
+        ..active
+    };
+    let marker = Bytes::from_static(b"consumer marker");
+    assert_eq!(
+        generic
+            .acknowledge_recovery_with_marker(stream, stale, marker.clone())
+            .await,
+        Err(JournalError::Conflict { head: Lsn(3) })
+    );
+    assert_eq!(
+        generic
+            .acknowledge_recovery_with_marker(stream, active, marker.clone())
+            .await,
+        Ok(Lsn(4))
+    );
+    assert_eq!(
+        generic
+            .acknowledge_recovery_with_marker(stream, active, marker.clone())
+            .await,
+        Ok(Lsn(4))
+    );
+    assert_eq!(
+        generic
+            .acknowledge_recovery_with_marker(stream, active, Bytes::from_static(b"other"))
+            .await,
+        Err(JournalError::Conflict { head: Lsn(4) })
+    );
+    assert_eq!(generic.recovery_fence(stream).await, Ok(None));
+
+    // Readers see the entry's kind and the catalog's record in it.
+    let page = generic
+        .read(stream, Lsn(1), 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.head, Lsn(4));
+    let [(at, entry)] = page.recoveries.as_slice() else {
+        panic!("one recovery entry: {:?}", page.recoveries);
+    };
+    assert_eq!(*at, Lsn(4));
+    assert_eq!(entry.fence, active);
+    assert_eq!(entry.configuration_epoch, report.revision);
+    assert_eq!(entry.loss_point, Lsn(3));
+    assert!(entry.exact);
+    assert_eq!(entry.source, RecoverySource::Survivor);
+    assert!(entry.time_unix_ms > 0);
+    assert_eq!(entry.marker.as_ref(), Some(&marker));
+    assert_eq!(page.records[3], (Lsn(4), entry.encode()));
+    assert_eq!(page.recovery(Lsn(3)), None);
+    let entry = entry.clone();
+
+    // Writers resume after it, and their copy of its bytes is client data.
+    assert_eq!(generic.seal(stream, Epoch(3)).await, Ok(Lsn(4)));
+    assert_eq!(
+        generic
+            .append(stream, Epoch(3), Lsn(5), entry.encode())
+            .await,
+        Ok(Lsn(5))
+    );
+    // The kind survives a snapshot and a restart from it.
+    let survivor = cluster.group(a, stream).await;
+    timeout(WAIT, async {
+        while survivor.state.head() != Ok(Lsn(5)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(survivor);
+    let group = snapshot(&cluster, a, stream).await;
+    assert_eq!(&wire_magic(&group).await, b"LKRIMG04");
+    drop(group);
+    cluster.running.remove(&a).unwrap().stop().await;
+    cluster.restart(a).await;
+    leased(&cluster).await;
+    timeout(WAIT, async {
+        loop {
+            if let Ok(page) = generic.read(stream, Lsn(1), 10, Duration::ZERO).await
+                && page.head == Lsn(5)
+            {
+                assert_eq!(page.recoveries, vec![(Lsn(4), entry.clone())]);
+                assert_eq!(page.records[4], (Lsn(5), entry.encode()));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let survivor = cluster.group(a, stream).await;
+    timeout(WAIT, async {
+        while survivor.state.head() != Ok(Lsn(5)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let local = survivor.state.page(Lsn(4), 2).await.unwrap();
+    assert_eq!(local.recoveries, vec![(Lsn(4), entry)]);
+    drop(survivor);
+    cluster.stop_all().await;
 }

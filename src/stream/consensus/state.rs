@@ -19,12 +19,15 @@ use std::{
 use bytes::Bytes;
 use journal_contract::{
     CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, JournalError, Lsn, Page,
-    RecoveryFence, Result, WriterSessionId,
+    RecoveryEntry, RecoveryFence, Result, WriterSessionId,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use super::{Fence, Genesis, MAX_PAGE, MAX_RECORD, MAX_RECORDS_PER_PAGE, Sealed, Stage};
+use super::{
+    Fence, Genesis, MAX_PAGE, MAX_RECORD, MAX_RECORDS_PER_PAGE, Sealed, Stage,
+    authority::RecoveryRecord,
+};
 use crate::stream::keeper::record_charge;
 use crate::stream::timed::{EVIDENCE_BYTES, TimedEvidence};
 
@@ -120,6 +123,26 @@ pub enum Command {
         fence: Fence,
         owner: String,
         anchor: CheckpointAnchor,
+    },
+    /// An operator recovery as `Recover`, which also records the catalog's
+    /// record of it. The fence it installs clears only by writing the
+    /// stream's typed recovery entry (`RecoveryEntry`). Added after
+    /// `SelectCheckpoint` and written only once the cluster finalized
+    /// `CLUSTER_VERSION_RECOVERY_ENTRY`, so older keepers never meet it.
+    RecoverRecorded {
+        stage: Stage,
+        record: RecoveryRecord,
+        /// Whether the record's loss point is exact (`RecoveryReport`).
+        exact: bool,
+    },
+    /// Writes the typed recovery entry at `at`, `fence.head + 1`, and clears
+    /// exactly that recorded fence. `entry` is the entry's canonical
+    /// encoding; keep it last so its retained extent ends with the entry.
+    /// Proposed only for a fence a `RecoverRecorded` installed.
+    RecoveryEntry {
+        fence: RecoveryFence,
+        at: Lsn,
+        entry: Bytes,
     },
 }
 
@@ -229,6 +252,16 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
             owner: String,
             anchor: CheckpointAnchor,
         },
+        RecoverRecorded {
+            stage: Stage,
+            record: RecoveryRecord,
+            exact: bool,
+        },
+        RecoveryEntry {
+            fence: RecoveryFence,
+            at: Lsn,
+            entry: Bytes,
+        },
     }
     Application::deserialize(decoder).map(Box::new)
 }
@@ -296,6 +329,8 @@ impl std::fmt::Display for Command {
             Self::SelectCheckpoint { anchor, .. } => {
                 write!(f, "SelectCheckpoint({:?})", anchor.announced_at)
             }
+            Self::RecoverRecorded { stage, .. } => write!(f, "RecoverRecorded({})", stage.source),
+            Self::RecoveryEntry { fence, .. } => write!(f, "RecoveryEntry({fence:?})"),
         }
     }
 }
@@ -305,7 +340,7 @@ pub enum Outcome {
     Unit,
     Sealed(Sealed),
     At(Lsn),
-    Page(Page),
+    Page(#[serde(with = "page_layout")] Page),
     Refused(JournalError),
     Configuration(super::Configuration),
     /// One keeper's signed sync sample for a staged original.
@@ -317,6 +352,70 @@ pub enum Outcome {
     /// Added last; never an applied command's outcome.
     Offload(super::OffloadStatus),
     Checkpoint(Option<CheckpointReceipt>),
+    /// A page that holds typed recovery entries, on the wire only: `Page`
+    /// keeps the N-1 layout, which has no entry kinds, so `for_wire` sends a
+    /// page with recovery entries as this and `from_wire` turns it back.
+    /// Added last.
+    RecoveryPage(Page),
+}
+
+impl Outcome {
+    /// The outcome as the current wire carries it.
+    pub(super) fn for_wire(self) -> Self {
+        match self {
+            Self::Page(page) if !page.recoveries.is_empty() => Self::RecoveryPage(page),
+            outcome => outcome,
+        }
+    }
+
+    /// The outcome as it arrived on the wire.
+    pub(super) fn from_wire(self) -> Self {
+        match self {
+            Self::RecoveryPage(page) => Self::Page(page),
+            outcome => outcome,
+        }
+    }
+}
+
+/// The N-1 layout of a page: no entry kinds. Only pages of client data use
+/// it, so nothing is dropped (`Outcome::for_wire`).
+pub(super) mod page_layout {
+    use bytes::Bytes;
+    use journal_contract::{Lsn, Page};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct Borrowed<'a> {
+        floor: Lsn,
+        records: &'a Vec<(Lsn, Bytes)>,
+        head: Lsn,
+    }
+
+    #[derive(Deserialize)]
+    struct Owned {
+        floor: Lsn,
+        records: Vec<(Lsn, Bytes)>,
+        head: Lsn,
+    }
+
+    pub fn serialize<S: Serializer>(page: &Page, serializer: S) -> Result<S::Ok, S::Error> {
+        if !page.recoveries.is_empty() {
+            return Err(serde::ser::Error::custom(
+                "a page with recovery entries needs the current wire",
+            ));
+        }
+        Borrowed {
+            floor: page.floor,
+            records: &page.records,
+            head: page.head,
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Page, D::Error> {
+        let page = Owned::deserialize(deserializer)?;
+        Ok(Page::new(page.floor, page.records, page.head))
+    }
 }
 
 impl From<Result<Outcome>> for Outcome {
@@ -360,6 +459,18 @@ pub(super) struct Live {
     /// epochs, so images without offload keep their format.
     #[serde(skip)]
     offload: Offload,
+    /// The catalog's record of the recovery whose fence stands, until its
+    /// typed entry is written. Snapshots store it beside the image.
+    #[serde(skip)]
+    recorded: Option<Recorded>,
+}
+
+/// A recorded recovery waiting for its typed entry: the catalog's record and
+/// whether its loss point is exact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recorded {
+    pub record: RecoveryRecord,
+    pub exact: bool,
 }
 
 /// One stream's offload progress.
@@ -523,7 +634,7 @@ pub(super) enum Payload {
         offset: u64,
         len: u32,
         crc: u32,
-        timed: bool,
+        kind: RecordKind,
     },
     Snapshot {
         file: Arc<Mutex<File>>,
@@ -531,7 +642,7 @@ pub(super) enum Payload {
         offset: u64,
         len: u32,
         crc: u32,
-        timed: bool,
+        kind: RecordKind,
     },
 }
 
@@ -539,12 +650,64 @@ pub(super) enum Payload {
 /// most 4 MiB, so the bit is free, and an older reader refuses it as an
 /// oversized record instead of reading evidence as payload.
 pub(super) const TIMED_RECORD: u32 = 1 << 31;
+/// Marks a typed recovery entry in the same lengths. An older reader
+/// refuses it as an oversized record, so it never serves one as data.
+pub(super) const RECOVERY_RECORD: u32 = 1 << 30;
+
+/// What a retained record is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordKind {
+    /// Client data.
+    #[default]
+    Data,
+    /// A timed original: its evidence, then client data.
+    Timed,
+    /// A typed recovery entry's canonical encoding. Never client data.
+    Recovery,
+}
+
+impl RecordKind {
+    /// The bits this kind sets in a framed record length.
+    pub(super) fn flag(self) -> u32 {
+        match self {
+            Self::Data => 0,
+            Self::Timed => TIMED_RECORD,
+            Self::Recovery => RECOVERY_RECORD,
+        }
+    }
+
+    /// Splits a framed record length into the kind and the length. `None`
+    /// when it sets more than one kind.
+    pub(super) fn split(len: u32) -> Option<(Self, u32)> {
+        let kind = match len & (TIMED_RECORD | RECOVERY_RECORD) {
+            0 => Self::Data,
+            TIMED_RECORD => Self::Timed,
+            RECOVERY_RECORD => Self::Recovery,
+            _ => return None,
+        };
+        Some((kind, len & !(TIMED_RECORD | RECOVERY_RECORD)))
+    }
+
+    /// Whether a record of `len` bytes can be of this kind.
+    pub(super) fn fits(self, len: usize) -> bool {
+        len <= MAX_RECORD
+            && match self {
+                Self::Data => true,
+                Self::Timed => len > EVIDENCE_BYTES,
+                Self::Recovery => len >= RecoveryEntry::HEADER_BYTES,
+            }
+    }
+}
 
 impl Payload {
-    pub(super) fn timed(&self) -> bool {
+    pub(super) fn kind(&self) -> RecordKind {
         match self {
-            Self::Extent { timed, .. } | Self::Snapshot { timed, .. } => *timed,
+            Self::Extent { kind, .. } | Self::Snapshot { kind, .. } => *kind,
         }
+    }
+
+    pub(super) fn timed(&self) -> bool {
+        self.kind() == RecordKind::Timed
     }
 
     /// The application payload. A timed record drops its evidence prefix.
@@ -605,17 +768,30 @@ impl ReadPage {
     }
 
     pub fn load(self) -> io::Result<Page> {
+        let mut recoveries = Vec::new();
         let records = self
             .records
             .into_iter()
-            .map(|(lsn, payload)| Ok((lsn, payload.contents()?)))
+            .map(|(lsn, payload)| {
+                let bytes = payload.contents()?;
+                if payload.kind() == RecordKind::Recovery {
+                    recoveries.push((lsn, recovery_entry(&bytes)?));
+                }
+                Ok((lsn, bytes))
+            })
             .collect::<io::Result<_>>()?;
         Ok(Page {
             floor: self.floor,
             records,
             head: self.head,
+            recoveries,
         })
     }
+}
+
+/// Decodes a retained recovery entry; damaged bytes are corruption.
+pub(super) fn recovery_entry(bytes: &Bytes) -> io::Result<RecoveryEntry> {
+    RecoveryEntry::decode(bytes).ok_or_else(|| super::invalid("retained recovery entry is damaged"))
 }
 
 impl State {
@@ -633,6 +809,16 @@ impl State {
         {
             return self.install_checkpoint(fence, &owner, checkpoint, segment, genesis);
         }
+        if let Command::RecoveryEntry { fence, at, entry } = command {
+            if genesis.immutable {
+                return Ok(Outcome::Refused(JournalError::Unsupported));
+            }
+            let live = match self.live_mut() {
+                Ok(live) => live,
+                Err(error) => return Ok(Outcome::Refused(error)),
+            };
+            return live.write_recovery_entry(fence, at, entry, segment, genesis.quota_bytes);
+        }
         if let Command::AcknowledgeRecoveryWithMarker { fence, at, payload } = command {
             if genesis.immutable {
                 return Ok(Outcome::Refused(JournalError::Unsupported));
@@ -641,6 +827,10 @@ impl State {
                 Ok(live) => live,
                 Err(error) => return Ok(Outcome::Refused(error)),
             };
+            // A recorded recovery clears only by writing its typed entry.
+            if live.recorded.is_some() {
+                return Ok(Outcome::Refused(JournalError::Conflict { head: live.head }));
+            }
             return live.acknowledge_with_marker(fence, at, payload, segment, genesis.quota_bytes);
         }
         if let Command::Append {
@@ -663,7 +853,7 @@ impl State {
                 // bytes an earlier epoch wrote conflict, as in the contract.
                 // A record of unknown epoch is judged by its bytes alone.
                 return Ok(
-                    if !retained.timed()
+                    if retained.kind() == RecordKind::Data
                         && match live.epochs.epoch(at) {
                             Some(epoch) => epoch == fence.epoch,
                             None => !genesis.immutable,
@@ -686,7 +876,7 @@ impl State {
                 offset,
                 len,
                 crc: crc32fast::hash(&payload),
-                timed: false,
+                kind: RecordKind::Data,
             };
             return Ok(live.append(at, retained, genesis.quota_bytes).into());
         }
@@ -741,7 +931,7 @@ impl State {
                 offset,
                 len,
                 crc: crc32fast::hash(&record),
-                timed: true,
+                kind: RecordKind::Timed,
             };
             return Ok(live.append(at, retained, genesis.quota_bytes).into());
         }
@@ -795,6 +985,7 @@ impl State {
                         records: VecDeque::new(),
                         epochs: EpochRuns::default(),
                         offload: Offload::default(),
+                        recorded: None,
                     };
                     *self = if genesis.immutable {
                         Self::Immutable {
@@ -857,6 +1048,10 @@ impl State {
                 *self = Self::Deleted;
                 Ok(Outcome::Unit)
             }
+            // A recorded recovery clears only by writing its typed entry.
+            Command::AcknowledgeRecovery if live.recorded.is_some() => {
+                Err(JournalError::Conflict { head: live.head })
+            }
             Command::AcknowledgeRecovery if !genesis.immutable => live.acknowledge_recovery(),
             Command::AcknowledgeRecovery => Err(JournalError::Unsupported),
             Command::Offloaded {
@@ -884,7 +1079,9 @@ impl State {
             | Command::AppendOriginal { .. }
             | Command::AcknowledgeRecoveryWithMarker { .. }
             | Command::InstallCheckpoint { .. }
-            | Command::SelectCheckpoint { .. } => unreachable!(),
+            | Command::SelectCheckpoint { .. }
+            | Command::RecoverRecorded { .. }
+            | Command::RecoveryEntry { .. } => unreachable!(),
         }
     }
 
@@ -952,6 +1149,47 @@ impl State {
             fence,
             head: live.head,
         }))
+    }
+
+    /// Installs the recovery fence as `recover` and records the catalog's
+    /// record of the recovery, which the fence's typed entry carries.
+    pub fn recover_recorded(&mut self, recorded: Recorded) -> Result<Outcome> {
+        let outcome = self.recover()?;
+        self.live_mut()?.recorded = Some(recorded);
+        Ok(outcome)
+    }
+
+    /// The standing recovery fence and the catalog's record of it, when a
+    /// recorded recovery waits for its typed entry.
+    pub fn recorded_recovery(&self) -> Option<(RecoveryFence, Recorded)> {
+        let live = self.live().ok()?;
+        let record = live.recorded?;
+        live.recovering().then(|| {
+            (
+                RecoveryFence {
+                    epoch: live.epoch(),
+                    head: live.head,
+                },
+                record,
+            )
+        })
+    }
+
+    /// The recorded recovery, for a snapshot.
+    pub fn recorded(&self) -> Option<Recorded> {
+        self.live().ok()?.recorded
+    }
+
+    /// Restores the recorded recovery a snapshot stored beside its image.
+    pub fn restore_recorded(&mut self, recorded: Option<Recorded>) -> io::Result<()> {
+        match (self.live_mut(), recorded) {
+            (_, None) => Ok(()),
+            (Ok(live), Some(record)) if live.recovering() => {
+                live.recorded = Some(record);
+                Ok(())
+            }
+            _ => Err(super::invalid("recorded recovery without its fence")),
+        }
     }
 
     /// Whether an unacknowledged operator recovery fences the stream.
@@ -1226,7 +1464,9 @@ impl State {
             let record = &live.records[(lsn - live.floor.0) as usize];
             match live.epochs.epoch(Lsn(lsn)) {
                 None => return Err(JournalError::Unavailable),
-                Some(written) if written != epoch || record.timed() => return Err(conflict),
+                Some(written) if written != epoch || record.kind() != RecordKind::Data => {
+                    return Err(conflict);
+                }
                 Some(_) => records.push(record.clone()),
             }
         }
@@ -1411,7 +1651,7 @@ impl Live {
                     .is_none_or(|epoch| epoch == fence.epoch)
                 && at <= self.head
                 && let Some(record) = self.records.get((at.0 - self.floor.0) as usize)
-                && !record.timed()
+                && record.kind() == RecordKind::Data
                 && record.len() == payload.len()
                 && record.load()? == payload
             {
@@ -1431,10 +1671,76 @@ impl Live {
             offset,
             len,
             crc: crc32fast::hash(&payload),
-            timed: false,
+            kind: RecordKind::Data,
         };
         match self.append(at, record, quota_bytes) {
             Ok(_) => Ok(self.acknowledge_recovery().into()),
+            Err(error) => Ok(Outcome::Refused(error)),
+        }
+    }
+
+    /// Writes the typed entry of the recorded recovery at `at` and clears
+    /// its fence. The entry must be exactly the one the record describes,
+    /// with any consumer marker. An identical retry returns `at` while the
+    /// entry is retained.
+    fn write_recovery_entry(
+        &mut self,
+        fence: RecoveryFence,
+        at: Lsn,
+        entry: Bytes,
+        segment: Arc<super::storage::Object>,
+        quota_bytes: u64,
+    ) -> io::Result<Outcome> {
+        let conflict = Outcome::Refused(JournalError::Conflict { head: self.head });
+        let Some(decoded) = RecoveryEntry::decode(&entry) else {
+            return Ok(conflict);
+        };
+        if decoded.fence != fence || decoded.at() != at || fence.head.0 == u64::MAX {
+            return Ok(conflict);
+        }
+        let Some(Recorded { record, exact }) = self.recorded.filter(|_| self.recovering()) else {
+            if at < self.floor {
+                return Ok(Outcome::Refused(JournalError::Trimmed {
+                    floor: self.floor,
+                }));
+            }
+            if at <= self.head
+                && let Some(retained) = self.records.get((at.0 - self.floor.0) as usize)
+                && retained.kind() == RecordKind::Recovery
+                && retained.len() == entry.len()
+                && retained.load()? == entry
+            {
+                return Ok(Outcome::At(at));
+            }
+            return Ok(conflict);
+        };
+        if self.epoch() != fence.epoch
+            || self.head != fence.head
+            || decoded.configuration_epoch != record.epoch
+            || decoded.loss_point != record.loss_point
+            || decoded.exact != exact
+            || decoded.source != record.source
+            || decoded.time_unix_ms != record.time_unix_ms
+        {
+            return Ok(conflict);
+        }
+        let len = entry.len() as u32;
+        let offset = segment.len().checked_sub(u64::from(len)).ok_or_else(|| {
+            super::invalid("accepted WAL extent does not contain the recovery entry")
+        })?;
+        let retained = Payload::Extent {
+            object: segment,
+            offset,
+            len,
+            crc: crc32fast::hash(&entry),
+            kind: RecordKind::Recovery,
+        };
+        match self.append(at, retained, quota_bytes) {
+            Ok(_) => {
+                self.recorded = None;
+                let _ = self.acknowledge_recovery();
+                Ok(Outcome::At(at))
+            }
             Err(error) => Ok(Outcome::Refused(error)),
         }
     }
@@ -1542,7 +1848,7 @@ impl Live {
         for (index, payload) in payloads.iter().take(retained).enumerate() {
             let record = &self.records[(at.0 - self.floor.0) as usize + index];
             let lsn = Lsn(at.0 + index as u64);
-            if record.timed()
+            if record.kind() != RecordKind::Data
                 || match self.epochs.epoch(lsn) {
                     Some(epoch) => epoch != self.epoch(),
                     None => genesis.immutable,
@@ -1578,7 +1884,7 @@ impl Live {
                 offset: *offset,
                 len: payload.len() as u32,
                 crc: crc32fast::hash(payload),
-                timed: false,
+                kind: RecordKind::Data,
             });
         }
         self.epochs.note(Lsn(at.0 + retained as u64), self.epoch());

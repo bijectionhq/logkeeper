@@ -202,6 +202,14 @@ finalized keeper cluster version 3 commits its marker at the next LSN
 together with clearing the fence. Keep writers held during a mixed RTDB
 rollout. A legacy RTDB writer can clear the fence without that marker.
 
+At finalized cluster version 10 the recovery records the catalog's record
+in the stream, and clearing its fence writes one typed recovery entry at
+`head + 1`: the epoch, the loss point, the source (survivor or object
+store), the time, and RTDB's marker inside it. Both RTDB's acknowledgement
+and the administrator's below write it, so the stream always records the
+recovery, and no client append can forge it. `head` stays the last record
+kept.
+
 With `multiJournal.holdWritesAfterRecovery: true`, an operator can
 explicitly clear the fence with an administrator principal. Record that
 decision in the incident, since this path bypasses the RTDB marker:

@@ -246,7 +246,11 @@ impl Config {
         // entry past it may be one the lost voters overwrote with other
         // committed records. Before, it keeps the whole log and reports the
         // last point it knows committed as the loss point.
-        let leases = self.catalog_version(disk, rpc).await >= super::super::CLUSTER_VERSION_LEASES;
+        let version = self.catalog_version(disk, rpc).await;
+        let leases = version >= super::super::CLUSTER_VERSION_LEASES;
+        // At this level the stream records the catalog's record, and its
+        // fence clears only by writing the typed recovery entry.
+        let entry = version >= super::super::CLUSTER_VERSION_RECOVERY_ENTRY;
         let exact = leases && point.written.is_none();
         if exact && point.committed.is_none() && point.tip.is_some() {
             return Err(invalid(
@@ -644,7 +648,7 @@ impl Config {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_millis() as u64),
         };
-        let (fenced, wait) = match self
+        let (fenced, wait, record) = match self
             .recover_in_catalog(disk, rpc, placement, &stage, &dead, record)
             .await
             .map_err(|error| {
@@ -667,7 +671,13 @@ impl Config {
                          or fenced, then name it with --lost and run this again"
                     )));
                 }
-                (recovered.fenced, Duration::from_millis(recovered.wait_ms))
+                // An earlier run may have committed the catalog's record:
+                // the stream carries the catalog's, not this run's.
+                (
+                    recovered.fenced,
+                    Duration::from_millis(recovered.wait_ms),
+                    Some(recovered.record),
+                )
             }
             None if named => {
                 self.stage_in_catalog(disk, rpc, placement, &stage)
@@ -678,7 +688,7 @@ impl Config {
                              stay fenced: {error}"
                         ))
                     })?;
-                (Vec::new(), Duration::ZERO)
+                (Vec::new(), Duration::ZERO, None)
             }
             None => {
                 return Err(invalid(format!(
@@ -720,7 +730,14 @@ impl Config {
         if let Some((restore, _)) = &offload {
             commands.push(Command::Restore(restore.clone()));
         }
-        commands.push(Command::Recover(stage.clone()));
+        commands.push(match record.filter(|_| entry) {
+            Some(record) => Command::RecoverRecorded {
+                stage: stage.clone(),
+                record,
+                exact: exact || restored,
+            },
+            None => Command::Recover(stage.clone()),
+        });
         let mut entries = commands
             .into_iter()
             .enumerate()

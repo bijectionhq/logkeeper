@@ -306,16 +306,32 @@ async fn losing_three_of_five_recovers_from_the_more_advanced_survivor() {
         },
     )
     .unwrap();
+    // The acknowledgement returns the last record kept and writes the
+    // recovery's typed entry after it.
     assert_eq!(contract.acknowledge_recovery(stream).await, Ok(Lsn(5)));
     let epoch = Epoch(report.epoch.0 + 1);
-    assert_eq!(contract.seal(stream, epoch).await, Ok(Lsn(5)));
+    assert_eq!(contract.seal(stream, epoch).await, Ok(Lsn(6)));
     assert_eq!(
-        contract.append(stream, epoch, Lsn(6), record(6)).await,
-        Ok(Lsn(6))
+        contract.append(stream, epoch, Lsn(7), record(7)).await,
+        Ok(Lsn(7))
     );
-    reads_back(&journal, stream, 6).await;
+    let kept = journal
+        .read(stream, Lsn(1), 5, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        kept.records,
+        (1..=5).map(|at| (Lsn(at), record(at))).collect::<Vec<_>>()
+    );
+    let page = journal
+        .read(stream, Lsn(6), 2, Duration::ZERO)
+        .await
+        .unwrap();
+    let entry = page.recovery(Lsn(6)).expect("the recovery entry");
+    assert_eq!(entry.fence.head, Lsn(5));
+    assert_eq!(page.records[1], (Lsn(7), record(7)));
     // The kept survivor and the three replacements hold the recovered log.
-    applied(&cluster, stream, &report.voters, 6).await;
+    applied(&cluster, stream, &report.voters, 7).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

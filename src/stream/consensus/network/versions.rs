@@ -149,6 +149,8 @@ impl Reply {
 /// translated to `Unavailable` by `outcome_v1`.
 pub(in crate::stream::consensus) fn outcome_introduced(outcome: &Outcome) -> WireVersion {
     match outcome {
+        // N-1 knows no entry kinds: a page with recovery entries is newer.
+        Outcome::Page(page) if !page.recoveries.is_empty() => WireVersion::Current,
         Outcome::Unit
         | Outcome::Sealed(_)
         | Outcome::At(_)
@@ -156,7 +158,10 @@ pub(in crate::stream::consensus) fn outcome_introduced(outcome: &Outcome) -> Wir
         | Outcome::Configuration(_)
         | Outcome::OriginalSample(_)
         | Outcome::OriginalEvidence(_) => WireVersion::Previous,
-        Outcome::RecoveryFence(_) | Outcome::Offload(_) | Outcome::Checkpoint(_) => {
+        Outcome::RecoveryFence(_)
+        | Outcome::Offload(_)
+        | Outcome::Checkpoint(_)
+        | Outcome::RecoveryPage(_) => {
             WireVersion::Current
         }
         Outcome::Refused(error) => error_introduced(error),

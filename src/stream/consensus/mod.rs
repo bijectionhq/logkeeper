@@ -94,8 +94,15 @@ pub const CLUSTER_VERSION_V7: u32 = 7;
 pub const CLUSTER_VERSION_REPLICATION: u32 = CLUSTER_VERSION_V7;
 /// Enables atomic checkpoint selection and removes unchecked immutable trim.
 pub const CLUSTER_VERSION_CHECKPOINT_INSTALL: u32 = 8;
+/// Cluster feature level of the typed recovery entry:
+/// `Command::RecoverRecorded`, `Command::RecoveryEntry`, the record kind
+/// bit and the snapshot formats that carry a recorded recovery. Level 9 is
+/// claimed for recovery exclusion (AGENTS-COORDINATION.md).
+pub const CLUSTER_VERSION_V10: u32 = 10;
+/// The level the typed recovery entry waits for.
+pub const CLUSTER_VERSION_RECOVERY_ENTRY: u32 = CLUSTER_VERSION_V10;
 /// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_CHECKPOINT_INSTALL;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V10;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -125,6 +132,9 @@ pub mod features {
     pub const REPLICATION_FACTOR: u64 = 1 << 9;
     /// Supports checkpoint installation and its durable selection.
     pub const CHECKPOINT_INSTALL: u64 = 1 << 10;
+    /// Applies `Command::RecoverRecorded` and `Command::RecoveryEntry` and
+    /// reads typed recovery entries in snapshots and offloaded objects.
+    pub const RECOVERY_ENTRY: u64 = 1 << 12;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 = VERSION_NEGOTIATION
@@ -136,7 +146,8 @@ pub mod features {
         | OFFLOAD
         | LEASES
         | REPLICATION_FACTOR
-        | CHECKPOINT_INSTALL;
+        | CHECKPOINT_INSTALL
+        | RECOVERY_ENTRY;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;

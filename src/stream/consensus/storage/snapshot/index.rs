@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::{Genesis, Image, Payload, Selected, SnapshotMeta, invalid, sha256};
 use crate::stream::consensus::{
     decode, encode,
-    state::{EpochRuns, MAX_RETAINED_RECORDS, Offload, TIMED_RECORD},
+    state::{EpochRuns, MAX_RETAINED_RECORDS, Offload, RecordKind, Recorded},
     storage::objects::{Key, Location, Object, Objects, Reference},
 };
 
@@ -29,10 +29,17 @@ pub(super) const MAGIC_WITHOUT_EPOCHS: &[u8; 8] = b"LKRIDX01";
 /// Roots that also store offload progress. Written only once a stream has
 /// offloaded, which needs the finalized `CLUSTER_VERSION_OFFLOAD`.
 const MAGIC_WITH_OFFLOAD: &[u8; 8] = b"LKRIDX03";
+/// Roots that also store a recorded recovery. Written only while a recorded
+/// recovery's fence stands, which needs the finalized
+/// `CLUSTER_VERSION_RECOVERY_ENTRY`.
+const MAGIC_WITH_RECOVERY: &[u8; 8] = b"LKRIDX04";
 
 /// Whether a selected snapshot starts with an index root.
 pub(in crate::stream::consensus::storage) fn indexed(magic: &[u8; 8]) -> bool {
-    magic == MAGIC || magic == MAGIC_WITHOUT_EPOCHS || magic == MAGIC_WITH_OFFLOAD
+    magic == MAGIC
+        || magic == MAGIC_WITHOUT_EPOCHS
+        || magic == MAGIC_WITH_OFFLOAD
+        || magic == MAGIC_WITH_RECOVERY
 }
 const PAGE: usize = 128;
 const MAX_PAGES: usize = MAX_RETAINED_RECORDS / PAGE + 1;
@@ -165,7 +172,12 @@ pub(super) fn build(
         legacy: dependencies.legacy.clone(),
     };
     let offload = image.state.offload();
-    let (magic, root) = if offload != Offload::default() {
+    let (magic, root) = if let Some(recorded) = image.state.recorded() {
+        (
+            MAGIC_WITH_RECOVERY,
+            encode(&(root, image.state.epoch_runs(), offload, recorded))?,
+        )
+    } else if offload != Offload::default() {
         (
             MAGIC_WITH_OFFLOAD,
             encode(&(root, image.state.epoch_runs(), offload))?,
@@ -195,7 +207,7 @@ pub(super) fn open(
     if bytes.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("invalid indexed snapshot root"));
     }
-    let (mut root, epochs, offload) = decode_root(&bytes)?;
+    let (mut root, epochs, offload, recorded) = decode_root(&bytes)?;
     root.image.stage_intent = root.meta.snapshot_id.starts_with(super::STAGED_IMAGE);
     if &root.genesis != genesis
         || root.meta.last_log_id != Some(selected.log_id)
@@ -264,20 +276,32 @@ pub(super) fn open(
         .restore_records(records, genesis.quota_bytes)?;
     root.image.state.restore_epochs(epochs)?;
     root.image.state.restore_offload(offload)?;
+    root.image.state.restore_recorded(recorded)?;
     Ok((root.meta, root.image, dependencies))
 }
 
-fn decode_root(bytes: &[u8]) -> io::Result<(Root, EpochRuns, Offload)> {
+type DecodedRoot = (Root, EpochRuns, Offload, Option<Recorded>);
+
+fn decode_root(bytes: &[u8]) -> io::Result<DecodedRoot> {
     if bytes.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("invalid indexed snapshot root"));
     }
     if let Some(body) = bytes.strip_prefix(MAGIC) {
         let (root, epochs) = decode(body)?;
-        Ok((root, epochs, Offload::default()))
+        Ok((root, epochs, Offload::default(), None))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_OFFLOAD) {
-        decode(body)
+        let (root, epochs, offload) = decode(body)?;
+        Ok((root, epochs, offload, None))
+    } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_RECOVERY) {
+        let (root, epochs, offload, recorded) = decode(body)?;
+        Ok((root, epochs, offload, Some(recorded)))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITHOUT_EPOCHS) {
-        Ok((decode(body)?, EpochRuns::default(), Offload::default()))
+        Ok((
+            decode(body)?,
+            EpochRuns::default(),
+            Offload::default(),
+            None,
+        ))
     } else {
         Err(invalid("invalid indexed snapshot root"))
     }
@@ -289,7 +313,7 @@ pub(in crate::stream::consensus::storage) fn scrub_root(
     stream: StreamId,
     selected: Selected,
 ) -> io::Result<(VecDeque<Key>, VecDeque<[u8; 32]>)> {
-    let (root, _, _) = decode_root(bytes)?;
+    let (root, ..) = decode_root(bytes)?;
     if root.genesis.stream != stream
         || root.meta.last_log_id != Some(selected.log_id)
         || root.pages.len() > MAX_PAGES
@@ -340,14 +364,14 @@ impl Span {
                 offset,
                 len,
                 crc,
-                timed,
+                kind,
             } => Self {
                 source: match object.reference() {
                     Reference::Object(key) => Source::Object(key),
                     Reference::Segment(location) => Source::Segment(location),
                 },
                 offset: *offset,
-                len: *len | if *timed { TIMED_RECORD } else { 0 },
+                len: *len | kind.flag(),
                 crc: *crc,
             },
             Payload::Snapshot {
@@ -355,14 +379,14 @@ impl Span {
                 offset,
                 len,
                 crc,
-                timed,
+                kind,
                 ..
             } => {
                 legacy.insert(*digest);
                 Self {
                     source: Source::Legacy(*digest),
                     offset: *offset,
-                    len: *len | if *timed { TIMED_RECORD } else { 0 },
+                    len: *len | kind.flag(),
                     crc: *crc,
                 }
             }
@@ -382,18 +406,16 @@ impl Span {
             len,
             crc,
         } = self;
-        let timed = len & TIMED_RECORD != 0;
-        let len = len & !TIMED_RECORD;
-        if len as usize > crate::stream::consensus::MAX_RECORD {
-            return Err(invalid("snapshot extent exceeds record bound"));
-        }
+        let (kind, len) = RecordKind::split(len)
+            .filter(|(kind, len)| kind.fits(*len as usize))
+            .ok_or_else(|| invalid("snapshot extent exceeds record bound"))?;
         let payload = match source {
             Source::Object(key) if key.scope == scope => Payload::Extent {
                 object: objects.pin(key)?,
                 offset,
                 len,
                 crc,
-                timed,
+                kind,
             },
             // Records of one batch entry share its slice, as they did when
             // the entry was applied.
@@ -405,7 +427,7 @@ impl Span {
                 offset,
                 len,
                 crc,
-                timed,
+                kind,
             },
             Source::Legacy(digest) => Payload::Snapshot {
                 file: legacy
@@ -416,7 +438,7 @@ impl Span {
                 offset,
                 len,
                 crc,
-                timed,
+                kind,
             },
             _ => return Err(invalid("foreign snapshot payload extent")),
         };

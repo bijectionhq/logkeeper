@@ -348,7 +348,13 @@ impl Engine {
         if target > CLUSTER_VERSION_CURRENT {
             return Err(JournalError::Unsupported);
         }
-        let required_feature = if target >= super::super::CLUSTER_VERSION_CHECKPOINT_INSTALL {
+        let required_feature = if target >= super::super::CLUSTER_VERSION_RECOVERY_ENTRY {
+            features::RECOVERY_ENTRY
+                | features::CHECKPOINT_INSTALL
+                | features::REPLICATION_FACTOR
+                | features::LEASES
+                | features::OFFLOAD
+        } else if target >= super::super::CLUSTER_VERSION_CHECKPOINT_INSTALL {
             features::CHECKPOINT_INSTALL
                 | features::REPLICATION_FACTOR
                 | features::LEASES

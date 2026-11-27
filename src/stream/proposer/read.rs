@@ -201,11 +201,9 @@ fn chunk(response: Response, from: Lsn) -> Result<Page> {
             floor,
             records,
             head,
-        }) if floor.0 > 0 && floor <= from && floor.0 - 1 <= head.0 => Ok(Page {
-            floor,
-            records,
-            head,
-        }),
+        }) if floor.0 > 0 && floor <= from && floor.0 - 1 <= head.0 => {
+            Ok(Page::new(floor, records, head))
+        }
         Err(JournalError::Trimmed { floor }) if floor <= from => Err(JournalError::Unavailable),
         Err(error) => Err(error),
         _ => Err(JournalError::Unavailable),

@@ -144,7 +144,10 @@ async fn a_live_catalog_grows_through_joint_consensus_and_reopens() {
         Err(JournalError::Unsupported),
     );
     cluster.finalize().await;
-    let current = client.replace(STREAM, original.revision, expanded).await.unwrap();
+    let current = client
+        .replace(STREAM, original.revision, expanded)
+        .await
+        .unwrap();
     assert_eq!(current.voters, expanded);
     assert_eq!(
         client.replace(STREAM, original.revision, expanded).await,

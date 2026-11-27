@@ -64,6 +64,123 @@ pub struct RecoveryFence {
     pub head: Lsn,
 }
 
+/// Where a recovered history's last kept record came from.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RecoverySource {
+    /// The surviving voter's log.
+    Survivor,
+    /// The object store's committed run, longer than the survivor's log.
+    ObjectStore,
+}
+
+/// The typed entry an operator recovery leaves in its stream: the first
+/// entry of the recovered configuration epoch, at `fence.head + 1`.
+///
+/// The journal writes it when the recovery fence is cleared, by
+/// `acknowledge_recovery` or `acknowledge_recovery_with_marker`, and only
+/// then. It is never client data: no append can produce an entry of this
+/// kind, whatever its bytes, so a reader that finds one in
+/// [`Page::recoveries`] knows an operator recovery happened there. In
+/// [`Page::records`] the same position holds the entry's canonical encoding
+/// ([`RecoveryEntry::encode`]), so positions stay contiguous.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryEntry {
+    /// The recovery fence this entry cleared. `fence.head` is the last
+    /// record the recovery kept, and the entry sits right after it.
+    pub fence: RecoveryFence,
+    /// The configuration epoch the recovery installed.
+    pub configuration_epoch: u64,
+    /// The last record the recovered history kept, as the recovery reported
+    /// it. Records a writer was acknowledged above it are lost.
+    pub loss_point: Lsn,
+    /// Whether `loss_point` is exact: the recovery knew the history's
+    /// committed point. When false, records between it and `fence.head` may
+    /// differ from what writers were acknowledged.
+    pub exact: bool,
+    pub source: RecoverySource,
+    /// When the recovery was committed, in Unix milliseconds.
+    pub time_unix_ms: u64,
+    /// The consumer's marker, given to `acknowledge_recovery_with_marker`.
+    pub marker: Option<Bytes>,
+}
+
+impl RecoveryEntry {
+    const MAGIC: &'static [u8; 8] = b"LKRECOV1";
+    /// The encoded size of an entry without its marker.
+    pub const HEADER_BYTES: usize = 8 + 5 * 8 + 3;
+
+    /// The entry's canonical encoding: what [`Page::records`] holds at its
+    /// position and what a journal stores.
+    pub fn encode(&self) -> Bytes {
+        let marker = self.marker.as_deref().unwrap_or_default();
+        let mut out = Vec::with_capacity(Self::HEADER_BYTES + marker.len());
+        out.extend_from_slice(Self::MAGIC);
+        for value in [
+            self.fence.epoch.0,
+            self.fence.head.0,
+            self.configuration_epoch,
+            self.loss_point.0,
+            self.time_unix_ms,
+        ] {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        out.push(match self.source {
+            RecoverySource::Survivor => 0,
+            RecoverySource::ObjectStore => 1,
+        });
+        out.push(u8::from(self.exact));
+        out.push(u8::from(self.marker.is_some()));
+        out.extend_from_slice(marker);
+        Bytes::from(out)
+    }
+
+    /// Decodes a canonical encoding. `None` for any other bytes.
+    pub fn decode(bytes: &Bytes) -> Option<Self> {
+        let header = bytes.get(..Self::HEADER_BYTES)?;
+        if &header[..8] != Self::MAGIC {
+            return None;
+        }
+        let word = |index: usize| {
+            let at = 8 + index * 8;
+            u64::from_be_bytes(header[at..at + 8].try_into().unwrap())
+        };
+        let source = match header[48] {
+            0 => RecoverySource::Survivor,
+            1 => RecoverySource::ObjectStore,
+            _ => return None,
+        };
+        let exact = match header[49] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let marker = match header[50] {
+            0 if bytes.len() == Self::HEADER_BYTES => None,
+            1 => Some(bytes.slice(Self::HEADER_BYTES..)),
+            _ => return None,
+        };
+        Some(Self {
+            fence: RecoveryFence {
+                epoch: Epoch(word(0)),
+                head: Lsn(word(1)),
+            },
+            configuration_epoch: word(2),
+            loss_point: Lsn(word(3)),
+            exact,
+            time_unix_ms: word(4),
+            source,
+            marker,
+        })
+    }
+
+    /// The entry's position: right after the last record kept.
+    pub fn at(&self) -> Lsn {
+        Lsn(self.fence.head.0.saturating_add(1))
+    }
+}
+
 /// Identifies one writer process or session within its authenticated principal.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -127,6 +244,31 @@ pub struct Page {
     pub records: Vec<(Lsn, Bytes)>,
     /// The committed position observed at the source of this page.
     pub head: Lsn,
+    /// The typed recovery entries among `records`, in LSN order. Every other
+    /// record is client data. Journals without operator recovery leave this
+    /// empty.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub recoveries: Vec<(Lsn, RecoveryEntry)>,
+}
+
+impl Page {
+    /// A page of client data only.
+    pub fn new(floor: Lsn, records: Vec<(Lsn, Bytes)>, head: Lsn) -> Self {
+        Self {
+            floor,
+            records,
+            head,
+            recoveries: Vec::new(),
+        }
+    }
+
+    /// The recovery entry at `at`, when the record there is one.
+    pub fn recovery(&self, at: Lsn) -> Option<&RecoveryEntry> {
+        self.recoveries
+            .binary_search_by_key(&at, |(lsn, _)| *lsn)
+            .ok()
+            .map(|index| &self.recoveries[index].1)
+    }
 }
 
 /// Every way a journal call can fail.
@@ -287,10 +429,12 @@ pub trait Journal: Send + Sync {
     }
 
     /// Accepts an operator recovery of the stream: lifts the recovery fence so
-    /// the next `seal` succeeds, and returns the recovered head. Idempotent.
-    /// The recovery itself already accepted the possible loss; a writer
-    /// acknowledges to record that it noticed. Journals without operator
-    /// recovery return `Unavailable`.
+    /// the next `seal` succeeds, and returns the recovered head, the last
+    /// record kept. Idempotent. The recovery itself already accepted the
+    /// possible loss; a writer acknowledges to record that it noticed. A
+    /// journal that records recoveries in the stream writes the typed
+    /// [`RecoveryEntry`], without a marker, at the head plus one in the same
+    /// decision. Journals without operator recovery return `Unavailable`.
     fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, Result<Lsn>> {
         let _ = stream;
         Box::pin(async { Err(JournalError::Unavailable) })
@@ -301,10 +445,13 @@ pub trait Journal: Send + Sync {
         Box::pin(async { Err(JournalError::Unsupported) })
     }
 
-    /// Appends an opaque marker at `fence.head + 1` under `fence.epoch` and
-    /// clears exactly that fence in one decision. An identical retry returns
-    /// the marker's position while it is retained. A superseded or trimmed
-    /// attempt never appends a record or clears a fence.
+    /// Writes the recovery's entry at `fence.head + 1` under `fence.epoch`,
+    /// carrying `marker`, and clears exactly that fence in one decision. A
+    /// journal that records recoveries in the stream writes the typed
+    /// [`RecoveryEntry`] with the marker inside it; an older one appends the
+    /// marker as an opaque record. An identical retry returns the entry's
+    /// position while it is retained. A superseded or trimmed attempt never
+    /// writes an entry or clears a fence.
     fn acknowledge_recovery_with_marker(
         &self,
         _stream: StreamId,
@@ -317,3 +464,67 @@ pub trait Journal: Send + Sync {
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(marker: Option<&'static [u8]>) -> RecoveryEntry {
+        RecoveryEntry {
+            fence: RecoveryFence {
+                epoch: Epoch(7),
+                head: Lsn(41),
+            },
+            configuration_epoch: 3,
+            loss_point: Lsn(41),
+            exact: true,
+            source: RecoverySource::ObjectStore,
+            time_unix_ms: 1_795_000_000_000,
+            marker: marker.map(Bytes::from_static),
+        }
+    }
+
+    #[test]
+    fn recovery_entries_round_trip_and_refuse_other_bytes() {
+        for marker in [None, Some(&b""[..]), Some(&b"consumer marker"[..])] {
+            let entry = entry(marker);
+            let bytes = entry.encode();
+            assert_eq!(
+                bytes.len(),
+                RecoveryEntry::HEADER_BYTES + marker.map_or(0, <[u8]>::len)
+            );
+            assert_eq!(RecoveryEntry::decode(&bytes), Some(entry.clone()));
+            assert_eq!(entry.at(), Lsn(42));
+        }
+        let bytes = entry(None).encode();
+        assert_eq!(RecoveryEntry::decode(&bytes.slice(..10)), None);
+        let mut extended = bytes.to_vec();
+        extended.push(0);
+        assert_eq!(RecoveryEntry::decode(&Bytes::from(extended)), None);
+        for (at, value) in [(48, 2), (49, 2), (50, 2)] {
+            let mut damaged = bytes.to_vec();
+            damaged[at] = value;
+            assert_eq!(RecoveryEntry::decode(&Bytes::from(damaged)), None);
+        }
+        assert_eq!(
+            RecoveryEntry::decode(&Bytes::from_static(b"client data")),
+            None
+        );
+    }
+
+    #[test]
+    fn pages_find_their_recovery_entries() {
+        let entry = entry(Some(b"m"));
+        let page = Page {
+            floor: Lsn(40),
+            records: vec![
+                (Lsn(41), Bytes::from_static(b"kept")),
+                (Lsn(42), entry.encode()),
+            ],
+            head: Lsn(42),
+            recoveries: vec![(Lsn(42), entry.clone())],
+        };
+        assert_eq!(page.recovery(Lsn(42)), Some(&entry));
+        assert_eq!(page.recovery(Lsn(41)), None);
+    }
+}

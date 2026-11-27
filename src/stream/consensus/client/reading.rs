@@ -336,6 +336,14 @@ fn checked_page(
                         || *at > page.head
                         || payload.len() > MAX_RECORD
                 })
+            // Each recovery entry names a record of the page, in order,
+            // whose bytes are its canonical encoding.
+            || page.recoveries.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || page.recoveries.iter().any(|(at, entry)| {
+                at.0.checked_sub(from.0)
+                    .and_then(|offset| page.records.get(offset as usize))
+                    .is_none_or(|(_, bytes)| entry.at() != *at || *bytes != entry.encode())
+            })
         {
             return None;
         }
@@ -435,11 +443,11 @@ mod tests {
         let page = |scope: Genesis, head| Reply::ScopedPage {
             genesis: scope,
             configuration: None,
-            outcome: Outcome::Page(Page {
-                floor: Lsn(1),
-                head: Lsn(head),
-                records: vec![(Lsn(1), Bytes::from_static(b"one"))],
-            }),
+            outcome: Outcome::Page(Page::new(
+                Lsn(1),
+                vec![(Lsn(1), Bytes::from_static(b"one"))],
+                Lsn(head),
+            )),
         };
         assert!(checked_page(page(genesis.clone(), 4), &genesis, Lsn(1), 1, Lsn(4)).is_some());
         assert!(checked_page(page(genesis.clone(), 3), &genesis, Lsn(1), 1, Lsn(4)).is_none());

@@ -734,9 +734,9 @@ impl Engine {
         }
         for entry in &request.entries {
             let valid = match &entry.payload {
-                openraft::EntryPayload::Membership(membership) => {
-                    self.placement.structural_membership(group.genesis.stream, membership)
-                }
+                openraft::EntryPayload::Membership(membership) => self
+                    .placement
+                    .structural_membership(group.genesis.stream, membership),
                 openraft::EntryPayload::Normal(command) => match command.body() {
                     Command::Stage(stage) | Command::StageOwned(stage) => {
                         stage.stream == group.genesis.stream
@@ -747,6 +747,16 @@ impl Engine {
                             && stage.stream == group.genesis.stream
                             && self.placement.structural_stage(stage)
                             && stage.recovery()
+                    }
+                    Command::RecoverRecorded { stage, record, .. } => {
+                        !group.genesis.immutable
+                            && stage.stream == group.genesis.stream
+                            && record.stream == group.genesis.stream
+                            && self.placement.structural_stage(stage)
+                            && stage.recovery()
+                    }
+                    Command::RecoveryEntry { entry, fence, at } => {
+                        entry.len() <= MAX_RECORD && fence.head.0.checked_add(1) == Some(at.0)
                     }
                     Command::Append { payload, .. } => payload.len() <= MAX_RECORD,
                     Command::InstallCheckpoint { checkpoint, .. } => {

@@ -40,7 +40,7 @@ use crate::stream::{
     consensus::{
         CLUSTER_VERSION_OFFLOAD, MAX_PAGE, MAX_RECORDS_PER_PAGE, decisions,
         offload::{LineageRecord, OffloadConfig, Store},
-        state::{Command, Outcome, Remote},
+        state::{Command, Outcome, RecordKind, Remote},
     },
     timed::EVIDENCE_BYTES,
 };
@@ -177,17 +177,23 @@ impl Offloader {
                 }
             })?;
         crate::stream::consensus::metrics::count(&metrics.remote_reads);
+        let mut recoveries = Vec::new();
         let records = records
             .into_iter()
             .map(|record| {
-                let bytes = if record.timed {
-                    record
+                let bytes = match record.kind {
+                    RecordKind::Timed => record
                         .bytes
                         .get(EVIDENCE_BYTES..)
                         .map(|payload| record.bytes.slice_ref(payload))
-                        .ok_or(JournalError::Corrupted)?
-                } else {
-                    record.bytes
+                        .ok_or(JournalError::Corrupted)?,
+                    RecordKind::Recovery => {
+                        let entry = journal_contract::RecoveryEntry::decode(&record.bytes)
+                            .ok_or(JournalError::Corrupted)?;
+                        recoveries.push((record.lsn, entry));
+                        record.bytes
+                    }
+                    RecordKind::Data => record.bytes,
                 };
                 Ok((record.lsn, bytes))
             })
@@ -196,6 +202,7 @@ impl Offloader {
             floor: remote.floor,
             records,
             head: remote.head,
+            recoveries,
         })
     }
 }

@@ -756,7 +756,7 @@ mod tests {
         (first..=last)
             .map(|lsn| Record {
                 lsn: Lsn(lsn),
-                timed: false,
+                kind: crate::stream::consensus::state::RecordKind::Data,
                 bytes: Bytes::from(format!("r{lsn}")),
             })
             .collect()

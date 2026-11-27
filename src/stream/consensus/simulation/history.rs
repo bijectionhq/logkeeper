@@ -723,6 +723,11 @@ impl History {
             //     (and any acknowledged payload in the same recovery era).
             for (era, page) in &history.observed_reads {
                 for (lsn, payload) in &page.records {
+                    // A typed recovery entry is the journal's, never a
+                    // client's: no append proposed it.
+                    if page.recovery(*lsn).is_some() {
+                        continue;
+                    }
                     if *era == history.era
                         && let Some(acked) = history.acked.get(lsn)
                         && acked != payload
@@ -850,6 +855,7 @@ impl History {
                             || w[0].floor != w[1].floor
                             || w[0].head != w[1].head
                             || w[0].records != w[1].records
+                            || w[0].recoveries != w[1].recoveries
                     })
                 {
                     return Err(Violation::CrossVoterDivergence {
@@ -915,6 +921,9 @@ impl History {
 
                     // Every record on disk must match some payload actually proposed for that LSN.
                     for (lsn, bytes) in &final_state.records {
+                        if final_state.recoveries.contains(lsn) {
+                            continue;
+                        }
                         if history
                             .proposed
                             .get(lsn)

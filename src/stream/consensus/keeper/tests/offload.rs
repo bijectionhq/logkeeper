@@ -335,7 +335,7 @@ async fn uploads_after_a_crash_mid_upload_are_idempotent_and_corruption_is_detec
     let records = (1..=20)
         .map(|lsn| Record {
             lsn: Lsn(lsn),
-            timed: false,
+            kind: crate::stream::consensus::state::RecordKind::Data,
             bytes: payload(lsn),
         })
         .collect::<Vec<_>>();
@@ -412,7 +412,9 @@ async fn uploads_after_a_crash_mid_upload_are_idempotent_and_corruption_is_detec
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovery_from_one_survivor_restores_the_longer_object_store_history() {
     let store = tempfile::tempdir().unwrap();
-    let mut cluster = Cluster::start_offloaded(&offload_config(store.path())).await;
+    let mut config = offload_config(store.path());
+    config.retain_local_bytes = Some(1000);
+    let mut cluster = Cluster::start_offloaded(&config).await;
     let journal = cluster.client(&cluster.credentials);
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(44);
@@ -492,20 +494,118 @@ async fn recovery_from_one_survivor_restores_the_longer_object_store_history() {
         journal.seal(stream, Epoch(2), Uuid::from_u128(99)).await,
         Err(JournalError::Recovered { head: Lsn(50) })
     );
+    // The acknowledgement returns the last record kept and writes the
+    // recovery's typed entry after it, naming the object store as source.
     assert_eq!(journal.acknowledge_recovery(stream).await, Ok(Lsn(50)));
-    let fence = journal
+    let sealed = journal
         .seal(stream, Epoch(2), Uuid::from_u128(100))
         .await
-        .unwrap()
-        .fence;
-    append_range(&journal, stream, fence, 51, 60).await;
-    let status = flushed(&journal, stream, 60).await;
+        .unwrap();
+    assert_eq!(sealed.head, Lsn(51));
+    let page = journal
+        .read(stream, Lsn(51), 1, Duration::ZERO)
+        .await
+        .unwrap();
+    let entry = page.recovery(Lsn(51)).cloned().expect("the recovery entry");
+    assert_eq!(entry.source, journal_contract::RecoverySource::ObjectStore);
+    assert_eq!(entry.loss_point, Lsn(50));
+    assert_eq!(entry.loss_point, offload.kept_through);
+    assert!(entry.exact);
+    assert_eq!(entry.fence.head, Lsn(50));
+    assert_eq!(entry.configuration_epoch, report.revision);
+    assert_eq!(entry.marker, None);
+    append_range(&journal, stream, sealed.fence, 52, 61).await;
+    let status = flushed(&journal, stream, 61).await;
     assert_eq!(status.lineage, report.revision);
     assert_eq!(
         status.lineages,
         vec![(0, Lsn(1)), (report.revision, Lsn(51))]
     );
-    check(&read_all(&journal, stream, 1, 60).await, 1, 60);
+    // The recovered lineage's objects hold the entry with its kind, and
+    // once retention drops the local copy the store serves it typed.
+    let objects = crate::stream::consensus::offload::Store::open(&config).unwrap();
+    let stored = objects
+        .read(stream, report.revision, Lsn(51), Lsn(51), 1, 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored[0].kind,
+        crate::stream::consensus::state::RecordKind::Recovery
+    );
+    assert_eq!(stored[0].bytes, entry.encode());
+    timeout(WAIT, async {
+        while journal
+            .offload_status(stream, false)
+            .await
+            .unwrap()
+            .local_floor
+            <= Lsn(51)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("retention dropped the local copy of the entry");
+    let page = journal
+        .read(stream, Lsn(49), 4, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.recoveries, vec![(Lsn(51), entry.clone())]);
+    let mut records = read_all(&journal, stream, 1, 61).await;
+    assert_eq!(records.remove(50), (Lsn(51), entry.encode()));
+    let expected = (1..=61)
+        .filter(|lsn| *lsn != 51)
+        .map(|lsn| (Lsn(lsn), payload(lsn)))
+        .collect::<Vec<_>>();
+    assert_eq!(records, expected);
+
+    // An export carries the entry verbatim, and an import keeps its kind.
+    let work = tempfile::tempdir().unwrap();
+    let operator = operator_file(&cluster, store.path(), work.path());
+    let export = work.path().join("export");
+    let exported = super::operator::admin(&[
+        "export-stream",
+        "--config",
+        &operator,
+        "--stream",
+        &Uuid::from_u128(stream.0).to_string(),
+        "--to",
+        export.to_str().unwrap(),
+    ])
+    .await
+    .unwrap();
+    assert!(exported.ok, "{:?}", exported.report);
+    let imported = StreamId(49);
+    let voters = report
+        .voters
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let outcome = super::operator::admin(&[
+        "import-stream",
+        "--config",
+        &operator,
+        "--from",
+        export.to_str().unwrap(),
+        "--stream",
+        &Uuid::from_u128(imported.0).to_string(),
+        "--quota-bytes",
+        "16777216",
+        "--voters",
+        &voters,
+    ])
+    .await
+    .unwrap();
+    assert!(outcome.ok, "{:?}", outcome.report);
+    let page = journal
+        .read(imported, Lsn(50), 3, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.recoveries, vec![(Lsn(51), entry.clone())]);
+    let mut records = read_all(&journal, imported, 1, 61).await;
+    assert_eq!(records.remove(50), (Lsn(51), entry.encode()));
+    assert_eq!(records, expected);
     cluster.stop_all().await;
 }
 
@@ -894,7 +994,7 @@ async fn offload_to_minio_is_idempotent_and_serves_reads_below_the_local_floor()
     let records = (1..=3)
         .map(|lsn| Record {
             lsn: Lsn(lsn),
-            timed: false,
+            kind: crate::stream::consensus::state::RecordKind::Data,
             bytes: payload(lsn),
         })
         .collect::<Vec<_>>();

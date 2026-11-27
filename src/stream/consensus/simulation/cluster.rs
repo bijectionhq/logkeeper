@@ -113,6 +113,8 @@ pub(super) struct VoterSnapshot {
     pub floor: Lsn,
     pub head: Lsn,
     pub records: Vec<(Lsn, Bytes)>,
+    /// The positions of `records` that are typed recovery entries.
+    pub recoveries: std::collections::BTreeSet<Lsn>,
     pub configuration: Option<Configuration>,
 }
 
@@ -688,6 +690,7 @@ impl SimCluster {
                 floor: Lsn(1),
                 head: Lsn(0),
                 records: Vec::new(),
+                recoveries: Default::default(),
                 configuration,
             });
         }
@@ -713,6 +716,7 @@ impl SimCluster {
                 floor: Lsn(1),
                 head: Lsn(0),
                 records: Vec::new(),
+                recoveries: Default::default(),
                 configuration,
             }),
             Err(JournalError::NotFound) | Err(_) => None,
@@ -731,6 +735,7 @@ impl SimCluster {
                             floor: Lsn(1),
                             head: Lsn(0),
                             records: Vec::new(),
+                            recoveries: Default::default(),
                             configuration,
                         });
                     }
@@ -741,6 +746,7 @@ impl SimCluster {
                 // Read the dropped part back from the store through this
                 // keeper's own store path, so durability covers it too.
                 let mut records = Vec::new();
+                let mut recoveries = std::collections::BTreeSet::new();
                 let mut below = floor;
                 while below < start {
                     let remote = state.remote(below)?;
@@ -755,8 +761,10 @@ impl SimCluster {
                         return None;
                     };
                     below = Lsn(last.0 + 1);
+                    recoveries.extend(page.recoveries.iter().map(|(lsn, _)| *lsn));
                     records.extend(page.records);
                 }
+                recoveries.extend(first_page.recoveries.iter().map(|(lsn, _)| *lsn));
                 records.extend(first_page.records);
                 let mut next = records
                     .last()
@@ -768,6 +776,7 @@ impl SimCluster {
                         break;
                     }
                     next = Lsn(page.records.last().unwrap().0.0 + 1);
+                    recoveries.extend(page.recoveries.iter().map(|(lsn, _)| *lsn));
                     records.extend(page.records);
                 }
                 Some(VoterSnapshot {
@@ -776,6 +785,7 @@ impl SimCluster {
                     floor,
                     head: observed_head,
                     records,
+                    recoveries,
                     configuration,
                 })
             }

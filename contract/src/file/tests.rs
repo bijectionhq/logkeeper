@@ -84,7 +84,8 @@ async fn check_live(journal: &FileJournal) {
         Ok(Page {
             floor: Lsn(2),
             head: Lsn(3),
-            records: vec![(Lsn(2), bytes(b"bbbb")), (Lsn(3), bytes(b"cccc"))]
+            records: vec![(Lsn(2), bytes(b"bbbb")), (Lsn(3), bytes(b"cccc"))],
+            recoveries: Vec::new(),
         }),
         "{LIVE_RECOVERY}"
     );

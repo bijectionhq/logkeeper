@@ -945,15 +945,34 @@ impl Reply {
 
 pub(super) fn encode_reply(reply: Reply, version: WireVersion) -> io::Result<Vec<u8>> {
     match version {
-        WireVersion::Current => encode(&reply),
+        WireVersion::Current => encode(&reply.map_outcome(Outcome::for_wire)),
         WireVersion::Previous => encode(&ReplyV1::from_reply(reply)?),
     }
 }
 
 pub(super) fn decode_reply(bytes: &[u8], version: WireVersion) -> io::Result<Reply> {
     match version {
-        WireVersion::Current => decode(bytes),
+        WireVersion::Current => Ok(decode::<Reply>(bytes)?.map_outcome(Outcome::from_wire)),
         WireVersion::Previous => Ok(decode::<ReplyV1>(bytes)?.into_reply()),
+    }
+}
+
+impl Reply {
+    /// The reply with `map` applied to the outcome it carries.
+    fn map_outcome(self, map: impl FnOnce(Outcome) -> Outcome) -> Self {
+        match self {
+            Self::Decision(outcome) => Self::Decision(map(outcome)),
+            Self::ScopedPage {
+                genesis,
+                configuration,
+                outcome,
+            } => Self::ScopedPage {
+                genesis,
+                configuration,
+                outcome: map(outcome),
+            },
+            reply => reply,
+        }
     }
 }
 

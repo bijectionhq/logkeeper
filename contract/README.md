@@ -57,6 +57,29 @@ async fn check_writers(writers: [Arc<dyn Journal>; 3]) {
 After a takeover, the consumer must apply the stream through the head
 returned by `seal` before serving requests.
 
+## Operator recovery
+
+A journal with operator recovery may rebuild a stream from fewer replicas
+than it needs, losing acknowledged records. `seal` then returns
+`Recovered { head }`, where `head` is the last record the recovery kept,
+until a writer acknowledges. `recovery_fence` names the fence;
+`acknowledge_recovery_with_marker(stream, fence, marker)` clears exactly
+that fence and `acknowledge_recovery(stream)` clears whichever stands.
+
+A journal that records recoveries in the stream writes one typed
+`RecoveryEntry` at `fence.head + 1` when the fence clears: the first entry of
+the recovered epoch. It carries the fence, the configuration epoch the
+recovery installed, the loss point and whether it is exact, the source (`Survivor` or
+`ObjectStore`), the time, and the marker given to
+`acknowledge_recovery_with_marker`, if any. Readers find it in
+`Page::recoveries`; `Page::records` holds its canonical encoding at the same
+position, so positions stay contiguous. It is never client data: an append of
+the same bytes is an ordinary record, absent from `Page::recoveries`. A
+consumer should treat the typed entry as the one recovery marker and keep no
+marker of its own. Journals without operator recovery leave
+`Page::recoveries` empty; the conformance suite checks that appends never
+produce an entry.
+
 Failures panic with the check name. A seeded history failure includes the seed
 and the recorded calls, intervals, and results. The suite uses 24 seeds with
 41 calls each, plus directed scenarios for errors, retries, fencing, trim

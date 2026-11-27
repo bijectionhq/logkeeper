@@ -32,7 +32,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use journal_contract::{Epoch, JournalError, Lsn, StreamId};
+use journal_contract::{Epoch, JournalError, Lsn, RecoveryEntry, RecoveryFence, StreamId};
 use openraft::{
     BasicNode, ReadPolicy, SnapshotPolicy,
     async_runtime::WatchReceiver,
@@ -2138,9 +2138,11 @@ impl Engine {
                             })
                             .await)
                     }
+                    // Only an operator recovery seals as the recovery
+                    // writer, so no client can stand in its fence.
                     Request::Seal {
                         expected, writer, ..
-                    } if !writer.is_nil() => Ok(group
+                    } if !writer.is_nil() && writer != super::state::RECOVERY_WRITER => Ok(group
                         .write(Command::Seal {
                             expected,
                             writer,
@@ -2265,7 +2267,15 @@ impl Engine {
                     Request::Delete(_) => Ok(group.write(Command::Delete).await),
                     Request::AcknowledgeRecovery(_) => {
                         let actor = owner.as_deref().unwrap_or("unknown");
-                        let reply = group.write(Command::AcknowledgeRecovery).await;
+                        let reply = match group.recovery_entry(None, None).await {
+                            // The entry follows the last record kept, which
+                            // is what an acknowledgement returns.
+                            Some(Reply::Decision(Outcome::At(at))) => {
+                                Reply::Decision(Outcome::At(Lsn(at.0 - 1)))
+                            }
+                            Some(reply) => reply,
+                            None => group.write(Command::AcknowledgeRecovery).await,
+                        };
                         let outcome = describe_audit_reply(&reply);
                         super::logging::audit_acknowledge_recovery(
                             self.id, stream, actor, &outcome,
@@ -2287,9 +2297,18 @@ impl Engine {
                         let Some(at) = fence.head.0.checked_add(1).map(Lsn) else {
                             return Ok(failure(JournalError::Conflict { head: fence.head }));
                         };
-                        let reply = group
-                            .write(Command::AcknowledgeRecoveryWithMarker { fence, at, payload })
-                            .await;
+                        let reply = match group.recovery_entry(Some(fence), Some(&payload)).await {
+                            Some(reply) => reply,
+                            None => {
+                                group
+                                    .write(Command::AcknowledgeRecoveryWithMarker {
+                                        fence,
+                                        at,
+                                        payload,
+                                    })
+                                    .await
+                            }
+                        };
                         let actor = owner.as_deref().unwrap_or("unknown");
                         let outcome = describe_audit_reply(&reply);
                         super::logging::audit_acknowledge_recovery(
@@ -2850,6 +2869,69 @@ impl Group {
         )
     }
 
+    /// Writes the typed entry of a recorded recovery, carrying `marker`,
+    /// when one is recorded: `None` leaves the request to the older
+    /// acknowledgement. `fence`, when given, must be the standing one. A
+    /// retry after the entry was written is answered by the same command,
+    /// built from the entry the stream retains.
+    async fn recovery_entry(
+        &self,
+        fence: Option<RecoveryFence>,
+        marker: Option<&Bytes>,
+    ) -> Option<Reply> {
+        if let Err(reply) = self.barrier(Instant::now() + REQUEST_TIMEOUT).await {
+            return Some(reply);
+        }
+        let entry = match self.state.recorded_recovery() {
+            Err(error) => return Some(failure(error)),
+            Ok(Some((standing, recorded))) => {
+                let record = recorded.record;
+                if fence.is_some_and(|fence| fence != standing) {
+                    return Some(failure(JournalError::Conflict {
+                        head: standing.head,
+                    }));
+                }
+                RecoveryEntry {
+                    fence: standing,
+                    configuration_epoch: record.epoch,
+                    loss_point: record.loss_point,
+                    exact: recorded.exact,
+                    source: record.source,
+                    time_unix_ms: record.time_unix_ms,
+                    marker: marker.cloned(),
+                }
+            }
+            // An exact retry of a written entry: rebuild it from the
+            // retained entry, which the state machine answers with its
+            // position.
+            Ok(None) => {
+                let fence = fence?;
+                let page = self.state.page(Lsn(fence.head.0 + 1), 1).await.ok()?;
+                let (_, written) = page.recoveries.into_iter().next()?;
+                if written.fence != fence || written.marker.as_ref() != marker {
+                    return None;
+                }
+                written
+            }
+        };
+        let encoded = entry.encode();
+        if encoded.len() > super::MAX_RECORD {
+            return Some(failure(JournalError::TooLarge {
+                max: super::MAX_RECORD - RecoveryEntry::HEADER_BYTES,
+            }));
+        }
+        // A recorded recovery exists only once the cluster finalized
+        // `CLUSTER_VERSION_RECOVERY_ENTRY`, so every voter applies this.
+        Some(
+            self.write(Command::RecoveryEntry {
+                fence: entry.fence,
+                at: entry.at(),
+                entry: encoded,
+            })
+            .await,
+        )
+    }
+
     async fn recovery_fence(&self) -> Reply {
         if let Err(reply) = self.barrier(Instant::now() + REQUEST_TIMEOUT).await {
             return reply;
@@ -2911,16 +2993,22 @@ impl Group {
                 page.records.push((lsn, record));
                 added = true;
             }
+            let last = page.recoveries.last().map(|(lsn, _)| *lsn);
+            page.recoveries.extend(
+                part.recoveries
+                    .into_iter()
+                    .filter(|(lsn, _)| *lsn < next && last.is_none_or(|last| last < *lsn)),
+            );
             page.head = page.head.max(part.head);
             if !added {
                 break;
             }
         }
-        Ok(Outcome::Page(page.unwrap_or(journal_contract::Page {
-            floor: from,
-            records: Vec::new(),
-            head: Lsn(0),
-        })))
+        Ok(Outcome::Page(page.unwrap_or(journal_contract::Page::new(
+            from,
+            Vec::new(),
+            Lsn(0),
+        ))))
     }
 
     async fn read(

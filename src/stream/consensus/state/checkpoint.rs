@@ -180,7 +180,7 @@ impl State {
                 offset,
                 len,
                 crc: crc32fast::hash(&record),
-                timed: false,
+                kind: super::RecordKind::Data,
             },
             used,
         );

@@ -1181,7 +1181,7 @@ impl Disk {
                         Command::Stage(stage) | Command::StageOwned(stage) => {
                             !placement.structural_stage(stage) || stage.stream != stream
                         }
-                        Command::Recover(stage) => {
+                        Command::Recover(stage) | Command::RecoverRecorded { stage, .. } => {
                             !placement.structural_stage(stage)
                                 || stage.stream != stream
                                 || !stage.recovery()
@@ -1246,9 +1246,9 @@ impl Disk {
                         && matches!(membership.payload, openraft::EntryPayload::Membership(_)) =>
                 {
                     match &recover.payload {
-                        openraft::EntryPayload::Normal(Command::Recover(stage)) => {
-                            Some(stage.clone())
-                        }
+                        openraft::EntryPayload::Normal(
+                            Command::Recover(stage) | Command::RecoverRecorded { stage, .. },
+                        ) => Some(stage.clone()),
                         _ => None,
                     }
                 }
