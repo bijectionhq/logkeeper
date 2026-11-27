@@ -356,17 +356,44 @@ cargo run --locked --features stream -- keeper recover-stream --config keeper.js
   [--fence-proof LOST1_UUID.fence.json ...] [--with KEEPER_UUID[,...]]
 ```
 
-With two survivors of five, the recovery runs on the more advanced one: the
-survivor whose last log entry is later, or the lower keeper ID on a tie. The
-command asks the other survivor, which keeps running, for its last entry
-(`Request::LocalTip`, keeper-only) and refuses on the less advanced one,
-naming the other. The other survivor keeps its seat in the recovered
-configuration and catches up from the recovering one like any follower; an
-uncommitted suffix of its own is replaced.
+With two survivors of five, the recovery runs on the survivor that knows the
+later commit, then the one whose last log entry is later, then the lower
+keeper ID. The command asks the other survivor, which keeps running, for both
+(`Request::LocalProgress`, keeper-only; a survivor on an older build answers
+`Request::LocalTip`) and refuses on the other one, naming it. The other
+survivor keeps its seat in the recovered configuration and catches up from
+the recovering one like any follower. Whatever it holds past the recovered
+history is replaced, and it never knew any of that committed.
 
 The command takes the keeper's media lock, so it refuses while the keeper
-runs. It replays the whole local log, including entries the survivor never
-saw committed, and asks every other keeper for its status.
+runs, and asks every other keeper for its status.
+
+**What it keeps: the loss point.** Once the cluster has finalized liveness
+leases (level 6), every keeper writes the commit index of each stream it
+holds to its WAL (`Record::Committed`). The recovery then replays and keeps
+the survivor's log only through that durable commit index, or its snapshot
+or purge cut if later. It drops the rest. An entry past it may be one the
+survivor wrote as leader and never committed, at an LSN where the lost
+voters then committed, and acknowledged, another record. The loss point is
+`max(end of the offload store's committed run, survivor's commit)`. The
+command prints it (`RecoveryReport.loss_point`) and the catalog records it.
+It is exact: every record at or below it is the one the stream committed,
+and a writer acknowledged above it lost that record. The recovery refuses a
+survivor that never recorded a commit of the stream.
+
+The commit index costs no fsync of its own: a keeper notes it in memory and
+the next WAL round that runs anyway carries it. A keeper that went idle
+writes it within 500 ms, and a stopping keeper writes it in its last round.
+A keeper that crashes may have committed up to about 500 ms more than it
+wrote. The recovery drops those records too and counts them in the loss.
+
+Before level 6 keepers do not write their commit index. The recovery then
+keeps the survivor's whole log, as before, but reports as the loss point
+only what the survivor knows committed: its last snapshot, or the store's
+longer committed run when that replaces the survivor's copy. The report says
+that the records it kept above that point may have been overwritten by the
+lost voters, and `RecoveryReport.exact` is false. Finalize level 6 before you
+rely on the head after a recovery.
 
 - **Refusals.** It refuses when the survivor is not a voter of the stream's
   latest configuration, when that configuration is joint, and when the other
@@ -414,7 +441,8 @@ saw committed, and asks every other keeper for its status.
   a lost voter held when the recovery committed has ended on its own clock.
 - **The durable step.** One WAL round on the survivor, `Record::Recover`,
   holds a vote for the survivor in a term 2^32 above every term it has seen
-  and two entries in that term. `Command::Recover` stages the move and seals
+  and two entries in that term, written right after the kept prefix. The
+  same round truncates the survivor's log past the prefix. `Command::Recover` stages the move and seals
   the stream under a reserved recovery writer at an epoch one above every
   epoch the survivor applied. The membership entry names the survivor and the
   two replacements. A crash before the round's boundary leaves no trace of it
@@ -423,7 +451,7 @@ saw committed, and asks every other keeper for its status.
 
 Then start the survivor. Its replacements vote for it with their empty logs,
 it becomes leader in the new membership and replicates its log to them, which
-commits the recovery. The stream's head is the survivor's.
+commits the recovery. The stream's head is the loss point.
 
 The recovery fence refuses ordinary appends and trims.
 Every `seal` returns `JournalError::Recovered { head }` until someone acknowledges the fence.
@@ -585,11 +613,12 @@ its log, Neon-style, and records how far it got through Raft:
   keeps uploading under its old lineage can never extend or overwrite the
   recovered history.
 - **Recovery.** `recover-stream` on a keeper with `offload` also reads the
-  store. It keeps every record at or below `max(survivor head, end of the
-  store's committed run)` (`decisions::recovered_head`) and reports that loss
-  point. When the store's run is longer, the recovery record replaces the
-  survivor's copy with it, and the recovered stream serves those records from
-  the store.
+  store. It keeps every record at or below `max(survivor's committed head,
+  end of the store's committed run)` (`decisions::recovered_head`) and reports
+  that loss point. When the store's run is longer, the recovery record
+  replaces the survivor's copy with it, and the recovered stream serves those
+  records from the store. That includes a survivor whose whole log reaches
+  past the store's end with records it never knew committed.
 - **Backup, export, restore.** `logkeeper admin offload-status`,
   `export-stream --to DIR` (flush, then copy the objects and a manifest),
   `import-stream --from DIR --stream NEW` and `restore-stream --from-stream
@@ -897,9 +926,13 @@ ALPNs move, and adding a variant needs a sample there.
 recovery marker; level 4 immutable streams and scoped writer sessions; level
 5 continuous offload; level 6, `CLUSTER_VERSION_LEASES`, makes liveness
 leases authoritative and lets the catalog write keeper records
-(`CatalogRecord::Authority` and `Keepers`). Finalizing level 6 also needs
-every keeper to advertise the `LEASES` feature bit (bit 8). The authority's requests (`RenewLease`, `FenceKeeper`, `RecoverStream`)
-and replies (`Lease`, `Recovered`) are appended without a new ALPN: an N
+(`CatalogRecord::Authority` and `Keepers`). Level 6 also starts the WAL's
+`Record::Committed` frames (appended last to the record enum) and the
+`LKRWAL06` checkpoint, which carries each stream's commit index. An older
+binary refuses both, so do not roll back past level 6. Finalizing level 6 also needs
+every keeper to advertise the `LEASES` feature bit (bit 8). The authority's requests (`RenewLease`, `FenceKeeper`, `RecoverStream`,
+`LocalTip`, `LocalProgress`) and replies (`Lease`, `Recovered`, `Tip`,
+`Progress`) are appended without a new ALPN: an N
 keeper that predates them answers their tags with a typed `Unsupported`, and
 they are refused on N-1 connections, so a mixed cluster keeps today's
 defences and the lease stays advisory until finalization. Keeper configuration ignores

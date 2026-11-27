@@ -52,6 +52,20 @@ Each lost keeper must have held a lease (`logkeeper_consensus_lease_epoch`
 above 0 on it before the loss); the command refuses until you name with
 `--lost` any that never did, which is your statement that it is down.
 
+**Check that the cluster finalized level 6 before you trust the loss
+point.** At level 6 every keeper writes each stream's commit index to its
+WAL, and the recovery keeps exactly the survivor's committed prefix. It
+drops any record the survivor wrote as leader but never knew committed. The
+lost keepers may have committed and acknowledged other records at those
+LSNs. The loss point it prints is then exact: every record at or below it is
+the one the stream committed. Below level 6 the recovery keeps the
+survivor's whole log, and the loss point is only its last snapshot. Records
+above that may differ from what writers were acknowledged. Finalizing after
+the loss does not help: the survivor learned its commits before the loss,
+so finalize level 6 as part of every upgrade. A keeper notes its commit
+index without an fsync of its own and writes it within about 500 ms, so a
+survivor that crashed may count those last commits in the loss.
+
 ## 2. Stop the survivor
 
 `recover-stream` runs on the stopped keeper, under its media lock. Stopping
@@ -70,8 +84,9 @@ lk keeper recover-stream --config $CONFIG --stream STREAM_UUID
 ```
 
 Expected: exit 1 with `refused without --acknowledge-data-loss. This would
-make this keeper's copy of stream <id> (head <n>) the only history: records
-only <lost-1> and <lost-2> held are lost. The voters would become [...] at
+make this keeper's copy of stream <id> through head <n> the only history:
+records only <lost-1> and <lost-2> held are lost, and writers lose every
+record they were acknowledged above <loss point>. The voters would become [...] at
 revision <r>, term <t>, ... To proceed, permanently retire both lost keepers
 and add --acknowledge-data-loss --lost <lost-1>,<lost-2> and a --fence-proof
 for each`. With leases enforced the message instead says the catalog
@@ -93,6 +108,7 @@ fences the stream for both and that `--lost` and the proofs are optional.
 | `the catalog records a pending move or a different source configuration` | Reconcile against the current membership with its original quorum. The local survivor may have missed a configuration change |
 | `replacements must be two live, accepting keepers ...` | Add keepers, or name them with `--with` |
 | `the selected snapshot is ahead of the log; start and stop this keeper first` | Do exactly that, then retry |
+| `refused: this keeper never recorded that the stream committed an entry ...` | Leases are finalized but this survivor never wrote a commit of the stream, so it would keep nothing. With two survivors, recover from the other one. Otherwise restore from the object store (`docs/runbooks/offload.md`) |
 
 For a joint configuration, follow [catalog and joint quorum loss](#catalog-and-joint-quorum-loss).
 
@@ -157,8 +173,17 @@ Expected:
 stream <id> recovered from this keeper at head <n>: voters <a> <b> <c>, revision <r>, term <t>,
 recovery fence at epoch <e>. Lost voters <x> and <y> must retire their copies or stay retired;
 the catalog fences the stream for 2 keeper(s), and this command waited 33000 ms for their leases
-to end. Start this keeper, then acknowledge the recovery so writers can seal again.
+to end. Start this keeper, then acknowledge the recovery so writers can seal again. Loss point:
+record <n>; acknowledged records above it are lost.
 ```
+
+Record the loss point in the incident. At level 6 the head is the loss
+point. Below level 6 the report ends instead with `Loss point: record <s>,
+the last point this keeper knows committed: ... may have been overwritten by
+the lost voters ...`. Here `<s>` is the survivor's last snapshot, and the
+records between `<s>` and the head are unverified. With offload the report
+also prints the store's part. When the store holds a longer committed run,
+it replaces the survivor's copy.
 
 A second run prints `was already recovered`. Repeat for each affected stream
 (batch recovery does not exist yet), then start the keeper:
@@ -251,14 +276,15 @@ applies until it loses a third. Repair replaces lost voters one at a time
 while three are live. After three or four are lost:
 
 - **Survivors.** With one survivor, run the steps above on it. With two,
-  run `recover-stream` on the **more advanced** survivor: the one whose last
-  log entry is later, or the lower keeper ID on a tie. Stop only that one;
-  keep the other running so the command can ask it for its last entry. On
-  the less advanced survivor the command refuses with `refused: surviving
-  voter <x> holds the more advanced log ...; stop it and recover from it
-  instead`: restart it, stop `<x>` and run there. The other survivor keeps
-  its seat in the recovered configuration and catches up; an uncommitted
-  suffix of its own is replaced.
+  run `recover-stream` on the survivor that **knows the later commit**,
+  then the one whose last log entry is later, then the lower keeper ID.
+  Stop only that one. Keep the other running so the command can ask it for
+  both. On the other survivor the command refuses with `refused: surviving
+  voter <x> knows the later commit or holds the more advanced log ...; stop
+  it and recover from it instead`: restart it, stop `<x>` and run there.
+  The other survivor keeps its seat in the recovered configuration and
+  catches up. Whatever it holds past the recovered history is replaced, and
+  it never knew any of that committed.
 - **`--lost`** names every voter that answers with no healthy replica:
   three with two survivors, four with one, each retired with
   `keeper fence-recovery` and passed with its own `--fence-proof`.

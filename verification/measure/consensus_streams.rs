@@ -29,6 +29,9 @@
 //!
 //! `--finalize 1` finalizes the cluster at this build's level first, so
 //! liveness leases are enforced, and waits until every keeper holds one.
+//! From level 6 keepers also write their commit indexes to the WAL; the
+//! `wal_*` and `segment_fsyncs_per_second` fields, summed over every
+//! keeper during the run, show what that costs.
 //!
 //! `--fill N` first writes N 64-byte records to stream 1 in 256-record
 //! batches and reports the process's resident memory with that stream open
@@ -175,6 +178,37 @@ fn resident_mib() -> f64 {
         / 1024.0
 }
 
+/// WAL rounds, round bytes and segment fsyncs, summed over every keeper's
+/// `/metrics`.
+async fn wal_totals(cluster: &LocalCluster) -> [f64; 3] {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut totals = [0.0; 3];
+    for keeper in cluster.keepers().keys() {
+        let mut socket = tokio::net::TcpStream::connect(cluster.admin(*keeper))
+            .await
+            .unwrap();
+        socket
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: keeper\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut body = String::new();
+        socket.read_to_string(&mut body).await.unwrap();
+        for line in body.lines() {
+            let index = match line.split_once(' ') {
+                Some(("logkeeper_consensus_wal_round_records_count", _)) => 0,
+                Some(("logkeeper_consensus_wal_round_bytes_sum", _)) => 1,
+                Some((
+                    "logkeeper_consensus_wal_fsync_duration_seconds_count{target=\"segment\"}",
+                    _,
+                )) => 2,
+                _ => continue,
+            };
+            totals[index] += line.rsplit(' ').next().unwrap().parse::<f64>().unwrap();
+        }
+    }
+    totals
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args = args();
@@ -252,6 +286,7 @@ async fn main() {
         );
     }
     let cpu = cpu_seconds();
+    let wal_before = wal_totals(&cluster).await;
     let started = Instant::now();
     let deadline = started + Duration::from_secs_f64(args.seconds);
     let record = Bytes::from(vec![7; args.record]);
@@ -333,6 +368,7 @@ async fn main() {
     }
     let elapsed = started.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu;
+    let wal_after = wal_totals(&cluster).await;
     if args.offload.is_some() {
         let stopped = Instant::now();
         for id in 1..=args.active {
@@ -353,6 +389,14 @@ async fn main() {
             stopped.elapsed().as_millis()
         );
     }
+    let rate = |index: usize| (wal_after[index] - wal_before[index]) / elapsed;
+    memory += &format!(
+        ", \"wal_rounds_per_second\": {:.1}, \"wal_bytes_per_second\": {:.0}, \
+         \"segment_fsyncs_per_second\": {:.1}",
+        rate(0),
+        rate(1),
+        rate(2)
+    );
     latencies.sort();
     let percentile = |p: f64| {
         latencies
