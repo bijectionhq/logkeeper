@@ -38,10 +38,12 @@ impl Engine {
             return Err(invalid("current placement is unknown"));
         };
         if &proof.genesis != genesis
-            || !self.placement.roster(&proof.configuration.voters)
+            || !self
+                .placement
+                .structural_roster(&proof.configuration.voters)
             || proof
                 .joint
-                .is_some_and(|roster| !self.placement.roster(&roster))
+                .is_some_and(|roster| !self.placement.structural_roster(&roster))
         {
             return Err(invalid(
                 "proof does not identify the checked stream placement",
@@ -56,7 +58,7 @@ impl Engine {
         genesis: &Genesis,
         stage: &Stage,
     ) -> io::Result<()> {
-        if !self.placement.genesis(genesis)
+        if !self.placement.structural_genesis(genesis)
             || !self.placement.stage(stage)
             || stage.stream != genesis.stream
             || !stage.old.contains(&authority)
@@ -122,7 +124,7 @@ impl Engine {
         stage: Stage,
     ) -> io::Result<Reply> {
         let stream = genesis.stream;
-        if !self.placement.genesis(&genesis)
+        if !self.placement.structural_genesis(&genesis)
             || !self.placement.stage(&stage)
             || !stage.recovery()
             || stage.stream != stream

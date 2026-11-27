@@ -286,7 +286,7 @@ impl Engine {
                         .is_ok_and(|id| self.administrators.contains(id.as_str()))
                         || transport::keeper_id(leaf).is_ok_and(|keeper| {
                             self.placement
-                                .domains()
+                                .all_domains()
                                 .contains_key(&uuid::Uuid::from_u128(keeper.0))
                         })
                 });
@@ -417,7 +417,7 @@ impl Engine {
             keeper: self.id,
             domain: self
                 .placement
-                .domains()
+                .all_domains()
                 .get(&self.id)
                 .cloned()
                 .unwrap_or_default(),
@@ -730,7 +730,7 @@ impl Engine {
         };
         let silence_limit = self.heartbeat_silence_limit();
         let now = Instant::now();
-        let domains = self.placement.domains();
+        let domains = self.placement.all_domains();
 
         let mut total_hosted = 0usize;
         let mut streams_open = 0usize;

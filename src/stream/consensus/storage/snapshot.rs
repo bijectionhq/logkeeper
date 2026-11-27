@@ -82,7 +82,7 @@ impl Image {
             })
             && self.membership.membership().get_joint_config().len() == 1
             && stage.stream == genesis.stream
-            && placement.stage(&stage)
+            && placement.structural_stage(&stage)
         {
             self.stage = Some(stage);
             self.stage_intent = explicit;
@@ -108,7 +108,7 @@ impl Image {
             })
             || self.membership.membership().get_joint_config().len() != 1
             || stage.stream != genesis.stream
-            || !placement.stage(&stage)
+            || !placement.structural_stage(&stage)
             || !stage.recovery()
         {
             return Outcome::Refused(JournalError::Conflict { head });
@@ -145,8 +145,8 @@ impl Image {
             .configuration
             .ok_or_else(|| invalid("snapshot lacks finalized placement"))?;
         let configs = membership.get_joint_config();
-        if placement.membership(membership)
-            && placement.roster(&current.voters)
+        if placement.structural_membership(membership)
+            && placement.structural_roster(&current.voters)
             && configs.first().is_some_and(|old| {
                 old.iter()
                     .copied()
@@ -157,7 +157,7 @@ impl Image {
                     stage.stream == genesis.stream
                         && stage.source == current.revision
                         && stage.old == current.voters
-                        && placement.stage(stage)
+                        && placement.structural_stage(stage)
                 }),
                 [_, target] => self.has_stage(genesis, target),
                 _ => false,
@@ -192,7 +192,7 @@ impl Image {
     ) -> io::Result<()> {
         let before = self.membership.membership().get_joint_config();
         let after = membership.get_joint_config();
-        if placement.membership(membership)
+        if placement.structural_membership(membership)
             && match (before.as_slice(), after.as_slice()) {
                 ([], [new]) => new
                     .iter()
@@ -1459,15 +1459,17 @@ pub(super) fn inspect_stream_readonly(
     log: &super::Log,
     placement: &Placement,
 ) -> io::Result<StreamStateView> {
-    if !placement.genesis(genesis)
+    if !placement.structural_genesis(genesis)
         || log.entries.values().any(|entry| match &entry.payload {
-            EntryPayload::Membership(membership) => !placement.membership(membership),
+            EntryPayload::Membership(membership) => !placement.structural_membership(membership),
             EntryPayload::Normal(command) => match command.body() {
                 Command::Stage(stage) | Command::StageOwned(stage) => {
-                    !placement.stage(stage) || stage.stream != genesis.stream
+                    !placement.structural_stage(stage) || stage.stream != genesis.stream
                 }
                 Command::Recover(stage) => {
-                    !placement.stage(stage) || stage.stream != genesis.stream || !stage.recovery()
+                    !placement.structural_stage(stage)
+                        || stage.stream != genesis.stream
+                        || !stage.recovery()
                 }
                 Command::Admitted(..) => true,
                 _ => false,

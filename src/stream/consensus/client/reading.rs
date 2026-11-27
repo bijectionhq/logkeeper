@@ -207,7 +207,9 @@ impl Client {
 
     fn valid_proof(&self, stream: StreamId, proof: &Proof) -> bool {
         proof.genesis.stream == stream
-            && proof.genesis.valid(self.rpc.keepers())
+            && proof
+                .genesis
+                .valid_with_retired(self.rpc.keepers(), &self.retired)
             && proof
                 .configuration
                 .voters
@@ -217,7 +219,7 @@ impl Client {
                 .configuration
                 .voters
                 .iter()
-                .all(|id| self.rpc.keepers().contains_key(id))
+                .all(|id| self.rpc.keepers().contains_key(id) || self.retired.contains(id))
     }
 
     fn remember_placement(&self, stream: StreamId, keeper: Uuid, proof: &Proof) {

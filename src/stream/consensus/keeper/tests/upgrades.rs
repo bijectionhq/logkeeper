@@ -956,3 +956,286 @@ async fn offline_salvage_boots_past_damaged_wal_quarantines_affected_streams_and
 
     cluster.stop_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn placement_change_does_not_quarantine_and_repair_rebalances_violation() {
+    use crate::stream::consensus::storage::{Authority, Provision, hex, sha256};
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, d] = cluster.ids;
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(240);
+    client.create(stream, [a, b, c], 4096).await.unwrap();
+    let fence = client
+        .seal(stream, Epoch(0), Uuid::from_u128(81))
+        .await
+        .unwrap()
+        .fence;
+    client
+        .append(
+            stream,
+            fence,
+            Lsn(1),
+            Bytes::from_static(b"before-domain-change"),
+        )
+        .await
+        .unwrap();
+
+    // Stop all keepers and reassign `b` from domain "b" to domain "a", so the
+    // existing voters [a, b, c] now violate distinct failure domains.
+    cluster.stop_all().await;
+    let enrollment = cluster.configs[&a].enrollment.clone();
+    let mut updated_domains = cluster.configs[&a].domains.clone();
+    updated_domains.insert(b, "a".into());
+    std::fs::write(
+        enrollment.join("placement.json"),
+        serde_json::to_vec(&Authority {
+            catalog: cluster.catalog,
+            domains: updated_domains.clone(),
+            retired: Default::default(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for config in cluster.configs.values_mut() {
+        config.domains = updated_domains.clone();
+    }
+    // Re-issue `b`'s enrollment provision for its new domain.
+    let b_cfg = &cluster.configs[&b];
+    std::fs::write(
+        enrollment.join(format!("{b}.provision.json")),
+        serde_json::to_vec(&Provision {
+            keeper: b,
+            data: b_cfg.data.canonicalize().unwrap(),
+            domain: "a".into(),
+            certificate_sha256: hex(
+                &sha256(std::fs::File::open(&b_cfg.tls.certificate).unwrap()).unwrap(),
+            ),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    let all_ids: Vec<Uuid> = cluster.configs.keys().copied().collect();
+    for id in all_ids {
+        cluster.restart(id).await;
+    }
+
+    // Placement change MUST NOT quarantine any replica of the existing stream.
+    for voter in [a, b, c] {
+        assert!(
+            !cluster.running[&voter].engine.is_quarantined(stream),
+            "domain change must not quarantine voter {voter}"
+        );
+    }
+
+    // Strict placement is STILL enforced on new geneses and stage targets.
+    let bad_stream = StreamId(241);
+    assert!(
+        client.create(bad_stream, [a, b, c], 4096).await.is_err(),
+        "new genesis violating updated placement must be rejected"
+    );
+
+    // Existing stream continues serving reads and writes while repair
+    // rebalances one of the colliding voters to a free domain.
+    assert_eq!(client.head(stream).await, Ok(Lsn(1)));
+    let page = client
+        .read(stream, Lsn(1), 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.records,
+        vec![(Lsn(1), Bytes::from_static(b"before-domain-change"))]
+    );
+    client
+        .append(
+            stream,
+            fence,
+            Lsn(2),
+            Bytes::from_static(b"during-domain-change"),
+        )
+        .await
+        .unwrap();
+
+    // Repair detects the placement violation and moves the stream to a valid
+    // three-distinct-domain roster.
+    let rebalanced = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(cfg) = client.configuration(stream).await
+                && cluster.running[&d].engine.placement.roster(&cfg.voters)
+            {
+                return cfg;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("repair rebalanced placement violation");
+    assert!(
+        cluster.running[&d]
+            .engine
+            .placement
+            .roster(&rebalanced.voters)
+    );
+    assert!(
+        cluster
+            .running
+            .values()
+            .map(|running| {
+                running
+                    .engine
+                    .disk
+                    .metrics
+                    .placement_violation
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum::<u64>()
+            > 0,
+        "placement violation counter must be incremented"
+    );
+
+    // Stage targeting a colliding roster must still be rejected.
+    assert!(matches!(
+        client.replace(stream, rebalanced.revision, [a, b, c]).await,
+        Err(JournalError::Conflict { .. })
+    ));
+
+    // All records survive rebalancing.
+    let page = client
+        .read(stream, Lsn(1), 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.records.len(), 2);
+
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retired_keepers_do_not_quarantine_and_repair_moves_streams_off_them() {
+    use std::collections::BTreeSet;
+
+    use crate::stream::consensus::storage::Authority;
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _d] = cluster.ids;
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(242);
+    client.create(stream, [a, b, c], 4096).await.unwrap();
+    let fence = client
+        .seal(stream, Epoch(0), Uuid::from_u128(82))
+        .await
+        .unwrap()
+        .fence;
+    client
+        .append(stream, fence, Lsn(1), Bytes::from_static(b"before-retire"))
+        .await
+        .unwrap();
+
+    // Phase 1: mark `c` retired while still present in the inventory (draining).
+    cluster.stop_all().await;
+    let enrollment = cluster.configs[&a].enrollment.clone();
+    let retired = BTreeSet::from([c]);
+    std::fs::write(
+        enrollment.join("placement.json"),
+        serde_json::to_vec(&Authority {
+            catalog: cluster.catalog,
+            domains: cluster.configs[&a].domains.clone(),
+            retired: retired.clone(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for config in cluster.configs.values_mut() {
+        config.retired = retired.clone();
+    }
+    let all_ids: Vec<Uuid> = cluster.configs.keys().copied().collect();
+    for id in all_ids {
+        cluster.restart(id).await;
+    }
+
+    // No replica is quarantined, and new streams cannot be placed on `c`.
+    for voter in [a, b, c] {
+        assert!(!cluster.running[&voter].engine.is_quarantined(stream));
+    }
+    assert!(
+        client.create(StreamId(243), [a, b, c], 4096).await.is_err(),
+        "new genesis naming a retired keeper must be rejected"
+    );
+
+    // Repair automatically moves `stream` off retired keeper `c`.
+    let moved = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(cfg) = client.configuration(stream).await
+                && !cfg.voters.contains(&c)
+            {
+                return cfg;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("repair moved stream off retired keeper");
+    assert!(!moved.voters.contains(&c));
+
+    // Phase 2: decommission `c` completely from `keepers`/`peers`/`bulk`/`domains`,
+    // keeping only its UUID in `retired`. The remaining cluster still boots
+    // without quarantining `stream` even though its historical genesis names `c`.
+    cluster.stop_all().await;
+    cluster.configs.remove(&c);
+    cluster.keepers.remove(&c);
+    let remaining_domains = {
+        let mut d = cluster.configs[&a].domains.clone();
+        d.remove(&c);
+        d
+    };
+    std::fs::write(
+        enrollment.join("placement.json"),
+        serde_json::to_vec(&Authority {
+            catalog: cluster.catalog,
+            domains: remaining_domains.clone(),
+            retired: retired.clone(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for config in cluster.configs.values_mut() {
+        config.keepers.remove(&c);
+        config.peers.remove(&c);
+        config.bulk.remove(&c);
+        config.domains = remaining_domains.clone();
+        config.retired = retired.clone();
+    }
+    let remaining_ids: Vec<Uuid> = cluster.configs.keys().copied().collect();
+    for id in remaining_ids {
+        cluster.restart(id).await;
+    }
+    for voter in moved.voters {
+        assert!(!cluster.running[&voter].engine.is_quarantined(stream));
+    }
+
+    // Client configured with `retired` reads and appends seamlessly.
+    let updated_client = Client::new(
+        &cluster.credentials,
+        cluster.keepers.clone(),
+        cluster.catalog,
+        Duration::from_secs(10),
+    )
+    .unwrap()
+    .with_retired(retired);
+    assert_eq!(updated_client.head(stream).await, Ok(Lsn(1)));
+    let page = updated_client
+        .read(stream, Lsn(1), 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.records,
+        vec![(Lsn(1), Bytes::from_static(b"before-retire"))]
+    );
+    updated_client
+        .append(stream, fence, Lsn(2), Bytes::from_static(b"after-retire"))
+        .await
+        .unwrap();
+    assert_eq!(updated_client.head(stream).await, Ok(Lsn(2)));
+
+    cluster.stop_all().await;
+}

@@ -66,6 +66,7 @@ fn contract_journal(
             voters: Some(voters),
             placement: None,
             draining: Default::default(),
+            retired: Default::default(),
             quota_bytes: 1 << 20,
             max_record_bytes: 1024,
             deadline_ms: 10_000,

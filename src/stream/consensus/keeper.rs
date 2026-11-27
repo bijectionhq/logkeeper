@@ -133,6 +133,10 @@ pub struct Config {
     pub peers: Keepers,
     pub bulk: Keepers,
     pub domains: Domains,
+    /// Retired keeper identities kept in the inventory so historical stream
+    /// records remain valid while repair moves streams off them.
+    #[serde(default)]
+    pub retired: BTreeSet<uuid::Uuid>,
     pub enrollment: PathBuf,
     pub catalog: uuid::Uuid,
     /// Three keepers in distinct failure domains that host the catalog as a
@@ -337,14 +341,20 @@ impl Config {
             return Err(invalid("invalid consensus keeper configuration"));
         }
         let authority = Authority::read(&self.enrollment)?;
-        if authority.catalog != self.catalog || authority.domains != self.domains {
+        if authority.catalog != self.catalog
+            || authority.domains != self.domains
+            || authority.retired != self.retired
+        {
             return Err(invalid(
                 "inventory does not match its trusted placement authority",
             ));
         }
-        let placement = Placement::new(&self.keepers, authority.domains)?;
+        let placement = Placement::new(&self.keepers, authority.domains, authority.retired)?;
+        if placement.is_retired(self.catalog) {
+            return Err(invalid("catalog keeper cannot be retired"));
+        }
         if let Some(voters) = &self.catalog_voters
-            && (!placement.roster(voters) || !voters.contains(&self.catalog))
+            && (!placement.structural_roster(voters) || !voters.contains(&self.catalog))
         {
             return Err(invalid(
                 "catalog voters must be three sorted keepers in distinct domains, one the catalog",

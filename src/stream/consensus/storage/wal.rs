@@ -1047,20 +1047,22 @@ impl Disk {
 
     pub fn check_placement(&self, stream: StreamId, placement: &Placement) -> io::Result<()> {
         let state = self.state.read();
-        if !placement.genesis(&state.genesis[&stream])
+        if !placement.structural_genesis(&state.genesis[&stream])
             || state.logs[&stream]
                 .entries
                 .values()
                 .any(|entry| match &entry.payload {
                     openraft::EntryPayload::Membership(membership) => {
-                        !placement.membership(membership)
+                        !placement.structural_membership(membership)
                     }
                     openraft::EntryPayload::Normal(command) => match command.body() {
                         Command::Stage(stage) | Command::StageOwned(stage) => {
-                            !placement.stage(stage) || stage.stream != stream
+                            !placement.structural_stage(stage) || stage.stream != stream
                         }
                         Command::Recover(stage) => {
-                            !placement.stage(stage) || stage.stream != stream || !stage.recovery()
+                            !placement.structural_stage(stage)
+                                || stage.stream != stream
+                                || !stage.recovery()
                         }
                         Command::Admitted(..) => true,
                         _ => false,

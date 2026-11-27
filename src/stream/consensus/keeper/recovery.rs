@@ -211,8 +211,9 @@ impl Config {
             }
         };
         let mut statuses = BTreeMap::new();
+        // Draining retired keepers still hold replicas, so they are asked too.
         let asked = placement
-            .domains()
+            .all_domains()
             .keys()
             .copied()
             .filter(|keeper| *keeper != self.keeper)

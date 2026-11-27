@@ -197,6 +197,7 @@ pub(super) struct Metrics {
     pub reopened_stopped: AtomicU64,
     pub evicted: AtomicU64,
     pub compacted_bytes: AtomicU64,
+    pub placement_violation: AtomicU64,
     // Election counters
     pub elections_started: AtomicU64,
     pub elections_won: AtomicU64,
@@ -270,6 +271,7 @@ impl Metrics {
             reopened_stopped: AtomicU64::new(0),
             evicted: AtomicU64::new(0),
             compacted_bytes: AtomicU64::new(0),
+            placement_violation: AtomicU64::new(0),
             elections_started: AtomicU64::new(0),
             elections_won: AtomicU64::new(0),
             votes_granted: AtomicU64::new(0),
@@ -355,6 +357,10 @@ impl Metrics {
             (
                 "segments.compacted_bytes",
                 self.compacted_bytes.load(Ordering::Relaxed),
+            ),
+            (
+                "placement.violation",
+                self.placement_violation.load(Ordering::Relaxed),
             ),
         ]
     }
@@ -508,6 +514,19 @@ impl Metrics {
             out,
             "logkeeper_consensus_wal_compacted_bytes_total {}",
             self.compacted_bytes.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_placement_violations_total Finalized configurations a leader found outside the current placement rules and queued for repair."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_placement_violations_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_placement_violations_total {}",
+            self.placement_violation.load(Ordering::Relaxed)
         );
 
         // Elections & votes

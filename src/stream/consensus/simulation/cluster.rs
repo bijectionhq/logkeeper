@@ -186,6 +186,7 @@ impl SimCluster {
             serde_json::to_vec(&Authority {
                 catalog,
                 domains: domains.clone(),
+                retired: BTreeSet::new(),
             })
             .unwrap(),
         )
@@ -242,6 +243,7 @@ impl SimCluster {
                 log_format: Default::default(),
                 admin: None,
                 sync_mode: crate::server::durability::SyncMode::Fsync,
+                retired: BTreeSet::new(),
             };
             provision(&config);
             config.initialize().unwrap();
@@ -297,6 +299,7 @@ impl SimCluster {
             voters: Some(voters),
             placement: None,
             draining: BTreeSet::new(),
+            retired: BTreeSet::new(),
             quota_bytes: self.options.quota_bytes,
             max_record_bytes: self.options.max_record_bytes,
             deadline_ms: self.options.client_deadline_ms,

@@ -51,6 +51,10 @@ pub struct JournalConfig {
     /// every stream has moved.
     #[serde(default)]
     pub draining: BTreeSet<uuid::Uuid>,
+    /// Retired keeper identities kept in the inventory so historical stream
+    /// genesis and placement proofs remain valid after decommissioning.
+    #[serde(default)]
+    pub retired: BTreeSet<uuid::Uuid>,
     /// Retained byte quota of every stream this consumer creates.
     pub quota_bytes: u64,
     /// Largest record this consumer may append, at most 4 MiB.
@@ -129,7 +133,9 @@ impl Placement {
             (None, Some(placement)) => Self::Ranked {
                 eligible: placement
                     .iter()
-                    .filter(|(keeper, _)| !config.draining.contains(keeper))
+                    .filter(|(keeper, _)| {
+                        !config.draining.contains(keeper) && !config.retired.contains(keeper)
+                    })
                     .map(|(keeper, domain)| (*keeper, domain.clone()))
                     .collect(),
             },
@@ -209,7 +215,8 @@ impl ConsensusJournal {
             config.catalog,
             Duration::from_millis(config.deadline_ms),
         )?
-        .with_local_keepers(local.clone());
+        .with_local_keepers(local.clone())
+        .with_retired(config.retired.clone());
         if let Some(voters) = config.catalog_voters {
             client = client.with_catalog_voters(voters);
         }

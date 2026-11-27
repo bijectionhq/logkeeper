@@ -32,7 +32,7 @@ fn placement() -> Placement {
         .into_iter()
         .zip(["a", "b", "c"].map(String::from))
         .collect();
-    Placement::new(&keepers, domains).unwrap()
+    Placement::new(&keepers, domains, Default::default()).unwrap()
 }
 
 fn entry(index: u64) -> Entry {

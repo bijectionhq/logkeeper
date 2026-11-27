@@ -34,7 +34,7 @@ use super::{Engine, Group, NodeId, Reply, Request};
 use crate::stream::consensus::{
     BUILD_VERSION, Configuration, KeeperStatus,
     assignment::{self, Health, View},
-    decisions, features,
+    decisions, features, metrics,
     network::{self, Proof},
 };
 use std::io;
@@ -87,6 +87,9 @@ enum Work {
     Learners(BTreeSet<NodeId>),
     /// Replace one of these silent voters.
     Voters(Vec<Uuid>),
+    /// Rebalance a stream whose finalized voters violate current placement
+    /// (shared failure domain or retired keeper).
+    Placement,
 }
 
 impl Work {
@@ -95,6 +98,7 @@ impl Work {
             Self::Joint(_) => 0,
             Self::Learners(_) => 1,
             Self::Voters(_) => 2,
+            Self::Placement => 3,
         }
     }
 }
@@ -306,6 +310,11 @@ impl Engine {
                     .collect::<Vec<_>>();
                 if !quiet.is_empty() {
                     work.push((*stream, group.clone(), Work::Voters(quiet)));
+                } else if let Some(configuration) = group.state.finalized()
+                    && !self.placement.roster(&configuration.voters)
+                {
+                    metrics::count(&self.disk.metrics.placement_violation);
+                    work.push((*stream, group.clone(), Work::Placement));
                 }
             }
             seen.retain(|key, _| present.contains(key));
@@ -451,6 +460,7 @@ impl Engine {
                 }
                 ok
             }
+            Work::Placement => self.replace_dead_voter(stream, group, &[]).await,
         }
     }
 
@@ -459,13 +469,32 @@ impl Engine {
             return false;
         };
         let mut health = BTreeMap::new();
-        for keeper in self.placement.domains().keys().copied() {
+        let candidates = self
+            .placement
+            .domains()
+            .keys()
+            .copied()
+            .chain(configuration.voters)
+            .collect::<BTreeSet<_>>();
+        for keeper in candidates {
             let voter = configuration.voters.contains(&keeper);
-            if voter && !quiet.contains(&keeper) {
+            let retired = self.placement.is_retired(keeper);
+            if voter && !quiet.contains(&keeper) && !retired {
+                continue;
+            }
+            if retired && !self.placement.all_domains().contains_key(&keeper) {
+                health.insert(
+                    keeper,
+                    Health {
+                        live: false,
+                        accepting: false,
+                        streams: 0,
+                    },
+                );
                 continue;
             }
             let status = self.reachable(keeper).await;
-            if voter && self.version_mismatched(keeper) {
+            if voter && !retired && self.version_mismatched(keeper) {
                 continue;
             }
             // Only a silent voter whose keeper still answers is asked about
@@ -484,7 +513,7 @@ impl Engine {
                 keeper,
                 Health {
                     live,
-                    accepting: status.as_ref().is_some_and(|status| status.accepting),
+                    accepting: !retired && status.as_ref().is_some_and(|status| status.accepting),
                     streams: status.as_ref().map_or(0, |status| status.streams),
                 },
             );
@@ -585,7 +614,7 @@ impl Engine {
     /// wants its leader in. Kept in memory on every voter: the writer
     /// repeats it after each seal, so it needs no durable record.
     pub(super) fn record_preference(&self, stream: StreamId, keeper: Uuid) {
-        if let Some(domain) = self.placement.domains().get(&keeper) {
+        if let Some(domain) = self.placement.all_domains().get(&keeper) {
             self.preferred.lock().insert(stream, domain.clone());
         }
     }
@@ -648,7 +677,7 @@ impl Engine {
                 configuration
                     .voters
                     .into_iter()
-                    .find(|voter| self.placement.domains().get(voter) == Some(domain))
+                    .find(|voter| self.placement.all_domains().get(voter) == Some(domain))
             }) else {
                 continue;
             };
@@ -704,9 +733,10 @@ impl Engine {
             .state
             .finalized()
             .map_or(0, |configuration| configuration.revision);
+        // Draining retired keepers still hold copies and are asked too.
         let asked = futures::future::join_all(
             self.placement
-                .domains()
+                .all_domains()
                 .keys()
                 .copied()
                 .filter(|keeper| *keeper != self.id)
@@ -727,8 +757,10 @@ impl Engine {
         let mut newest: Option<(Uuid, Configuration)> = None;
         for (keeper, reply) in asked {
             match reply {
+                // A committed configuration counts even when it no longer
+                // meets placement; only a malformed one is ignored.
                 Ok(Reply::Configured(Some(configuration)))
-                    if self.placement.roster(&configuration.voters) =>
+                    if self.placement.structural_roster(&configuration.voters) =>
                 {
                     if newest
                         .as_ref()
@@ -803,7 +835,7 @@ impl Engine {
             };
             let excluder = *group.excluded.lock();
             let mut authorities = excluder.into_iter().collect::<Vec<_>>();
-            for keeper in self.placement.domains().keys() {
+            for keeper in self.placement.all_domains().keys() {
                 if *keeper != self.id && !authorities.contains(keeper) {
                     authorities.push(*keeper);
                 }

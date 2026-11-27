@@ -115,6 +115,7 @@ impl Cluster {
             serde_json::to_vec(&Authority {
                 catalog,
                 domains: domains.clone(),
+                retired: Default::default(),
             })
             .unwrap(),
         )
@@ -152,6 +153,7 @@ impl Cluster {
                 peers: peers.clone(),
                 bulk: bulk.clone(),
                 domains: domains.clone(),
+                retired: Default::default(),
                 enrollment: enrollment.clone(),
                 catalog,
                 catalog_voters,

@@ -41,6 +41,9 @@ pub struct Client {
     routes: Arc<Mutex<BTreeMap<StreamId, Route>>>,
     /// Keepers in this client's failure domain, tried first for reads.
     local: Arc<BTreeSet<uuid::Uuid>>,
+    /// Retired keeper identities that may still appear in historical stream
+    /// genesis or pre-repair configurations.
+    retired: Arc<BTreeSet<uuid::Uuid>>,
 }
 
 #[derive(Clone)]
@@ -70,6 +73,7 @@ impl Client {
             deadline,
             routes: Arc::default(),
             local: Arc::default(),
+            retired: Arc::default(),
         })
     }
 
@@ -96,6 +100,14 @@ impl Client {
         self.rpc.set_filter(source, filter);
     }
 
+    /// Recognizes `retired` keeper identities in historical stream genesis and
+    /// placement proofs without sending new traffic to retired keepers absent
+    /// from `keepers`.
+    pub fn with_retired(mut self, retired: BTreeSet<uuid::Uuid>) -> Self {
+        self.retired = Arc::new(retired);
+        self
+    }
+
     /// Assigns and initializes a stream's unique genesis. Use the same ID, voter
     /// set, and quota when retrying an uncertain create.
     pub async fn create(
@@ -110,7 +122,7 @@ impl Client {
             voters,
             quota_bytes,
         };
-        if !genesis.valid(self.rpc.keepers()) {
+        if !genesis.valid(self.rpc.keepers()) || voters.iter().any(|id| self.retired.contains(id)) {
             return Err(JournalError::Unavailable);
         }
         let end = Instant::now() + self.deadline;
@@ -770,7 +782,8 @@ impl Client {
     fn install_route(&self, stream: StreamId, reply: Reply) -> Result<Route> {
         match reply {
             Reply::Catalog(genesis, contacts)
-                if genesis.stream == stream && genesis.valid(self.rpc.keepers()) =>
+                if genesis.stream == stream
+                    && genesis.valid_with_retired(self.rpc.keepers(), &self.retired) =>
             {
                 let mut routes = self.routes.lock();
                 let route = routes.entry(stream).or_insert_with(|| Route {
@@ -787,7 +800,10 @@ impl Client {
                     return Err(JournalError::Unavailable);
                 }
                 route.genesis = Some(genesis);
-                route.contacts = contacts;
+                route.contacts = contacts
+                    .into_iter()
+                    .filter(|id| self.rpc.keepers().contains_key(id))
+                    .collect();
                 Ok(route.clone())
             }
             Reply::Decision(Outcome::Refused(error)) => Err(error),

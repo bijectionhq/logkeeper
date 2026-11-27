@@ -249,6 +249,20 @@ impl Genesis {
             && self.voters.iter().all(|id| keepers.contains_key(id))
             && self.voters.windows(2).all(|pair| pair[0] < pair[1])
     }
+
+    fn valid_with_retired(
+        &self,
+        keepers: &Keepers,
+        retired: &std::collections::BTreeSet<uuid::Uuid>,
+    ) -> bool {
+        self.stream.0 != 0
+            && self.quota_bytes > 0
+            && self
+                .voters
+                .iter()
+                .all(|id| keepers.contains_key(id) || retired.contains(id))
+            && self.voters.windows(2).all(|pair| pair[0] < pair[1])
+    }
 }
 
 fn options() -> impl Options {

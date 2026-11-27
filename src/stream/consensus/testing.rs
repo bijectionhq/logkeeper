@@ -113,6 +113,7 @@ impl LocalCluster {
             serde_json::to_vec(&Authority {
                 catalog,
                 domains: domains.clone(),
+                retired: Default::default(),
             })?,
         )?;
         let [mut keepers, mut peers, mut bulk] = [(); 3].map(|_| Keepers::new());
@@ -181,6 +182,7 @@ impl LocalCluster {
                 peers: peers.clone(),
                 bulk: bulk.clone(),
                 domains: domains.clone(),
+                retired: Default::default(),
                 enrollment: enrollment.clone(),
                 catalog,
                 catalog_voters,
@@ -258,6 +260,7 @@ impl LocalCluster {
             voters: Some(self.voters),
             placement: None,
             draining: Default::default(),
+            retired: Default::default(),
             quota_bytes,
             max_record_bytes,
             deadline_ms: 10_000,

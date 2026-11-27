@@ -113,7 +113,7 @@ impl Engine {
         }
         let expected_peers = self
             .placement
-            .domains()
+            .all_domains()
             .keys()
             .filter(|keeper| **keeper != self.id)
             .count();
@@ -144,7 +144,7 @@ impl Engine {
         let now = Instant::now();
         let repair_ms = self.repair_after.as_millis() as u64;
         self.placement
-            .domains()
+            .all_domains()
             .iter()
             .map(|(&keeper, domain)| {
                 if keeper == self.id {
@@ -320,7 +320,7 @@ impl Engine {
         }
         let peers = self
             .placement
-            .domains()
+            .all_domains()
             .keys()
             .copied()
             .filter(|keeper| *keeper != self.id)
@@ -388,7 +388,7 @@ impl Engine {
     async fn ping(&self) {
         let peers = self
             .placement
-            .domains()
+            .all_domains()
             .keys()
             .copied()
             .filter(|keeper| *keeper != self.id)
@@ -492,15 +492,11 @@ impl Engine {
     async fn wake_for_dead(&self) {
         let dead = self
             .placement
-            .domains()
+            .all_domains()
             .keys()
             .copied()
             .filter(|keeper| self.dead(*keeper))
             .collect::<BTreeSet<_>>();
-        if dead.is_empty() {
-            self.liveness.lock().wakes.clear();
-            return;
-        }
         // A parked copy knows its current configuration. A copy that never
         // opened, such as one past the stream limit at startup, is judged
         // by its genesis voters.
@@ -535,6 +531,23 @@ impl Engine {
                 .map(|genesis| (genesis.stream, genesis.voters));
             parked_copies.chain(unopened).collect::<Vec<_>>()
         };
+        let needs_wake = |voters: &[Uuid; 3]| {
+            let lost = voters
+                .iter()
+                .filter(|voter| {
+                    dead.contains(voter) || !self.placement.all_domains().contains_key(voter)
+                })
+                .count();
+            lost == 1 || (lost == 0 && !self.placement.roster(voters))
+        };
+        if !candidates.iter().any(|(_, voters)| needs_wake(voters)) {
+            // A woken stream leaves the candidates while it is open, so its
+            // backoff is kept as long as a keeper is dead.
+            if dead.is_empty() {
+                self.liveness.lock().wakes.clear();
+            }
+            return;
+        }
         let now = Instant::now();
         let mut woken = Vec::new();
         {
@@ -544,8 +557,7 @@ impl Engine {
                 .wakes
                 .retain(|_, (_, next)| now.saturating_duration_since(*next) < MAX_WAKE_BACKOFF);
             for (stream, voters) in candidates {
-                let lost = voters.iter().filter(|voter| dead.contains(voter)).count();
-                if lost != 1 {
+                if !needs_wake(&voters) {
                     continue;
                 }
                 let (failures, next) = liveness.wakes.get(&stream).copied().unwrap_or((0, now));
@@ -573,7 +585,7 @@ impl Engine {
                 tracing::info!(
                     keeper = %self.id,
                     stream = %crate::stream::consensus::logging::stream_uuid(stream),
-                    "woke parked stream to repair dead voter"
+                    "woke parked stream to repair placement or a dead voter"
                 );
             }
         }

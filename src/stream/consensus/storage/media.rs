@@ -45,6 +45,11 @@ pub(in crate::stream::consensus) struct Provision {
 pub(in crate::stream::consensus) struct Authority {
     pub catalog: Uuid,
     pub domains: Domains,
+    /// Retired keeper identities kept in the inventory so historical stream
+    /// genesis and membership records remain valid while repair moves streams
+    /// off them.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retired: BTreeSet<Uuid>,
 }
 
 impl Authority {

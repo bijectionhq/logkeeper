@@ -506,7 +506,7 @@ impl Engine {
         request: PeerRequest,
         body: Option<Charge>,
     ) -> io::Result<Vec<u8>> {
-        if !self.placement.genesis(&genesis) {
+        if !self.placement.structural_genesis(&genesis) {
             return Err(invalid("invalid consensus sender or stream genesis"));
         }
         if self.deleted.read().contains(&genesis.stream) {
@@ -719,15 +719,16 @@ impl Engine {
         for entry in &request.entries {
             let valid = match &entry.payload {
                 openraft::EntryPayload::Membership(membership) => {
-                    self.placement.membership(membership)
+                    self.placement.structural_membership(membership)
                 }
                 openraft::EntryPayload::Normal(command) => match command.body() {
                     Command::Stage(stage) | Command::StageOwned(stage) => {
-                        stage.stream == group.genesis.stream && self.placement.stage(stage)
+                        stage.stream == group.genesis.stream
+                            && self.placement.structural_stage(stage)
                     }
                     Command::Recover(stage) => {
                         stage.stream == group.genesis.stream
-                            && self.placement.stage(stage)
+                            && self.placement.structural_stage(stage)
                             && stage.recovery()
                     }
                     Command::Append { payload, .. } => payload.len() <= MAX_RECORD,
