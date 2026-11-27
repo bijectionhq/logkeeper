@@ -8,7 +8,8 @@ from the one it expects, so CI can call it.
 
 ```sh
 ./verification/tla/check.sh        # every configuration
-./verification/tla/check.sh fast   # skips the five deep safety configurations
+./verification/tla/check.sh fast   # skips the deep safety configurations
+./verification/tla/check.sh additions   # only the focused models below
 TLC_WORKERS=4 ./verification/tla/check.sh   # bound TLC's worker threads
 ```
 
@@ -399,6 +400,37 @@ Where the code is weaker than the model:
   this cannot happen, but the model's rule is strictly "less than `L - M`
   elapsed"; returning invalid there costs nothing.
 - **Loss point** (finding 5) on main, with and without offload.
+
+## Focused models (`check.sh additions`)
+
+Small models of single mechanisms, each with a passing configuration and
+controls that drop one rule and must fail on the named invariant
+(`check.sh` matches the invariant's name, not only TLC's exit code). They run
+first and in seconds; `./verification/tla/check.sh additions` runs only them.
+
+### `Relocation.tla`: compaction relocation and checkpoints
+
+One slice of a stream whose extent compaction copies from segment `source`
+to `destination` (`Wal::relocate_segment`, `Record::Relocate`,
+`Objects::relocate`), one index page, the WAL checkpoint, the stream's
+selected snapshot, a park and wake, and one crash with restart. A segment is
+reaped once nothing pins it. Modeled pins: the live slice; the checkpoint's
+selected and pending cut (an old segment outlives the checkpoint that names
+it); the move hold, which keeps `source` while the selected snapshot may
+still name it, until a snapshot built after the move is selected
+(`hold`/`last_move`/`release_moved`); and the durable park mark
+(`snapshot::Pin::persist`), which names the pinned segments and the held
+moves. Replay ignores `Record::Relocate`, so a crash puts the slice back at
+the checkpoint's cut.
+
+| Config | Rule dropped | Result |
+| --- | --- | --- |
+| `Relocation` | none | `RootsReadable`, `ParkCanReopenAfterRestart` and `ReclaimsSource` (the source is eventually reaped) pass |
+| `RelocationNoCheckpointPin` | the checkpoint does not pin its cut | `RootsReadable` violated |
+| `RelocationReusePages` | a rebuild after a move reuses the selected pages | `RootsReadable` violated |
+| `RelocationLateWatermark` | the build reads the move watermark at selection, not before its pages | `RootsReadable` violated |
+| `RelocationNoParkPins` | the park mark names nothing | `RootsReadable` violated |
+| `RelocationParkRace` | the swap and the move hold are two steps (`AtomicMoveHold = FALSE`) | `ParkCanReopenAfterRestart` violated |
 
 ## Fidelity review
 

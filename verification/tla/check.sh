@@ -4,7 +4,8 @@ set -euo pipefail
 # Run all exhaustive TLA+ checks for Logkeeper's consensus protocol additions.
 # Usage:
 #   ./verification/tla/check.sh            # run all configs
-#   ./verification/tla/check.sh fast       # skip the five deep safety configs
+#   ./verification/tla/check.sh fast       # skip the deep safety configs
+#   ./verification/tla/check.sh additions  # run the focused consensus additions
 #
 # Exits non-zero when any configuration does not match its expected outcome:
 # a property violated where it should hold, or a control that stopped failing.
@@ -41,8 +42,8 @@ JAVA="$(find_java)"
 RESULTS="$ROOT/.results"
 mkdir -p "$RESULTS"
 
-# expected: "pass" (exit 0), "invariant" (exit 12), or "liveness" (exit 13)
-run_case() {
+# expected: "pass" (exit 0), "invariant[:name]" (exit 12), or "liveness" (exit 13)
+run_case() (
   local name="$1"
   local module="$2"
   local cfg="$3"
@@ -51,7 +52,9 @@ run_case() {
   local log="$RESULTS/${name}.log"
   local meta
   meta="$(mktemp -d "${TMPDIR:-/tmp}/tlc-${name}.XXXXXX")"
-  trap 'rm -rf "$meta"' RETURN
+  trap 'rm -rf "$meta"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   local args=(-Xmx2g -XX:+UseParallelGC -jar "$JAR" -workers "$WORKERS" -deadlock -metadir "$meta")
   if [[ "$extra" == "liveness" ]]; then
@@ -63,8 +66,6 @@ run_case() {
   "$JAVA" "${args[@]}" > "$log" 2>&1
   local rc=$?
   set -e
-  rm -rf "$meta"
-  trap - RETURN
 
   local stats
   stats="$(grep -E 'states generated, [0-9]+ distinct states found' "$log" | tail -n 1 || true)"
@@ -80,7 +81,7 @@ run_case() {
       fi
       printf "[PASS] %-30s | %s | %s\n" "$name" "$stats" "$elapsed"
       ;;
-    invariant)
+    invariant|invariant:*)
       if [[ $rc -ne 12 ]]; then
         echo "[FAIL] $name: expected invariant counterexample (exit 12), got exit=$rc (see $log)" >&2
         tail -n 20 "$log" >&2
@@ -88,6 +89,10 @@ run_case() {
       fi
       local inv
       inv="$(grep -E '^Error: Invariant ' "$log" | head -n 1 || true)"
+      if [[ "$expected" == invariant:* && "$inv" != "Error: Invariant ${expected#invariant:} is violated." ]]; then
+        echo "[FAIL] $name: expected ${expected#invariant:}, got '$inv' (see $log)" >&2
+        exit 1
+      fi
       printf "[CE  ] %-30s | %s | %s | %s\n" "$name" "$inv" "$stats" "$elapsed"
       ;;
     liveness)
@@ -99,15 +104,28 @@ run_case() {
       printf "[CE  ] %-30s | Temporal property violated | %s | %s\n" "$name" "$stats" "$elapsed"
       ;;
   esac
-}
+)
 
 echo "Using Java: $JAVA"
 echo "Using TLC:  $JAR"
 echo
 
+run_case "Relocation"                 "Relocation.tla" "Relocation.cfg"                pass liveness
+run_case "RelocationNoCheckpointPin"  "Relocation.tla" "RelocationNoCheckpointPin.cfg" invariant:RootsReadable
+run_case "RelocationReusePages"       "Relocation.tla" "RelocationReusePages.cfg"      invariant:RootsReadable
+run_case "RelocationNoParkPins"       "Relocation.tla" "RelocationNoParkPins.cfg"      invariant:RootsReadable
+run_case "RelocationLateWatermark"    "Relocation.tla" "RelocationLateWatermark.cfg"   invariant:RootsReadable
+run_case "RelocationParkRace"         "Relocation.tla" "RelocationParkRace.cfg"        invariant:ParkCanReopenAfterRestart
+
+if [[ "$MODE" == "additions" ]]; then
+  echo
+  echo "All focused consensus checks matched expected outcomes."
+  exit 0
+fi
+
 # Every property holds on the fixed protocol. The counterexamples the model
 # found (CE-1 to CE-4, see README.md) are fixed, so their configurations now
-# pass. The only expected failures are the epoch-lease controls below.
+# pass.
 run_case "RaftParkSafety"              "LogkeeperProtocol.tla" "RaftParkSafety.cfg"              pass
 run_case "ParkedRepairLiveness"        "LogkeeperProtocol.tla" "ParkedRepairLiveness.cfg"        pass liveness
 run_case "AbortedReplaceLiveness"      "LogkeeperProtocol.tla" "AbortedReplaceLiveness.cfg"      pass liveness
