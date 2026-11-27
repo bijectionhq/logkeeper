@@ -143,7 +143,7 @@ async fn a_survivor_recovers_only_after_retiring_the_partitioned_voters() {
     for (lost, listener) in [b, c].into_iter().zip(&blackholes) {
         isolated
             .keepers
-            .insert(lost, listener.local_addr().unwrap());
+            .insert(lost, listener.local_addr().unwrap().into());
         assert!(cluster.configs[&lost].fence_recovery(lost).is_err());
     }
     let refused = isolated
