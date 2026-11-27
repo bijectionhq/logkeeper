@@ -54,7 +54,7 @@ struct Running {
 /// Three voters and a catalog keeper serving on loopback, and optionally
 /// two spare keepers.
 pub struct LocalCluster {
-    verifier: Arc<dyn TimedOriginalVerifier>,
+    verifier: Arc<LocalVerifier>,
     offset: Arc<AtomicI64>,
     dir: tempfile::TempDir,
     issuer: Issuer<'static, KeyPair>,
@@ -197,7 +197,7 @@ impl LocalCluster {
         } else {
             BTreeMap::new()
         };
-        let verifier: Arc<dyn TimedOriginalVerifier> = Arc::new(LocalVerifier(
+        let verifier = Arc::new(LocalVerifier(
             keys.iter()
                 .map(|(id, key)| {
                     let public: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
@@ -292,6 +292,15 @@ impl LocalCluster {
     /// The installed keeper trust of a timed cluster.
     pub fn timed_verifier(&self) -> Arc<dyn TimedOriginalVerifier> {
         self.verifier.clone()
+    }
+
+    /// Public keys for independently verifying this test cluster's receipts.
+    pub fn timed_verification_keys(&self) -> BTreeMap<Uuid, [u8; 32]> {
+        self.verifier
+            .0
+            .iter()
+            .map(|(id, key)| (Uuid::from_u128(*id), *key))
+            .collect()
     }
 
     /// Shifts every keeper's timed clock, for example past a cutoff.
