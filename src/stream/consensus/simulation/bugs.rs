@@ -465,3 +465,60 @@ async fn record_epochs_survive_a_snapshot_and_a_full_restart() {
     assert_eq!(earlier, Err(JournalError::Conflict { head: Lsn(300) }));
     assert_eq!(retry, Ok(Lsn(250)));
 }
+
+/// Found by the soak after the fix above (seeds 1037, 2003, 2045 and 2547):
+/// a call that starts after a competing seal cannot take effect, even when
+/// an earlier, identical call committed its record. Writer A commits LSN 1,
+/// writer B seals epoch 2, and only then A appends the same record again.
+/// The reply to A's first attempt is lost, so its retry's `Fenced` is
+/// checked against the stream; the record is there, written by the earlier
+/// call, and the append must not be reported committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_append_after_a_competing_seal_is_never_reported_committed() {
+    let options = ClusterOptions {
+        park_after_secs: 3600,
+        repair_after_secs: 60,
+        ..ClusterOptions::default()
+    };
+    let mut cluster = SimCluster::start(240_002, options).await;
+    let voters = [
+        cluster.data_ids[0],
+        cluster.data_ids[1],
+        cluster.data_ids[2],
+    ];
+    let stream = StreamId(240_002);
+    let writer_a = cluster.journal(WRITER_A, voters);
+    let writer_b = cluster.journal(WRITER_B, voters);
+    let record = Bytes::from_static(b"one");
+
+    settle!(writer_a.create(stream)).unwrap();
+    assert_eq!(settle!(writer_a.seal(stream, Epoch(1))), Ok(Lsn(0)));
+    assert_eq!(
+        settle!(writer_a.append(stream, Epoch(1), Lsn(1), record.clone())),
+        Ok(Lsn(1))
+    );
+    assert_eq!(settle!(writer_b.seal(stream, Epoch(2))), Ok(Lsn(1)));
+
+    let armed = Arc::new(AtomicBool::new(true));
+    let filter_flag = armed.clone();
+    writer_a.client().set_transport_filter(
+        uuid::Uuid::from_u128(0x1001),
+        Some(Arc::new(move |_, _, lane| {
+            if lane == Lane::Application && filter_flag.swap(false, Ordering::SeqCst) {
+                RpcFault::DropReply(Duration::ZERO)
+            } else {
+                RpcFault::Allow
+            }
+        })),
+    );
+    let late = writer_a.append(stream, Epoch(1), Lsn(1), record).await;
+    cluster.stop_all().await;
+    assert!(!armed.load(Ordering::SeqCst), "the reply drop was not used");
+    assert!(
+        matches!(
+            late,
+            Err(JournalError::Fenced { .. } | JournalError::Unavailable)
+        ),
+        "an append begun after a competing seal returned {late:?}"
+    );
+}

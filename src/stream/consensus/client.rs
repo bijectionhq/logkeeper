@@ -212,9 +212,11 @@ impl Client {
     /// committed the records before a competing seal or a trim, and then a
     /// retry is refused `Fenced` or `Trimmed` although the records are in
     /// the stream: such a refusal is not definite. The keeper then says
-    /// whether this writer's epoch wrote exactly these records; if it did
-    /// the append succeeded, if another writer's records or none hold them
-    /// the refusal stands, and otherwise the outcome is unknown.
+    /// whether records of this writer's epoch hold exactly these payloads.
+    /// When none do, or another epoch's records do, no attempt committed and
+    /// none can, so the refusal stands. When they do, the outcome is unknown,
+    /// not a success: an earlier, identical call may have written them, and
+    /// a call that began after the fencing seal cannot have taken effect.
     async fn write_records(
         &self,
         request: Request,
@@ -250,9 +252,8 @@ impl Client {
             .await
             .and_then(position)
         {
-            Ok(last) => Ok(last),
             Err(JournalError::Conflict { .. }) => Err(refusal),
-            Err(_) => Err(JournalError::Unavailable),
+            Ok(_) | Err(_) => Err(JournalError::Unavailable),
         }
     }
 
