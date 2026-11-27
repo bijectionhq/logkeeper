@@ -183,6 +183,11 @@ struct ProcessCluster {
     catalog_voters: Option<[Uuid; 3]>,
     keepers: Keepers,
     config_paths: BTreeMap<Uuid, PathBuf>,
+    /// Each keeper's configuration without an admin listener, which N-1
+    /// refuses as an unknown field.
+    configs: BTreeMap<Uuid, serde_json::Value>,
+    /// The loopback admin listener each keeper serves on the N binary.
+    admin: BTreeMap<Uuid, SocketAddr>,
     client_credentials: Credentials,
     children: BTreeMap<Uuid, Child>,
 }
@@ -248,6 +253,7 @@ impl ProcessCluster {
         );
 
         let mut config_paths = BTreeMap::new();
+        let mut configs = BTreeMap::new();
         for id in roster {
             let tls = issue_cert(
                 dir.path(),
@@ -309,6 +315,7 @@ impl ProcessCluster {
             }
             let cfg_path = dir.path().join(format!("config-{id}.json"));
             fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+            configs.insert(id, cfg.clone());
 
             let init = Command::new(initial.path())
                 .args(["keeper", "initialize", "--config"])
@@ -326,6 +333,8 @@ impl ProcessCluster {
             catalog_voters,
             keepers,
             config_paths,
+            configs,
+            admin: roster.into_iter().map(|id| (id, free_port())).collect(),
             client_credentials,
             children: BTreeMap::new(),
         };
@@ -349,11 +358,92 @@ impl ProcessCluster {
         }
     }
 
+    /// The HTTP status of `GET path` on `id`'s admin listener.
+    async fn probe(&self, id: Uuid, path: &str) -> Option<u16> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut socket = timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(self.admin[&id]),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        socket
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: keeper\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .ok()?;
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(5), socket.read_to_end(&mut response))
+            .await
+            .ok()?
+            .ok()?;
+        std::str::from_utf8(&response)
+            .ok()?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    }
+
+    /// Waits until `path` answers 200, as the runbook's `until probe` loops.
+    async fn wait_for(&self, id: Uuid, path: &str) -> Duration {
+        let started = Instant::now();
+        while self.probe(id, path).await != Some(200) {
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "{path} on keeper {id} did not answer 200: abort the rollout"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        started.elapsed()
+    }
+
+    /// Writes an operator configuration for `logkeeper admin`.
+    fn operator_config(&self) -> PathBuf {
+        let path = self._dir.path().join("operator.json");
+        let mut config = serde_json::json!({
+            "tls": {
+                "certificate": self.client_credentials.certificate,
+                "private_key": self.client_credentials.private_key,
+                "ca": self.client_credentials.ca,
+            },
+            "keepers": self.keepers,
+            "catalog": self.catalog,
+            "admin": self.admin,
+            "admin_mtls": false,
+        });
+        if let Some(voters) = self.catalog_voters {
+            config
+                .as_object_mut()
+                .unwrap()
+                .insert("catalog_voters".into(), serde_json::json!(voters));
+        }
+        fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+        path
+    }
+
     async fn start_keeper(&mut self, id: Uuid, binary: Binary) {
         assert!(
             !self.children.contains_key(&id),
             "keeper {id} already running"
         );
+        // The admin listener is added with the N binary and removed on a
+        // rollback, since N-1 refuses an unknown configuration field.
+        let mut config = self.configs[&id].clone();
+        if binary == Binary::New {
+            config.as_object_mut().unwrap().insert(
+                "admin".into(),
+                serde_json::json!({"listen": self.admin[&id], "mtls": false}),
+            );
+        }
+        fs::write(
+            &self.config_paths[&id],
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .unwrap();
         let child = Command::new(binary.path())
             .args(["keeper", "--config"])
             .arg(&self.config_paths[&id])
@@ -664,30 +754,47 @@ async fn rolling_restart_one_at_a_time_under_load() {
     .expect("initial writes on old cluster");
 
     let started = Instant::now();
+    // The runbook (docs/runbooks/rolling-upgrade.md), one keeper at a time,
+    // the catalog keeper and catalog voters first (step 2).
     let upgrade_order = [
+        cluster.catalog,
         cluster.voters[0],
         cluster.voters[1],
         cluster.voters[2],
-        cluster.catalog,
     ];
     for id in upgrade_order {
         let before = acked.load(std::sync::atomic::Ordering::Acquire);
-        cluster.stop_keeper(id).await;
-        cluster.start_keeper(id, Binary::New).await;
+        // Step 6. N-1 has no admin listener, so instead of `/safe-to-stop`
+        // the stream's other voters must report healthy replicas.
         timeout(WAIT, async {
             loop {
-                if let Ok(status) = client.keeper_status(id, stream).await
-                    && status.features == features::SUPPORTED
-                {
+                let mut healthy = true;
+                for voter in cluster.voters.into_iter().filter(|voter| *voter != id) {
+                    healthy &= client
+                        .keeper_status(voter, stream)
+                        .await
+                        .is_ok_and(|status| status.replica == Some(true));
+                }
+                if healthy {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
-        .expect("upgraded keeper responded with current features");
-        // Require the background writer to continue making progress after each
-        // keeper rolls over.
+        .expect("the other voters are healthy before a keeper stops");
+        // Step 7: SIGTERM hands off leadership; start the new binary with its
+        // admin listener.
+        cluster.stop_keeper(id).await;
+        cluster.start_keeper(id, Binary::New).await;
+        // Step 8: wait until it is ready.
+        cluster.wait_for(id, "/ready").await;
+        assert_eq!(cluster.probe(id, "/live").await, Some(200));
+        assert_eq!(
+            client.keeper_status(id, stream).await.unwrap().features,
+            features::SUPPORTED
+        );
+        // Step 9: writes go on before the next keeper.
         timeout(WAIT, async {
             while acked.load(std::sync::atomic::Ordering::Acquire) < before + 5 {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -695,6 +802,10 @@ async fn rolling_restart_one_at_a_time_under_load() {
         })
         .await
         .expect("writes progressed after rolling restart");
+    }
+    // Every keeper now answers `/safe-to-stop`, as a later upgrade asks.
+    for id in upgrade_order {
+        cluster.wait_for(id, "/safe-to-stop").await;
     }
     let elapsed = started.elapsed();
 
@@ -718,12 +829,27 @@ async fn rolling_restart_one_at_a_time_under_load() {
         .unwrap();
     assert_eq!(page.records, recorded);
 
-    // Now that all 4 keepers are on N, finalizing cluster feature level 2 works.
+    // Step 11: finalize with the operator CLI, as the runbook does.
     assert_eq!(client.cluster_version().await, Ok(CLUSTER_VERSION_V1));
-    assert_eq!(
-        client.finalize_version(CLUSTER_VERSION_CURRENT).await,
-        Ok(CLUSTER_VERSION_CURRENT)
-    );
+    let operator = cluster.operator_config();
+    let finalized = timeout(WAIT, async {
+        loop {
+            let output = Command::new(new_binary())
+                .args(["admin", "finalize-version", "--config"])
+                .arg(&operator)
+                .output()
+                .expect("run logkeeper admin finalize-version");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            if output.status.success() {
+                return stdout;
+            }
+            // Unavailable while a keeper is still settling: retry.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("lk admin finalize-version succeeded");
+    assert!(finalized.contains("cluster_version: 2"), "{finalized}");
     assert_eq!(client.cluster_version().await, Ok(CLUSTER_VERSION_CURRENT));
 
     // Once finalized, keepers write N formats, here an LKRWAL05 checkpoint,
