@@ -84,6 +84,11 @@ impl Engine {
                 let mut handles = Vec::new();
                 for (id, node) in new_voters {
                     let keeper = Uuid::from_u128(id);
+                    // A learner an aborted move left is restaged with an
+                    // empty log, below what this leader saw it match.
+                    if membership.membership().get_node(&id).is_some() {
+                        let _ = group.raft.trigger().allow_next_revert(&id, true).await;
+                    }
                     let Reply::Generation(generation) = self
                         .rpc
                         .call(

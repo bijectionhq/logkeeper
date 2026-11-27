@@ -1,12 +1,11 @@
 //! Deterministic reproductions of protocol counterexamples discovered by the
 //! TLA+ model in `verification/tla/`.
 //!
-//! Each test reproduces a real safety or liveness failure against the live
-//! keeper implementation and is marked `#[ignore]` as a known failure so the
-//! default workspace suite stays green. Run them with:
+//! Each test reproduced a safety or liveness failure against the live keeper
+//! implementation, and now checks its fix. Run them with:
 //!
 //! ```sh
-//! cargo test --locked --all-features --lib model_counterexamples -- --ignored --nocapture
+//! cargo test --locked --all-features --lib model_counterexamples
 //! ```
 
 use super::*;
@@ -35,13 +34,12 @@ async fn wait_configured(journal: &Client, stream: StreamId, voters: [Uuid; 3]) 
 /// `StageReplica` on `d`, advancing `d`'s durable `Ownership::high` to `r + 1`
 /// with `installed = false`. If that replacement aborts before entering joint
 /// consensus (e.g., leader `a` crashes), the stream remains at revision `r`
-/// (`[a, b, c]`). When `b` and `c` subsequently attempt to replace dead voter
-/// `a` with `d` (`[a, b, c] -> [b, c, d]`, still from `source = r`), `d`
-/// rejects `StageReplica` in `ownership.rs` (`revision = r + 1 <= self.high`)
-/// with `stale()`, and also refuses `Change::Detach` (`!installed` and
-/// `r < self.high`). Repair onto `d` is permanently wedged.
+/// (`[a, b, c]`). When `b` and `c` then replace dead voter `a` with `d`
+/// (`[a, b, c] -> [b, c, d]`, still from `source = r`), `d` used to refuse
+/// `StageReplica` (`revision = r + 1 <= self.high`) and `Change::Detach`
+/// alike, wedging repair onto `d` for good. `decisions::restages_replacement`
+/// now restages a copy another ordinary move from the same source staged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known protocol failure (CE-2): Ownership::high after an aborted replacement permanently blocks subsequent repair onto the same keeper at the same revision"]
 async fn an_aborted_replacement_does_not_wedge_subsequent_repair_on_the_same_keeper() {
     let mut cluster = Cluster::start().await;
     // Disable automatic background repair onto extra test keepers (5, 6, 7) so
@@ -112,10 +110,9 @@ async fn an_aborted_replacement_does_not_wedge_subsequent_repair_on_the_same_kee
     assert!(d_own.high_water() > current.revision);
     assert!(!d_own.installed());
 
-    // Now `b` and `c` (the live majority) try to replace dead `a` with `d`.
-    // Today this fails permanently with `Unavailable` because `d` rejects
-    // `StageReplica` for `source = initial.revision` (`revision = r + 1 <=
-    // high_water = r + 1` in `ownership.rs`).
+    // Now `b` and `c` (the live majority) replace dead `a` with `d`. This
+    // used to fail for good with `Unavailable`: `d` refused `StageReplica`
+    // for `source = initial.revision` (`revision = r + 1 <= high_water`).
     let mut target = [b, c, d];
     target.sort_unstable();
     let replaced = journal.replace(stream, current.revision, target).await;
@@ -157,7 +154,12 @@ async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suf
         .await
         .unwrap();
     journal
-        .append(stream, sealed.fence, Lsn(1), Bytes::from_static(b"shared-1"))
+        .append(
+            stream,
+            sealed.fence,
+            Lsn(1),
+            Bytes::from_static(b"shared-1"),
+        )
         .await
         .unwrap();
 
@@ -321,7 +323,7 @@ async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suf
 ///      EVER retires (`LostVotersEventuallyRetire` violated).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn returning_lost_voters_retire_and_cannot_form_a_permanent_split_brain_when_survivor_is_replaced()
-{
+ {
     let mut cluster = Cluster::start().await;
     let [a, b, c, d] = cluster.ids;
     let f = Uuid::from_u128(6);
@@ -335,7 +337,12 @@ async fn returning_lost_voters_retire_and_cannot_form_a_permanent_split_brain_wh
         .await
         .unwrap();
     journal
-        .append(stream, old_seal.fence, Lsn(1), Bytes::from_static(b"shared-1"))
+        .append(
+            stream,
+            old_seal.fence,
+            Lsn(1),
+            Bytes::from_static(b"shared-1"),
+        )
         .await
         .unwrap();
 
@@ -355,7 +362,12 @@ async fn returning_lost_voters_retire_and_cannot_form_a_permanent_split_brain_wh
         group == stream && !req.entries.is_empty()
     }));
     journal
-        .append(stream, old_seal.fence, Lsn(2), Bytes::from_static(b"lost-2"))
+        .append(
+            stream,
+            old_seal.fence,
+            Lsn(2),
+            Bytes::from_static(b"lost-2"),
+        )
         .await
         .unwrap();
 

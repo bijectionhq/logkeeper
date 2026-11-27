@@ -153,7 +153,24 @@ impl Ownership {
                     return Ok(false);
                 }
                 let revision = stage.source.checked_add(1).ok_or_else(stale)?;
-                if revision <= self.high {
+                // A move aborted before its joint configuration committed
+                // leaves its copy at this revision; another move from the
+                // same source restages it.
+                let restages = self
+                    .current
+                    .as_ref()
+                    .and_then(|copy| copy.stage.as_ref())
+                    .is_some_and(|staged| {
+                        decisions::restages_replacement(
+                            staged.recovery(),
+                            stage.recovery(),
+                            staged.stream == stage.stream
+                                && staged.source == stage.source
+                                && staged.old == stage.old,
+                            *staged == stage,
+                        )
+                    });
+                if revision < self.high || (revision == self.high && !restages) {
                     return Err(stale());
                 }
                 self.stage_copy(stage, revision)
@@ -292,6 +309,32 @@ mod tests {
         assert_eq!(book.generation(), Some(2));
         assert_eq!(book.detached(), [1]);
         assert_eq!(book.high_water(), 1);
+    }
+
+    #[test]
+    fn another_move_from_the_same_source_restages_an_aborted_copy() {
+        let mut book = Ownership {
+            current: None,
+            ..Ownership::default()
+        };
+        let aborted = stage([1, 2, 3], [1, 2, 4]);
+        assert!(book.apply(Change::Stage(aborted), |_| false).unwrap());
+        let repair = stage([1, 2, 3], [2, 3, 4]);
+        assert!(
+            book.apply(Change::Stage(repair.clone()), |_| false)
+                .unwrap()
+        );
+        assert!(book.contains_stage(&repair) && !book.installed());
+        assert_eq!(book.generation(), Some(2));
+        assert_eq!(book.detached(), [1]);
+        assert_eq!(book.high_water(), 1);
+        // Another source configuration at that revision stays refused.
+        let mut other = stage([1, 2, 5], [1, 2, 4]);
+        assert!(book.apply(Change::Stage(other.clone()), |_| false).is_err());
+        // So does any stage below the high-water mark.
+        other.old = [1, 2, 3].map(uuid::Uuid::from_u128);
+        book.high = 2;
+        assert!(book.apply(Change::Stage(other), |_| false).is_err());
     }
 
     #[test]

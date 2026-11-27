@@ -244,6 +244,19 @@ fn a_recovery_restages_only_its_own_aborted_copy(
     assert(!same_origin ==> !restages);
 }
 
+// An ordinary move restages a copy at the revision it already holds only
+// when another ordinary move from the same source staged it: a recovery
+// copy, a copy of another source configuration and the same stage are
+// never restaged.
+fn an_aborted_move_restages_only_for_the_same_source(
+    staged_recovery: bool, stage_recovery: bool, same_source: bool, same_stage: bool,
+) {
+    let restages = restages_replacement(staged_recovery, stage_recovery, same_source, same_stage);
+    assert(restages ==> same_source && !same_stage);
+    assert(staged_recovery || stage_recovery ==> !restages);
+    assert(!staged_recovery && !stage_recovery && same_source && !same_stage ==> restages);
+}
+
 // A replica refuses a peer without a Raft answer only when the peer is
 // outside its effective membership and below its term: a member, or a peer
 // at or above its term, always gets an answer, so the refusal never hides a

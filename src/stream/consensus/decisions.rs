@@ -268,6 +268,27 @@ pub(super) fn restages_recovery(
     staged_recovery && retried_recovery && same_origin
 }
 
+/// Whether an ordinary move's stage replaces the copy another ordinary move
+/// staged on this keeper at the same revision, from the same source
+/// configuration. The caller holds the authority's committed placement
+/// proof that names the new stage at that source with no joint
+/// configuration, so the other move's joint configuration can never commit
+/// and nothing the copy acknowledged under it can count toward a quorum. The
+/// stream's durable vote is kept across generations, so the restage loses no
+/// vote. A recovery stage on either side stays refused: it may belong to
+/// another survivor of a split history.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (!staged_recovery && !stage_recovery && same_source && !same_stage)
+))]
+pub(super) fn restages_replacement(
+    staged_recovery: bool,
+    stage_recovery: bool,
+    same_source: bool,
+    same_stage: bool,
+) -> bool {
+    !staged_recovery && !stage_recovery && same_source && !same_stage
+}
+
 /// The term of a recovery write: far above the survivor's vote and every
 /// term in its log, so no ballot or entry of the lost history can outrank it.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
