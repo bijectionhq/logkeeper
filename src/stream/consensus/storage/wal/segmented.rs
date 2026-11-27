@@ -38,7 +38,7 @@ use crate::stream::{
         decisions, options,
         storage::{
             media::{Boundaries, Boundary, CheckpointRef, Slot},
-            objects::{Location, Object, Objects, Reference},
+            objects::{Location, Object, Objects, Pins, Reference, Segment},
             segment::{self, FIRST, FRAME_HEADER, Frame, HEADER, MAX_FRAME},
             space::Space,
         },
@@ -121,6 +121,7 @@ struct Writer {
 pub(super) struct Staged {
     start: usize,
     pub slices: Option<(StreamId, Vec<(u64, Arc<Object>)>)>,
+    pub moved: Option<(Location, Location)>,
 }
 
 pub(super) struct Segmented {
@@ -133,6 +134,10 @@ pub(super) struct Segmented {
     last: Instant,
     scopes: BTreeSet<StreamId>,
     tuning: Tuning,
+    /// Segments that relocated slices left. The published checkpoint may
+    /// still name their old copies, so they stay until a checkpoint
+    /// captured after the move is published.
+    retired: Vec<Arc<Segment>>,
     #[cfg(test)]
     cut: std::cell::Cell<u8>,
 }
@@ -141,13 +146,16 @@ pub(super) struct Segmented {
 /// to until a newer checkpoint replaces it.
 struct Published {
     reference: Option<CheckpointRef>,
-    _pins: Vec<Arc<Object>>,
+    _pins: Pins,
 }
 
 struct Pending {
     handle: JoinHandle<io::Result<CheckpointRef>>,
     position: Position,
-    pins: Vec<Arc<Object>>,
+    pins: Pins,
+    /// Segments retired before this checkpoint was captured, released once
+    /// it is published.
+    retired: Vec<Arc<Segment>>,
 }
 
 impl Writer {
@@ -164,16 +172,19 @@ impl Writer {
             .map_err(io::Error::other)
             .and_then(|()| segment::seal(&mut self.buffer, start))
             .and_then(|()| {
-                slices(
-                    record,
-                    &self.buffer[body..],
-                    self.id,
-                    self.len + body as u64,
-                    objects,
-                )
+                let frame = &self.buffer[body..];
+                let base = self.len + body as u64;
+                Ok((
+                    slices(record, frame, self.id, base, objects)?,
+                    moved(record, frame, self.id, base)?,
+                ))
             });
         match staged {
-            Ok(slices) => Ok(Staged { start, slices }),
+            Ok((slices, moved)) => Ok(Staged {
+                start,
+                slices,
+                moved,
+            }),
             Err(error) => {
                 self.buffer.truncate(start);
                 Err(error)
@@ -245,6 +256,34 @@ fn slices(
     }
     slices.reverse();
     Ok(Some((scope, slices)))
+}
+
+/// Where a relocated slice's copy lies: the last bytes of its frame body.
+fn moved(
+    record: &Record,
+    body: &[u8],
+    segment: u64,
+    base: u64,
+) -> io::Result<Option<(Location, Location)>> {
+    let Record::Relocate(from, bytes) = record else {
+        return Ok(None);
+    };
+    let start = body
+        .len()
+        .checked_sub(bytes.len())
+        .filter(|start| body[*start..] == bytes[..])
+        .ok_or_else(|| invalid("WAL frame does not end with its relocated slice"))?;
+    if bytes.len() as u64 != from.len || crc32fast::hash(bytes) != from.crc {
+        return Err(invalid("relocated slice differs from its source"));
+    }
+    Ok(Some((
+        *from,
+        Location {
+            segment,
+            offset: base + start as u64,
+            ..*from
+        },
+    )))
 }
 
 impl Segmented {
@@ -357,13 +396,14 @@ impl Segmented {
                 boundaries,
                 published: Published {
                     reference: slot.checkpoint,
-                    _pins: pins,
+                    _pins: pins.into(),
                 },
                 pending: None,
                 since: replayed,
                 last: Instant::now(),
                 scopes,
                 tuning,
+                retired: Vec::new(),
                 #[cfg(test)]
                 cut: Default::default(),
             },
@@ -449,6 +489,12 @@ impl Segmented {
         self.writer.stage(record, objects)
     }
 
+    /// Keeps `segment` until a checkpoint captured from now on is
+    /// published.
+    pub fn retire(&mut self, segment: Arc<Segment>) {
+        self.retired.push(segment);
+    }
+
     pub fn discard(&mut self, staged: Staged) {
         self.writer.buffer.truncate(staged.start);
     }
@@ -505,11 +551,12 @@ impl Segmented {
     fn adopt(
         &mut self,
         reference: CheckpointRef,
-        (position, pins): (Position, Vec<Arc<Object>>),
+        (position, pins, retired): (Position, Pins, Vec<Arc<Segment>>),
         objects: &Objects,
     ) {
         let old = self.published.reference.replace(reference);
         self.published._pins = pins;
+        drop(retired);
         objects.set_floor(position.segment);
         if let Some(old) = old {
             // A name that survives a crash is removed on the next open.
@@ -517,23 +564,29 @@ impl Segmented {
         }
     }
 
-    fn ready_checkpoint(&mut self) -> Option<(CheckpointRef, (Position, Vec<Arc<Object>>))> {
+    #[allow(clippy::type_complexity)]
+    fn ready_checkpoint(&mut self) -> Option<(CheckpointRef, (Position, Pins, Vec<Arc<Segment>>))> {
         let Pending {
             handle,
             position,
             pins,
+            retired,
         } = self
             .pending
             .take_if(|pending| pending.handle.is_finished())?;
         match handle.join() {
-            Ok(Ok(reference)) => Some((reference, (position, pins))),
+            // The retired segments drop with the old checkpoint's pins
+            // once the caller adopts the new one.
+            Ok(Ok(reference)) => Some((reference, (position, pins, retired))),
             Ok(Err(error)) => {
                 eprintln!("logkeeper WAL checkpoint deferred: {error}");
                 self.since = self.since.max(self.tuning.checkpoint_bytes / 2);
+                self.retired.extend(retired);
                 None
             }
             Err(_) => {
                 eprintln!("logkeeper WAL checkpoint writer panicked");
+                self.retired.extend(retired);
                 None
             }
         }
@@ -576,7 +629,8 @@ impl Segmented {
         self.pending = Some(Pending {
             handle,
             position,
-            pins,
+            pins: pins.into(),
+            retired: std::mem::take(&mut self.retired),
         });
         Ok(())
     }

@@ -9,8 +9,13 @@ use std::{
 use uuid::Uuid;
 
 use super::*;
-use crate::stream::consensus::{Fence, MAX_RECORD, state::Command, storage::objects::Reference};
+use crate::stream::consensus::{
+    Fence, MAX_RECORD,
+    state::Command,
+    storage::objects::{Object, Reference},
+};
 use bincode::Options as _;
+use std::time::Duration;
 
 fn genesis() -> Genesis {
     Genesis {
@@ -905,4 +910,149 @@ async fn each_segment_counts_the_exact_bytes_its_live_slices_hold() {
     assert_eq!(disk.objects.live_bytes(slices[1].segment), 0);
     assert_eq!(disk.objects.live_bytes(slices[2].segment), slices[2].len);
     disk.shutdown().await.unwrap();
+}
+
+fn small_segments() -> Tuning {
+    Tuning {
+        segment_bytes: 4096,
+        checkpoint_bytes: 1,
+        synchronous: false,
+    }
+}
+
+/// Stream 1 holds one entry in an early segment; stream 2 fills later
+/// segments and is purged, so checkpoints move past the early segment.
+/// Returns the early entry's slice, as a snapshot would hold it.
+async fn cold_entry(disk: &Disk) -> (StreamId, Arc<Object>, PathBuf) {
+    let stream = registered(disk, genesis()).await;
+    disk.write(Record::Append(
+        stream,
+        vec![entry(0, Bytes::from(vec![9; 1024]))],
+    ))
+    .await
+    .unwrap();
+    let held = disk.log(stream, |log| log.segments[&0].clone());
+    let path = held.path();
+    let filler = registered(
+        disk,
+        Genesis {
+            stream: StreamId(2),
+            ..genesis()
+        },
+    )
+    .await;
+    for index in 0..12 {
+        disk.write(Record::Append(
+            filler,
+            vec![entry(index, Bytes::from(vec![3; 2048]))],
+        ))
+        .await
+        .unwrap();
+    }
+    let cut = disk.log(filler, |log| log.entries[&11].log_id);
+    disk.protocol(Record::Snapshot(
+        filler,
+        Selected {
+            log_id: cut,
+            digest: [2; 32],
+        },
+    ))
+    .await
+    .unwrap();
+    disk.covered(Record::Purge(filler, cut)).await.unwrap();
+    (stream, held, path)
+}
+
+fn segment_of(object: &Object) -> u64 {
+    match object.reference() {
+        Reference::Segment(location) => location.segment,
+        Reference::Object(_) => panic!("segment slice"),
+    }
+}
+
+/// A relocation interrupted at any step of its round leaves the old copy
+/// in place and the WAL reopens with every entry; a completed one points
+/// every holder at the copy, and replaying its frame changes nothing.
+#[tokio::test]
+async fn a_relocation_survives_a_crash_at_every_step_of_its_round() {
+    for cut in [None, Some(6), Some(5), Some(2), Some(3)] {
+        let dir = tempfile::tempdir().unwrap();
+        let enrollment = install(dir.path(), genesis().voters[0]);
+        let disk = Disk::open_tuned(enrollment(), small_segments()).unwrap();
+        let (stream, held, path) = cold_entry(&disk).await;
+        let early = segment_of(&held);
+        let before = disk.objects.live_bytes(early);
+        if let Some(cut) = cut {
+            disk.interrupt_next(stream, cut);
+        }
+        let relocated = disk.relocate_segment(early, u64::MAX).await;
+        assert_eq!(relocated.is_ok(), cut.is_none(), "cut {cut:?}");
+        assert_eq!(held.read().unwrap(), {
+            let mut bytes = Vec::new();
+            crate::stream::consensus::options()
+                .serialize_into(&mut bytes, &entry(0, Bytes::from(vec![9; 1024])))
+                .unwrap();
+            bytes
+        });
+        match cut {
+            None => {
+                assert!(segment_of(&held) > early, "the slice moved");
+                // Slices only checkpoints hold are not copied; a checkpoint
+                // published meanwhile may have dropped them.
+                assert!(disk.objects.live_bytes(early) <= before - held.len());
+                assert!(disk.objects.live_bytes(segment_of(&held)) >= held.len());
+            }
+            Some(_) => assert_eq!(segment_of(&held), early, "cut {cut:?}"),
+        }
+        drop(held);
+        let _ = disk.shutdown().await;
+        drop(disk);
+        assert!(path.exists() || cut.is_none());
+        let reopened = Disk::open_tuned(enrollment(), small_segments()).unwrap();
+        reopened.log(stream, |log| {
+            assert_eq!(payload_of(&log.entries[&0]), vec![9; 1024], "cut {cut:?}");
+        });
+        reopened.shutdown().await.unwrap();
+    }
+}
+
+/// The segment a relocated slice left stays until a checkpoint captured
+/// after the move is published, since the published one still names it.
+#[tokio::test]
+async fn a_relocated_segment_outlives_the_checkpoint_that_names_it() {
+    for publish in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let enrollment = install(dir.path(), genesis().voters[0]);
+        let disk = Disk::open_tuned(enrollment(), small_segments()).unwrap();
+        let (stream, held, path) = cold_entry(&disk).await;
+        let early = segment_of(&held);
+        drop(held);
+        disk.enable_reaping();
+        disk.relocate_segment(early, u64::MAX).await.unwrap();
+        if publish {
+            // Later rounds publish the checkpoint taken after the move.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while path.exists() {
+                    disk.protocol(Record::Vote(stream, Vote::new_committed(2, 1)))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    disk.reap_objects().await.unwrap();
+                }
+            })
+            .await
+            .expect("the moved segment went once a later checkpoint was published");
+        } else {
+            for _ in 0..8 {
+                disk.reap_objects().await.unwrap();
+            }
+            assert!(path.exists(), "the published checkpoint still names it");
+        }
+        disk.shutdown().await.unwrap();
+        let reopened = Disk::open_tuned(enrollment(), small_segments()).unwrap();
+        reopened.log(stream, |log| {
+            assert_eq!(payload_of(&log.entries[&0]), vec![9; 1024]);
+        });
+        reopened.shutdown().await.unwrap();
+    }
 }

@@ -45,6 +45,7 @@ counters! {
     park_declined: "stream.park_declined",
     reopened_stopped: "stream.reopened_stopped",
     evicted: "stream.evicted",
+    compacted_bytes: "segments.compacted_bytes",
 }
 
 pub(super) static COUNTERS: Counters = Counters::new();
@@ -61,6 +62,10 @@ pub(super) fn sample(reason: &str, detail: impl FnOnce() -> String) {
 
 pub(super) fn count(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(super) fn add(counter: &AtomicU64, amount: u64) {
+    counter.fetch_add(amount, Ordering::Relaxed);
 }
 
 /// The counters that changed since `previous`, as `name=total(+delta)` pairs.

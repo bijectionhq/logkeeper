@@ -286,10 +286,16 @@ impl Pin {
     /// Makes the pin durable in the replica's directory, so a restart keeps
     /// the copy parked without loading its image.
     pub fn persist(&self, disk: &Disk, stream: StreamId) -> io::Result<()> {
+        // Segments that slices of the selected snapshot left stay named
+        // until a rebuilt snapshot is selected.
+        let mut segments = self.segments().collect::<Vec<_>>();
+        segments.extend(disk.objects.moved_segments(stream));
+        segments.sort_unstable();
+        segments.dedup();
         let mark = Mark {
             selected: self.selected,
             finalized: self.finalized,
-            segments: self.segments().collect(),
+            segments,
         };
         let mut body = PARK_MARK.to_vec();
         options()
@@ -958,6 +964,8 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
         })
         .await?;
         let _publish = inner.publishing.lock().await;
+        // An installed image carries its records in its own file.
+        let moved = inner.disk.objects.last_move(inner.genesis.stream);
         if inner.applied.read().applied > meta.last_log_id {
             return Err(invalid("snapshot would roll back applied state"));
         }
@@ -969,6 +977,12 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
             image,
             dependencies: index::Dependencies::legacy(selected.digest),
         });
+        if let Some(moved) = moved {
+            inner
+                .disk
+                .objects
+                .release_moved(inner.genesis.stream, moved);
+        }
         inner.changed.send_replace(());
         Ok(())
     }
@@ -1195,16 +1209,24 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
         };
         let _publish = inner.publishing.lock().await;
         let previous = inner.snapshot.lock().clone();
-        if previous
-            .as_ref()
-            .is_some_and(|prior| prior.meta.last_log_id >= meta.last_log_id)
+        // Slices this stream's selected snapshot names may have moved. A
+        // rebuild then writes every page again, which the scratch for a
+        // full page set covers, so the new snapshot names only their new
+        // copies and the segments they left can go.
+        let moved = inner.disk.objects.last_move(inner.genesis.stream);
+        if moved.is_none()
+            && previous
+                .as_ref()
+                .is_some_and(|prior| prior.meta.last_log_id >= meta.last_log_id)
         {
             return inner
                 .current_snapshot()
                 .ok_or_else(|| invalid("selected image disappeared"));
         }
-        let previous =
-            previous.map_or_else(index::Dependencies::default, |prior| prior.dependencies);
+        let previous = match previous {
+            Some(prior) if moved.is_none() => prior.dependencies,
+            _ => index::Dependencies::default(),
+        };
         let scratch = inner.disk.space.scratch(index::SCRATCH).await?;
         let temporary = inner
             .directory
@@ -1242,6 +1264,12 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
         drop(reserved);
         inner.select(&temporary, active.selected, false).await?;
         inner.installed(active);
+        if let Some(moved) = moved {
+            inner
+                .disk
+                .objects
+                .release_moved(inner.genesis.stream, moved);
+        }
         inner
             .current_snapshot()
             .ok_or_else(|| invalid("built image disappeared"))

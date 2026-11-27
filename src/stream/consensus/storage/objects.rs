@@ -10,7 +10,10 @@ use std::{
     fs::{self, File, OpenOptions, ReadDir},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
 };
 
 use journal_contract::StreamId;
@@ -88,7 +91,13 @@ struct Segments {
     // Every live slice, by segment and offset, so two holders of the same
     // bytes share one object and each segment's live bytes are exact.
     slices: BTreeMap<(u64, u64), Weak<Object>>,
-    bytes: BTreeMap<u64, u64>,
+    bytes: BTreeMap<u64, (u64, usize)>,
+    // Segments whose slices moved, kept until each scope that held them
+    // selects a snapshot built after the move: until then its selected
+    // snapshot may still name them. Numbered so a build knows which moves
+    // it saw.
+    moved: BTreeMap<StreamId, Vec<(u64, Arc<Segment>)>>,
+    moves: u64,
     // Recovery replays segments from here on.
     floor: u64,
     scan: Option<ReadDir>,
@@ -131,6 +140,24 @@ impl std::fmt::Display for Usage {
     }
 }
 
+impl Segments {
+    fn add(&mut self, location: Location) {
+        let (bytes, count) = self.bytes.entry(location.segment).or_default();
+        *bytes += location.len;
+        *count += 1;
+    }
+
+    fn remove(&mut self, location: Location) {
+        if let Some((bytes, count)) = self.bytes.get_mut(&location.segment) {
+            *bytes = bytes.saturating_sub(location.len);
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.bytes.remove(&location.segment);
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(in crate::stream::consensus) struct Segment {
     id: u64,
@@ -141,7 +168,30 @@ pub(in crate::stream::consensus) struct Segment {
 }
 
 #[derive(Debug)]
-pub(in crate::stream::consensus) struct Object(Body);
+pub(in crate::stream::consensus) struct Object(Body, AtomicUsize);
+
+/// The objects a WAL checkpoint names. Each counts its checkpoint holders,
+/// so compaction can tell a slice only checkpoints hold, which dies at the
+/// next checkpoint, from one a stream still needs.
+#[derive(Default)]
+pub(in crate::stream::consensus) struct Pins(Vec<Arc<Object>>);
+
+impl From<Vec<Arc<Object>>> for Pins {
+    fn from(objects: Vec<Arc<Object>>) -> Self {
+        for object in &objects {
+            object.1.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        Self(objects)
+    }
+}
+
+impl Drop for Pins {
+    fn drop(&mut self) {
+        for object in &self.0 {
+            object.1.fetch_sub(1, AtomicOrdering::Relaxed);
+        }
+    }
+}
 
 #[derive(Debug)]
 enum Body {
@@ -150,10 +200,15 @@ enum Body {
         store: Weak<Inner>,
         path: PathBuf,
     },
-    Slice {
-        segment: Arc<Segment>,
-        location: Location,
-    },
+    /// Compaction may move a slice's bytes to a newer segment; every
+    /// holder then reads them there.
+    Slice(parking_lot::RwLock<At>),
+}
+
+#[derive(Debug, Clone)]
+struct At {
+    segment: Arc<Segment>,
+    location: Location,
 }
 
 impl Objects {
@@ -210,11 +265,14 @@ impl Objects {
             }
             return Ok(found);
         }
-        let object = Arc::new(Object(Body::File {
-            key,
-            store: Arc::downgrade(&self.0),
-            path: self.0.root.join(key.name()),
-        }));
+        let object = Arc::new(Object(
+            Body::File {
+                key,
+                store: Arc::downgrade(&self.0),
+                path: self.0.root.join(key.name()),
+            },
+            AtomicUsize::new(0),
+        ));
         state
             .live
             .insert((key.scope, key.id), Arc::downgrade(&object));
@@ -252,8 +310,11 @@ impl Objects {
             .entry(location.segment)
             .or_default()
             .insert(location.scope);
-        *segments.bytes.entry(location.segment).or_default() += location.len;
-        let object = Arc::new(Object(Body::Slice { segment, location }));
+        segments.add(location);
+        let object = Arc::new(Object(
+            Body::Slice(parking_lot::RwLock::new(At { segment, location })),
+            AtomicUsize::new(0),
+        ));
         segments.slices.insert(key, Arc::downgrade(&object));
         Ok(object)
     }
@@ -261,6 +322,9 @@ impl Objects {
     /// How full the segments before the published checkpoint are with
     /// bytes some slice still holds.
     pub fn usage(&self) -> Usage {
+        // A segment upgraded here may lose its last other holder meanwhile,
+        // and dropping it takes the table lock: drop them after it.
+        let mut upgraded = Vec::new();
         let state = self.0.state.lock();
         let segments = &state.segments;
         let mut usage = Usage::default();
@@ -268,12 +332,18 @@ impl Objects {
             let Some(segment) = segment.upgrade() else {
                 continue;
             };
-            let Ok(size) = segment.file.metadata().map(|meta| meta.len()) else {
-                continue;
-            };
-            let live = segments.bytes.get(&id).copied().unwrap_or(0).min(size);
-            usage.add(live, size);
+            if let Ok(size) = segment.file.metadata().map(|meta| meta.len()) {
+                let live = segments
+                    .bytes
+                    .get(&id)
+                    .map_or(0, |(bytes, _)| *bytes)
+                    .min(size);
+                usage.add(live, size);
+            }
+            upgraded.push(segment);
         }
+        drop(state);
+        drop(upgraded);
         usage
     }
 
@@ -286,8 +356,167 @@ impl Objects {
             .segments
             .bytes
             .get(&id)
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |(bytes, _)| *bytes)
+    }
+
+    /// The segments before the published checkpoint, other than the newest
+    /// `keep`, whose live slices hold less than `share` percent of their
+    /// bytes and that nothing but those slices holds, least live first.
+    pub fn cold_segments(&self, keep: u64, share: u64) -> Vec<u64> {
+        let mut upgraded = Vec::new();
+        let state = self.0.state.lock();
+        let segments = &state.segments;
+        let mut cold = Vec::new();
+        for (&id, segment) in segments.live.range(..segments.floor.saturating_sub(keep)) {
+            let Some(segment) = segment.upgrade() else {
+                continue;
+            };
+            let (live, count) = segments.bytes.get(&id).copied().unwrap_or((0, 0));
+            let Ok(size) = segment.file.metadata().map(|meta| meta.len()) else {
+                upgraded.push(segment);
+                continue;
+            };
+            // This upgrade and one per slice; anything else is a pin of a
+            // closed copy, a quarantine or a relocation hold.
+            let pinned = Arc::strong_count(&segment) > count + 1
+                || segments
+                    .scopes
+                    .get(&id)
+                    .is_some_and(|scopes| !scopes.is_disjoint(&state.protected));
+            if count > 0 && !pinned && live.saturating_mul(100) < size.saturating_mul(share) {
+                cold.push((live, id));
+            }
+            upgraded.push(segment);
+        }
+        drop(state);
+        drop(upgraded);
+        cold.sort();
+        cold.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// The live slices of segment `id`.
+    pub fn slices_in(&self, id: u64) -> Vec<Arc<Object>> {
+        let state = self.0.state.lock();
+        let slices = state
+            .segments
+            .slices
+            .range((id, 0)..(id + 1, 0))
+            .filter_map(|(_, slice)| slice.upgrade())
+            .collect();
+        drop(state);
+        slices
+    }
+
+    /// Points the live slice at `from` at `to`, a copy of its bytes, and
+    /// returns the segment it left, which the caller keeps until nothing
+    /// durable names `from`. `None` when no slice holds `from` any more.
+    pub fn relocate(&self, from: Location, to: Location) -> io::Result<Option<Arc<Segment>>> {
+        if from.scope != to.scope || from.len != to.len || from.crc != to.crc {
+            return Err(invalid("relocated slice differs from its source"));
+        }
+        // Dropping the last holder of the slice or of a segment takes the
+        // table lock, so both are dropped after it.
+        let object;
+        let mut state = self.0.state.lock();
+        object = state
+            .segments
+            .slices
+            .get(&(from.segment, from.offset))
+            .and_then(Weak::upgrade);
+        let Some(object) = &object else {
+            return Ok(None);
+        };
+        let Body::Slice(at) = &object.0 else {
+            unreachable!("segment slice table holds a file object");
+        };
+        if at.read().location != from {
+            return Ok(None);
+        }
+        let segment = self.open_segment(&mut state, to.segment)?;
+        let segments = &mut state.segments;
+        let previous = std::mem::replace(
+            &mut *at.write(),
+            At {
+                segment,
+                location: to,
+            },
+        );
+        segments.slices.remove(&(from.segment, from.offset));
+        segments
+            .slices
+            .insert((to.segment, to.offset), Arc::downgrade(object));
+        segments.remove(from);
+        segments.add(to);
+        segments
+            .scopes
+            .entry(to.segment)
+            .or_default()
+            .insert(to.scope);
+        drop(state);
+        Ok(Some(previous.segment))
+    }
+
+    /// Keeps `segment`, which slices of `scope` left, until `scope` selects
+    /// a snapshot built after this call.
+    pub fn hold_moved(&self, scope: StreamId, segment: Arc<Segment>) {
+        let mut state = self.0.state.lock();
+        state.segments.moves += 1;
+        let number = state.segments.moves;
+        state
+            .segments
+            .moved
+            .entry(scope)
+            .or_default()
+            .push((number, segment));
+    }
+
+    /// The newest move of `scope`'s slices, or `None` when its selected
+    /// snapshot names no segment its slices left.
+    pub fn last_move(&self, scope: StreamId) -> Option<u64> {
+        let state = self.0.state.lock();
+        state
+            .segments
+            .moved
+            .get(&scope)
+            .and_then(|moved| moved.last())
+            .map(|(number, _)| *number)
+    }
+
+    /// Releases the segments `scope`'s slices left up to move `through`,
+    /// once a snapshot built after them is selected.
+    pub fn release_moved(&self, scope: StreamId, through: u64) {
+        let mut state = self.0.state.lock();
+        let mut released = Vec::new();
+        if let Some(moved) = state.segments.moved.get_mut(&scope) {
+            let kept;
+            (released, kept) = std::mem::take(moved)
+                .into_iter()
+                .partition(|(number, _)| *number <= through);
+            *moved = kept;
+            if moved.is_empty() {
+                state.segments.moved.remove(&scope);
+            }
+        }
+        // Dropping a segment's last holder takes the table lock.
+        drop(state);
+        drop(released);
+    }
+
+    /// The segments held for `scope`'s selected snapshot after its slices
+    /// moved.
+    pub fn moved_segments(&self, scope: StreamId) -> Vec<u64> {
+        let state = self.0.state.lock();
+        state
+            .segments
+            .moved
+            .get(&scope)
+            .map(|moved| moved.iter().map(|(_, segment)| segment.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// The scopes holding segments for a snapshot not yet rebuilt.
+    pub fn moved_scopes(&self) -> Vec<StreamId> {
+        self.0.state.lock().segments.moved.keys().copied().collect()
     }
 
     fn open_segment(&self, state: &mut State, id: u64) -> io::Result<Arc<Segment>> {
@@ -500,40 +729,50 @@ impl Drop for Segment {
 }
 
 impl Object {
+    /// Whether something other than checkpoints and `held` handles of the
+    /// caller's holds this object.
+    pub fn needed(self: &Arc<Self>, held: usize) -> bool {
+        Arc::strong_count(self) > held + self.1.load(AtomicOrdering::Relaxed)
+    }
+
     pub fn key(&self) -> Option<Key> {
         match &self.0 {
             Body::File { key, .. } => Some(*key),
-            Body::Slice { .. } => None,
+            Body::Slice(_) => None,
+        }
+    }
+
+    fn at(&self) -> Option<At> {
+        match &self.0 {
+            Body::File { .. } => None,
+            Body::Slice(at) => Some(at.read().clone()),
         }
     }
 
     /// The segment a slice lies in.
     pub fn segment(&self) -> Option<Arc<Segment>> {
-        match &self.0 {
-            Body::File { .. } => None,
-            Body::Slice { segment, .. } => Some(segment.clone()),
-        }
+        self.at().map(|at| at.segment)
     }
 
     pub fn reference(&self) -> Reference {
         match &self.0 {
             Body::File { key, .. } => Reference::Object(*key),
-            Body::Slice { location, .. } => Reference::Segment(*location),
+            Body::Slice(at) => Reference::Segment(at.read().location),
         }
     }
 
     pub fn len(&self) -> u64 {
         match &self.0 {
             Body::File { key, .. } => key.len,
-            Body::Slice { location, .. } => location.len,
+            Body::Slice(at) => at.read().location.len,
         }
     }
 
     #[cfg(test)]
-    pub fn path(&self) -> &Path {
+    pub fn path(&self) -> PathBuf {
         match &self.0 {
-            Body::File { path, .. } => path,
-            Body::Slice { segment, .. } => &segment.path,
+            Body::File { path, .. } => path.clone(),
+            Body::Slice(at) => at.read().segment.path.clone(),
         }
     }
 
@@ -542,7 +781,7 @@ impl Object {
     pub fn position(&self) -> u64 {
         match &self.0 {
             Body::File { .. } => 0,
-            Body::Slice { location, .. } => location.offset,
+            Body::Slice(at) => at.read().location.offset,
         }
     }
 
@@ -560,7 +799,8 @@ impl Object {
                 }
                 Ok(bytes)
             }
-            Body::Slice { segment, location } => {
+            Body::Slice(at) => {
+                let At { segment, location } = at.read().clone();
                 let mut bytes = vec![0; location.len as usize];
                 segment::read_at(&segment.file, location.offset, &mut bytes)?;
                 if crc32fast::hash(&bytes) != location.crc {
@@ -584,7 +824,8 @@ impl Object {
                 file.seek(SeekFrom::Start(offset))?;
                 file.read_exact(buf)
             }
-            Body::Slice { segment, location } => {
+            Body::Slice(at) => {
+                let At { segment, location } = at.read().clone();
                 segment::read_at(&segment.file, location.offset + offset, buf)
             }
         }
@@ -593,9 +834,10 @@ impl Object {
 
 impl Drop for Object {
     fn drop(&mut self) {
-        let (key, store) = match &self.0 {
+        let (key, store) = match &mut self.0 {
             Body::File { key, store, .. } => (key, store),
-            Body::Slice { segment, location } => {
+            Body::Slice(at) => {
+                let At { segment, location } = at.get_mut();
                 if let Some(store) = segment.store.upgrade() {
                     let mut state = store.state.lock();
                     let segments = &mut state.segments;
@@ -607,12 +849,7 @@ impl Drop for Object {
                     {
                         segments.slices.remove(&key);
                     }
-                    if let Some(bytes) = segments.bytes.get_mut(&location.segment) {
-                        *bytes = bytes.saturating_sub(location.len);
-                        if *bytes == 0 {
-                            segments.bytes.remove(&location.segment);
-                        }
-                    }
+                    segments.remove(*location);
                 }
                 return;
             }

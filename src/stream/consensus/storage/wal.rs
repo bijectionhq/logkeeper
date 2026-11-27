@@ -27,7 +27,7 @@ mod tests;
 use super::{
     Entry, Genesis, Log, LogId, Vote,
     media::{Boundary, Enrollment, Media, Opened},
-    objects::Objects,
+    objects::{Location, Objects},
     snapshot::Selected,
     space::{Admission, Reservation, Space, WAL_METADATA_BYTES},
 };
@@ -70,6 +70,13 @@ pub(in crate::stream::consensus) enum Record {
     /// `Owned`, so an older keeper refuses a WAL that holds it instead of
     /// misreading it; checkpoints keep their format.
     Recover(StreamId, Vote, Vec<Entry>),
+    /// A copy of the live slice at the location, written by segment
+    /// compaction so the slice's old segment can go. The bytes end the
+    /// frame body. Local to this keeper and outside Raft; replay ignores
+    /// it, since whatever a restart reads still names the old copy or a
+    /// checkpoint taken after the move. Added after `Recover`, so an older
+    /// keeper refuses a WAL whose unpublished suffix holds it.
+    Relocate(Location, Vec<u8>),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -186,6 +193,7 @@ impl State {
                 self.apply(Record::Vote(stream, vote))?;
                 self.apply(Record::Append(stream, entries))?;
             }
+            Record::Relocate(..) => (),
             Record::Truncate(stream, since) => {
                 let log = self.log_mut(stream)?;
                 if log.purged.is_some_and(|id| id.index >= since) {
@@ -289,12 +297,14 @@ impl State {
             .collect()
     }
 
+    /// Applies `record` and stages its frame. Returns the move of a
+    /// relocated slice, which takes effect once the round is durable.
     fn apply_indexed(
         &mut self,
         record: Record,
         wal: &mut Segmented,
         objects: &Objects,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<(Location, Location)>> {
         if let Record::Owned(generation, scoped) = &record
             && self.log_mut(scoped.stream())?.ownership.generation() != Some(*generation)
         {
@@ -326,6 +336,7 @@ impl State {
         }
         let mut staged = wal.stage(&record, objects)?;
         let slices = staged.slices.take();
+        let moved = staged.moved.take();
         if let Err(error) = self.apply(record) {
             wal.discard(staged);
             return Err(error);
@@ -333,7 +344,7 @@ impl State {
         if let Some((stream, slices)) = slices {
             self.log_mut(stream)?.segments.extend(slices);
         }
-        Ok(())
+        Ok(moved)
     }
 }
 
@@ -382,6 +393,7 @@ impl Record {
             | Self::Contacts(stream, _)
             | Self::Recover(stream, ..)
             | Self::Ownership(stream, _) => *stream,
+            Self::Relocate(from, _) => from.scope,
         }
     }
 }
@@ -682,6 +694,94 @@ impl Disk {
         self.objects.unprotect(stream);
     }
 
+    /// Sealed segments before the published checkpoint, other than the
+    /// newest, whose live slices hold under `share` percent of their bytes
+    /// and that only those slices hold, least live first.
+    pub fn cold_segments(&self, share: u64) -> Vec<u64> {
+        self.objects.cold_segments(1, share)
+    }
+
+    /// The streams whose WAL suffix still holds entries in segment `id`;
+    /// a snapshot and purge would free them without copying.
+    pub fn suffix_owners(&self, id: u64) -> BTreeSet<StreamId> {
+        let state = self.state.read();
+        state
+            .logs
+            .iter()
+            .filter(|(_, log)| {
+                log.segments.values().any(|slice| {
+                    matches!(slice.reference(), super::objects::Reference::Segment(at) if at.segment == id)
+                })
+            })
+            .map(|(stream, _)| *stream)
+            .collect()
+    }
+
+    /// Copies the live slices of segment `id` to the active segment, grouped
+    /// by stream, up to `budget` bytes, through the maintenance lane. Every
+    /// holder reads the copies once their round is durable. Suspended, with
+    /// nothing copied, unless ordinary writes keep room for twice the
+    /// batch. Returns the bytes copied.
+    pub async fn relocate_segment(&self, id: u64, budget: u64) -> io::Result<u64> {
+        let mut slices = self
+            .objects
+            .slices_in(id)
+            .into_iter()
+            // A slice only checkpoints hold dies at the next one.
+            .filter(|slice| slice.needed(1))
+            .filter_map(|slice| match slice.reference() {
+                super::objects::Reference::Segment(at) => Some((at, slice)),
+                super::objects::Reference::Object(_) => None,
+            })
+            .collect::<Vec<_>>();
+        slices.sort_by_key(|(at, _)| (at.scope, at.offset));
+        let mut total = 0u64;
+        slices.retain(|(at, _)| {
+            let keep = total == 0 || total + at.len <= budget;
+            if keep {
+                total += at.len;
+            }
+            keep
+        });
+        if slices.is_empty() {
+            return Ok(0);
+        }
+        let room = total.saturating_mul(2) + WAL_METADATA_BYTES;
+        if !self.space.clear_of_ordinary(room) {
+            return Ok(0);
+        }
+        let _space = self.space.maintenance(total + WAL_METADATA_BYTES)?;
+        let records = tokio::task::spawn_blocking(move || {
+            slices
+                .into_iter()
+                .map(|(at, slice)| Ok(Record::Relocate(at, slice.read()?)))
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .await??;
+        let writes = records
+            .into_iter()
+            .map(|record| self.enqueue(&self.maintenance, record, None, false));
+        for result in futures::future::join_all(writes).await {
+            result?;
+        }
+        Ok(total)
+    }
+
+    /// Releases segments held for streams this keeper no longer holds.
+    pub fn release_moved_of_detached(&self) {
+        for scope in self.objects.moved_scopes() {
+            if !self.installed(scope) {
+                self.objects.release_moved(scope, u64::MAX);
+            }
+        }
+    }
+
+    /// Streams whose selected snapshot may still name segments their slices
+    /// left; a rebuilt snapshot releases them.
+    pub fn moved_scopes(&self) -> Vec<StreamId> {
+        self.objects.moved_scopes()
+    }
+
     /// How much of each segment before the published checkpoint is live.
     pub fn segment_usage(&self) -> super::objects::Usage {
         self.objects.usage()
@@ -965,6 +1065,7 @@ fn rounds(
         let mut changed = BTreeSet::new();
         let mut added = 0;
         let mut tickets = Vec::new();
+        let mut moves = Vec::new();
         #[cfg(test)]
         let mut before_settlement = None;
         for mut work in round {
@@ -1011,7 +1112,8 @@ fn rounds(
                 }
             }
             match working.apply_indexed(work.record, wal, objects) {
-                Ok(()) => {
+                Ok(moved) => {
+                    moves.extend(moved);
                     changed.insert(scope);
                     added += usize::from(new);
                     replies.push((work.done, work._space));
@@ -1035,6 +1137,28 @@ fn rounds(
                 }
             }
             wal.commit(objects, &changed)?;
+            // The copies are durable: every holder reads them from now on.
+            // Their old segments stay for the checkpoint and the selected
+            // snapshots that may still name them.
+            for (from, to) in moves {
+                match objects.relocate(from, to) {
+                    Ok(Some(left)) => {
+                        // Only a selected snapshot can still name the old
+                        // copy once the checkpoint moves on.
+                        if working
+                            .logs
+                            .get(&from.scope)
+                            .is_some_and(|log| log.snapshot.is_some())
+                        {
+                            objects.hold_moved(from.scope, left.clone());
+                        }
+                        wal.retire(left);
+                    }
+                    Ok(None) => (),
+                    // The copy stays unused; the old one is still read.
+                    Err(error) => eprintln!("logkeeper kept a slice in place: {error}"),
+                }
+            }
             #[cfg(test)]
             if let Some(ReplicaFault::BeforeSettlement { entered, resume }) = before_settlement {
                 let _ = entered.send(());

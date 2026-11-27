@@ -1,5 +1,6 @@
 mod admission;
 mod catalog_stream;
+mod compaction;
 mod incarnation;
 mod ingress;
 mod liveness;
@@ -351,6 +352,7 @@ impl Config {
             deleted: parking_lot::RwLock::default(),
             parked: parking_lot::RwLock::default(),
             closed_states: parking_lot::Mutex::default(),
+            compaction: parking_lot::Mutex::default(),
             activity: parking_lot::Mutex::default(),
             liveness: parking_lot::Mutex::default(),
             repairs: parking_lot::Mutex::default(),
@@ -425,6 +427,7 @@ pub(super) struct Engine {
     /// Pins of parked and deleted groups, kept so the reaper cannot delete
     /// what only they reference.
     pub(super) closed_states: parking_lot::Mutex<HashMap<StreamId, Closed>>,
+    compaction: parking_lot::Mutex<compaction::Compaction>,
     /// The last log index of each led stream and when it last changed.
     activity: parking_lot::Mutex<HashMap<StreamId, (Option<u64>, Instant)>>,
     /// When each other keeper last answered a ping, and what it reported.
@@ -570,6 +573,11 @@ impl Engine {
             let pinging = self.clone();
             sockets.spawn(async move {
                 pinging.liveness_loop().await;
+                Ok(())
+            });
+            let compacting = self.clone();
+            sockets.spawn(async move {
+                compacting.compaction_loop().await;
                 Ok(())
             });
             if self.catalog_stream.is_some() {

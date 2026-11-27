@@ -364,6 +364,35 @@ already on disk. Its immutable index pages hold up to 128 records each, with
 at most 2,049 pages. A build rewrites only the pages that changed since the
 previous snapshot, and the scratch budget covers a full set, since keeper
 batches can change every page between two snapshots.
+
+A WAL segment is deleted once no entry slice holds it, so one retained record
+would keep its whole 64 MiB segment. The keeper counts each segment's live
+bytes as slices are created and dropped, and prints the segments before the
+published checkpoint in usage buckets every 5 s when they change. Every 10 s,
+with up to 2 s of jitter, a compaction pass takes the sealed segments before
+the checkpoint whose live slices hold under half their bytes and that nothing
+else holds (a parked copy's pins, a quarantine), least live first. A stream
+whose WAL suffix still holds entries there is first asked to snapshot and
+purge, and gets 30 s. The remaining slices, held by snapshots and applied
+images, are then copied to the active segment grouped by stream, at most
+16 MiB a pass, as `Record::Relocate` frames on the maintenance lane, booked
+against the maintenance floor and suspended unless ordinary writes keep room
+for twice the batch. Once a copy's round is durable every holder reads it.
+The old segment stays until a checkpoint captured after the copy is published
+and, for a stream with a selected snapshot, until that stream selects a
+snapshot rebuilt after the copy; that rebuild writes every index page again,
+within the full-page-set scratch. `segments.compacted_bytes` counts the bytes
+copied. A crash before the round's boundary leaves the old copy in use; after
+it, replay ignores the frame and the old copy is read until the next
+checkpoint, so the copy is at worst dead bytes for a later pass.
+
+`Record::Relocate` is a WAL format addition, appended last to the record enum
+like `Record::Recover`; checkpoints, segment headers and snapshot formats are
+unchanged. A keeper built before it refuses to open a WAL whose frames after
+the published checkpoint hold one (bincode reports an unknown variant), so
+roll back only after a checkpoint has passed the last compaction, or with the
+keeper's data replaced. Once the cluster feature level lands, relocation
+should wait for it.
 New appends enforce a 262,144 retained-record ceiling alongside the configured
 retained-byte quota. A further append or batch past the ceiling returns
 `Full` until a trim lowers the count. Consumers that checkpoint and trim on a
@@ -697,6 +726,25 @@ unopened copies of streams whose configuration names a dead keeper, and
 their leaders repair them. Parked streams whose voters all live stay parked.
 On one host, 128 idle streams used 0.09 CPU cores parked
 against 0.47 unparked.
+
+A parked copy keeps no state machine. Once its group has stopped, it keeps
+pins of the segments its selected snapshot and applied records lie in, a
+hold on its standalone objects (index pages and entries from before
+segments), and its configuration; the WAL suffix pins itself. A full stream
+of 262,144 records parked in about 3 MiB of heap per voter instead of about
+33 MiB. The pins are also written as a park mark, `parked` in the copy's
+directory, naming the selected snapshot they were taken for. A restarted
+keeper keeps a copy whose mark matches its selected snapshot parked, without
+loading its image, until traffic reopens it; a mismatched or damaged mark is
+ignored and the copy opens. Opening a copy removes its mark.
+
+At `max_streams`, opening another stream closes the least recently used copy
+that served no client, grew no log and ran no repair for 30 s (or
+`park_after_secs`, if shorter), instead of refusing. Copies the keeper
+follows go first; one it leads first hands its leadership to a matched
+follower. An evicted copy is parked with a mark and refuses empty heartbeats
+until entries, a vote, a snapshot or a client reopen it. `stream.evicted`
+counts evictions.
 
 On the control and replication lanes a keeper keeps one long-lived
 connection to each other keeper, opened on first use and again after it

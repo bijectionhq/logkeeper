@@ -206,6 +206,13 @@ impl Space {
         self.available(&state, 0, PROTOCOL_FLOOR).is_ok()
     }
 
+    /// Whether `bytes` more still leave the ordinary floor free, so
+    /// background copying never eats into the room the floors protect.
+    pub fn clear_of_ordinary(&self, bytes: u64) -> bool {
+        let state = self.0.state.lock();
+        self.available(&state, bytes, ORDINARY_FLOOR).is_ok()
+    }
+
     fn available(&self, state: &Ledger, bytes: u64, floor: u64) -> io::Result<()> {
         if !fits(self.measured_space()?, state.pending, bytes, floor) {
             return Err(exhausted());
