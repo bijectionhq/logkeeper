@@ -18,6 +18,7 @@ async fn immutable_trim_checks_the_exact_checkpoint_and_current_writer() {
 
     use bytes::Bytes;
     use journal_contract::{CheckpointAnchor, Epoch, JournalError, Lsn, StreamId, WriterSessionId};
+    use logkeeper::stream::consensus::CLUSTER_VERSION_V4;
     use sha2::{Digest, Sha256};
 
     let mut cluster = LocalCluster::start_replicated_catalog(&PRINCIPALS)
@@ -25,6 +26,19 @@ async fn immutable_trim_checks_the_exact_checkpoint_and_current_writer() {
         .unwrap();
     let config = cluster.journal_config(1 << 20, 4096);
     let writer = cluster.journal(PRINCIPALS[0], &config).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match writer.finalize_version(CLUSTER_VERSION_V4).await {
+                Ok(version) => break assert_eq!(version, CLUSTER_VERSION_V4),
+                Err(JournalError::Unavailable) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
+                Err(error) => panic!("finalizing immutable stream support: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
     let stream = StreamId(68);
     writer.create_immutable(stream).await.unwrap();
     let original = writer

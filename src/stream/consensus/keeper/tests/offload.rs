@@ -110,6 +110,56 @@ fn objects(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trim_checkpoint_verifies_an_announcement_below_the_local_floor() {
+    use journal_contract::{CheckpointAnchor, WriterSessionId};
+    use sha2::{Digest, Sha256};
+
+    let store = tempfile::tempdir().unwrap();
+    let mut config = offload_config(store.path());
+    config.retain_local_bytes = Some(1500);
+    let cluster = Cluster::start_offloaded(&config).await;
+    let journal = cluster.client(&cluster.credentials);
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(43);
+    journal
+        .create_stream(stream, Voters::from([a, b, c]), 1 << 20, true)
+        .await
+        .unwrap();
+    let writer = journal
+        .seal_session(stream, Epoch(0), WriterSessionId(1))
+        .await
+        .unwrap()
+        .fence;
+    let fence = Fence {
+        epoch: writer.writer_epoch,
+        writer: Uuid::from_u128(writer.writer_session_id.0),
+    };
+    journal
+        .append_batch(stream, fence, Lsn(1), (1..=60).map(payload).collect())
+        .await
+        .unwrap();
+
+    let status = flushed(&journal, stream, 60).await;
+    assert!(status.local_floor > Lsn(20));
+    assert_eq!(status.floor, Lsn(1));
+    let anchor = CheckpointAnchor {
+        announced_at: Lsn(20),
+        covered_through: Lsn(19),
+        record_sha256: Sha256::digest(payload(20)).into(),
+    };
+    journal
+        .trim_checkpoint(stream, fence, anchor)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        journal.read(stream, Lsn(19), 1, Duration::ZERO).await,
+        Err(JournalError::Trimmed { floor: Lsn(20) })
+    );
+    check(&read_all(&journal, stream, 20, 60).await, 20, 60);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offload_survives_leader_changes_and_serves_reads_below_the_local_floor() {
     let store = tempfile::tempdir().unwrap();
     let mut config = offload_config(store.path());

@@ -1540,6 +1540,8 @@ logkeeper = { git = "https://github.com/bijectionhq/logkeeper", tag = "v0.2.0" }
 
 A single authority allocates increasing epochs for a stream and supplies an ensemble with intersecting write quorums.
 The caller owns checkpoint publication and sets the safe trim boundary.
+For immutable histories, `Journal::trim_checkpoint` checks the SHA-256 of the exact committed announcement and retains that record.
+The keeper reads the announcement from local storage or offload and orders the cut under the current writer session.
 The journal owns the persisted promise, commit position, and record retention for that stream.
 The server, client and journal format ship together.
 Version 0.2 adds the durable journal identity handshake from [RTDB](https://github.com/bijectionhq/rtdb/commit/65d0a3d9f1340372d4bd71453b7af980fe02b91f).
