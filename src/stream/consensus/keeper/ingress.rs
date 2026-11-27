@@ -514,7 +514,12 @@ impl Engine {
         // tombstone for an election, while leaving it closed to heartbeats.
         if deleted
             && !matches!(&request, PeerRequest::Vote(_) | PeerRequest::PreVote(_))
-            && !self.groups.lock().await.contains_key(&genesis.stream)
+            && !self
+                .groups
+                .lock()
+                .await
+                .get(&genesis.stream)
+                .is_some_and(|group| group.state.is_deleted())
         {
             return Err(invalid("stream is deleted"));
         }
