@@ -3018,7 +3018,7 @@ async fn heartbeats_for_many_streams_share_one_frame_and_keep_the_parked_and_del
     engine
         .parked
         .write()
-        .extend(parked.iter().map(|stream| (*stream, Instant::now())));
+        .extend(parked.iter().map(|stream| (*stream, Some(Instant::now()))));
     engine.deleted.write().insert(deleted);
     // A stale heartbeat from `b` reaches Raft, which refuses its old vote.
     let vote = Vote::new_committed(0, b.as_u128());

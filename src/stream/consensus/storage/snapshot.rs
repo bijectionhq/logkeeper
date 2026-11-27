@@ -34,7 +34,7 @@ use crate::stream::timed::EVIDENCE_BYTES;
 use crate::stream::{
     consensus::{
         Configuration, Entry, Genesis, LogId, MAX_MESSAGE, MAX_RECORD, Membership, RaftTypes,
-        SnapshotMeta, Stage, invalid, options,
+        SnapshotMeta, Stage, invalid, options, ownership,
         placement::Placement,
         state::{Command, MAX_RETAINED_RECORDS, Outcome, Payload, State, TIMED_RECORD},
     },
@@ -265,6 +265,7 @@ struct ActiveSnapshot {
 /// lifetime and its finalized configuration. Reopening loads the image
 /// again from the selected snapshot and the WAL suffix, which pins itself.
 pub(in crate::stream::consensus) struct Pin {
+    pub selected: Option<Selected>,
     pub finalized: Option<Configuration>,
     pub generation: u64,
     _segments: Vec<Arc<super::objects::Segment>>,
@@ -278,10 +279,113 @@ impl Pin {
     }
 
     /// The segments the pin keeps.
-    #[cfg(test)]
     pub fn segments(&self) -> impl Iterator<Item = u64> + '_ {
         self._segments.iter().map(|segment| segment.id())
     }
+
+    /// Makes the pin durable in the replica's directory, so a restart keeps
+    /// the copy parked without loading its image.
+    pub fn persist(&self, disk: &Disk, stream: StreamId) -> io::Result<()> {
+        let mark = Mark {
+            selected: self.selected,
+            finalized: self.finalized,
+            segments: self.segments().collect(),
+        };
+        let mut body = PARK_MARK.to_vec();
+        options()
+            .with_limit(MAX_MARK_BYTES)
+            .serialize_into(&mut body, &mark)
+            .map_err(io::Error::other)?;
+        body.extend_from_slice(&crc32fast::hash(&body).to_le_bytes());
+        let directory = ownership::directory(&disk.path, stream, self.generation);
+        let temporary = directory.join(format!("{PARK_FILE}.tmp"));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&temporary)?;
+        file.write_all(&body)?;
+        sync_file(&file)?;
+        fs::rename(&temporary, directory.join(PARK_FILE))?;
+        sync_directory(&directory)
+    }
+
+    /// The pin a restart restores from the park mark of `stream`'s current
+    /// copy. `None` when there is no mark, or the mark was taken for another
+    /// selected snapshot than the one the WAL names: the copy then reopens
+    /// as usual. A mark for the selected snapshot names every segment its
+    /// records lie in; the WAL suffix pins itself.
+    pub fn restore(disk: &Disk, stream: StreamId) -> io::Result<Option<Self>> {
+        let Some(generation) = disk
+            .ownership(stream)
+            .and_then(|ownership| ownership.generation())
+        else {
+            return Ok(None);
+        };
+        let path = ownership::directory(&disk.path, stream, generation).join(PARK_FILE);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let (body, crc) = bytes
+            .split_last_chunk::<4>()
+            .ok_or_else(|| invalid("short park mark"))?;
+        if crc32fast::hash(body) != u32::from_le_bytes(*crc) || !body.starts_with(PARK_MARK) {
+            return Err(invalid("park mark failed its checksum"));
+        }
+        let mark: Mark = options()
+            .with_limit(MAX_MARK_BYTES)
+            .deserialize(&body[PARK_MARK.len()..])
+            .map_err(io::Error::other)?;
+        let current = disk.log(stream, |log| log.snapshot);
+        let same = match (mark.selected, current) {
+            (None, None) => true,
+            (Some(mark), Some(current)) => {
+                mark.log_id == current.log_id && mark.digest == current.digest
+            }
+            _ => false,
+        };
+        if !same {
+            return Ok(None);
+        }
+        let files = disk.objects.hold(stream);
+        let segments = mark
+            .segments
+            .into_iter()
+            .map(|id| disk.objects.segment(id))
+            .collect::<io::Result<_>>()?;
+        Ok(Some(Self {
+            selected: mark.selected,
+            finalized: mark.finalized,
+            generation,
+            _segments: segments,
+            _files: files,
+            _lifetime: Arc::new(()),
+        }))
+    }
+
+    /// Removes the park mark of copy `generation` of `stream`, if any.
+    pub fn forget(disk: &Disk, stream: StreamId, generation: u64) -> io::Result<()> {
+        let directory = ownership::directory(&disk.path, stream, generation);
+        match fs::remove_file(directory.join(PARK_FILE)) {
+            Ok(()) => sync_directory(&directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+const PARK_FILE: &str = "parked";
+const PARK_MARK: &[u8; 8] = b"LKRPRK01";
+const MAX_MARK_BYTES: u64 = 1024 * 1024;
+
+/// A parked copy's pin on disk.
+#[derive(Serialize, Deserialize)]
+struct Mark {
+    selected: Option<Selected>,
+    finalized: Option<Configuration>,
+    segments: Vec<u64>,
 }
 
 /// Captures an applied state before handing snapshot work to a background task.
@@ -463,6 +567,7 @@ impl StateMachine {
             }
         }
         Pin {
+            selected: snapshot.as_ref().map(|active| active.selected),
             finalized: applied.configuration,
             generation: self.inner.generation,
             _segments: segments.into_values().collect(),

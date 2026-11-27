@@ -61,6 +61,10 @@ const MAX_LOG_SUFFIX: u64 = 512;
 const LEADER_HOLD_DOWN: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const LEADER_HOLD_DOWN: Duration = Duration::from_secs(4);
+/// How long an open copy must have been idle before a new stream past the
+/// stream limit closes it, unless the park delay is shorter.
+const EVICT_AFTER: Duration = Duration::from_secs(30);
+
 /// How long a deleted stream's settled group stays open for late requests.
 #[cfg(not(test))]
 const DELETED_GROUP_GRACE: Duration = Duration::from_secs(30);
@@ -415,8 +419,9 @@ pub(super) struct Engine {
     /// `Deleted` and peers are refused instead of reopening the group.
     pub(super) deleted: parking_lot::RwLock<HashSet<StreamId>>,
     /// Idle streams whose groups this keeper closed until the next request,
-    /// and when each parked.
-    pub(super) parked: parking_lot::RwLock<HashMap<StreamId, Instant>>,
+    /// and when each parked. A copy closed to free its slot has no time: it
+    /// refuses empty heartbeats until other traffic reopens it.
+    pub(super) parked: parking_lot::RwLock<HashMap<StreamId, Option<Instant>>>,
     /// Pins of parked and deleted groups, kept so the reaper cannot delete
     /// what only they reference.
     pub(super) closed_states: parking_lot::Mutex<HashMap<StreamId, Closed>>,
@@ -458,7 +463,7 @@ pub(super) enum Closed {
     /// The group is shutting down; its state machine still holds everything.
     Closing(StateMachine),
     /// The group shut down; only pins remain, and the image is dropped.
-    Pinned(storage::Pin),
+    Pinned(Arc<storage::Pin>),
 }
 
 impl Closed {
@@ -519,6 +524,27 @@ impl Engine {
                     .is_some_and(|owner| owner.generation().is_none())
                 {
                     continue;
+                }
+                // A copy parked before the restart stays parked, with the
+                // pins its park mark names, until traffic reopens it.
+                let disk = self.disk.clone();
+                let stream = genesis.stream;
+                match tokio::task::spawn_blocking(move || storage::Pin::restore(&disk, stream))
+                    .await
+                    .map_err(io::Error::other)
+                    .and_then(|restored| restored)
+                {
+                    Ok(Some(pin)) => {
+                        self.closed_states
+                            .lock()
+                            .insert(stream, Closed::Pinned(Arc::new(pin)));
+                        self.parked.write().insert(stream, Some(Instant::now()));
+                        continue;
+                    }
+                    Ok(None) => (),
+                    Err(error) => {
+                        eprintln!("logkeeper ignored the park mark of {stream:?}: {error}");
+                    }
                 }
                 if let Err(error) = self.group(genesis.clone()).await {
                     if !self.disk.healthy() {
@@ -721,6 +747,126 @@ impl Engine {
         Ok(openings.entry(stream).or_default().clone())
     }
 
+    /// The opening lock of `stream`. At the stream limit the least recently
+    /// used idle copy closes to free its slot instead of refusing the open.
+    async fn opening_or_evict(&self, stream: StreamId) -> io::Result<Arc<Mutex<()>>> {
+        match self.opening(stream).await {
+            Err(error) if error.kind() == io::ErrorKind::QuotaExceeded => {
+                if self.evict_idle(stream).await {
+                    self.opening(stream).await
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
+    }
+
+    /// Closes the least recently used open copy that has served no client,
+    /// grown no log and run no repair for `EVICT_AFTER` (or the park delay,
+    /// if shorter), other than `except`. A copy this keeper leads first
+    /// hands its leadership to a matched follower, so the stream elects no
+    /// new leader; copies it follows go first. The closed copy is parked
+    /// with a durable mark and refuses empty heartbeats until entries, a
+    /// vote, a snapshot or a client reopen it. False when no copy qualifies.
+    async fn evict_idle(&self, except: StreamId) -> bool {
+        let after = self.park_after.min(EVICT_AFTER);
+        let now = Instant::now();
+        let groups = self
+            .groups
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut candidates = groups
+            .into_iter()
+            .filter(|group| {
+                let stream = group.genesis.stream;
+                let metrics = group.raft.metrics().borrow_watched().clone();
+                let grew = self
+                    .activity
+                    .lock()
+                    .get(&stream)
+                    .is_some_and(|(_, since)| now.duration_since(*since) < after);
+                stream != except
+                    && !(self.catalog_stream.is_some() && stream == catalog_stream::STREAM)
+                    && !self.repairing(stream)
+                    && !grew
+                    && now.duration_since(*group.used.lock()) >= after
+                    && metrics.last_applied.map(|applied| applied.index) == metrics.last_log_index
+                    && metrics
+                        .membership_config
+                        .membership()
+                        .get_joint_config()
+                        .len()
+                        == 1
+            })
+            .map(|group| {
+                let leads =
+                    group.raft.metrics().borrow_watched().state == openraft::ServerState::Leader;
+                let used = *group.used.lock();
+                (leads, used, group)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|(leads, used, _)| (*leads, *used));
+        for (leads, _, group) in candidates {
+            if leads && !self.hand_off(&group).await {
+                continue;
+            }
+            let stream = group.genesis.stream;
+            drop(group);
+            let closed = self
+                .close_retaining(
+                    stream,
+                    || {
+                        self.parked.write().insert(stream, None);
+                        self.activity.lock().remove(&stream);
+                    },
+                    true,
+                )
+                .await;
+            if closed {
+                super::metrics::count(&super::metrics::COUNTERS.evicted);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Hands a led stream to a voter that matched its whole log, and waits
+    /// up to a second for this keeper to stop leading it.
+    async fn hand_off(&self, group: &Group) -> bool {
+        let metrics = group.raft.metrics().borrow_watched().clone();
+        let last = metrics.last_log_index;
+        let target = metrics.replication.as_ref().and_then(|progress| {
+            progress
+                .iter()
+                .filter(|(id, matched)| {
+                    **id != self.id.as_u128() && matched.map(|log| log.index) == last
+                })
+                .map(|(id, _)| *id)
+                .next()
+        });
+        let Some(target) = target else {
+            return false;
+        };
+        if group.raft.trigger().transfer_leader(target).await.is_err() {
+            return false;
+        }
+        let mut metrics = group.raft.metrics();
+        timeout(Duration::from_secs(1), async {
+            while metrics.borrow_watched().state == openraft::ServerState::Leader {
+                if metrics.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok()
+            && group.raft.metrics().borrow_watched().state != openraft::ServerState::Leader
+    }
+
     /// Closes the groups of deleted streams once the deletion is applied on
     /// this replica, replicated to every voter it can see, and older than
     /// `DELETED_GROUP_GRACE`. Later requests are answered `Deleted` without
@@ -758,7 +904,7 @@ impl Engine {
             // Marked first: a request that races the close is refused
             // rather than reopening the group.
             self.deleted.write().insert(stream);
-            self.close_retaining(stream, || ()).await;
+            self.close_retaining(stream, || (), false).await;
             self.preferred.lock().remove(&stream);
         }
     }
@@ -776,7 +922,7 @@ impl Engine {
         }
         super::metrics::count(&super::metrics::COUNTERS.reopened_stopped);
         eprintln!("logkeeper reopens stream {stream:?}, whose Raft core stopped");
-        self.close_retaining(stream, || ()).await;
+        self.close_retaining(stream, || (), false).await;
         Ok(())
     }
 
@@ -791,7 +937,7 @@ impl Engine {
             Some(group) => self.close_stopped(&group).await?,
             None => {}
         }
-        let opening = self.opening(genesis.stream).await?;
+        let opening = self.opening_or_evict(genesis.stream).await?;
         let _guard = opening.lock().await;
         if let Some(group) = self.groups.lock().await.get(&genesis.stream).cloned() {
             return group.for_genesis(&genesis);
@@ -841,6 +987,18 @@ impl Engine {
             // a copy protected while it could not open no longer needs to be.
             Ok(state) => {
                 self.disk.unprotect_objects(genesis.stream);
+                // An open copy is no longer parked across a restart.
+                let (disk, stream, generation) =
+                    (self.disk.clone(), genesis.stream, state.generation());
+                let forgotten = tokio::task::spawn_blocking(move || {
+                    storage::Pin::forget(&disk, stream, generation)
+                })
+                .await
+                .map_err(io::Error::other)
+                .and_then(|result| result);
+                if let Err(error) = forgotten {
+                    eprintln!("logkeeper park mark of {stream:?} not removed: {error}");
+                }
                 state
             }
             Err(error) => {

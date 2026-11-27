@@ -341,6 +341,12 @@ impl Objects {
         }
     }
 
+    /// Pins segment `id`, which must still exist.
+    pub fn segment(&self, id: u64) -> io::Result<Arc<Segment>> {
+        let mut state = self.0.state.lock();
+        self.open_segment(&mut state, id)
+    }
+
     pub fn enable_reaping(&self) {
         self.0.state.lock().ready = true;
     }

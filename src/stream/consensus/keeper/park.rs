@@ -145,9 +145,13 @@ impl Engine {
 
     pub(super) async fn park(&self, stream: StreamId) {
         let parked = self
-            .close_retaining(stream, || {
-                self.parked.write().insert(stream, Instant::now());
-            })
+            .close_retaining(
+                stream,
+                || {
+                    self.parked.write().insert(stream, Some(Instant::now()));
+                },
+                true,
+            )
             .await;
         if parked {
             super::super::metrics::count(&super::super::metrics::COUNTERS.parked);

@@ -44,6 +44,7 @@ counters! {
     unparked_for_repair: "stream.unparked_for_repair",
     park_declined: "stream.park_declined",
     reopened_stopped: "stream.reopened_stopped",
+    evicted: "stream.evicted",
 }
 
 pub(super) static COUNTERS: Counters = Counters::new();

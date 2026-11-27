@@ -1,6 +1,6 @@
 //! Replica retirement and staging share the local opening gate.
 
-use std::{fs, io, path::Path};
+use std::{fs, io, path::Path, sync::Arc};
 
 use journal_contract::{JournalError, StreamId};
 use openraft::async_runtime::WatchReceiver;
@@ -293,7 +293,15 @@ impl Engine {
     /// stop: the generation stays the same, so nothing else fences the old
     /// group's snapshot files and WAL writes from a reopened one, and an
     /// open that raced the close finds the mark once it has the lock.
-    pub(super) async fn close_retaining(&self, scope: StreamId, mark: impl FnOnce()) -> bool {
+    ///
+    /// With `persist`, the pin is also written to the copy's directory, so a
+    /// restart keeps the copy closed without loading it.
+    pub(super) async fn close_retaining(
+        &self,
+        scope: StreamId,
+        mark: impl FnOnce(),
+        persist: bool,
+    ) -> bool {
         let Ok(opening) = self.opening(scope).await else {
             return false;
         };
@@ -309,7 +317,17 @@ impl Engine {
         group.stop.cancel();
         let _ = group.raft.shutdown().await;
         group.state.shutdown().await;
-        let pin = group.state.pin();
+        let pin = Arc::new(group.state.pin());
+        if persist {
+            let (disk, pin) = (self.disk.clone(), pin.clone());
+            let persisted = tokio::task::spawn_blocking(move || pin.persist(&disk, scope)).await;
+            if let Err(error) = persisted
+                .map_err(io::Error::other)
+                .and_then(|result| result)
+            {
+                eprintln!("logkeeper park mark of {scope:?} not written: {error}");
+            }
+        }
         let mut closed = self.closed_states.lock();
         if let Some(entry) = closed.get_mut(&scope)
             && matches!(entry, Closed::Closing(state) if state.same(&group.state))

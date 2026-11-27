@@ -214,3 +214,201 @@ async fn deleting_a_stream_forgets_its_preferred_leader() {
     );
     cluster.stop_all().await;
 }
+
+async fn parked_everywhere(cluster: &Cluster, stream: StreamId, voters: &[Uuid]) -> bool {
+    for id in voters {
+        let engine = &cluster.running[id].engine;
+        if !engine.parked.read().contains_key(&stream)
+            || engine.groups.lock().await.contains_key(&stream)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// A parked stream stays parked across a restart of every voter, with only
+/// the pins its durable mark names, and reopens with its records on the
+/// first request. A mark left from before a later snapshot is ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_parked_stream_stays_parked_across_a_restart_and_opens_lazily() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    cluster.stop_all().await;
+    for config in cluster.configs.values_mut() {
+        config.park_after_secs = 2;
+    }
+    for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
+        cluster.restart(id).await;
+    }
+    let journal = cluster.client(&cluster.credentials);
+    let record = |at: u64| Bytes::from(vec![(at % 251) as u8; 2048]);
+    let (parked, busy) = (StreamId(220), StreamId(221));
+    let mut fences = Vec::new();
+    for stream in [parked, busy] {
+        journal.create(stream, [a, b, c], 1 << 30).await.unwrap();
+        let sealed = journal
+            .seal(stream, Epoch(0), Uuid::from_u128(9))
+            .await
+            .unwrap();
+        fences.push(sealed.fence);
+    }
+    for at in 1..=200 {
+        journal
+            .append(parked, fences[0], Lsn(at), record(at))
+            .await
+            .unwrap();
+    }
+    timeout(Duration::from_secs(40), async {
+        while !parked_everywhere(&cluster, parked, &[a, b, c]).await {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the idle stream parked on every voter");
+    let generation = cluster.running[&a]
+        .engine
+        .disk
+        .current_generation(parked)
+        .unwrap();
+    let directory = |id: Uuid| {
+        crate::stream::consensus::ownership::directory(
+            &cluster.running[&id].engine.disk.path,
+            parked,
+            generation,
+        )
+    };
+    let mark = directory(a).join("parked");
+    assert!(mark.exists(), "parking wrote a durable mark");
+    let early = std::fs::read(&mark).unwrap();
+
+    for id in [a, b, c] {
+        cluster.running.remove(&id).unwrap().stop().await;
+        cluster.restart(id).await;
+    }
+    // Roll and checkpoint segments while the parked copies stay closed and
+    // the reaper runs.
+    for at in 1..=200 {
+        let _ = journal.append(busy, fences[1], Lsn(at), record(at)).await;
+    }
+    for id in [a, b, c] {
+        let engine = cluster.running[&id].engine.clone();
+        assert!(engine.parked.read().contains_key(&parked), "still parked");
+        assert!(!engine.groups.lock().await.contains_key(&parked));
+        assert!(matches!(
+            engine.closed_states.lock().get(&parked),
+            Some(super::Closed::Pinned(pin)) if pin.segments().count() > 0
+        ));
+        for _ in 0..8 {
+            engine.disk.reap_objects().await.unwrap();
+        }
+    }
+    let page = timeout(WAIT, async {
+        loop {
+            match journal.read(parked, Lsn(1), 1, Duration::ZERO).await {
+                Ok(page) => return page,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(page.records, [(Lsn(1), record(1))]);
+    timeout(WAIT, async {
+        while mark.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("reopening removed the mark");
+
+    // A newer snapshot makes the early mark stale, as if a crash had kept
+    // it: the restarted keeper ignores it and opens the stream.
+    for at in 201..=400 {
+        journal
+            .append(parked, fences[0], Lsn(at), record(at))
+            .await
+            .unwrap();
+    }
+    let group = cluster.group(a, parked).await;
+    timeout(WAIT, async {
+        while group
+            .state
+            .covered()
+            .is_none_or(|covered| covered.index < 300)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a later snapshot was published");
+    drop(group);
+    cluster.running.remove(&a).unwrap().stop().await;
+    std::fs::write(&mark, early).unwrap();
+    cluster.restart(a).await;
+    let _ = cluster.group(a, parked).await;
+    let engine = cluster.running[&a].engine.clone();
+    assert!(!engine.parked.read().contains_key(&parked));
+    assert!(
+        !mark.exists(),
+        "the stale mark was removed when the copy opened"
+    );
+    cluster.stop_all().await;
+}
+
+/// At its stream limit a keeper closes its least recently used idle copy
+/// to open another, instead of refusing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keeper_at_its_limit_evicts_its_least_recently_used_idle_copy() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    cluster.stop_all().await;
+    for config in cluster.configs.values_mut() {
+        config.park_after_secs = 600;
+    }
+    cluster.configs.get_mut(&a).unwrap().max_streams = 2;
+    for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
+        cluster.restart(id).await;
+    }
+    let journal = cluster.client(&cluster.credentials);
+    let streams = [StreamId(222), StreamId(223), StreamId(224)];
+    for stream in &streams[..2] {
+        journal.create(*stream, [a, b, c], 4096).await.unwrap();
+        assert_eq!(journal.head(*stream).await, Ok(Lsn(0)));
+    }
+    let engine = cluster.running[&a].engine.clone();
+    let first = cluster.group(a, streams[0]).await;
+    let second = cluster.group(a, streams[1]).await;
+    // Both look idle for longer than the eviction delay, the second longer.
+    for (group, idle) in [(&first, 31), (&second, 32)] {
+        let since = Instant::now() - Duration::from_secs(idle);
+        *group.used.lock() = since;
+        if let Some(entry) = engine.activity.lock().get_mut(&group.genesis.stream) {
+            entry.1 = since;
+        }
+    }
+    // Copies `a` follows go first, then the least recently used.
+    let leads = |group: &Group| {
+        group.raft.metrics().borrow_watched().state == openraft::ServerState::Leader
+    };
+    let expected = match (leads(&first), leads(&second)) {
+        (false, true) => streams[0],
+        _ => streams[1],
+    };
+    drop((first, second));
+    journal.create(streams[2], [a, b, c], 4096).await.unwrap();
+    assert_eq!(journal.head(streams[2]).await, Ok(Lsn(0)));
+    let open = engine
+        .groups
+        .lock()
+        .await
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    assert!(open.contains(&streams[2]), "{open:?}");
+    assert!(!open.contains(&expected), "{open:?} kept {expected:?}");
+    assert_eq!(engine.parked.read().get(&expected), Some(&None));
+    // The evicted copy still serves: a request reopens it, evicting again.
+    assert_eq!(journal.head(expected).await, Ok(Lsn(0)));
+    cluster.stop_all().await;
+}

@@ -465,7 +465,9 @@ impl Engine {
             };
             match decisions::parked_answer(
                 parked,
-                since.elapsed().as_nanos(),
+                // A copy closed to free its slot has no park time: it stays
+                // closed to heartbeats until other traffic reopens it.
+                since.map_or(0, |since| since.elapsed().as_nanos()),
                 super::park::PARKED_HEARTBEATS.as_nanos(),
             ) {
                 decisions::ParkedAnswer::Busy => return encode(&AppendReply::Busy),
