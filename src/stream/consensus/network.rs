@@ -762,6 +762,11 @@ fn outcome_v1(outcome: Outcome) -> Outcome {
 
 impl ReplyV1 {
     pub(super) fn from_reply(reply: Reply) -> io::Result<Self> {
+        // Whatever is newer than N-1, including a reply that carries an
+        // immutable genesis, is refused rather than sent undecodable.
+        if reply.introduced() > WireVersion::Previous {
+            return Err(unsupported("reply requires a newer keeper protocol"));
+        }
         Ok(match reply {
             Reply::Decision(outcome) => Self::Decision(outcome_v1(outcome)),
             Reply::Leader(leader) => Self::Leader(leader),

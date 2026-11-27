@@ -590,3 +590,29 @@ fn unknown_variant_tags_are_unsupported_from_the_enums_own_bounds() {
         Ok(DecodedFrame::Unsupported(_))
     ));
 }
+
+#[test]
+fn replies_carrying_an_immutable_genesis_never_reach_n_minus_1() {
+    let immutable = Genesis {
+        immutable: true,
+        ..genesis()
+    };
+    for reply in [
+        Reply::Catalog(immutable.clone(), Vec::new()),
+        Reply::ScopedPage {
+            genesis: immutable.clone(),
+            configuration: None,
+            outcome: Outcome::Unit,
+        },
+        Reply::Placement(Proof {
+            genesis: immutable.clone(),
+            configuration: configuration(),
+            joint: None,
+            stage: None,
+        }),
+    ] {
+        assert_eq!(reply.introduced(), WireVersion::Current);
+        assert!(encode_reply(reply.clone(), WireVersion::Previous).is_err());
+        assert!(encode_reply(reply, WireVersion::Current).is_ok());
+    }
+}

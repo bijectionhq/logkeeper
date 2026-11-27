@@ -113,6 +113,12 @@ impl Reply {
     /// one only through `ReplyV1::from_reply`.
     pub(in crate::stream::consensus) fn introduced(&self) -> WireVersion {
         match self {
+            // An immutable genesis has a layout N-1 cannot decode, whatever
+            // reply carries it.
+            Self::Catalog(genesis, _) | Self::ScopedPage { genesis, .. } if genesis.immutable => {
+                WireVersion::Current
+            }
+            Self::Placement(proof) if proof.genesis.immutable => WireVersion::Current,
             Self::Decision(_)
             | Self::Leader(_)
             | Self::Catalog(..)
