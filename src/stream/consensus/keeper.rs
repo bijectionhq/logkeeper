@@ -1028,9 +1028,10 @@ impl Engine {
                 }
                 while metrics.borrow_watched().state == openraft::ServerState::Leader {
                     if metrics.changed().await.is_err() {
-                        break;
+                        return;
                     }
                 }
+                super::metrics::count(&self.disk.metrics.handoffs);
             })),
         )
         .await;

@@ -241,16 +241,41 @@ async fn a_parked_stream_answers_within_an_election_timeout_and_parks_past_a_dea
         .unwrap();
     let mut slowest = Duration::ZERO;
     for _ in 0..3 {
+        let leader = cluster.leader(stream).await;
+        let term = cluster
+            .group(leader, stream)
+            .await
+            .raft
+            .metrics()
+            .borrow_watched()
+            .current_term;
+        let metrics = cluster.running[&leader].engine.disk.metrics.clone();
+        let campaigns = metrics.wake_campaigns.load(Ordering::Relaxed);
         wait_parked(&cluster, stream, &[a, b, c]).await;
-        // The voter that led before parking restores its leadership as soon
-        // as it reopens, so the first request does not wait out an
-        // election timeout (450 to 900 ms).
+        // The voter that led before parking campaigns as soon as it
+        // reopens, so the first request does not wait out an election
+        // timeout (450 to 900 ms). Checked as steps, not time, so a loaded
+        // machine cannot fail it: the former leader started a wake campaign
+        // and the stream is led again after exactly one election, by it.
         let started = Instant::now();
         assert_eq!(journal.head(stream).await, Ok(Lsn(1)));
         slowest = slowest.max(started.elapsed());
+        assert_eq!(
+            metrics.wake_campaigns.load(Ordering::Relaxed),
+            campaigns + 1,
+            "the former leader campaigned on waking"
+        );
+        let led = cluster
+            .group(leader, stream)
+            .await
+            .raft
+            .metrics()
+            .borrow_watched()
+            .clone();
+        assert_eq!(led.current_leader, Some(leader.as_u128()));
+        assert_eq!(led.current_term, term + 1, "one election woke the stream");
     }
     eprintln!("slowest first head on a parked stream: {slowest:?}");
-    assert!(slowest < Duration::from_millis(450), "{slowest:?}");
 
     // A stream whose follower's keeper is dead still parks. Its repair is
     // made to fail so it stays on the dead keeper.

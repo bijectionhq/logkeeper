@@ -680,7 +680,9 @@ impl Engine {
         };
         let previous = Uuid::from_u128(vote.leader_id().voted_for);
         if previous == self.id {
-            let _ = group.raft.trigger().elect(false).await;
+            if group.raft.trigger().elect(false).await.is_ok() {
+                super::super::metrics::count(&self.disk.metrics.wake_campaigns);
+            }
             return;
         }
         if !self.suspect(previous) {

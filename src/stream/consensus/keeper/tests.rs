@@ -2686,14 +2686,19 @@ async fn a_gracefully_stopped_leader_hands_its_streams_to_a_voter() {
     journal.create(stream, [a, b, c], 4096).await.unwrap();
     assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
     let leader = cluster.leader(stream).await;
+    let metrics = cluster.running[&leader].engine.disk.metrics.clone();
     cluster.running.remove(&leader).unwrap().stop().await;
-    // Without a handoff the followers wait out the leader's lease before an
-    // election, which takes longer than this.
+    // The stop handed the stream to a voter and waited until it no longer
+    // led, before it shut down: checked as a step, not against a clock, so
+    // a loaded machine cannot fail it. Without a handoff the leader would
+    // still lead when it stopped, and the followers would wait out its
+    // lease before an election.
+    assert_eq!(metrics.handoffs.load(Ordering::Relaxed), 1);
     let others = [a, b, c]
         .into_iter()
         .filter(|id| *id != leader)
         .collect::<Vec<_>>();
-    timeout(Duration::from_millis(300), async {
+    timeout(WAIT, async {
         loop {
             for id in &others {
                 if let Some(group) = cluster.running[id].engine.groups.lock().await.get(&stream)

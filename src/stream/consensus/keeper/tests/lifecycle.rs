@@ -428,6 +428,14 @@ async fn a_keeper_at_its_limit_evicts_its_least_recently_used_idle_copy() {
         journal.create(*stream, [a, b, c], 4096).await.unwrap();
         assert_eq!(journal.head(*stream).await, Ok(Lsn(0)));
     }
+    // `a` follows the first and leads the second, which looks idle longer:
+    // a followed copy goes first even when it was used more recently.
+    // Leadership is placed rather than read as found, so it cannot move
+    // between the check and the eviction.
+    journal.prefer_leader(streams[0], b).await.unwrap();
+    journal.prefer_leader(streams[1], a).await.unwrap();
+    assert!(wait_for_leader(&cluster, streams[0], b).await);
+    assert!(wait_for_leader(&cluster, streams[1], a).await);
     let engine = cluster.running[&a].engine.clone();
     let first = cluster.group(a, streams[0]).await;
     let second = cluster.group(a, streams[1]).await;
@@ -439,14 +447,7 @@ async fn a_keeper_at_its_limit_evicts_its_least_recently_used_idle_copy() {
             entry.1 = since;
         }
     }
-    // Copies `a` follows go first, then the least recently used.
-    let leads = |group: &Group| {
-        group.raft.metrics().borrow_watched().state == openraft::ServerState::Leader
-    };
-    let expected = match (leads(&first), leads(&second)) {
-        (false, true) => streams[0],
-        _ => streams[1],
-    };
+    let expected = streams[0];
     drop((first, second));
     journal.create(streams[2], [a, b, c], 4096).await.unwrap();
     assert_eq!(journal.head(streams[2]).await, Ok(Lsn(0)));
