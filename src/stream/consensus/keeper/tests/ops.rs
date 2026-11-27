@@ -60,7 +60,11 @@ async fn start_admin_cluster(mtls: bool) -> (Cluster, BTreeMap<Uuid, SocketAddr>
     let mut addrs = BTreeMap::new();
     for (&id, config) in &mut cluster.configs {
         let addr = free_loopback();
-        config.admin = Some(AdminConfig { listen: addr, mtls });
+        config.admin = Some(AdminConfig {
+            listen: addr,
+            mtls,
+            cluster: BTreeMap::new(),
+        });
         addrs.insert(id, addr);
     }
     for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
@@ -81,6 +85,7 @@ async fn admin_plain_http_metrics_health_and_validation() {
     bad.admin = Some(AdminConfig {
         listen: "0.0.0.0:9199".parse().unwrap(),
         mtls: false,
+        cluster: BTreeMap::new(),
     });
     assert!(bad.validate().is_err());
 
@@ -716,4 +721,94 @@ fn in_flight_proposals_turn_slow_after_a_second() {
     drop(fresh);
     assert_eq!(proposals.slow(), (0, Duration::ZERO));
     assert_eq!(metrics.slow_proposals.load(Ordering::Relaxed), 1);
+}
+
+/// The names and bodies of a debug bundle's tar entries.
+fn untar(bytes: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    let mut entries = BTreeMap::new();
+    let mut at = 0;
+    while at + 512 <= bytes.len() && bytes[at] != 0 {
+        let header = &bytes[at..at + 512];
+        let name_end = header[..100].iter().position(|b| *b == 0).unwrap_or(100);
+        let name = String::from_utf8(header[..name_end].to_vec()).unwrap();
+        let size = u64::from_str_radix(std::str::from_utf8(&header[124..135]).unwrap(), 8).unwrap()
+            as usize;
+        entries.insert(name, bytes[at + 512..at + 512 + size].to_vec());
+        at += 512 + size.div_ceil(512) * 512;
+    }
+    entries
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn debug_bundle_collects_every_keeper_over_mtls_and_inspects_offline() {
+    let (mut cluster, addrs) = start_admin_cluster(true).await;
+    let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(Uuid::new_v4().as_u128());
+    client.create(stream, voters, 1 << 20).await.unwrap();
+
+    let local = voters[0];
+    let mut config = cluster.configs[&local].clone();
+    let admin = config.admin.as_mut().unwrap();
+    admin.cluster = addrs
+        .iter()
+        .filter(|(id, _)| **id != local)
+        .map(|(id, at)| (*id, *at))
+        .collect();
+    let raw = serde_json::json!({
+        "keeper": local,
+        "tls": {"certificate": "keeper.pem", "private_key": "keeper.key", "ca": "ca.pem"},
+    });
+    // A listener nothing answers on is recorded, not fatal.
+    let silent = free_loopback();
+    let bundle = config.debug_bundle(&raw, &[silent], None).await.unwrap();
+    let entries = untar(&bundle);
+    let config_json: serde_json::Value =
+        serde_json::from_slice(&entries["logkeeper-debug/config.json"]).unwrap();
+    assert_eq!(config_json["tls"]["private_key"], "<redacted>");
+    assert_eq!(config_json["tls"]["certificate"], "keeper.pem");
+    for id in addrs.keys() {
+        let metrics = &entries[&format!("logkeeper-debug/keepers/{id}/metrics.txt")];
+        assert!(String::from_utf8_lossy(metrics).contains("logkeeper_build_info"));
+        let status: serde_json::Value =
+            serde_json::from_slice(&entries[&format!("logkeeper-debug/keepers/{id}/status.json")])
+                .unwrap();
+        assert_eq!(status["keeper"], id.to_string());
+        assert_eq!(status["status"]["keeper"], id.to_string());
+        assert_eq!(status["config"]["tls"]["private_key"], "<redacted>");
+        assert!(entries.contains_key(&format!("logkeeper-debug/keepers/{id}/problems.json")));
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&entries["logkeeper-debug/manifest.json"]).unwrap();
+    let endpoints = manifest["endpoints"].as_array().unwrap();
+    assert_eq!(endpoints.len(), addrs.len() + 1);
+    let unanswered = endpoints
+        .iter()
+        .find(|endpoint| endpoint["address"] == silent.to_string())
+        .unwrap();
+    assert!(
+        unanswered["answers"]["/metrics"]
+            .as_str()
+            .unwrap()
+            .starts_with("error")
+    );
+
+    // A stopped keeper's data directory adds its offline reports.
+    cluster.stop_all().await;
+    let data = config.data.clone();
+    config.admin = None;
+    let bundle = config.debug_bundle(&raw, &[], Some(data)).await.unwrap();
+    let entries = untar(&bundle);
+    let inspect: serde_json::Value =
+        serde_json::from_slice(&entries["logkeeper-debug/offline/inspect.json"]).unwrap();
+    assert!(
+        inspect["streams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|info| info["stream"] == Uuid::from_u128(stream.0).to_string())
+    );
+    let verify: serde_json::Value =
+        serde_json::from_slice(&entries["logkeeper-debug/offline/verify.json"]).unwrap();
+    assert_eq!(verify["ok"], true);
 }

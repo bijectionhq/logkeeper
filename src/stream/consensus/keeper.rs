@@ -1,5 +1,6 @@
 mod admin;
 mod admission;
+mod bundle;
 mod catalog_stream;
 mod certify;
 mod compaction;
@@ -108,10 +109,14 @@ pub struct AdminConfig {
     #[serde(default = "default_admin_listen")]
     pub listen: SocketAddr,
     /// Require mutual TLS using the keeper's credentials and configured
-    /// `administrators` principals. Plain HTTP (default) requires a loopback
-    /// bind address.
+    /// `administrators` principals, or other keepers of this cluster.
+    /// Plain HTTP (default) requires a loopback bind address.
     #[serde(default)]
     pub mtls: bool,
+    /// The admin listeners of the other keepers, which
+    /// `logkeeper keeper debug-bundle` collects from.
+    #[serde(default)]
+    pub cluster: BTreeMap<uuid::Uuid, SocketAddr>,
 }
 
 /// Installed, authenticated keeper inventory and local service settings.
@@ -330,6 +335,7 @@ impl Config {
         stop: CancellationToken,
     ) -> io::Result<(Arc<Engine>, [TlsAcceptor; 3], Option<TlsAcceptor>)> {
         let placement = self.validate()?;
+        let summary = self.summary();
         let keeper = KeeperId(self.keeper.as_u128());
         let acceptors = [
             self.tls.server_protocol(keeper, Lane::Application.alpn())?,
@@ -409,6 +415,7 @@ impl Config {
             None => None,
         };
         let engine = Arc::new(Engine {
+            summary,
             timed,
             id,
             catalog_id: self.catalog,
@@ -481,6 +488,8 @@ struct TimedState {
 }
 
 pub(super) struct Engine {
+    /// This keeper's settings without secrets, which `/status` reports.
+    summary: serde_json::Value,
     timed: Option<Arc<TimedState>>,
     pub(super) id: uuid::Uuid,
     catalog_id: uuid::Uuid,

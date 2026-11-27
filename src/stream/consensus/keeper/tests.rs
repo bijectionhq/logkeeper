@@ -19,8 +19,8 @@ mod compaction;
 mod incarnation;
 mod lifecycle;
 mod model_counterexamples;
-mod park;
 mod ops;
+mod park;
 mod recovery;
 mod repair;
 

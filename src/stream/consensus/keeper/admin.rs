@@ -62,6 +62,19 @@ pub(super) const PROBLEM_REASONS: [&str; 9] = [
 ];
 
 #[derive(Debug, Serialize)]
+pub(super) struct StatusReport {
+    pub keeper: Uuid,
+    pub domain: String,
+    pub version: &'static str,
+    pub alpn: BTreeMap<&'static str, String>,
+    pub wal_healthy: bool,
+    pub media_responsive: bool,
+    pub replayed: bool,
+    pub status: crate::stream::consensus::KeeperStatus,
+    pub config: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
 pub(super) struct LiveReport {
     pub live: bool,
     pub wal_healthy: bool,
@@ -264,9 +277,19 @@ impl Engine {
             Some(acceptor) => {
                 let mut stream = acceptor.accept(socket).await?;
                 let (_, tls) = stream.get_ref();
-                let authorized = transport::leaf(tls.peer_certificates())
-                    .and_then(transport::client_identity)
-                    .is_ok_and(|id| self.administrators.contains(id.as_str()));
+                // An administrator, or another keeper of this cluster, which
+                // already holds every replica the admin pages describe and
+                // collects them for `logkeeper keeper debug-bundle`.
+                let leaf = transport::leaf(tls.peer_certificates()).ok();
+                let authorized = leaf.is_some_and(|leaf| {
+                    transport::client_identity(leaf)
+                        .is_ok_and(|id| self.administrators.contains(id.as_str()))
+                        || transport::keeper_id(leaf).is_ok_and(|keeper| {
+                            self.placement
+                                .domains()
+                                .contains_key(&uuid::Uuid::from_u128(keeper.0))
+                        })
+                });
                 self.serve_http(&mut stream, authorized).await
             }
             None => {
@@ -364,6 +387,11 @@ impl Engine {
                 let body = serde_json::to_vec(&report).unwrap_or_default();
                 write_http_response(stream, status, "application/json", &body, head_only).await
             }
+            "/status" => {
+                let report = self.status_report().await;
+                let body = serde_json::to_vec(&report).unwrap_or_default();
+                write_http_response(stream, "200 OK", "application/json", &body, head_only).await
+            }
             "/problems" | "/problem-streams" => {
                 let report = self.problem_streams_report().await;
                 let body = serde_json::to_vec(&report).unwrap_or_default();
@@ -380,6 +408,34 @@ impl Engine {
                 )
                 .await
             }
+        }
+    }
+
+    /// What this keeper reports to its peers, with its build and settings.
+    pub(super) async fn status_report(&self) -> StatusReport {
+        StatusReport {
+            keeper: self.id,
+            domain: self
+                .placement
+                .domains()
+                .get(&self.id)
+                .cloned()
+                .unwrap_or_default(),
+            version: env!("CARGO_PKG_VERSION"),
+            alpn: [
+                ("control", super::super::CONTROL_ALPN),
+                ("replication", super::super::REPLICATION_ALPN),
+                ("bulk", super::super::BULK_ALPN),
+                ("client", super::super::ALPN),
+            ]
+            .into_iter()
+            .map(|(lane, alpn)| (lane, String::from_utf8_lossy(alpn).into_owned()))
+            .collect(),
+            wal_healthy: self.disk.healthy(),
+            media_responsive: self.disk.responsive(),
+            replayed: self.replayed.load(Ordering::Acquire),
+            status: self.keeper_status().await,
+            config: self.summary.clone(),
         }
     }
 

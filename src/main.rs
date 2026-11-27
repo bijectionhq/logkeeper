@@ -31,6 +31,8 @@ async fn main() -> ExitCode {
         println!(
             "       logkeeper keeper dump-segment (--config FILE --segment ID | --file PATH) [--limit N] [--json]"
         );
+        #[cfg(feature = "stream")]
+        println!("       {}", &DEBUG_BUNDLE_USAGE["Usage: ".len()..]);
         return ExitCode::SUCCESS;
     }
     match run(&args).await {
@@ -84,6 +86,9 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
         }
         if args.get(1).is_some_and(|action| action == "dump-segment") {
             return dump_segment(&args[2..]);
+        }
+        if args.get(1).is_some_and(|action| action == "debug-bundle") {
+            return debug_bundle(&args[2..]).await;
         }
         let mut config_file = None;
         let mut log_format = None;
@@ -240,6 +245,48 @@ const INSPECT_USAGE: &str =
 const VERIFY_USAGE: &str = "Usage: logkeeper keeper verify --config FILE [--json]";
 #[cfg(feature = "stream")]
 const DUMP_SEGMENT_USAGE: &str = "Usage: logkeeper keeper dump-segment (--config FILE --segment ID | --file PATH) [--limit N] [--json]";
+
+#[cfg(feature = "stream")]
+const DEBUG_BUNDLE_USAGE: &str = "Usage: logkeeper keeper debug-bundle --config FILE [--admin ADDR]... [--data DIR] [--out FILE]";
+
+#[cfg(feature = "stream")]
+async fn debug_bundle(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = None;
+    let mut admin = Vec::new();
+    let mut data = None;
+    let mut out = None;
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--config" => config = iter.next(),
+            "--admin" => admin.push(
+                iter.next()
+                    .ok_or(DEBUG_BUNDLE_USAGE)?
+                    .parse::<std::net::SocketAddr>()?,
+            ),
+            "--data" => data = iter.next().map(std::path::PathBuf::from),
+            "--out" => out = iter.next().map(std::path::PathBuf::from),
+            _ => return Err(DEBUG_BUNDLE_USAGE.into()),
+        }
+    }
+    let Some(config) = config else {
+        return Err(DEBUG_BUNDLE_USAGE.into());
+    };
+    let raw = std::fs::read(config)?;
+    let parsed = serde_json::from_slice::<logkeeper::stream::consensus::Config>(&raw)?;
+    let raw = serde_json::from_slice::<serde_json::Value>(&raw)?;
+    let bundle = parsed.debug_bundle(&raw, &admin, data).await?;
+    let out = out.unwrap_or_else(|| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        std::path::PathBuf::from(format!("logkeeper-debug-{}-{secs}.tar", parsed.keeper))
+    });
+    std::fs::write(&out, bundle)?;
+    println!("{}", out.display());
+    Ok(())
+}
 
 #[cfg(feature = "stream")]
 fn inspect_keeper(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
