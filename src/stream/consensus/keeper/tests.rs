@@ -14,6 +14,7 @@ use crate::stream::{
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod authority;
 mod catalog;
 mod compaction;
 mod immutable;
@@ -194,6 +195,9 @@ impl Cluster {
                 enrollment: enrollment.clone(),
                 catalog,
                 catalog_voters,
+                allow_single_catalog: true,
+                lease_millis: 2_000,
+                lease_drift_margin_millis: 200,
                 readers: vec![OWNER.into(), OTHER.into()],
                 writers: vec![OWNER.into(), OTHER.into()],
                 administrators: vec![OWNER.into()],
@@ -361,8 +365,14 @@ impl Cluster {
     /// administrator would once every keeper runs this build, and waits
     /// until every running keeper allows the formats it gates.
     async fn finalize(&self) {
+        self.finalize_to(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+            .await;
+    }
+
+    /// Finalizes the cluster version at `version`, below this build's when
+    /// a test exercises an earlier level.
+    async fn finalize_to(&self, version: u32) {
         let client = self.client(&self.credentials);
-        let version = crate::stream::consensus::CLUSTER_VERSION_CURRENT;
         timeout(WAIT, async {
             while client.finalize_version(version).await != Ok(version) {
                 tokio::time::sleep(Duration::from_millis(100)).await;

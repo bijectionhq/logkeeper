@@ -3,6 +3,7 @@
 
 mod address;
 mod assignment;
+mod authority;
 mod catalog;
 mod client;
 mod decisions;
@@ -36,6 +37,7 @@ use serde::{
 pub use super::transport::Credentials;
 pub use crate::server::durability::SyncMode;
 pub use address::Address;
+pub use authority::{Grant, Recovered};
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
 pub use keeper::{AdminConfig, Config, FenceProof, OffloadStatus, Recovery, RecoveryReport};
@@ -74,8 +76,14 @@ pub const CLUSTER_VERSION_V4: u32 = 4;
 pub const CLUSTER_VERSION_V5: u32 = 5;
 /// The level offload waits for.
 pub const CLUSTER_VERSION_OFFLOAD: u32 = CLUSTER_VERSION_V5;
+/// Cluster feature level at which the catalog's liveness leases become
+/// authoritative: keepers campaign, lead and serve reads only under a valid
+/// lease, and the catalog stores keeper records.
+pub const CLUSTER_VERSION_V6: u32 = 6;
+/// The level liveness leases wait for.
+pub const CLUSTER_VERSION_LEASES: u32 = CLUSTER_VERSION_V6;
 /// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V5;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V6;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -98,6 +106,10 @@ pub mod features {
     /// snapshot formats that carry offload progress.
     pub const OFFLOAD: u64 = 1 << 7;
 
+    /// Renews liveness leases with the catalog and honours them once the
+    /// cluster finalizes `CLUSTER_VERSION_LEASES`.
+    pub const LEASES: u64 = 1 << 8;
+
     /// All features supported by this build.
     pub const SUPPORTED: u64 = VERSION_NEGOTIATION
         | WRITE_VERSION_GATE
@@ -105,7 +117,8 @@ pub mod features {
         | SOFT_PLACEMENT
         | RECOVERY_MARKER
         | IMMUTABLE_STREAMS
-        | OFFLOAD;
+        | OFFLOAD
+        | LEASES;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;

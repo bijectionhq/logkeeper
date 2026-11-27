@@ -49,7 +49,7 @@ async fn written_stream(
 fn acknowledged() -> Recovery {
     Recovery {
         acknowledge_data_loss: true,
-        lost: Some([2, 3].map(Uuid::from_u128)),
+        lost: Some([2, 3].map(Uuid::from_u128).to_vec()),
         ..Recovery::default()
     }
 }
@@ -124,7 +124,11 @@ async fn a_survivor_recovers_only_after_retiring_the_partitioned_voters() {
     use journal_contract::{Journal, RecoveryFence};
 
     let mut cluster = Cluster::start().await;
-    cluster.finalize().await;
+    // Before leases are finalized, only retirement deposes the partitioned
+    // voters; `tests/authority.rs` covers the lease.
+    cluster
+        .finalize_to(crate::stream::consensus::CLUSTER_VERSION_V4)
+        .await;
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(81);
     let old_fence = written_stream(&cluster, stream, [a, b, c], a, 5).await;
@@ -523,7 +527,7 @@ async fn recovery_is_refused_while_another_voter_holds_a_healthy_replica() {
     assert!(refused.to_string().contains("quorum"), "{refused}");
     // The operator must name the lost voters, and name the right ones.
     cluster.running.remove(&c).unwrap().stop().await;
-    for lost in [None, Some([b, d])] {
+    for lost in [None, Some(vec![b, d])] {
         let refused = cluster.configs[&a]
             .recover_stream(
                 stream,
@@ -753,7 +757,7 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some([b, c]),
+                lost: Some(vec![b, c]),
                 with: Some([d, e]),
                 ..legacy_acknowledged()
             },
@@ -767,7 +771,7 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some([b, c]),
+                lost: Some(vec![b, c]),
                 with: Some([d, f]),
                 ..legacy_acknowledged()
             },
@@ -836,7 +840,7 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some([b, c]),
+                lost: Some(vec![b, c]),
                 with: Some([d, f]),
                 ..legacy_acknowledged()
             },
@@ -979,7 +983,7 @@ async fn returning_lost_voters_never_lead_and_retire_past_a_follower_survivor() 
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some([b, c]),
+                lost: Some(vec![b, c]),
                 with: Some([d, f]),
                 ..legacy_acknowledged()
             },

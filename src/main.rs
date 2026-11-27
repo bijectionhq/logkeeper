@@ -273,13 +273,16 @@ const FENCE_USAGE: &str =
 
 #[cfg(feature = "stream")]
 const RECOVER_USAGE: &str = "Usage: logkeeper keeper recover-stream --config FILE --stream UUID \
-     [--acknowledge-data-loss --lost KEEPER,KEEPER --fence-proof FILE --fence-proof FILE] \
+     [--acknowledge-data-loss [--lost KEEPER[,KEEPER]] [--fence-proof FILE --fence-proof FILE]] \
      [--with KEEPER,KEEPER]";
 
 /// Recovers a stream that lost two of its three voters from this stopped
 /// keeper's replica. Without `--acknowledge-data-loss` it prints what it
-/// would do and refuses. An acknowledged run requires signed retirement
-/// evidence for the two voters named by `--lost`.
+/// would do and refuses. Once liveness leases are finalized, `--lost`
+/// declares lost voters dead, which bumps their epochs, and is needed only
+/// for a lost voter that never held a lease; retirement proofs are optional.
+/// Before that, an acknowledged run names both lost voters with `--lost`
+/// and gives signed retirement evidence for each.
 #[cfg(feature = "stream")]
 async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = None;
@@ -304,11 +307,10 @@ async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error
                     .split(',')
                     .map(uuid::Uuid::parse_str)
                     .collect::<Result<Vec<_>, _>>()?;
-                let keepers = Some(<[_; 2]>::try_from(keepers).map_err(|_| RECOVER_USAGE)?);
                 if flag == "--with" {
-                    recovery.with = keepers;
+                    recovery.with = Some(<[_; 2]>::try_from(keepers).map_err(|_| RECOVER_USAGE)?);
                 } else {
-                    recovery.lost = keepers;
+                    recovery.lost = Some(keepers);
                 }
             }
             _ => return Err(RECOVER_USAGE.into()),

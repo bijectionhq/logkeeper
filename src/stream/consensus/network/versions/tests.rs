@@ -291,6 +291,16 @@ fn request(tag: usize) -> Option<Request> {
                 replace: true,
             },
         },
+        39 => Request::RenewLease {
+            keeper: uuid::Uuid::from_u128(1),
+            incarnation: uuid::Uuid::from_u128(9),
+            epoch: 1,
+        },
+        40 => Request::FenceKeeper(uuid::Uuid::from_u128(1)),
+        41 => Request::RecoverStream {
+            stage: stage(),
+            dead: Vec::new(),
+        },
         _ => return None,
     })
 }
@@ -364,6 +374,21 @@ fn reply(tag: usize) -> Option<Reply> {
         8 => Reply::Configured(None),
         9 => Reply::Unsupported(String::new()),
         10 => Reply::ClusterVersion(1),
+        11 => Reply::Lease(crate::stream::consensus::Grant {
+            granted: true,
+            enforced: true,
+            epoch: 1,
+            fenced: Default::default(),
+            reused: false,
+            duration_ms: 30_000,
+            margin_ms: 3_000,
+        }),
+        12 => Reply::Recovered(crate::stream::consensus::Recovered {
+            fenced: Vec::new(),
+            unleased: Vec::new(),
+            wait_ms: 33_000,
+            written: true,
+        }),
         _ => return None,
     })
 }

@@ -302,6 +302,26 @@ pub(super) enum Request {
         stream: StreamId,
         restore: super::state::Restore,
     },
+    /// A keeper renews its liveness lease with the catalog under its media
+    /// incarnation and epoch, zero when the process joins. Answered with
+    /// `Reply::Lease`. A catalog follower forwards it to its leader.
+    RenewLease {
+        keeper: uuid::Uuid,
+        incarnation: uuid::Uuid,
+        epoch: u64,
+    },
+    /// Bumps `keeper`'s epoch in the catalog, ending every lease issued
+    /// under the old one. Administrators, or the keeper itself once it has
+    /// decommissioned.
+    FenceKeeper(uuid::Uuid),
+    /// An operator recovery's catalog transaction: records `stage` as the
+    /// stream's membership at its next revision, fences the stream for the
+    /// voters it leaves, and bumps the epochs of the keepers in `dead`.
+    /// Sent by the survivor. Answered with `Reply::Recovered`.
+    RecoverStream {
+        stage: Stage,
+        dead: Vec<uuid::Uuid>,
+    },
 }
 
 impl Request {
@@ -327,8 +347,11 @@ impl Request {
             | Self::Staging(stream)
             | Self::ClearQuarantine(stream)
             | Self::Configuration(stream) => stream,
-            Self::Stage(ref stage) => stage.stream,
-            Self::ClusterVersion | Self::FinalizeVersion(_) => StreamId(0),
+            Self::Stage(ref stage) | Self::RecoverStream { ref stage, .. } => stage.stream,
+            Self::ClusterVersion
+            | Self::FinalizeVersion(_)
+            | Self::RenewLease { .. }
+            | Self::FenceKeeper(_) => StreamId(0),
             Self::Seal { stream, .. }
             | Self::SealSession { stream, .. }
             | Self::AcknowledgeRecoveryWithMarker { stream, .. }
@@ -701,6 +724,10 @@ pub(super) enum Reply {
     Unsupported(String),
     /// The finalized cluster feature level.
     ClusterVersion(u32),
+    /// The catalog's answer to a lease renewal. Added last.
+    Lease(super::authority::Grant),
+    /// The catalog's answer to a recovery transaction. Added last.
+    Recovered(super::authority::Recovered),
 }
 
 /// The N-1 wire codec for [`Reply`], the bincode layout of
@@ -762,6 +789,11 @@ impl ReplyV1 {
             Reply::Unsupported(reason) => return Err(unsupported(reason)),
             Reply::ClusterVersion(_) => {
                 return Err(unsupported("cluster version requires a newer protocol"));
+            }
+            Reply::Lease(_) | Reply::Recovered(_) => {
+                return Err(unsupported(
+                    "the configuration authority requires a newer protocol",
+                ));
             }
         })
     }
@@ -1585,6 +1617,11 @@ pub(super) const EXCLUDED: &str = "sender is outside the receiver's placement";
 /// Why an uncertified copy does not campaign (`keeper/certify.rs`).
 const UNCERTIFIED: &str = "replica placement is not certified since it opened";
 
+/// Why a copy without authority neither campaigns nor leads
+/// (`keeper/lease.rs`).
+pub(super) const UNAUTHORIZED: &str =
+    "keeper holds no valid liveness lease, or the catalog fenced its copy";
+
 #[derive(Clone)]
 pub(super) struct Network {
     pub control: Rpc,
@@ -1604,6 +1641,11 @@ pub(super) struct Network {
     /// Whether the keeper certified this copy's placement. An uncertified
     /// copy sends no vote or pre-vote, so it never campaigns.
     pub certified: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Whether the keeper holds authority over this copy: a valid liveness
+    /// lease, its current epoch, and no catalog fence on the copy
+    /// (`keeper/lease.rs`). Without it the copy sends no vote, pre-vote,
+    /// append or snapshot, so it neither campaigns nor leads.
+    pub authority: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl Network {
@@ -1777,6 +1819,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         if !self.network.state.active() {
             return Err(unreachable(&invalid("quarantined stream replica")).into());
         }
+        if !(self.network.authority)() {
+            return Err(unreachable(&invalid(UNAUTHORIZED)).into());
+        }
         let mut request = request;
         let mut rest = Vec::new();
         let mut accepted = None;
@@ -1832,6 +1877,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         if !(self.network.certified)() {
             return Err(unreachable(&invalid(UNCERTIFIED)).into());
         }
+        if !(self.network.authority)() {
+            return Err(unreachable(&invalid(UNAUTHORIZED)).into());
+        }
         let proposed = request.vote;
         let last_log = request.last_log_id;
         let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
@@ -1863,6 +1911,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         if !(self.network.certified)() {
             return Err(unreachable(&invalid(UNCERTIFIED)).into());
         }
+        if !(self.network.authority)() {
+            return Err(unreachable(&invalid(UNAUTHORIZED)).into());
+        }
         let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
             self.request(PeerRequest::PreVote(request), &option).await?;
         let response = response.map_err(|error| unreachable(&error))?;
@@ -1893,6 +1944,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<RaftTypes>, StreamingError<RaftTypes>> {
+        if !(self.network.authority)() {
+            return Err(unreachable(&invalid(UNAUTHORIZED)).into());
+        }
         let mut cancel = Box::pin(cancel);
         let mut file = snapshot.snapshot;
         // A private spool is a bulk admission, so refusal must be retryable.

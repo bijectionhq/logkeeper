@@ -73,7 +73,10 @@ impl Request {
             | Self::SealSession { .. }
             | Self::StageSessionOriginal { .. }
             | Self::OffloadStatus { .. }
-            | Self::Restore { .. } => WireVersion::Current,
+            | Self::Restore { .. }
+            | Self::RenewLease { .. }
+            | Self::FenceKeeper(_)
+            | Self::RecoverStream { .. } => WireVersion::Current,
         }
     }
 }
@@ -118,9 +121,11 @@ impl Reply {
             | Self::Generation(_)
             | Self::ScopedPage { .. }
             | Self::Status(_) => WireVersion::Previous,
-            Self::Configured(_) | Self::Unsupported(_) | Self::ClusterVersion(_) => {
-                WireVersion::Current
-            }
+            Self::Configured(_)
+            | Self::Unsupported(_)
+            | Self::ClusterVersion(_)
+            | Self::Lease(_)
+            | Self::Recovered(_) => WireVersion::Current,
         }
     }
 }

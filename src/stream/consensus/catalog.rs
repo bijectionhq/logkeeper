@@ -5,30 +5,174 @@
 //! `catalog_voters`; then the catalog is a consensus stream of its own (see
 //! `keeper/catalog_stream.rs`), and callers find its leader with [`ask`].
 
-use std::{collections::BTreeSet, io, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use journal_contract::{JournalError, Lsn, StreamId};
 use tokio::{sync::Mutex, time::Instant};
 
+use crate::server::durability::{sync_directory, sync_file};
+
 use super::{
-    Genesis, Stage, invalid,
+    Genesis, Stage, authority, invalid,
     network::Reply,
     placement::Placement,
     state::Outcome,
     storage::{CatalogEntry, Disk, Record},
 };
 
+/// The single-keeper catalog's keeper records, beside its data. A
+/// development catalog only: production replicates the catalog.
+pub(super) const AUTHORITY_FILE: &str = "authority-records.json";
+
 pub(super) struct Catalog {
     disk: Disk,
     claim: Arc<Mutex<()>>,
+    /// The authority's keeper records, stored in `authority`.
+    records: Arc<Mutex<authority::Records>>,
+    authority: PathBuf,
 }
 
 impl Catalog {
-    pub fn new(disk: Disk) -> Self {
-        Self {
+    pub fn new(disk: Disk, data: &Path) -> io::Result<Self> {
+        let authority = data.join(AUTHORITY_FILE);
+        let records = match std::fs::read(&authority) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|error| invalid(format!("{}: {error}", authority.display())))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Default::default(),
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
             disk,
             claim: Arc::default(),
+            records: Arc::new(Mutex::new(records)),
+            authority,
+        })
+    }
+
+    fn enforced(&self) -> bool {
+        self.disk.cluster_version() >= super::CLUSTER_VERSION_LEASES
+    }
+
+    /// Applies `change` to the records and stores them before they answer.
+    async fn change(
+        &self,
+        records: &mut authority::Records,
+        change: authority::Change,
+    ) -> io::Result<()> {
+        let mut next = records.clone();
+        next.apply(&change);
+        let bytes = serde_json::to_vec(&next).map_err(io::Error::other)?;
+        let path = self.authority.clone();
+        tokio::task::spawn_blocking(move || {
+            let temporary = path.with_extension("json.tmp");
+            let file = std::fs::File::create(&temporary)?;
+            std::io::Write::write_all(&mut &file, &bytes)?;
+            sync_file(&file)?;
+            drop(file);
+            std::fs::rename(&temporary, &path)?;
+            sync_directory(path.parent().unwrap_or(Path::new(".")))
+        })
+        .await
+        .map_err(io::Error::other)??;
+        *records = next;
+        Ok(())
+    }
+
+    /// Answers `keeper`'s lease renewal, enrolling it first once leases are
+    /// enforced.
+    pub async fn renew(
+        &self,
+        keeper: uuid::Uuid,
+        incarnation: uuid::Uuid,
+        epoch: u64,
+        lease: (u64, u64),
+    ) -> io::Result<Reply> {
+        self.require_trusted()?;
+        let enforced = self.enforced();
+        let mut records = self.records.lock().await;
+        if enforced && let Some(change) = records.enrollment(keeper, incarnation) {
+            self.change(&mut records, change).await?;
         }
+        Ok(Reply::Lease(records.grant(
+            keeper,
+            incarnation,
+            epoch,
+            enforced,
+            lease.0,
+            lease.1,
+        )))
+    }
+
+    /// Bumps `keeper`'s epoch.
+    pub async fn fence(&self, keeper: uuid::Uuid) -> io::Result<Reply> {
+        self.require_trusted()?;
+        if !self.enforced() {
+            return Ok(Reply::Decision(Outcome::Refused(JournalError::Unsupported)));
+        }
+        let mut records = self.records.lock().await;
+        self.change(&mut records, authority::Change::Fence { keeper })
+            .await?;
+        Ok(Reply::Decision(Outcome::Unit))
+    }
+
+    /// An operator recovery's catalog transaction. The fence is stored
+    /// before the stage, so a crash between them leaves the lost voters
+    /// fenced and a rerun stages again.
+    pub async fn recover(
+        &self,
+        stage: Stage,
+        dead: Vec<uuid::Uuid>,
+        placement: &Placement,
+        wait_ms: u64,
+    ) -> io::Result<Reply> {
+        self.require_trusted()?;
+        if !self.enforced() {
+            return Ok(Reply::Decision(Outcome::Refused(JournalError::Unsupported)));
+        }
+        if !stage.recovery()
+            || !placement.stage(&stage)
+            || dead
+                .iter()
+                .any(|keeper| !authority::fenced_by(&stage).contains(keeper))
+        {
+            return Err(invalid("invalid recovery stage"));
+        }
+        let _guard = self.claim.lock().await;
+        let entry = self
+            .disk
+            .catalog(stage.stream)
+            .ok_or_else(|| invalid("missing catalog entry"))?;
+        if !admits_stage(&entry, &stage) {
+            return Ok(stage_conflict());
+        }
+        let mut records = self.records.lock().await;
+        let written = !(records.recovered(&stage) && entry.staged.as_ref() == Some(&stage));
+        if written {
+            self.change(
+                &mut records,
+                authority::Change::Recover {
+                    stage: stage.clone(),
+                    dead,
+                },
+            )
+            .await?;
+            if entry.staged.as_ref() != Some(&stage) {
+                self.disk.write(Record::Stage(stage.clone())).await?;
+            }
+        }
+        let fenced = authority::fenced_by(&stage);
+        Ok(Reply::Recovered(authority::Recovered {
+            unleased: records.unleased(&fenced),
+            fenced,
+            wait_ms,
+            written,
+        }))
     }
 
     pub async fn claim(&self, genesis: Genesis, placement: &Placement) -> io::Result<Reply> {
@@ -42,6 +186,8 @@ impl Catalog {
         let catalog = Self {
             disk: self.disk.clone(),
             claim: self.claim.clone(),
+            records: self.records.clone(),
+            authority: self.authority.clone(),
         };
         tokio::spawn(async move { catalog.claim_validated(genesis).await })
             .await
@@ -95,6 +241,8 @@ impl Catalog {
         let catalog = Self {
             disk: self.disk.clone(),
             claim: self.claim.clone(),
+            records: self.records.clone(),
+            authority: self.authority.clone(),
         };
         tokio::spawn(async move { catalog.stage_validated(stage).await })
             .await

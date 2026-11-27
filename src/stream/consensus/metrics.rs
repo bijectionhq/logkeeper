@@ -1030,6 +1030,79 @@ impl Metrics {
             scrape.repair_backoff
         );
 
+        // Liveness lease with the configuration authority
+        let lease = &scrape.lease;
+        for (name, kind, help, value) in [
+            (
+                "logkeeper_consensus_lease_enforced",
+                "gauge",
+                "Whether liveness leases are authoritative on this keeper (1) or advisory (0).",
+                f64::from(u8::from(lease.enforced)),
+            ),
+            (
+                "logkeeper_consensus_lease_valid",
+                "gauge",
+                "Whether this keeper holds a valid liveness lease from the catalog.",
+                f64::from(u8::from(lease.valid)),
+            ),
+            (
+                "logkeeper_consensus_lease_remaining_seconds",
+                "gauge",
+                "Seconds the liveness lease stays valid on this keeper's clock.",
+                lease.remaining_secs,
+            ),
+            (
+                "logkeeper_consensus_lease_epoch",
+                "gauge",
+                "This keeper's epoch in the catalog; zero before it enrolled.",
+                lease.epoch as f64,
+            ),
+            (
+                "logkeeper_consensus_lease_fenced_streams",
+                "gauge",
+                "Streams the catalog fences for this keeper.",
+                lease.fenced_streams as f64,
+            ),
+            (
+                "logkeeper_consensus_lease_renewal_failures_total",
+                "counter",
+                "Lease renewals that got no answer from the catalog.",
+                lease.renewal_failures as f64,
+            ),
+            (
+                "logkeeper_consensus_lease_renewal_refusals_total",
+                "counter",
+                "Lease renewals the catalog refused: a stale epoch or replaced media.",
+                lease.renewal_refusals as f64,
+            ),
+            (
+                "logkeeper_consensus_lease_lapses_total",
+                "counter",
+                "Times this keeper's liveness lease lapsed.",
+                lease.lapses as f64,
+            ),
+            (
+                "logkeeper_consensus_lease_gated_total",
+                "counter",
+                "Requests refused because this keeper held no authority over the stream.",
+                lease.gated as f64,
+            ),
+        ] {
+            let _ = writeln!(out, "# HELP {name} {help}");
+            let _ = writeln!(out, "# TYPE {name} {kind}");
+            let _ = writeln!(out, "{name} {value}");
+        }
+        // Absent until a renewal was granted, so an alert on age needs no
+        // sentinel.
+        if let Some(age) = lease.age_secs {
+            let _ = writeln!(
+                out,
+                "# HELP logkeeper_consensus_lease_age_seconds Seconds since the catalog last granted this keeper's lease renewal."
+            );
+            let _ = writeln!(out, "# TYPE logkeeper_consensus_lease_age_seconds gauge");
+            let _ = writeln!(out, "logkeeper_consensus_lease_age_seconds {age:.3}");
+        }
+
         // Hosted stream counts & aggregated retention
         let _ = writeln!(
             out,
@@ -1292,6 +1365,25 @@ pub(super) struct ScrapeSnapshot {
     pub repair_oldest_secs: f64,
     /// Streams whose last repair failed and wait out a backoff.
     pub repair_backoff: usize,
+    /// The keeper's liveness lease with the catalog.
+    pub lease: LeaseScrape,
+}
+
+/// What the scrape reports of the keeper's liveness lease.
+#[derive(Clone, Debug, Default)]
+pub(super) struct LeaseScrape {
+    /// Whether leases are authoritative on this keeper.
+    pub enforced: bool,
+    pub valid: bool,
+    /// Seconds since the catalog last granted a renewal, when it ever did.
+    pub age_secs: Option<f64>,
+    pub remaining_secs: f64,
+    pub epoch: u64,
+    pub fenced_streams: usize,
+    pub renewal_failures: u64,
+    pub renewal_refusals: u64,
+    pub lapses: u64,
+    pub gated: u64,
 }
 
 fn escape_label(value: &str) -> String {
@@ -1429,6 +1521,14 @@ mod tests {
             repair_pending: 1,
             repair_oldest_secs: 12.0,
             repair_backoff: 0,
+            lease: LeaseScrape {
+                enforced: true,
+                valid: true,
+                age_secs: Some(1.5),
+                remaining_secs: 20.0,
+                epoch: 3,
+                ..Default::default()
+            },
         }
     }
 

@@ -36,6 +36,18 @@ catalog if the keeper stores a catalog replica. Prefer restoring the existing
 quorum while that is possible. Use the current Logkeeper operator binary
 throughout this procedure. Older operator binaries predate retirement proofs.
 
+**Check whether the cluster enforces liveness leases.** Each keeper's
+`/metrics` shows it (`logkeeper_consensus_lease_enforced 1`). Once the
+cluster has finalized leases (cluster level 6), a lost keeper that still
+runs, cut off from the survivor and the catalog, is deposed by time:
+`recover-stream` commits the recovery in the catalog, which fences the
+stream for both lost keepers, and waits out their leases before the
+recovered configuration serves. Retiring the lost identities (step 4) and
+naming them then become optional; nothing in this runbook needs a lost host.
+Each lost keeper must have held a lease (`logkeeper_consensus_lease_epoch`
+above 0 on it before the loss); the command refuses until you name with
+`--lost` any that never did, which is your statement that it is down.
+
 ## 2. Stop the survivor
 
 `recover-stream` runs on the stopped keeper, under its media lock. Stopping
@@ -58,7 +70,8 @@ make this keeper's copy of stream <id> (head <n>) the only history: records
 only <lost-1> and <lost-2> held are lost. The voters would become [...] at
 revision <r>, term <t>, ... To proceed, permanently retire both lost keepers
 and add --acknowledge-data-loss --lost <lost-1>,<lost-2> and a --fence-proof
-for each`.
+for each`. With leases enforced the message instead says the catalog
+fences the stream for both and that `--lost` and the proofs are optional.
 
 **Abort** on any other refusal:
 
@@ -68,6 +81,9 @@ for each`.
 | `refused: name both lost voters with --lost x,y` | `--lost` is missing or names other keepers |
 | `refused: supply two independently signed keeper retirement proofs` | Generate one proof on each lost keeper's original enrolled media |
 | `immutable histories require their original quorum or a successor with a fresh stream ID` | Restore the original quorum or create a successor with a verified application cut |
+| `refused: the cluster has not finalized liveness leases ... name them with --lost x,y` | Leases are advisory: fence both lost keepers, then name them |
+| `refused: [...] never held a liveness lease ...` | Time cannot depose those keepers: confirm each is down or fenced, then name it with `--lost` and run again |
+| `refused: --lost may name only the lost voters ...` | `--lost` names another keeper |
 | `this keeper is not a voter of the stream's latest configuration` | Run it on the right survivor |
 | `the replicated catalog requires its original quorum or disaster restore` | Follow [catalog and joint quorum loss](#catalog-and-joint-quorum-loss) |
 | `the catalog records a pending move or a different source configuration` | Reconcile against the current membership with its original quorum. The local survivor may have missed a configuration change |
@@ -108,12 +124,36 @@ lk keeper recover-stream --config $CONFIG --stream STREAM_UUID --acknowledge-dat
   --fence-proof LOST2_UUID.fence.json [--with KEEPER_UUID,KEEPER_UUID]
 ```
 
+With leases enforced, the retirement above is optional defence in depth,
+and so is `--lost`:
+
+```sh
+lk keeper recover-stream --config $CONFIG --stream STREAM_UUID --acknowledge-data-loss \
+  [--lost LOST_UUID[,LOST_UUID]] [--with KEEPER_UUID,KEEPER_UUID]
+```
+
+`--lost` then declares the named keepers dead, which bumps their epochs and
+ends their leases for every stream they host. Without it the catalog still
+fences this stream for both lost keepers. The command waits a lease plus the
+drift margin (33 s by default) after the catalog commits, before it writes.
+
+With leases enforced, `--lost` is optional: it declares the named keepers
+dead, which bumps their epochs and ends their leases for every stream they
+host, not just this one. Without it the catalog still fences this stream for
+both lost keepers. Use it when you know a lost keeper's media is gone or
+untrustworthy. Without leases, name both (step 1).
+
+The command commits the recovery in the catalog, then waits a lease plus
+the drift margin (33 s by default) before it writes, so the recovered
+configuration cannot serve while a lost keeper's lease lasts.
+
 Expected:
 
 ```text
 stream <id> recovered from this keeper at head <n>: voters <a> <b> <c>, revision <r>, term <t>,
-recovery fence at epoch <e>. Lost voters <x> and <y> must remain retired.
-Start this keeper, then acknowledge the recovery so writers can seal again.
+recovery fence at epoch <e>. Lost voters <x> and <y> must retire their copies or stay retired;
+the catalog fences the stream for 2 keeper(s), and this command waited 33000 ms for their leases
+to end. Start this keeper, then acknowledge the recovery so writers can seal again.
 ```
 
 A second run prints `was already recovered`. Repeat for each affected stream
@@ -162,6 +202,18 @@ depends on exclusive ownership of the enrolled identity and a registry that
 never rolls back. Discard any copied credentials for those identities. To
 add capacity, use freshly provisioned keeper UUIDs and keys, then update
 inventory as described in [add and remove a keeper](add-drain-remove-keeper.md).
+
+## Lost keepers that never stopped
+
+A lost keeper that never stopped, cut off from the survivor but still
+holding a quorum of the old configuration with the other lost keeper, is
+deposed by its lease once the cluster enforces leases: it cannot renew while
+cut off from the catalog, and if it reaches the catalog it learns that the
+stream is fenced for it. Either way it stops leading and serving before the
+recovered configuration serves; the recovery's wait guarantees that order.
+When it reconnects it retires its copy. Without enforced leases only its
+retirement (step 4) closes that gap. A keeper on new media under its old ID
+gets a new epoch from the catalog and takes copies only through staging.
 
 ## Catalog and joint quorum loss
 

@@ -7,6 +7,7 @@ mod compaction;
 mod drain;
 mod incarnation;
 mod ingress;
+mod lease;
 mod liveness;
 mod offload;
 mod park;
@@ -107,6 +108,14 @@ fn default_async_append() -> bool {
     true
 }
 
+fn default_lease_millis() -> u64 {
+    30_000
+}
+
+fn default_lease_drift_margin_millis() -> u64 {
+    3_000
+}
+
 fn default_admin_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 9100))
 }
@@ -162,6 +171,21 @@ pub struct Config {
     /// its single-keeper entries once.
     #[serde(default)]
     pub catalog_voters: Option<[uuid::Uuid; 3]>,
+    /// Lets `catalog` alone hold the catalog, without `catalog_voters`. For
+    /// development only: production replicates the catalog, which is the
+    /// configuration authority every keeper's lease depends on.
+    #[serde(default)]
+    pub allow_single_catalog: bool,
+    /// How long a liveness lease from the catalog lasts. A keeper whose
+    /// lease lapses stops leading and serving, and an operator recovery
+    /// waits this long plus the drift margin before the recovered
+    /// configuration serves. Configure the same value on every keeper.
+    #[serde(default = "default_lease_millis")]
+    pub lease_millis: u64,
+    /// How much shorter than the lease its holder counts it, to cover clock
+    /// rate drift between keepers. Positive and below half the lease.
+    #[serde(default = "default_lease_drift_margin_millis")]
+    pub lease_drift_margin_millis: u64,
     pub readers: Vec<String>,
     pub writers: Vec<String>,
     pub administrators: Vec<String>,
@@ -385,6 +409,17 @@ impl Config {
         if placement.is_retired(self.catalog) {
             return Err(invalid("catalog keeper cannot be retired"));
         }
+        if !super::decisions::lease_bounds(self.lease_millis, self.lease_drift_margin_millis) {
+            return Err(invalid(
+                "lease_drift_margin_millis must be positive and below half of lease_millis",
+            ));
+        }
+        if self.catalog_voters.is_none() && !self.allow_single_catalog {
+            return Err(invalid(
+                "production keepers replicate the catalog: name catalog_voters, or set \
+                 allow_single_catalog for a development cluster",
+            ));
+        }
         if let Some(voters) = &self.catalog_voters
             && (!placement.structural_roster(voters) || !voters.contains(&self.catalog))
         {
@@ -479,6 +514,16 @@ impl Config {
             Ok::<_, io::Error>((disk, recognition, mode))
         })
         .await??;
+        let lease = Arc::new(lease::Lease::open(
+            &self.data,
+            Duration::from_millis(self.lease_millis),
+            Duration::from_millis(self.lease_drift_margin_millis),
+        )?);
+        let catalog = if id == self.catalog && self.catalog_voters.is_none() {
+            Some(Catalog::new(disk.clone(), &self.data)?)
+        } else {
+            None
+        };
         let raft_config = openraft::Config {
             heartbeat_interval: 100,
             election_timeout_min: 450,
@@ -531,8 +576,8 @@ impl Config {
             timed,
             id,
             catalog_id: self.catalog,
-            catalog: (id == self.catalog && self.catalog_voters.is_none())
-                .then(|| Catalog::new(disk.clone())),
+            catalog,
+            lease,
             catalog_stream: self
                 .catalog_voters
                 .map(|voters| catalog_stream::CatalogStream::new(voters, self.catalog)),
@@ -614,6 +659,8 @@ pub(super) struct Engine {
     catalog_id: uuid::Uuid,
     catalog: Option<Catalog>,
     catalog_stream: Option<catalog_stream::CatalogStream>,
+    /// This keeper's liveness lease with the catalog.
+    pub(super) lease: Arc<lease::Lease>,
     pub(super) disk: Disk,
     /// The media incarnations of this keeper and its peers.
     recognition: incarnation::Recognition,
@@ -867,6 +914,11 @@ impl Engine {
             let versioning = self.clone();
             sockets.spawn(async move {
                 versioning.cluster_version_loop().await;
+                Ok(())
+            });
+            let leasing = self.clone();
+            sockets.spawn(async move {
+                leasing.lease_loop().await;
                 Ok(())
             });
             let draining = self.clone();
@@ -1441,6 +1493,11 @@ impl Engine {
                     let (stream, generation) = (genesis.stream, state.generation());
                     Arc::new(move || certification.require(stream, generation))
                 },
+                authority: {
+                    let (lease, stream, state) =
+                        (self.lease.clone(), genesis.stream, state.clone());
+                    Arc::new(move || lease::permits(&lease, stream, &state))
+                },
             },
             store,
             state.clone(),
@@ -1526,6 +1583,18 @@ impl Engine {
             {
                 Ok(None)
             }
+            // A keeper renews only its own lease, fences only itself once it
+            // decommissioned, and only a recovery's survivor recovers.
+            Identity::Keeper(id)
+                if matches!(request, Request::RenewLease { keeper, .. }
+                    if keeper.as_u128() == *id)
+                    || matches!(request, Request::FenceKeeper(keeper)
+                    if keeper.as_u128() == *id)
+                    || matches!(request, Request::RecoverStream { stage, .. }
+                    if stage.survivor().map(|survivor| survivor.as_u128()) == Some(*id)) =>
+            {
+                Ok(None)
+            }
             Identity::Keeper(_) => Err(denied()),
             Identity::Client(identity) => {
                 let uri = identity.as_str();
@@ -1560,7 +1629,9 @@ impl Engine {
                     Request::Stage(_)
                     | Request::StageReplica { .. }
                     | Request::InstallReplica { .. }
-                    | Request::StageRecovered { .. } => false,
+                    | Request::StageRecovered { .. }
+                    | Request::RenewLease { .. }
+                    | Request::RecoverStream { .. } => false,
                     _ => admin,
                 };
                 if allowed {
@@ -1710,14 +1781,38 @@ impl Engine {
                     self.catalog()?.finalize_version(target).await
                 }
             }
+            // A renewal from another catalog voter is not forwarded again,
+            // so two followers with stale leaders cannot pass it around.
+            Request::RenewLease { .. } if self.catalog_stream.is_some() => {
+                let forward = !matches!(identity, Identity::Keeper(id)
+                    if self.catalog_voter(uuid::Uuid::from_u128(*id)));
+                self.serve_renewal(request, forward).await
+            }
             Request::Claim(_)
             | Request::Locate(_)
             | Request::Stage(_)
             | Request::Staging(_)
             | Request::ClusterVersion
+            | Request::FenceKeeper(_)
+            | Request::RecoverStream { .. }
                 if self.catalog_stream.is_some() =>
             {
                 self.serve_catalog_stream(request).await
+            }
+            Request::RenewLease {
+                keeper,
+                incarnation,
+                epoch,
+            } => {
+                self.catalog()?
+                    .renew(keeper, incarnation, epoch, self.lease_millis())
+                    .await
+            }
+            Request::FenceKeeper(keeper) => self.catalog()?.fence(keeper).await,
+            Request::RecoverStream { stage, dead } => {
+                self.catalog()?
+                    .recover(stage, dead, &self.placement, self.recovery_wait_ms()?)
+                    .await
             }
             Request::Claim(genesis) => self.catalog()?.claim(genesis, &self.placement).await,
             Request::Locate(stream) => self.catalog()?.locate(stream),
@@ -1784,6 +1879,14 @@ impl Engine {
                     });
                 }
                 group.require_healthy()?;
+                // Leading and serving need authority: a valid liveness lease,
+                // the current epoch and no catalog fence (`keeper/lease.rs`).
+                // It is checked again before the answer leaves, so nothing
+                // read or acknowledged after a lapse is served.
+                if !self.holds_authority(&group) {
+                    super::metrics::count(&self.lease.gated);
+                    return Ok(failure(JournalError::Unavailable));
+                }
                 if matches!(
                     request,
                     Request::Append { .. }
@@ -2069,6 +2172,10 @@ impl Engine {
                     return Ok(reply);
                 }
                 group.require_healthy()?;
+                if !self.holds_authority(&group) {
+                    super::metrics::count(&self.lease.gated);
+                    return Ok(failure(JournalError::Unavailable));
+                }
                 Ok(reply)
             }
         }
@@ -2226,6 +2333,16 @@ impl Engine {
                 Request::Stage(stage) => catalog.stage(stage, &self.placement).await,
                 Request::Staging(stream) => catalog.staged(stream),
                 Request::ClusterVersion => catalog.cluster_version(),
+                Request::RenewLease {
+                    keeper,
+                    incarnation,
+                    epoch,
+                } => {
+                    catalog
+                        .renew(keeper, incarnation, epoch, self.lease_millis())
+                        .await
+                }
+                Request::FenceKeeper(keeper) => catalog.fence(keeper).await,
                 _ => Err(invalid("invalid internal catalog request")),
             }
         } else {
@@ -2233,6 +2350,27 @@ impl Engine {
                 .call_application(self.catalog_id, request, REQUEST_TIMEOUT)
                 .await
         }
+    }
+
+    /// The lease and drift margin this keeper grants as a catalog keeper,
+    /// in milliseconds.
+    fn lease_millis(&self) -> (u64, u64) {
+        (
+            self.lease.duration().as_millis() as u64,
+            self.lease.margin().as_millis() as u64,
+        )
+    }
+
+    fn recovery_wait_ms(&self) -> io::Result<u64> {
+        let (duration, margin) = self.lease_millis();
+        super::decisions::recovery_wait(duration, margin)
+            .ok_or_else(|| invalid("lease duration overflows"))
+    }
+
+    fn catalog_voter(&self, keeper: uuid::Uuid) -> bool {
+        self.catalog_stream
+            .as_ref()
+            .is_some_and(|catalog| catalog.voters().contains(&keeper))
     }
 
     async fn bootstrap(&self, stream: StreamId) -> io::Result<Reply> {

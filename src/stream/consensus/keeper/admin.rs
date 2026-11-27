@@ -1144,6 +1144,7 @@ impl Engine {
             repair_pending,
             repair_oldest_secs: repair_oldest.as_secs_f64(),
             repair_backoff,
+            lease: self.lease_scrape(),
         };
         (report, scrape)
     }

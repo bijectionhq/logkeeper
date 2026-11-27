@@ -598,6 +598,7 @@ Commands:
   drain --keeper KEEPER [--wait-secs N] | undrain --keeper KEEPER | drain-status --keeper KEEPER
   decommission --keeper KEEPER [--wait-secs N]
   clear-quarantine --keeper KEEPER --stream UUID
+  fence-keeper --keeper KEEPER
   finalize-version
   offload-status --stream UUID
   export-stream --stream UUID --to DIRECTORY
@@ -907,6 +908,15 @@ impl Operator {
                 done(
                     json!({"keeper": keeper, "stream": Uuid::from_u128(stream.0), "cleared": true}),
                 )
+            }
+            "fence-keeper" => {
+                let keeper = keeper_flag(&mut flags, "keeper")?;
+                no_remaining_flags(command, &flags)?;
+                self.client
+                    .fence_keeper(keeper)
+                    .await
+                    .map_err(journal_error)?;
+                done(json!({"keeper": keeper, "fenced": true}))
             }
             "finalize-version" => {
                 no_remaining_flags(command, &flags)?;

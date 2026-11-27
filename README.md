@@ -191,10 +191,20 @@ unavailable catalog leaves genesis unknown and existing groups can use
 authenticated inventory contacts to elect and serve. Creation and unpublished
 staging require the catalog.
 
-By default the configured `catalog` keeper holds the catalog alone. To keep
-creation and staging available through the loss of a keeper, give every
-keeper the same `catalog_voters`: three sorted keeper UUIDs in distinct
-failure domains, one of them the `catalog` keeper.
+Production keepers replicate the catalog: give every keeper the same
+`catalog_voters`, three sorted keeper UUIDs in distinct failure domains, one
+of them the `catalog` keeper. The catalog is the configuration authority
+whose leases every keeper needs to lead (see "Lost voters that never
+stopped" below), so a keeper refuses to start with the `catalog` keeper
+alone unless its configuration sets `allow_single_catalog: true`, for
+development clusters. The design calls for five catalog voters across
+failure domains; the catalog takes three until streams take five voters.
+
+`lease_millis` (30000) is how long a keeper's liveness lease lasts and
+`lease_drift_margin_millis` (3000) how much shorter its holder counts it;
+the margin must be positive and below half the lease. Configure both alike
+on every keeper: a holder never counts a longer lease than the catalog
+keeper that granted it is configured with.
 
 ```json
   "catalog": "00000000-0000-0000-0000-000000000004",
@@ -220,8 +230,10 @@ read the stream but not write, seal, trim or delete it.
   a read barrier, catches up, and appends.
 - **Outages:** with one catalog voter down, creation, staging and repair
   continue. With two down, creation and unpublished staging fail with
-  `Unavailable`; existing streams keep serving, and a cold client still finds
-  a stream that the remaining voter has applied.
+  `Unavailable`, and a cold client still finds a stream that the remaining
+  voter has applied. Once leases are finalized, existing streams keep
+  serving only for the lease: after it every keeper stops leading until the
+  catalog regains its majority.
 - **Compaction:** when more than 1024 records follow the last checkpoint,
   the leader appends a checkpoint of every entry and trims the records
   before it.
@@ -311,8 +323,9 @@ the surviving keeper. Then run on the survivor's host:
 
 ```sh
 cargo run --locked --features stream -- keeper recover-stream --config keeper.json \
-  --stream STREAM_UUID --acknowledge-data-loss --lost LOST1_UUID,LOST2_UUID \
-  --fence-proof LOST1_UUID.fence.json --fence-proof LOST2_UUID.fence.json
+  --stream STREAM_UUID --acknowledge-data-loss [--lost LOST1_UUID[,LOST2_UUID]] \
+  [--fence-proof LOST1_UUID.fence.json --fence-proof LOST2_UUID.fence.json] \
+  [--with KEEPER_UUID,KEEPER_UUID]
 ```
 
 The command takes the keeper's media lock, so it refuses while the keeper
@@ -325,23 +338,41 @@ saw committed, and asks every other keeper for its status.
   still has a quorum, so restart the survivor instead. It also refuses the
   replicated catalog stream. Without `--acknowledge-data-loss` it prints what
   it would do and refuses.
-- **Lost voters.** `--lost` names the configuration's two other voters.
-  Each `--fence-proof` comes from running `keeper fence-recovery` while the
-  voter is stopped. Recovery validates both signatures and verifies the
-  proofs correspond to the original enrolled media. The preview repeats
-  unanswered health probes to help distinguish a slow voter from a silent one.
+- **Lost voters.** The preview repeats unanswered health probes to help
+  distinguish a slow voter from a silent one. Once the cluster has finalized
+  liveness leases (see below), `--lost` and `--fence-proof` are optional:
+  `--lost` declares the named lost voters dead, which bumps their epochs in
+  the catalog and ends their leases for every stream, and a `--fence-proof`
+  given is still checked. `--lost` is required only for a lost voter that
+  never held a lease, which time cannot depose. Before finalization `--lost`
+  names the configuration's two other voters and each `--fence-proof` comes
+  from running `keeper fence-recovery` while the voter is stopped; recovery
+  validates both signatures and verifies the proofs correspond to the
+  original enrolled media.
 - **Replacements.** `--with` names two keepers. Without it the command takes
   the two best-ranked live, accepting keepers outside the lost configuration,
   in failure domains distinct from each other and from the survivor's. They
   must answer.
-- **Staging.** Each replacement stages an installed, empty copy of the
-  stream. A replacement refuses when its own open replica votes in its
-  configuration, which means the survivor's view is stale. The command then
-  stages the move in the catalog and refuses if the catalog does not record
-  it. Clients see the new voters first among the contacts and replica
-  certification uses the catalog's placement record. A refused replacement
-  leaves the catalog untouched. If recovery stops after the catalog records
-  the move, run it again to completion.
+- **The catalog transaction.** Each replacement stages an installed, empty
+  copy of the stream. A replacement refuses when its own open replica votes
+  in its configuration, which means the survivor's view is stale. The
+  command then commits the recovery in the catalog as one record
+  (`Request::RecoverStream`): it installs the new membership at the next
+  configuration revision, the stream's configuration epoch; it fences the
+  stream for every voter of the old configuration other than the survivor,
+  below that revision; and it bumps the epochs of the voters named with
+  `--lost`. The fence never needs the operator: a voter the recovered
+  membership leaves can only retire its copy. The command refuses if the
+  catalog does not record the recovery. Clients also see the new voters
+  first among the contacts, and replica certification uses the catalog's
+  placement record. A refused replacement leaves the catalog
+  untouched; a recovery that stops after the catalog recorded it leaves the
+  old configuration fenced, so run it again to completion. Before leases are
+  finalized the command only stages the move in the catalog, as before.
+- **The wait.** Once the catalog committed, the command waits a whole lease
+  plus the drift margin (33 s by default) while it holds the survivor's
+  media lock, so the recovered configuration cannot serve until every lease
+  a lost voter held when the recovery committed has ended on its own clock.
 - **The durable step.** One WAL round on the survivor, `Record::Recover`,
   holds a vote for the survivor in a term 2^32 above every term it has seen
   and two entries in that term. `Command::Recover` stages the move and seals
@@ -400,13 +431,58 @@ it nowhere; that check stays open while a keeper does not answer, which
 certification does not. The TLA+ model in `verification/tla` checks
 certification (`RecoveryBothReturn`, `RecoveryBothReturnLiveness`).
 
-**Continuously running lost voters.** The retirement command uses the same
-exclusive media lock as the keeper service. It commits an irreversible
-enrollment marker before emitting a signed proof. A partitioned keeper that
-can still serve its old configuration cannot emit that proof. Restarts and
-fresh initialization under a retired identity are refused as long as the
-original trusted registry is preserved. When an original enrollment cannot
-be attested, restore the original quorum or use an isolated disaster restore.
+**Lost voters that never stopped: the configuration authority.** The
+catalog is the configuration authority. Each keeper holds one liveness
+lease from it, renewed in the background against its keeper record
+`{epoch, incarnation, fenced streams}` (`Request::RenewLease`, answered by
+the catalog's leader after a read barrier; a catalog follower forwards it).
+The holder measures the lease on its own monotonic clock from the moment it
+sent the granted renewal, for `lease_millis` (30 s) less
+`lease_drift_margin_millis` (3 s), so it always counts the lease expired
+before the authority does; the assumption is clock rates within
+margin / lease of each other, not synchronized clocks. A keeper campaigns,
+leads or serves reads and writes for a stream only while its lease is
+valid, its epoch is current and the catalog does not fence its copy
+(`decisions::holds_authority`): its network sends no vote, pre-vote, append
+or snapshot without it, its request path refuses before and again after
+answering, and a leader hands off and steps down. Elections, replication
+and commits never wait on the catalog; the checks are local. So two lost
+voters that keep running, cut off from the survivor and the catalog, still
+form a quorum of the old configuration, but their leases end before the
+recovered configuration serves, whether or not anyone can reach them and
+whether or not the operator was right. The keeper's epoch increments
+whenever its identity is in doubt: a recovery declares it dead, it finished
+decommissioning, it runs on new media under its old ID, or an operator ran
+`logkeeper admin fence-keeper --keeper KEEPER`. A renewal under an older
+epoch is refused, which ends every lease issued under it; the keeper rejoins
+under the new epoch and certifies its copies again. The replicated catalog
+stream is never gated: it is the authority, and operator recovery never
+applies to it.
+
+The cost is availability: a keeper that cannot reach a catalog majority for
+longer than the lease stops leading. Exempting healthy-looking quorums would
+reopen the gap, since a partitioned lost pair is one. Production therefore
+replicates the catalog (`catalog_voters`); a single catalog keeper needs
+`allow_single_catalog: true` and is for development only. Leases are
+advisory until the cluster finalizes `CLUSTER_VERSION_LEASES` (level 6)
+with `logkeeper admin finalize-version`, which needs every keeper to run
+this build; until then the defences above decide alone, and a recovery
+needs `--lost` and a retirement proof for both lost voters. A keeper records its first enforced
+lease in its data directory, so it keeps enforcing after a restart cut off
+from the catalog. Certification, excluded senders, the stale-vote check,
+retire-on-proof, incarnations and decommission stay in place as defence in
+depth. `/metrics` reports the lease (`logkeeper_consensus_lease_*`), and
+the alert rules page on stale renewals and lapses.
+
+**Retired keepers.** Before leases are finalized, and as defence in depth
+after, `keeper fence-recovery` retires a lost voter's enrollment. It uses
+the same exclusive media lock as the keeper service and commits an
+irreversible enrollment marker before emitting a signed proof, so a
+partitioned keeper that can still serve its old configuration cannot emit
+one. Restarts and fresh initialization under a retired identity are refused
+as long as the original trusted registry is preserved. When an original
+enrollment cannot be attested and leases are not finalized, restore the
+original quorum or use an isolated disaster restore.
 
 **Why readers cannot mix histories.** The recovered entries and every later
 entry carry terms above every term in the survivor's history and, with the
@@ -419,7 +495,8 @@ placement proof certified by the recovered membership. So every committed
 record a reader sees after the recovery comes from the survivor's log or was
 appended after the recovery, never from the lost suffix. Writers before the
 recovery are fenced by the recovery epoch, so none of their appends commits
-after it.
+after it. A lost voter that kept running serves only while its lease lasts,
+which ends before the recovered configuration first serves.
 
 ### Continuous offload to object storage
 
@@ -751,7 +828,18 @@ mapping in `ReplyV1::from_reply`, a refusal maps to `Unavailable`, and a
 receiver refuses one arriving on an N-1 connection. The receiver's variant
 bounds come from the enums themselves. A test pins N-1's variant lists and
 checks every variant's tag and classification; it changes only when the
-ALPNs move, and adding a variant needs a sample there. Keeper configuration ignores
+ALPNs move, and adding a variant needs a sample there.
+
+**Cluster levels.** Level 2 gates the formats above; level 3 the atomic
+recovery marker; level 4 immutable streams and scoped writer sessions; level
+5 continuous offload; level 6, `CLUSTER_VERSION_LEASES`, makes liveness
+leases authoritative and lets the catalog write keeper records
+(`CatalogRecord::Authority` and `Keepers`). Finalizing level 6 also needs
+every keeper to advertise the `LEASES` feature bit (bit 8). The authority's requests (`RenewLease`, `FenceKeeper`, `RecoverStream`)
+and replies (`Lease`, `Recovered`) are appended without a new ALPN: an N
+keeper that predates them answers their tags with a typed `Unsupported`, and
+they are refused on N-1 connections, so a mixed cluster keeps today's
+defences and the lease stays advisory until finalization. Keeper configuration ignores
 an unknown top-level field with a warning, so a configuration may name a
 newer release's setting first; nested settings and `JournalConfig` stay
 strict.
@@ -1381,6 +1469,10 @@ rules read the keeper's own gates rather than copying them:
 | `LogkeeperOffloadUploadsFailing` | warning | uploads fail for 10 m | the store's reachability, credentials, bucket policy |
 | `LogkeeperOffloadBackpressure` | critical | appends are refused because offload fell behind | restore the store, or accept the risk with `backpressure: false` |
 | `LogkeeperOffloadCorruptObject` | critical | a fetched object failed its checksum | `docs/runbooks/offload.md` |
+| `LogkeeperLeaseRenewalStale` | warning | an enforced lease was last renewed over 15 s ago | the catalog voters and the path to them; past the lease less the margin the keeper stops leading |
+| `LogkeeperLeaseLapsed` | critical | an enforced lease lapsed for 30 s | the keeper leads and serves nothing; if every keeper fires, restore the catalog's majority |
+| `LogkeeperLeaseRenewalFailures` | warning | over 5 renewals failed in 5 m | `logkeeper_consensus_lease_age_seconds` shows how close the lease is to lapsing |
+| `LogkeeperLeaseRefused` | warning | the catalog refused a renewal | an epoch bump (fence, recovery, new media) or replaced media; replaced media needs a new keeper ID |
 
 `deploy/grafana/logkeeper.json` (data source and keeper variables) charts the
 same families in four rows: overview, writes and commit stages, WAL and disk,

@@ -164,6 +164,29 @@ impl Recognition {
         }
     }
 
+    /// Marks this keeper reused because `source`, an authority other than
+    /// its peers, knows its ID under another incarnation.
+    pub async fn mark_reused(&self, source: &str) {
+        if self.reused() || self.ignoring_reuse() {
+            return;
+        }
+        let mut guard = self.record.lock().await;
+        let (record, unsaved) = &mut *guard;
+        if !record.reused {
+            record.reused = true;
+            *unsaved = true;
+            tracing::error!(
+                source = source,
+                incarnation = %self.own,
+                "{source} knows this keeper under another incarnation: its media was installed \
+                 again under a used keeper ID, so it registers no replica it does not hold; \
+                 give it a new keeper ID"
+            );
+        }
+        self.store(record, unsaved).await;
+        self.reused.store(true, Ordering::Release);
+    }
+
     /// Records `peer`'s incarnation on first contact and marks the peer
     /// when it differs from the first. Whether the record changed.
     fn note(&self, record: &mut Incarnations, peer: Uuid, incarnation: Uuid) -> bool {

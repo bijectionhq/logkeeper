@@ -632,6 +632,26 @@ impl Client {
         }
     }
 
+    /// Bumps `keeper`'s epoch in the catalog, which ends every liveness
+    /// lease it holds: it stops leading and serving until it rejoins under
+    /// the new epoch and certifies its copies again. Administrators only;
+    /// refused as unsupported until leases are finalized.
+    pub async fn fence_keeper(&self, keeper: uuid::Uuid) -> Result<()> {
+        let end = Instant::now() + self.deadline;
+        let attempt = match self.catalog_voters {
+            Some(_) => CATALOG_WRITE_ATTEMPT,
+            None => self.deadline,
+        };
+        match self
+            .ask_catalog(Request::FenceKeeper(keeper), end, attempt)
+            .await?
+        {
+            Reply::Decision(outcome) => unit(decision(outcome)?),
+            Reply::Unsupported(_) => Err(JournalError::Unsupported),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
     /// Clears a durable corruption quarantine marker for `stream` on `keeper`.
     /// Administrators only.
     pub async fn clear_quarantine(&self, keeper: uuid::Uuid, stream: StreamId) -> Result<()> {

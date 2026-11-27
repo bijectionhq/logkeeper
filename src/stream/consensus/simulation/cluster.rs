@@ -229,6 +229,9 @@ impl SimCluster {
                 enrollment: enrollment.clone(),
                 catalog,
                 catalog_voters,
+                allow_single_catalog: true,
+                lease_millis: 2_000,
+                lease_drift_margin_millis: 200,
                 readers: vec![WRITER_A.into(), WRITER_B.into(), READER.into()],
                 writers: vec![WRITER_A.into(), WRITER_B.into()],
                 administrators: vec![WRITER_A.into()],
@@ -536,7 +539,7 @@ impl SimCluster {
         self.stop_graceful(survivor).await;
         let mut req = Recovery::default();
         req.acknowledge_data_loss = true;
-        req.lost = Some(lost);
+        req.lost = Some(lost.to_vec());
         // Explore histories created by older operator recovery tools, whose
         // replaced keepers can still restart as part of the fault schedule.
         req.legacy_unfenced = true;

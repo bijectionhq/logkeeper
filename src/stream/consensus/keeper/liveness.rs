@@ -347,7 +347,10 @@ impl Engine {
         if target > CLUSTER_VERSION_CURRENT {
             return Err(JournalError::Unsupported);
         }
-        let required_feature = if target >= super::super::CLUSTER_VERSION_V5 {
+        // Leases also need every keeper to renew and honour them.
+        let required_feature = if target >= super::super::CLUSTER_VERSION_LEASES {
+            features::LEASES | features::OFFLOAD
+        } else if target >= super::super::CLUSTER_VERSION_V5 {
             features::OFFLOAD
         } else if target >= super::super::CLUSTER_VERSION_V4 {
             features::IMMUTABLE_STREAMS

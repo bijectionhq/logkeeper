@@ -314,7 +314,14 @@ impl ProcessCluster {
                     .insert("catalog_voters".into(), serde_json::json!(cv));
             }
             let cfg_path = dir.path().join(format!("config-{id}.json"));
-            fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+            let mut written = cfg.clone();
+            if initial == Binary::New {
+                written
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("allow_single_catalog".into(), serde_json::json!(true));
+            }
+            fs::write(&cfg_path, serde_json::to_vec_pretty(&written).unwrap()).unwrap();
             configs.insert(id, cfg.clone());
 
             let init = Command::new(initial.path())
@@ -438,6 +445,12 @@ impl ProcessCluster {
                 "admin".into(),
                 serde_json::json!({"listen": self.admin[&id], "mtls": false}),
             );
+            // N refuses a single catalog unless told it is a development
+            // cluster.
+            config
+                .as_object_mut()
+                .unwrap()
+                .insert("allow_single_catalog".into(), serde_json::json!(true));
         }
         fs::write(
             &self.config_paths[&id],
@@ -849,7 +862,10 @@ async fn rolling_restart_one_at_a_time_under_load() {
     })
     .await
     .expect("lk admin finalize-version succeeded");
-    assert!(finalized.contains("cluster_version: 2"), "{finalized}");
+    assert!(
+        finalized.contains(&format!("cluster_version: {CLUSTER_VERSION_CURRENT}")),
+        "{finalized}"
+    );
     assert_eq!(client.cluster_version().await, Ok(CLUSTER_VERSION_CURRENT));
 
     // Once finalized, keepers write N formats, here an LKRWAL05 checkpoint,

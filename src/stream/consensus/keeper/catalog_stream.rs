@@ -45,7 +45,8 @@ use uuid::Uuid;
 
 use super::{Engine, Group, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
 use crate::stream::consensus::{
-    Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, catalog, decode, encode,
+    Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, authority, catalog, decisions, decode,
+    encode,
     state::{Command, Outcome},
     storage::CatalogEntry,
 };
@@ -69,6 +70,8 @@ const TEND_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const TEND_INTERVAL: Duration = Duration::from_millis(100);
 const ATTEMPT: Duration = Duration::from_secs(2);
+/// Keeper records per checkpoint record.
+const KEEPERS_PER_RECORD: usize = 64;
 
 #[derive(Serialize, Deserialize)]
 enum CatalogRecord {
@@ -84,6 +87,12 @@ enum CatalogRecord {
     /// appended once finalized past V1, so N-1 binaries can read the catalog
     /// stream before finalize.
     ClusterVersion(u32),
+    /// A change to the configuration authority's keeper records. Only
+    /// appended once `CLUSTER_VERSION_LEASES` is finalized.
+    Authority(authority::Change),
+    /// Keeper records as they stood when a checkpoint was taken; each
+    /// replaces the records it holds. Only appended with leases finalized.
+    Keepers(Vec<(Uuid, authority::KeeperRecord)>),
 }
 
 struct Fold {
@@ -93,6 +102,7 @@ struct Fold {
     tail: u64,
     seeded: bool,
     cluster_version: u32,
+    authority: authority::Records,
 }
 
 impl Fold {
@@ -109,7 +119,12 @@ impl Fold {
             // Only compaction trims, and it follows the seed.
             seeded: next > Lsn(1),
             cluster_version: crate::stream::consensus::CLUSTER_VERSION_V1,
+            authority: authority::Records::default(),
         }
+    }
+
+    fn enforced(&self) -> bool {
+        self.cluster_version >= crate::stream::consensus::CLUSTER_VERSION_LEASES
     }
 
     /// Applies one record by the single-keeper catalog's rules: the first
@@ -148,6 +163,19 @@ impl Fold {
             CatalogRecord::ClusterVersion(version) => {
                 self.cluster_version = self.cluster_version.max(version);
             }
+            CatalogRecord::Authority(change) => {
+                // A recovery installs its membership with its fence.
+                if let authority::Change::Recover { stage, .. } = &change
+                    && let Some(entry) = self.entries.get_mut(&stage.stream)
+                {
+                    entry.staged = Some(stage.clone());
+                    entry.contacts = entry.ordered_contacts().into_iter().collect();
+                }
+                self.authority.apply(&change);
+            }
+            CatalogRecord::Keepers(records) => {
+                self.authority.keepers.extend(records);
+            }
         }
     }
 }
@@ -180,6 +208,13 @@ impl CatalogStream {
             sealed: AtomicBool::new(false),
             leader: parking_lot::Mutex::default(),
         }
+    }
+}
+
+impl CatalogStream {
+    /// The configured voters of the catalog stream.
+    pub fn voters(&self) -> [Uuid; 3] {
+        self.genesis.voters
     }
 }
 
@@ -250,8 +285,29 @@ impl Engine {
                 self.finalize_version_replicated(catalog, &group, target)
                     .await
             }
+            Request::RenewLease { .. } => {
+                self.renew_replicated(catalog, &group, request, true).await
+            }
+            Request::FenceKeeper(keeper) => {
+                self.authority_write(catalog, &group, authority::Change::Fence { keeper })
+                    .await
+            }
+            Request::RecoverStream { stage, dead } => {
+                self.recover_replicated(catalog, &group, stage, dead).await
+            }
             _ => Err(invalid("invalid catalog request")),
         }
+    }
+
+    /// Answers a lease renewal from this keeper's catalog replica.
+    pub(super) async fn serve_renewal(&self, request: Request, forward: bool) -> io::Result<Reply> {
+        self.require_media()?;
+        let catalog = self.catalog_stream()?;
+        let Some(group) = self.catalog_group().await else {
+            return Ok(Reply::Leader(None));
+        };
+        self.renew_replicated(catalog, &group, request, forward)
+            .await
     }
 
     /// Asks the replicated catalog, starting with this keeper when it holds
@@ -598,6 +654,191 @@ impl Engine {
         })
     }
 
+    /// Answers a lease renewal on the leader after a read barrier, so a
+    /// renewal answered after a recovery or a fence committed sees it. The
+    /// first enforced renewal of a keeper or media incarnation enrolls it.
+    /// A follower forwards the renewal to its leader once.
+    pub(super) async fn renew_replicated(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+        request: Request,
+        forward: bool,
+    ) -> io::Result<Reply> {
+        let Request::RenewLease {
+            keeper,
+            incarnation,
+            epoch,
+        } = request.clone()
+        else {
+            return Err(invalid("invalid lease renewal"));
+        };
+        let metrics = group.raft.metrics().borrow_watched().clone();
+        if metrics.state != ServerState::Leader {
+            let leader = metrics.current_leader.map(Uuid::from_u128);
+            return Ok(match leader {
+                Some(leader) if forward && leader != self.id => self
+                    .rpc
+                    .call_application(leader, request, ATTEMPT)
+                    .await
+                    .unwrap_or_else(|_| Reply::Leader(Some(leader))),
+                leader => Reply::Leader(leader),
+            });
+        }
+        let lease = (
+            self.lease.duration().as_millis() as u64,
+            self.lease.margin().as_millis() as u64,
+        );
+        let enrollment = {
+            let (fold, _) = match self.leading(catalog, group, false).await {
+                Ok(view) => view,
+                Err(reply) => return Ok(reply),
+            };
+            if !fold.seeded {
+                return Ok(failure(JournalError::Unavailable));
+            }
+            let enforced = fold.enforced();
+            match fold.authority.enrollment(keeper, incarnation) {
+                Some(change) if enforced => change,
+                _ => {
+                    return Ok(Reply::Lease(fold.authority.grant(
+                        keeper,
+                        incarnation,
+                        epoch,
+                        enforced,
+                        lease.0,
+                        lease.1,
+                    )));
+                }
+            }
+        };
+        match self.authority_write(catalog, group, enrollment).await? {
+            Reply::Decision(Outcome::Unit) => (),
+            reply => return Ok(reply),
+        }
+        let (fold, _) = self
+            .caught_up(catalog, group)
+            .await
+            .map_err(|_| invalid("enrolled keeper record is not readable"))?;
+        Ok(Reply::Lease(fold.authority.grant(
+            keeper,
+            incarnation,
+            epoch,
+            fold.enforced(),
+            lease.0,
+            lease.1,
+        )))
+    }
+
+    /// Appends one change to the authority's records on the leader. Refused
+    /// as unsupported until leases are finalized.
+    async fn authority_write(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+        change: authority::Change,
+    ) -> io::Result<Reply> {
+        let _writing = catalog.writing.lock().await;
+        let record = CatalogRecord::Authority(change);
+        for _ in 0..3 {
+            let (fold, head) = match self.leading(catalog, group, true).await {
+                Ok(view) => view,
+                Err(reply) => return Ok(reply),
+            };
+            if !fold.seeded {
+                return Ok(failure(JournalError::Unavailable));
+            }
+            if !fold.enforced() {
+                return Ok(failure(JournalError::Unsupported));
+            }
+            // A recovery checks its source against the committed move at the
+            // head it appends after, as a stage does.
+            if let CatalogRecord::Authority(authority::Change::Recover { stage, .. }) = &record
+                && !fold
+                    .entries
+                    .get(&stage.stream)
+                    .is_some_and(|entry| catalog::admits_stage(entry, stage))
+            {
+                return Ok(catalog::stage_conflict());
+            }
+            drop(fold);
+            match self.append_catalog(group, head, &record).await {
+                Ok(_) => return Ok(Reply::Decision(Outcome::Unit)),
+                Err(reply) if is_conflict(&reply) => continue,
+                Err(reply) => return Ok(reply),
+            }
+        }
+        Ok(failure(JournalError::Unavailable))
+    }
+
+    /// An operator recovery's catalog transaction, in one record: the
+    /// recovered membership, the fence of every voter it leaves, and the
+    /// epoch bumps of the keepers the operator declared dead.
+    async fn recover_replicated(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+        stage: Stage,
+        dead: Vec<Uuid>,
+    ) -> io::Result<Reply> {
+        let fenced = authority::fenced_by(&stage);
+        if stage.stream == STREAM
+            || !stage.recovery()
+            || !self.placement.stage(&stage)
+            || dead.iter().any(|keeper| !fenced.contains(keeper))
+        {
+            return Err(invalid("invalid recovery stage"));
+        }
+        let wait_ms = decisions::recovery_wait(
+            self.lease.duration().as_millis() as u64,
+            self.lease.margin().as_millis() as u64,
+        )
+        .ok_or_else(|| invalid("lease duration overflows"))?;
+        let done = {
+            let (fold, _) = match self.leading(catalog, group, false).await {
+                Ok(view) => view,
+                Err(reply) => return Ok(reply),
+            };
+            if !fold.seeded {
+                return Ok(failure(JournalError::Unavailable));
+            }
+            let entry = fold
+                .entries
+                .get(&stage.stream)
+                .ok_or_else(|| invalid("missing catalog entry"))?;
+            if !catalog::admits_stage(entry, &stage) {
+                return Ok(catalog::stage_conflict());
+            }
+            entry.staged.as_ref() == Some(&stage) && fold.authority.recovered(&stage)
+        };
+        if !done {
+            match self
+                .authority_write(
+                    catalog,
+                    group,
+                    authority::Change::Recover {
+                        stage: stage.clone(),
+                        dead,
+                    },
+                )
+                .await?
+            {
+                Reply::Decision(Outcome::Unit) => (),
+                reply => return Ok(reply),
+            }
+        }
+        let (fold, _) = self
+            .caught_up(catalog, group)
+            .await
+            .map_err(|_| invalid("recovered catalog entry is not readable"))?;
+        Ok(Reply::Recovered(authority::Recovered {
+            unleased: fold.authority.unleased(&fenced),
+            fenced,
+            wait_ms,
+            written: !done,
+        }))
+    }
+
     /// Registers and initializes this keeper's catalog replica, then seeds
     /// and compacts the catalog while this keeper leads it.
     pub(super) async fn tend_catalog_stream(&self) {
@@ -689,8 +930,15 @@ impl Engine {
         } else if fold.tail > COMPACT_AFTER {
             let entries = fold.entries.values().cloned().collect();
             let cluster_version = fold.cluster_version;
+            let keepers = fold
+                .authority
+                .keepers
+                .iter()
+                .map(|(keeper, record)| (*keeper, record.clone()))
+                .collect::<Vec<_>>();
             drop(fold);
-            self.compact(&group, head, entries, cluster_version).await;
+            self.compact(&group, head, entries, keepers, cluster_version)
+                .await;
         }
     }
 
@@ -744,10 +992,17 @@ impl Engine {
         group: &Group,
         head: Lsn,
         entries: Vec<CatalogEntry>,
+        keepers: Vec<(Uuid, authority::KeeperRecord)>,
         cluster_version: u32,
     ) {
         let compacted = async {
-            let (first, last) = self.checkpoint(group, head, entries).await?;
+            let (first, mut last) = self.checkpoint(group, head, entries).await?;
+            // Keeper records exist only once leases are finalized.
+            for part in keepers.chunks(KEEPERS_PER_RECORD) {
+                last = self
+                    .append_catalog(group, last, &CatalogRecord::Keepers(part.to_vec()))
+                    .await?;
+            }
             if cluster_version > crate::stream::consensus::CLUSTER_VERSION_V1 {
                 self.append_catalog(group, last, &CatalogRecord::ClusterVersion(cluster_version))
                     .await?;

@@ -217,6 +217,9 @@ impl LocalCluster {
                 enrollment: enrollment.clone(),
                 catalog,
                 catalog_voters,
+                allow_single_catalog: true,
+                lease_millis: 30_000,
+                lease_drift_margin_millis: 3_000,
                 readers: principals.clone(),
                 writers: principals.clone(),
                 administrators: principals.clone(),
@@ -383,6 +386,9 @@ impl LocalCluster {
             "enrollment": config.enrollment,
             "catalog": config.catalog,
             "catalog_voters": config.catalog_voters,
+            "allow_single_catalog": config.allow_single_catalog,
+            "lease_millis": config.lease_millis,
+            "lease_drift_margin_millis": config.lease_drift_margin_millis,
             "readers": config.readers,
             "writers": config.writers,
             "administrators": config.administrators,
@@ -459,7 +465,7 @@ impl LocalCluster {
         // Built by assignment: the struct has a field private to unit tests.
         let mut recovery = Recovery::default();
         recovery.acknowledge_data_loss = true;
-        recovery.lost = Some(lost);
+        recovery.lost = Some(lost.to_vec());
         recovery.fence_proofs = fence_proofs;
         self.configs
             .get(&survivor)

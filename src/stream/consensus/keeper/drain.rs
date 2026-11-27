@@ -70,6 +70,8 @@ pub(super) struct OperatorMode {
     pub(super) changed: tokio::sync::Notify,
     /// Serializes new replica ownership with a change of operator mode.
     placement: tokio::sync::RwLock<()>,
+    /// Whether this process bumped its epoch after decommissioning.
+    pub(super) fenced: AtomicBool,
 }
 
 impl OperatorMode {
@@ -92,6 +94,7 @@ impl OperatorMode {
             mark: parking_lot::Mutex::new(mark),
             changed: tokio::sync::Notify::new(),
             placement: tokio::sync::RwLock::new(()),
+            fenced: AtomicBool::new(false),
         })
     }
 
@@ -181,9 +184,13 @@ pub(super) struct DrainReport {
 
 impl Engine {
     /// Applies the mode to one open group: a draining keeper starts no
-    /// election of its own. It still votes, so the other voters elect.
+    /// election of its own, nor does one without authority over the stream
+    /// (`keeper/lease.rs`). It still votes, so the other voters elect.
     pub(super) fn apply_mode(&self, group: &Group) {
-        group.raft.runtime_config().elect(!self.mode.draining());
+        group
+            .raft
+            .runtime_config()
+            .elect(!self.mode.draining() && self.holds_authority(group));
     }
 
     /// Records `mode` durably and applies it to every open group.
@@ -224,6 +231,7 @@ impl Engine {
         loop {
             if self.mode.draining() {
                 self.evict_leaders(DRAIN_INTERVAL, true).await;
+                self.fence_decommissioned().await;
                 tokio::select! {
                     () = self.stop.cancelled() => return,
                     () = tokio::time::sleep(DRAIN_INTERVAL) => (),
@@ -234,6 +242,33 @@ impl Engine {
                     () = self.mode.changed.notified() => (),
                 }
             }
+        }
+    }
+
+    /// Once a decommissioning keeper holds nothing, bumps its epoch in the
+    /// catalog: whatever authority it held before is in doubt, and every
+    /// lease issued under the old epoch ends. Done once per process.
+    async fn fence_decommissioned(&self) {
+        if self.mode.mode() != Mode::Decommissioning
+            || self.mode.fenced.load(Ordering::Acquire)
+            || !self.drain_report().await.safe_to_delete
+        {
+            return;
+        }
+        match self
+            .catalog_request(super::Request::FenceKeeper(self.id))
+            .await
+        {
+            Ok(super::Reply::Decision(crate::stream::consensus::state::Outcome::Unit)) => {
+                tracing::info!(keeper = %self.id, "decommissioned: bumped this keeper's epoch");
+                self.mode.fenced.store(true, Ordering::Release);
+            }
+            // Before leases are finalized there is no epoch to bump.
+            Ok(super::Reply::Decision(crate::stream::consensus::state::Outcome::Refused(
+                journal_contract::JournalError::Unsupported,
+            )))
+            | Ok(super::Reply::Unsupported(_)) => self.mode.fenced.store(true, Ordering::Release),
+            _ => (),
         }
     }
 

@@ -70,9 +70,23 @@ impl Certification {
         self.fenced.read().get(&stream) == Some(&generation)
     }
 
+    /// Fences `generation` of `stream`, as the catalog's keeper record did.
+    pub fn fence(&self, stream: StreamId, generation: u64) {
+        self.certified.write().remove(&stream);
+        self.fenced.write().insert(stream, generation);
+    }
+
     /// Clears a fence that a certified placement proof contradicted.
     pub fn unfence(&self, stream: StreamId) {
         self.fenced.write().remove(&stream);
+    }
+
+    /// Forgets every certification and fence, as a bump of this keeper's
+    /// epoch requires: each copy certifies again.
+    pub fn reset(&self) {
+        self.certified.write().clear();
+        self.fenced.write().clear();
+        self.wake.notify_one();
     }
 
     /// Forgets a copy that closed for good.

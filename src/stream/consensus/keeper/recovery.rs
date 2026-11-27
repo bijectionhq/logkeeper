@@ -3,18 +3,32 @@
 //! `logkeeper keeper recover-stream` runs on the stopped survivor's data
 //! directory under its media lock. It replays the survivor's whole log,
 //! asks every other keeper for its status, and refuses unless the operator
-//! acknowledges the data loss, names the two lost voters, and supplies an
-//! authenticated retirement proof for each recorded media incarnation. The
-//! proofs attest permanent enrollment retirement while each keeper was
-//! offline. It then stages an installed empty copy on each of two
-//! replacements, stages the move in the catalog, and writes one WAL round on the
+//! acknowledges the data loss and no other voter answers with a healthy
+//! replica. A voter that does not answer is asked again for longer before
+//! it counts as lost: a slow keeper is not a lost one. It then stages an
+//! installed empty copy on each of two replacements and commits the
+//! recovery as one catalog transaction: it bumps the stream's configuration
+//! epoch (its revision) and installs the new membership, fences the stream
+//! for every voter it leaves, and bumps the epochs of the keepers the
+//! operator declared dead with `--lost`. The fence never needs the operator:
+//! a voter the recovered membership leaves can only retire its copy. Once
+//! the transaction commits, the command waits a whole liveness lease plus
+//! the drift margin, so every lease a lost voter held has ended on its own
+//! clock, whether or not it still runs and whether or not anyone can reach
+//! it (`keeper/lease.rs`). Only then does it write one WAL round on the
 //! survivor: a vote for itself in a term above every term it has seen, and
-//! two entries in that term. The first,
-//! `Command::Recover`, stages the move and fences the stream under the
-//! recovery writer at an epoch above every applied epoch. The second is the
-//! membership of the survivor and the two replacements. When the survivor
-//! starts, its replacements elect it with their empty logs, and it
-//! replicates its log, which commits the recovery.
+//! two entries in that term. The first, `Command::Recover`, stages the move
+//! and fences the stream under the recovery writer at an epoch above every
+//! applied epoch. The second is the membership of the survivor and the two
+//! replacements. When the survivor starts, its replacements elect it with
+//! their empty logs, and it replicates its log, which commits the recovery.
+//!
+//! A lost voter that never held a lease cannot be deposed by time, so the
+//! operator must name it with `--lost`, the statement that it is down or
+//! fenced. Until the cluster finalizes leases, the recovery stages the move
+//! in the catalog as before and needs both lost voters named and proven
+//! retired with signed retirement proofs (`keeper/retirement.rs`). After,
+//! retirement proofs are optional defence in depth, checked when given.
 
 use std::{collections::BTreeMap, io, time::Duration};
 
@@ -27,6 +41,7 @@ use super::{Config, FenceProof, Reply, Request, catalog_stream, failure};
 use crate::stream::{
     consensus::{
         Entry, LogId, Stage, Vote, assignment,
+        authority::Recovered,
         catalog::{self, Catalog},
         decisions, invalid,
         network::{Lane, Rpc},
@@ -51,13 +66,16 @@ pub struct Recovery {
     /// The operator accepts that acknowledged records only the lost voters
     /// held are gone.
     pub acknowledge_data_loss: bool,
-    /// The two voters whose keeper identities were retired. They must be the
-    /// survivor's configuration's other two voters.
-    pub lost: Option<[Uuid; 2]>,
+    /// Voters of the lost configuration the operator declares dead: their
+    /// epochs are bumped, which ends every lease they hold for every
+    /// stream. Optional once leases are finalized, except for a lost voter
+    /// that never held a lease. Before that it must name both.
+    pub lost: Option<Vec<Uuid>>,
     /// The two replacement keepers. Without them the best-ranked live,
     /// accepting keepers in free failure domains are chosen.
     pub with: Option<[Uuid; 2]>,
-    /// One retirement proof per lost voter.
+    /// One retirement proof per lost voter. Required until leases are
+    /// finalized; optional after, and checked when given.
     pub fence_proofs: Vec<FenceProof>,
     /// Exercises protocol compatibility with pre-retirement recovery
     /// histories whose former voters could still boot.
@@ -66,6 +84,9 @@ pub struct Recovery {
     /// Fails the durable WAL round: 2 before its boundary, 3 after it.
     #[cfg(test)]
     pub(super) interrupt: Option<u8>,
+    /// Keepers the command cannot reach, as if partitioned from it.
+    #[cfg(test)]
+    pub(super) unreachable: Vec<Uuid>,
 }
 
 /// What a recovery did, or found already done.
@@ -83,6 +104,12 @@ pub struct RecoveryReport {
     /// The offload store's part, when the keeper offloads: the exact loss
     /// point and whether the store's longer run replaced the survivor's.
     pub offload: Option<super::offload::OffloadRecovery>,
+    /// The keepers the catalog fences the stream for; empty when leases are
+    /// not finalized and the catalog only staged the move.
+    pub fenced: Vec<Uuid>,
+    /// How long the command waited after the catalog committed, so the
+    /// lost voters' leases ended before the recovered configuration serves.
+    pub waited: Duration,
 }
 
 impl std::fmt::Display for RecoveryReport {
@@ -90,9 +117,10 @@ impl std::fmt::Display for RecoveryReport {
         write!(
             f,
             "stream {:032x} {} from this keeper at head {}: voters {} {} {}, revision {}, \
-             term {}, recovery fence at epoch {}. Lost voters {} and {} must remain retired. \
-             Start this keeper, then acknowledge the recovery \
-             so writers can seal again.",
+             term {}, recovery fence at epoch {}. Lost voters {} and {} must retire their \
+             copies or stay retired; the catalog fences the stream for {} keeper(s), and \
+             this command waited {} ms for their leases to end. Start this keeper, then \
+             acknowledge the recovery so writers can seal again.",
             self.stream.0,
             if self.written {
                 "recovered"
@@ -108,6 +136,8 @@ impl std::fmt::Display for RecoveryReport {
             self.epoch.0,
             self.lost[0],
             self.lost[1],
+            self.fenced.len(),
+            self.waited.as_millis(),
         )?;
         if let Some(offload) = &self.offload {
             write!(f, " {offload}")?;
@@ -197,6 +227,8 @@ impl Config {
                 term: point.vote_term,
                 written: false,
                 offload: None,
+                fenced: Vec::new(),
+                waited: Duration::ZERO,
             };
             crate::stream::consensus::logging::audit_recovery(
                 self.keeper,
@@ -220,13 +252,27 @@ impl Config {
         }
         let old = configuration.voters;
         let others = lost(&old, self.keeper);
-        let named = recovery.lost.is_some_and(|mut lost| {
-            lost.sort_unstable();
-            lost == others
-        });
-        if recovery.acknowledge_data_loss && !named {
+        let mut dead = recovery.lost.clone().unwrap_or_default();
+        dead.sort_unstable();
+        dead.dedup();
+        if dead.iter().any(|keeper| !others.contains(keeper)) {
             return Err(invalid(format!(
-                "refused: name both lost voters with --lost {},{}",
+                "refused: --lost may name only the lost voters {} and {}",
+                others[0], others[1],
+            )));
+        }
+        let named = dead == others;
+        // Once leases are finalized, the catalog's fence and the wait for
+        // the lost voters' leases depose them whether or not they still run,
+        // so naming them and proving their retirement become optional.
+        // Before that, nothing deposes a lost voter that still runs: the
+        // operator names both and proves both retired, as before.
+        let leases = self.catalog_version(disk, rpc).await >= super::super::CLUSTER_VERSION_LEASES;
+        if recovery.acknowledge_data_loss && !leases && !named {
+            return Err(invalid(format!(
+                "refused: the cluster has not finalized liveness leases, so nothing deposes \
+                 a lost voter that still runs. Retire both lost keepers, then name them with \
+                 --lost {},{} and a --fence-proof for each",
                 others[0], others[1],
             )));
         }
@@ -236,11 +282,20 @@ impl Config {
         let legacy_unfenced = recovery.legacy_unfenced;
         #[cfg(not(test))]
         let legacy_unfenced = false;
-        if recovery.acknowledge_data_loss && !legacy_unfenced {
+        if recovery.acknowledge_data_loss
+            && !legacy_unfenced
+            && (!leases || !recovery.fence_proofs.is_empty())
+        {
             self.verify_recovery_fences(others, &recovery.fence_proofs)?;
         }
 
+        #[cfg(test)]
+        let unreachable = &recovery.unreachable;
         let ask = |keeper: Uuid, limit: Duration| async move {
+            #[cfg(test)]
+            if unreachable.contains(&keeper) {
+                return (keeper, None);
+            }
             let status = timeout(
                 limit,
                 rpc.call_application(keeper, Request::KeeperStatus(stream), limit),
@@ -370,24 +425,25 @@ impl Config {
         let epoch = decisions::recovery_epoch(restored_epoch.0)
             .map(Epoch)
             .ok_or_else(|| invalid("the stream's epoch is exhausted"))?;
-        if !decisions::allows_recovery(
-            recovery.acknowledge_data_loss && named,
-            survivor_votes,
-            healthy,
-        ) {
+        if !decisions::allows_recovery(recovery.acknowledge_data_loss, survivor_votes, healthy) {
             return Err(invalid(format!(
                 "refused without --acknowledge-data-loss. This would make this keeper's copy of \
                  stream {:032x} (head {}) the only history: records only {} and {} held are \
                  lost. The voters would become {target:?} at revision {}, term {term}, with \
                  seals refused under a recovery fence at epoch {} until an administrator \
-                 acknowledges the recovery. To proceed, permanently retire both lost keepers \
-                 and add --acknowledge-data-loss --lost {},{} and a --fence-proof for each",
+                 acknowledges the recovery. Once leases are finalized the catalog fences the \
+                 stream for {} and {}, and the recovered configuration serves only once their \
+                 leases have ended. To proceed, add --acknowledge-data-loss; add --lost {},{} \
+                 to declare either dead, which ends its leases for every stream. Before leases \
+                 are finalized, also retire both and add a --fence-proof for each",
                 stream.0,
                 head.0,
                 others[0],
                 others[1],
                 stage.source + 1,
                 epoch.0,
+                others[0],
+                others[1],
                 others[0],
                 others[1],
             )));
@@ -414,20 +470,63 @@ impl Config {
             }
         }
 
-        // The catalog records the move before the survivor writes it. Its
-        // latest staged move is what fences the lost configuration: a lost
-        // voter that restarts asks for it before it campaigns or serves a
-        // read (`keeper/certify.rs`). So the recovery refuses without the
-        // catalog. It stages after the replacements, so a refused
-        // replacement leaves the old configuration unfenced.
-        self.stage_in_catalog(disk, rpc, placement, &stage)
+        // The catalog commits the recovery before the survivor writes it:
+        // the recovered membership, the fence of every voter it leaves, and
+        // the epochs of the dead. A lost voter that restarts asks for the
+        // staged move before it campaigns or serves a read
+        // (`keeper/certify.rs`), and one that kept running loses its lease.
+        // So the recovery refuses without the catalog. It commits after the
+        // replacements, so a refused replacement leaves the old
+        // configuration unfenced.
+        let (fenced, wait) = match self
+            .recover_in_catalog(disk, rpc, placement, &stage, &dead)
             .await
             .map_err(|error| {
                 invalid(format!(
                     "refused: the catalog must record the recovery so the lost voters stay \
                      fenced: {error}"
                 ))
-            })?;
+            })? {
+            Some(recovered) => {
+                let unnamed = recovered
+                    .unleased
+                    .iter()
+                    .filter(|keeper| !dead.contains(keeper))
+                    .copied()
+                    .collect::<Vec<_>>();
+                if !unnamed.is_empty() {
+                    return Err(invalid(format!(
+                        "refused: {unnamed:?} never held a liveness lease, so no lease of theirs \
+                         ends by time. The catalog fences them, but confirm that each is down \
+                         or fenced, then name it with --lost and run this again"
+                    )));
+                }
+                (recovered.fenced, Duration::from_millis(recovered.wait_ms))
+            }
+            None if named => {
+                self.stage_in_catalog(disk, rpc, placement, &stage)
+                    .await
+                    .map_err(|error| {
+                        invalid(format!(
+                            "refused: the catalog must record the recovery so the lost voters \
+                             stay fenced: {error}"
+                        ))
+                    })?;
+                (Vec::new(), Duration::ZERO)
+            }
+            None => {
+                return Err(invalid(format!(
+                    "refused: the cluster has not finalized liveness leases, so nothing deposes \
+                     a lost voter that still runs. Confirm that {} and {} are down or fenced, \
+                     then name them with --lost {},{}",
+                    others[0], others[1], others[0], others[1],
+                )));
+            }
+        };
+        // The recovered configuration serves only after every lease the lost
+        // voters held when the catalog committed has ended on their clocks.
+        // The survivor stays stopped under this command's media lock.
+        tokio::time::sleep(wait).await;
         let log_id = |index| {
             LogId::new(
                 openraft::vote::leader_id_std::CommittedLeaderId::new(term),
@@ -491,6 +590,8 @@ impl Config {
             term,
             written: true,
             offload: offload.map(|(_, report)| report),
+            fenced,
+            waited: wait,
         };
         crate::stream::consensus::logging::audit_recovery(
             self.keeper,
@@ -533,6 +634,105 @@ impl Config {
             })
     }
 
+    /// The catalog's finalized cluster feature level, or V1 when no catalog
+    /// keeper answers.
+    async fn catalog_version(&self, disk: &Disk, rpc: &Rpc) -> u32 {
+        let reply = match self.catalog_voters {
+            None if self.catalog == self.keeper => {
+                return disk.cluster_version();
+            }
+            None => rpc
+                .call_application(self.catalog, Request::ClusterVersion, STATUS_TIMEOUT)
+                .await
+                .ok(),
+            Some(voters) => {
+                let order = voters
+                    .into_iter()
+                    .chain(self.keepers.keys().copied())
+                    .filter(|voter| *voter != self.keeper)
+                    .collect::<Vec<_>>();
+                catalog::ask(&order, Instant::now() + STAGING_TIMEOUT, |voter| {
+                    rpc.call_application(voter, Request::ClusterVersion, STATUS_TIMEOUT)
+                })
+                .await
+                .map(|(_, reply)| reply)
+            }
+        };
+        match reply {
+            Some(Reply::ClusterVersion(version)) => version,
+            _ => crate::stream::consensus::CLUSTER_VERSION_V1,
+        }
+    }
+
+    /// Commits the recovery as a catalog transaction. `None` when the
+    /// catalog cannot: leases are not finalized, or it runs an older build.
+    async fn recover_in_catalog(
+        &self,
+        disk: &Disk,
+        rpc: &Rpc,
+        placement: &Placement,
+        stage: &Stage,
+        dead: &[Uuid],
+    ) -> io::Result<Option<Recovered>> {
+        let request = Request::RecoverStream {
+            stage: stage.clone(),
+            dead: dead.to_vec(),
+        };
+        let reply = match self.catalog_voters {
+            None if self.catalog == self.keeper => {
+                let wait =
+                    decisions::recovery_wait(self.lease_millis, self.lease_drift_margin_millis)
+                        .ok_or_else(|| invalid("lease duration overflows"))?;
+                Catalog::new(disk.clone(), &self.data)?
+                    .recover(stage.clone(), dead.to_vec(), placement, wait)
+                    .await?
+            }
+            None => {
+                rpc.call_application(self.catalog, request, STAGING_TIMEOUT)
+                    .await?
+            }
+            Some(voters) => {
+                let order = voters
+                    .into_iter()
+                    .chain(self.keepers.keys().copied())
+                    .filter(|voter| *voter != self.keeper)
+                    .collect::<Vec<_>>();
+                catalog::ask(&order, Instant::now() + STAGING_TIMEOUT, |voter| {
+                    rpc.call_application(voter, request.clone(), STATUS_TIMEOUT)
+                })
+                .await
+                .map_or_else(
+                    || failure(journal_contract::JournalError::Unavailable),
+                    |(_, reply)| reply,
+                )
+            }
+        };
+        match reply {
+            Reply::Recovered(mut recovered) => {
+                // Never wait less than this keeper's own lease would need.
+                let own =
+                    decisions::recovery_wait(self.lease_millis, self.lease_drift_margin_millis)
+                        .unwrap_or(u64::MAX);
+                recovered.wait_ms = recovered.wait_ms.max(own);
+                Ok(Some(recovered))
+            }
+            Reply::Unsupported(_)
+            | Reply::Decision(Outcome::Refused(journal_contract::JournalError::Unsupported)) => {
+                Ok(None)
+            }
+            Reply::Decision(Outcome::Refused(journal_contract::JournalError::Conflict {
+                ..
+            })) => Err(invalid(
+                "the catalog records a pending move or a different source configuration; \
+                 restore the original quorum and resolve membership first",
+            )),
+            Reply::Decision(Outcome::Refused(error)) => Err(invalid(format!(
+                "the catalog refused the recovery: {error:?}"
+            ))),
+            _ => Err(invalid("the catalog did not record the recovery")),
+        }
+    }
+
     async fn stage_in_catalog(
         &self,
         disk: &Disk,
@@ -542,7 +742,7 @@ impl Config {
     ) -> io::Result<()> {
         let reply = match self.catalog_voters {
             None if self.catalog == self.keeper => {
-                Catalog::new(disk.clone())
+                Catalog::new(disk.clone(), &self.data)?
                     .stage(stage.clone(), placement)
                     .await?
             }

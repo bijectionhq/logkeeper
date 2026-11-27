@@ -230,6 +230,42 @@ groups:
           summary: "{{ $value }} proposals on {{ $labels.instance }} have been in flight for over a second"
           description: "Writes are stuck. logkeeper_consensus_commit_stage_seconds shows which stage holds them."
 
+      - alert: LogkeeperLeaseRenewalStale
+        expr: logkeeper_consensus_lease_enforced == 1 and logkeeper_consensus_lease_age_seconds > 15
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} last renewed its liveness lease {{ $value | humanizeDuration }} ago"
+          description: "The keeper cannot reach a catalog majority. Past the lease (lease_millis, 30 s by default) less the drift margin it stops leading and serving every stream. Check the catalog voters and the path to them."
+
+      - alert: LogkeeperLeaseLapsed
+        expr: logkeeper_consensus_lease_enforced == 1 and logkeeper_consensus_lease_valid == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} holds no liveness lease and serves nothing"
+          description: "Without a valid lease from the catalog the keeper campaigns, leads and serves no stream. If every keeper fires, the catalog has lost its majority: restore catalog voters first."
+
+      - alert: LogkeeperLeaseRenewalFailures
+        expr: increase(logkeeper_consensus_lease_renewal_failures_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} lease renewals from {{ $labels.instance }} failed in 5 minutes"
+          description: "Renewals time out or find no catalog leader. The lease still holds while logkeeper_consensus_lease_age_seconds stays low; a growing age leads to LogkeeperLeaseLapsed."
+
+      - alert: LogkeeperLeaseRefused
+        expr: increase(logkeeper_consensus_lease_renewal_refusals_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The catalog refused {{ $labels.instance }}'s lease renewal"
+          description: "The keeper's epoch was bumped (an operator fence, a recovery that declared it dead, or new media under its ID), or another media incarnation replaced it. A bumped keeper rejoins and certifies its copies again; replaced media never renews: give it a new keeper ID."
+
   - name: logkeeper-offload
     rules:
       - alert: LogkeeperOffloadLagging
