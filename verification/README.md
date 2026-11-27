@@ -152,3 +152,67 @@ reference laws and checks that each declared production mutation fails at
 its expected function. The [ordered admission area](verus/ordered_admission/README.md)
 covers checked debits, trim pinning, receipt expiry and exact fingerprint
 comparison.
+
+## Consensus keeper additions
+
+The keeper-hosted consensus streams (`src/stream/consensus/`) run OpenRaft
+0.10.1, whose election, log matching and commit rules are trusted. Four
+checks cover what Logkeeper adds on top of Raft, each at its own level.
+
+- **Verus, local decisions.** The [consensus admission area](verus/consensus_admission/README.md)
+  verifies the shipped functions in `decisions.rs` that the keeper calls on
+  its real paths: admission budgets, lanes and batch cuts, the restart vote,
+  recovery admission, term and fence epoch, the excluded-sender rule, vote
+  eligibility, keeper incarnations, park eligibility and the parked answer,
+  silent voters, stale learners, repair order, slots and backoff, the load
+  ceiling and the two-live-voters rule, leader preference, retirement on a
+  proof, the seal under the recovery fence, and WAL boundary-slot selection
+  and rollback detection. Each law has negative controls, production
+  mutations the proof must reject.
+- **Lean, abstract protocol.** [`Logkeeper.ConsensusAdditions`](lean/Logkeeper/ConsensusAdditions.lean)
+  proves state-machine theorems for any number of steps:
+  [operator recovery](lean/Logkeeper/ConsensusAdditions/RecoveryFence.lean),
+  [parking](lean/Logkeeper/ConsensusAdditions/Parking.lean),
+  [retirement on a proof](lean/Logkeeper/ConsensusAdditions/RetireOnProof.lean)
+  and the [catalog's first claim](lean/Logkeeper/ConsensusAdditions/CatalogClaim.lean).
+  Run `python3 run_consensus_additions.py` in `verification/lean` for the
+  theorems, their axioms and ten negative controls.
+- **TLA+, bounded model checking.** The Antigravity branch `protocol-model`
+  holds `verification/tla/LogkeeperProtocol.tla` and `CatalogStream.tla`,
+  checked exhaustively by TLC within small bounds (3 to 5 keepers, terms up
+  to 2, logs up to 7 entries). Its `MODEL-REPORT.md` lists the
+  configurations and the counterexamples, with ignored Rust reproductions
+  in `src/stream/consensus/keeper/tests/model_counterexamples.rs`.
+- **The fault harness, randomized execution.** The Antigravity branch
+  `fault-harness` adds `src/stream/consensus/simulation/`: seeded faults
+  against seven in-process keepers, with linearizability, durability,
+  fencing and cross-voter convergence checked on each history.
+
+| Property | Verus (local) | Lean (abstract) | TLA+ (bounded) | Fault harness |
+| --- | --- | --- | --- | --- |
+| Admission budgets, lanes, batch cuts, restart vote | `consensus_admission` | `LeaderJournal.PeerBudget`, `Headroom`, `RestartRead` | Not modeled | Not targeted |
+| Recovery admission, term `T' = max + 2^32`, fence epoch | `allows_recovery`, `recovery_term`, `recovery_epoch` | `recovery_term_outranks` | `OperatorRecoverFrom` | `recover-stream` plans |
+| Excluded senders keep lost voters below `T'` | `excludes_sender` | `lost_replicas_stay_below_the_recovery_term`, `survivor_excludes_lost_voters` | `RecoverySingleReturn*` | Recovery plans |
+| No reader mixes the lost suffix with the recovered log | Not local | `barrier_reads_never_mix`, `recovered_replicas_never_mix` (one returning voter, reads behind a quorum barrier) | `NoMixedHistory`: passes with one returning voter without a snapshot; CE-3 and CE-4 | Linearizability before recovery |
+| Residual risk: both lost voters return | Not local | `two_returning_voters_serve_the_lost_suffix` (witness) | CE-4, safety and liveness | Not covered |
+| Residual risk: an unconfirmed local read on a returning voter | Not local | `unconfirmed_local_read_serves_the_lost_suffix` (witness) | CE-3 | Not covered |
+| Recovery fence refuses seals until acknowledged | `seal_step` | `fence_refuses_every_seal` | Recovery fence and `AcknowledgeRecovery` | Writer fencing invariant |
+| Park eligibility and the parked answer | `accepts_park`, `idle`, `leader_parks`, `parked_answer` | `accept_requires_exact_log`, `parked_answers_preserve_state` | `RaftParkSafety` | Park and wake plans |
+| Parking and unparking preserve the committed log | Not local | `parking_preserves_durable_state`, `parking_preserves_the_committed_log` | `CommittedEntriesPreserved` | Durability invariant |
+| Retirement never removes a copy a quorum needs | `orphaned`, `certifies_exclusion` | `retirement_keeps_every_quorum`, `retirement_refuses_a_restaged_copy` | `RetiredNeverVotes`, `RepairReplaceSafety` | Replace plans |
+| Repair queue order, slots, backoff, silent voters, stale learners | `repair_key`, `starts_repair`, `backoff`, `silent`, `learner_stale` | Not modeled | `ParkedRepairLiveness`; CE-2 (aborted replacement wedges repair) | Repair under faults |
+| Placement load ceiling, two live voters, leader preference | `load_ceiling`, `roomy`, `repair_allowed`, `hands_off` | `LeaderJournal.Placement` (domains) | Not modeled | `prefer_leader` plans |
+| Empty voter from a reused keeper ID | `reincarnated`, `registers`, `counts_grant` | Not modeled | `AmnesiaWipe` (calibration CE-1) | `allow_wipe` mode |
+| Catalog first claim wins, one genesis per stream | Not local | `first_claim_wins`, `at_most_one_genesis_per_stream`, `replicas_agree`, `checkpoint_then_suffix` | `CatalogSafety` (`AtMostOneGenesisPerStream`) | Replicated catalog outages |
+| WAL boundary slot and rollback detection | `newest_slot`, `checkpoint_within`, `replay_step` | Studies 25 and 26 (`SelectionFence`) | Not modeled | WAL crash cuts |
+
+The Lean recovery theorem is exact about its scope. While at most one lost
+voter runs, a read or commit that a quorum of the serving replica's
+configuration confirmed never observes the lost suffix, on any interleaving
+of lost and recovered work, provided the lost voters run fewer than `2^32`
+elections past the survivor's highest term and a recovered leader holds the
+committed recovery entries (Raft's leader completeness). Two returning lost
+voters form a quorum of the old configuration and serve the lost suffix
+until one of them contacts a recovered voter. A single returning voter
+cannot commit or pass a barrier, but a read it answers from its own applied
+state, without a barrier, can serve the lost suffix (TLA+ CE-3).
