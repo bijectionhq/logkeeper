@@ -1190,8 +1190,8 @@ impl Engine {
 
     /// Closes the groups of deleted streams once the deletion is applied on
     /// this replica, replicated to every voter it can see, and older than
-    /// `DELETED_GROUP_GRACE`. Later requests are answered `Deleted` without
-    /// reopening the group.
+    /// `DELETED_GROUP_GRACE`. The terminal snapshot preserves the applied
+    /// deletion across restart. Client requests never reopen a closed copy.
     async fn close_settled_deletions(&self) {
         let groups = self
             .groups
@@ -1202,6 +1202,7 @@ impl Engine {
             .collect::<Vec<_>>();
         let now = Instant::now();
         let mut closing = Vec::new();
+        let mut snapshotting = Vec::new();
         {
             let mut seen = self.deletions.lock();
             seen.retain(|stream, _| groups.iter().any(|(open, _)| open == stream));
@@ -1213,13 +1214,25 @@ impl Engine {
                 let since = *seen.entry(*stream).or_insert(now);
                 if now.duration_since(since) >= DELETED_GROUP_GRACE
                     && now.duration_since(*group.used.lock()) >= DELETED_GROUP_GRACE
+                    && let Some(applied) = group.raft.metrics().borrow_watched().last_applied
                 {
-                    closing.push(*stream);
+                    if group
+                        .state
+                        .covered()
+                        .is_some_and(|covered| covered == applied)
+                    {
+                        closing.push(*stream);
+                    } else {
+                        snapshotting.push(group.clone());
+                    }
                 }
             }
             for stream in &closing {
                 seen.remove(stream);
             }
+        }
+        for group in snapshotting {
+            let _ = group.raft.trigger().snapshot().await;
         }
         for stream in closing {
             // Marked first: a request that races the close is refused

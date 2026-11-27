@@ -508,7 +508,14 @@ impl Engine {
         if !self.placement.structural_genesis(&genesis) {
             return Err(invalid("invalid consensus sender or stream genesis"));
         }
-        if self.deleted.read().contains(&genesis.stream) {
+        let deleted = self.deleted.read().contains(&genesis.stream);
+        // A voter that crashed before saving its terminal snapshot may
+        // need a new leader to learn the committed deletion. Reopen a
+        // tombstone for an election, while leaving it closed to heartbeats.
+        if deleted
+            && !matches!(&request, PeerRequest::Vote(_) | PeerRequest::PreVote(_))
+            && !self.groups.lock().await.contains_key(&genesis.stream)
+        {
             return Err(invalid("stream is deleted"));
         }
         if self.is_quarantined(genesis.stream) {

@@ -3,6 +3,58 @@
 
 use super::*;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_voter_learns_deletion_from_closed_tombstones() {
+    let mut cluster = Cluster::start().await;
+    let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
+    let stream = StreamId(223);
+    let client = cluster.client(&cluster.credentials);
+    client.create(stream, voters, 4096).await.unwrap();
+    let leader = cluster.leader_after_head(&client, stream).await;
+    let victim = voters.into_iter().find(|id| *id != leader).unwrap();
+    let follower = cluster.group(victim, stream).await;
+    assert!(follower.state.covered().is_none());
+    follower.state.pause_snapshots(true);
+    client.delete(stream).await.unwrap();
+    timeout(WAIT, async {
+        while !voters
+            .iter()
+            .filter(|&&id| id != victim)
+            .all(|id| cluster.running[id].engine.deleted.read().contains(&stream))
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the other voters retain terminal snapshots and close");
+    let stopped = cluster.running.remove(&victim).unwrap();
+    stopped.engine.crash.store(true, Ordering::Release);
+    drop(follower);
+    stopped.stop().await;
+
+    cluster.restart(victim).await;
+    timeout(WAIT, async {
+        let engine = &cluster.running[&victim].engine;
+        loop {
+            if engine.deleted.read().contains(&stream)
+                || engine
+                    .groups
+                    .lock()
+                    .await
+                    .get(&stream)
+                    .is_some_and(|group| group.state.is_deleted())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the restarted voter learns the committed deletion");
+    assert_eq!(client.head(stream).await, Err(JournalError::Deleted));
+    cluster.stop_all().await;
+}
+
 /// A keeper restarted past its stream limit skips a stream, and the reaper
 /// must not delete the snapshot objects and segments only that stream's
 /// unopened replica references.
