@@ -215,6 +215,8 @@ impl LocalCluster {
                     listen: free_port()?,
                     mtls: false,
                     cluster: Default::default(),
+                    metrics_readers: Vec::new(),
+                    probe_listen: None,
                 }),
             };
             provision(&config)?;

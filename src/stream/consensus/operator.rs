@@ -31,6 +31,7 @@ pub(super) const ADMIN_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const DRAIN_POLL: Duration = Duration::from_secs(1);
 /// How long `drain` waits for leadership to move by default.
 const DRAIN_WAIT: Duration = Duration::from_secs(120);
+const DECOMMISSION_WAIT: Duration = Duration::from_secs(600);
 /// The largest admin answer kept; a `/metrics` page is far smaller.
 const MAX_RESPONSE: u64 = 64 * 1024 * 1024;
 
@@ -577,6 +578,7 @@ Commands:
   retire --stream UUID --keeper KEEPER
   problems
   drain --keeper KEEPER [--wait-secs N] | undrain --keeper KEEPER | drain-status --keeper KEEPER
+  decommission --keeper KEEPER [--wait-secs N]
   clear-quarantine --keeper KEEPER --stream UUID
   finalize-version";
 
@@ -631,6 +633,13 @@ fn wait_flag(flags: &mut BTreeMap<&str, &str>, default: Duration) -> io::Result<
             .map_err(|error| invalid(format!("--wait-secs: {error}"))),
         None => Ok(default),
     }
+}
+
+fn no_remaining_flags(command: &str, flags: &BTreeMap<&str, &str>) -> io::Result<()> {
+    if let Some(flag) = flags.keys().next() {
+        return Err(invalid(format!("unknown flag --{flag} for {command}")));
+    }
+    Ok(())
 }
 
 fn parse_uuid(raw: &str) -> io::Result<Uuid> {
@@ -741,44 +750,63 @@ impl Operator {
                     json: false,
                 }
             }
-            "drain" => {
+            "drain" | "decommission" => {
                 let keeper = keeper_flag(&mut flags, "keeper")?;
-                let wait = wait_flag(&mut flags, DRAIN_WAIT)?;
-                self.set_mode(keeper, "/drain").await?;
-                let (report, drained) = self
-                    .wait_for(keeper, "drained", wait, |report| {
-                        eprintln!("keeper {keeper}: leads {} streams", report["led"]);
+                let (path, condition, default) = if command == "drain" {
+                    ("/drain", "drained", DRAIN_WAIT)
+                } else {
+                    ("/decommission", "safe_to_delete", DECOMMISSION_WAIT)
+                };
+                let wait = wait_flag(&mut flags, default)?;
+                no_remaining_flags(command, &flags)?;
+                self.set_mode(keeper, path).await?;
+                let (report, finished) = self
+                    .wait_for(keeper, condition, wait, |report| {
+                        eprintln!(
+                            "keeper {keeper}: leads {} streams, hosts {} replicas",
+                            report["led"], report["hosted"]
+                        );
                     })
                     .await?;
                 AdminOutcome {
                     report,
-                    ok: drained,
+                    ok: finished,
                     json: false,
                 }
             }
             "undrain" => {
                 let keeper = keeper_flag(&mut flags, "keeper")?;
+                no_remaining_flags(command, &flags)?;
                 done(self.set_mode(keeper, "/undrain").await?)
             }
             "drain-status" => {
                 let keeper = keeper_flag(&mut flags, "keeper")?;
                 done(self.drain_status(keeper).await?)
             }
-            "clear-quarantine" | "finalize-version" => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "`{command}` needs the keeper support from the upgrades work \
-                         (durable quarantine and the cluster feature level), which this \
-                         build does not have"
-                    ),
-                ));
+            "clear-quarantine" => {
+                let keeper = keeper_flag(&mut flags, "keeper")?;
+                let stream = stream_flag(&mut flags)?;
+                no_remaining_flags(command, &flags)?;
+                self.client
+                    .clear_quarantine(keeper, stream)
+                    .await
+                    .map_err(journal_error)?;
+                done(
+                    json!({"keeper": keeper, "stream": Uuid::from_u128(stream.0), "cleared": true}),
+                )
+            }
+            "finalize-version" => {
+                no_remaining_flags(command, &flags)?;
+                let version = self
+                    .client
+                    .finalize_version(super::CLUSTER_VERSION_CURRENT)
+                    .await
+                    .map_err(journal_error)?;
+                done(json!({"cluster_version": version}))
             }
             _ => return Err(invalid(ADMIN_USAGE)),
         };
-        if let Some(flag) = flags.keys().next() {
-            return Err(invalid(format!("unknown flag --{flag} for {command}")));
-        }
+        no_remaining_flags(command, &flags)?;
         Ok(outcome)
     }
 }

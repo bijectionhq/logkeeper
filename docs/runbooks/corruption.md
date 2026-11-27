@@ -8,10 +8,9 @@ The keeper detects damage at three levels:
 | WAL frames, segments, the boundary or the keeper identity | Refuses to start ("missing or foreign installed keeper media", a boundary or chain mismatch), or the WAL thread fails and `/live` turns 503 | `journalctl -u $UNIT`; `/live` |
 | A stalled disk (WAL round over 20 s) | The watchdog ends the process | Exit in `journalctl`; systemd stops restarting after 5 failures in 10 minutes |
 
-On `main`, snapshot quarantine survives restarts. With **[upgrades]**, every
-checksum failure quarantines durably in `<registry>/<uuid>.quarantine.json`
-and returns a typed `Corrupted` error. The replica then reports itself
-unhealthy, so its stream's leader replaces it after `repair_after_secs`.
+A replica checksum failure persists a marker in
+`<registry>/<uuid>.quarantine.json` and returns a typed `Corrupted` error.
+The replica reports itself unhealthy, so its stream's leader can replace it.
 
 **First rule:** a corrupted replica is not needed while its stream's other two
 voters are healthy. Check that before doing anything else. If they are not
@@ -49,17 +48,15 @@ keeper runs.
 
 Choose one of the following:
 
-- **Let repair replace it** (preferred). Leave the keeper running. With
-  **[upgrades]**, the quarantined replica reports unhealthy, and the leader
+- **Let repair replace it** (preferred). Leave the keeper running. The quarantined
+  replica reports unhealthy, and the leader
   replaces it with a voter on another keeper after `repair_after_secs`. That
   needs a free domain with an accepting keeper, so six keepers or more. Then
   clear the marker, so the keeper stops protecting the old copy's objects:
 
   ```sh
-  sudo systemctl stop $UNIT
-  lk keeper clear-quarantine --config $CONFIG --stream STREAM_UUID
-  # cleared quarantine marker for stream <id>
-  sudo systemctl start $UNIT
+  lk admin clear-quarantine --config operator.json --keeper "$KEEPER" --stream STREAM_UUID
+  # cleared: true
   ```
 
   The removed copy then retires itself.
@@ -74,7 +71,7 @@ Choose one of the following:
 have repaired its data. Clearing only removes the marker. It does not fix
 bytes.
 
-## 2b. Damaged WAL span: salvage [upgrades]
+## 2b. Salvage a damaged WAL span
 
 ```sh
 lk keeper salvage --config $CONFIG
@@ -93,9 +90,6 @@ disk](replace-disk.md)),** if any of these holds:
 - `preserved` is 0;
 - the boundary or the identity is damaged;
 - the device reports I/O errors (`dmesg`, SMART).
-
-Without **[upgrades]**: there is no salvage. A keeper whose WAL fails
-verification cannot boot. Replace it as a lost disk with a new UUID.
 
 ## 3. After any corruption
 

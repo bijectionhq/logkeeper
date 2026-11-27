@@ -979,7 +979,7 @@ pub(super) struct Rpc {
 }
 
 struct Connections {
-    tls: TlsConnector,
+    tls: Connector,
     keepers: Keepers,
     idle: Mutex<HashMap<uuid::Uuid, Vec<(Channel, WireVersion)>>>,
     /// In-flight snapshot chunks per target on the bulk lane.
@@ -996,6 +996,11 @@ struct Connections {
     /// Fault filter `(sender_id, filter)` for fault-injection tests.
     #[cfg(test)]
     filter: Mutex<Option<(uuid::Uuid, TransportFilter)>>,
+}
+
+enum Connector {
+    Fixed(TlsConnector),
+    Keeper(super::keeper::tls::Tls),
 }
 
 const PEER_IN_FLIGHT: usize = 16;
@@ -1042,8 +1047,12 @@ impl Connections {
         target: uuid::Uuid,
         address: &std::net::SocketAddr,
     ) -> io::Result<(Channel, WireVersion)> {
+        let tls = match &self.tls {
+            Connector::Fixed(tls) => tls.clone(),
+            Connector::Keeper(tls) => tls.client(self.lane),
+        };
         let (peer, negotiated, channel) =
-            connect_protocols(&self.tls, &address.to_string(), self.lane.alpns()).await?;
+            connect_protocols(&tls, &address.to_string(), self.lane.alpns()).await?;
         if peer.0 != target.as_u128() {
             return Err(invalid("keeper certificate does not match route"));
         }
@@ -1249,6 +1258,14 @@ impl PeerChannel {
 
 impl Rpc {
     pub fn new(tls: TlsConnector, keepers: Keepers, lane: Lane) -> Self {
+        Self::with_connector(Connector::Fixed(tls), keepers, lane)
+    }
+
+    pub(super) fn keeper(tls: super::keeper::tls::Tls, keepers: Keepers, lane: Lane) -> Self {
+        Self::with_connector(Connector::Keeper(tls), keepers, lane)
+    }
+
+    fn with_connector(tls: Connector, keepers: Keepers, lane: Lane) -> Self {
         Self {
             inner: Arc::new(Connections {
                 tls,

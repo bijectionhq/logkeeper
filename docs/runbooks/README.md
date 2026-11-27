@@ -1,9 +1,7 @@
 # Consensus keeper runbooks
 
 Each runbook gives the exact commands, the output to expect, and when to stop.
-Read [the deployment guide](../deployment.md) first. Steps marked
-**[upgrades]** depend on features that are still landing (see the guide's
-introduction), and each says what to do without them.
+Read [the deployment guide](../deployment.md) first.
 
 | Runbook | When |
 | --- | --- |

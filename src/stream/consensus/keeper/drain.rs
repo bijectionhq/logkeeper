@@ -68,6 +68,8 @@ pub(super) struct OperatorMode {
     mark: parking_lot::Mutex<Mark>,
     /// Wakes the drain loop when the mode changes.
     pub(super) changed: tokio::sync::Notify,
+    /// Serializes new replica ownership with a change of operator mode.
+    placement: tokio::sync::RwLock<()>,
 }
 
 impl OperatorMode {
@@ -89,6 +91,7 @@ impl OperatorMode {
             flag: Arc::new(AtomicBool::new(mark.mode.draining())),
             mark: parking_lot::Mutex::new(mark),
             changed: tokio::sync::Notify::new(),
+            placement: tokio::sync::RwLock::new(()),
         })
     }
 
@@ -101,7 +104,18 @@ impl OperatorMode {
     }
 
     pub(super) fn draining(&self) -> bool {
-        self.mode().draining()
+        self.flag.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn admit_placement(&self) -> io::Result<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let guard = self.placement.read().await;
+        if self.draining() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "keeper is draining",
+            ));
+        }
+        Ok(guard)
     }
 
     /// Durably records `mode` before it takes effect, and returns the mark
@@ -141,7 +155,7 @@ impl OperatorMode {
         *mark = next;
         self.flag.store(mode.draining(), Ordering::Release);
         drop(mark);
-        self.changed.notify_waiters();
+        self.changed.notify_one();
         Ok(next)
     }
 }
@@ -161,8 +175,7 @@ pub(super) struct DrainReport {
     pub voter_streams: usize,
     /// True once a draining keeper leads nothing.
     pub drained: bool,
-    /// True once a decommissioning keeper votes in no stream: its data may
-    /// be deleted after it stops.
+    /// True once a decommissioning keeper has retired all its live copies.
     pub safe_to_delete: bool,
 }
 
@@ -175,34 +188,42 @@ impl Engine {
 
     /// Records `mode` durably and applies it to every open group.
     pub(super) async fn set_mode(self: &Arc<Self>, mode: Mode, actor: &str) -> io::Result<Mark> {
-        let engine = self.clone();
-        let mark = tokio::task::spawn_blocking(move || engine.mode.set(mode))
-            .await
-            .map_err(io::Error::other)??;
-        let groups = self
-            .groups
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for group in &groups {
-            self.apply_mode(group);
+        if mode == Mode::Decommissioning && self.catalog.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "replicate the single-keeper catalog before decommissioning its keeper",
+            ));
         }
-        tracing::info!(
-            keeper = %self.id,
-            mode = ?mark.mode,
-            "operator mode changed"
-        );
-        crate::stream::consensus::logging::audit_mode(self.id, actor, mark.mode.name());
-        Ok(mark)
+        let engine = self.clone();
+        let actor = actor.to_owned();
+        // Finish applying the durable change even if the requesting client
+        // disconnects while the mark is being synced.
+        tokio::spawn(async move {
+            let _placement = engine.mode.placement.write().await;
+            let persistent = engine.clone();
+            let mark = tokio::task::spawn_blocking(move || persistent.mode.set(mode))
+                .await
+                .map_err(io::Error::other)??;
+            for group in engine.groups.lock().await.values() {
+                engine.apply_mode(group);
+            }
+            tracing::info!(
+                keeper = %engine.id,
+                mode = ?mark.mode,
+                "operator mode changed"
+            );
+            crate::stream::consensus::logging::audit_mode(engine.id, &actor, mark.mode.name());
+            Ok(mark)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     /// While draining, hands off every led stream each `DRAIN_INTERVAL`.
     pub(super) async fn drain_loop(self: &Arc<Self>) {
         loop {
             if self.mode.draining() {
-                self.shed_leadership_when_full().await;
+                self.evict_leaders(DRAIN_INTERVAL, true).await;
                 tokio::select! {
                     () = self.stop.cancelled() => return,
                     () = tokio::time::sleep(DRAIN_INTERVAL) => (),
@@ -211,14 +232,13 @@ impl Engine {
                 tokio::select! {
                     () = self.stop.cancelled() => return,
                     () = self.mode.changed.notified() => (),
-                    // A missed notification costs at most one interval.
-                    () = tokio::time::sleep(DRAIN_INTERVAL * 10) => (),
                 }
             }
         }
     }
 
     pub(super) async fn drain_report(&self) -> DrainReport {
+        let _placement = self.mode.placement.read().await;
         let mark = self.mode.mark();
         let groups = self.groups.lock().await.clone();
         let led = groups
@@ -263,7 +283,11 @@ impl Engine {
             hosted,
             voter_streams,
             drained: mark.mode.draining() && led == 0,
-            safe_to_delete: mark.mode == Mode::Decommissioning && led == 0 && voter_streams == 0,
+            safe_to_delete: mark.mode == Mode::Decommissioning
+                && self.replayed.load(Ordering::Acquire)
+                && self.disk.healthy()
+                && led == 0
+                && hosted == 0,
         }
     }
 }

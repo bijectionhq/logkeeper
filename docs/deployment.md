@@ -5,20 +5,9 @@ mainly as the journal of RTDB Multi. The [README](../README.md) documents the
 APIs. This guide covers hosts, disks, identities, bring-up and day-two
 operations. The [runbooks](runbooks/) hold the step-by-step procedures.
 
-Every command, flag and config field here exists in the code on `main`. The
-admin endpoints (`/live`, `/ready`, `/safe-to-stop`, `/problems`, `/status`,
-`/metrics`), the offline `keeper inspect`, `verify`, `dump-segment` and
-`debug-bundle` tools and structured logs are on `main`; the procedures assume
-a keeper built with them. One group of features is still landing and marked
-inline:
-
-- **[upgrades]**: N-1 wire negotiation, the cluster write-version gate,
-  `keeper salvage`, durable quarantine with `keeper clear-quarantine`, and
-  `retired` keepers.
-
-Until it reaches `main`, a marked step does not work, and each says what to
-do instead. [Missing features](#missing-features)
-lists what does not exist at all.
+The procedures use the consensus keeper's admin endpoints, offline inspection
+tools, and N/N−1 compatibility. [Missing features](#missing-features) lists
+the operations that still require other tooling.
 
 Packaging lives in [`deploy/consensus/`](../deploy/consensus/):
 
@@ -42,11 +31,11 @@ A keeper is one process, `logkeeper keeper --config FILE`, built with the
 `stream` feature. It hosts one Raft group per stream (OpenRaft 0.10.1) on a
 shared segmented WAL. It listens on three TCP ports, each with mutual TLS 1.3:
 
-| Lane | Config map | Who connects | ALPN on `main` |
+| Lane | Config map | Who connects | ALPN (current, previous) |
 | --- | --- | --- | --- |
-| Application | `keepers` (and `listen`) | Clients such as RTDB, and other keepers | `logkeeper-consensus/1` |
-| Control | `peers` | Keepers only: votes, heartbeats, pings, parking, leader transfer | `logkeeper-consensus-control/8` |
-| Bulk and replication | `bulk` | Keepers only: AppendEntries batches and snapshot files | `logkeeper-consensus-bulk/2`, `logkeeper-consensus-replication/3` |
+| Application | `keepers` (and `listen`) | Clients such as RTDB, and other keepers | `logkeeper-consensus/2`, `logkeeper-consensus/1` |
+| Control | `peers` | Keepers only: votes, heartbeats, pings, parking, leader transfer | `logkeeper-consensus-control/9`, `logkeeper-consensus-control/8` |
+| Bulk and replication | `bulk` | Keepers only: AppendEntries batches and snapshot files | Bulk `/3`, `/2`. Replication `/4`, `/3` |
 | Admin | `admin.listen` | Probes, metrics scrapers, operators | Plain HTTP on loopback, or mTLS |
 
 A keeper binds the `peers` and `bulk` addresses that its own inventory lists
@@ -180,8 +169,8 @@ size)`. With 3 voters per stream and N keepers, a keeper hosts on average
 `3 x streams / N` streams.
 
 RTDB's journals stay far below the ceiling in steady state. RTDB checkpoints to
-object storage and trims each stream when its retained suffix reaches 32,768
-records ([RTDB side](#rtdb-side)). A stream normally holds at most 32,768
+object storage and trims each stream when its retained suffix reaches 131,072
+records ([RTDB side](#rtdb-side)). A stream normally holds at most 131,072
 records plus whatever arrives while a checkpoint is being built.
 
 ### CPU and memory
@@ -241,7 +230,7 @@ What these figures mean for sizing:
   state on top of the index. Budget 300 bytes per retained record per voter in
   steady state, and leave room for a peak of about 400 MiB per voter for each
   stream that is filling toward the ceiling at full speed. A stream that RTDB
-  trims at 32,768 records costs about 10 MiB in steady state.
+  trims at 131,072 records costs about 40 MiB in steady state.
 - **Disk per record** at 256-byte payloads is about 340 bytes per voter
   (2,107 MiB / 3 copies / 2.17 M records). Budget 1.4 times the payload size
   for small records.
@@ -283,10 +272,13 @@ reconciliation, and writes it. Its principal must therefore be in both
 any writer may write any stream. Do not share keepers between tenants that
 must not write each other's journals.
 
-With `admin.mtls: true`, the admin listener also requires a client
-certificate listed in `administrators`. There is no read-only metrics role, so
-an mTLS scraper holds administrator rights. Prefer the loopback listener and a
-node-local scraper.
+With `admin.mtls: true`, give Prometheus a CA-signed client certificate and
+list its URI in `admin.metrics_readers`. This role permits `/metrics`, `/live`
+and `/ready`. Administrators and cluster keepers can query the other admin
+pages. To probe from a node-local process without a certificate, set
+`admin.probe_listen` to a loopback address such as `127.0.0.1:5742`.
+That listener serves `/live` and `/ready`. For Kubernetes, use an
+`exec` probe that makes the request from inside the keeper pod.
 
 ### Enrollment: the provisioning authority
 
@@ -360,7 +352,7 @@ For each keeper, in any order:
    | `admin` | none | `{"listen": "127.0.0.1:5741", "mtls": false, "cluster": {...}}`. `cluster` lists the other keepers' admin addresses for `keeper debug-bundle` |
    | `log_format` | `human` | `human` or `json` |
 
-   On `main`, unknown fields are refused at startup. With **[upgrades]** they
+   Unknown top-level fields
    only produce a warning.
 4. **Create the directories.** `install -d -o logkeeper -g logkeeper -m 0700
    /var/lib/logkeeper/media /var/lib/logkeeper/registry`, each on its own
@@ -506,8 +498,8 @@ RTDB re-reads this file every 5 s and, for each database it writes, calls
 editing `draining` or `placement` in place is how streams move.
 
 **Checkpoint flags.** The RTDB writer checkpoints and trims each stream when
-its retained suffix reaches 32,768 records, on a 250 ms maintenance loop. It
-has no byte trigger. So set `quota_bytes` to at least 2 x 32,768 x your
+its retained suffix reaches 131,072 records, on a 250 ms maintenance loop. It
+has no byte trigger. So set `quota_bytes` to at least 2 x 131,072 x your
 largest typical commit size, or RTDB gets `rtdb/journal-full`. The Multi YAML
 key `multiCheckpoints` has two flags:
 
@@ -517,18 +509,13 @@ key `multiCheckpoints` has two flags:
 Both default to `false`. Enable them only after every RTDB node runs a release
 that reads them.
 
-**Versions.** RTDB `main` pins Logkeeper `e24e4967`. At that commit, the
-retained-record ceiling is 65,536, not 262,144, and RTDB's 32,768 threshold is
-half of it. Logkeeper `main`'s keepers accept the 65,536-era client. Repin
-RTDB only to a Logkeeper SHA already on `main`. The Logkeeper side lands
-first.
+**Versions.** RTDB pins Logkeeper to a commit already on Logkeeper `main`.
+The Logkeeper side lands first.
 
-**Recovery.** After `recover-stream`, RTDB's next seal gets
-`JournalError::Recovered`, which RTDB reports as `rtdb/journal-recovered`.
-RTDB at its current pin does not acknowledge it by itself. An operator
-acknowledges with `logkeeper admin acknowledge-recovery --stream UUID`
-(or `ConsensusJournal::acknowledge_recovery`; writer or administrator). The
-[two-voter-loss runbook](runbooks/lose-two-voters.md) has the steps.
+**Recovery.** RTDB Multi normally acknowledges a keeper recovery and
+records it in the journal before accepting transactions. Set
+`multiJournal.holdWritesAfterRecovery: true` to wait for an operator instead.
+The [two-voter-loss runbook](runbooks/lose-two-voters.md) covers the sequence.
 
 ## Monitoring
 
@@ -570,25 +557,13 @@ until the cluster is finalized at N. That way, rolling back to N-1 stays
 possible until finalization. Downgrades below N-1 and skipping a release are
 not supported.
 
-How this is enforced:
-
-- **With [upgrades]:**
-  - Each lane accepts ALPN N and N-1, and new frames go only to peers that
-    advertise them.
-  - A version mismatch counts as alive, so it never triggers repair.
-  - New WAL and checkpoint formats wait for
-    `ConsensusJournal::finalize_version`. That call is refused until every
-    active keeper advertises the gate.
-- **On `main` today:** none of that exists. Two builds interoperate only if
-  every ALPN in `src/stream/consensus/mod.rs` is identical. Any ALPN bump
-  between your running build and the new one means a full-cluster stop and
-  start, not a rolling upgrade. Compare the `logkeeper_build_info` labels,
-  or the constants in the source, before you upgrade.
-- **Media formats** migrate forward on first start. For example,
-  `logkeeper-raft-2` becomes `logkeeper-raft-3` (segments). Older binaries
-  cannot reopen migrated media, so on `main` a rollback after a format
-  migration is impossible. Take that into account before upgrading across a
-  format change.
+Each lane accepts the current and previous ALPN. A version mismatch
+counts as reachable for repair. `logkeeper admin finalize-version` checks
+that every active keeper supports the write-version gate before enabling
+the current disk formats. Compaction relocation and durable park marks also
+wait for finalization. The previous binary tested for this upgrade is
+`44d3f2aadb`. Check the release notes before planning an upgrade from an
+earlier media format.
 
 The procedure is in the [rolling-upgrade runbook](runbooks/rolling-upgrade.md).
 The [rolling-upgrade test](../tests/rolling_upgrade.rs) runs it in process.
@@ -644,10 +619,7 @@ Most are items in the consensus design's review tables.
 | --- | --- | --- |
 | DNS names in the inventory | Keepers need stable IPs; Kubernetes uses host networking | Static IPs, pinned nodes |
 | Runtime inventory change (T19) | Adding a keeper restarts every keeper | Plan the count; restart one at a time |
-| Durable decommission state (T20) | A leadership drain is durable (`logkeeper admin drain`), but moving replicas off a keeper lives only in the consumer's `draining` list | Edit RTDB's `JournalConfig` |
 | Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
-| TLS reload without restart (T12) | Certificate rotation restarts each keeper | Rolling restart |
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |
-| Read-only metrics principal | mTLS scrapers are administrators or keepers | Loopback admin listener and a local agent |
 | Online backup and export | See [backup](#backup-and-restore) | RTDB checkpoints |
 | Catalog-bounded leases | A lost keeper that never stopped stays certified and, with the other lost keeper, can keep leading the old configuration. Restarting lost keepers are fenced by placement certification | Fence both lost keepers before `recover-stream` (`--lost` states it) |

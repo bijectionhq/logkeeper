@@ -99,8 +99,9 @@ until probe ready | grep -qx 200; do sleep 5; done
 
 The stream is sealed under a recovery fence. Every `seal` returns
 `JournalError::Recovered { head }`, which RTDB reports as the fault
-`rtdb/journal-recovered`. At its current pin, RTDB does not acknowledge by
-itself. Acknowledge with an administrator (or writer) principal:
+`rtdb/journal-recovered`. RTDB Multi normally acknowledges and records the recovery before writing.
+With `multiJournal.holdWritesAfterRecovery: true`, acknowledge with an
+administrator or writer principal:
 
 ```sh
 lk admin acknowledge-recovery --config operator.json --stream UUID

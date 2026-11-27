@@ -90,6 +90,7 @@ impl Engine {
         let opening = self.opening(stream).await?;
         let _guard = opening.lock().await;
         self.verified_stage(authority, &genesis, &stage).await?;
+        let _placement = self.mode.admit_placement().await?;
         match self.disk.genesis(stream) {
             Some(local) if local != genesis => return Err(invalid("staging would change genesis")),
             Some(_) => (),
@@ -137,6 +138,7 @@ impl Engine {
         }
         let opening = self.opening(stream).await?;
         let _guard = opening.lock().await;
+        let _placement = self.mode.admit_placement().await?;
         match self.disk.genesis(stream) {
             Some(local) if local != genesis => return Err(invalid("staging would change genesis")),
             Some(_) => (),

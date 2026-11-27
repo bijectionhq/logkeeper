@@ -1,41 +1,41 @@
 # Certificate rotation
 
-Keepers read their certificates only at startup, so every rotation is a
-rolling restart (TLS reload without restart is T12, not built). Peers
-authenticate each other by CA and URI SAN, not by certificate bytes. A keeper
-also checks its own certificate against `certificate_sha256` in its
-provision file at every start.
+On Unix, send the keeper SIGHUP after updating the certificate, private
+key and trusted CA bundle at the configured paths. A successful reload
+supplies the new credentials to fresh application, peer and mTLS admin
+connections. Established TLS sessions can finish on their existing
+credentials. The keeper validates the leaf's URI and the provision digest
+before swapping the credentials.
 
 ## Keeper certificate (same UUID)
 
 For each keeper, one at a time:
 
-1. Issue a new leaf from the same CA, with the same URI SAN
-   `urn:logkeeper:keeper:<uuid>` and both serverAuth and clientAuth.
-2. Wait until it is safe to stop (`probe safe-to-stop`, as in [rolling
-   upgrade](rolling-upgrade.md) step 6), then stop the keeper.
-3. Replace the files at the configured `tls.certificate` and
-   `tls.private_key` paths, and rewrite the digest:
+1. Issue a new leaf with URI SAN `urn:logkeeper:keeper:<uuid>` and both
+   serverAuth and clientAuth. Ensure peers already trust the new issuer.
+2. Stage and rename the files into place, then update the authorization:
 
    ```sh
-   sudo install -o logkeeper -m 0400 new.pem /etc/logkeeper/tls/keeper.pem
-   sudo install -o logkeeper -m 0400 new.key /etc/logkeeper/tls/keeper.key
+   sudo install -o logkeeper -m 0400 new.pem /etc/logkeeper/tls/keeper.pem.next
+   sudo install -o logkeeper -m 0400 new.key /etc/logkeeper/tls/keeper.key.next
+   sudo mv /etc/logkeeper/tls/keeper.pem.next /etc/logkeeper/tls/keeper.pem
+   sudo mv /etc/logkeeper/tls/keeper.key.next /etc/logkeeper/tls/keeper.key
    digest=$(shasum -a 256 /etc/logkeeper/tls/keeper.pem | cut -d' ' -f1)
-   reg=/var/lib/logkeeper/registry/$(jq -r .keeper $CONFIG).provision.json
+   reg=/var/lib/logkeeper/registry/$(jq -r .keeper "$CONFIG").provision.json
    jq --arg d "$digest" '.certificate_sha256 = $d' "$reg" | sudo -u logkeeper tee "$reg.new" >/dev/null
    sudo -u logkeeper mv "$reg.new" "$reg"
+   sudo systemctl kill --signal=HUP "$UNIT"
    ```
 
-4. Start it and wait for `probe ready` to return 200.
+3. Check for `reloaded TLS credentials` in the keeper log. Open a fresh mTLS
+   connection with `logkeeper admin status --config operator.json --keeper
+   "$KEEPER"`, then check readiness and writes. If the log says `TLS reload
+   refused`, the keeper still uses its previous credentials. Correct the
+   files and send SIGHUP again.
 
-If the digest does not match, the keeper refuses to start with "keeper does
-not match its enrollment authorization". Fix the provision file. Do not
-re-initialize.
-
-On Kubernetes: update `keeper-N.pem` and `keeper-N.key` in the
-`logkeeper-tls` Secret and `certificate_sha256` in
-`keepers/keeper-N.provision.json`, then apply. The generated ConfigMap name
-changes, which rolls the StatefulSet one pod at a time.
+On Kubernetes, ensure the mounted files and provision digest have updated
+before sending HUP to the keeper process. Applying a ConfigMap change that
+updates the pod template uses the StatefulSet's rolling restart instead.
 
 ## Client certificates (RTDB, operators)
 
@@ -54,8 +54,8 @@ changes, which rolls the StatefulSet one pod at a time.
 ## CA rotation
 
 `tls.ca` may hold several PEM roots, and all of them are trusted. Rotate in
-three rolling passes. Each pass covers every keeper (rolling restart) and
-every RTDB node:
+three passes. Reload every keeper in each pass and roll the RTDB nodes
+when their client credential mounts change:
 
 1. **Trust both:** set `ca` to a bundle of the old and new roots.
 2. **Reissue leaves** from the new CA (keepers as above, with new digests;

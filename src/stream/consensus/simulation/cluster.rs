@@ -118,12 +118,12 @@ impl Running {
         faults: &FaultNetwork,
         ignore_reused_ids: bool,
     ) -> Self {
-        let (engine, acceptor, _) = config.prepare(CancellationToken::new()).await.unwrap();
+        let engine = config.prepare(CancellationToken::new()).await.unwrap();
         if ignore_reused_ids {
             engine.ignore_reused_ids();
         }
         engine.set_transport_filter(Some(faults.filter()));
-        let task = tokio::spawn(engine.clone().serve(listeners, acceptor, None));
+        let task = tokio::spawn(engine.clone().serve(listeners, None));
         Self { engine, task }
     }
 

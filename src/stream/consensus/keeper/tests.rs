@@ -50,13 +50,12 @@ impl Running {
         before: impl FnOnce(&Engine),
     ) -> Self {
         let admin_listener = match &config.admin {
-            Some(admin) => Some(TcpListener::bind(admin.listen).await.unwrap()),
+            Some(admin) => Some((TcpListener::bind(admin.listen).await.unwrap(), admin.mtls)),
             None => None,
         };
-        let (engine, acceptor, admin_tls) = config.prepare(CancellationToken::new()).await.unwrap();
+        let engine = config.prepare(CancellationToken::new()).await.unwrap();
         before(&engine);
-        let admin = admin_listener.map(|listener| (listener, admin_tls));
-        let task = tokio::spawn(engine.clone().serve(listeners, acceptor, admin));
+        let task = tokio::spawn(engine.clone().serve(listeners, admin_listener));
         Self { engine, task }
     }
 
@@ -75,6 +74,8 @@ struct Cluster {
     catalog_voters: Option<[Uuid; 3]>,
     credentials: Credentials,
     other: Credentials,
+    #[cfg(unix)]
+    certificate_issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
     _dir: tempfile::TempDir,
 }
 
@@ -190,6 +191,8 @@ impl Cluster {
             catalog_voters,
             credentials,
             other,
+            #[cfg(unix)]
+            certificate_issuer: ca,
             _dir: dir,
         }
     }

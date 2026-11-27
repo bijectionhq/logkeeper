@@ -4,13 +4,9 @@ The keeper inventory (`keepers`, `peers`, `bulk`, `domains`) is static. It is
 read at startup and must equal `placement.json` in each keeper's registry.
 Changing it means restarting every keeper, one at a time.
 
-There are two kinds of drain:
-- **Leadership drain** (`lk admin drain`) is durable on the keeper. The
-  keeper hands off every stream it leads, starts no election, and reports
-  that it accepts no new streams, so new placements and repairs skip it. Its
-  replicas stay where they are. `lk admin undrain` reverses it.
-- **Replica drain** moves the streams themselves. RTDB moves the streams it
-  writes off keepers listed in `draining` in its `JournalConfig`.
+Use `lk admin drain` for maintenance when replicas should stay in place.
+For permanent removal, use `lk admin decommission` to move the replicas too.
+Both modes survive restart and block new replica registration on the keeper.
 
 ## Add a keeper
 
@@ -67,71 +63,40 @@ restart.
 
 ## Drain a keeper
 
-Start with a leadership drain, so the keeper stops leading and nothing new
-lands on it while its streams move:
-
 ```sh
-lk admin drain --config operator.json --keeper UUID
+lk admin drain --config operator.json --keeper "$KEEPER"
 # mode: draining
 # drained: true
 ```
 
-Only streams whose RTDB writer is running move. RTDB reconciles a database's
-stream only while it writes that database, at most one voter per stream every
-5 s. Fixed `voters` rosters never move.
+The keeper hands off leadership and stops campaigning. Its replicas still
+vote. Run `lk admin undrain --config operator.json --keeper "$KEEPER"` when
+the maintenance is done.
 
-1. Make sure the remaining eligible keepers have room: three domains, each
-   with an accepting keeper other than the drained one
-   (`logkeeper_consensus_accepting 1`).
+## Decommission and remove a keeper
 
-2. Add the UUID to `draining` in every RTDB `JournalConfig` file, keeping it
-   in `placement`. Rewrite each file in place, atomically:
-
-   ```sh
-   jq '.draining += ["UUID"] | .draining |= unique' journal.json > journal.json.new
-   mv journal.json.new journal.json
-   ```
-
-   RTDB logs `Multi journal placement moved stream <id> to revision <n>` for
-   each move. `Multi journal placement deferred: ...` is retried on the next
-   tick.
-
-3. **Wait until no stream names the keeper.** On the drained keeper:
+1. Ensure the remaining keepers have enough room and three failure domains.
+   Replicate a single-keeper catalog before decommissioning its host. A
+   replicated catalog moves through the same quorum repair as other streams.
+2. Move replicas and wait for their retirement:
 
    ```sh
-   curl -sS $ADMIN/metrics | grep 'logkeeper_consensus_streams{state="hosted"}'
-   # logkeeper_consensus_streams{state="hosted"} 0
+   lk admin decommission --config operator.json --keeper "$KEEPER"
+   # mode: decommissioning
+   # led: 0
+   # hosted: 0
+   # safe_to_delete: true
    ```
 
-   Removed copies retire themselves, so `hosted` reaches 0 once every move
-   has committed and retirement has run. To check one stream, run
-   `lk admin status --config operator.json --stream UUID`.
-
-   Streams that RTDB does not write (databases with no running writer) do
-   not move. Wake their writers or accept that they stay. If the keeper is a
-   catalog voter, the catalog stream does not move with `draining`. It moves
-   when its leader repairs it, after the keeper has been stopped for
-   `repair_after_secs`.
-
-Abort criteria: `hosted` stops decreasing for 10 minutes while RTDB logs
-`deferred`. Remove the UUID from `draining` and run `lk admin undrain` to
-cancel.
-
-## Remove a keeper
-
-1. Drain it (above) until `hosted` is 0, except for the catalog stream if it
-   is a catalog voter.
-2. Stop it: `probe safe-to-stop` should return 200, then run `sudo systemctl
-   disable --now $UNIT`.
-3. If it was a catalog voter, wait `repair_after_secs` (600 s by default) for
-   the catalog leader to replace it. Check that `/problems` on the other
-   keepers shows no `under_replicated` catalog stream (ID
-   `ffffffff-ffff-ffff-ffff-ffffffffffff`).
-4. Remove the UUID from `placement` and `draining` in every RTDB
-   `JournalConfig`.
-5. **Keep the UUID in the keeper inventory** on `main`. Removing it from
-   `keepers` or `domains` changes placement validation for streams whose
-   history names it (T11). With **[upgrades]**, move it to `retired` in every
-   keeper config instead.
-6. Record the UUID as retired in your inventory and never issue it again.
-   Destroy its private key.
+   This includes parked streams. If the command times out, use
+   `lk admin drain-status --config operator.json --keeper "$KEEPER"` to check
+   progress. Check the cluster's problems and spare capacity if the number
+   of hosted replicas stops decreasing. Keep the keeper running until its
+   report says `safe_to_delete: true`. Use `undrain` to cancel further moves.
+3. Stop the keeper and remove it from RTDB placement. Mark its UUID retired
+   in the keepers' configs and placement registries so historical placements
+   still validate. Preserve the addresses and configured catalog seed until
+   the remaining keepers have been restarted with a consistent inventory.
+4. Record the UUID as retired and never issue it again. Retire its private
+   key and delete the stopped keeper's data only after the safe-to-delete
+   check.

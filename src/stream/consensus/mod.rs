@@ -70,6 +70,8 @@ pub mod features {
     pub const DURABLE_QUARANTINE: u64 = 1 << 2;
     /// Supports placement changes without quarantine and retired keepers.
     pub const SOFT_PLACEMENT: u64 = 1 << 3;
+    /// Runtime status: the operator is moving replicas off this keeper.
+    pub const DECOMMISSIONING: u64 = 1 << 4;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 =

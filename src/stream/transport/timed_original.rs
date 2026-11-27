@@ -98,6 +98,10 @@ impl TimedOriginalVerifier for Trust {
 }
 
 impl TimedOriginalConfig {
+    pub(crate) fn check_tls_key(&self, tls_public_key: &[u8]) -> io::Result<()> {
+        Trust::read(&self.trust_file, tls_public_key).map(|_| ())
+    }
+
     /// Loads the installed trust and, when configured, the signing clock.
     pub(crate) fn authority(
         self,

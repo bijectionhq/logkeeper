@@ -64,8 +64,7 @@ voter (3-keeper case), after `repair_after_secs`.
 ## 4. Retire the old UUID
 
 - Remove it from `placement` in every RTDB `JournalConfig`.
-- Keep it in the keeper inventory on `main`, or move it to `retired` with
-  **[upgrades]**.
+- Mark it `retired` in every keeper config and placement registry.
 - Record it as retired, and destroy its key.
 - Wipe and reuse the old registry volume only for a new UUID.
 

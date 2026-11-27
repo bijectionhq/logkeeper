@@ -271,7 +271,7 @@ impl Enrollment {
         keeper: Uuid,
         catalog: Uuid,
         domain: &str,
-        certificate: &Path,
+        certificate_digest: [u8; 32],
     ) -> io::Result<Self> {
         let registry = registry.canonicalize()?;
         let data = canonical_target(data)?;
@@ -282,7 +282,7 @@ impl Enrollment {
         if provision.keeper != keeper
             || provision.data != data
             || provision.domain != domain
-            || provision.certificate_sha256 != hex(&sha256(File::open(certificate)?)?)
+            || provision.certificate_sha256 != hex(&certificate_digest)
         {
             return Err(invalid(
                 "keeper does not match its enrollment authorization",

@@ -72,6 +72,8 @@ pub(super) async fn start_admin_cluster(mtls: bool) -> (Cluster, BTreeMap<Uuid, 
             listen: addr,
             mtls,
             cluster: BTreeMap::new(),
+            metrics_readers: Vec::new(),
+            probe_listen: None,
         });
         addrs.insert(id, addr);
     }
@@ -79,6 +81,115 @@ pub(super) async fn start_admin_cluster(mtls: bool) -> (Cluster, BTreeMap<Uuid, 
         cluster.restart(id).await;
     }
     (cluster, addrs)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_principal_and_loopback_probe_have_limited_access() {
+    let (mut cluster, addresses) = start_admin_cluster(true).await;
+    let keeper = cluster.ids[0];
+    let probe = free_loopback();
+    let admin = cluster
+        .configs
+        .get_mut(&keeper)
+        .unwrap()
+        .admin
+        .as_mut()
+        .unwrap();
+    admin.metrics_readers = vec![OTHER.into()];
+    admin.probe_listen = Some(probe);
+    cluster.running.remove(&keeper).unwrap().stop().await;
+    cluster.restart(keeper).await;
+    let addr = addresses[&keeper];
+    assert_eq!(https_get(addr, &cluster.other, "/metrics").await.0, 200);
+    assert_eq!(https_get(addr, &cluster.other, "/live").await.0, 200);
+    assert_eq!(https_get(addr, &cluster.other, "/status").await.0, 403);
+    let mut config = super::operator::operator_config(&cluster, &addresses);
+    config.tls = cluster.other.clone();
+    assert!(
+        crate::stream::consensus::Operator::new(config)
+            .unwrap()
+            .set_mode(keeper, "/drain")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("403")
+    );
+    assert_eq!(http_get(probe, "/live").await.0, 200);
+    assert!(matches!(http_get(probe, "/ready").await.0, 200 | 503));
+    assert_eq!(http_get(probe, "/metrics").await.0, 403);
+    assert_eq!(http_request(probe, "POST", "/drain").await.0, 403);
+    cluster.stop_all().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotating_tls_keeps_existing_connections_and_publishes_only_authorized_credentials() {
+    type TlsStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
+    async fn connect(addr: SocketAddr, credentials: &Credentials) -> (TlsStream, Vec<u8>) {
+        let (tls, _) = credentials.client_protocol(b"http/1.1").unwrap();
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("logkeeper").unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = tls.connect(name, tcp).await.unwrap();
+        let cert = transport::leaf(stream.get_ref().1.peer_certificates())
+            .unwrap()
+            .to_vec();
+        (stream, cert)
+    }
+
+    let (mut cluster, addresses) = start_admin_cluster(true).await;
+    let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(Uuid::new_v4().as_u128());
+    client.create(stream, voters, 1 << 26).await.unwrap();
+    let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
+    let keeper = cluster.leader_after_head(&client, stream).await;
+    let addr = addresses[&keeper];
+    let (mut existing, old) = connect(addr, &cluster.credentials).await;
+    let (first, started) = tokio::sync::oneshot::channel();
+    let writing = tokio::spawn(async move {
+        let payload = Bytes::from_static(b"write during rotation");
+        client
+            .append(stream, sealed.fence, Lsn(1), payload.clone())
+            .await
+            .unwrap();
+        first.send(()).unwrap();
+        for lsn in 2..=32 {
+            client
+                .append(stream, sealed.fence, Lsn(lsn), payload.clone())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        client.head(stream).await.unwrap()
+    });
+    started.await.unwrap();
+
+    let config = cluster.configs[&keeper].clone();
+    let replacement = credentials_with_usages(
+        cluster._dir.path(),
+        "rotated",
+        &format!("urn:logkeeper:keeper:{keeper}"),
+        vec![ClientAuth, ServerAuth],
+        &cluster.certificate_issuer,
+        &config.tls.ca,
+    );
+    std::fs::rename(replacement.certificate, &config.tls.certificate).unwrap();
+    std::fs::rename(replacement.private_key, &config.tls.private_key).unwrap();
+    let tls = &cluster.running[&keeper].engine.tls;
+    assert!(tls.reload(&config).is_err());
+    assert_eq!(connect(addr, &cluster.credentials).await.1, old);
+    provision(&config);
+    tls.reload(&config).unwrap();
+    assert_ne!(connect(addr, &cluster.credentials).await.1, old);
+    existing
+        .write_all(b"GET /live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    let _ = existing.read_to_end(&mut response).await;
+    assert_eq!(parse_http_response(&response).0, 200);
+    assert_eq!(writing.await.unwrap(), Lsn(32));
+    cluster.stop_all().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -94,6 +205,8 @@ async fn admin_plain_http_metrics_health_and_validation() {
         listen: "0.0.0.0:9199".parse().unwrap(),
         mtls: false,
         cluster: BTreeMap::new(),
+        metrics_readers: Vec::new(),
+        probe_listen: None,
     });
     assert!(bad.validate().is_err());
 

@@ -34,7 +34,7 @@ use super::{Engine, Group, NodeId, Reply, Request};
 use crate::stream::consensus::{
     BUILD_VERSION, Configuration, KeeperStatus,
     assignment::{self, Health, View},
-    decisions, features, metrics,
+    decisions, metrics,
     network::{self, Proof},
 };
 use std::io;
@@ -146,7 +146,7 @@ impl Engine {
             led: led as u32,
             replica: None,
             build_version: BUILD_VERSION.to_owned(),
-            features: features::SUPPORTED,
+            features: self.advertised_features(),
             cluster_version: self.disk.cluster_version(),
         }
     }
@@ -186,7 +186,7 @@ impl Engine {
             led: led as u32,
             replica,
             build_version: BUILD_VERSION.to_owned(),
-            features: features::SUPPORTED,
+            features: self.advertised_features(),
             cluster_version: self.disk.cluster_version(),
         }
     }
@@ -243,6 +243,7 @@ impl Engine {
             .map(|(stream, group)| (*stream, group.clone()))
             .collect::<Vec<_>>();
         let now = Instant::now();
+        let leaving = self.decommissioning();
         let mut work = Vec::new();
         {
             let mut led = self.led_since.lock();
@@ -317,7 +318,11 @@ impl Engine {
                 if !quiet.is_empty() {
                     work.push((*stream, group.clone(), Work::Voters(quiet)));
                 } else if let Some(configuration) = group.state.finalized()
-                    && !self.placement.roster(&configuration.voters)
+                    && (!self.placement.roster(&configuration.voters)
+                        || configuration
+                            .voters
+                            .iter()
+                            .any(|voter| leaving.contains(voter)))
                 {
                     metrics::count(&self.disk.metrics.placement_violation);
                     work.push((*stream, group.clone(), Work::Placement));
@@ -475,6 +480,7 @@ impl Engine {
             return false;
         };
         let mut health = BTreeMap::new();
+        let leaving = self.decommissioning();
         let candidates = self
             .placement
             .domains()
@@ -485,7 +491,8 @@ impl Engine {
         for keeper in candidates {
             let voter = configuration.voters.contains(&keeper);
             let retired = self.placement.is_retired(keeper);
-            if voter && !quiet.contains(&keeper) && !retired {
+            let decommissioning = leaving.contains(&keeper);
+            if voter && !quiet.contains(&keeper) && !retired && !decommissioning {
                 continue;
             }
             if retired && !self.placement.all_domains().contains_key(&keeper) {
@@ -519,7 +526,9 @@ impl Engine {
                 keeper,
                 Health {
                     live,
-                    accepting: !retired && status.as_ref().is_some_and(|status| status.accepting),
+                    accepting: !retired
+                        && !decommissioning
+                        && status.as_ref().is_some_and(|status| status.accepting),
                     streams: status.as_ref().map_or(0, |status| status.streams),
                 },
             );
@@ -575,12 +584,11 @@ impl Engine {
     }
 
     /// A keeper whose media is unhealthy, slow or full cannot accept the
-    /// writes of the streams it leads, even when their followers have room,
-    /// and a draining keeper must not lead.
+    /// writes of the streams it leads, even when their followers have room.
     /// It hands each to a follower that has matched its log and whose keeper
     /// accepts streams. Slow media sheds at once, not at the next pass.
     pub(super) async fn shed_leadership_when_full(&self) {
-        if self.accepting() {
+        if self.disk.responsive() && self.disk.space.accepts_streams() {
             return;
         }
         let groups = self

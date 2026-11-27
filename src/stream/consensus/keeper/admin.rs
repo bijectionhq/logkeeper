@@ -68,6 +68,8 @@ enum Access {
     Administrator(String),
     /// Another keeper of the cluster: read-only.
     Keeper,
+    Metrics,
+    Probe,
     Denied,
 }
 
@@ -234,7 +236,8 @@ impl Engine {
     pub(super) async fn listen_admin(
         self: Arc<Self>,
         listener: TcpListener,
-        acceptor: Option<TlsAcceptor>,
+        mtls: bool,
+        probe_only: bool,
     ) -> io::Result<()> {
         // The admin listener is auxiliary: neither a failed accept nor a
         // panicking request may stop the keeper, so it logs and goes on.
@@ -276,13 +279,16 @@ impl Engine {
                         continue;
                     };
                     let engine = self.clone();
-                    let acceptor = acceptor.clone();
+                    let acceptor = mtls.then(|| self.tls.admin());
                     tasks.spawn(async move {
                         let _permit = permit;
                         // One deadline covers the handshake, the request and
                         // the response, so a slow client holds a slot for at
                         // most `ADMIN_TIMEOUT`.
-                        let _ = timeout(ADMIN_TIMEOUT, engine.admin_connection(socket, acceptor)).await;
+                        let _ = timeout(
+                            ADMIN_TIMEOUT,
+                            engine.admin_connection(socket, acceptor, probe_only),
+                        ).await;
                     });
                 }
             }
@@ -293,6 +299,7 @@ impl Engine {
         self: &Arc<Self>,
         socket: TcpStream,
         acceptor: Option<TlsAcceptor>,
+        probe_only: bool,
     ) -> io::Result<()> {
         let _ = socket.set_nodelay(true);
         match acceptor {
@@ -303,34 +310,36 @@ impl Engine {
                 // already holds every replica the admin pages describe and
                 // collects them for `logkeeper keeper debug-bundle`.
                 let leaf = transport::leaf(tls.peer_certificates()).ok();
-                let access = match leaf {
-                    Some(leaf)
-                        if transport::client_identity(leaf)
-                            .is_ok_and(|id| self.administrators.contains(id.as_str())) =>
-                    {
-                        Access::Administrator(
-                            transport::client_identity(leaf)
-                                .map(|id| id.as_str().to_owned())
-                                .unwrap_or_default(),
-                        )
-                    }
-                    Some(leaf)
-                        if transport::keeper_id(leaf).is_ok_and(|keeper| {
+                let access =
+                    if let Some(id) = leaf.and_then(|leaf| transport::client_identity(leaf).ok()) {
+                        if self.administrators.contains(id.as_str()) {
+                            Access::Administrator(id.as_str().to_owned())
+                        } else if self.metrics_readers.contains(id.as_str()) {
+                            Access::Metrics
+                        } else {
+                            Access::Denied
+                        }
+                    } else if leaf.is_some_and(|leaf| {
+                        transport::keeper_id(leaf).is_ok_and(|keeper| {
                             self.placement
                                 .all_domains()
                                 .contains_key(&uuid::Uuid::from_u128(keeper.0))
-                        }) =>
-                    {
+                        })
+                    }) {
                         Access::Keeper
-                    }
-                    _ => Access::Denied,
-                };
+                    } else {
+                        Access::Denied
+                    };
                 self.serve_http(&mut stream, access).await
             }
             None => {
                 let mut stream = socket;
-                self.serve_http(&mut stream, Access::Administrator("loopback".into()))
-                    .await
+                let access = if probe_only {
+                    Access::Probe
+                } else {
+                    Access::Administrator("loopback".into())
+                };
+                self.serve_http(&mut stream, access).await
             }
         }
     }
@@ -399,7 +408,13 @@ impl Engine {
                 .await;
             }
         };
-        if matches!(access, Access::Denied) {
+        let allowed = match access {
+            Access::Administrator(_) | Access::Keeper => true,
+            Access::Metrics => matches!(path, "/metrics" | "/live" | "/ready"),
+            Access::Probe => matches!(path, "/live" | "/ready"),
+            Access::Denied => false,
+        };
+        if !allowed {
             let body = r#"{"error":"unauthorized admin client"}"#;
             return write_http_response(
                 stream,

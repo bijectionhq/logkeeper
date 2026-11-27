@@ -2,9 +2,9 @@
 //! in-process cluster under write load.
 //!
 //! Writers append to several streams the whole time. Each keeper in turn is
-//! stopped once its admin listener answers `/safe-to-stop` with 200, then
-//! restarted on the same media, and the next keeper waits until this one
-//! answers `/ready` with 200. Every acknowledged record must still be there
+//! drained and stopped once its admin listener answers `/safe-to-stop`
+//! with 200. After restart on the same media, it must become ready before
+//! it is undrained and the rollout continues. Every acknowledged record must still be there
 //! afterwards, and no append may stall for more than `MAX_STALL` during a
 //! restart. The test prints the measured stall per restart.
 #![cfg(feature = "consensus-testing")]
@@ -37,15 +37,15 @@ const MAX_STALL: Duration = Duration::from_secs(8);
 /// How long the runbook waits for a probe before aborting.
 const PROBE_DEADLINE: Duration = Duration::from_secs(120);
 
-/// The HTTP status of `GET path` on a keeper's admin listener.
-async fn probe(admin: SocketAddr, path: &str) -> Option<u16> {
+async fn request(admin: SocketAddr, method: &str, path: &str) -> Option<(u16, Vec<u8>)> {
     let mut socket = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(admin))
         .await
         .ok()?
         .ok()?;
     socket
         .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: keeper\r\nConnection: close\r\n\r\n").as_bytes(),
+            format!("{method} {path} HTTP/1.1\r\nHost: keeper\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
         )
         .await
         .ok()?;
@@ -54,18 +54,38 @@ async fn probe(admin: SocketAddr, path: &str) -> Option<u16> {
         .await
         .ok()?
         .ok()?;
-    std::str::from_utf8(&response)
-        .ok()?
-        .split(' ')
-        .nth(1)?
-        .parse()
-        .ok()
+    let response = std::str::from_utf8(&response).ok()?;
+    let (header, body) = response.split_once("\r\n\r\n")?;
+    Some((
+        header.split_whitespace().nth(1)?.parse().ok()?,
+        body.as_bytes().to_vec(),
+    ))
+}
+
+async fn drain(admin: SocketAddr) {
+    assert_eq!(
+        request(admin, "POST", "/drain").await.map(|r| r.0),
+        Some(200)
+    );
+    let start = Instant::now();
+    loop {
+        if let Some((200, body)) = request(admin, "GET", "/drain").await
+            && serde_json::from_slice::<serde_json::Value>(&body).unwrap()["drained"] == true
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < PROBE_DEADLINE,
+            "keeper did not drain: {admin}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Waits until `path` answers 200, as the runbook's `until probe ...` loops.
 async fn wait_for(admin: SocketAddr, path: &str) -> Duration {
     let started = Instant::now();
-    while probe(admin, path).await != Some(200) {
+    while request(admin, "GET", path).await.map(|r| r.0) != Some(200) {
         assert!(
             started.elapsed() < PROBE_DEADLINE,
             "{path} on {admin} did not answer 200 within {PROBE_DEADLINE:?}: abort the rollout"
@@ -191,12 +211,16 @@ async fn rolling_restart_under_load_keeps_every_acknowledged_write() {
         let admin = cluster.admin(*keeper);
         let waited = wait_for(admin, "/safe-to-stop").await;
         let started = Instant::now();
-        // SIGTERM in production: leaders hand off, then the keeper stops.
+        drain(admin).await;
         cluster.stop(*keeper).await.unwrap();
         let stopped = started.elapsed();
         // The upgrade itself: the same binary restarts on the same media.
         cluster.restart(*keeper).await.unwrap();
         let ready = wait_for(admin, "/ready").await;
+        assert_eq!(
+            request(admin, "POST", "/undrain").await.map(|r| r.0),
+            Some(200)
+        );
         let finished = Instant::now();
         // Let every writer complete an append after the step.
         tokio::time::sleep(Duration::from_millis(500)).await;

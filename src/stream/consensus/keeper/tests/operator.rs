@@ -161,14 +161,53 @@ async fn admin_cli_creates_inspects_moves_and_retires_a_stream() {
             .all(|answer| answer.status == Some(200))
     );
 
-    let unsupported = admin(&["finalize-version", "--config", &file]).await;
+    let finalized = admin(&["finalize-version", "--config", &file])
+        .await
+        .unwrap();
     assert_eq!(
-        unsupported.err().map(|error| error.kind()),
-        Some(io::ErrorKind::Unsupported)
+        finalized.report["cluster_version"],
+        crate::stream::consensus::CLUSTER_VERSION_CURRENT
     );
     let unknown = admin(&["problems", "--config", &file, "--bogus", "1"]).await;
     assert!(unknown.is_err());
 
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn decommission_retires_replicas_without_losing_records() {
+    let (mut cluster, addrs) = start_admin_cluster(true).await;
+    let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
+    let leaving = voters[0];
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(Uuid::new_v4().as_u128());
+    client.create(stream, voters, 1 << 26).await.unwrap();
+    let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
+    client
+        .append(stream, sealed.fence, Lsn(1), Bytes::from_static(b"keep me"))
+        .await
+        .unwrap();
+
+    let operator = operator(&cluster, &addrs, true);
+    assert!(
+        operator
+            .set_mode(cluster.catalog, "/decommission")
+            .await
+            .is_err()
+    );
+    let report = operator.set_mode(leaving, "/decommission").await.unwrap();
+    assert_eq!(report["mode"], "decommissioning");
+    assert_eq!(report["safe_to_delete"], false);
+    cluster.running.remove(&leaving).unwrap().stop().await;
+    cluster.restart(leaving).await;
+    let (report, finished) = operator
+        .wait_for(leaving, "safe_to_delete", WAIT, |_| ())
+        .await
+        .unwrap();
+    assert!(finished, "{report}");
+    let configuration = client.configuration(stream).await.unwrap();
+    assert!(!configuration.voters.contains(&leaving));
+    assert_eq!(client.head(stream).await.unwrap(), Lsn(1));
     cluster.stop_all().await;
 }
 

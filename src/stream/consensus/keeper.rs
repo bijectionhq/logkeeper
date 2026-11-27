@@ -15,6 +15,7 @@ mod replacement;
 mod replicas;
 #[cfg(test)]
 mod tests;
+pub(super) mod tls;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -40,7 +41,6 @@ use tokio::{
     task::JoinSet,
     time::{Instant, timeout, timeout_at},
 };
-use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -118,6 +118,12 @@ pub struct AdminConfig {
     /// `logkeeper keeper debug-bundle` collects from.
     #[serde(default)]
     pub cluster: BTreeMap<uuid::Uuid, SocketAddr>,
+    /// Client URI principals authorized for metrics and health over mTLS.
+    #[serde(default)]
+    pub metrics_readers: Vec<String>,
+    /// Optional plain HTTP endpoint for node-local liveness and readiness.
+    #[serde(default)]
+    pub probe_listen: Option<SocketAddr>,
 }
 
 /// Installed, authenticated keeper inventory and local service settings.
@@ -305,6 +311,13 @@ impl Config {
     /// Every path that writes this keeper's media opens its enrollment
     /// first, so installing the sync mode here covers them all.
     fn enrollment(&self) -> io::Result<Enrollment> {
+        use sha2::{Digest, Sha256};
+
+        let digest = Sha256::digest(std::fs::read(&self.tls.certificate)?).into();
+        self.enrollment_with_certificate_digest(digest)
+    }
+
+    fn enrollment_with_certificate_digest(&self, digest: [u8; 32]) -> io::Result<Enrollment> {
         self.sync_mode.install();
         Enrollment::authorized(
             &self.enrollment,
@@ -312,7 +325,7 @@ impl Config {
             self.keeper,
             self.catalog,
             &self.domains[&self.keeper],
-            &self.tls.certificate,
+            digest,
         )
     }
 
@@ -376,6 +389,14 @@ impl Config {
                     "admin listener address must be separate from consensus listeners",
                 ));
             }
+            if admin
+                .probe_listen
+                .is_some_and(|probe| !probe.ip().is_loopback())
+            {
+                return Err(invalid(
+                    "plain HTTP probe listener must bind to a loopback address",
+                ));
+            }
         }
         Ok(placement)
     }
@@ -392,63 +413,35 @@ impl Config {
         let control = TcpListener::bind(peer).await?;
         let bulk = TcpListener::bind(bulk).await?;
         let admin_listener = match &self.admin {
-            Some(admin) => Some(TcpListener::bind(admin.listen).await?),
+            Some(admin) => Some((TcpListener::bind(admin.listen).await?, admin.mtls)),
             None => None,
         };
-        let (engine, acceptors, admin_tls) = self.prepare(stop).await?;
-        let admin = admin_listener.map(|listener| (listener, admin_tls));
-        engine
-            .serve([listener, control, bulk], acceptors, admin)
-            .await
+        #[cfg(unix)]
+        let reload = self.clone();
+        let engine = self.prepare(stop).await?;
+        #[cfg(unix)]
+        let reloader = engine.tls.listen_for_reload(reload, engine.stop.clone())?;
+        let result = engine
+            .serve([listener, control, bulk], admin_listener)
+            .await;
+        #[cfg(unix)]
+        let _ = reloader.await;
+        result
     }
 
-    pub(super) async fn prepare(
-        self,
-        stop: CancellationToken,
-    ) -> io::Result<(Arc<Engine>, [TlsAcceptor; 3], Option<TlsAcceptor>)> {
+    pub(super) async fn prepare(self, stop: CancellationToken) -> io::Result<Arc<Engine>> {
         let placement = self.validate()?;
         let summary = self.summary();
         let keeper = KeeperId(self.keeper.as_u128());
-        let acceptors = [
-            self.tls
-                .server_protocols(keeper, Lane::Application.alpns())?,
-            self.tls.server_protocols(keeper, Lane::Control.alpns())?,
-            self.tls.server_protocols(
-                keeper,
-                &[
-                    super::BULK_ALPN,
-                    super::PREV_BULK_ALPN,
-                    super::REPLICATION_ALPN,
-                    super::PREV_REPLICATION_ALPN,
-                ],
-            )?,
-        ];
-        let admin_tls = match &self.admin {
-            Some(admin) if admin.mtls => Some(self.tls.server_protocols(keeper, &[b"http/1.1"])?),
-            _ => None,
-        };
-        let enrollment = self.enrollment()?;
+        let material = self.tls.keeper_tls(keeper)?;
+        let enrollment = self.enrollment_with_certificate_digest(material.certificate_digest)?;
+        let public_key = material.public_key.clone();
+        let tls = tls::Tls::new(material);
         let (rpc, control, bulk, replication) = (
-            Rpc::new(
-                self.tls.peer_protocols(keeper, Lane::Application.alpns())?,
-                self.keepers,
-                Lane::Application,
-            ),
-            Rpc::new(
-                self.tls.peer_protocols(keeper, Lane::Control.alpns())?,
-                self.peers,
-                Lane::Control,
-            ),
-            Rpc::new(
-                self.tls.peer_protocols(keeper, Lane::Bulk.alpns())?,
-                self.bulk.clone(),
-                Lane::Bulk,
-            ),
-            Rpc::new(
-                self.tls.peer_protocols(keeper, Lane::Replication.alpns())?,
-                self.bulk,
-                Lane::Replication,
-            ),
+            Rpc::keeper(tls.clone(), self.keepers, Lane::Application),
+            Rpc::keeper(tls.clone(), self.peers, Lane::Control),
+            Rpc::keeper(tls.clone(), self.bulk.clone(), Lane::Bulk),
+            Rpc::keeper(tls.clone(), self.bulk, Lane::Replication),
         );
         let id = self.keeper;
         let registry = self.enrollment.clone();
@@ -482,7 +475,6 @@ impl Config {
         let timed = match (self.timed_authority.clone(), self.timed_original.clone()) {
             (Some(authority), _) => Some(authority),
             (None, Some(config)) => {
-                let public_key = self.tls.public_key(keeper)?;
                 Some(config.authority(keeper, &public_key, tokio::runtime::Handle::current())?)
             }
             (None, None) => None,
@@ -498,6 +490,13 @@ impl Config {
         };
         let engine = Arc::new(Engine {
             summary,
+            tls,
+            probe_listen: self.admin.as_ref().and_then(|admin| admin.probe_listen),
+            metrics_readers: self
+                .admin
+                .into_iter()
+                .flat_map(|admin| admin.metrics_readers)
+                .collect(),
             timed,
             id,
             catalog_id: self.catalog,
@@ -561,7 +560,7 @@ impl Config {
             #[cfg(test)]
             crash: std::sync::atomic::AtomicBool::new(false),
         });
-        Ok((engine, acceptors, admin_tls))
+        Ok(engine)
     }
 }
 
@@ -573,6 +572,9 @@ struct TimedState {
 pub(super) struct Engine {
     /// This keeper's settings without secrets, which `/status` reports.
     summary: serde_json::Value,
+    tls: tls::Tls,
+    probe_listen: Option<SocketAddr>,
+    metrics_readers: HashSet<String>,
     timed: Option<Arc<TimedState>>,
     pub(super) id: uuid::Uuid,
     catalog_id: uuid::Uuid,
@@ -713,8 +715,7 @@ impl Engine {
     pub(super) async fn serve(
         self: Arc<Self>,
         listeners: [TcpListener; 3],
-        acceptors: [TlsAcceptor; 3],
-        admin: Option<(TcpListener, Option<TlsAcceptor>)>,
+        admin: Option<(TcpListener, bool)>,
     ) -> io::Result<()> {
         let mut sockets = JoinSet::new();
         let result = async {
@@ -729,9 +730,14 @@ impl Engine {
                     );
                 }
             }
-            if let Some((listener, acceptor)) = admin {
+            if let Some((listener, mtls)) = admin {
                 let engine = self.clone();
-                sockets.spawn(async move { engine.listen_admin(listener, acceptor).await });
+                sockets.spawn(async move { engine.listen_admin(listener, mtls, false).await });
+            }
+            if let Some(address) = self.probe_listen {
+                let listener = TcpListener::bind(address).await?;
+                let engine = self.clone();
+                sockets.spawn(async move { engine.listen_admin(listener, false, true).await });
             }
             for genesis in self.disk.streams() {
                 if self.is_quarantined(genesis.stream) {
@@ -874,16 +880,13 @@ impl Engine {
                     }
                 }
             });
-            for ((listener, acceptor), (lane, capacity)) in
-                listeners.into_iter().zip(acceptors).zip([
-                    (Lane::Application, MAX_CLIENT_CONNECTIONS),
-                    (Lane::Control, 0),
-                    (Lane::Bulk, MAX_BULK_CONNECTIONS),
-                ])
-            {
+            for (listener, (lane, capacity)) in listeners.into_iter().zip([
+                (Lane::Application, MAX_CLIENT_CONNECTIONS),
+                (Lane::Control, 0),
+                (Lane::Bulk, MAX_BULK_CONNECTIONS),
+            ]) {
                 let engine = self.clone();
-                sockets
-                    .spawn(async move { engine.listen(listener, acceptor, lane, capacity).await });
+                sockets.spawn(async move { engine.listen(listener, lane, capacity).await });
             }
             tokio::select! {
                 _ = self.stop.cancelled() => Ok(()),
@@ -898,7 +901,7 @@ impl Engine {
         #[cfg(not(test))]
         let evict = true;
         if evict {
-            self.evict_leaders(Duration::from_secs(3)).await;
+            self.evict_leaders(Duration::from_secs(3), false).await;
         }
         sockets.shutdown().await;
         for group in std::mem::take(&mut *self.groups.lock().await).into_values() {
@@ -912,7 +915,7 @@ impl Engine {
     /// Hands every stream this keeper leads to a caught-up voter before a
     /// graceful shutdown, so its streams elect no new leader after a lease
     /// expires. Waits at most `limit` for leadership to move.
-    async fn evict_leaders(&self, limit: Duration) {
+    async fn evict_leaders(&self, limit: Duration, require_accepting: bool) {
         let groups = self
             .groups
             .lock()
@@ -920,38 +923,67 @@ impl Engine {
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let mut leading = Vec::new();
-        for group in groups {
-            let metrics = group.raft.metrics().borrow_watched().clone();
-            if metrics.state != openraft::ServerState::Leader {
-                continue;
-            }
-            let last = metrics.last_log_index;
-            let target = metrics.replication.as_ref().and_then(|progress| {
-                progress
-                    .iter()
-                    .filter(|(id, matched)| {
-                        **id != self.id.as_u128() && matched.map(|log| log.index) == last
-                    })
-                    .map(|(id, _)| *id)
-                    .next()
-            });
-            if let Some(target) = target
-                && group.raft.trigger().transfer_leader(target).await.is_ok()
-            {
-                leading.push(group);
-            }
-        }
-        let _ = timeout(limit, async {
-            for group in leading {
+        let _ = timeout(
+            limit,
+            futures::future::join_all(groups.into_iter().map(|group| async move {
                 let mut metrics = group.raft.metrics();
+                let mut targets = BTreeSet::new();
+                let current = metrics.borrow_watched().clone();
+                if current.state != openraft::ServerState::Leader {
+                    return;
+                }
+                for id in current.membership_config.membership().voter_ids() {
+                    if id != self.id.as_u128()
+                        && self
+                            .reachable(uuid::Uuid::from_u128(id))
+                            .await
+                            .map_or(!require_accepting, |status| status.accepting)
+                    {
+                        targets.insert(id);
+                    }
+                }
+                if targets.is_empty() {
+                    return;
+                }
+                let Ok(_membership) = group.membership.try_lock() else {
+                    return;
+                };
+                // Bound the write pause by the hand-off deadline. A busy
+                // stream's followers can now catch up to the last proposal.
+                let Ok(_writes) = group.writes.acquire_many(MAX_PENDING_WRITES as u32).await else {
+                    return;
+                };
+                loop {
+                    let current = metrics.borrow_watched().clone();
+                    if current.state != openraft::ServerState::Leader {
+                        return;
+                    }
+                    let matched = current
+                        .replication
+                        .iter()
+                        .flatten()
+                        .find_map(|(id, matched)| {
+                            (targets.contains(id)
+                                && matched.map(|log| log.index) == current.last_log_index)
+                                .then_some(*id)
+                        });
+                    if let Some(target) = matched {
+                        if group.raft.trigger().transfer_leader(target).await.is_err() {
+                            return;
+                        }
+                        break;
+                    }
+                    if metrics.changed().await.is_err() {
+                        return;
+                    }
+                }
                 while metrics.borrow_watched().state == openraft::ServerState::Leader {
                     if metrics.changed().await.is_err() {
                         break;
                     }
                 }
-            }
-        })
+            })),
+        )
         .await;
     }
 
@@ -1265,6 +1297,7 @@ impl Engine {
                 }));
             }
             None => {
+                let _placement = self.mode.admit_placement().await?;
                 self.disk
                     .maintenance(Record::Register(genesis.clone()))
                     .await?

@@ -187,6 +187,33 @@ impl Engine {
         (peer.answered.elapsed() < PING_INTERVAL * MISSED_PINGS).then(|| peer.status.clone())
     }
 
+    pub(super) fn advertised_features(&self) -> u64 {
+        let mut advertised = features::SUPPORTED;
+        if self.mode.mode() == super::drain::Mode::Decommissioning {
+            advertised |= features::DECOMMISSIONING;
+        }
+        advertised
+    }
+
+    pub(super) fn decommissioning(&self) -> BTreeSet<Uuid> {
+        let mut keepers = self
+            .liveness
+            .lock()
+            .peers
+            .iter()
+            .filter(|(_, peer)| {
+                !peer.version_mismatch
+                    && peer.answered.elapsed() < PING_INTERVAL * MISSED_PINGS
+                    && peer.status.features & features::DECOMMISSIONING != 0
+            })
+            .map(|(&keeper, _)| keeper)
+            .collect::<BTreeSet<_>>();
+        if self.advertised_features() & features::DECOMMISSIONING != 0 {
+            keepers.insert(self.id);
+        }
+        keepers
+    }
+
     /// Whether `keeper` recently answered with an incompatible protocol version.
     /// A version mismatch counts as alive and never triggers automatic repair.
     pub(super) fn version_mismatched(&self, keeper: Uuid) -> bool {
@@ -306,7 +333,7 @@ impl Engine {
         }
     }
 
-    /// Whether every other keeper in the inventory answers a live probe now
+    /// Whether every other active keeper answers a live probe now
     /// and advertises the write-version gate: `Ok(())` when all do,
     /// `Unsupported` when one answers without the feature or on another
     /// protocol version, and `Unavailable` when one does not answer. Live
@@ -322,7 +349,7 @@ impl Engine {
         }
         let peers = self
             .placement
-            .all_domains()
+            .domains()
             .keys()
             .copied()
             .filter(|keeper| *keeper != self.id)
@@ -337,7 +364,7 @@ impl Engine {
                         keeper,
                         self.recognition.own(),
                         BUILD_VERSION.to_owned(),
-                        features::SUPPORTED,
+                        self.advertised_features(),
                         PING_TIMEOUT,
                     ),
                 )
@@ -396,6 +423,7 @@ impl Engine {
             .filter(|keeper| *keeper != self.id)
             .collect::<Vec<_>>();
         let own = self.recognition.own();
+        let advertised = self.advertised_features();
         let answers = futures::future::join_all(peers.into_iter().map(|keeper| async move {
             let answer = timeout(
                 PING_TIMEOUT,
@@ -403,7 +431,7 @@ impl Engine {
                     keeper,
                     own,
                     BUILD_VERSION.to_owned(),
-                    features::SUPPORTED,
+                    advertised,
                     PING_TIMEOUT,
                 ),
             )
@@ -492,6 +520,7 @@ impl Engine {
     /// the repair delay, doubling up to `MAX_WAKE_BACKOFF`, before it is
     /// woken again, so a stream that cannot be repaired does not stay awake.
     async fn wake_for_dead(&self) {
+        let leaving = self.decommissioning();
         let dead = self
             .placement
             .all_domains()
@@ -540,12 +569,15 @@ impl Engine {
                     dead.contains(voter) || !self.placement.all_domains().contains_key(voter)
                 })
                 .count();
-            lost == 1 || (lost == 0 && !self.placement.roster(voters))
+            lost == 1
+                || (lost == 0
+                    && (!self.placement.roster(voters)
+                        || voters.iter().any(|voter| leaving.contains(voter))))
         };
         if !candidates.iter().any(|(_, voters)| needs_wake(voters)) {
             // A woken stream leaves the candidates while it is open, so its
             // backoff is kept as long as a keeper is dead.
-            if dead.is_empty() {
+            if dead.is_empty() && leaving.is_empty() {
                 self.liveness.lock().wakes.clear();
             }
             return;

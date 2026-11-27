@@ -594,21 +594,7 @@ impl Credentials {
         self.keyed_server(keeper, &[ALPN])
     }
 
-    /// The public key of the configured keeper certificate.
-    pub(super) fn public_key(&self, keeper: KeeperId) -> io::Result<Vec<u8>> {
-        Ok(self.keyed_server(keeper, &[ALPN])?.1)
-    }
-
     #[cfg(test)]
-    #[allow(dead_code)]
-    pub(super) fn server_protocol(
-        &self,
-        keeper: KeeperId,
-        protocol: &[u8],
-    ) -> io::Result<TlsAcceptor> {
-        self.server_protocols(keeper, &[protocol])
-    }
-
     pub(super) fn server_protocols(
         &self,
         keeper: KeeperId,
@@ -624,14 +610,27 @@ impl Credentials {
         keeper: KeeperId,
         protocols: &[&[u8]],
     ) -> io::Result<(TlsAcceptor, Vec<u8>)> {
-        let provider = Arc::new(ring::default_provider());
-        let verifier = WebPkiClientVerifier::builder_with_provider(
-            Arc::new(self.root_store()?),
-            Arc::clone(&provider),
+        Self::build_server(
+            keeper,
+            protocols,
+            certificates(&self.certificate)?,
+            self.key()?,
+            self.root_store()?,
         )
-        .build()
-        .map_err(display_error)?;
-        let chain = certificates(&self.certificate)?;
+    }
+
+    fn build_server(
+        keeper: KeeperId,
+        protocols: &[&[u8]],
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        roots: RootCertStore,
+    ) -> io::Result<(TlsAcceptor, Vec<u8>)> {
+        let provider = Arc::new(ring::default_provider());
+        let verifier =
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
+                .build()
+                .map_err(display_error)?;
         let certificate = leaf(Some(&chain))?;
         if keeper_id(certificate)? != keeper {
             return Err(invalid("configured keeper does not match certificate URI"));
@@ -643,7 +642,7 @@ impl Credentials {
             .with_protocol_versions(&[&TLS13])
             .map_err(display_error)?
             .with_client_cert_verifier(verifier)
-            .with_single_cert(chain, self.key()?)
+            .with_single_cert(chain, key)
             .map_err(display_error)?;
         config.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
         config.send_tls13_tickets = 0;
@@ -692,9 +691,18 @@ impl Credentials {
         protocols: &[&[u8]],
         chain: Vec<CertificateDer<'static>>,
     ) -> io::Result<TlsConnector> {
+        Self::build_connector(protocols, chain, self.key()?, self.root_store()?)
+    }
+
+    fn build_connector(
+        protocols: &[&[u8]],
+        chain: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        roots: RootCertStore,
+    ) -> io::Result<TlsConnector> {
         let provider = Arc::new(ring::default_provider());
         let verifier = Arc::new(KeeperVerifier {
-            roots: self.root_store()?,
+            roots,
             algorithms: provider.signature_verification_algorithms,
         });
         let mut config = ClientConfig::builder_with_provider(provider)
@@ -702,12 +710,33 @@ impl Credentials {
             .map_err(display_error)?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
-            .with_client_auth_cert(chain, self.key()?)
+            .with_client_auth_cert(chain, key)
             .map_err(display_error)?;
         config.alpn_protocols = protocols.iter().map(|protocol| protocol.to_vec()).collect();
         config.enable_sni = false;
         config.resumption = rustls::client::Resumption::disabled();
         Ok(TlsConnector::from(Arc::new(config)))
+    }
+
+    /// Loads one credential set for both directions of a keeper's TLS traffic.
+    pub(super) fn keeper_tls(&self, keeper: KeeperId) -> io::Result<KeeperTls> {
+        use sha2::{Digest, Sha256};
+
+        let pem = std::fs::read(&self.certificate)?;
+        let chain = CertificateDer::pem_slice_iter(&pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(display_error)?;
+        let key = self.key()?;
+        let roots = self.root_store()?;
+        let (server, public_key) =
+            Self::build_server(keeper, &[], chain.clone(), key.clone_key(), roots.clone())?;
+        let client = Self::build_connector(&[], chain, key, roots)?;
+        Ok(KeeperTls {
+            server: server.config().as_ref().clone(),
+            client: client.config().as_ref().clone(),
+            public_key,
+            certificate_digest: Sha256::digest(&pem).into(),
+        })
     }
 
     fn key(&self) -> io::Result<PrivateKeyDer<'static>> {
@@ -721,6 +750,13 @@ impl Credentials {
         }
         Ok(roots)
     }
+}
+
+pub(super) struct KeeperTls {
+    pub server: ServerConfig,
+    pub client: ClientConfig,
+    pub public_key: Vec<u8>,
+    pub certificate_digest: [u8; 32],
 }
 
 #[derive(Debug)]

@@ -199,7 +199,6 @@ impl Engine {
     pub(super) async fn listen(
         self: Arc<Self>,
         listener: TcpListener,
-        acceptor: TlsAcceptor,
         lane: Lane,
         capacity: usize,
     ) -> io::Result<()> {
@@ -220,7 +219,7 @@ impl Engine {
                 } => {
                     let (socket, pending) = admitted?;
                     let engine = self.clone();
-                    let acceptor = acceptor.clone();
+                    let acceptor = self.tls.server(lane);
                     let connections = connections.clone();
                     let control = control.clone();
                     tasks.spawn(async move {

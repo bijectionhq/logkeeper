@@ -16,34 +16,16 @@ every few milliseconds. Results:
 - The worst append stall during a restart was 2.35 s, and the mean 0.66 s.
 - A keeper was ready again at most 2.3 s after it started.
 
-In 24 of the 40 restarts, the stopping keeper handed its leaders off and
-writes paused for well under a second. In the other 16, a leader was not
-handed off: the hand-off only targets a follower that has matched the
-leader's last entry, and under constant writes there often is none. Its
-streams then waited out the 1.8 s lease plus an election. Budget about 2.5 s
-of write unavailability per keeper restart, on the streams that keeper leads.
+The drain and shutdown paths now pause writes briefly while a target voter
+catches up. The mixed-binary qualification also runs a complete rolling
+restart with writes in flight.
 
 ## Before you start
 
-1. **Check compatibility.** With **[upgrades]**, the new release must be
-   exactly one release ahead of every running keeper (N-1). On `main`
-   without it, the two builds must have identical ALPNs. Compare
-   `logkeeper_build_info` on a running keeper:
-
-   ```sh
-   curl -sS $ADMIN/metrics | grep '^logkeeper_build_info'
-   # logkeeper_build_info{version="0.2.0",keeper="...",domain="zone-a",control_alpn="logkeeper-consensus-control/8",replication_alpn="logkeeper-consensus-replication/3",bulk_alpn="logkeeper-consensus-bulk/2"} 1
-   ```
-
-   Then check the constants in the new release's
-   `src/stream/consensus/mod.rs`:
-
-   ```sh
-   git -C logkeeper show NEW_SHA:src/stream/consensus/mod.rs | grep '_ALPN: &\[u8\]'
-   ```
-
-   If any ALPN differs on `main` without **[upgrades]**, this is not a rolling
-   upgrade. Stop every keeper, upgrade them all, and start them all.
+1. **Check compatibility.** Use the previous release supported by the target
+   binary. This release was tested against Logkeeper `44d3f2aadb`. Check the
+   current and previous ALPNs in the target source and compare them with
+   `logkeeper_build_info` on a running keeper.
 
 2. **Upgrade catalog keepers first when the protocol grows.** A new
    application request, such as `Request::Staging` from commit `59038f5`, is
@@ -52,12 +34,9 @@ of write unavailability per keeper restart, on the streams that keeper leads.
    `catalog_voters` before the other keepers. The release notes or the README
    say when a release adds a request.
 
-3. **Check media format changes.** Read the release notes or the README's
-   "Keeper storage and upgrade" section for a media format change, such as a
-   new `FORMAT` in `storage/media.rs`. A keeper migrates its media on first
-   start, and the old binary cannot reopen migrated media. With
-   **[upgrades]**, new formats wait for finalization, so rollback stays
-   possible until step 11.
+3. **Check media format changes.** Read the target release's storage and
+   upgrade notes. During a supported N−1 rolling upgrade, the write-version
+   gate keeps the media compatible with the previous binary until step 11.
 
 4. **Check that the cluster is healthy.** On every keeper:
 
@@ -88,6 +67,11 @@ of write unavailability per keeper restart, on the streams that keeper leads.
    `503` lists `blocking` entries of `{stream, voter, reason}`: another voter
    of a stream hosted here is unreachable or silent. **Abort** if it stays
    `503` for more than 5 minutes. Fix the other keeper first.
+
+   A previous binary may predate the admin listener. In that case check the
+   other voters of each hosted stream with `lk admin status --stream UUID
+   --config operator.json`, and proceed only when both are reachable and
+   report healthy. Start the new binary with the admin listener enabled.
 
 7. **Drain leaders, stop, upgrade, start:**
 
@@ -145,7 +129,8 @@ of write unavailability per keeper restart, on the streams that keeper leads.
    again. Rollback requires that the media still use a format the previous
    binary supports (see step 3). A release without operator mode ignores
    the drain mark. The keeper resumes draining when upgraded again,
-   until you clear the mark.
+   until you clear the mark. When the outgoing binary predates `admin drain`,
+   use its graceful shutdown in step 7.
 
 9. **Soak** for at least `minReadySeconds` (30 s), check `probe problems` on
    all keepers, then continue with the next keeper at step 6.
@@ -156,19 +141,15 @@ of write unavailability per keeper restart, on the streams that keeper leads.
    normal load. Until you finalize, rollback is the same procedure with the
    previous binary.
 
-11. **Finalize [upgrades]:** this allows the new durable formats. It is
-    refused unless every active keeper advertises the write-version gate.
-    `lk admin finalize-version` is reserved for it but refuses until the
-    cluster feature level from the upgrades work is on `main`. Until then,
-    call it from a Rust program with an administrator principal:
+11. **Finalize.** Once every active keeper supports the write-version gate
+    and the cluster has soaked, enable the new durable formats:
 
-    ```rust,ignore
-    let finalized = journal.finalize_version(TARGET).await?;   // ConsensusJournal
-    assert_eq!(finalized, TARGET);
+    ```sh
+    lk admin finalize-version --config operator.json
+    # cluster_version: 2
     ```
 
-    After finalizing, rolling back below this release is no longer
-    supported.
+    Schedule finalization after the rollback window has ended.
 
 ## Kubernetes
 
