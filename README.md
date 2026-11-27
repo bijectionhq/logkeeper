@@ -511,7 +511,13 @@ the last record kept; `acknowledge_recovery_with_marker` returns the entry's
 position. Readers see the kind in `Page::recoveries`; `Page::records` holds
 the entry's canonical encoding (`RecoveryEntry::encode`) at that position.
 No append produces the kind, whatever its bytes, and no client may seal as
-the reserved recovery writer, so a consumer can trust the kind. The kind is a
+the reserved recovery writer, so a consumer can trust the kind. The entry
+must be written for the stream to make progress, so it is exempt from the
+byte quota and the retained-record limit, within a fixed headroom
+(`RECOVERY_HEADROOM_BYTES`, 64 KiB, and `RECOVERY_HEADROOM_RECORDS`, 16)
+that only recovery entries, one per recovery, can use: a stream exactly at
+its quota still clears its fence, and its writer then trims before ordinary
+appends fit again. The kind is a
 bit of the record's framed length in snapshots (`LKRIMG`, `LKRIDX`) and in
 offloaded objects (`LKOFF001`), so snapshots, offload, reads below the local
 floor, export, import and restore carry the entry intact; a pending recorded

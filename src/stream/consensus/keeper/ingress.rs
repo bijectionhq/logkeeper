@@ -715,11 +715,10 @@ impl Engine {
             }
             PeerRequest::Snapshot(request, digest) => {
                 let data = request.data.len() as u64;
-                let capacity = group
-                    .genesis
-                    .quota_bytes
-                    .saturating_mul(9)
-                    .saturating_add(MAX_MESSAGE);
+                let capacity =
+                    crate::stream::consensus::state::quota_with_headroom(group.genesis.quota_bytes)
+                        .saturating_mul(9)
+                        .saturating_add(MAX_MESSAGE);
                 if data > SNAPSHOT_CHUNK_BYTES
                     || request
                         .offset

@@ -36,7 +36,10 @@ use crate::stream::{
         Configuration, Entry, Genesis, LogId, MAX_MESSAGE, Membership, RaftTypes, SnapshotMeta,
         Stage, invalid, options, ownership,
         placement::Placement,
-        state::{Command, EpochRuns, MAX_RETAINED_RECORDS, Outcome, Payload, RecordKind, State},
+        state::{
+            Command, EpochRuns, MAX_RETAINED_WITH_HEADROOM, Outcome, Payload, RecordKind, State,
+            quota_with_headroom,
+        },
     },
     keeper::durability::{sync_directory, sync_file},
 };
@@ -1215,7 +1218,7 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
                 file.try_clone()?,
                 &source.genesis,
                 digest,
-                MAX_RETAINED_RECORDS as u64,
+                MAX_RETAINED_WITH_HEADROOM as u64,
             )?;
             if stored != transferred || stored.raft() != expected {
                 return Err(invalid("snapshot metadata does not match its body"));
@@ -2249,7 +2252,7 @@ fn read_image(
     }
     let count = image.state.record_count()?;
     if count > max_records
-        || count > genesis.quota_bytes
+        || count > quota_with_headroom(genesis.quota_bytes)
         || count > size.saturating_sub(reader.position) / 8
     {
         return Err(invalid("invalid snapshot record count"));

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::{Genesis, Image, Payload, Selected, SnapshotMeta, invalid, sha256};
 use crate::stream::consensus::{
     decode, encode,
-    state::{EpochRuns, MAX_RETAINED_RECORDS, Offload, RecordKind, Recorded},
+    state::{EpochRuns, MAX_RETAINED_WITH_HEADROOM, Offload, RecordKind, Recorded},
     storage::objects::{Key, Location, Object, Objects, Reference},
 };
 
@@ -44,7 +44,8 @@ pub(in crate::stream::consensus::storage) fn indexed(magic: &[u8; 8]) -> bool {
         || magic == MAGIC_WITH_CUSTODY
 }
 const PAGE: usize = 128;
-const MAX_PAGES: usize = MAX_RETAINED_RECORDS / PAGE + 1;
+// A partial first page and the recovery headroom each add at most a page.
+const MAX_PAGES: usize = MAX_RETAINED_WITH_HEADROOM / PAGE + 2;
 const MAX_PAGE_BYTES: usize = 16 * 1024;
 pub(in crate::stream::consensus::storage) const MAX_ROOT_BYTES: u64 = 384 * 1024;
 // The encoded size of one page reference. A full stream's references take
@@ -123,7 +124,7 @@ pub(super) fn build(
     let mut dependencies = Dependencies::default();
     let mut first = image.state.retained_floor().0;
     let mut left = usize::try_from(image.state.record_count()?).map_err(io::Error::other)?;
-    if left > MAX_RETAINED_RECORDS {
+    if left > MAX_RETAINED_WITH_HEADROOM {
         return Err(invalid("snapshot exceeds retained record geometry"));
     }
     let mut records = image.state.records();
@@ -250,7 +251,7 @@ pub(super) fn open(
         legacy.insert(digest, Arc::new(Mutex::new(file)));
     }
     let count = root.image.state.record_count()?;
-    if count > MAX_RETAINED_RECORDS as u64 {
+    if count > MAX_RETAINED_WITH_HEADROOM as u64 {
         return Err(invalid("snapshot has too many records"));
     }
     let mut first = root.image.state.retained_floor().0;

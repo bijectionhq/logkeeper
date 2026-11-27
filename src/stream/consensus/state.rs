@@ -1,6 +1,25 @@
 //! Deterministic decisions over the committed journal view.
 
 pub(super) const MAX_RETAINED_RECORDS: usize = 262_144;
+/// How far typed recovery entries may take a stream past its byte quota.
+/// A stream exactly at its quota must still take the one entry that clears
+/// its recovery fence, or the fence never clears; ordinary writes stay
+/// within the quota, so only recovery entries, one per recovery, ever use
+/// this headroom.
+pub(super) const RECOVERY_HEADROOM_BYTES: u64 = 64 * 1024;
+/// How far typed recovery entries may take a stream past
+/// `MAX_RETAINED_RECORDS`, as `RECOVERY_HEADROOM_BYTES` for bytes.
+pub(super) const RECOVERY_HEADROOM_RECORDS: usize = 16;
+/// The most records any retained state holds: the ordinary limit and the
+/// recovery entries' headroom. Snapshot geometry admits this many.
+pub(super) const MAX_RETAINED_WITH_HEADROOM: usize =
+    MAX_RETAINED_RECORDS + RECOVERY_HEADROOM_RECORDS;
+
+/// The most bytes a stream of `quota` retains: the quota and the recovery
+/// entries' headroom.
+pub(super) fn quota_with_headroom(quota: u64) -> u64 {
+    quota.saturating_add(RECOVERY_HEADROOM_BYTES)
+}
 
 /// The writer of the fence an operator recovery installs. No client seals
 /// as this UUID with an empty principal, so the fence admits no append or
@@ -1455,7 +1474,10 @@ impl State {
                 .iter()
                 .map(|record| record_charge(record.len()))
                 .sum::<u64>();
-            if live.bytes != bytes || bytes > quota {
+            if live.bytes != bytes
+                || bytes > quota_with_headroom(quota)
+                || records.len() > MAX_RETAINED_WITH_HEADROOM
+            {
                 return Err(super::invalid("invalid retained snapshot quota"));
             }
             live.records = records;
@@ -1760,7 +1782,14 @@ impl Live {
             crc: crc32fast::hash(&entry),
             kind: RecordKind::Recovery,
         };
-        match self.append(at, retained, quota_bytes) {
+        // The entry must be written for the stream to make progress, so it
+        // may use the recovery headroom past the quota and record limit.
+        match self.append_within(
+            at,
+            retained,
+            quota_with_headroom(quota_bytes),
+            MAX_RETAINED_WITH_HEADROOM,
+        ) {
             Ok(_) => {
                 self.recorded = None;
                 let _ = self.acknowledge_recovery();
@@ -1815,6 +1844,18 @@ impl Live {
     }
 
     fn append(&mut self, at: Lsn, payload: Payload, quota_bytes: u64) -> Result<Outcome> {
+        self.append_within(at, payload, quota_bytes, MAX_RETAINED_RECORDS)
+    }
+
+    /// Appends `payload` at `at` if the stream stays within `quota_bytes`
+    /// and `max_records`.
+    fn append_within(
+        &mut self,
+        at: Lsn,
+        payload: Payload,
+        quota_bytes: u64,
+        max_records: usize,
+    ) -> Result<Outcome> {
         let conflict = JournalError::Conflict { head: self.head };
         if at < self.floor {
             return Err(JournalError::Trimmed { floor: self.floor });
@@ -1825,7 +1866,7 @@ impl Live {
         if payload.len() > MAX_RECORD {
             return Err(JournalError::TooLarge { max: MAX_RECORD });
         }
-        if self.records.len() >= MAX_RETAINED_RECORDS {
+        if self.records.len() >= max_records {
             return Err(JournalError::Full { floor: self.floor });
         }
         let charge = record_charge(payload.len());

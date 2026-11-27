@@ -1011,6 +1011,150 @@ async fn a_recovery_leaves_one_typed_entry_that_no_append_can_forge() {
     cluster.stop_all().await;
 }
 
+/// A stream filled exactly to its byte quota still takes the typed
+/// recovery entry that clears its fence: the entry uses the recovery
+/// headroom, which no ordinary write can. The stream then holds more than
+/// its quota, so the next ordinary append is refused as `Full` until the
+/// writer trims, and the over-quota state survives a snapshot and a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_at_its_quota_still_clears_its_recovery_fence() {
+    use journal_contract::{Journal, RecoverySource};
+
+    let mut cluster = Cluster::start_replicated().await;
+    cluster.finalize().await;
+    leased(&cluster).await;
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(0xA8);
+    let journal = cluster.client(&cluster.credentials);
+    // Four 64-byte records fill the 256-byte quota exactly.
+    journal
+        .create(stream, Voters::from([a, b, c]), 256)
+        .await
+        .unwrap();
+    let sealed = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap();
+    for at in 1..=4u64 {
+        journal
+            .append(
+                stream,
+                sealed.fence,
+                Lsn(at),
+                Bytes::from(format!("record-{at:057}")),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        journal
+            .append(stream, sealed.fence, Lsn(5), Bytes::from_static(b"x"))
+            .await,
+        Err(JournalError::Full { .. })
+    ));
+    let survivor = cluster.group(a, stream).await;
+    timeout(WAIT, async {
+        while survivor.state.head() != Ok(Lsn(4)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(survivor);
+
+    for keeper in [a, b, c] {
+        cluster.running.remove(&keeper).unwrap().stop().await;
+    }
+    let report = cluster.configs[&a]
+        .recover_stream(
+            stream,
+            Recovery {
+                acknowledge_data_loss: true,
+                lost: Some(vec![b, c]),
+                unreachable: vec![b, c],
+                ..Recovery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(report.written);
+    assert_eq!(report.head, Lsn(4));
+    cluster.restart(a).await;
+    configured(&journal, stream, report.voters).await;
+
+    // The acknowledgement writes the entry past the quota and clears the
+    // fence; a retry returns the same position.
+    let contract = super::recovery::contract_journal(&cluster, &cluster.credentials, report.voters);
+    let generic: &dyn Journal = &contract;
+    let fence = generic.recovery_fence(stream).await.unwrap().unwrap();
+    let marker = Bytes::from_static(b"consumer marker past the quota");
+    for _ in 0..2 {
+        assert_eq!(
+            generic
+                .acknowledge_recovery_with_marker(stream, fence, marker.clone())
+                .await,
+            Ok(Lsn(5))
+        );
+    }
+    assert_eq!(generic.recovery_fence(stream).await, Ok(None));
+    let page = generic
+        .read(stream, Lsn(1), 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.head, Lsn(5));
+    let [(at, entry)] = page.recoveries.as_slice() else {
+        panic!("one recovery entry: {:?}", page.recoveries);
+    };
+    assert_eq!(*at, Lsn(5));
+    assert_eq!(entry.fence, fence);
+    assert_eq!(entry.source, RecoverySource::Survivor);
+    assert_eq!(entry.marker.as_ref(), Some(&marker));
+
+    // Ordinary writes get no headroom: the writer resumes and must trim.
+    let epoch = Epoch(fence.epoch.0 + 1);
+    assert_eq!(generic.seal(stream, epoch).await, Ok(Lsn(5)));
+    assert!(matches!(
+        generic
+            .append(stream, epoch, Lsn(6), Bytes::from_static(b"x"))
+            .await,
+        Err(JournalError::Full { .. })
+    ));
+
+    // The over-quota stream survives a snapshot and a restart from it.
+    let group = snapshot(&cluster, a, stream).await;
+    drop(group);
+    cluster.running.remove(&a).unwrap().stop().await;
+    cluster.restart(a).await;
+    leased(&cluster).await;
+    timeout(WAIT, async {
+        loop {
+            if let Ok(page) = generic.read(stream, Lsn(1), 10, Duration::ZERO).await
+                && page.head == Lsn(5)
+            {
+                assert_eq!(page.recoveries.len(), 1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    timeout(WAIT, async {
+        while generic.trim(stream, epoch, Lsn(4)).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the writer trims the stream back under its quota");
+    assert_eq!(
+        generic
+            .append(stream, epoch, Lsn(6), Bytes::from_static(b"after trim"))
+            .await,
+        Ok(Lsn(6))
+    );
+    cluster.stop_all().await;
+}
+
 /// `records` without the typed recovery entry at `at`, the first entry of
 /// the recovered epoch.
 fn without_entry(records: Option<Vec<(Lsn, Bytes)>>, at: Lsn) -> Option<Vec<(Lsn, Bytes)>> {
