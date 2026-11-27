@@ -101,7 +101,12 @@ single-label `Host`).
    # safe_to_delete: true
    ```
 
-   This includes parked streams. If the command times out, use
+   This includes parked streams. `safe_to_delete` also needs the cluster to
+   agree: the catalog lists every stream whose genesis or latest move names
+   the keeper, and each stream's own configuration must leave it out.
+   `named_elsewhere` counts the streams that still name it (empty when one
+   did not answer), so a keeper with an empty or replaced disk is not
+   reported safe while streams it holds no copy of still count on it. If the command times out, use
    `lk admin drain-status --config operator.json --keeper "$KEEPER"` to check
    progress. Check the cluster's problems and spare capacity if the number
    of hosted replicas stops decreasing. Keep the keeper running until its

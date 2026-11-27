@@ -310,6 +310,7 @@ fn request(tag: usize) -> Option<Request> {
             },
         },
         42 => Request::LocalTip(STREAM),
+        43 => Request::NamedStreams(uuid::Uuid::from_u128(1)),
         _ => return None,
     })
 }
@@ -406,6 +407,7 @@ fn reply(tag: usize) -> Option<Reply> {
             written: true,
         }),
         13 => Reply::Tip(None),
+        14 => Reply::Named(vec![STREAM]),
         _ => return None,
     })
 }

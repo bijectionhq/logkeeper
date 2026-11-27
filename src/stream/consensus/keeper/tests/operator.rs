@@ -433,3 +433,64 @@ async fn draining_does_not_stall_writes_while_the_target_lags() {
     assert!(metrics.handoff_pauses.load(Ordering::Relaxed) >= 1);
     cluster.stop_all().await;
 }
+
+/// A decommissioning keeper that holds no copy of a stream which still
+/// names it is not safe to delete: the catalog lists the stream and the
+/// stream's own configuration confirms it. Once the stream moves off the
+/// keeper, it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn decommission_is_safe_only_once_no_stream_in_the_cluster_names_the_keeper() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, d] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    cluster.running[&c]
+        .engine
+        .set_mode(super::super::drain::Mode::Decommissioning, "test")
+        .await
+        .unwrap();
+    // `c` is down while the stream is created, and comes back
+    // decommissioning, so it never registers a copy of it.
+    cluster.running.remove(&c).unwrap().stop().await;
+    let stream = StreamId(234);
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
+    assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
+    cluster.restart(c).await;
+    let engine = cluster.running[&c].engine.clone();
+    let report = timeout(WAIT, async {
+        loop {
+            let report = engine.drain_report().await;
+            if report.named_elsewhere.is_some() {
+                break report;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the cluster answered for every stream naming the keeper");
+    // Locally it looks done; the cluster says otherwise.
+    assert_eq!((report.led, report.hosted), (0, 0));
+    assert_eq!(report.named_elsewhere, Some(1));
+    assert!(!report.safe_to_delete);
+
+    let current = journal.configuration(stream).await.unwrap();
+    journal
+        .replace(stream, current.revision, Voters::from([a, b, d]))
+        .await
+        .unwrap();
+    let report = timeout(WAIT, async {
+        loop {
+            let report = engine.drain_report().await;
+            if report.safe_to_delete {
+                break report;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("safe once no stream names the keeper");
+    assert_eq!(report.named_elsewhere, Some(0));
+    cluster.stop_all().await;
+}

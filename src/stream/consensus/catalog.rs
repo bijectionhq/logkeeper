@@ -240,6 +240,12 @@ impl Catalog {
     }
 
     /// The latest move staged for `stream`, which certifies a keeper's copy.
+    /// The streams whose genesis or latest staged move names `keeper`.
+    pub fn named(&self, keeper: uuid::Uuid) -> io::Result<Reply> {
+        self.require_trusted()?;
+        Ok(Reply::Named(named(&self.disk.catalog_entries(), keeper)))
+    }
+
     pub fn staged(&self, stream: StreamId) -> io::Result<Reply> {
         self.require_trusted()?;
         Ok(match self.disk.catalog(stream) {
@@ -382,4 +388,24 @@ where
         .await;
     }
     None
+}
+
+/// The streams among `entries` that may still name `keeper`: in their
+/// genesis voters, or on either side of their latest staged move. Every
+/// voter change is staged here before it happens, so a stream outside this
+/// list never named the keeper after its genesis.
+pub(super) fn named<'a>(
+    entries: impl IntoIterator<Item = &'a super::storage::CatalogEntry>,
+    keeper: uuid::Uuid,
+) -> Vec<StreamId> {
+    entries
+        .into_iter()
+        .filter(|entry| {
+            entry.genesis.voters.contains(&keeper)
+                || entry.staged.as_ref().is_some_and(|stage| {
+                    stage.old.contains(&keeper) || stage.target.contains(&keeper)
+                })
+        })
+        .map(|entry| entry.genesis.stream)
+        .collect()
 }

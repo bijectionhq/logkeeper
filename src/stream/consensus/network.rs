@@ -329,6 +329,10 @@ pub(super) enum Request {
     /// survivors of five only the more advanced one recovers. Keepers only;
     /// added last.
     LocalTip(StreamId),
+    /// A decommissioning keeper asks the catalog for every stream whose
+    /// genesis or latest staged move names it, answered with
+    /// `Reply::Named`. Sent only by that keeper. Added last.
+    NamedStreams(uuid::Uuid),
 }
 
 impl Request {
@@ -359,7 +363,8 @@ impl Request {
             Self::ClusterVersion
             | Self::FinalizeVersion(_)
             | Self::RenewLease { .. }
-            | Self::FenceKeeper(_) => StreamId(0),
+            | Self::FenceKeeper(_)
+            | Self::NamedStreams(_) => StreamId(0),
             Self::Seal { stream, .. }
             | Self::SealSession { stream, .. }
             | Self::AcknowledgeRecoveryWithMarker { stream, .. }
@@ -776,6 +781,8 @@ pub(super) enum Reply {
     /// The last log entry of the answering keeper's copy, if it holds one.
     /// Added last.
     Tip(Option<super::LogId>),
+    /// The streams a `Request::NamedStreams` asked about. Added last.
+    Named(Vec<StreamId>),
 }
 
 /// The N-1 wire codec for [`Reply`], the bincode layout of
@@ -848,7 +855,7 @@ impl ReplyV1 {
             Reply::ClusterVersion(_) => {
                 return Err(unsupported("cluster version requires a newer protocol"));
             }
-            Reply::Lease(_) | Reply::Recovered(_) => {
+            Reply::Lease(_) | Reply::Recovered(_) | Reply::Named(_) => {
                 return Err(unsupported(
                     "the configuration authority requires a newer protocol",
                 ));

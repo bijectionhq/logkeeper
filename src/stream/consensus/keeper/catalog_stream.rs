@@ -300,6 +300,19 @@ impl Engine {
                 self.authority_write(catalog, &group, authority::Change::Fence { keeper })
                     .await
             }
+            Request::NamedStreams(keeper) => {
+                let (fold, _) = match self.leading(catalog, &group, false).await {
+                    Ok(view) => view,
+                    Err(reply) => return Ok(reply),
+                };
+                if !fold.seeded {
+                    return Ok(failure(JournalError::Unavailable));
+                }
+                Ok(Reply::Named(crate::stream::consensus::catalog::named(
+                    fold.entries.values(),
+                    keeper,
+                )))
+            }
             Request::RecoverStream {
                 stage,
                 dead,

@@ -1655,6 +1655,8 @@ impl Engine {
                     if keeper.as_u128() == *id)
                     || matches!(request, Request::FenceKeeper(keeper)
                     if keeper.as_u128() == *id)
+                    || matches!(request, Request::NamedStreams(keeper)
+                    if keeper.as_u128() == *id)
                     || matches!(request, Request::RecoverStream { stage, .. }
                     if stage.survivors().iter().any(|survivor| survivor.as_u128() == *id)) =>
             {
@@ -1866,6 +1868,7 @@ impl Engine {
             | Request::Staging(_)
             | Request::ClusterVersion
             | Request::FenceKeeper(_)
+            | Request::NamedStreams(_)
             | Request::RecoverStream { .. }
                 if self.catalog_stream.is_some() =>
             {
@@ -1881,6 +1884,7 @@ impl Engine {
                     .await
             }
             Request::FenceKeeper(keeper) => self.catalog()?.fence(keeper).await,
+            Request::NamedStreams(keeper) => self.catalog()?.named(keeper),
             Request::RecoverStream {
                 stage,
                 dead,
@@ -2427,6 +2431,7 @@ impl Engine {
                         .await
                 }
                 Request::FenceKeeper(keeper) => catalog.fence(keeper).await,
+                Request::NamedStreams(keeper) => catalog.named(keeper),
                 _ => Err(invalid("invalid internal catalog request")),
             }
         } else {

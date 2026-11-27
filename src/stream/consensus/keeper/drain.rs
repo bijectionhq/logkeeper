@@ -181,7 +181,13 @@ pub(super) struct DrainReport {
     pub voter_streams: usize,
     /// True once a draining keeper leads nothing.
     pub drained: bool,
-    /// True once a decommissioning keeper has retired all its live copies.
+    /// Streams anywhere in the cluster whose current configuration still
+    /// names this keeper, checked once it holds no copy itself; `None` when
+    /// not checked or not every stream answered.
+    pub named_elsewhere: Option<usize>,
+    /// True once a decommissioning keeper holds no live copy and no stream
+    /// in the cluster names it: the catalog's placement records and each
+    /// stream's own configuration agree it can go.
     pub safe_to_delete: bool,
 }
 
@@ -358,6 +364,21 @@ impl Engine {
                 voter_streams += 1;
             }
         }
+        let locally_clear = mark.mode == Mode::Decommissioning
+            && self.replayed.load(Ordering::Acquire)
+            && self.disk.healthy()
+            && led == 0
+            && hosted == 0;
+        // A keeper with no copy of a stream cannot see that the stream still
+        // names it (an empty or replaced disk, a copy refused registration),
+        // so the cluster confirms before it reports safe.
+        // Boxed: the admin server awaits this report, and the checks below
+        // nest deep enough to pass the compiler's layout depth.
+        let named_elsewhere = if locally_clear {
+            Box::pin(self.streams_still_naming()).await
+        } else {
+            None
+        };
         DrainReport {
             keeper: self.id,
             mode: mark.mode,
@@ -366,11 +387,87 @@ impl Engine {
             hosted,
             voter_streams,
             drained: mark.mode.draining() && led == 0,
-            safe_to_delete: mark.mode == Mode::Decommissioning
-                && self.replayed.load(Ordering::Acquire)
-                && self.disk.healthy()
-                && led == 0
-                && hosted == 0,
+            named_elsewhere,
+            safe_to_delete: locally_clear && named_elsewhere == Some(0),
         }
+    }
+
+    /// How many streams in the cluster still name this keeper. The catalog
+    /// lists every stream whose genesis or latest staged move names it, and
+    /// each is checked against placement proofs from its other possible
+    /// voters. `None` when the catalog or any listed stream does not answer,
+    /// so a decommission never reports safe on a guess.
+    async fn streams_still_naming(&self) -> Option<usize> {
+        use futures::StreamExt;
+
+        let Ok(super::Reply::Named(streams)) = self
+            .catalog_request(super::Request::NamedStreams(self.id))
+            .await
+        else {
+            return None;
+        };
+        let checks = futures::stream::iter(streams)
+            .map(|stream| self.still_names(stream))
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        checks.into_iter().try_fold(0, |named, check| {
+            check.map(|names| named + usize::from(names))
+        })
+    }
+
+    /// Whether `stream`'s current configuration names this keeper, from the
+    /// placement proof with the highest revision among its other possible
+    /// voters, so a follower that has not applied a move onto this keeper
+    /// cannot hide it. `Some(false)` for a deleted stream; `None` when no
+    /// voter answers.
+    async fn still_names(&self, stream: journal_contract::StreamId) -> Option<bool> {
+        use crate::stream::consensus::state::Outcome;
+        use journal_contract::JournalError;
+
+        let mut candidates = std::collections::BTreeSet::new();
+        match self.catalog_request(super::Request::Locate(stream)).await {
+            Ok(super::Reply::Catalog(genesis, contacts)) => {
+                candidates.extend(genesis.voters);
+                candidates.extend(contacts);
+            }
+            _ => return None,
+        }
+        if let Ok(super::Reply::Staged(stage)) =
+            self.catalog_request(super::Request::Staging(stream)).await
+        {
+            candidates.extend(stage.old);
+            candidates.extend(stage.target);
+        }
+        candidates.remove(&self.id);
+        let mut newest: Option<crate::stream::consensus::network::Proof> = None;
+        for authority in candidates {
+            match self
+                .rpc
+                .call_application(
+                    authority,
+                    super::Request::PlacementProof(stream),
+                    super::REQUEST_TIMEOUT,
+                )
+                .await
+            {
+                Ok(super::Reply::Placement(proof))
+                    if newest.as_ref().is_none_or(|newest| {
+                        proof.configuration.revision > newest.configuration.revision
+                    }) =>
+                {
+                    newest = Some(proof);
+                }
+                Ok(super::Reply::Decision(Outcome::Refused(JournalError::Deleted))) => {
+                    return Some(false);
+                }
+                _ => (),
+            }
+        }
+        let proof = newest?;
+        Some(
+            proof.configuration.voters.contains(&self.id)
+                || proof.joint.is_some_and(|joint| joint.contains(&self.id)),
+        )
     }
 }
