@@ -469,6 +469,20 @@ impl Metrics {
             );
         }
 
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_stream_reopened_stopped_total Replicas reopened after their Raft core stopped on a storage error."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_stream_reopened_stopped_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_stream_reopened_stopped_total {}",
+            self.reopened_stopped.load(Ordering::Relaxed)
+        );
+
         // Elections & votes
         let _ = writeln!(
             out,
