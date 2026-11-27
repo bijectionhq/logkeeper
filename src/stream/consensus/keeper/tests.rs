@@ -2988,7 +2988,10 @@ async fn heartbeats_for_many_streams_share_one_frame_and_keep_the_parked_and_del
     }
     let engine = cluster.running[&a].engine.clone();
     let (parked, deleted) = (&streams[..4], streams[4]);
-    engine.parked.write().extend(parked.iter().copied());
+    engine
+        .parked
+        .write()
+        .extend(parked.iter().map(|stream| (*stream, Instant::now())));
     engine.deleted.write().insert(deleted);
     // A stale heartbeat from `b` reaches Raft, which refuses its old vote.
     let vote = Vote::new_committed(0, b.as_u128());
@@ -3027,7 +3030,7 @@ async fn heartbeats_for_many_streams_share_one_frame_and_keep_the_parked_and_del
     }
     // A repeated park of a parked stream is accepted without opening it.
     assert!(park.unwrap());
-    assert!(engine.parked.read().contains(&streams[0]));
+    assert!(engine.parked.read().contains_key(&streams[0]));
     engine.deleted.write().remove(&deleted);
     engine.parked.write().clear();
     // The connection survived the deleted stream's refusal.

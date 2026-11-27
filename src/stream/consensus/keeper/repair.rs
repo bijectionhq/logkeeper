@@ -90,6 +90,11 @@ impl Work {
 }
 
 impl Engine {
+    /// Whether a repair of `stream` is running.
+    pub(super) fn repairing(&self, stream: StreamId) -> bool {
+        self.repairs.lock().running.contains(&stream)
+    }
+
     /// This keeper's status without a replica.
     pub(super) async fn keeper_status(&self) -> KeeperStatus {
         let groups = self.groups.lock().await;

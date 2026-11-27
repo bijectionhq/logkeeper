@@ -398,8 +398,9 @@ struct Engine {
     /// Deleted streams whose groups this keeper closed. Clients are answered
     /// `Deleted` and peers are refused instead of reopening the group.
     deleted: parking_lot::RwLock<HashSet<StreamId>>,
-    /// Idle streams whose groups this keeper closed until the next request.
-    parked: parking_lot::RwLock<HashSet<StreamId>>,
+    /// Idle streams whose groups this keeper closed until the next request,
+    /// and when each parked.
+    parked: parking_lot::RwLock<HashMap<StreamId, Instant>>,
     /// State machines of parked and deleted groups, kept so the reaper
     /// cannot delete what only they reference.
     closed_states: parking_lot::Mutex<HashMap<StreamId, StateMachine>>,

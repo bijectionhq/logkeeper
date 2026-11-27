@@ -20,7 +20,7 @@ async fn parking_cluster() -> Cluster {
 async fn parked_on(cluster: &Cluster, stream: StreamId, voters: &[Uuid]) -> bool {
     for id in voters {
         let engine = &cluster.running[id].engine;
-        if !engine.parked.read().contains(&stream)
+        if !engine.parked.read().contains_key(&stream)
             || engine.groups.lock().await.contains_key(&stream)
         {
             return false;

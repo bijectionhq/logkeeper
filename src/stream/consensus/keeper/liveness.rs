@@ -213,7 +213,7 @@ impl Engine {
             let deleted = self.deleted.read();
             let quarantined = self.quarantined.read();
             let closed = self.closed_states.lock();
-            let parked_copies = parked.iter().filter_map(|stream| {
+            let parked_copies = parked.keys().filter_map(|stream| {
                 let configuration = closed.get(stream)?.finalized()?;
                 Some((*stream, configuration.voters))
             });
@@ -224,7 +224,7 @@ impl Engine {
                 .filter(|genesis| {
                     let stream = genesis.stream;
                     !open.contains(&stream)
-                        && !parked.contains(&stream)
+                        && !parked.contains_key(&stream)
                         && !deleted.contains(&stream)
                         && !quarantined.contains(&stream)
                         && self.attached(stream)
@@ -278,7 +278,7 @@ impl Engine {
     /// election timeout. `None` when this keeper holds no such closed copy
     /// or it did not open.
     pub(super) async fn unpark(&self, stream: StreamId) -> Option<std::sync::Arc<Group>> {
-        let parked = self.parked.write().remove(&stream);
+        let parked = self.parked.write().remove(&stream).is_some();
         if !parked
             && (self.deleted.read().contains(&stream)
                 || self.quarantined.read().contains(&stream)

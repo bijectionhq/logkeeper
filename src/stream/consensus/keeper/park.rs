@@ -4,11 +4,15 @@
 //! Once a stream has served no client and appended nothing for the park
 //! delay, its leader asks each follower that matches its whole log to park
 //! the stream: close the group and keep only a mark. When every follower has
-//! parked, the leader parks too. A parked follower answers empty heartbeats
-//! as busy without opening the group; entries, votes, snapshots and client
-//! requests reopen it. The voter that led the stream restores its
-//! leadership as soon as it reopens, so waking costs one vote round rather
-//! than an election timeout. A follower whose keeper is dead is skipped.
+//! parked, the leader parks too, unless a repair, a write or a vote started
+//! meanwhile. A parked follower answers empty heartbeats as busy without
+//! opening the group; entries, votes, snapshots and client requests reopen
+//! it, and so do heartbeats that outlast the park round, which come from a
+//! leader that stayed open because another follower declined. A leader
+//! whose park was declined waits the park delay before asking again. The
+//! voter that led the stream restores its leadership as soon as it reopens,
+//! so waking costs one vote round rather than an election timeout. A
+//! follower whose keeper is dead is skipped.
 
 use std::time::Duration;
 
@@ -23,12 +27,19 @@ use crate::stream::consensus::{
 };
 
 const PARK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a parked follower refuses empty heartbeats. A leader asks its
+/// followers at once and parks within `PARK_TIMEOUT`, so heartbeats after
+/// twice that come from a leader that did not park.
+pub(super) const PARKED_HEARTBEATS: Duration = Duration::from_secs(4);
 
 impl Engine {
-    /// Whether `group` served no client and grew no log for the park delay.
-    /// The replicated catalog is never idle.
+    /// Whether `group` served no client, grew no log and ran no repair for
+    /// the park delay. The replicated catalog is never idle.
     fn idle(&self, group: &Group, now: Instant) -> bool {
         if self.catalog_stream.is_some() && group.genesis.stream == super::catalog_stream::STREAM {
+            return false;
+        }
+        if self.repairing(group.genesis.stream) || group.membership.try_lock().is_err() {
             return false;
         }
         let metrics = group.raft.metrics().borrow_watched().clone();
@@ -81,32 +92,43 @@ impl Engine {
             }
             let stream = group.genesis.stream;
             let (vote, last) = (metrics.vote, metrics.last_applied);
+            // A dead follower cannot answer. Parking without it keeps a zone
+            // outage from holding every stream awake; the wake sweep reopens
+            // the stream for repair.
             let followers = metrics
                 .membership_config
                 .membership()
                 .voter_ids()
                 .filter(|id| *id != self.id.as_u128())
+                .map(uuid::Uuid::from_u128)
+                .filter(|follower| !self.dead(*follower))
                 .collect::<Vec<_>>();
-            let mut parked = true;
-            for follower in followers {
-                // A dead follower cannot answer. Parking without it keeps a
-                // zone outage from holding every stream awake; the wake
-                // sweep reopens the stream for repair.
-                if self.dead(uuid::Uuid::from_u128(follower)) {
-                    continue;
-                }
+            // Asked at once, so the round ends within `PARK_TIMEOUT` and a
+            // follower that parked for nothing reopens soon after.
+            let answers = futures::future::join_all(followers.into_iter().map(|follower| {
                 let frame = Frame::Peer(group.genesis.clone(), PeerRequest::Park { vote, last });
-                let accepted: bool = self
-                    .control
-                    .call(uuid::Uuid::from_u128(follower), frame, PARK_TIMEOUT)
-                    .await
-                    .unwrap_or(false);
-                parked &= accepted;
-            }
-            if parked {
+                self.control.call::<bool>(follower, frame, PARK_TIMEOUT)
+            }))
+            .await;
+            let accepted = answers.into_iter().all(|answer| answer.unwrap_or(false));
+            // A repair, a write or a vote may have started while the
+            // followers answered. Holding the membership lock keeps a
+            // replacement from starting on the group being closed.
+            let current = group.raft.metrics().borrow_watched().clone();
+            let unchanged = current.vote == vote
+                && current.last_applied == last
+                && current.last_log_index == metrics.last_log_index;
+            let membership = (accepted && unchanged && self.idle(&group, Instant::now()))
+                .then(|| group.membership.try_lock().ok())
+                .flatten();
+            if let Some(_membership) = membership {
                 self.park(stream).await;
             } else {
                 super::super::metrics::count(&super::super::metrics::COUNTERS.park_declined);
+                // Ask again only after another park delay.
+                self.activity
+                    .lock()
+                    .insert(stream, (current.last_log_index, Instant::now()));
             }
         }
     }
@@ -114,7 +136,7 @@ impl Engine {
     pub(super) async fn park(&self, stream: StreamId) {
         let parked = self
             .close_retaining(stream, || {
-                self.parked.write().insert(stream);
+                self.parked.write().insert(stream, Instant::now());
             })
             .await;
         if parked {

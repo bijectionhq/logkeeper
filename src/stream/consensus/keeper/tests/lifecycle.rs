@@ -112,7 +112,8 @@ async fn a_client_request_opens_a_stream_past_the_limit_at_startup() {
             let mut all_parked = true;
             for id in [a, b, c] {
                 let engine = &cluster.running[&id].engine;
-                if !engine.parked.read().contains(&first) || !engine.groups.lock().await.is_empty()
+                if !engine.parked.read().contains_key(&first)
+                    || !engine.groups.lock().await.is_empty()
                 {
                     all_parked = false;
                 }
@@ -158,7 +159,7 @@ async fn retiring_a_parked_copy_drops_its_closed_state_and_park_mark() {
     let engine_c = cluster.running[&c].engine.clone();
     let _ = cluster.group(c, stream).await;
     engine_c.park(stream).await;
-    assert!(engine_c.parked.read().contains(&stream));
+    assert!(engine_c.parked.read().contains_key(&stream));
     assert!(engine_c.closed_states.lock().contains_key(&stream));
     let pin = engine_c.closed_states.lock()[&stream].lifetime();
 
@@ -168,7 +169,7 @@ async fn retiring_a_parked_copy_drops_its_closed_state_and_park_mark() {
         .await
         .unwrap();
 
-    assert!(!engine_c.parked.read().contains(&stream));
+    assert!(!engine_c.parked.read().contains_key(&stream));
     assert!(!engine_c.closed_states.lock().contains_key(&stream));
     assert_eq!(
         pin.strong_count(),
