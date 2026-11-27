@@ -24,7 +24,9 @@ store's prefix otherwise. `restore_exact` shows the restored log is exactly
 the committed log through `known`, so recovery loses exactly the committed
 records past `known`, and `restore_keeps_uploaded` that the old lineage's
 uploaded prefix is a prefix of the restored log, which starts the new
-lineage. The control `whole_survivor_log_diverges` shows why the restore
+lineage. `one_recovery_record` states the owner's one-record decision: the
+recovery marker opens the next configuration epoch, which is the new offload
+lineage, at the reported loss point. The control `whole_survivor_log_diverges` shows why the restore
 point is the known-committed `known` and not the survivor's head: a survivor
 may hold an uncommitted record at an LSN at or below its head where the
 committed log holds another, so a loss check that compares heads misses it.
@@ -265,6 +267,36 @@ theorem restore_moves_forward {o : Offload} (good : Good o) (survivor : Survivor
       (by unfold known; have := through_committed good
           have := committedPrefix.length_le; rw [List.length_take] at this; omega)]
 
+/-- The one recovery record (owner decision, 2026-11-27): the catalog's
+    recovery transaction bumps the stream's configuration epoch, the new
+    offload lineage is that epoch, and the journal's recovery marker, the
+    first entry of the new epoch, carries it and the loss point. -/
+structure RecoveryRecord where
+  epoch : Nat
+  lossPoint : Nat
+
+/-- The recovery: the restored log followed by the marker of the next
+    configuration epoch, at the loss point `known`. -/
+def recover (o : Offload) (survivor : Survivor) (epoch : Nat) : Log × RecoveryRecord :=
+  (restore o survivor ++ [(epoch + 1, known o survivor)], ⟨epoch + 1, known o survivor⟩)
+
+/-- One record: the marker opens the next epoch at the reported loss point,
+    every committed record below it is kept at its LSN, and the old
+    lineage's uploads are a prefix of the new lineage's log. -/
+theorem one_recovery_record {o : Offload} (good : Good o) (survivor : Survivor) (epoch : Nat)
+    (committedPrefix : survivor.log.take survivor.commit <+: o.committed)
+    (held : survivor.commit ≤ survivor.log.length) :
+    let (log, record) := recover o survivor epoch
+    record.epoch = epoch + 1 ∧ record.lossPoint = known o survivor ∧
+      log = segment o.committed o.floor record.lossPoint ++ [(record.epoch, record.lossPoint)] ∧
+      uploaded o.objects <+: log := by
+  have exact := (restore_exact good survivor committedPrefix held).1
+  refine ⟨rfl, rfl, ?_, ?_⟩
+  · show restore o survivor ++ _ = _
+    rw [exact]
+  · exact (restore_keeps_uploaded good survivor committedPrefix held).trans
+      (List.prefix_append _ _)
+
 /-- The control: a survivor holds an uncommitted record `(1, 9)` at LSN 1, at
     or below its head 2, where the committed log holds `(2, 2)`. Restoring
     its whole log would keep the head at the acknowledged LSN and silently
@@ -287,6 +319,7 @@ theorem whole_survivor_log_diverges :
 #print axioms restore_exact
 #print axioms restore_keeps_uploaded
 #print axioms restore_moves_forward
+#print axioms one_recovery_record
 #print axioms whole_survivor_log_diverges
 
 end Logkeeper.ConsensusAdditions.OffloadPrefix

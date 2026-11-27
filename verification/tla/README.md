@@ -1,7 +1,8 @@
 # TLA+ model of the consensus keeper's protocol additions
 
 Two finite-state TLA+ specifications cover what Logkeeper adds on top of
-OpenRaft 0.10.1 in `src/stream/consensus/`. `check.sh` checks every
+OpenRaft 0.10.1 in `src/stream/consensus/`, and a third models the endgame's
+configuration authority with epoch leases. `check.sh` checks every
 configuration with a pinned TLC and exits non-zero when any outcome differs
 from the one it expects, so CI can call it.
 
@@ -58,6 +59,58 @@ The replicated catalog (`keeper/catalog_stream.rs`) on three voters: Raft,
 seeding from the single-keeper catalog, first-claim-wins claims under the
 internal fence, and compaction by checkpoint and trim.
 
+### `EpochLeases.tla`
+
+The endgame design (`logkeeper-consensus-design.md`, "Endgame: a
+configuration authority with epoch leases"): one stream, a compact Raft in
+the style of `LogkeeperProtocol` (direct RPCs, full-log replication, commit
+by inspection), and what the authority adds:
+
+- **Time.** A global real-time tick and a local tick per clock. Every
+  interval a keeper measures (a lease since its grant, the wait-out since the
+  recovery) is an anchor `[le, d]`: `le` is the local time elapsed and
+  `d = local - real` elapsed. Ticks keep `|d| <= D` for every live anchor,
+  which is what bounded clock-rate drift gives over an interval no longer
+  than a lease plus the wait-out. No two clocks are synchronized.
+- **Leases.** One catalog record per keeper `{epoch, fenced_streams}`. A
+  renewal is granted only to the current incarnation and says whether the
+  stream is fenced for that keeper. The holder treats it as valid while its
+  clock measured less than `L - M` since the grant.
+- **Gating.** Campaign, become leader, append, replicate, commit and read
+  need a valid lease of the current epoch that does not fence the stream,
+  and a finished wait-out. Votes and follower appends are not gated.
+- **Recovery** is one catalog transaction: new membership, the stream added
+  to the `fenced_streams` of every old voter outside it (`FenceRule =
+  "AllOld"`) or, as the spec words it, only of the keepers `--lost` names
+  (`"NamedOnly"`), epoch bumps for named keepers declared dead, and the
+  survivors' recovery round. `--lost` and "declared dead" are chosen
+  nondeterministically: absent, partial or wrong. The recovered members then
+  wait out `L + M` on their own clocks. The recovery term is only
+  `RecoveryGap = 1` above the survivor's, so nothing relies on the `2^32` gap.
+- **Environment.** Every keeper and the catalog sit on one of two sides; a
+  bounded number of arbitrary re-partitions; a permanent catalog outage; a
+  second incarnation of one keeper ID (new media) that registers under a
+  bumped epoch while the first keeps running or stops.
+
+Abstractions, each of which only adds behaviors, so a safety result carries
+over:
+
+1. A renewal's anchor starts when the catalog grants it, not when the holder
+   sent it, which lengthens leases. A reply delivered late is simulated by a
+   later grant: fences and epoch bumps are permanent, so a late reply that
+   carries a fence permits nothing, and one that does not is dominated by a
+   grant at the time the catalog answered.
+2. `LeasedProcs` lists the keepers whose leases are modeled; every other
+   keeper is treated as always holding a valid, unfenced lease. The
+   recovery configurations model the lost voters' leases; the reuse and
+   outage configurations model every keeper's.
+3. One wait-out clock stands for every recovered member's: the one that
+   finishes first, after which every member may act.
+4. The survivors, the replacements and the catalog stay on one side when the
+   network re-partitions (up to relabeling the sides, the other keepers
+   choose freely); in the recovery configurations re-partitions happen after
+   the recovery commits.
+
 ## Properties
 
 | Property | Meaning |
@@ -77,9 +130,11 @@ internal fence, and compaction by checkpoint and trim.
 
 ## Configurations
 
-Every configuration passes on the fixed protocol. The counterexamples below
-were found by the first version of the model; each configuration that failed
-then passes now, and none is kept as an expected failure.
+Every `LogkeeperProtocol` and `CatalogStream` configuration passes on the
+fixed protocol. The counterexamples below were found by the first version of
+the model; each configuration that failed then passes now, and none is kept
+as an expected failure. The `EpochLeases` configurations, including their
+expected failures, are listed in their own section below.
 
 | Config | Bounds | Checks | Result |
 | --- | --- | --- | --- |
@@ -200,6 +255,132 @@ vote at the recovery term. Every frame that carries the sender's vote now
 goes through `decisions::excludes_sender`. `LearnHigherTerm` models the
 answers, and `LostStayBelowRecoveryTerm` checks that no lost voter learns
 the recovered term.
+
+## Epoch leases (`EpochLeases.tla`)
+
+### Properties
+
+| Property | Meaning |
+| --- | --- |
+| `NoMixedHistory` | Once a reader has seen the recovered history, no reader sees a history the recovery did not keep, and every recovered read is a prefix of one log. Reads of the lost suffix before the recovered configuration serves are the acknowledged loss. |
+| `CommittedEntriesPreserved` | Every gated leader holds every record of its world committed in an earlier term; a recovered leader also holds every pre-recovery commit the survivors kept. Old-world commits the survivors never held, including the lost voters' commits during the wait-out, are the acknowledged loss. |
+| `ElectionSafety` | At most one leader per term within each world (the old configuration and the recovered one may reuse terms when the recovery gap is small; no record crosses between them). |
+| `NewWorldLogMatching` | Log matching among logs that extend the recovery round. |
+| `LossAboveReportedHead` | Every lost commit lies above the head the recovery reports. |
+| `LeadershipLapses` | Once the catalog is down for good, eventually no keeper leads, ever again. |
+
+### Configurations
+
+Bounds common to the recovery configurations: keepers `s` (survivor), `a`
+and `b` (lost), `r1` and `r2` (replacements); `L = 2`, `M = 1`, `D = 1`;
+`RecoveryGap = 1`; lost voters start at term 2 and may reach 3, above the
+recovery term 2; one re-partition after the commit; two appends. State
+counts are from TLC 2.19 on 10 workers of the development Mac.
+
+| Config | Setup | Checks | Result |
+| --- | --- | --- | --- |
+| `AuthorityRecovery` | both lost voters keep running, partitioned from the survivor and the catalog; `--lost` and "declared dead" free | `NoMixedHistory`, `CommittedEntriesPreserved`, `ElectionSafety`, `NewWorldLogMatching` | pass, 4,585,689 states, 4 min 47 s |
+| `AuthorityOutageSafety` | as above, plus a permanent catalog outage at any time | same | pass, 9,171,378 states, 14 min on 4 workers |
+| `AuthorityNoWaitOut` | control: no wait-out | same | `NoMixedHistory` violated |
+| `AuthorityDriftBeyondBound` | control: `D = 2 > M = 1` | same | `NoMixedHistory` violated |
+| `AuthorityNamedOnlyFence` | control: `--lost` narrows the fence, as the spec words it | same | `NoMixedHistory` violated (finding 2) |
+| `AuthorityLossPoint` | control: from a cut where the survivor led and wrote a record it never committed | `LossAboveReportedHead` | violated (finding 5) |
+| `AuthorityOutageLapse` | three keepers, every lease modeled, the catalog goes down for good, under fairness of time and step-down | `LeadershipLapses` | pass, 40,284 states, 10 s |
+| `AuthorityOutageNoLease` | control: leases not modeled | `LeadershipLapses` | violated |
+| `AuthorityReusedId` | keeper `k3` reincarnates on new media under a bumped epoch while the first incarnation runs or stops; 6d75fec kept | `CommittedEntriesPreserved`, `ElectionSafety` | pass, 1,011,168 states, 1 min 37 s |
+| `AuthorityReusedIdEpochOnly` | control: the epoch bump without 6d75fec | same | `CommittedEntriesPreserved` violated (finding 3) |
+| `AuthorityRF5` | RF 5: survivors `s`, `t`; lost `a`, `b`, `c`; three replacements; `ExcludeLostIds` | as `AuthorityRecovery` | not exhaustive: no violation in 18.7 million distinct states of breadth-first search (stopped, queue still growing) nor in 95 million states of random simulation (`-simulate -depth 60`, 11 min) |
+
+`check.sh` runs all but `AuthorityRF5`: the controls and the liveness and
+reuse configurations in `fast` mode, and `AuthorityRecovery` and
+`AuthorityOutageSafety` with the deep configurations.
+
+### Findings
+
+1. **The lease design closes CE-4 for lost voters that keep running, with no
+   term gap and no trust in `--lost`.** `AuthorityRecovery` lets both lost
+   voters run through the recovery at terms above the recovery term,
+   re-partitions the network once at any time after the commit (including
+   healing the lost pair toward the survivor or the catalog), and chooses
+   `--lost` and "declared dead" freely. A lost leader may overwrite the
+   survivor's recovery round before the wait-out ends; the survivor then
+   simply continues the old history, and no reader mixes histories. The Lean
+   module `EpochLease` proves the same for any number of steps.
+2. **`--lost` must not narrow the fence** (the code already fences every
+   voter the recovery leaves). The spec says `--lost` "narrows
+   fencing to named keepers". With a partial or wrong `--lost`, an unnamed
+   lost voter that reaches the catalog renews an unfenced lease after the
+   commit and, with the fenced voter's vote (votes are not gated), leads the
+   old configuration next to the recovered one (`AuthorityNamedOnlyFence`).
+   The recovery must fence every old voter outside the new membership;
+   `--lost` can only add epoch bumps for keepers declared dead.
+3. **The epoch bump does not replace 6d75fec.** Votes are not gated, so a new
+   incarnation under a reused ID that may register from peer traffic votes
+   with an empty log, and a laggard erases a committed record
+   (`AuthorityReusedIdEpochOnly`, CE-1 again). With 6d75fec's refusal kept,
+   `AuthorityReusedId` passes with the first incarnation still running. The
+   reused-ID rule is load-bearing, not only defense in depth.
+4. **With RF 5 and more than one survivor, the term gap (or an identity
+   exclusion) is still needed.** `AuthorityRF5` (two survivors, three lost voters
+   that are a quorum of the old configuration), with recovered copies
+   refusing the recovery's lost voters at any term (`ExcludeLostIds`), shows
+   no violation within its bounded runs; it is too large to finish. Without
+   that, and with a recovery term the lost voters can exceed, this trace
+   breaks it (argued, not model-checked: it needs two re-partitions and
+   terms beyond what TLC explores for eight keepers in reasonable time): a
+   lost leader above the recovery term overwrites survivor `s` before the
+   wait-out ends; after it, survivor `t` leads the recovered configuration
+   and serves the recovered history; `s`, unfenced and back in the old
+   configuration, leads it with the fenced lost voters' votes (votes are not
+   gated) and, at a higher term than `t`, overwrites `t`, which then serves
+   the old history. With one survivor (RF 3) nothing else holds the
+   recovered history, so the overwrite is harmless, which is what the Lean
+   proof covers. The shipped `2^32` gap prevents the trace in practice; the
+   identity exclusion removes the dependence on it.
+5. **The reported loss point can hide a loss.** A recovery keeps the survivor's whole log,
+   including records it never knew committed, and reports its head. If the
+   survivor led and wrote records it never committed, and the lost voters
+   then committed other records at the same LSNs, those acknowledged LSNs lie
+   at or below the reported head and hold other records, so a writer that
+   compares the head with what it was acknowledged sees no loss.
+   `AuthorityLossPoint` finds the trace; the Rust tests
+   `the_reported_head_never_covers_a_survivors_uncommitted_records` and
+   `recovery_keeps_committed_store_records_over_a_survivors_uncommitted_ones`
+   reproduce it on real keepers, the second with the offload store holding
+   the committed records, which the restore then ignores because the
+   survivor's head is at least the store's end. The fix the Lean module
+   `OffloadPrefix` proves exact: restore only known-committed records, the
+   larger of the store's committed run and the survivor's commit index, and
+   report that as the loss point.
+
+### Cross-check against the implementation (main at `3f15f877`)
+
+The authority landed in `c1544919`, `e6d29472`, `2ba84f47` and `972f6a83`.
+It matches the model on the points the model depends on: the recovery
+transaction fences every voter it leaves, by configuration revision
+(`decisions::copy_fenced`), whatever `--lost` names, which now only bumps
+epochs (finding 2 does not apply to the code); a lease runs from the
+holder's send time for the lease less the margin on its monotonic clock
+(`lease_valid`); the recovery waits a lease plus the margin after the
+catalog committed, before the survivor writes its round
+(`recovery_wait`); campaign, lead, append, snapshot and reads are gated
+(`holds_authority`); 6d75fec stays; and a recovery's offload lineage is its
+configuration revision, the one recovery record `OneRecoveryRecord` checks.
+Where the code is weaker than the model:
+
+- **Lease length is per catalog keeper.** A grant carries the granting
+  catalog keeper's configured `lease_millis` and margin, which the holder
+  uses, but the liveness record does not keep it, and the recovery waits the
+  answering catalog leader's own lease plus margin, at least the recovery
+  host's. After a configuration change that shortens the lease, a lost
+  keeper may still hold a longer lease granted by an earlier catalog leader
+  when the recovered configuration starts serving. The model has one `L`.
+  The catalog should record the longest lease it granted each keeper (or
+  refuse to shorten below outstanding grants) and wait that.
+- **`lease_valid` treats `now < sent` as valid.** With one monotonic clock
+  this cannot happen, but the model's rule is strictly "less than `L - M`
+  elapsed"; returning invalid there costs nothing.
+- **Loss point** (finding 5) on main, with and without offload.
 
 ## Fidelity review
 

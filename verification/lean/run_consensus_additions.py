@@ -14,7 +14,7 @@ from study_tools import check_lean_mutation, check_lean_theorems
 
 MODULES = {
     "RecoveryFence": 10, "Parking": 7, "RetireOnProof": 4, "CatalogClaim": 6,
-    "EpochLease": 10, "OffloadPrefix": 10,
+    "EpochLease": 10, "OffloadPrefix": 11,
 }
 
 CONTROLS = [

@@ -107,7 +107,7 @@ echo
 
 # Every property holds on the fixed protocol. The counterexamples the model
 # found (CE-1 to CE-4, see README.md) are fixed, so their configurations now
-# pass, and no configuration is expected to fail.
+# pass. The only expected failures are the epoch-lease controls below.
 run_case "RaftParkSafety"              "LogkeeperProtocol.tla" "RaftParkSafety.cfg"              pass
 run_case "ParkedRepairLiveness"        "LogkeeperProtocol.tla" "ParkedRepairLiveness.cfg"        pass liveness
 run_case "AbortedReplaceLiveness"      "LogkeeperProtocol.tla" "AbortedReplaceLiveness.cfg"      pass liveness
@@ -116,7 +116,20 @@ run_case "RecoverySingleReturnSnap"    "LogkeeperProtocol.tla" "RecoverySingleRe
 run_case "RecoverySingleReturnLiveness" "LogkeeperProtocol.tla" "RecoverySingleReturnLiveness.cfg" pass liveness
 run_case "RecoveryBothReturnLiveness"  "LogkeeperProtocol.tla" "RecoveryBothReturnLiveness.cfg"  pass liveness
 
+# The endgame's epoch leases (EpochLeases.tla). The controls must fail.
+run_case "AuthorityReusedId"           "EpochLeases.tla" "AuthorityReusedId.cfg"           pass
+run_case "AuthorityReusedIdEpochOnly"  "EpochLeases.tla" "AuthorityReusedIdEpochOnly.cfg"  invariant
+run_case "AuthorityOutageLapse"        "EpochLeases.tla" "AuthorityOutageLapse.cfg"        pass liveness
+run_case "AuthorityOutageNoLease"      "EpochLeases.tla" "AuthorityOutageNoLease.cfg"      liveness liveness
+run_case "AuthorityNoWaitOut"          "EpochLeases.tla" "AuthorityNoWaitOut.cfg"          invariant
+run_case "AuthorityDriftBeyondBound"   "EpochLeases.tla" "AuthorityDriftBeyondBound.cfg"   invariant
+run_case "AuthorityNamedOnlyFence"     "EpochLeases.tla" "AuthorityNamedOnlyFence.cfg"     invariant
+run_case "AuthorityLossPoint"          "EpochLeases.tla" "AuthorityLossPoint.cfg"          invariant
+
 if [[ "$MODE" != "fast" ]]; then
+  run_case "AuthorityRecovery"         "EpochLeases.tla" "AuthorityRecovery.cfg"           pass
+  run_case "AuthorityOutageSafety"     "EpochLeases.tla" "AuthorityOutageSafety.cfg"       pass
+
   run_case "AmnesiaWipe"               "LogkeeperProtocol.tla" "AmnesiaWipe.cfg"                 pass
   run_case "RepairReplaceSafety"       "LogkeeperProtocol.tla" "RepairReplaceSafety.cfg"         pass
   run_case "RecoveryBothReturn"        "LogkeeperProtocol.tla" "RecoveryBothReturn.cfg"          pass
