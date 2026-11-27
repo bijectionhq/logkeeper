@@ -64,6 +64,28 @@ pub struct RecoveryFence {
     pub head: Lsn,
 }
 
+/// Identifies one writer process or session within its authenticated principal.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WriterSessionId(pub u128);
+
+/// Authority for one writer session on one immutable history.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriterFence {
+    pub stream: StreamId,
+    pub writer_epoch: Epoch,
+    pub writer_session_id: WriterSessionId,
+}
+
+/// The fence and the committed head chosen at the instant of sealing.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SealReceipt {
+    pub fence: WriterFence,
+    pub sealed_head_lsn: Lsn,
+}
+
 /// A page of committed records.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +176,55 @@ pub trait Journal: Send + Sync {
     fn trim(&self, stream: StreamId, epoch: Epoch, through: Lsn) -> BoxFuture<'_, Result<()>>;
     /// Deletes the stream permanently.
     fn delete(&self, stream: StreamId) -> BoxFuture<'_, Result<()>>;
+    /// Claims and creates a stream whose committed positions are never reused.
+    /// A backend that cannot guarantee this property refuses the operation.
+    fn create_immutable(&self, _stream: StreamId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Verifies the claimed stream's immutable history mode without creating it.
+    fn require_immutable(&self, _stream: StreamId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Advances the expected epoch and binds it to this principal and session.
+    /// Retries by the same session return the original receipt while its fence holds.
+    fn seal_session(
+        &self,
+        _stream: StreamId,
+        _expected_writer_epoch: Epoch,
+        _writer_session_id: WriterSessionId,
+    ) -> BoxFuture<'_, Result<SealReceipt>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Commits the whole batch at the next position, or resolves an exact retained retry.
+    fn append_session_batch(
+        &self,
+        _fence: WriterFence,
+        _first_lsn: Lsn,
+        _records: Vec<Bytes>,
+    ) -> BoxFuture<'_, Result<Lsn>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Trims a stream under its current writer session.
+    fn trim_session(&self, _fence: WriterFence, _through: Lsn) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Reads one applied view whose head reaches `minimum_head`.
+    fn read_page(
+        &self,
+        _stream: StreamId,
+        _from: Lsn,
+        _minimum_head: Lsn,
+        _limit: usize,
+        _wait: Duration,
+    ) -> BoxFuture<'_, Result<Page>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
     /// Accepts an operator recovery of the stream: lifts the recovery fence so
     /// the next `seal` succeeds, and returns the recovered head. Idempotent.
     /// The recovery itself already accepted the possible loss; a writer

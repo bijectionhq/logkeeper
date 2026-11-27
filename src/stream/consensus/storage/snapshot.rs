@@ -140,6 +140,9 @@ impl Image {
     }
 
     fn verify_placement(&self, placement: &Placement, genesis: &Genesis) -> io::Result<()> {
+        if !self.state.matches_genesis(genesis) {
+            return Err(invalid("snapshot history differs from its genesis"));
+        }
         let membership = self.membership.membership();
         let current = self
             .configuration

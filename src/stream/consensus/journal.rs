@@ -6,7 +6,10 @@
 use std::{collections::BTreeSet, io, path::Path, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, Result, StreamId};
+use journal_contract::{
+    BoxFuture, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, Result, SealReceipt,
+    StreamId, WriterFence, WriterSessionId,
+};
 use parking_lot::RwLock;
 
 use crate::stream::timed::{
@@ -259,6 +262,33 @@ impl ConsensusJournal {
         original: TimedOriginal,
         payload: Bytes,
     ) -> Result<TimedOriginalProof> {
+        self.append_timed_with_fence(Self::fence(original.epoch), original, payload)
+            .await
+    }
+
+    /// A timed original staged and committed by the immutable stream's writer session.
+    pub async fn append_session_timed_original(
+        &self,
+        fence: WriterFence,
+        original: TimedOriginal,
+        payload: Bytes,
+    ) -> Result<TimedOriginalProof> {
+        if fence.stream != original.stream || fence.writer_epoch != original.epoch {
+            return Err(JournalError::Fenced {
+                current: fence.writer_epoch,
+            });
+        }
+        self.client.require_immutable(fence.stream).await?;
+        self.append_timed_with_fence(Self::session_fence(fence), original, payload)
+            .await
+    }
+
+    async fn append_timed_with_fence(
+        &self,
+        fence: Fence,
+        original: TimedOriginal,
+        payload: Bytes,
+    ) -> Result<TimedOriginalProof> {
         let timed = self.timed.as_ref().ok_or(JournalError::Unavailable)?;
         let max = timed.max_payload_bytes.ok_or(JournalError::Unavailable)?;
         if payload.len() > max {
@@ -290,7 +320,6 @@ impl ConsensusJournal {
         let proof = evidence
             .proof(&*timed.verifier)
             .ok_or(JournalError::Unavailable)?;
-        let fence = Self::fence(original.epoch);
         match self
             .client
             .append_original(original.stream, fence, &evidence, payload)
@@ -496,6 +525,57 @@ impl ConsensusJournal {
         &self.client
     }
 
+    async fn create_stream(&self, stream: StreamId, immutable: bool) -> Result<()> {
+        let placement = self.placement.read().clone();
+        let Placement::Ranked { eligible } = placement else {
+            let voters = placement.voters(stream)?;
+            return self
+                .client
+                .create_stream(stream, voters, self.quota_bytes, immutable)
+                .await;
+        };
+        // A retried or concurrent create reuses the catalog's genesis, so
+        // a changed keeper view never proposes a second one.
+        let voters = match self.client.claimed_voters(stream).await? {
+            Some(voters) => voters,
+            None => {
+                let health = self.health(stream, &eligible).await;
+                assignment::choose_balanced(
+                    stream,
+                    &assignment::View {
+                        eligible: &eligible,
+                        health: &health,
+                    },
+                )
+                .ok_or(JournalError::Unavailable)?
+            }
+        };
+        match self
+            .client
+            .create_stream(stream, voters, self.quota_bytes, immutable)
+            .await
+        {
+            Err(JournalError::Conflict { .. }) => {
+                let voters = self
+                    .client
+                    .claimed_voters(stream)
+                    .await?
+                    .ok_or(JournalError::Unavailable)?;
+                self.client
+                    .create_stream(stream, voters, self.quota_bytes, immutable)
+                    .await
+            }
+            result => result,
+        }
+    }
+
+    fn session_fence(fence: WriterFence) -> Fence {
+        Fence {
+            epoch: fence.writer_epoch,
+            writer: uuid::Uuid::from_u128(fence.writer_session_id.0),
+        }
+    }
+
     fn fence(epoch: Epoch) -> Fence {
         Fence {
             epoch,
@@ -549,44 +629,90 @@ impl Journal for ConsensusJournal {
             let max = self.max_record_bytes;
             return Box::pin(async move { Err(JournalError::TooLarge { max }) });
         }
-        Box::pin(self.client.acknowledge_recovery_with_marker(stream, fence, marker))
+        Box::pin(
+            self.client
+                .acknowledge_recovery_with_marker(stream, fence, marker),
+        )
     }
 
     fn create(&self, stream: StreamId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.create_stream(stream, false))
+    }
+
+    fn create_immutable(&self, stream: StreamId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.create_stream(stream, true))
+    }
+
+    fn require_immutable(&self, stream: StreamId) -> BoxFuture<'_, Result<()>> {
+        Box::pin(self.client.require_immutable(stream))
+    }
+
+    fn seal_session(
+        &self,
+        stream: StreamId,
+        expected_writer_epoch: Epoch,
+        writer_session_id: WriterSessionId,
+    ) -> BoxFuture<'_, Result<SealReceipt>> {
         Box::pin(async move {
-            let placement = self.placement.read().clone();
-            let Placement::Ranked { eligible } = placement else {
-                let voters = placement.voters(stream)?;
-                return self.client.create(stream, voters, self.quota_bytes).await;
-            };
-            // A retried or concurrent create reuses the catalog's genesis, so
-            // a changed keeper view never proposes a second one.
-            let voters = match self.client.claimed_voters(stream).await? {
-                Some(voters) => voters,
-                None => {
-                    let health = self.health(stream, &eligible).await;
-                    assignment::choose_balanced(
-                        stream,
-                        &assignment::View {
-                            eligible: &eligible,
-                            health: &health,
-                        },
-                    )
-                    .ok_or(JournalError::Unavailable)?
-                }
-            };
-            match self.client.create(stream, voters, self.quota_bytes).await {
-                Err(JournalError::Conflict { .. }) => {
-                    let voters = self
-                        .client
-                        .claimed_voters(stream)
-                        .await?
-                        .ok_or(JournalError::Unavailable)?;
-                    self.client.create(stream, voters, self.quota_bytes).await
-                }
-                result => result,
-            }
+            let receipt = self
+                .client
+                .seal_session(stream, expected_writer_epoch, writer_session_id)
+                .await?;
+            self.prefer_local_leader(stream).await;
+            Ok(receipt)
         })
+    }
+
+    fn append_session_batch(
+        &self,
+        fence: WriterFence,
+        first_lsn: Lsn,
+        records: Vec<Bytes>,
+    ) -> BoxFuture<'_, Result<Lsn>> {
+        Box::pin(async move {
+            if records
+                .iter()
+                .any(|record| record.len() > self.max_record_bytes)
+            {
+                return Err(JournalError::TooLarge {
+                    max: self.max_record_bytes,
+                });
+            }
+            self.client.require_immutable(fence.stream).await?;
+            retry_unavailable(self.deadline, |retried| {
+                self.client.append_batch_after(
+                    fence.stream,
+                    Self::session_fence(fence),
+                    first_lsn,
+                    records.clone(),
+                    retried,
+                )
+            })
+            .await
+        })
+    }
+
+    fn trim_session(&self, fence: WriterFence, through: Lsn) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.client.require_immutable(fence.stream).await?;
+            self.client
+                .trim(fence.stream, Self::session_fence(fence), through)
+                .await
+        })
+    }
+
+    fn read_page(
+        &self,
+        stream: StreamId,
+        from: Lsn,
+        minimum_head: Lsn,
+        limit: usize,
+        wait: Duration,
+    ) -> BoxFuture<'_, Result<Page>> {
+        Box::pin(
+            self.client
+                .read_at_least(stream, from, limit, wait, minimum_head),
+        )
     }
 
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, Result<Lsn>> {

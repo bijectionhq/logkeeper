@@ -209,6 +209,13 @@ impl State {
                 }
             }
             Record::Recover(stream, vote, entries) => {
+                if self
+                    .genesis
+                    .get(&stream)
+                    .is_some_and(|genesis| genesis.immutable)
+                {
+                    return Err(invalid("recovery would rewrite an immutable history"));
+                }
                 self.apply(Record::Vote(stream, vote))?;
                 self.apply(Record::Append(stream, entries))?;
             }
@@ -237,6 +244,16 @@ impl State {
                 self.apply(*record)?;
             }
             Record::Ownership(stream, change) => {
+                if matches!(&change, Change::Recover(_))
+                    && self
+                        .genesis
+                        .get(&stream)
+                        .is_some_and(|genesis| genesis.immutable)
+                {
+                    return Err(invalid(
+                        "recovery staging would rewrite an immutable history",
+                    ));
+                }
                 let log = self.log_mut(stream)?;
                 let has_cut = |cut: LogId| {
                     log.purged == Some(cut)

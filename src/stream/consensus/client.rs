@@ -12,7 +12,10 @@ use std::{
 
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
-use journal_contract::{Epoch, JournalError, Lsn, RecoveryFence, Result, StreamId};
+use journal_contract::{
+    Epoch, JournalError, Lsn, RecoveryFence, Result, SealReceipt, StreamId, WriterFence,
+    WriterSessionId,
+};
 use parking_lot::Mutex;
 use tokio::time::{Instant, sleep};
 
@@ -113,14 +116,35 @@ impl Client {
     pub async fn create(
         &self,
         stream: StreamId,
+        voters: [uuid::Uuid; 3],
+        quota_bytes: u64,
+    ) -> Result<()> {
+        self.create_stream(stream, voters, quota_bytes, false).await
+    }
+
+    /// Creates an immutable history after the cluster has finalized version 4.
+    pub async fn create_immutable(
+        &self,
+        stream: StreamId,
+        voters: [uuid::Uuid; 3],
+        quota_bytes: u64,
+    ) -> Result<()> {
+        self.create_stream(stream, voters, quota_bytes, true).await
+    }
+
+    pub(super) async fn create_stream(
+        &self,
+        stream: StreamId,
         mut voters: [uuid::Uuid; 3],
         quota_bytes: u64,
+        immutable: bool,
     ) -> Result<()> {
         voters.sort_unstable();
         let genesis = Genesis {
             stream,
             voters,
             quota_bytes,
+            immutable,
         };
         if !genesis.valid(self.rpc.keepers()) || voters.iter().any(|id| self.retired.contains(id)) {
             return Err(JournalError::Unavailable);
@@ -182,6 +206,48 @@ impl Client {
             .await?
         {
             Outcome::Sealed(sealed) => Ok(sealed),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
+    /// Checks the catalog-claimed history mode without opening a writer.
+    pub async fn require_immutable(&self, stream: StreamId) -> Result<()> {
+        let route = self.route(stream, Instant::now() + self.deadline).await?;
+        match route.genesis {
+            Some(genesis) if genesis.immutable => Ok(()),
+            Some(_) => Err(JournalError::Unsupported),
+            None => Err(JournalError::Unavailable),
+        }
+    }
+
+    /// Seals an immutable stream for this authenticated writer session.
+    pub async fn seal_session(
+        &self,
+        stream: StreamId,
+        expected_writer_epoch: Epoch,
+        writer_session_id: WriterSessionId,
+    ) -> Result<SealReceipt> {
+        match self
+            .operation(Request::SealSession {
+                stream,
+                expected_writer_epoch,
+                writer_session_id,
+            })
+            .await?
+        {
+            Outcome::Sealed(sealed)
+                if expected_writer_epoch.0.checked_add(1) == Some(sealed.fence.epoch.0)
+                    && sealed.fence.writer.as_u128() == writer_session_id.0 =>
+            {
+                Ok(SealReceipt {
+                    fence: WriterFence {
+                        stream,
+                        writer_epoch: sealed.fence.epoch,
+                        writer_session_id,
+                    },
+                    sealed_head_lsn: sealed.head,
+                })
+            }
             _ => Err(JournalError::Unavailable),
         }
     }
@@ -356,8 +422,12 @@ impl Client {
         payload: Bytes,
     ) -> Result<Lsn> {
         position(
-            self.operation(Request::AcknowledgeRecoveryWithMarker { stream, fence, payload })
-                .await?,
+            self.operation(Request::AcknowledgeRecoveryWithMarker {
+                stream,
+                fence,
+                payload,
+            })
+            .await?,
         )
     }
 

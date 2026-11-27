@@ -738,7 +738,8 @@ impl Engine {
                             && self.placement.structural_stage(stage)
                     }
                     Command::Recover(stage) => {
-                        stage.stream == group.genesis.stream
+                        !group.genesis.immutable
+                            && stage.stream == group.genesis.stream
                             && self.placement.structural_stage(stage)
                             && stage.recovery()
                     }

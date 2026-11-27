@@ -17,7 +17,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryFence, Result};
+use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryFence, Result, WriterSessionId};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +82,11 @@ pub enum Command {
         fence: RecoveryFence,
         at: Lsn,
         payload: Bytes,
+    },
+    SealSession {
+        expected_writer_epoch: Epoch,
+        writer_session_id: WriterSessionId,
+        owner: String,
     },
 }
 
@@ -156,6 +161,11 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
             at: Lsn,
             payload: Bytes,
         },
+        SealSession {
+            expected_writer_epoch: Epoch,
+            writer_session_id: WriterSessionId,
+            owner: String,
+        },
     }
     Application::deserialize(decoder).map(Box::new)
 }
@@ -188,6 +198,12 @@ impl std::fmt::Display for Command {
         match self {
             Self::Create => f.write_str("Create"),
             Self::Seal { expected, .. } => write!(f, "Seal({expected:?})"),
+            Self::SealSession {
+                expected_writer_epoch,
+                ..
+            } => {
+                write!(f, "SealSession({expected_writer_epoch:?})")
+            }
             Self::Append { at, payload, .. } => {
                 write!(f, "Append({at:?}, {} bytes)", payload.len())
             }
@@ -238,6 +254,10 @@ pub(super) enum State {
     Absent,
     Live(Live),
     Deleted,
+    Immutable {
+        live: Live,
+        sealed_head_lsn: Lsn,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -415,6 +435,9 @@ impl State {
         segment: Arc<super::storage::Object>,
     ) -> io::Result<Outcome> {
         if let Command::AcknowledgeRecoveryWithMarker { fence, at, payload } = command {
+            if genesis.immutable {
+                return Ok(Outcome::Refused(JournalError::Unsupported));
+            }
             let live = match self.live_mut() {
                 Ok(live) => live,
                 Err(error) => return Ok(Outcome::Refused(error)),
@@ -442,10 +465,10 @@ impl State {
                 // A record of unknown epoch is judged by its bytes alone.
                 return Ok(
                     if !retained.timed()
-                        && live
-                            .epochs
-                            .epoch(at)
-                            .is_none_or(|epoch| epoch == fence.epoch)
+                        && match live.epochs.epoch(at) {
+                            Some(epoch) => epoch == fence.epoch,
+                            None => !genesis.immutable,
+                        }
                         && retained.len() == payload.len()
                         && retained.load()? == payload
                     {
@@ -555,32 +578,48 @@ impl State {
             }
             extents.reverse();
             return Ok(live
-                .append_batch(at, payloads, &extents, &segment, genesis.quota_bytes)?
+                .append_batch(at, payloads, &extents, &segment, genesis)?
                 .into());
         }
-        Ok(self.decide(command).into())
+        Ok(self.decide(command, genesis).into())
     }
 
-    fn decide(&mut self, command: Command) -> Result<Outcome> {
+    fn decide(&mut self, command: Command, genesis: &Genesis) -> Result<Outcome> {
         if matches!(command, Command::Create) {
             return match self {
                 Self::Absent => {
-                    *self = Self::Live(Live {
+                    let live = Live {
                         writer: None,
                         head: Lsn(0),
                         floor: Lsn(1),
                         bytes: 0,
                         records: VecDeque::new(),
                         epochs: EpochRuns::default(),
-                    });
+                    };
+                    *self = if genesis.immutable {
+                        Self::Immutable {
+                            live,
+                            sealed_head_lsn: Lsn(0),
+                        }
+                    } else {
+                        Self::Live(live)
+                    };
                     Ok(Outcome::Unit)
                 }
-                Self::Live(_) => Ok(Outcome::Unit),
+                Self::Live(_) | Self::Immutable { .. } => Ok(Outcome::Unit),
                 Self::Deleted => Err(JournalError::Deleted),
             };
         }
         if matches!(command, Command::Delete) && matches!(self, Self::Deleted) {
             return Ok(Outcome::Unit);
+        }
+        if let Command::SealSession {
+            expected_writer_epoch,
+            writer_session_id,
+            owner,
+        } = command
+        {
+            return self.seal_session(expected_writer_epoch, writer_session_id, owner);
         }
         let live = self.live_mut()?;
         match command {
@@ -588,7 +627,8 @@ impl State {
                 expected,
                 writer,
                 owner,
-            } => live.seal(expected, writer, owner),
+            } if !genesis.immutable => live.seal(expected, writer, owner),
+            Command::Seal { .. } => Err(JournalError::Unsupported),
             Command::Trim {
                 fence,
                 owner,
@@ -601,8 +641,10 @@ impl State {
                 *self = Self::Deleted;
                 Ok(Outcome::Unit)
             }
-            Command::AcknowledgeRecovery => live.acknowledge_recovery(),
-            Command::Create
+            Command::AcknowledgeRecovery if !genesis.immutable => live.acknowledge_recovery(),
+            Command::AcknowledgeRecovery => Err(JournalError::Unsupported),
+            Command::SealSession { .. }
+            | Command::Create
             | Command::Append { .. }
             | Command::Stage(_)
             | Command::StageOwned(_)
@@ -614,12 +656,52 @@ impl State {
         }
     }
 
+    fn seal_session(
+        &mut self,
+        expected_writer_epoch: Epoch,
+        writer_session_id: WriterSessionId,
+        owner: String,
+    ) -> Result<Outcome> {
+        let Self::Immutable {
+            live,
+            sealed_head_lsn,
+        } = self
+        else {
+            self.live()?;
+            return Err(JournalError::Unsupported);
+        };
+        let current = live.epoch();
+        let epoch = expected_writer_epoch
+            .0
+            .checked_add(1)
+            .map(Epoch)
+            .ok_or(JournalError::Fenced { current })?;
+        let writer = uuid::Uuid::from_u128(writer_session_id.0);
+        if writer.is_nil() || writer == RECOVERY_WRITER || owner.is_empty() {
+            return Err(JournalError::Fenced { current });
+        }
+        let fence = Fence { epoch, writer };
+        if expected_writer_epoch == current {
+            live.writer = Some((fence, owner));
+            *sealed_head_lsn = live.head;
+        } else {
+            live.require_writer(fence, &owner)?;
+        }
+        Ok(Outcome::Sealed(Sealed {
+            fence,
+            head: *sealed_head_lsn,
+        }))
+    }
+
     pub fn head(&self) -> Result<Lsn> {
         Ok(self.live()?.head)
     }
 
     /// Installs the recovery fence above the current epoch.
     pub fn recover(&mut self) -> Result<Outcome> {
+        if matches!(self, Self::Immutable { .. }) {
+            return Err(JournalError::Unsupported);
+        }
         let live = self.live_mut()?;
         let epoch = super::decisions::recovery_epoch(live.epoch().0)
             .map(Epoch)
@@ -642,7 +724,10 @@ impl State {
 
     pub fn recovery_fence(&self) -> Result<Option<RecoveryFence>> {
         let live = self.live()?;
-        Ok(live.recovering().then(|| RecoveryFence { epoch: live.epoch(), head: live.head }))
+        Ok(live.recovering().then(|| RecoveryFence {
+            epoch: live.epoch(),
+            head: live.head,
+        }))
     }
 
     pub fn read(&self, from: Lsn, limit: usize) -> Result<ReadPage> {
@@ -706,6 +791,29 @@ impl State {
             .map_or((0, 0), |live| (live.records.len() as u64, live.bytes))
     }
 
+    pub fn matches_genesis(&self, genesis: &Genesis) -> bool {
+        match self {
+            Self::Absent | Self::Deleted => true,
+            Self::Live(_) => !genesis.immutable,
+            Self::Immutable {
+                live,
+                sealed_head_lsn,
+            } => {
+                genesis.immutable
+                    && *sealed_head_lsn <= live.head
+                    && match &live.writer {
+                        Some((fence, owner)) => {
+                            fence.epoch != Epoch(0)
+                                && !fence.writer.is_nil()
+                                && fence.writer != RECOVERY_WRITER
+                                && !owner.is_empty()
+                        }
+                        None => *sealed_head_lsn == Lsn(0) && live.head == Lsn(0),
+                    }
+            }
+        }
+    }
+
     pub fn is_deleted(&self) -> bool {
         matches!(self, Self::Deleted)
     }
@@ -721,7 +829,7 @@ impl State {
     }
 
     pub fn restore_records(&mut self, records: VecDeque<Payload>, quota: u64) -> io::Result<()> {
-        if let Self::Live(live) = self {
+        if let Ok(live) = self.live_mut() {
             let bytes = records
                 .iter()
                 .map(|record| record_charge(record.len()))
@@ -776,7 +884,7 @@ impl State {
 
     /// Restores the epochs a snapshot stored beside its image.
     pub fn restore_epochs(&mut self, epochs: EpochRuns) -> io::Result<()> {
-        if let Self::Live(live) = self {
+        if let Ok(live) = self.live_mut() {
             if !epochs.valid(live.head) {
                 return Err(super::invalid("invalid retained epoch runs"));
             }
@@ -790,7 +898,7 @@ impl State {
     fn live(&self) -> Result<&Live> {
         match self {
             Self::Absent => Err(JournalError::NotFound),
-            Self::Live(live) => Ok(live),
+            Self::Live(live) | Self::Immutable { live, .. } => Ok(live),
             Self::Deleted => Err(JournalError::Deleted),
         }
     }
@@ -798,7 +906,7 @@ impl State {
     fn live_mut(&mut self) -> Result<&mut Live> {
         match self {
             Self::Absent => Err(JournalError::NotFound),
-            Self::Live(live) => Ok(live),
+            Self::Live(live) | Self::Immutable { live, .. } => Ok(live),
             Self::Deleted => Err(JournalError::Deleted),
         }
     }
@@ -845,13 +953,18 @@ impl Live {
         }
         if !self.recovering() {
             if at < self.floor {
-                return Ok(Outcome::Refused(JournalError::Trimmed { floor: self.floor }));
+                return Ok(Outcome::Refused(JournalError::Trimmed {
+                    floor: self.floor,
+                }));
             }
             // A transferred snapshot may have no epoch run for this record.
             // An exact retry can still return retained bytes without mutating
             // the stream, as with an ordinary append.
             if self.epoch() >= fence.epoch
-                && self.epochs.epoch(at).is_none_or(|epoch| epoch == fence.epoch)
+                && self
+                    .epochs
+                    .epoch(at)
+                    .is_none_or(|epoch| epoch == fence.epoch)
                 && at <= self.head
                 && let Some(record) = self.records.get((at.0 - self.floor.0) as usize)
                 && !record.timed()
@@ -961,7 +1074,7 @@ impl Live {
         payloads: Vec<Bytes>,
         extents: &[u64],
         segment: &Arc<super::storage::Object>,
-        quota_bytes: u64,
+        genesis: &Genesis,
     ) -> io::Result<Result<Outcome>> {
         let conflict = JournalError::Conflict { head: self.head };
         let Some(last) =
@@ -973,16 +1086,19 @@ impl Live {
         if at < self.floor {
             return Ok(Err(JournalError::Trimmed { floor: self.floor }));
         }
+        if genesis.immutable && at <= self.head && last > self.head.0 {
+            return Ok(Err(conflict));
+        }
         let retained = self.head.0.min(last).saturating_sub(at.0.saturating_sub(1)) as usize;
         let retained = if at > self.head { 0 } else { retained };
         for (index, payload) in payloads.iter().take(retained).enumerate() {
             let record = &self.records[(at.0 - self.floor.0) as usize + index];
             let lsn = Lsn(at.0 + index as u64);
             if record.timed()
-                || self
-                    .epochs
-                    .epoch(lsn)
-                    .is_some_and(|epoch| epoch != self.epoch())
+                || match self.epochs.epoch(lsn) {
+                    Some(epoch) => epoch != self.epoch(),
+                    None => genesis.immutable,
+                }
                 || record.len() != payload.len()
                 || record.load()? != *payload
             {
@@ -1004,7 +1120,7 @@ impl Live {
             .try_fold(self.bytes, |used, payload| {
                 used.checked_add(record_charge(payload.len()))
             })
-            .filter(|used| *used <= quota_bytes)
+            .filter(|used| *used <= genesis.quota_bytes)
         else {
             return Ok(Err(JournalError::Full { floor: self.floor }));
         };

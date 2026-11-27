@@ -12,7 +12,7 @@ use std::{
 
 use bincode::Options;
 use futures::FutureExt;
-use journal_contract::{Epoch, Lsn, RecoveryFence, StreamId};
+use journal_contract::{Epoch, Lsn, RecoveryFence, StreamId, WriterSessionId};
 use openraft::{
     BasicNode, EntryPayload, OptionalSend,
     errors::{NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable},
@@ -274,6 +274,11 @@ pub(super) enum Request {
         fence: RecoveryFence,
         payload: bytes::Bytes,
     },
+    SealSession {
+        stream: StreamId,
+        expected_writer_epoch: Epoch,
+        writer_session_id: WriterSessionId,
+    },
 }
 
 impl Request {
@@ -301,6 +306,7 @@ impl Request {
             Self::Stage(ref stage) => stage.stream,
             Self::ClusterVersion | Self::FinalizeVersion(_) => StreamId(0),
             Self::Seal { stream, .. }
+            | Self::SealSession { stream, .. }
             | Self::AcknowledgeRecoveryWithMarker { stream, .. }
             | Self::Append { stream, .. }
             | Self::AppendBatch { stream, .. }
@@ -386,7 +392,7 @@ pub(super) fn encode_pong(pong: &Pong, version: WireVersion) -> io::Result<Vec<u
 const MAX_FRAME_TAG_V1: u32 = 2;
 const MAX_FRAME_TAG_CURRENT: u32 = 3;
 const MAX_REQUEST_TAG_V1: u32 = 27;
-const MAX_REQUEST_TAG_CURRENT: u32 = 34;
+const MAX_REQUEST_TAG_CURRENT: u32 = 35;
 const MAX_PEER_REQUEST_TAG_V1: u32 = 5;
 const MAX_PEER_REQUEST_TAG_CURRENT: u32 = 5;
 // Genesis encodes a u128 stream ID, three length-prefixed UUID byte strings
@@ -442,9 +448,22 @@ pub(super) fn decode_frame(bytes: &[u8], version: WireVersion) -> io::Result<Dec
             };
         }
     }
-    if frame_tag == 1 && bytes.len() >= 4 + GENESIS_WIRE_BYTES + 4 {
-        let start = 4 + GENESIS_WIRE_BYTES;
-        let peer_tag = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
+    let immutable = frame_tag == 1 && bytes.get(4..20) == Some(&[0; 16]);
+    if immutable && version == WireVersion::Previous {
+        return Err(unsupported(
+            "immutable genesis requires a newer keeper protocol",
+        ));
+    }
+    let prefix = if immutable {
+        super::IMMUTABLE_GENESIS_PREFIX_BYTES
+    } else {
+        0
+    };
+    let peer_start = 4 + GENESIS_WIRE_BYTES + prefix;
+    if frame_tag == 1
+        && let Some(tag) = bytes.get(peer_start..peer_start + 4)
+    {
+        let peer_tag = u32::from_le_bytes(tag.try_into().unwrap());
         if peer_tag > max_peer {
             return match version {
                 WireVersion::Current => Ok(DecodedFrame::Unsupported(format!(
@@ -470,7 +489,17 @@ impl Request {
             | Self::FinalizeVersion(_)
             | Self::ClearQuarantine(_)
             | Self::RecoveryFence(_)
-            | Self::AcknowledgeRecoveryWithMarker { .. } => version == WireVersion::Current,
+            | Self::AcknowledgeRecoveryWithMarker { .. }
+            | Self::SealSession { .. } => version == WireVersion::Current,
+            Self::Claim(genesis)
+            | Self::ReadAt { genesis, .. }
+            | Self::StageReplica { genesis, .. }
+            | Self::InstallReplica { genesis, .. }
+            | Self::StageRecovered { genesis, .. }
+                if genesis.immutable =>
+            {
+                version == WireVersion::Current
+            }
             _ => true,
         }
     }
@@ -493,7 +522,9 @@ impl Frame {
                 Self::Client(request) if !request.supported_on(WireVersion::Previous) => {
                     Err(unsupported("request requires a newer keeper protocol"))
                 }
-                Self::Peer(_, request) if !request.supported_on(WireVersion::Previous) => {
+                Self::Peer(genesis, request)
+                    if genesis.immutable || !request.supported_on(WireVersion::Previous) =>
+                {
                     Err(unsupported("peer request requires a newer keeper protocol"))
                 }
                 frame => encode(frame),
@@ -722,6 +753,11 @@ impl ReplyV1 {
         Ok(match reply {
             Reply::Decision(outcome) => Self::Decision(outcome_v1(outcome)),
             Reply::Leader(leader) => Self::Leader(leader),
+            Reply::Catalog(genesis, _) | Reply::ScopedPage { genesis, .. } if genesis.immutable => {
+                return Err(unsupported(
+                    "immutable genesis requires a newer keeper protocol",
+                ));
+            }
             Reply::Catalog(genesis, contacts) => Self::Catalog(genesis, contacts),
             Reply::Staged(stage) => Self::Staged(stage),
             Reply::Placement(proof) => Self::Placement(proof),

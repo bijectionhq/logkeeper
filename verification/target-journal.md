@@ -65,7 +65,22 @@ takeover policy and applies records through the head returned by seal before
 serving. A stream moved between ensembles admits writes through at most one
 authority across crashes and stale routes.
 
-### Consensus recovery acknowledgement
+### Immutable consensus histories
+
+Finalized cluster version 4 admits immutable genesis for fresh streams.
+Create claims the history mode with the stream ID, so re-creating a legacy ID as an immutable history conflicts.
+Opening a claimed stream can check that mode through `require_immutable` without a write.
+The legacy wire and persisted genesis remain decodable, and immutable genesis requires a version-4 keeper.
+
+An immutable stream uses `seal_session` to advance an expected writer epoch.
+The new fence binds the stream, principal, and writer session, and a retry by that session returns the original sealed head while the fence remains current.
+A batch commits only at the next LSN; an exact retained retry returns its last LSN and a partial overlap conflicts.
+`read_page` exposes an explicit minimum applied head through the scoped read path.
+
+Membership changes preserve the stream's committed history.
+If its quorum cannot recover, open the restored application cut in a successor stream with a fresh ID.
+
+### Legacy consensus recovery acknowledgement
 
 A journal that supports operator recovery can expose its active `RecoveryFence { epoch, head }` through a linearizable `recovery_fence` read.
 At finalized cluster version 3 a consensus writer can call `acknowledge_recovery_with_marker(stream, fence, payload)`.

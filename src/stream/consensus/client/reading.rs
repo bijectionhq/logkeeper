@@ -429,6 +429,7 @@ mod tests {
             stream: StreamId(4),
             voters: [1, 2, 3].map(Uuid::from_u128),
             quota_bytes: 128,
+            immutable: false,
         };
         let page = |scope: Genesis, head| Reply::ScopedPage {
             genesis: scope,

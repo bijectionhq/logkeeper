@@ -170,6 +170,7 @@ impl CatalogStream {
             stream: STREAM,
             voters,
             quota_bytes: QUOTA_BYTES,
+            immutable: false,
         };
         Self {
             fold: Mutex::new(Fold::new(&genesis, Lsn(1))),
@@ -826,11 +827,13 @@ mod tests {
             stream: STREAM,
             voters: [ids[0], ids[1], ids[2]],
             quota_bytes: QUOTA_BYTES,
+            immutable: false,
         };
         let genesis = |voters| Genesis {
             stream: StreamId(7),
             voters,
             quota_bytes: 4096,
+            immutable: false,
         };
         let first = genesis([ids[0], ids[1], ids[2]]);
         let stage = Stage {

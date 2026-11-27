@@ -153,6 +153,11 @@ impl Config {
         let genesis = disk
             .genesis(stream)
             .ok_or_else(|| invalid("stream is not installed on this keeper"))?;
+        if genesis.immutable {
+            return Err(invalid(
+                "immutable histories require their original quorum or a successor with a fresh stream ID",
+            ));
+        }
         let generation = disk
             .ownership(stream)
             .filter(|book| book.installed())
