@@ -408,13 +408,16 @@ impl SimCluster {
         }
     }
 
+    /// Simulates ordinary disk exhaustion (80 MiB left: below `ORDINARY_FLOOR`
+    /// of 88 MiB so `accepts_streams()` is false, ordinary writes fail and E5
+    /// sheds leadership, while leaving the protected `PROTOCOL_FLOOR` intact).
     pub fn set_disk_full(&self, id: Uuid, full: bool) {
         if let Some(server) = self.running.get(&id) {
             server
                 .engine
                 .disk
                 .space
-                .set_available(if full { 0 } else { u64::MAX });
+                .set_available(if full { 80 * 1024 * 1024 } else { u64::MAX });
             if full {
                 self.faults.hit("fault:disk_full");
             }
@@ -577,6 +580,15 @@ impl SimCluster {
         let probe = self.probe_client();
         let outcome = timeout(limit, async {
             loop {
+                // Bail out early if any voter's OpenRaft core has panicked.
+                for &v in voters {
+                    if let Some(server) = self.running.get(&v)
+                        && let Some(group) = server.engine.groups.lock().await.get(&stream)
+                        && group.raft.metrics().borrow_watched().running_state.is_err()
+                    {
+                        return None;
+                    }
+                }
                 // Issue a fresh head so parked streams reopen and followers
                 // receive the latest commit index from the leader.
                 let expected_head = probe.head(stream).await;
@@ -600,7 +612,7 @@ impl SimCluster {
                         && a.records == b.records
                         && b.records == c.records
                     {
-                        return snaps.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+                        return Some(snaps.into_iter().map(Option::unwrap).collect::<Vec<_>>());
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
@@ -608,8 +620,8 @@ impl SimCluster {
         })
         .await;
         match outcome {
-            Ok(snaps) => Ok(snaps),
-            Err(_) => {
+            Ok(Some(snaps)) => Ok(snaps),
+            Ok(None) | Err(_) => {
                 let mut snaps = Vec::with_capacity(3);
                 for &v in voters {
                     snaps.push(self.inspect_voter(v, stream).await);

@@ -775,6 +775,36 @@ full-restart test run against both.
 cargo test --locked --features consensus-testing --test consensus_journal_conformance
 ```
 
+#### Randomized consensus fault-injection and linearizability harness
+
+`src/stream/consensus/simulation/` runs real in-process consensus keepers over
+the `Network`/`Rpc` seam with seeded fault injection (symmetric and asymmetric
+per-lane partitions across control, replication, bulk and application lanes;
+message drops, delays, reply drops and peer duplicates; graceful stops, abrupt
+crashes and WAL before/after-sync crash cuts; slow disks and disk-full
+shedding; parking/waking, membership replacement, leader preference, replicated
+catalog outages, offline `recover-stream` + `acknowledge_recovery`, and
+wipe-and-reinitialize). Every run checks per-stream linearizability with
+`journal_contract::conformance::history::linearizable`, durability, monotonic
+heads, writer fencing, ambiguous `append_batch` atomicity, delete permanence
+and post-run cross-voter convergence.
+
+```sh
+# Default CI suite (6 seeds across all non-wipe profiles) + large-batch test + amnesia detector
+cargo test --locked --features stream --lib stream::consensus::simulation -- --nocapture
+
+# Replay a specific failing seed (optionally with wipe-and-reinitialize and automatic shrinking)
+LOGKEEPER_CONSENSUS_SEED=1 LOGKEEPER_CONSENSUS_ALLOW_WIPE=1 LOGKEEPER_CONSENSUS_SHRINK=1 \
+  cargo test --locked --features stream --lib consensus_fault_harness_replay_seed -- --ignored --nocapture
+
+# Extended randomized soak run (default 50 seeds; override with LOGKEEPER_CONSENSUS_FIRST_SEED / LOGKEEPER_CONSENSUS_SEEDS)
+LOGKEEPER_CONSENSUS_SEEDS=50 \
+  cargo test --locked --features stream --lib consensus_fault_harness_soak -- --ignored --nocapture
+```
+
+See [verification/simulation/README.md](verification/simulation/README.md#consensus-keeper-fault-injection-harness)
+for the fault model and checked invariants.
+
 ### Operations
 
 #### Admin listener and Prometheus metrics

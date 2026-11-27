@@ -47,3 +47,71 @@ The [keeper I/O controls](../verus/stream_keeper/runtime-controls.py) cover
 the shared WAL's group rounds, CRC, checkpoint and deployment authorization.
 The [proof link](../link/README.md#stream-journal) and the Verus harnesses
 cover the projections and the primitive guards.
+
+## Consensus keeper fault-injection harness
+
+`src/stream/consensus/simulation/` drives seven real in-process OpenRaft 0.10.1
+consensus `Engine`s (in distinct failure domains, supporting both single and
+replicated `catalog_voters`) through `ConsensusJournal` and `Client`, injecting
+seeded faults over the `Network`/`Rpc`, `Disk`, `Space` and `Engine` seams.
+
+### Running
+
+```sh
+# Default CI run (6 seeds, large-batch fault test, and autonomous amnesia detector)
+cargo test --locked --features stream --lib stream::consensus::simulation -- --nocapture
+
+# Replay and shrink a single seed
+LOGKEEPER_CONSENSUS_SEED=1 LOGKEEPER_CONSENSUS_ALLOW_WIPE=1 LOGKEEPER_CONSENSUS_SHRINK=1 \
+  cargo test --locked --features stream --lib consensus_fault_harness_replay_seed -- --ignored --nocapture
+
+# Extended soak run
+LOGKEEPER_CONSENSUS_FIRST_SEED=0 LOGKEEPER_CONSENSUS_SEEDS=50 \
+  cargo test --locked --features stream --lib consensus_fault_harness_soak -- --ignored --nocapture
+```
+
+### Faults and operations mixed by seed
+
+- **Operations:** `create`, `seal` (writer handoffs and stale-epoch probes),
+  `append`, `append_batch` (small linearizability-checked batches plus a
+  dedicated 256/300-record large-batch test crossing snapshot intervals),
+  `read` (immediate and long-poll), `head`, `trim`, `delete`, `replace`,
+  `prefer_leader`, idle `park` (`park_after_secs = 2`) and wake, offline
+  `recover-stream` + `acknowledge_recovery`, and replicated catalog outages.
+- **Faults:** symmetric and asymmetric per-lane partitions (`control`,
+  `replication`, `bulk`, `application`), probabilistic drops, delays, reply
+  drops (creating ambiguous `Unavailable` outcomes), peer duplicates, graceful
+  stop/restart, abrupt crash/restart, WAL before/after-sync and torn-frame
+  crash cuts (`ReplicaFault` / `interrupt_next`), slow WAL rounds
+  (`Disk::set_wal_delay`), disk-full leadership shedding (`Space::set_available`),
+  and keeper wipe-and-reinitialize under its old ID (`LOGKEEPER_CONSENSUS_ALLOW_WIPE=1`).
+
+### Checked invariants
+
+1. **Linearizability:** Every non-recovered stream history (and the
+   pre-recovery prefix of recovered streams, up to the 63-call bitmask bound of
+   `journal_contract::conformance::history::linearizable`) must admit a valid
+   sequential linearization under real-time precedence, where `Unavailable`
+   mutations may either take effect or not.
+2. **Durability:** An acknowledged append never disappears or changes bytes
+   unless an operator recovery explicitly acknowledged data loss for that
+   stream. Every record returned by `read` or present on disk must match an
+   actually proposed payload for that LSN.
+3. **Monotonic heads:** Across any strict real-time ordering (`B.invocation >
+   A.response`) within the same recovery era, linearizable heads (`head`,
+   `seal`, `append`, `append_batch`) never regress.
+4. **Writer fencing:** No `append`, `append_batch` or `trim` invoked after a
+   completed `seal(E)` by owner `O` may succeed under a lower epoch or under
+   epoch `E` by a different principal. After an operator recovery, no
+   pre-recovery epoch may ever be accepted, and ordinary seals are refused with
+   `Recovered` until `acknowledge_recovery` clears the recovery fence.
+5. **Ambiguous batch atomicity:** A single keeper batch (`<= 256` records,
+   `<= 4 MiB`) that returned `Unavailable` must either commit atomically in
+   full or not at all; multi-chunk `ConsensusJournal::append_batch` calls may
+   commit only a whole-batch prefix.
+6. **Delete permanence:** Once `delete` returns `Ok(())`, no later non-delete
+   operation on that stream may succeed.
+7. **Cross-voter convergence:** After all faults heal and stopped keepers
+   restart, all three voters of each stream's finalized configuration must be
+   healthy and converge to identical `(deleted, floor, head, records)` state
+   directly in their `StateMachine`s.

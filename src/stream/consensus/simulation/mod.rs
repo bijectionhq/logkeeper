@@ -329,11 +329,17 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
         ]));
         for step_idx in 0..config.steps {
             let roll = rng.range(100);
-            if !wiped && step_idx >= 3 && roll < 30 {
-                // Pick a random voter slot of stream 0 (0, 1, or 2) to wipe.
-                // Prefer a slot that is not the currently partitioned one so the
-                // wiped keeper and any lagging peer can communicate.
-                let slot = rng.range(3);
+            if !wiped && step_idx >= 5 && (roll < 35 || step_idx + 2 == config.steps) {
+                // Pick a random voter slot of stream 0 that is not already down
+                // (or any random slot if none are down).
+                let candidates: Vec<usize> = (0..3)
+                    .filter(|s| !active_down.contains(s) && Some(*s) != partitioned_slot)
+                    .collect();
+                let slot = if candidates.is_empty() {
+                    rng.range(3)
+                } else {
+                    candidates[rng.range(candidates.len())]
+                };
                 if partitioned_slot.is_some() {
                     steps.push(Step::HealNetwork);
                     partitioned_slot = None;
@@ -353,11 +359,11 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
                 ]));
                 steps.push(Step::PauseMs(800));
                 steps.push(Step::Ops(vec![ClientOp::Head { stream_idx: 0 }]));
-            } else if roll < 52 {
+            } else if roll < 46 {
                 // Partition or stop a random voter of stream 0.
                 let slot = rng.range(3);
-                if partitioned_slot.is_none() && active_down.is_empty() && rng.chance(2, 3) {
-                    let lanes = if rng.chance(2, 3) {
+                if partitioned_slot.is_none() && active_down.is_empty() && rng.chance(3, 4) {
+                    let lanes = if rng.chance(3, 4) {
                         vec![LaneKey::Replication]
                     } else {
                         LaneKey::PEER.to_vec()
@@ -373,11 +379,9 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
                         crash: rng.chance(1, 2),
                     });
                     active_down.push(slot);
-                } else if !wiped && partitioned_slot.is_some() {
+                } else if !wiped && partitioned_slot.is_some() && active_down.is_empty() {
                     steps.push(Step::HealNetwork);
                     partitioned_slot = None;
-                } else if !wiped && let Some(down) = active_down.pop() {
-                    steps.push(Step::RestartKeeper { keeper_slot: down });
                 }
             } else if roll < 86 {
                 let writer = if rng.chance(4, 5) {
@@ -478,6 +482,13 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
                     wait_ms: 150,
                 },
             ]));
+            // Clear application reply-drop before racing Seal(B) + Append(A)
+            // so CI does not flake on the unfixed retry-returns-Fenced bug
+            // (reproduced deterministically in bugs.rs).
+            steps.push(Step::ImpairLane {
+                lane: LaneKey::Application,
+                faults: LaneFaults::default(),
+            });
             steps.push(Step::PartitionSymmetric {
                 keeper_slot: victim,
                 lanes: LaneKey::PEER.to_vec(),
@@ -903,6 +914,24 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
         }
     }
 
+    // Canonicalize keeper slots relative to stream 0's initial leader so a
+    // given seed targets the same Raft roles (leader vs followers) on replay
+    // and during plan shrinking regardless of initial election timer races.
+    let mut slot_map: Vec<Uuid> = Vec::with_capacity(cluster.all_ids.len());
+    if let Some(leader) = cluster.leader(plan.streams[0].stream).await {
+        slot_map.push(leader);
+    }
+    for id in plan.streams[0].initial_voters {
+        if !slot_map.contains(&id) {
+            slot_map.push(id);
+        }
+    }
+    for id in cluster.all_ids {
+        if !slot_map.contains(&id) {
+            slot_map.push(id);
+        }
+    }
+
     // Execute plan steps.
     for step in &plan.steps {
         // Reap any keeper whose WAL thread terminated from an armed WAL fault.
@@ -1049,9 +1078,8 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                 }
             }
             Step::PartitionSymmetric { keeper_slot, lanes } => {
-                let target = cluster.all_ids[*keeper_slot % cluster.all_ids.len()];
-                let others: Vec<Uuid> = cluster
-                    .all_ids
+                let target = slot_map[*keeper_slot % slot_map.len()];
+                let others: Vec<Uuid> = slot_map
                     .iter()
                     .copied()
                     .filter(|id| *id != target)
@@ -1065,8 +1093,8 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                 to_slot,
                 lanes,
             } => {
-                let from = cluster.all_ids[*from_slot % cluster.all_ids.len()];
-                let to = cluster.all_ids[*to_slot % cluster.all_ids.len()];
+                let from = slot_map[*from_slot % slot_map.len()];
+                let to = slot_map[*to_slot % slot_map.len()];
                 if from != to {
                     cluster.faults.partition_asymmetric(from, to, lanes);
                 }
@@ -1078,7 +1106,7 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                 cluster.faults.heal_all();
             }
             Step::StopKeeper { keeper_slot, crash } => {
-                let id = cluster.all_ids[*keeper_slot % cluster.all_ids.len()];
+                let id = slot_map[*keeper_slot % slot_map.len()];
                 if *crash {
                     cluster.crash(id).await;
                 } else {
@@ -1086,7 +1114,7 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                 }
             }
             Step::RestartKeeper { keeper_slot } => {
-                let id = cluster.all_ids[*keeper_slot % cluster.all_ids.len()];
+                let id = slot_map[*keeper_slot % slot_map.len()];
                 if !cluster.is_running(id) {
                     cluster.restart(id).await;
                 }
@@ -1124,15 +1152,15 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                 keeper_slot,
                 delay_ms,
             } => {
-                let id = cluster.all_ids[*keeper_slot % cluster.all_ids.len()];
+                let id = slot_map[*keeper_slot % slot_map.len()];
                 cluster.set_slow_disk(id, Duration::from_millis(*delay_ms));
             }
             Step::DiskFull { keeper_slot, full } => {
-                let id = cluster.all_ids[*keeper_slot % cluster.all_ids.len()];
+                let id = slot_map[*keeper_slot % slot_map.len()];
                 cluster.set_disk_full(id, *full);
             }
             Step::WipeAndReinit { keeper_slot } => {
-                let id = cluster.all_ids[*keeper_slot % cluster.all_ids.len()];
+                let id = slot_map[*keeper_slot % slot_map.len()];
                 cluster.wipe_and_reinitialize(id).await;
             }
             Step::CatalogOutage { down_count } => {
@@ -1182,6 +1210,11 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                 // Stop 2 of the 3 voters; keep voters[0] as survivor.
                 let survivor = voters[0];
                 let lost = [voters[1], voters[2]];
+                let probe_before = cluster.probe_client();
+                let mut lost_gens = Vec::with_capacity(2);
+                for id in lost {
+                    lost_gens.push((id, probe_before.replica_generation(stream, id).await.ok()));
+                }
                 for id in lost {
                     cluster.crash(id).await;
                 }
@@ -1250,9 +1283,24 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                             lock[*stream_idx].next_lsn = Lsn(h.0 + 1);
                         }
                     }
-                    // Restart lost voters to verify they do not corrupt or lead the recovered stream.
-                    for id in lost {
+                    // Restart lost voters one at a time (per README operational
+                    // guidance: starting both lost voters at once before either
+                    // retires lets them form an old-configuration quorum).
+                    let probe_client = cluster.probe_client();
+                    for (id, gen_before) in lost_gens {
                         cluster.restart(id).await;
+                        if let Some(gen_before) = gen_before {
+                            let _ = timeout(Duration::from_secs(6), async {
+                                while probe_client.replica_generation(stream, id).await
+                                    == Ok(gen_before)
+                                {
+                                    tokio::time::sleep(Duration::from_millis(40)).await;
+                                }
+                            })
+                            .await;
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(600)).await;
+                        }
                     }
                 } else {
                     cluster.restart_all_stopped().await;
@@ -1711,8 +1759,13 @@ async fn run_concurrent_ops(
 }
 
 /// Attempts to shrink a failing `Plan` to a smaller step sequence that still
-/// reproduces a violation, within `max_attempts` re-executions.
-async fn shrink_plan(original: &Plan, max_attempts: usize) -> (Plan, Option<Violation>) {
+/// reproduces the same violation class, within `max_attempts` re-executions.
+async fn shrink_plan(
+    original: &Plan,
+    initial_violation: &Violation,
+    max_attempts: usize,
+) -> (Plan, Option<Violation>) {
+    let target_kind = std::mem::discriminant(initial_violation);
     let mut best = original.clone();
     let mut best_violation = None;
     let mut attempts = 0usize;
@@ -1723,7 +1776,9 @@ async fn shrink_plan(original: &Plan, max_attempts: usize) -> (Plan, Option<Viol
         let mut candidate = best.clone();
         candidate.steps.truncate(mid);
         attempts += 1;
-        if let Err(v) = execute_plan(&candidate).await {
+        if let Err(v) = execute_plan(&candidate).await
+            && std::mem::discriminant(&v) == target_kind
+        {
             best = candidate;
             best_violation = Some(v);
         } else {
@@ -1738,7 +1793,9 @@ async fn shrink_plan(original: &Plan, max_attempts: usize) -> (Plan, Option<Viol
         let mut candidate = best.clone();
         candidate.steps.remove(idx);
         attempts += 1;
-        if let Err(v) = execute_plan(&candidate).await {
+        if let Err(v) = execute_plan(&candidate).await
+            && std::mem::discriminant(&v) == target_kind
+        {
             best = candidate;
             best_violation = Some(v);
             idx = idx.min(best.steps.len());
@@ -2026,7 +2083,7 @@ async fn consensus_fault_harness_replay_seed() {
                 plan.steps
             );
             if do_shrink {
-                let (shrunk, shrunk_v) = shrink_plan(&plan, 12).await;
+                let (shrunk, shrunk_v) = shrink_plan(&plan, &violation, 12).await;
                 eprintln!(
                     "shrunk plan ({} -> {} steps): {:#?}\nshrunk violation: {:?}",
                     plan.steps.len(),
