@@ -444,6 +444,33 @@ reopen. The Rust test
 reproduces it with the `ReplicaFault::AfterRelocationSwap` pause.
 `Objects::relocate` now registers the hold under the same lock as the swap.
 
+### `AsyncAppend.tla`: async leader append and the durable commit index
+
+Three voters, a fixed leader and three records (53b9a6d, 07635deb). The
+leader queues an append on its WAL and replicates it from the in-memory
+overlay before its own write lands (`Queue`, `Send`); each copy becomes
+durable separately (`Flush`). Commit counts only durable copies, the
+leader's on `io_completed` (`Choose`). A follower learns the commit index
+only up to its durable log, and every copy applies only durable records.
+`save_committed` notes the index and the WAL writes `Record::Committed` in a
+later round once the log holds the exact ID (`Note`, `Mark`). A crash at any
+point drops the overlay, the noted index and applied state, and keeps the
+durable marker. With two voters down a recovery may start from a down copy;
+it keeps only that copy's durable commit (fc4855ed).
+
+| Config | Bounds or rule dropped | Result |
+| --- | --- | --- |
+| `AsyncAppend` | two crashes at any point | `ChosenHasDurableQuorum`, `AppliedHasLocalBytes`, `MarkerHasLocalCommittedBytes`, `RecoveryKeepsOnlyCommitted` pass, 1,299,627 states, 69 s on 3 workers |
+| `AsyncAppendLiveness` | one crash, under fairness | `RequestsSettle` (every request is answered, or a recovery ran) and `MarkersCatchUp` pass, 541,513 states, 5 min 34 s on 3 workers |
+| `AsyncAppendCountOverlay` | the leader counts its overlay toward commit | `ChosenHasDurableQuorum` violated |
+| `AsyncAppendRecoverTip` | the recovery keeps the writer's durable tip | `RecoveryKeepsOnlyCommitted` violated: the leader's durable but uncommitted record survives |
+| `AsyncAppendNoIdleFlush` | no idle flush of the noted index (`COMMITTED_FLUSH`) | `MarkersCatchUp` violated |
+
+Abstractions: one leader for the whole run (elections are
+`LogkeeperProtocol`'s), record positions instead of log IDs, so a
+truncation is not modeled, and one `Record::Committed` round per step (a
+torn round lands the marker with its records or not at all).
+
 ## Fidelity review
 
 Changes made to the first version of the model when it was checked against

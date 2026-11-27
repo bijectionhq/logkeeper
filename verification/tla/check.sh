@@ -4,7 +4,7 @@ set -euo pipefail
 # Run all exhaustive TLA+ checks for Logkeeper's consensus protocol additions.
 # Usage:
 #   ./verification/tla/check.sh            # run all configs
-#   ./verification/tla/check.sh fast       # skip the deep safety configs
+#   ./verification/tla/check.sh fast       # skip the deep and slow liveness configs
 #   ./verification/tla/check.sh additions  # run the focused consensus additions
 #
 # Exits non-zero when any configuration does not match its expected outcome:
@@ -116,6 +116,13 @@ run_case "RelocationReusePages"       "Relocation.tla" "RelocationReusePages.cfg
 run_case "RelocationNoParkPins"       "Relocation.tla" "RelocationNoParkPins.cfg"      invariant:RootsReadable
 run_case "RelocationLateWatermark"    "Relocation.tla" "RelocationLateWatermark.cfg"   invariant:RootsReadable
 run_case "RelocationParkRace"         "Relocation.tla" "RelocationParkRace.cfg"        invariant:ParkCanReopenAfterRestart
+run_case "AsyncAppend"                "AsyncAppend.tla" "AsyncAppend.cfg"               pass
+run_case "AsyncAppendCountOverlay"    "AsyncAppend.tla" "AsyncAppendCountOverlay.cfg"   invariant:ChosenHasDurableQuorum
+run_case "AsyncAppendRecoverTip"      "AsyncAppend.tla" "AsyncAppendRecoverTip.cfg"     invariant:RecoveryKeepsOnlyCommitted
+if [[ "$MODE" != "fast" ]]; then
+  run_case "AsyncAppendLiveness"      "AsyncAppend.tla" "AsyncAppendLiveness.cfg"       pass liveness
+  run_case "AsyncAppendNoIdleFlush"   "AsyncAppend.tla" "AsyncAppendNoIdleFlush.cfg"    liveness liveness
+fi
 
 if [[ "$MODE" == "additions" ]]; then
   echo
