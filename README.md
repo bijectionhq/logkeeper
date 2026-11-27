@@ -338,18 +338,16 @@ Then start the survivor. Its replacements vote for it with their empty logs,
 it becomes leader in the new membership and replicates its log to them, which
 commits the recovery. The stream's head is the survivor's.
 
-The recovery fence admits no append or trim. Every `seal` returns
-`JournalError::Recovered { head }` until a writer or an administrator calls
-`Journal::acknowledge_recovery(stream)` (also
-`ConsensusJournal::acknowledge_recovery`), which returns the head and
-replaces the fence with an ownerless one at the same epoch. Writers then seal
-above it. The operator already accepted the possible loss with
-`--acknowledge-data-loss`; the second call only records that the consumer
-noticed, so a consumer may acknowledge on its own and resume, recording the
-recovery durably and reporting it, rather than waiting for a person. A
-consumer that sees `Recovered`, or a head below what it was acknowledged,
-must treat it as data loss and rebuild from the journal instead of its own
-previous head.
+The recovery fence refuses ordinary appends and trims.
+Every `seal` returns `JournalError::Recovered { head }` until someone acknowledges the fence.
+At finalized cluster version 3, a writer can read the active fence with `Journal::recovery_fence` and call `Journal::acknowledge_recovery_with_marker`.
+One committed entry appends its opaque marker at the position after the survivor's head and clears that exact fence.
+A repeated request with identical bytes can recover the marker's position while it is retained.
+A refusal to append leaves the fence in place.
+An older request cannot clear a different recovery epoch.
+`Journal::acknowledge_recovery` still clears a recovery fence explicitly for an operator-directed handoff.
+Writers seal above the recovery epoch to resume.
+A consumer that sees `Recovered` or a head below a position it already acknowledged must rebuild from the journal.
 
 **Lost voters and placement certification.** Two lost voters are a quorum
 of the configuration the recovery left, and a lost voter may still hold the
@@ -647,6 +645,10 @@ request it adds is refused on N-1 connections in `Request::supported_on`. Keeper
 an unknown top-level field with a warning, so a configuration may name a
 newer release's setting first; nested settings and `JournalConfig` stay
 strict.
+
+Cluster version 3 enables the atomic recovery marker.
+Finalization probes each active keeper for explicit support for that command.
+The version 2 parking, relocation and checkpoint formats remain available during this upgrade.
 
 **Placement changes and retired keepers.** The rule of three active keepers
 in distinct failure domains applies only where a roster is chosen: a new

@@ -56,6 +56,14 @@ pub struct Epoch(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lsn(pub u64);
 
+/// The seal installed by one operator recovery and the head that survived it.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecoveryFence {
+    pub epoch: Epoch,
+    pub head: Lsn,
+}
+
 /// A page of committed records.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +162,24 @@ pub trait Journal: Send + Sync {
     fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, Result<Lsn>> {
         let _ = stream;
         Box::pin(async { Err(JournalError::Unavailable) })
+    }
+
+    /// Reads the current operator recovery fence from a linearizable view.
+    fn recovery_fence(&self, _stream: StreamId) -> BoxFuture<'_, Result<Option<RecoveryFence>>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Appends an opaque marker at `fence.head + 1` under `fence.epoch` and
+    /// clears exactly that fence in one decision. An identical retry returns
+    /// the marker's position while it is retained. A superseded or trimmed
+    /// attempt never appends a record or clears a fence.
+    fn acknowledge_recovery_with_marker(
+        &self,
+        _stream: StreamId,
+        _fence: RecoveryFence,
+        _marker: Bytes,
+    ) -> BoxFuture<'_, Result<Lsn>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
     }
 }
 

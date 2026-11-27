@@ -55,9 +55,11 @@ pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Cluster feature level before any rolling-upgrade format finalization (N-1).
 pub const CLUSTER_VERSION_V1: u32 = 1;
+/// Cluster feature level for durable parking and segmented WAL relocation.
+pub const CLUSTER_VERSION_V2: u32 = 2;
 /// Cluster feature level enabled once all keepers run this build and an
-/// operator finalizes the upgrade.
-pub const CLUSTER_VERSION_CURRENT: u32 = 2;
+/// operator finalizes the upgrade. Enables atomic recovery acknowledgement.
+pub const CLUSTER_VERSION_CURRENT: u32 = 3;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -72,10 +74,12 @@ pub mod features {
     pub const SOFT_PLACEMENT: u64 = 1 << 3;
     /// Runtime status: the operator is moving replicas off this keeper.
     pub const DECOMMISSIONING: u64 = 1 << 4;
+    /// Supports the Raft command to append a marker and acknowledge recovery.
+    pub const RECOVERY_MARKER: u64 = 1 << 5;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 =
-        VERSION_NEGOTIATION | WRITE_VERSION_GATE | DURABLE_QUARANTINE | SOFT_PLACEMENT;
+        VERSION_NEGOTIATION | WRITE_VERSION_GATE | DURABLE_QUARANTINE | SOFT_PLACEMENT | RECOVERY_MARKER;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;

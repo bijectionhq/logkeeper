@@ -743,6 +743,9 @@ impl Engine {
                             && stage.recovery()
                     }
                     Command::Append { payload, .. } => payload.len() <= MAX_RECORD,
+                    Command::AcknowledgeRecoveryWithMarker { payload, fence, at } => {
+                        payload.len() <= MAX_RECORD && fence.head.0.checked_add(1) == Some(at.0)
+                    }
                     Command::AppendOriginal { record, .. } => {
                         record.len() > crate::stream::timed::EVIDENCE_BYTES
                             && record.len() <= MAX_RECORD

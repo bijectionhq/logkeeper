@@ -1492,6 +1492,7 @@ impl Engine {
                     | Request::KeeperStatus(_)
                     | Request::ClusterVersion
                     | Request::Head(_)
+                    | Request::RecoveryFence(_)
                     | Request::Configuration(_)
                     | Request::Read { .. }
                     | Request::ReadAt { .. } => admin || writer || reader,
@@ -1501,6 +1502,7 @@ impl Engine {
                     | Request::StageOriginal { .. }
                     | Request::AppendOriginal { .. }
                     | Request::Written { .. }
+                    | Request::AcknowledgeRecoveryWithMarker { .. }
                     | Request::Trim { .. } => writer,
                     // An administrator may move leadership; it writes nothing.
                     Request::PreferLeader { .. } => writer || admin,
@@ -1712,6 +1714,7 @@ impl Engine {
                 group.require_healthy()?;
                 let reply = match request {
                     Request::Head(_) => Ok(group.head().await),
+                    Request::RecoveryFence(_) => Ok(group.recovery_fence().await),
                     Request::Written {
                         fence,
                         at,
@@ -1888,6 +1891,27 @@ impl Engine {
                         super::logging::audit_acknowledge_recovery(
                             self.id, stream, actor, &outcome,
                         );
+                        Ok(reply)
+                    }
+                    Request::AcknowledgeRecoveryWithMarker { fence, payload, .. } => {
+                        if !self.disk.write_version_allows(super::CLUSTER_VERSION_CURRENT) {
+                            self.sync_cluster_version().await;
+                            if !self.disk.write_version_allows(super::CLUSTER_VERSION_CURRENT) {
+                                return Ok(failure(JournalError::Unsupported));
+                            }
+                        }
+                        if payload.len() > super::MAX_RECORD {
+                            return Ok(failure(JournalError::TooLarge { max: super::MAX_RECORD }));
+                        }
+                        let Some(at) = fence.head.0.checked_add(1).map(Lsn) else {
+                            return Ok(failure(JournalError::Conflict { head: fence.head }));
+                        };
+                        let reply = group
+                            .write(Command::AcknowledgeRecoveryWithMarker { fence, at, payload })
+                            .await;
+                        let actor = owner.as_deref().unwrap_or("unknown");
+                        let outcome = describe_audit_reply(&reply);
+                        super::logging::audit_acknowledge_recovery(self.id, stream, actor, &outcome);
                         Ok(reply)
                     }
                     _ => Err(invalid("invalid application request")),
@@ -2392,6 +2416,13 @@ impl Group {
                 .map(Outcome::At)
                 .into(),
         )
+    }
+
+    async fn recovery_fence(&self) -> Reply {
+        if let Err(reply) = self.barrier(Instant::now() + REQUEST_TIMEOUT).await {
+            return reply;
+        }
+        Reply::Decision(self.state.recovery_fence().map(Outcome::RecoveryFence).into())
     }
 
     async fn read(&self, from: Lsn, limit: usize, wait_ms: u32, minimum_head: Lsn) -> Outcome {

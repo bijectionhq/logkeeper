@@ -14,7 +14,7 @@ use std::{
 
 use bincode::Options;
 use futures::TryStreamExt;
-use journal_contract::{Epoch, JournalError, Lsn, Page, StreamId};
+use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryFence, StreamId};
 use openraft::{
     EntryPayload, OptionalSend, RaftSnapshotBuilder,
     storage::{EntryResponder, RaftStateMachine},
@@ -307,7 +307,7 @@ impl Pin {
     /// keeper never meets one and a later N never trusts one an N-1 outran.
     /// The copy then reopens at restart, as N-1 does.
     pub fn persist(&self, disk: &Disk, stream: StreamId) -> io::Result<()> {
-        if !disk.write_version_allows(crate::stream::consensus::CLUSTER_VERSION_CURRENT) {
+        if !disk.write_version_allows(crate::stream::consensus::CLUSTER_VERSION_V2) {
             return Ok(());
         }
         // Segments that slices of the selected snapshot left stay named
@@ -692,6 +692,11 @@ impl StateMachine {
         self.inner.applied.read().state.head()
     }
 
+    pub fn recovery_fence(&self) -> journal_contract::Result<Option<RecoveryFence>> {
+        self.head()?;
+        self.inner.applied.read().state.recovery_fence()
+    }
+
     pub async fn page(&self, from: Lsn, limit: usize) -> journal_contract::Result<Page> {
         if self.is_quarantined() {
             return Err(JournalError::Corrupted);
@@ -990,7 +995,7 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
         let started = std::time::Instant::now();
         let last = entries.last().map(|entry| entry.log_id.index);
         let may_read_snapshot = self.head().is_ok_and(|head| entries.iter().any(|entry| {
-            matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } | Command::AppendOriginal { at, .. } if *at <= head))
+            matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } | Command::AppendOriginal { at, .. } | Command::AcknowledgeRecoveryWithMarker { at, .. } if *at <= head))
         }));
         let outcomes = if may_read_snapshot {
             let inner = self.inner.clone();

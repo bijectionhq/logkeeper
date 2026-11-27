@@ -6,7 +6,7 @@
 use std::{collections::BTreeSet, io, path::Path, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, Result, StreamId};
+use journal_contract::{BoxFuture, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, Result, StreamId};
 use parking_lot::RwLock;
 
 use crate::stream::timed::{
@@ -533,6 +533,23 @@ impl ConsensusJournal {
 impl Journal for ConsensusJournal {
     fn acknowledge_recovery(&self, stream: StreamId) -> BoxFuture<'_, Result<Lsn>> {
         Box::pin(self.client.acknowledge_recovery(stream))
+    }
+
+    fn recovery_fence(&self, stream: StreamId) -> BoxFuture<'_, Result<Option<RecoveryFence>>> {
+        Box::pin(self.client.recovery_fence(stream))
+    }
+
+    fn acknowledge_recovery_with_marker(
+        &self,
+        stream: StreamId,
+        fence: RecoveryFence,
+        marker: Bytes,
+    ) -> BoxFuture<'_, Result<Lsn>> {
+        if marker.len() > self.max_record_bytes {
+            let max = self.max_record_bytes;
+            return Box::pin(async move { Err(JournalError::TooLarge { max }) });
+        }
+        Box::pin(self.client.acknowledge_recovery_with_marker(stream, fence, marker))
     }
 
     fn create(&self, stream: StreamId) -> BoxFuture<'_, Result<()>> {

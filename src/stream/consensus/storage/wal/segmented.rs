@@ -1200,7 +1200,7 @@ fn write_checkpoint(
 ) -> io::Result<CheckpointRef> {
     let body = if crate::stream::consensus::decisions::write_version_allows(
         write_version,
-        crate::stream::consensus::CLUSTER_VERSION_CURRENT,
+        crate::stream::consensus::CLUSTER_VERSION_V2,
     ) {
         let mut body = CHECKPOINT_MAGIC_V5.to_vec();
         options()

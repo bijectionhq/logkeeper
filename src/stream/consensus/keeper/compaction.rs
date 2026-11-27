@@ -110,7 +110,7 @@ impl Engine {
             }
             if !self
                 .disk
-                .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+                .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_V2)
             {
                 // Relocate frames are an N format: copy nothing before
                 // finalization, so N-1 can still open this WAL.

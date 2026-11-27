@@ -12,7 +12,7 @@ use std::{
 
 use bincode::Options;
 use futures::FutureExt;
-use journal_contract::{Epoch, Lsn, StreamId};
+use journal_contract::{Epoch, Lsn, RecoveryFence, StreamId};
 use openraft::{
     BasicNode, EntryPayload, OptionalSend,
     errors::{NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable},
@@ -266,6 +266,14 @@ pub(super) enum Request {
     /// Clears a durable corruption quarantine marker on this keeper for
     /// `stream`. Administrators only.
     ClearQuarantine(StreamId),
+    /// A linearizable read of the active recovery fence.
+    RecoveryFence(StreamId),
+    /// Commits the consumer's marker and clears the observed fence together.
+    AcknowledgeRecoveryWithMarker {
+        stream: StreamId,
+        fence: RecoveryFence,
+        payload: bytes::Bytes,
+    },
 }
 
 impl Request {
@@ -285,6 +293,7 @@ impl Request {
             | Self::Delete(stream)
             | Self::KeeperStatus(stream)
             | Self::AcknowledgeRecovery(stream)
+            | Self::RecoveryFence(stream)
             | Self::LocalConfiguration(stream)
             | Self::Staging(stream)
             | Self::ClearQuarantine(stream)
@@ -292,6 +301,7 @@ impl Request {
             Self::Stage(ref stage) => stage.stream,
             Self::ClusterVersion | Self::FinalizeVersion(_) => StreamId(0),
             Self::Seal { stream, .. }
+            | Self::AcknowledgeRecoveryWithMarker { stream, .. }
             | Self::Append { stream, .. }
             | Self::AppendBatch { stream, .. }
             | Self::StageOriginal { stream, .. }
@@ -376,7 +386,7 @@ pub(super) fn encode_pong(pong: &Pong, version: WireVersion) -> io::Result<Vec<u
 const MAX_FRAME_TAG_V1: u32 = 2;
 const MAX_FRAME_TAG_CURRENT: u32 = 3;
 const MAX_REQUEST_TAG_V1: u32 = 27;
-const MAX_REQUEST_TAG_CURRENT: u32 = 32;
+const MAX_REQUEST_TAG_CURRENT: u32 = 34;
 const MAX_PEER_REQUEST_TAG_V1: u32 = 5;
 const MAX_PEER_REQUEST_TAG_CURRENT: u32 = 5;
 // Genesis encodes a u128 stream ID, three length-prefixed UUID byte strings
@@ -458,7 +468,9 @@ impl Request {
             | Self::Staging(_)
             | Self::ClusterVersion
             | Self::FinalizeVersion(_)
-            | Self::ClearQuarantine(_) => version == WireVersion::Current,
+            | Self::ClearQuarantine(_)
+            | Self::RecoveryFence(_)
+            | Self::AcknowledgeRecoveryWithMarker { .. } => version == WireVersion::Current,
             _ => true,
         }
     }

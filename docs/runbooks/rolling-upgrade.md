@@ -146,7 +146,7 @@ restart with writes in flight.
 
     ```sh
     lk admin finalize-version --config operator.json
-    # cluster_version: 2
+    # cluster_version: 3
     ```
 
     Schedule finalization after the rollback window has ended.

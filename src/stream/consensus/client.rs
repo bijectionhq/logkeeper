@@ -12,7 +12,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
-use journal_contract::{Epoch, JournalError, Lsn, Result, StreamId};
+use journal_contract::{Epoch, JournalError, Lsn, RecoveryFence, Result, StreamId};
 use parking_lot::Mutex;
 use tokio::time::{Instant, sleep};
 
@@ -340,6 +340,25 @@ impl Client {
     /// Idempotent: without a recovery fence it only returns the head.
     pub async fn acknowledge_recovery(&self, stream: StreamId) -> Result<Lsn> {
         position(self.operation(Request::AcknowledgeRecovery(stream)).await?)
+    }
+
+    pub async fn recovery_fence(&self, stream: StreamId) -> Result<Option<RecoveryFence>> {
+        match self.operation(Request::RecoveryFence(stream)).await? {
+            Outcome::RecoveryFence(fence) => Ok(fence),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
+    pub async fn acknowledge_recovery_with_marker(
+        &self,
+        stream: StreamId,
+        fence: RecoveryFence,
+        payload: Bytes,
+    ) -> Result<Lsn> {
+        position(
+            self.operation(Request::AcknowledgeRecoveryWithMarker { stream, fence, payload })
+                .await?,
+        )
     }
 
     /// Stages a timed original on one signing voter and returns its signed
