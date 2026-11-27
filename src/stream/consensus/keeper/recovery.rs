@@ -2,15 +2,25 @@
 //! three, or three or more of five.
 //!
 //! `logkeeper keeper recover-stream` runs on the stopped survivor's data
-//! directory under its media lock. It replays the survivor's whole log,
-//! asks every other keeper for its status, and refuses unless the operator
+//! directory under its media lock. It replays the survivor's log through
+//! its durable commit index (`Record::Committed`, its snapshot or purge
+//! cut) once the cluster finalized leases, and keeps only that prefix: an
+//! entry past it may be one the survivor wrote as leader and never
+//! committed, at an LSN where the lost voters then committed and
+//! acknowledged another record. The loss point it reports and the catalog
+//! records is then exact, `max(offloaded run, survivor's commit)` (Lean
+//! `OffloadPrefix.restore_exact`). Before leases are finalized keepers do
+//! not write their commit index: it keeps the whole log as before and
+//! reports the last point it knows committed, its snapshot, saying that
+//! records above it may have been overwritten. It asks every other keeper for its status, and refuses unless the operator
 //! acknowledges the data loss and the other voters that answer with a
 //! healthy replica do not form a quorum with the survivor (none of three,
 //! at most one of five). A voter that does not answer is asked again for
 //! longer before it counts as lost: a slow keeper is not a lost one. With
-//! two survivors of five, the recovery runs on the more advanced one (the
-//! later last log entry, then the lower keeper ID): it asks the other for
-//! its last entry (`Request::LocalTip`) and refuses on the other's keeper.
+//! two survivors of five, the recovery runs on the one that knows the later
+//! commit, then the later last log entry, then the lower keeper ID: it asks
+//! the other for both (`Request::LocalProgress`) and refuses on the other's
+//! keeper.
 //! The other survivor keeps its seat in the recovered configuration and
 //! catches up from the survivor like any follower, its divergent
 //! uncommitted suffix replaced. It then stages an installed empty copy on
@@ -25,7 +35,8 @@
 //! clock, whether or not it still runs and whether or not anyone can reach
 //! it (`keeper/lease.rs`). Only then does it write one WAL round on the
 //! survivor: a vote for itself in a term above every term it has seen, and
-//! two entries in that term. The first, `Command::Recover`, stages the move
+//! two entries in that term, right after the kept prefix, which truncates
+//! the uncommitted tail in the same round. The first, `Command::Recover`, stages the move
 //! and fences the stream under the recovery writer at an epoch above every
 //! applied epoch. The second is the membership of the survivor and the two
 //! replacements. When the survivor starts, its replacements elect it with
@@ -68,6 +79,11 @@ const LOST_STATUS_ROUNDS: u32 = 2;
 const LOST_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const LOST_STATUS_PAUSE: Duration = Duration::from_secs(1);
 const STAGING_TIMEOUT: Duration = Duration::from_secs(10);
+/// Why a loss point below the kept head is not exact.
+const UNKNOWN_COMMIT: &str = ", the last point this keeper knows committed: the cluster has not \
+     finalized liveness leases, so keepers do not record their commit index, and the records \
+     this keeper keeps above it may have been overwritten by the lost voters with records \
+     writers were acknowledged";
 
 /// What the operator asked of a recovery.
 #[derive(Clone, Debug, Default)]
@@ -106,7 +122,17 @@ pub struct RecoveryReport {
     pub lost: Vec<Uuid>,
     pub voters: Voters,
     pub revision: u64,
+    /// The last record the survivor keeps: through its durable commit index
+    /// once leases are finalized, its whole log before.
     pub head: Lsn,
+    /// Every record at or below it is one the stream committed; writers that
+    /// were acknowledged records above it lost them.
+    pub loss_point: Lsn,
+    /// Whether the loss point is exact. False before leases are finalized:
+    /// the survivor did not know its commit index, so records between the
+    /// loss point and its head may differ from what writers were
+    /// acknowledged.
+    pub exact: bool,
     pub epoch: Epoch,
     pub term: u64,
     /// False when an earlier run already wrote this recovery.
@@ -146,6 +172,12 @@ impl std::fmt::Display for RecoveryReport {
             self.fenced.len(),
             self.waited.as_millis(),
         )?;
+        write!(f, " Loss point: record {}", self.loss_point.0)?;
+        if self.exact {
+            write!(f, "; acknowledged records above it are lost.")?;
+        } else {
+            write!(f, "{UNKNOWN_COMMIT}.")?;
+        }
         if let Some(offload) = &self.offload {
             write!(f, " {offload}")?;
         }
@@ -208,7 +240,27 @@ impl Config {
             .and_then(|book| book.generation())
             .ok_or_else(|| invalid("this keeper holds no installed replica of the stream"))?;
         disk.check_placement(stream, placement)?;
-        let replayed = storage::replay(disk, genesis.clone(), placement.clone()).await?;
+        let point = disk.recovery_point(stream);
+        // Once leases are finalized, keepers write their commit indexes, so
+        // the recovery keeps exactly the survivor's committed prefix: an
+        // entry past it may be one the lost voters overwrote with other
+        // committed records. Before, it keeps the whole log and reports the
+        // last point it knows committed as the loss point.
+        let leases = self.catalog_version(disk, rpc).await >= super::super::CLUSTER_VERSION_LEASES;
+        let exact = leases && point.written.is_none();
+        if exact && point.committed.is_none() && point.tip.is_some() {
+            return Err(invalid(
+                "refused: this keeper never recorded that the stream committed an entry, so a \
+                 recovery from it would keep no history; recover from another survivor",
+            ));
+        }
+        let committed_next = point.committed.map_or(0, |id| id.index + 1);
+        let next = decisions::recovery_cut(
+            exact,
+            committed_next,
+            point.tip.map_or(0, |tip| tip.index + 1),
+        );
+        let replayed = storage::replay(disk, genesis.clone(), placement.clone(), next).await?;
         let head = replayed
             .head
             .clone()
@@ -222,7 +274,6 @@ impl Config {
                          restore the joint quorum before changing membership",
                 )
             })?;
-        let point = disk.recovery_point(stream);
         if let Some(done) = point.written {
             let report = RecoveryReport {
                 stream,
@@ -230,6 +281,8 @@ impl Config {
                 voters: done.target,
                 revision: configuration.revision,
                 head,
+                loss_point: head,
+                exact: leases,
                 epoch: replayed.epoch,
                 term: point.vote_term,
                 written: false,
@@ -278,7 +331,6 @@ impl Config {
         // so naming them and proving their retirement become optional.
         // Before that, nothing deposes a lost voter that still runs: the
         // operator names both and proves both retired, as before.
-        let leases = self.catalog_version(disk, rpc).await >= super::super::CLUSTER_VERSION_LEASES;
         if recovery.acknowledge_data_loss && !leases && !named {
             return Err(invalid(format!(
                 "refused: the cluster has not finalized liveness leases, so nothing deposes \
@@ -370,26 +422,44 @@ impl Config {
                  so the stream still has a quorum; restart this keeper instead"
             )));
         }
-        // With two survivors of five, the more advanced one recovers, so two
-        // runs can never write rival recoveries.
+        // With two survivors of five, one recovers, so two runs can never
+        // write rival recoveries: the one that knows the later commit, then
+        // the more advanced log. The other keeps only what the recovered
+        // history keeps, so it never knew a later commit than the recovery
+        // keeps. A survivor of an older build reports only its tip.
         for peer in &peers {
-            let tip = match rpc
-                .call_application(*peer, Request::LocalTip(stream), STATUS_TIMEOUT)
+            let progress = match rpc
+                .call_application(*peer, Request::LocalProgress(stream), STATUS_TIMEOUT)
                 .await
             {
-                Ok(Reply::Tip(tip)) => tip,
-                _ => {
-                    return Err(invalid(format!(
-                        "refused: surviving voter {peer} did not report its last log entry, \
-                         so this recovery cannot tell which survivor is more advanced; retry"
-                    )));
-                }
+                Ok(Reply::Progress { tip, committed }) => Some((tip, committed)),
+                _ => None,
             };
-            if (tip, std::cmp::Reverse(*peer)) > (point.tip, std::cmp::Reverse(self.keeper)) {
+            let (tip, committed) = match progress {
+                Some(progress) => progress,
+                None => match rpc
+                    .call_application(*peer, Request::LocalTip(stream), STATUS_TIMEOUT)
+                    .await
+                {
+                    Ok(Reply::Tip(tip)) => (tip, point.committed),
+                    _ => {
+                        return Err(invalid(format!(
+                            "refused: surviving voter {peer} did not report its last log \
+                             entry, so this recovery cannot tell which survivor is more \
+                             advanced; retry"
+                        )));
+                    }
+                },
+            };
+            let rank = |committed: Option<LogId>, tip: Option<LogId>, keeper: Uuid| {
+                (committed.map(|id| id.index), tip, std::cmp::Reverse(keeper))
+            };
+            if rank(committed, tip, *peer) > rank(point.committed, point.tip, self.keeper) {
                 return Err(invalid(format!(
-                    "refused: surviving voter {peer} holds the more advanced log \
-                     ({tip:?} against this keeper's {:?}); stop it and recover from it instead",
-                    point.tip
+                    "refused: surviving voter {peer} knows the later commit or holds the more \
+                     advanced log (committed {committed:?}, last {tip:?} against this keeper's \
+                     {:?}, {:?}); stop it and recover from it instead",
+                    point.committed, point.tip
                 )));
             }
         }
@@ -469,13 +539,31 @@ impl Config {
                 "the selected snapshot is ahead of the log; start and stop this keeper first",
             ));
         }
-        let tip = point.tip;
         let term = decisions::recovery_term(point.vote_term, point.log_term)
             .ok_or_else(|| invalid("the stream's term is exhausted"))?;
         // With offload, the history is the survivor plus the object store.
         let offload = self
             .recovery_offload(stream, head, &replayed, stage.source.saturating_add(1))
             .await?;
+        // The head the survivor knew committed, its snapshot or purge cut
+        // when it never wrote a commit index.
+        let known = if next == committed_next {
+            head
+        } else {
+            storage::replay(disk, genesis.clone(), placement.clone(), committed_next)
+                .await?
+                .head
+                .unwrap_or(Lsn(0))
+        };
+        let restored = offload.as_ref().is_some_and(|(_, report)| report.restored);
+        let loss_point = Lsn(decisions::reported_loss_point(
+            exact || restored,
+            offload
+                .as_ref()
+                .map_or(head, |(_, report)| report.kept_through)
+                .0,
+            known.0,
+        ));
         let restored_epoch = offload.as_ref().map_or(replayed.epoch, |(restore, _)| {
             restore.epoch.max(replayed.epoch)
         });
@@ -490,8 +578,8 @@ impl Config {
         ) {
             return Err(invalid(format!(
                 "refused without --acknowledge-data-loss. This would make this keeper's copy of \
-                 stream {:032x} (head {}) the only history: records only {} held are \
-                 lost. The voters would become {target:?} at revision {}, term {term}, with \
+                 stream {:032x} through head {} the only history: records only {} held are \
+                 lost, and writers lose every record they were acknowledged above {}{}. The voters would become {target:?} at revision {}, term {term}, with \
                  seals refused under a recovery fence at epoch {} until an administrator \
                  acknowledges the recovery. Once leases are finalized the catalog fences the \
                  stream for {}, and the recovered configuration serves only once their \
@@ -501,6 +589,12 @@ impl Config {
                 stream.0,
                 head.0,
                 listed(&others, " and "),
+                loss_point.0,
+                if exact || restored {
+                    ""
+                } else {
+                    UNKNOWN_COMMIT
+                },
                 stage.source + 1,
                 epoch.0,
                 listed(&others, " and "),
@@ -540,10 +634,8 @@ impl Config {
         let record = RecoveryRecord {
             stream,
             epoch: stage.source.saturating_add(1),
-            loss_point: offload
-                .as_ref()
-                .map_or(head, |(_, report)| report.kept_through),
-            source: if offload.as_ref().is_some_and(|(_, report)| report.restored) {
+            loss_point,
+            source: if restored {
                 RecoverySource::ObjectStore
             } else {
                 RecoverySource::Survivor
@@ -608,7 +700,6 @@ impl Config {
                 index,
             )
         };
-        let next = tip.map_or(0, |tip| tip.index + 1);
         let nodes = target
             .into_iter()
             .map(|id| {
@@ -661,6 +752,8 @@ impl Config {
             voters: target,
             revision: stage.source + 1,
             head,
+            loss_point,
+            exact: exact || restored,
             epoch,
             term,
             written: true,

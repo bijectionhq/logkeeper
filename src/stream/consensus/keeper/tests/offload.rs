@@ -511,12 +511,13 @@ async fn recovery_from_one_survivor_restores_the_longer_object_store_history() {
 
 /// A survivor that holds uncommitted records at LSNs where the lost voters
 /// later committed, and offloaded, other records: the recovery must keep
-/// the committed records the store holds, or report those LSNs lost. It
-/// keeps the survivor's whole log instead, because the loss point compares
-/// the survivor's head, which counts uncommitted records, with the end of
-/// the store's run (Lean `OffloadPrefix.whole_survivor_log_diverges`).
+/// the committed records the store holds, or report those LSNs lost.
+/// Comparing the survivor's whole head, which counts uncommitted records,
+/// with the end of the store's run kept the survivor's log (Lean
+/// `OffloadPrefix.whole_survivor_log_diverges`). The recovery compares its
+/// committed head, 20, so the store's run 1..=23 replaces it (Lean
+/// `OffloadPrefix.restore_exact`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known bug: recovery keeps a survivor's uncommitted records below the reported head; see AUTHORITY-MODEL-REPORT.md"]
 async fn recovery_keeps_committed_store_records_over_a_survivors_uncommitted_ones() {
     let store = tempfile::tempdir().unwrap();
     let mut cluster = Cluster::start_offloaded(&offload_config(store.path())).await;

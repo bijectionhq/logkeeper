@@ -1660,6 +1660,7 @@ impl Engine {
                         | Request::PlacementProof(_)
                         | Request::LocalConfiguration(_)
                         | Request::LocalTip(_)
+                        | Request::LocalProgress(_)
                         | Request::StageReplica { .. }
                         | Request::InstallReplica { .. }
                         | Request::StageRecovered { .. }
@@ -1795,6 +1796,16 @@ impl Engine {
                     .then(|| self.disk.recovery_point(stream).tip)
                     .flatten(),
             )),
+            Request::LocalProgress(stream) => {
+                let point = self
+                    .disk
+                    .genesis(stream)
+                    .map(|_| self.disk.recovery_point(stream));
+                Ok(Reply::Progress {
+                    tip: point.as_ref().and_then(|point| point.tip),
+                    committed: point.and_then(|point| point.committed),
+                })
+            }
             Request::LocalCopy(_) => Ok(self
                 .disk
                 .ownership(stream)

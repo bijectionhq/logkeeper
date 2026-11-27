@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 158,
+  "min_verified_functions": 161,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -1555,6 +1555,70 @@
         }
       ],
       "min_verified_functions": 157
+    },
+    "keep-uncommitted-tail": {
+      "defect": "write a recovery after the survivor's whole log once leases are finalized",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    if exact && committed_next < tip_next {",
+          "replace": "    if !exact && committed_next < tip_next {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_cut",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_cut",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_cut",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "prefer-survivor-head": {
+      "defect": "keep the survivor's head over a longer committed run in the store",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    if uploaded > survivor {\n        uploaded",
+          "replace": "    if uploaded > survivor && survivor == 0 {\n        uploaded"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovered_head",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "report-kept-head": {
+      "defect": "report the kept head as the loss point when the survivor did not know its commit index",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    if exact || known > kept { kept } else { known }",
+          "replace": "    if true || known > kept { kept } else { known }"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "reported_loss_point",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
     }
   }
 }

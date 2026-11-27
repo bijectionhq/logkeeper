@@ -543,7 +543,8 @@ impl Engine {
 /// What an operator recovery found in the offload store, and kept.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OffloadRecovery {
-    /// The survivor's own head before recovery.
+    /// The head of the survivor's history the recovery started from: its
+    /// committed prefix once leases are finalized, its whole log before.
     pub survivor_head: Lsn,
     /// The `offloaded_through` the survivor had applied.
     pub offloaded_through: Lsn,
@@ -587,7 +588,10 @@ impl std::fmt::Display for OffloadRecovery {
 /// store holds under the survivor's lineages, the `Command::Restore` that
 /// starts a new lineage and, when the run is longer than the survivor's
 /// log, makes it the history. Records the new lineage in the store first,
-/// so a later restore with no voter left finds it.
+/// so a later restore with no voter left finds it. `survivor_head` is the
+/// head of the history the survivor keeps: its committed prefix once leases
+/// are finalized, so the store's committed run replaces every survivor
+/// record it never knew committed (`decisions::recovered_head`).
 pub(super) async fn plan_recovery(
     store: &Store,
     stream: StreamId,

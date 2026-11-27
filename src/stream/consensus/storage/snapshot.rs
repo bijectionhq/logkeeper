@@ -1745,10 +1745,13 @@ pub(super) fn inspect_stream_readonly(
     })
 }
 
+/// Replays a stopped keeper's copy of the stream from its snapshot through
+/// the log entries before index `until`, `u64::MAX` for the whole log.
 pub(in crate::stream::consensus) async fn replay(
     disk: &Disk,
     genesis: Genesis,
     placement: Placement,
+    until: u64,
 ) -> io::Result<Replayed> {
     let machine = StateMachine::open(disk, genesis, placement).await?;
     let inner = machine.inner.clone();
@@ -1756,7 +1759,8 @@ pub(in crate::stream::consensus) async fn replay(
         let applied = inner.applied.read().applied;
         let entries = inner.disk.log(inner.genesis.stream, |log| {
             log.entries
-                .values()
+                .range(..until)
+                .map(|(_, entry)| entry)
                 .filter(|entry| applied.is_none_or(|applied| entry.log_id.index > applied.index))
                 .cloned()
                 .collect::<Vec<_>>()

@@ -1140,23 +1140,12 @@ async fn the_survivor_refuses_a_lost_voters_snapshot_without_its_term() {
     cluster.stop_all().await;
 }
 
-/// A survivor that holds uncommitted records at LSNs where the lost voters
-/// later committed other records. Every record at or below the head the
-/// recovery reports must be one the stream committed, so that a writer that
-/// compares the reported head with what it was acknowledged finds the loss.
-/// The recovery reports the survivor's whole log instead: its head counts
-/// the uncommitted records, the writer's acknowledged LSNs 21..=23 lie at
-/// or below it, and they now hold other records (TLA+
-/// `EpochLeases.LossAboveReportedHead`, Lean
-/// `OffloadPrefix.whole_survivor_log_diverges`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known bug: recovery keeps a survivor's uncommitted records below the reported head; see AUTHORITY-MODEL-REPORT.md"]
-async fn the_reported_head_never_covers_a_survivors_uncommitted_records() {
-    let mut cluster = Cluster::start().await;
-    cluster.finalize().await;
+/// The survivor of `stream`, and the lost voters, after the survivor led
+/// and wrote 21..=25 to its own log without committing them, and the lost
+/// voters then committed and acknowledged other records at 21..=23.
+async fn diverged_survivor(cluster: &mut Cluster, stream: StreamId) -> (Uuid, [Uuid; 2]) {
     let [a, b, c, _] = cluster.ids;
-    let stream = StreamId(88);
-    let fence = written_stream(&cluster, stream, Voters::from([a, b, c]), a, 20).await;
+    let fence = written_stream(cluster, stream, Voters::from([a, b, c]), a, 20).await;
     let journal = cluster.client(&cluster.credentials);
     let survivor = cluster.leader_after_head(&journal, stream).await;
     let lost: [Uuid; 2] = [a, b, c]
@@ -1173,7 +1162,7 @@ async fn the_reported_head_never_covers_a_survivors_uncommitted_records() {
     })
     .await
     .unwrap();
-    remember_peers(&cluster, survivor, lost).await;
+    remember_peers(cluster, survivor, lost).await;
 
     // The leader writes 21..=25 to its own log and never commits them.
     for id in lost {
@@ -1228,24 +1217,129 @@ async fn the_reported_head_never_covers_a_survivors_uncommitted_records() {
     for id in lost {
         cluster.running.remove(&id).unwrap().stop().await;
     }
+    (survivor, lost)
+}
 
-    let fence_proofs = lost
-        .into_iter()
-        .map(|id| cluster.configs[&id].fence_recovery(id).unwrap())
-        .collect();
+/// An acknowledged recovery of `stream` from `survivor` naming `lost`.
+fn recovery_naming(cluster: &Cluster, lost: [Uuid; 2]) -> Recovery {
+    Recovery {
+        acknowledge_data_loss: true,
+        lost: Some(lost.to_vec()),
+        fence_proofs: lost
+            .into_iter()
+            .map(|id| cluster.configs[&id].fence_recovery(id).unwrap())
+            .collect(),
+        ..Recovery::default()
+    }
+}
+
+/// A survivor that holds uncommitted records at LSNs where the lost voters
+/// later committed other records. Every record at or below the head the
+/// recovery reports must be one the stream committed, so that a writer that
+/// compares the reported head with what it was acknowledged finds the loss
+/// (TLA+ `EpochLeases.LossAboveReportedHead`, Lean
+/// `OffloadPrefix.whole_survivor_log_diverges`). Once leases are finalized
+/// the survivor wrote its commit index, so the recovery keeps exactly its
+/// committed prefix 1..=20, drops 21..=25 and reports 20 as the loss point
+/// (Lean `OffloadPrefix.restore_exact`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reported_head_never_covers_a_survivors_uncommitted_records() {
+    let mut cluster = Cluster::start().await;
+    cluster.finalize().await;
+    let stream = StreamId(88);
+    let (survivor, lost) = diverged_survivor(&mut cluster, stream).await;
     let report = cluster.configs[&survivor]
-        .recover_stream(
-            stream,
-            Recovery {
-                acknowledge_data_loss: true,
-                lost: Some(lost.to_vec()),
-                fence_proofs,
-                ..Recovery::default()
-            },
-        )
+        .recover_stream(stream, recovery_naming(&cluster, lost))
         .await
         .unwrap();
     // 21..=23 were acknowledged and are gone: the loss point lies below them.
     assert!(report.head < Lsn(21), "{report}");
+    assert_eq!((report.head, report.loss_point), (Lsn(20), Lsn(20)));
+    assert!(report.exact, "{report}");
+    cluster.restart(survivor).await;
+    let journal = cluster.client(&cluster.credentials);
+    timeout(RECOVERY_WAIT, async {
+        while journal.head(stream).await != Ok(Lsn(20)) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the recovered stream serves its committed prefix");
+    let page = journal
+        .read(stream, Lsn(20), 8, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.records, vec![(Lsn(20), Bytes::from("record-20"))]);
+    cluster.stop_all().await;
+}
+
+/// Before leases are finalized keepers write no commit index, so the same
+/// recovery keeps the survivor's whole log as before, but reports only the
+/// point it knows committed, here nothing past its empty snapshot, and says
+/// that the records it kept above may have been overwritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn below_leases_the_loss_point_is_the_last_point_the_survivor_knows_committed() {
+    let mut cluster = Cluster::start().await;
+    cluster
+        .finalize_to(crate::stream::consensus::CLUSTER_VERSION_OFFLOAD)
+        .await;
+    let stream = StreamId(89);
+    let (survivor, lost) = diverged_survivor(&mut cluster, stream).await;
+    let report = cluster.configs[&survivor]
+        .recover_stream(stream, recovery_naming(&cluster, lost))
+        .await
+        .unwrap();
+    assert_eq!(report.head, Lsn(25), "{report}");
+    assert!(!report.exact, "{report}");
+    assert!(report.loss_point < Lsn(21), "{report}");
+    assert!(
+        report.to_string().contains("may have been overwritten"),
+        "{report}"
+    );
+    cluster.stop_all().await;
+}
+
+/// A young stream, with no snapshot, keeps every record it committed: the
+/// commit index the survivor wrote, not its snapshot, bounds the recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_young_stream_keeps_every_committed_record_through_recovery() {
+    let mut cluster = Cluster::start().await;
+    cluster.finalize().await;
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(90);
+    written_stream(&cluster, stream, Voters::from([a, b, c]), a, 3).await;
+    remember_peers(&cluster, a, [b, c]).await;
+    for keeper in [b, c, a] {
+        cluster.running.remove(&keeper).unwrap().stop().await;
+    }
+    let report = cluster.configs[&a]
+        .recover_stream(stream, recovery_naming(&cluster, [b, c]))
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.head, report.loss_point),
+        (Lsn(3), Lsn(3)),
+        "{report}"
+    );
+    assert!(report.exact);
+    cluster.restart(a).await;
+    let journal = cluster.client(&cluster.credentials);
+    timeout(RECOVERY_WAIT, async {
+        while journal.head(stream).await != Ok(Lsn(3)) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the recovered stream serves");
+    let page = journal
+        .read(stream, Lsn(1), 8, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.records,
+        (1..=3)
+            .map(|at| (Lsn(at), Bytes::from(format!("record-{at}"))))
+            .collect::<Vec<_>>()
+    );
     cluster.stop_all().await;
 }

@@ -409,8 +409,12 @@ pub(super) fn local_floor(floor: u64, requested: u64, offloaded: u64, head: u64)
 }
 
 /// The head an operator recovery keeps: everything at or below the larger
-/// of the survivor's head and the end of the committed run the offload
-/// store holds. Records above it that a writer was acknowledged are lost.
+/// of the survivor's committed head and the end of the committed run the
+/// offload store holds, exactly. `survivor` is the head of the survivor's
+/// log through its commit index, never its uncommitted tail, which the lost
+/// voters may have overwritten with other committed records (Lean
+/// `OffloadPrefix.restore_exact`). Records above it that a writer was
+/// acknowledged are lost.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures
         out >= survivor,
@@ -423,6 +427,45 @@ pub(super) fn recovered_head(survivor: u64, uploaded: u64) -> u64 {
     } else {
         survivor
     }
+}
+
+/// The first log index an operator recovery writes its entries at, which
+/// truncates every entry of the survivor's log from it. With `exact`, once
+/// the cluster finalized leases and so writes commit indexes, it is right
+/// after the survivor's durable commit index: an entry past it may be one
+/// the lost voters overwrote. Before, the survivor does not know its commit
+/// index and keeps its whole log. Never past the log.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out <= tip_next,
+        exact ==> out <= committed_next,
+        exact && committed_next <= tip_next ==> out == committed_next,
+        !exact ==> out == tip_next,
+))]
+pub(super) fn recovery_cut(exact: bool, committed_next: u64, tip_next: u64) -> u64 {
+    if exact && committed_next < tip_next {
+        committed_next
+    } else {
+        tip_next
+    }
+}
+
+/// The loss point an operator recovery reports and the catalog records:
+/// every record at or below it is one the stream committed. With `exact`,
+/// it is the head the recovery keeps. Without, the kept head may count
+/// records the survivor never knew committed, so it is the head the
+/// survivor knew committed, its snapshot or offloaded point, and records
+/// between it and the kept head may differ from what writers were
+/// acknowledged.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out <= kept,
+        exact ==> out == kept,
+        !exact ==> out == known || out == kept,
+        !exact ==> out <= known,
+))]
+pub(super) fn reported_loss_point(exact: bool, kept: u64, known: u64) -> u64 {
+    if exact || known > kept { kept } else { known }
 }
 
 /// Whether a leader refuses an append because offload fell too far behind.

@@ -332,6 +332,7 @@ fn request(tag: usize) -> Option<Request> {
             },
         },
         46 => Request::SelectedCheckpoint(STREAM),
+        47 => Request::LocalProgress(STREAM),
         _ => return None,
     })
 }
@@ -429,6 +430,10 @@ fn reply(tag: usize) -> Option<Reply> {
         }),
         13 => Reply::Tip(None),
         14 => Reply::Named(vec![STREAM]),
+        15 => Reply::Progress {
+            tip: None,
+            committed: None,
+        },
         _ => return None,
     })
 }

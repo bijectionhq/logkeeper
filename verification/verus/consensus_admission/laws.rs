@@ -840,11 +840,40 @@ fn retention_drops_only_offloaded_records(floor: u64, requested: u64, offloaded:
     assert(out as int <= head as int + 1);
 }
 
-// Offload.loss_point: a recovery keeps the survivor's head and the store's
-// committed run, whichever is longer.
+// Offload.loss_point: a recovery keeps the survivor's committed head and the
+// store's committed run, whichever is longer, and nothing past both.
 fn recovery_keeps_the_longer_history(survivor: u64, uploaded: u64) {
     let out = recovered_head(survivor, uploaded);
     assert(out >= survivor && out >= uploaded);
+    assert(out <= survivor || out <= uploaded);
+}
+
+// OffloadPrefix.restore_exact: once leases are finalized a recovery writes
+// right after the survivor's commit index, so it keeps no entry the survivor
+// never knew committed, and the head it keeps past that commit comes from the
+// store's committed run alone. The loss point it reports is that head. Before
+// leases are finalized it keeps the whole log and reports no more than the
+// point the survivor knew committed (OffloadPrefix.whole_survivor_log_diverges).
+fn recovery_keeps_exactly_the_committed_history(
+    committed_next: u64,
+    tip_next: u64,
+    committed_head: u64,
+    uploaded: u64,
+    known: u64,
+)
+    requires committed_next <= tip_next,
+{
+    let cut = recovery_cut(true, committed_next, tip_next);
+    assert(cut == committed_next);
+    let kept = recovered_head(committed_head, uploaded);
+    assert(kept > committed_head ==> kept == uploaded);
+    let point = reported_loss_point(true, kept, known);
+    assert(point == kept);
+
+    let whole = recovery_cut(false, committed_next, tip_next);
+    assert(whole == tip_next);
+    let conservative = reported_loss_point(false, kept, known);
+    assert(conservative <= known && conservative <= kept);
 }
 
 // Offload.backpressure: appends are refused only when enforced and the

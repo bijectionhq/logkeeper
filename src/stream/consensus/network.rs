@@ -347,6 +347,13 @@ pub(super) enum Request {
         checkpoint: CheckpointInstallation,
     },
     SelectedCheckpoint(StreamId),
+    /// An operator recovery asks another surviving voter for the last log
+    /// entry of its copy of `stream` and the highest one it knows committed,
+    /// answered with `Reply::Progress`. With two survivors of five the one
+    /// that knows the later commit recovers, then the more advanced log.
+    /// Keepers only; added last, after `LocalTip`, which an older survivor
+    /// still answers.
+    LocalProgress(StreamId),
 }
 
 impl Request {
@@ -373,6 +380,7 @@ impl Request {
             | Self::Staging(stream)
             | Self::ClearQuarantine(stream)
             | Self::LocalTip(stream)
+            | Self::LocalProgress(stream)
             | Self::Configuration(stream) => stream,
             Self::Stage(ref stage) | Self::RecoverStream { ref stage, .. } => stage.stream,
             Self::ClusterVersion
@@ -800,6 +808,12 @@ pub(super) enum Reply {
     Tip(Option<super::LogId>),
     /// The streams a `Request::NamedStreams` asked about. Added last.
     Named(Vec<StreamId>),
+    /// The answering keeper's last log entry of its copy and the highest it
+    /// knows committed, for `Request::LocalProgress`. Added last.
+    Progress {
+        tip: Option<super::LogId>,
+        committed: Option<super::LogId>,
+    },
 }
 
 /// The N-1 wire codec for [`Reply`], the bincode layout of
@@ -877,7 +891,7 @@ impl ReplyV1 {
                     "the configuration authority requires a newer protocol",
                 ));
             }
-            Reply::Tip(_) => {
+            Reply::Tip(_) | Reply::Progress { .. } => {
                 return Err(unsupported("N-1 knows no local tip request"));
             }
         })

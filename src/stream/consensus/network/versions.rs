@@ -81,7 +81,8 @@ impl Request {
             | Self::NamedStreams(_)
             | Self::TrimCheckpoint { .. }
             | Self::InstallCheckpoint { .. }
-            | Self::SelectedCheckpoint(_) => WireVersion::Current,
+            | Self::SelectedCheckpoint(_)
+            | Self::LocalProgress(_) => WireVersion::Current,
         }
     }
 }
@@ -138,7 +139,8 @@ impl Reply {
             | Self::Lease(_)
             | Self::Recovered(_)
             | Self::Tip(_)
-            | Self::Named(_) => WireVersion::Current,
+            | Self::Named(_)
+            | Self::Progress { .. } => WireVersion::Current,
         }
     }
 }
