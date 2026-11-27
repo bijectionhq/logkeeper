@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use super::{Engine, Group, Outcome, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
 use crate::stream::consensus::{
-    Genesis, LogId, Stage,
+    Genesis, LogId, Stage, decisions,
     network::{Frame, Proof},
     ownership::{self, Change},
     storage::Record,
@@ -234,10 +234,11 @@ impl Engine {
             return Err(ownership::stale());
         }
         let proof = self.verified_proof(authority, &genesis).await?;
-        if proof.configuration.revision != revision
-            || proof.configuration.voters.contains(&self.id)
-            || proof.joint.is_some_and(|target| target.contains(&self.id))
-        {
+        if !decisions::certifies_exclusion(
+            proof.configuration.revision == revision,
+            proof.configuration.voters.contains(&self.id),
+            proof.joint.is_some_and(|target| target.contains(&self.id)),
+        ) {
             return Err(invalid(
                 "current placement does not certify replica exclusion",
             ));

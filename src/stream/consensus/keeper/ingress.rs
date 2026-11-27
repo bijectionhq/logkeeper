@@ -456,15 +456,21 @@ impl Engine {
             // parked; anything else reopens it. So do heartbeats that go on
             // past the park round: their leader stayed open because another
             // follower declined to park.
-            match &request {
-                PeerRequest::Append(append)
-                    if append.entries.is_empty()
-                        && since.elapsed() < super::park::PARKED_HEARTBEATS =>
-                {
-                    return encode(&AppendReply::Busy);
+            let parked = match &request {
+                PeerRequest::Append(append) if append.entries.is_empty() => {
+                    decisions::ParkedRequest::Heartbeat
                 }
-                PeerRequest::Park { .. } => return encode(&true),
-                _ => {
+                PeerRequest::Park { .. } => decisions::ParkedRequest::Park,
+                _ => decisions::ParkedRequest::Other,
+            };
+            match decisions::parked_answer(
+                parked,
+                since.elapsed().as_nanos(),
+                super::park::PARKED_HEARTBEATS.as_nanos(),
+            ) {
+                decisions::ParkedAnswer::Busy => return encode(&AppendReply::Busy),
+                decisions::ParkedAnswer::Parked => return encode(&true),
+                decisions::ParkedAnswer::Reopen => {
                     if self.parked.write().remove(&genesis.stream).is_some() {
                         super::super::metrics::count(
                             &super::super::metrics::COUNTERS.unparked_by_peer,

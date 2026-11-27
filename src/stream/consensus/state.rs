@@ -676,20 +676,29 @@ impl Live {
     }
 
     fn seal(&mut self, expected: Epoch, writer: uuid::Uuid, owner: String) -> Result<Outcome> {
-        if self.recovering() {
-            return Err(JournalError::Recovered { head: self.head });
-        }
-        let epoch = expected
-            .0
-            .checked_add(1)
-            .map(Epoch)
-            .ok_or(JournalError::Unavailable)?;
-        let fence = Fence { epoch, writer };
-        if self.epoch() == expected {
-            self.writer = Some((fence, owner));
-        } else {
-            self.require_writer(fence, &owner)?;
-        }
+        let fence = match super::decisions::seal_step(self.recovering(), self.epoch().0, expected.0)
+        {
+            super::decisions::SealStep::Recovered => {
+                return Err(JournalError::Recovered { head: self.head });
+            }
+            super::decisions::SealStep::Unavailable => return Err(JournalError::Unavailable),
+            super::decisions::SealStep::Install(epoch) => {
+                let fence = Fence {
+                    epoch: Epoch(epoch),
+                    writer,
+                };
+                self.writer = Some((fence, owner));
+                fence
+            }
+            super::decisions::SealStep::Repeat(epoch) => {
+                let fence = Fence {
+                    epoch: Epoch(epoch),
+                    writer,
+                };
+                self.require_writer(fence, &owner)?;
+                fence
+            }
+        };
         Ok(Outcome::Sealed(Sealed {
             fence,
             head: self.head,

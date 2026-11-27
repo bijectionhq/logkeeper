@@ -568,3 +568,419 @@ pub(super) fn consecutive_cut(
 ) -> bool {
     indices_follow(previous, ids) && terms_ordered(previous, ids, vote_term)
 }
+
+/// Whether two optional log indices name the same position.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (a == b)
+))]
+pub(super) fn same_index(a: Option<u64>, b: Option<u64>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Whether a replica's group is idle enough to park, apart from the
+/// replicated catalog, which never parks: it served no client and grew no
+/// log for the park delay, it applied its whole log, its membership is
+/// uniform, and it receives no snapshot.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (quiet_log_ns >= park_after_ns && unused_ns >= park_after_ns
+        && applied == last_log && uniform && !receiving)
+))]
+pub(super) fn idle(
+    quiet_log_ns: u128,
+    unused_ns: u128,
+    park_after_ns: u128,
+    applied: Option<u64>,
+    last_log: Option<u64>,
+    uniform: bool,
+    receiving: bool,
+) -> bool {
+    quiet_log_ns >= park_after_ns
+        && unused_ns >= park_after_ns
+        && same_index(applied, last_log)
+        && uniform
+        && !receiving
+}
+
+/// Whether a leader asks its followers to park: it leads, it applied its
+/// whole log and every live voter matched it, and it is idle itself.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (leader && settled && idle)
+))]
+pub(super) fn leader_parks(leader: bool, settled: bool, idle: bool) -> bool {
+    leader && settled && idle
+}
+
+/// Whether a follower parks at a leader's request: it follows under the
+/// leader's vote, it applied exactly the leader's applied log and holds no
+/// entry past it, and it is idle itself.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (follower && same_vote && same_applied && last_log == leader_applied && idle)
+))]
+pub(super) fn accepts_park(
+    follower: bool,
+    same_vote: bool,
+    same_applied: bool,
+    last_log: Option<u64>,
+    leader_applied: Option<u64>,
+    idle: bool,
+) -> bool {
+    follower && same_vote && same_applied && same_index(last_log, leader_applied) && idle
+}
+
+/// A peer request that reaches a parked replica.
+pub(super) enum ParkedRequest {
+    /// An AppendEntries with no entries.
+    Heartbeat,
+    /// A repeated park request.
+    Park,
+    /// Entries, a vote, a pre-vote, a snapshot or a leader transfer.
+    Other,
+}
+
+/// How a parked replica handles a peer request.
+pub(super) enum ParkedAnswer {
+    /// Answer busy without opening the group.
+    Busy,
+    /// Confirm the park without opening the group.
+    Parked,
+    /// Reopen the group and serve the request.
+    Reopen,
+}
+
+/// A parked replica answers an empty heartbeat busy only within
+/// `heartbeat_window_ns` of parking: heartbeats that go on past the park
+/// round come from a leader that stayed open because another follower
+/// declined, so they reopen the group.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        (out is Busy) == (request is Heartbeat && parked_ns < heartbeat_window_ns),
+        (out is Parked) == (request is Park),
+        (out is Reopen) == (request is Other
+            || (request is Heartbeat && parked_ns >= heartbeat_window_ns)),
+))]
+pub(super) fn parked_answer(
+    request: ParkedRequest,
+    parked_ns: u128,
+    heartbeat_window_ns: u128,
+) -> ParkedAnswer {
+    match request {
+        ParkedRequest::Heartbeat if parked_ns < heartbeat_window_ns => ParkedAnswer::Busy,
+        ParkedRequest::Park => ParkedAnswer::Parked,
+        _ => ParkedAnswer::Reopen,
+    }
+}
+
+/// Whether a leader counts a voter silent: its keeper is dead, or it has
+/// not acknowledged this leader for the repair delay, measured from this
+/// leader's term when it never acknowledged.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (dead || match acked_ns {
+        Some(acked) => acked >= repair_after_ns,
+        None => led_ns >= repair_after_ns,
+    })
+))]
+pub(super) fn silent(
+    dead: bool,
+    acked_ns: Option<u128>,
+    led_ns: u128,
+    repair_after_ns: u128,
+) -> bool {
+    dead || match acked_ns {
+        Some(acked) => acked >= repair_after_ns,
+        None => led_ns >= repair_after_ns,
+    }
+}
+
+/// Whether a learner the leader has seen for `seen_ns` belongs to an
+/// aborted replacement.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (seen_ns >= stale_ns)
+))]
+pub(super) fn learner_stale(seen_ns: u128, stale_ns: u128) -> bool {
+    seen_ns >= stale_ns
+}
+
+/// The order in which a repair pass starts queued work: higher priority
+/// (lower rank) first; within one rank, the streams after the one the
+/// last pass started last, then the rest, each in stream order.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out.0 == rank,
+        out.1 == (cursor matches Some(last) && stream <= last),
+        out.2 == stream,
+))]
+pub(super) fn repair_key(rank: u8, stream: u128, cursor: Option<u128>) -> (u8, bool, u128) {
+    let wrapped = match cursor {
+        Some(last) => stream <= last,
+        None => false,
+    };
+    (rank, wrapped, stream)
+}
+
+/// What a repair pass does with the next queued stream.
+pub(super) enum RepairStart {
+    Start,
+    /// The stream already repairs or waits out its backoff.
+    Skip,
+    /// Every repair slot is taken.
+    Full,
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        (out is Full) == (running >= max_repairs),
+        (out is Start) == (running < max_repairs && !repairing && !backed_off),
+))]
+pub(super) fn starts_repair(
+    running: usize,
+    max_repairs: usize,
+    repairing: bool,
+    backed_off: bool,
+) -> RepairStart {
+    if running >= max_repairs {
+        RepairStart::Full
+    } else if repairing || backed_off {
+        RepairStart::Skip
+    } else {
+        RepairStart::Start
+    }
+}
+
+/// Whether a voter roster may move: a membership change needs a quorum,
+/// so at least two of the three current voters must be live.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (live >= 2)
+))]
+pub(super) fn repair_allowed(live: usize) -> bool {
+    live >= 2
+}
+
+/// The stream count above which an eligible keeper takes no new voter:
+/// a quarter above the rounded-up average of the `count` known keepers,
+/// and at least one above it. `None` when no load is known.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        count == 0 ==> out is None,
+        count > 0 ==> (out matches Some(ceiling)
+            && ceiling as int == ceiling_of(rounded_average(sum as int, count as int))),
+))]
+pub(super) fn load_ceiling(sum: u64, count: u64) -> Option<u32> {
+    if count == 0 {
+        return None;
+    }
+    // The quotient is below `u64::MAX` whenever a remainder is left.
+    let quotient = sum / count;
+    let average = if sum % count != 0 && quotient < u64::MAX {
+        quotient + 1
+    } else {
+        quotient
+    };
+    let bump = if average / 4 > 1 { average / 4 } else { 1 };
+    let ceiling = if average > u64::MAX - bump {
+        u64::MAX
+    } else {
+        average + bump
+    };
+    Some(if ceiling > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        ceiling as u32
+    })
+}
+
+/// Whether a keeper with `streams` open groups is under the load ceiling.
+/// A keeper of unknown load, or a view with no known load, counts as roomy.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == match (ceiling, streams) {
+        (Some(ceiling), Some(streams)) => streams <= ceiling,
+        _ => true,
+    }
+))]
+pub(super) fn roomy(ceiling: Option<u32>, streams: Option<u32>) -> bool {
+    match (ceiling, streams) {
+        (Some(ceiling), Some(streams)) => streams <= ceiling,
+        _ => true,
+    }
+}
+
+/// Whether a leader hands leadership to a writer's preferred voter: it is
+/// another voter, it matched the leader's whole log, and no handoff
+/// reached or left this group within the hold-down.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (!to_self && matched is Some && matched == last && !recent)
+))]
+pub(super) fn hands_off(
+    to_self: bool,
+    matched: Option<u64>,
+    last: Option<u64>,
+    recent: bool,
+) -> bool {
+    !to_self && matched.is_some() && same_index(matched, last) && !recent
+}
+
+/// Whether a replica looks for a placement proof that would retire its
+/// copy: a peer refused it as outside its placement, or it does not lead
+/// and has heard from no leader for the repair delay.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (excluded || (!leader && unheard_ns >= repair_after_ns))
+))]
+pub(super) fn orphaned(
+    excluded: bool,
+    leader: bool,
+    unheard_ns: u128,
+    repair_after_ns: u128,
+) -> bool {
+    excluded || (!leader && unheard_ns >= repair_after_ns)
+}
+
+/// Whether a certified placement proof retires this keeper's copy: the
+/// proof is of the revision the copy was asked to leave, and neither its
+/// configuration nor the target of its joint change names this keeper.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (same_revision && !named_voter && !named_joint)
+))]
+pub(super) fn certifies_exclusion(
+    same_revision: bool,
+    named_voter: bool,
+    named_joint: bool,
+) -> bool {
+    same_revision && !named_voter && !named_joint
+}
+
+/// How the stream state machine decides a seal.
+pub(super) enum SealStep {
+    /// An unacknowledged operator recovery fences the stream.
+    Recovered,
+    /// The next epoch would overflow.
+    Unavailable,
+    /// Install a new fence at this epoch.
+    Install(u64),
+    /// Only the writer already holding a fence at this epoch may repeat it.
+    Repeat(u64),
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        recovering ==> out is Recovered,
+        !recovering && expected == u64::MAX ==> out is Unavailable,
+        out matches SealStep::Install(epoch) ==> !recovering && current == expected
+            && epoch == expected + 1 && epoch > current,
+        out matches SealStep::Repeat(epoch) ==> !recovering && current != expected
+            && epoch == expected + 1,
+        !recovering && expected < u64::MAX ==> (if current == expected {
+            out is Install } else { out is Repeat }),
+))]
+pub(super) fn seal_step(recovering: bool, current: u64, expected: u64) -> SealStep {
+    if recovering {
+        SealStep::Recovered
+    } else if expected == u64::MAX {
+        SealStep::Unavailable
+    } else if current == expected {
+        SealStep::Install(expected + 1)
+    } else {
+        SealStep::Repeat(expected + 1)
+    }
+}
+
+/// The boundary slot a restart trusts: the intact slot with the higher
+/// sequence, 0 or 1, preferring the second on a tie. `None` when neither
+/// slot is intact.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        (first is None && second is None) <==> out is None,
+        out matches Some(index) ==> index <= 1,
+        out matches Some(0) ==> first matches Some(a)
+            && (second matches Some(b) ==> a > b),
+        out matches Some(1) ==> second matches Some(b)
+            && (first matches Some(a) ==> a <= b),
+))]
+pub(super) fn newest_slot(first: Option<u64>, second: Option<u64>) -> Option<usize> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(_), None) => Some(0),
+        (None, Some(_)) => Some(1),
+        (Some(a), Some(b)) => Some(if a > b { 0 } else { 1 }),
+    }
+}
+
+/// Whether a WAL checkpoint lies within the trusted boundary: at or before
+/// it, and neither inside a segment header.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == ((checkpoint_segment < boundary_segment
+            || (checkpoint_segment == boundary_segment && checkpoint_offset <= boundary_offset))
+        && checkpoint_offset >= header && boundary_offset >= header)
+))]
+pub(super) fn checkpoint_within(
+    checkpoint_segment: u64,
+    checkpoint_offset: u64,
+    boundary_segment: u64,
+    boundary_offset: u64,
+    header: u64,
+) -> bool {
+    (checkpoint_segment < boundary_segment
+        || (checkpoint_segment == boundary_segment && checkpoint_offset <= boundary_offset))
+        && checkpoint_offset >= header
+        && boundary_offset >= header
+}
+
+/// What WAL replay finds at its offset in a segment.
+pub(super) enum FrameRead {
+    /// A whole frame whose end is at `next`.
+    Complete,
+    /// Clean end of the segment's frames.
+    End,
+    /// A short or damaged frame.
+    Torn,
+}
+
+/// What WAL replay does with a frame. `end` is the trusted boundary offset
+/// in the boundary's own segment, and `None` in an earlier segment.
+pub(super) enum ReplayStep {
+    Apply,
+    /// The segment ended cleanly before the boundary's segment.
+    Finish,
+    /// The boundary falls inside this frame.
+    Split,
+    /// The data volume lost frames the boundary acknowledged.
+    Lost,
+}
+
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out is Apply ==> frame is Complete && (end matches Some(end) ==> next <= end),
+        out is Finish ==> frame is End && end is None,
+        out is Split ==> frame is Complete && (end matches Some(end) && next > end),
+        out is Lost ==> !(frame is Complete) && !(frame is End && end is None),
+        frame is Complete ==> (out is Apply || out is Split),
+))]
+pub(super) fn replay_step(frame: FrameRead, next: u64, end: Option<u64>) -> ReplayStep {
+    match frame {
+        FrameRead::Complete => match end {
+            Some(end) if next > end => ReplayStep::Split,
+            _ => ReplayStep::Apply,
+        },
+        FrameRead::End => match end {
+            None => ReplayStep::Finish,
+            Some(_) => ReplayStep::Lost,
+        },
+        FrameRead::Torn => ReplayStep::Lost,
+    }
+}
+
+#[cfg(verus_keep_ghost)]
+verus! {
+    /// A quarter above `average`, at least one above it, capped at
+    /// `u32::MAX`.
+    pub(super) open spec fn rounded_average(sum: int, count: int) -> int {
+        if sum % count != 0 && sum / count < u64::MAX as int { sum / count + 1 } else { sum / count }
+    }
+
+    pub(super) open spec fn ceiling_of(average: int) -> int {
+        let bump = if average / 4 > 1 { average / 4 } else { 1 };
+        if average + bump > u32::MAX as int { u32::MAX as int } else { average + bump }
+    }
+}

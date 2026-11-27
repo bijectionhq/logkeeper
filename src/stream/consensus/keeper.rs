@@ -1370,16 +1370,17 @@ impl Group {
             .handoff
             .lock()
             .is_some_and(|at| at.elapsed() < LEADER_HOLD_DOWN);
-        if target.as_u128() != metrics.id
-            && matched.is_some()
-            && matched == metrics.last_log_index
-            && !recent
-            && self
-                .raft
-                .trigger()
-                .transfer_leader(target.as_u128())
-                .await
-                .is_ok()
+        if super::decisions::hands_off(
+            target.as_u128() == metrics.id,
+            matched,
+            metrics.last_log_index,
+            recent,
+        ) && self
+            .raft
+            .trigger()
+            .transfer_leader(target.as_u128())
+            .await
+            .is_ok()
         {
             *self.handoff.lock() = Some(Instant::now());
         }

@@ -50,6 +50,7 @@ python3 verification/link/run.py
 The area READMEs describe the checked production functions and Lean mappings.
 
 - [Compact image](compact_image/README.md)
+- [Consensus admission and keeper decisions](consensus_admission/README.md)
 - [Mirrored voter media](mirrored_voter_media/README.md)
 - [Voter mirror body reuse](voter_mirror_body/area.json)
 - [Object-name codec](object_name_codec/README.md)

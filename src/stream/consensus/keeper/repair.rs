@@ -225,7 +225,10 @@ impl Engine {
                     }
                     present.insert((*stream, *learner));
                     let since = *seen.entry((*stream, *learner)).or_insert(now);
-                    if now.duration_since(since) >= STALE_LEARNER {
+                    if decisions::learner_stale(
+                        now.duration_since(since).as_nanos(),
+                        STALE_LEARNER.as_nanos(),
+                    ) {
                         expired.insert(*learner);
                     }
                 }
@@ -251,11 +254,12 @@ impl Engine {
                     .iter()
                     .filter(|(id, _)| **id != self.id.as_u128())
                     .filter(|(id, acked)| {
-                        self.dead(Uuid::from_u128(**id))
-                            || match acked {
-                                Some(acked) => acked.elapsed() >= self.repair_after,
-                                None => now.duration_since(since) >= self.repair_after,
-                            }
+                        decisions::silent(
+                            self.dead(Uuid::from_u128(**id)),
+                            acked.as_ref().map(|acked| acked.elapsed().as_nanos()),
+                            now.duration_since(since).as_nanos(),
+                            self.repair_after.as_nanos(),
+                        )
                     })
                     .map(|(id, _)| Uuid::from_u128(*id))
                     .collect::<Vec<_>>();
@@ -274,24 +278,22 @@ impl Engine {
             // Higher priority first; within one priority, the streams after
             // the last one started, then the rest.
             work.sort_by_key(|(stream, _, work)| {
-                (
-                    work.rank(),
-                    cursor.is_some_and(|last| *stream <= last),
-                    *stream,
-                )
+                decisions::repair_key(work.rank(), stream.0, cursor.map(|last| last.0))
             });
             let mut started = Vec::new();
             for (stream, group, work) in work {
-                if queue.running.len() >= MAX_REPAIRS {
-                    break;
-                }
-                if queue.running.contains(&stream)
-                    || queue
+                match decisions::starts_repair(
+                    queue.running.len(),
+                    MAX_REPAIRS,
+                    queue.running.contains(&stream),
+                    queue
                         .backoff
                         .get(&stream)
-                        .is_some_and(|(_, next)| *next > now)
-                {
-                    continue;
+                        .is_some_and(|(_, next)| *next > now),
+                ) {
+                    decisions::RepairStart::Full => break,
+                    decisions::RepairStart::Skip => continue,
+                    decisions::RepairStart::Start => {}
                 }
                 queue.running.insert(stream);
                 queue.cursor = Some(stream);
@@ -583,9 +585,12 @@ impl Engine {
         let orphaned = groups
             .iter()
             .filter(|(_, group)| {
-                group.excluded.lock().is_some()
-                    || (group.raft.metrics().borrow_watched().state != ServerState::Leader
-                        && now.duration_since(*group.heard.lock()) >= self.repair_after)
+                decisions::orphaned(
+                    group.excluded.lock().is_some(),
+                    group.raft.metrics().borrow_watched().state == ServerState::Leader,
+                    now.duration_since(*group.heard.lock()).as_nanos(),
+                    self.repair_after.as_nanos(),
+                )
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -623,9 +628,11 @@ impl Engine {
             let Some((authority, proof)) = highest else {
                 continue;
             };
-            let named = proof.configuration.voters.contains(&self.id)
-                || proof.joint.is_some_and(|roster| roster.contains(&self.id));
-            if named {
+            if !decisions::certifies_exclusion(
+                true,
+                proof.configuration.voters.contains(&self.id),
+                proof.joint.is_some_and(|roster| roster.contains(&self.id)),
+            ) {
                 // The refusal came from a stale or lagging peer.
                 *group.excluded.lock() = None;
             } else {

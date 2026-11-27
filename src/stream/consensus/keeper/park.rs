@@ -22,7 +22,7 @@ use tokio::time::Instant;
 
 use super::{Engine, Group};
 use crate::stream::consensus::{
-    LogId, NodeId, Vote,
+    LogId, NodeId, Vote, decisions,
     network::{Frame, PeerRequest},
 };
 
@@ -50,19 +50,25 @@ impl Engine {
         if entry.0 != metrics.last_log_index {
             *entry = (metrics.last_log_index, now);
         }
-        now.duration_since(entry.1) >= self.park_after
-            && now.duration_since(*group.used.lock()) >= self.park_after
-            && metrics.last_applied.map(|applied| applied.index) == metrics.last_log_index
-            && metrics
+        let quiet = now.duration_since(entry.1).as_nanos();
+        drop(activity);
+        decisions::idle(
+            quiet,
+            now.duration_since(*group.used.lock()).as_nanos(),
+            self.park_after.as_nanos(),
+            metrics.last_applied.map(|applied| applied.index),
+            metrics.last_log_index,
+            metrics
                 .membership_config
                 .membership()
                 .get_joint_config()
                 .len()
-                == 1
-            && group
+                == 1,
+            !group
                 .snapshot_receive
                 .try_lock()
-                .is_ok_and(|receive| receive.is_none())
+                .is_ok_and(|receive| receive.is_none()),
+        )
     }
 
     /// Parks every idle stream this keeper leads.
@@ -87,7 +93,11 @@ impl Engine {
         for (group, idle) in groups.into_iter().zip(idle) {
             let metrics = group.raft.metrics().borrow_watched().clone();
             let dead = |id: NodeId| self.dead(uuid::Uuid::from_u128(id));
-            if metrics.state != ServerState::Leader || !group.settled_except(&dead) || !idle {
+            if !decisions::leader_parks(
+                metrics.state == ServerState::Leader,
+                group.settled_except(&dead),
+                idle,
+            ) {
                 continue;
             }
             let stream = group.genesis.stream;
@@ -149,11 +159,14 @@ impl Engine {
     /// leader's applied log under the leader's vote.
     pub(super) async fn accept_park(&self, group: &Group, vote: Vote, last: Option<LogId>) -> bool {
         let metrics = group.raft.metrics().borrow_watched().clone();
-        let ready = metrics.state == ServerState::Follower
-            && metrics.vote == vote
-            && metrics.last_applied == last
-            && metrics.last_log_index == last.map(|log| log.index)
-            && self.idle(group, Instant::now());
+        let ready = decisions::accepts_park(
+            metrics.state == ServerState::Follower,
+            metrics.vote == vote,
+            metrics.last_applied == last,
+            metrics.last_log_index,
+            last.map(|log| log.index),
+            self.idle(group, Instant::now()),
+        );
         if ready {
             self.park(group.genesis.stream).await;
         }

@@ -381,4 +381,307 @@ fn backoff_is_bounded_and_grows(failures: u32, base_ms: u64, cap_ms: u64)
     assert(next >= wait);
 }
 
+
+// Parking.accept_requires_exact_log: a follower parks only while it follows
+// under the leader's vote and holds exactly the leader's applied log, with
+// no entry past it, so a parked follower never freezes a suffix the leader
+// lacks.
+fn a_parked_follower_holds_the_leaders_applied_log(
+    follower: bool, same_vote: bool, same_applied: bool, last_log: Option<u64>,
+    leader_applied: Option<u64>, idle: bool,
+) {
+    let parked = accepts_park(follower, same_vote, same_applied, last_log, leader_applied, idle);
+    assert(parked ==> follower && same_vote && same_applied && last_log == leader_applied && idle);
+    if last_log != leader_applied {
+        assert(!parked);
+    }
+    let leading = accepts_park(false, same_vote, same_applied, last_log, leader_applied, idle);
+    assert(!leading);
+}
+
+// A group is idle only when it applied its whole log, its membership is
+// uniform, it receives no snapshot, and neither a client nor a new entry
+// touched it within the park delay.
+fn only_a_quiet_applied_uniform_group_is_idle(
+    quiet_log_ns: u128, unused_ns: u128, park_after_ns: u128, applied: Option<u64>,
+    last_log: Option<u64>, uniform: bool, receiving: bool,
+) {
+    let parks = idle(quiet_log_ns, unused_ns, park_after_ns, applied, last_log, uniform, receiving);
+    assert(parks ==> applied == last_log && uniform && !receiving);
+    assert(quiet_log_ns < park_after_ns || unused_ns < park_after_ns ==> !parks);
+}
+
+// Parking.leader_parks_only_settled: a leader asks for parks only when it
+// leads, is idle, and has applied its log with every live voter matched.
+fn only_a_settled_idle_leader_parks(leader: bool, settled: bool, idle: bool) {
+    let parks = leader_parks(leader, settled, idle);
+    assert(parks == (leader && settled && idle));
+}
+
+// Parking.parked_answers_preserve_state: a parked replica answers an empty
+// heartbeat busy within the park round and a repeated park without opening
+// its group, and reopens for entries, votes, pre-votes, snapshots,
+// transfers and heartbeats that go on past the park round.
+fn a_parked_replica_reopens_only_for_work(parked_ns: u128, window_ns: u128) {
+    let heartbeat = parked_answer(ParkedRequest::Heartbeat, parked_ns, window_ns);
+    assert(parked_ns < window_ns ==> heartbeat is Busy);
+    assert(parked_ns >= window_ns ==> heartbeat is Reopen);
+    let repeated = parked_answer(ParkedRequest::Park, parked_ns, window_ns);
+    assert(repeated is Parked);
+    let work = parked_answer(ParkedRequest::Other, parked_ns, window_ns);
+    assert(work is Reopen);
+}
+
+// A voter whose keeper is alive and that acknowledged this leader within
+// the repair delay is never repaired away; nor is one that never
+// acknowledged while this leader has led for less than the delay.
+fn a_recently_heard_voter_is_not_silent(
+    dead: bool, acked_ns: Option<u128>, led_ns: u128, repair_after_ns: u128,
+) {
+    let quiet = silent(dead, acked_ns, led_ns, repair_after_ns);
+    assert(dead ==> quiet);
+    if let Some(acked) = acked_ns {
+        assert(!dead && acked < repair_after_ns ==> !quiet);
+        assert(acked >= repair_after_ns ==> quiet);
+    } else {
+        assert(!dead && led_ns < repair_after_ns ==> !quiet);
+    }
+}
+
+// A learner leaves only after the stale delay.
+fn learners_leave_only_after_the_stale_delay(seen_ns: u128, stale_ns: u128) {
+    let stale = learner_stale(seen_ns, stale_ns);
+    assert(seen_ns < stale_ns ==> !stale);
+    assert(seen_ns >= stale_ns ==> stale);
+}
+
+spec fn key_less(a: (u8, bool, u128), b: (u8, bool, u128)) -> bool {
+    a.0 < b.0 || (a.0 == b.0 && ((!a.1 && b.1) || (a.1 == b.1 && a.2 < b.2)))
+}
+
+// Repair order: higher priority work starts first; within one priority,
+// a stream after the one the last pass started last goes before every
+// stream at or before it, so each stream gets its turn.
+fn repair_order_prefers_priority_then_rotation(
+    rank_a: u8, a: u128, rank_b: u8, b: u128, cursor: Option<u128>,
+) {
+    let key_a = repair_key(rank_a, a, cursor);
+    let key_b = repair_key(rank_b, b, cursor);
+    assert(rank_a < rank_b ==> key_less(key_a, key_b));
+    if let Some(last) = cursor {
+        assert(rank_a == rank_b && b <= last && last < a ==> key_less(key_a, key_b));
+    }
+    assert(rank_a == rank_b && cursor is None && a < b ==> key_less(key_a, key_b));
+}
+
+// A pass over queued work starts at most `max_repairs` repairs in all,
+// never a stream that already repairs or waits out its backoff, and
+// stops at the first stream it finds with every slot taken.
+fn a_repair_pass_respects_its_slots(
+    queued: &[(bool, bool)], running: usize, max_repairs: usize,
+) -> (started: usize)
+    requires running <= max_repairs,
+    ensures running + started <= max_repairs,
+{
+    let mut started: usize = 0;
+    let mut index = 0;
+    while index < queued.len()
+        invariant
+            index <= queued@.len(),
+            running + started <= max_repairs,
+        decreases queued@.len() - index,
+    {
+        let (repairing, backed_off) = queued[index];
+        match starts_repair(running + started, max_repairs, repairing, backed_off) {
+            RepairStart::Full => break,
+            RepairStart::Skip => {}
+            RepairStart::Start => {
+                assert(!repairing && !backed_off);
+                started += 1;
+            }
+        }
+        index += 1;
+    }
+    started
+}
+
+// Nothing moves unless two of three voters are live: a membership change
+// needs a quorum.
+fn a_roster_moves_only_with_two_live_voters(live: usize) {
+    let moves = repair_allowed(live);
+    assert(live < 2 ==> !moves);
+    assert(live >= 2 ==> moves);
+}
+
+// Placement never refuses an eligible keeper at or below the average load,
+// and the ceiling exceeds the average by at least one stream.
+fn average_keepers_stay_roomy(sum: u64, count: u64, streams: u32)
+    requires count > 0,
+{
+    let ceiling = load_ceiling(sum, count);
+    let ghost average = rounded_average(sum as int, count as int);
+    assert(average >= sum as int / count as int);
+    match ceiling {
+        Some(ceiling) => {
+            assert(ceiling as int > average || ceiling == u32::MAX);
+            if streams as u64 <= sum / count {
+                let room = roomy(Some(ceiling), Some(streams));
+                assert(room);
+            }
+        }
+        None => assert(false),
+    }
+    let unknown = roomy(ceiling, None);
+    assert(unknown);
+    let none = load_ceiling(sum, 0);
+    assert(none is None);
+}
+
+// LeaderPreference: leadership moves only to another voter that matched
+// the leader's whole log, and never within the hold-down.
+fn leadership_moves_only_to_a_matched_voter(
+    to_self: bool, matched: Option<u64>, last: Option<u64>, recent: bool,
+) {
+    let moves = hands_off(to_self, matched, last, recent);
+    assert(moves ==> !to_self && !recent && matched is Some && matched == last);
+    assert(recent ==> !moves);
+}
+
+// A copy looks for a retiring proof only when a peer excluded it or it
+// heard no leader for the repair delay without leading.
+fn only_orphaned_copies_seek_retirement(
+    excluded: bool, leader: bool, unheard_ns: u128, repair_after_ns: u128,
+) {
+    let seeks = orphaned(excluded, leader, unheard_ns, repair_after_ns);
+    assert(!excluded && leader ==> !seeks);
+    assert(!excluded && unheard_ns < repair_after_ns ==> !seeks);
+    assert(excluded ==> seeks);
+}
+
+// RetireOnProof.retired_copy_outside_every_quorum: a certified proof
+// retires a copy only at the asked revision and only when neither the
+// configuration nor its joint target names the keeper, so no quorum of
+// the certified configuration counts the retired copy.
+fn retirement_never_removes_a_named_copy(same_revision: bool, named_voter: bool, named_joint: bool) {
+    let retires = certifies_exclusion(same_revision, named_voter, named_joint);
+    assert(retires ==> same_revision && !named_voter && !named_joint);
+    assert(named_voter || named_joint ==> !retires);
+}
+
+// RecoveryFence: while an operator recovery's fence stands, every seal is
+// refused with `Recovered`. Otherwise a seal installs a fence one above the
+// epoch it expected only when that epoch is current, so the new epoch is
+// above every applied one; any other seal only repeats an existing fence.
+fn a_recovery_fence_refuses_every_seal(current: u64, expected: u64) {
+    let fenced = seal_step(true, current, expected);
+    assert(fenced is Recovered);
+    match seal_step(false, current, expected) {
+        SealStep::Install(epoch) => assert(epoch > current && current == expected),
+        SealStep::Repeat(epoch) => assert(current != expected && epoch == expected + 1),
+        SealStep::Unavailable => assert(expected == u64::MAX),
+        SealStep::Recovered => assert(false),
+    }
+    // The recovery fence sits above the survivor's epoch, and after the
+    // acknowledgement the first seal of that epoch installs the next one.
+    if let Some(fence) = recovery_epoch(current) {
+        assert(fence > current);
+        if fence < u64::MAX {
+            let resumed = seal_step(false, fence, fence);
+            assert(resumed matches SealStep::Install(next) && next > fence);
+            let stale = seal_step(false, fence, current);
+            assert(stale is Repeat);
+        }
+    }
+}
+
+// The boundary restart trusts is the intact slot with the higher sequence.
+// A write alternates slots, so a torn write of round n + 1 leaves round n.
+fn restart_trusts_the_newest_intact_slot(older: u64)
+    requires older < u64::MAX,
+{
+    let both = newest_slot(Some(older), Some(older + 1));
+    assert(both matches Some(1));
+    let reversed = newest_slot(Some(older + 1), Some(older));
+    assert(reversed matches Some(0));
+    let torn = newest_slot(Some(older), None);
+    assert(torn matches Some(0));
+    let lost = newest_slot(None, None);
+    assert(lost is None);
+}
+
+// A checkpoint past the trusted boundary, or inside a segment header, is
+// refused.
+fn a_checkpoint_past_the_boundary_is_refused(
+    segment: u64, offset: u64, boundary_segment: u64, boundary_offset: u64, header: u64,
+) {
+    let within = checkpoint_within(segment, offset, boundary_segment, boundary_offset, header);
+    assert(segment > boundary_segment ==> !within);
+    assert(segment == boundary_segment && offset > boundary_offset ==> !within);
+    assert(offset < header || boundary_offset < header ==> !within);
+}
+
+spec fn total(lengths: Seq<u64>, n: int) -> int
+    decreases n,
+{
+    if n <= 0 { 0 } else { total(lengths, n - 1) + lengths[n - 1] as int }
+}
+
+proof fn total_grows(lengths: Seq<u64>, a: int, b: int)
+    requires 0 <= a <= b <= lengths.len(),
+    ensures total(lengths, a) <= total(lengths, b),
+    decreases b - a,
+{
+    if a < b {
+        total_grows(lengths, a, b - 1);
+    }
+}
+
+// Rollback detection. Replay of the boundary's segment from `start` reads
+// whole frames of the given lengths followed by a clean end or a torn
+// frame. It finishes only exactly at the trusted boundary, and when the
+// data volume holds fewer bytes than the boundary acknowledged, as after
+// a rollback, it fails.
+fn replay_detects_a_rolled_back_segment(
+    lengths: &[u64], start: u64, end: u64,
+) -> (finished: bool)
+    requires
+        lengths@.len() <= 0x1_0000,
+        forall|i: int| 0 <= i < lengths@.len() ==> 0 < #[trigger] lengths@[i] <= 0x1_0000_0000,
+        start <= 0x1_0000_0000_0000,
+        start <= end,
+    ensures
+        end > start + total(lengths@, lengths@.len() as int) ==> !finished,
+{
+    let mut offset = start;
+    let mut index: usize = 0;
+    while offset != end
+        invariant
+            index <= lengths@.len(),
+            lengths@.len() <= 0x1_0000,
+            forall|i: int| 0 <= i < lengths@.len() ==> 0 < #[trigger] lengths@[i] <= 0x1_0000_0000,
+            start <= 0x1_0000_0000_0000,
+            offset as int == start as int + total(lengths@, index as int),
+            total(lengths@, index as int) <= index as int * 0x1_0000_0000,
+        decreases lengths@.len() - index,
+    {
+        let (frame, next) = if index < lengths.len() {
+            (FrameRead::Complete, offset + lengths[index])
+        } else {
+            (FrameRead::Torn, offset)
+        };
+        match replay_step(frame, next, Some(end)) {
+            ReplayStep::Apply => {
+                assert(index < lengths@.len());
+                index += 1;
+                offset = next;
+            }
+            _ => return false,
+        }
+    }
+    proof {
+        total_grows(lengths@, index as int, lengths@.len() as int);
+    }
+    true
+}
+
 }

@@ -35,7 +35,7 @@ use super::{
 };
 use crate::stream::{
     consensus::{
-        options,
+        decisions, options,
         storage::{
             media::{Boundaries, Boundary, CheckpointRef, Slot},
             objects::{Location, Object, Objects, Reference},
@@ -286,7 +286,13 @@ impl Segmented {
             segment: slot.segment,
             offset: slot.offset,
         };
-        if position > boundary || position.offset < HEADER || boundary.offset < HEADER {
+        if !decisions::checkpoint_within(
+            position.segment,
+            position.offset,
+            boundary.segment,
+            boundary.offset,
+            HEADER,
+        ) {
             return Err(invalid("WAL checkpoint lies past its trusted boundary"));
         }
         let replayed = replay(
@@ -657,12 +663,17 @@ fn replay(
         }
         let end = (id == slot.segment).then_some(slot.offset);
         while Some(offset) != end {
-            match segment::next(&mut file)? {
-                Frame::Complete { header, body } => {
-                    let next = offset + FRAME_HEADER + body.len() as u64;
-                    if end.is_some_and(|end| next > end) {
-                        return Err(invalid("trusted WAL boundary splits a frame"));
-                    }
+            let frame = segment::next(&mut file)?;
+            let (read, next) = match &frame {
+                Frame::Complete { body, .. } => (
+                    decisions::FrameRead::Complete,
+                    offset + FRAME_HEADER + body.len() as u64,
+                ),
+                Frame::End => (decisions::FrameRead::End, offset),
+                Frame::Torn => (decisions::FrameRead::Torn, offset),
+            };
+            match (decisions::replay_step(read, next, end), frame) {
+                (decisions::ReplayStep::Apply, Frame::Complete { header, body }) => {
                     chain = segment::chain(&chain, &header, &body);
                     let record: Record = options()
                         .with_limit(MAX_FRAME)
@@ -676,8 +687,11 @@ fn replay(
                     replayed += next - offset;
                     offset = next;
                 }
-                Frame::End if end.is_none() => break,
-                Frame::End | Frame::Torn => {
+                (decisions::ReplayStep::Finish, _) => break,
+                (decisions::ReplayStep::Split, _) => {
+                    return Err(invalid("trusted WAL boundary splits a frame"));
+                }
+                (decisions::ReplayStep::Apply | decisions::ReplayStep::Lost, _) => {
                     return Err(invalid(
                         "WAL segment lost acknowledged frames before its trusted boundary",
                     ));

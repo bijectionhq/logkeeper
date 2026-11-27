@@ -361,12 +361,16 @@ impl Media {
             return Err(invalid("WAL boundary slots have the wrong size"));
         }
         let incarnation = self.identity.incarnation;
-        let last = bytes
-            .chunks(SLOT_BYTES)
-            .enumerate()
-            .filter_map(|(index, slot)| Slot::decode(slot, incarnation, index * SLOT_BYTES))
-            .max_by_key(|slot| slot.sequence)
-            .ok_or_else(|| invalid("WAL boundary has no intact slot"))?;
+        let slots = [
+            Slot::decode(&bytes[..SLOT_BYTES], incarnation, 0),
+            Slot::decode(&bytes[SLOT_BYTES..], incarnation, SLOT_BYTES),
+        ];
+        let last = crate::stream::consensus::decisions::newest_slot(
+            slots[0].map(|slot| slot.sequence),
+            slots[1].map(|slot| slot.sequence),
+        )
+        .and_then(|index| slots[index])
+        .ok_or_else(|| invalid("WAL boundary has no intact slot"))?;
         Ok((
             Boundaries {
                 file,

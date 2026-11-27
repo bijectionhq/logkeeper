@@ -12,7 +12,7 @@ use journal_contract::StreamId;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::Domains;
+use super::{Domains, decisions};
 
 /// The rendezvous score of `keeper` for `stream`. Higher ranks first.
 fn score(stream: StreamId, keeper: Uuid) -> [u8; 32] {
@@ -74,18 +74,14 @@ impl View<'_> {
             .filter_map(|keeper| self.health.get(keeper))
             .map(|health| u64::from(health.streams))
             .collect::<Vec<_>>();
-        if known.is_empty() {
-            return None;
-        }
-        let average = known.iter().sum::<u64>().div_ceil(known.len() as u64);
-        Some((average + (average / 4).max(1)).min(u64::from(u32::MAX)) as u32)
+        decisions::load_ceiling(known.iter().sum::<u64>(), known.len() as u64)
     }
 
     fn roomy(&self, keeper: &Uuid, ceiling: Option<u32>) -> bool {
-        match (ceiling, self.health.get(keeper)) {
-            (Some(ceiling), Some(health)) => health.streams <= ceiling,
-            _ => true,
-        }
+        decisions::roomy(
+            ceiling,
+            self.health.get(keeper).map(|health| health.streams),
+        )
     }
 
     /// Eligible keepers that accept streams, first those under the load
@@ -159,7 +155,7 @@ pub fn next_roster(stream: StreamId, current: [Uuid; 3], eligible: &Domains) -> 
 /// a quorum and the third voter may still hold the only copy of recent
 /// records.
 pub fn repair_roster(stream: StreamId, current: [Uuid; 3], view: &View<'_>) -> Option<[Uuid; 3]> {
-    if current.iter().filter(|voter| view.live(voter)).count() < 2 {
+    if !decisions::repair_allowed(current.iter().filter(|voter| view.live(voter)).count()) {
         return None;
     }
     let eligible = view.eligible;
