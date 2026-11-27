@@ -45,9 +45,14 @@ use super::{
 };
 use crate::stream::transport::{Channel, connect_protocols, is_alpn_mismatch};
 
+mod versions;
+
+pub(super) use versions::{error_introduced, outcome_introduced};
+
 /// Wire protocol version negotiated via TLS ALPN. Rolling upgrades support
-/// adjacent versions `Previous` (N-1) and `Current` (N) only.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// adjacent versions `Previous` (N-1) and `Current` (N) only. Ordered, so a
+/// variant introduced in `v` is known on every version at least `v`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum WireVersion {
     Previous,
     Current,
@@ -372,13 +377,6 @@ pub(super) fn encode_pong(pong: &Pong, version: WireVersion) -> io::Result<Vec<u
     }
 }
 
-/// Highest known bincode variant tag on `Frame`, `Request` and `PeerRequest`.
-const MAX_FRAME_TAG_V1: u32 = 2;
-const MAX_FRAME_TAG_CURRENT: u32 = 3;
-const MAX_REQUEST_TAG_V1: u32 = 27;
-const MAX_REQUEST_TAG_CURRENT: u32 = 32;
-const MAX_PEER_REQUEST_TAG_V1: u32 = 5;
-const MAX_PEER_REQUEST_TAG_CURRENT: u32 = 5;
 // Genesis encodes a u128 stream ID, three length-prefixed UUID byte strings
 // (u64 length and 16 bytes each), and a u64 quota.
 const GENESIS_WIRE_BYTES: usize = 16 + 3 * (8 + 16) + 8;
@@ -391,82 +389,55 @@ pub(super) enum DecodedFrame {
 /// Decodes a wire `Frame` for `version`. On `WireVersion::Current`, unknown
 /// `Frame`, `Request`, or `PeerRequest` variant tags return
 /// `DecodedFrame::Unsupported` so the receiver can reply with a typed
-/// `Unsupported` instead of closing the connection.
+/// `Unsupported` instead of closing the connection. The known tags are the
+/// enums' own variants. On `WireVersion::Previous`, a frame carrying a
+/// variant introduced since N-1 is refused (`versions.rs`).
 pub(super) fn decode_frame(bytes: &[u8], version: WireVersion) -> io::Result<DecodedFrame> {
     if bytes.len() < 4 {
         return Err(invalid("truncated consensus frame"));
     }
-    let frame_tag = u32::from_le_bytes(bytes[..4].try_into().unwrap());
-    let (max_frame, max_req, max_peer) = match version {
-        WireVersion::Previous => (
-            MAX_FRAME_TAG_V1,
-            MAX_REQUEST_TAG_V1,
-            MAX_PEER_REQUEST_TAG_V1,
-        ),
-        WireVersion::Current => (
-            MAX_FRAME_TAG_CURRENT,
-            MAX_REQUEST_TAG_CURRENT,
-            MAX_PEER_REQUEST_TAG_CURRENT,
-        ),
+    let refuse = |what: &str, tag: u32| match version {
+        WireVersion::Current => Ok(DecodedFrame::Unsupported(format!(
+            "unsupported {what} variant {tag}"
+        ))),
+        WireVersion::Previous => Err(unsupported(format!("unsupported N-1 {what} variant {tag}"))),
     };
-    if frame_tag > max_frame {
-        return match version {
-            WireVersion::Current => Ok(DecodedFrame::Unsupported(format!(
-                "unsupported frame variant {frame_tag}"
-            ))),
-            WireVersion::Previous => Err(unsupported(format!(
-                "unsupported N-1 frame variant {frame_tag}"
-            ))),
-        };
+    let counts = &*versions::COUNTS;
+    let frame_tag = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+    if frame_tag >= counts.frame {
+        return refuse("frame", frame_tag);
     }
     if frame_tag == 0 && bytes.len() >= 8 {
         let req_tag = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        if req_tag > max_req {
-            return match version {
-                WireVersion::Current => Ok(DecodedFrame::Unsupported(format!(
-                    "unsupported request variant {req_tag}"
-                ))),
-                WireVersion::Previous => Err(unsupported(format!(
-                    "unsupported N-1 request variant {req_tag}"
-                ))),
-            };
+        if req_tag >= counts.request {
+            return refuse("request", req_tag);
         }
     }
     if frame_tag == 1 && bytes.len() >= 4 + GENESIS_WIRE_BYTES + 4 {
         let start = 4 + GENESIS_WIRE_BYTES;
         let peer_tag = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
-        if peer_tag > max_peer {
-            return match version {
-                WireVersion::Current => Ok(DecodedFrame::Unsupported(format!(
-                    "unsupported peer request variant {peer_tag}"
-                ))),
-                WireVersion::Previous => Err(unsupported(format!(
-                    "unsupported N-1 peer request variant {peer_tag}"
-                ))),
-            };
+        if peer_tag >= counts.peer {
+            return refuse("peer request", peer_tag);
         }
     }
-    Ok(DecodedFrame::Frame(decode(bytes)?))
+    let frame: Frame = decode(bytes)?;
+    if frame.introduced() > version {
+        return Err(unsupported("frame requires a newer keeper protocol"));
+    }
+    Ok(DecodedFrame::Frame(frame))
 }
 
 impl Request {
     /// Whether a peer speaking `version` knows this request. One added
     /// since N-1 is refused locally on an N-1 connection.
     pub(super) fn supported_on(&self, version: WireVersion) -> bool {
-        match self {
-            Self::LocalConfiguration(_)
-            | Self::Staging(_)
-            | Self::ClusterVersion
-            | Self::FinalizeVersion(_)
-            | Self::ClearQuarantine(_) => version == WireVersion::Current,
-            _ => true,
-        }
+        self.introduced() <= version
     }
 }
 
 impl PeerRequest {
-    pub(super) fn supported_on(&self, _version: WireVersion) -> bool {
-        true
+    pub(super) fn supported_on(&self, version: WireVersion) -> bool {
+        self.introduced() <= version
     }
 }
 
@@ -483,6 +454,9 @@ impl Frame {
                 }
                 Self::Peer(_, request) if !request.supported_on(WireVersion::Previous) => {
                     Err(unsupported("peer request requires a newer keeper protocol"))
+                }
+                frame if frame.introduced() > WireVersion::Previous => {
+                    Err(unsupported("frame requires a newer keeper protocol"))
                 }
                 frame => encode(frame),
             },
@@ -696,12 +670,17 @@ pub(super) enum ReplyV1 {
     Status(KeeperStatusV1),
 }
 
+/// `outcome` for an N-1 peer: a refusal it does not know becomes
+/// `Unavailable`.
 fn outcome_v1(outcome: Outcome) -> Outcome {
     match outcome {
-        Outcome::Refused(
-            journal_contract::JournalError::Unsupported | journal_contract::JournalError::Corrupted,
-        ) => Outcome::Refused(journal_contract::JournalError::Unavailable),
-        other => other,
+        Outcome::Refused(error) if error_introduced(&error) > WireVersion::Previous => {
+            Outcome::Refused(journal_contract::JournalError::Unavailable)
+        }
+        other => {
+            debug_assert_eq!(outcome_introduced(&other), WireVersion::Previous);
+            other
+        }
     }
 }
 

@@ -663,8 +663,19 @@ stay `LKRIDX01` and wire images stay `LKRIMG03`. After it, checkpoints become
 carry record epochs (`LKRIDX02`, `LKRIMG04`), and N-1 refuses the media.
 Each gate names the level its format needs (`CLUSTER_VERSION_V2` for all of
 these), never `CLUSTER_VERSION_CURRENT`. A format a later release adds follows
-the same rule: it is written only once `write_version_allows` it, and a
-request it adds is refused on N-1 connections in `Request::supported_on`. Keeper configuration ignores
+the same rule: it is written only once `write_version_allows` it.
+
+**Wire variants.** Variants of `Frame`, `Request`, `PeerRequest`, `Reply`,
+`Outcome` and `JournalError` are only ever appended, and each is classified
+by the wire version that introduced it in `network/versions.rs`, an
+exhaustive match, so a new variant does not compile until it is classified.
+A variant newer than N-1 never reaches an N-1 peer: a request or frame is
+refused locally (`supported_on`, `Frame::encode_for`), a reply needs an N-1
+mapping in `ReplyV1::from_reply`, a refusal maps to `Unavailable`, and a
+receiver refuses one arriving on an N-1 connection. The receiver's variant
+bounds come from the enums themselves. A test pins N-1's variant lists and
+checks every variant's tag and classification; it changes only when the
+ALPNs move, and adding a variant needs a sample there. Keeper configuration ignores
 an unknown top-level field with a warning, so a configuration may name a
 newer release's setting first; nested settings and `JournalConfig` stay
 strict.
