@@ -479,6 +479,19 @@ impl Client {
         }
     }
 
+    /// Clears a durable corruption quarantine marker for `stream` on `keeper`.
+    /// Administrators only.
+    pub async fn clear_quarantine(&self, keeper: uuid::Uuid, stream: StreamId) -> Result<()> {
+        match self
+            .keeper_operation(keeper, Request::ClearQuarantine(stream))
+            .await?
+        {
+            Reply::Decision(outcome) => unit(decision(outcome)?),
+            Reply::Unsupported(_) => Err(JournalError::Unsupported),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
     /// The status `keeper` reports about itself and its replica of `stream`.
     pub async fn keeper_status(
         &self,
@@ -585,6 +598,8 @@ impl Client {
     ) -> Result<Outcome> {
         let stream = request.stream();
         let mut route = self.route(stream, end).await?;
+        let mut saw_corrupted = false;
+        let mut saw_unavailable = false;
         while !remaining(end).is_zero() {
             let mut visited = BTreeSet::new();
             let mut contacts = route.contacts.iter().copied();
@@ -623,7 +638,11 @@ impl Client {
                             if self.rpc.keepers().contains_key(&leader)
                                 && visited.insert(leader) =>
                         {
+                            saw_unavailable = true;
                             calls.push(call(leader));
+                        }
+                        Ok(Reply::Decision(Outcome::Refused(JournalError::Corrupted))) => {
+                            saw_corrupted = true;
                         }
                         Ok(Reply::Unsupported(_)) => return Err(JournalError::Unsupported),
                         Err(ref error) if error.kind() == io::ErrorKind::Unsupported => {
@@ -631,6 +650,7 @@ impl Client {
                         }
                         Ok(Reply::Decision(Outcome::Refused(JournalError::Unavailable)))
                         | Err(_) => {
+                            saw_unavailable = true;
                             uncertain.store(true, Ordering::Relaxed);
                         }
                         Ok(Reply::Decision(outcome)) => {
@@ -641,7 +661,7 @@ impl Client {
                                 .leader = Some(keeper);
                             return decision(outcome);
                         }
-                        _ => (),
+                        _ => saw_unavailable = true,
                     }
                 }
             }
@@ -649,7 +669,11 @@ impl Client {
             route = self.resolve(stream, end).await?;
             route.leader = None;
         }
-        Err(JournalError::Unavailable)
+        if saw_corrupted && !saw_unavailable {
+            Err(JournalError::Corrupted)
+        } else {
+            Err(JournalError::Unavailable)
+        }
     }
 
     async fn route(&self, stream: StreamId, end: Instant) -> Result<Route> {

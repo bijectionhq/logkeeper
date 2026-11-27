@@ -512,6 +512,9 @@ impl Engine {
         if self.deleted.read().contains(&genesis.stream) {
             return Err(invalid("stream is deleted"));
         }
+        if self.is_quarantined(genesis.stream) {
+            return Err(invalid("stream replica is quarantined"));
+        }
         let parked = self.parked.read().get(&genesis.stream).copied();
         if let Some(since) = parked {
             // An empty heartbeat or a repeated park leaves the stream

@@ -38,6 +38,8 @@ async fn main() -> ExitCode {
             "       {}",
             &logkeeper::stream::consensus::ADMIN_USAGE["Usage: ".len()..]
         );
+        #[cfg(feature = "stream")]
+        println!("       logkeeper keeper clear-quarantine --config FILE --stream UUID");
         return ExitCode::SUCCESS;
     }
     match run(&args).await {
@@ -98,6 +100,21 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
         }
         if args.get(1).is_some_and(|action| action == "recover-stream") {
             return recover_stream(&args[2..]).await;
+        }
+        if let [_, action, flag, file, stream_flag, stream] = args
+            && action == "clear-quarantine"
+            && flag == "--config"
+            && stream_flag == "--stream"
+        {
+            let stream = journal_contract::StreamId(uuid::Uuid::parse_str(stream)?.as_u128());
+            let cleared = logkeeper::stream::consensus::Config::read(std::path::Path::new(file))?
+                .clear_quarantine(stream)?;
+            if cleared {
+                println!("cleared quarantine marker for stream {:032x}", stream.0);
+            } else {
+                println!("stream {:032x} was not quarantined", stream.0);
+            }
+            return Ok(());
         }
         if args.get(1).is_some_and(|action| action == "inspect") {
             return inspect_keeper(&args[2..]);

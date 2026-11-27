@@ -10,9 +10,12 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use fs2::FileExt;
+use journal_contract::StreamId;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Digest;
 use uuid::Uuid;
@@ -49,6 +52,96 @@ impl Authority {
         // The authority can describe the full inventory, unlike a single
         // enrollment document.
         read_bounded(&registry.join("placement.json"), 1024 * 1024)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct QuarantinedEntry {
+    stream: StreamId,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct QuarantineFile {
+    streams: Vec<QuarantinedEntry>,
+}
+
+/// Durable per-keeper quarantine markers stored in the enrollment registry
+/// (`<registry>/<keeper>.quarantine.json`), outside the data directory so
+/// markers survive restarts and never alter the WAL format.
+#[derive(Clone)]
+pub(in crate::stream::consensus) struct QuarantineStore {
+    path: PathBuf,
+    entries: Arc<Mutex<BTreeMap<StreamId, String>>>,
+}
+
+impl QuarantineStore {
+    pub fn open(registry: &Path, keeper: Uuid) -> io::Result<Self> {
+        let path = registry.join(format!("{keeper}.quarantine.json"));
+        let entries = match File::open(&path) {
+            Ok(_) => {
+                let file: QuarantineFile = read_bounded(&path, 1024 * 1024)?;
+                file.streams
+                    .into_iter()
+                    .map(|entry| (entry.stream, entry.reason))
+                    .collect()
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            path,
+            entries: Arc::new(Mutex::new(entries)),
+        })
+    }
+
+    pub fn mark(&self, stream: StreamId, reason: &str) -> io::Result<()> {
+        let mut entries = self.entries.lock();
+        if entries
+            .get(&stream)
+            .is_some_and(|existing| existing == reason)
+        {
+            return Ok(());
+        }
+        entries.insert(stream, reason.to_owned());
+        self.persist(&entries)
+    }
+
+    pub fn clear(&self, stream: StreamId) -> io::Result<bool> {
+        let mut entries = self.entries.lock();
+        if entries.remove(&stream).is_none() {
+            return Ok(false);
+        }
+        self.persist(&entries)?;
+        Ok(true)
+    }
+
+    pub fn contains(&self, stream: StreamId) -> bool {
+        self.entries.lock().contains_key(&stream)
+    }
+
+    pub fn streams(&self) -> BTreeMap<StreamId, String> {
+        self.entries.lock().clone()
+    }
+
+    fn persist(&self, entries: &BTreeMap<StreamId, String>) -> io::Result<()> {
+        if entries.is_empty() {
+            remove_if_present(&self.path)?;
+            if let Some(parent) = self.path.parent() {
+                sync_directory(parent)?;
+            }
+            return Ok(());
+        }
+        let file = QuarantineFile {
+            streams: entries
+                .iter()
+                .map(|(stream, reason)| QuarantinedEntry {
+                    stream: *stream,
+                    reason: reason.clone(),
+                })
+                .collect(),
+        };
+        replace_json(&self.path, &file)
     }
 }
 
@@ -342,6 +435,20 @@ impl Enrollment {
             return Ok((media, lock, Opened::Legacy(boundary)));
         }
         Ok((media, lock, Opened::Current))
+    }
+
+    pub fn quarantine_store(&self) -> io::Result<QuarantineStore> {
+        QuarantineStore::open(&self.registry, self.keeper)
+    }
+
+    /// Acquires the keeper's exclusive media lock without opening the WAL,
+    /// for offline registry commands such as `clear-quarantine`.
+    pub fn lock_offline(&self) -> io::Result<File> {
+        let lock = OpenOptions::new()
+            .write(true)
+            .open(self.data.join("LOCK"))?;
+        lock.try_lock_exclusive()?;
+        Ok(lock)
     }
 
     fn enrolled(&self) -> PathBuf {

@@ -996,7 +996,10 @@ async fn damaged_snapshot_is_scoped_and_only_the_selected_bytes_repair_it() {
         limit: 145,
         wait_ms: 0,
     };
-    assert!(engine.request(&identity, read(damaged)).await.is_err());
+    assert!(matches!(
+        engine.request(&identity, read(damaged)).await,
+        Ok(Reply::Decision(Outcome::Refused(JournalError::Corrupted)))
+    ));
     assert!(group.require_healthy().is_err());
     assert!(matches!(
         engine.request(&identity, read(other)).await,

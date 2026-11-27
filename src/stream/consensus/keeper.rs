@@ -275,6 +275,17 @@ impl Config {
         result.and(shutdown)
     }
 
+    /// Offline operator command that clears a durable quarantine marker in the
+    /// enrollment registry for `stream` on this stopped keeper.
+    pub fn clear_quarantine(&self, stream: StreamId) -> io::Result<bool> {
+        self.validate()?;
+        self.tls
+            .peer_protocol(KeeperId(self.keeper.as_u128()), Lane::Control.alpn())?;
+        let enrollment = self.enrollment()?;
+        let _lock = enrollment.lock_offline()?;
+        enrollment.quarantine_store()?.clear(stream)
+    }
+
     /// Every path that writes this keeper's media opens its enrollment
     /// first, so installing the sync mode here covers them all.
     fn enrollment(&self) -> io::Result<Enrollment> {
@@ -680,11 +691,25 @@ impl Engine {
     ) -> io::Result<()> {
         let mut sockets = JoinSet::new();
         let result = async {
+            for (stream, reason) in self.disk.quarantined_streams() {
+                self.disk.protect_objects(stream);
+                if self.quarantined.write().insert(stream) {
+                    tracing::warn!(
+                        keeper = %self.id,
+                        stream = %super::logging::stream_uuid(stream),
+                        reason = %reason,
+                        "loaded a durable quarantine"
+                    );
+                }
+            }
             if let Some((listener, acceptor)) = admin {
                 let engine = self.clone();
                 sockets.spawn(async move { engine.listen_admin(listener, acceptor).await });
             }
             for genesis in self.disk.streams() {
+                if self.is_quarantined(genesis.stream) {
+                    continue;
+                }
                 if self
                     .disk
                     .ownership(genesis.stream)
@@ -898,8 +923,16 @@ impl Engine {
         .await;
     }
 
+    /// Takes a copy that failed to open out of service. A copy whose data
+    /// fails its checksum or does not decode stays quarantined across
+    /// restarts until repair restores it or an operator clears it; one that
+    /// failed otherwise is retried at the next start.
     fn quarantine(&self, stream: StreamId, error: &io::Error) {
-        self.disk.protect_objects(stream);
+        if error.kind() == io::ErrorKind::InvalidData {
+            self.disk.quarantine_stream(stream, &error.to_string());
+        } else {
+            self.disk.protect_objects(stream);
+        }
         if self.quarantined.write().insert(stream) {
             tracing::error!(
                 keeper = %self.id,
@@ -908,6 +941,19 @@ impl Engine {
                 "quarantined stream replica"
             );
         }
+    }
+
+    pub(super) fn is_quarantined(&self, stream: StreamId) -> bool {
+        self.quarantined.read().contains(&stream) || self.disk.is_quarantined(stream)
+    }
+
+    async fn clear_quarantine(&self, stream: StreamId) -> io::Result<Reply> {
+        let opening = self.opening(stream).await?;
+        let _guard = opening.lock().await;
+        self.disk.clear_quarantine(stream)?;
+        self.quarantined.write().remove(&stream);
+        self.close_copy(stream).await;
+        Ok(Reply::Decision(Outcome::Unit))
     }
 
     fn require_media(&self) -> io::Result<()> {
@@ -1143,7 +1189,7 @@ impl Engine {
 
     async fn group(&self, genesis: Genesis) -> io::Result<Arc<Group>> {
         self.require_media()?;
-        if self.quarantined.read().contains(&genesis.stream) {
+        if self.is_quarantined(genesis.stream) {
             return Err(invalid("stream replica is quarantined"));
         }
         let existing = self.groups.lock().await.get(&genesis.stream).cloned();
@@ -1157,7 +1203,7 @@ impl Engine {
         if let Some(group) = self.groups.lock().await.get(&genesis.stream).cloned() {
             return group.for_genesis(&genesis);
         }
-        if self.quarantined.read().contains(&genesis.stream) {
+        if self.is_quarantined(genesis.stream) {
             return Err(invalid("stream replica is quarantined"));
         }
         match self.disk.genesis(genesis.stream) {
@@ -1427,6 +1473,7 @@ impl Engine {
                 };
                 Ok(Reply::Configured(configuration))
             }
+            Request::ClearQuarantine(stream) => self.clear_quarantine(stream).await,
             Request::LocalCopy(_) => Ok(self
                 .disk
                 .ownership(stream)
@@ -1516,6 +1563,19 @@ impl Engine {
             Request::ClusterVersion => self.catalog()?.cluster_version(),
             Request::Bootstrap(stream) => self.bootstrap(stream).await,
             request => {
+                // Only a copy whose data failed its checksum is Corrupted; one
+                // out of service for another reason is merely unavailable.
+                if self.disk.is_quarantined(stream) {
+                    let refused = Outcome::Refused(JournalError::Corrupted);
+                    return Ok(match (&request, self.disk.genesis(stream)) {
+                        (Request::ReadAt { .. }, Some(genesis)) => Reply::ScopedPage {
+                            genesis,
+                            configuration: None,
+                            outcome: refused,
+                        },
+                        _ => Reply::Decision(refused),
+                    });
+                }
                 let group = self.groups.lock().await.get(&stream).cloned();
                 if let Some(stopped) = group.as_ref().filter(|group| group.stopped()) {
                     // Reopen the copy; it elects a leader and the client
@@ -1547,6 +1607,18 @@ impl Engine {
                 *group.used.lock() = Instant::now();
                 if !self.disk.installed(stream) {
                     return Ok(failure(JournalError::Unavailable));
+                }
+                if group.state.is_quarantined() {
+                    self.quarantined.write().insert(stream);
+                    let refused = Outcome::Refused(JournalError::Corrupted);
+                    return Ok(match &request {
+                        Request::ReadAt { .. } => Reply::ScopedPage {
+                            genesis: group.genesis.clone(),
+                            configuration: None,
+                            outcome: refused,
+                        },
+                        _ => Reply::Decision(refused),
+                    });
                 }
                 group.require_healthy()?;
                 let reply = match request {
@@ -1698,7 +1770,15 @@ impl Engine {
                                     Ok(Ok(bytes)) => Outcome::OriginalEvidence(
                                         bytes[..crate::stream::timed::EVIDENCE_BYTES].to_vec(),
                                     ),
-                                    _ => Outcome::Refused(JournalError::Unavailable),
+                                    Ok(Err(error))
+                                        if error.kind() == io::ErrorKind::InvalidData =>
+                                    {
+                                        group.state.quarantine_corrupt(&error.to_string());
+                                        self.quarantined.write().insert(stream);
+                                        Outcome::Refused(JournalError::Corrupted)
+                                    }
+                                    Ok(Err(_)) => Outcome::Refused(JournalError::Unavailable),
+                                    Err(_) => Outcome::Refused(JournalError::Unavailable),
                                 }
                             }
                             Err(error) => Outcome::Refused(error),
@@ -1723,6 +1803,10 @@ impl Engine {
                     }
                     _ => Err(invalid("invalid application request")),
                 }?;
+                if group.state.is_quarantined() {
+                    self.quarantined.write().insert(stream);
+                    return Ok(reply);
+                }
                 group.require_healthy()?;
                 Ok(reply)
             }

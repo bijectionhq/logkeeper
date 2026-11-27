@@ -26,7 +26,7 @@ mod tests;
 
 use super::{
     Entry, Genesis, Log, LogId, Vote,
-    media::{Boundary, Enrollment, Media, Opened},
+    media::{Boundary, Enrollment, Media, Opened, QuarantineStore},
     objects::{Location, Objects},
     snapshot::Selected,
     space::{Admission, Reservation, Space, WAL_METADATA_BYTES},
@@ -477,6 +477,7 @@ pub(in crate::stream::consensus) struct Disk {
     pub space: Space,
     pub(super) objects: Objects,
     pub(in crate::stream::consensus) metrics: Arc<crate::stream::consensus::metrics::Metrics>,
+    pub quarantine: QuarantineStore,
     #[cfg(test)]
     replica_fault: Arc<parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>>,
     #[cfg(test)]
@@ -511,11 +512,15 @@ impl Disk {
     }
 
     fn open_tuned(enrollment: Enrollment, tuning: Tuning) -> io::Result<Self> {
+        let quarantine = enrollment.quarantine_store()?;
         let (media, lock, opened) = enrollment.open()?;
         let keeper_id = media.keeper();
         let path = media.data().to_path_buf();
         let space = Space::new(path.clone())?;
         let objects = Objects::open(&path)?;
+        for stream in quarantine.streams().keys() {
+            objects.protect(*stream);
+        }
         if let Opened::Legacy(boundary) = opened {
             Segmented::migrate(&media, boundary, &objects, &space)?;
         }
@@ -606,6 +611,7 @@ impl Disk {
             space,
             objects,
             metrics,
+            quarantine,
             #[cfg(test)]
             replica_fault,
             #[cfg(test)]
@@ -631,6 +637,33 @@ impl Disk {
     #[cfg(test)]
     pub fn mark_slow(&self, hold: std::time::Duration) {
         self.watchdog.mark_slow(hold);
+    }
+
+    /// Durably quarantines `stream` in the enrollment registry and protects
+    /// its objects and segments from reaping until cleared.
+    pub fn quarantine_stream(&self, stream: StreamId, reason: &str) {
+        self.objects.protect(stream);
+        if let Err(error) = self.quarantine.mark(stream, reason) {
+            tracing::error!(
+                stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                error = %error,
+                "could not persist a quarantine marker"
+            );
+        }
+    }
+
+    /// Clears a durable quarantine marker for `stream`.
+    pub fn clear_quarantine(&self, stream: StreamId) -> io::Result<bool> {
+        // Objects stay protected until the copy opens again and pins them.
+        self.quarantine.clear(stream)
+    }
+
+    pub fn is_quarantined(&self, stream: StreamId) -> bool {
+        self.quarantine.contains(stream)
+    }
+
+    pub fn quarantined_streams(&self) -> BTreeMap<StreamId, String> {
+        self.quarantine.streams()
     }
 
     /// Finalized cluster feature level gating new on-disk formats and commands.

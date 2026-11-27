@@ -486,3 +486,151 @@ fn keeper_config_warns_on_unknown_fields_while_journal_config_stays_strict() {
     .unwrap_err();
     assert!(err.to_string().contains("unknown field"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checksum_failure_quarantines_durably_survives_restart_triggers_repair_and_clears() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(220);
+    client.create(stream, [a, b, c], 4096).await.unwrap();
+    let fence = client
+        .seal(stream, Epoch(0), Uuid::from_u128(61))
+        .await
+        .unwrap()
+        .fence;
+    client
+        .append(stream, fence, Lsn(1), Bytes::from_static(b"corrupt-me"))
+        .await
+        .unwrap();
+
+    // Pick a follower so the other two voters keep quorum for repair.
+    let leader = cluster.leader(stream).await;
+    let victim = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    let group = cluster.group(victim, stream).await;
+    group
+        .raft
+        .wait(Some(WAIT))
+        .metrics(|_| group.state.head() == Ok(Lsn(1)), "victim applied LSN 1")
+        .await
+        .unwrap();
+
+    // Flip one byte in the retained segment slice on `victim`.
+    let (payload_file, last_byte) = group.state.payload_path().unwrap();
+    let flip = || {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&payload_file)
+            .unwrap();
+        file.seek(SeekFrom::Start(last_byte)).unwrap();
+        let mut byte = [0];
+        file.read_exact(&mut byte).unwrap();
+        file.seek(SeekFrom::Start(last_byte)).unwrap();
+        file.write_all(&[byte[0] ^ 0xff]).unwrap();
+        file.sync_all().unwrap();
+    };
+    flip();
+
+    // Reading from `victim` hits checksum mismatch, returns typed Corrupted,
+    // writes a durable quarantine marker in the registry, and reports unhealthy.
+    let identity = Identity::Client(journal_contract::Identity::from(OWNER));
+    let read_req = Request::Read {
+        stream,
+        from: Lsn(1),
+        limit: 1,
+        wait_ms: 0,
+    };
+    assert!(matches!(
+        cluster.running[&victim]
+            .engine
+            .request(&identity, read_req.clone())
+            .await,
+        Ok(Reply::Decision(Outcome::Refused(JournalError::Corrupted)))
+    ));
+    let marker = cluster.configs[&victim]
+        .enrollment
+        .join(format!("{victim}.quarantine.json"));
+    assert!(
+        marker.exists(),
+        "durable quarantine marker must exist in registry"
+    );
+    let status = client.keeper_status(victim, stream).await.unwrap();
+    assert_eq!(status.replica, Some(false));
+
+    // Even if the byte is restored and `victim` restarts, durable quarantine
+    // survives restart until explicitly cleared!
+    cluster.running.remove(&victim).unwrap().stop().await;
+    flip();
+    cluster.restart(victim).await;
+    assert_eq!(
+        client.keeper_status(victim, stream).await.unwrap().replica,
+        Some(false)
+    );
+    assert!(matches!(
+        cluster.running[&victim]
+            .engine
+            .request(&identity, read_req.clone())
+            .await,
+        Ok(Reply::Decision(Outcome::Refused(JournalError::Corrupted)))
+    ));
+
+    // Meanwhile the stream's leader sees `victim` unhealthy and replaces it.
+    let initial_voters = [a, b, c];
+    let repaired = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(cfg) = client.configuration(stream).await
+                && cfg.voters != initial_voters
+                && !cfg.voters.contains(&victim)
+            {
+                return cfg;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("repair replaced quarantined replica");
+    assert!(!repaired.voters.contains(&victim));
+    // Reads from the healthy quorum still return the intact record.
+    let page = client
+        .read(stream, Lsn(1), 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.records,
+        vec![(Lsn(1), Bytes::from_static(b"corrupt-me"))]
+    );
+
+    // Online admin command clears the quarantine marker.
+    client.clear_quarantine(victim, stream).await.unwrap();
+    assert!(
+        !cluster.running[&victim].engine.is_quarantined(stream),
+        "online clear_quarantine must clear in-memory and durable markers"
+    );
+    assert!(!marker.exists(), "empty quarantine file removed on clear");
+
+    // A copy that fails to open for another reason than its data is taken
+    // out of service only until the keeper restarts.
+    cluster.running[&victim]
+        .engine
+        .quarantine(stream, &io::Error::other("transient open failure"));
+    assert!(cluster.running[&victim].engine.is_quarantined(stream));
+    assert!(!marker.exists(), "only corrupt data is quarantined durably");
+
+    // Offline operator command also clears a durable marker on a stopped keeper.
+    cluster.running[&victim].engine.quarantine(
+        stream,
+        &io::Error::new(io::ErrorKind::InvalidData, "manual test quarantine"),
+    );
+    assert!(marker.exists());
+    cluster.running.remove(&victim).unwrap().stop().await;
+    assert!(cluster.configs[&victim].clear_quarantine(stream).unwrap());
+    assert!(!marker.exists());
+    assert!(!cluster.configs[&victim].clear_quarantine(stream).unwrap());
+    cluster.restart(victim).await;
+    assert!(!cluster.running[&victim].engine.is_quarantined(stream));
+
+    cluster.stop_all().await;
+}

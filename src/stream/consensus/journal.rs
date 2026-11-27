@@ -478,6 +478,12 @@ impl ConsensusJournal {
         self.client.finalize_version(version).await
     }
 
+    /// Clears a durable corruption quarantine marker for `stream` on `keeper`.
+    /// Administrators only.
+    pub async fn clear_quarantine(&self, keeper: uuid::Uuid, stream: StreamId) -> Result<()> {
+        self.client.clear_quarantine(keeper, stream).await
+    }
+
     /// The consensus client, for placement and replica administration.
     pub fn client(&self) -> &Client {
         &self.client

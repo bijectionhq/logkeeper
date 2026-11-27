@@ -622,7 +622,15 @@ impl StateMachine {
     }
 
     pub fn suspend(&self) {
-        self.inner.quarantine();
+        self.inner.suspend();
+    }
+
+    pub fn quarantine_corrupt(&self, reason: &str) {
+        self.inner.quarantine_corrupt(reason);
+    }
+
+    pub fn is_quarantined(&self) -> bool {
+        self.inner.disk.is_quarantined(self.inner.genesis.stream)
     }
 
     pub fn healthy(&self) -> bool {
@@ -637,12 +645,19 @@ impl StateMachine {
 
     pub fn head(&self) -> journal_contract::Result<Lsn> {
         if !self.healthy() {
-            return Err(JournalError::Unavailable);
+            return Err(if self.is_quarantined() {
+                JournalError::Corrupted
+            } else {
+                JournalError::Unavailable
+            });
         }
         self.inner.applied.read().state.head()
     }
 
     pub async fn page(&self, from: Lsn, limit: usize) -> journal_contract::Result<Page> {
+        if self.is_quarantined() {
+            return Err(JournalError::Corrupted);
+        }
         if !self.healthy() {
             return Err(JournalError::Unavailable);
         }
@@ -655,9 +670,12 @@ impl StateMachine {
         } else {
             page.load()
         };
-        result.map_err(|_| {
-            self.inner.quarantine();
-            JournalError::Unavailable
+        result.map_err(|error| {
+            if self.inner.fail(&error) {
+                JournalError::Corrupted
+            } else {
+                JournalError::Unavailable
+            }
         })
     }
 
@@ -945,7 +963,9 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
         } else {
             self.inner.apply(entries)
         };
-        let outcomes = outcomes.inspect_err(|_| self.inner.quarantine())?;
+        let outcomes = outcomes.inspect_err(|error| {
+            self.inner.fail(error);
+        })?;
         let metrics = &self.inner.disk.metrics;
         metrics.commit_stage_apply.observe(started.elapsed());
         if let Some(last) = last {
@@ -1055,9 +1075,29 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
 }
 
 impl Inner {
-    fn quarantine(&self) {
+    fn suspend(&self) {
         self.healthy.store(false, Ordering::Release);
         self.changed.send_replace(());
+    }
+
+    fn quarantine_corrupt(&self, reason: &str) {
+        self.disk.quarantine_stream(self.genesis.stream, reason);
+        self.healthy.store(false, Ordering::Release);
+        self.changed.send_replace(());
+    }
+
+    /// Takes the replica out of service after `error`. Only data that fails
+    /// its checksum or does not decode (`InvalidData`) quarantines it
+    /// durably; another error, such as a failed read, only suspends it until
+    /// it reopens. Whether it was quarantined.
+    fn fail(&self, error: &io::Error) -> bool {
+        if error.kind() == io::ErrorKind::InvalidData {
+            self.quarantine_corrupt(&error.to_string());
+            true
+        } else {
+            self.suspend();
+            false
+        }
     }
 
     async fn select(&self, temporary: &Path, selected: Selected, incoming: bool) -> io::Result<()> {
@@ -1137,7 +1177,7 @@ impl Inner {
                 &inner.genesis,
                 &active.meta,
                 &active.image,
-                || inner.quarantine(),
+                |reason| inner.quarantine_corrupt(reason),
             )?;
             temporary.transfer.account(&file.metadata()?);
             file.rewind()?;
@@ -1637,7 +1677,9 @@ pub(in crate::stream::consensus) fn repair_snapshot(
         image.verify_placement(placement, &genesis)?;
         sync_file(&target)?;
         fs::rename(&temporary, selected.path(&directory))?;
-        sync_directory(&directory)
+        sync_directory(&directory)?;
+        let _ = disk.clear_quarantine(stream)?;
+        Ok(())
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);
@@ -1665,7 +1707,7 @@ fn write_image(
     genesis: &Genesis,
     meta: &SnapshotMeta,
     image: &Image,
-    quarantine: impl Fn(),
+    quarantine: impl Fn(&str),
 ) -> io::Result<()> {
     file.write_all(MAGIC)?;
     file.write_all(&[0; 4])?;
@@ -1681,7 +1723,9 @@ fn write_image(
             .serialize_into(&mut writer, &(genesis, meta, image))
             .map_err(io::Error::other)?;
         for payload in image.state.records() {
-            let bytes = payload.load().inspect_err(|_| quarantine())?;
+            let bytes = payload
+                .load()
+                .inspect_err(|error| quarantine(&error.to_string()))?;
             let len = bytes.len() as u32 | if payload.timed() { TIMED_RECORD } else { 0 };
             let crc = crc32fast::hash(&bytes);
             writer.write_all(&len.to_be_bytes())?;

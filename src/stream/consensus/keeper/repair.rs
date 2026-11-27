@@ -155,7 +155,7 @@ impl Engine {
             .count();
         // A parked or not yet opened replica still holds the stream: an
         // operator recovery must not count it lost.
-        let replica = if self.quarantined.read().contains(&stream) {
+        let replica = if self.is_quarantined(stream) {
             Some(false)
         } else {
             groups

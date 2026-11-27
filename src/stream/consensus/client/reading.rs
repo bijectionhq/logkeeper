@@ -351,6 +351,7 @@ struct Seen {
     empty: Option<Page>,
     floor: Option<Lsn>,
     deleted: bool,
+    corrupted: bool,
 }
 
 impl Seen {
@@ -372,6 +373,7 @@ impl Seen {
                 self.floor = self.floor.max(Some(floor))
             }
             Outcome::Refused(JournalError::Deleted) => self.deleted = true,
+            Outcome::Refused(JournalError::Corrupted) => self.corrupted = true,
             _ => (),
         }
         None
@@ -384,7 +386,13 @@ impl Seen {
         if let Some(floor) = self.floor {
             return Err(JournalError::Trimmed { floor });
         }
-        self.empty.ok_or(JournalError::Unavailable)
+        if let Some(empty) = self.empty {
+            return Ok(empty);
+        }
+        if self.corrupted {
+            return Err(JournalError::Corrupted);
+        }
+        Err(JournalError::Unavailable)
     }
 }
 

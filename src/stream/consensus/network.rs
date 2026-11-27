@@ -263,6 +263,9 @@ pub(super) enum Request {
     /// Advances the finalized cluster feature level to `version` once all
     /// active keepers support it. Administrators only.
     FinalizeVersion(u32),
+    /// Clears a durable corruption quarantine marker on this keeper for
+    /// `stream`. Administrators only.
+    ClearQuarantine(StreamId),
 }
 
 impl Request {
@@ -284,6 +287,7 @@ impl Request {
             | Self::AcknowledgeRecovery(stream)
             | Self::LocalConfiguration(stream)
             | Self::Staging(stream)
+            | Self::ClearQuarantine(stream)
             | Self::Configuration(stream) => stream,
             Self::Stage(ref stage) => stage.stream,
             Self::ClusterVersion | Self::FinalizeVersion(_) => StreamId(0),
@@ -372,7 +376,7 @@ pub(super) fn encode_pong(pong: &Pong, version: WireVersion) -> io::Result<Vec<u
 const MAX_FRAME_TAG_V1: u32 = 2;
 const MAX_FRAME_TAG_CURRENT: u32 = 3;
 const MAX_REQUEST_TAG_V1: u32 = 27;
-const MAX_REQUEST_TAG_CURRENT: u32 = 31;
+const MAX_REQUEST_TAG_CURRENT: u32 = 32;
 const MAX_PEER_REQUEST_TAG_V1: u32 = 5;
 const MAX_PEER_REQUEST_TAG_CURRENT: u32 = 5;
 /// Serialized size of `Genesis` under fixint bincode: StreamId(16) + [Uuid; 3](48) + u64(8).
@@ -452,7 +456,8 @@ impl Request {
             Self::LocalConfiguration(_)
             | Self::Staging(_)
             | Self::ClusterVersion
-            | Self::FinalizeVersion(_) => version == WireVersion::Current,
+            | Self::FinalizeVersion(_)
+            | Self::ClearQuarantine(_) => version == WireVersion::Current,
             _ => true,
         }
     }
