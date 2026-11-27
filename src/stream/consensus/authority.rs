@@ -575,6 +575,29 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "recovery drops a fenced keeper's lease bound when recorded maxima overflow"]
+    fn recovery_wait_keeps_the_prior_bound_when_grant_maxima_overflow() {
+        let keeper = ids()[0];
+        let mut records = Records::default();
+        let duration = u64::MAX - 1;
+        assert!(decisions::lease_bounds(duration, 1));
+        assert!(decisions::lease_bounds(30, 2));
+        records.apply(&Change::Lease {
+            keeper,
+            lease_ms: duration,
+            margin_ms: 1,
+        });
+        let prior = records.recovery_wait(&[keeper], 32);
+        assert_eq!(prior, u64::MAX);
+        records.apply(&Change::Lease {
+            keeper,
+            lease_ms: 30,
+            margin_ms: 2,
+        });
+        assert!(records.recovery_wait(&[keeper], 32) >= prior);
+    }
+
+    #[test]
     fn a_fence_bumps_the_epoch() {
         let keeper = ids()[0];
         let mut records = Records::default();
