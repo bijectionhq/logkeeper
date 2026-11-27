@@ -289,6 +289,44 @@ pub(super) fn restages_replacement(
     !staged_recovery && !stage_recovery && same_source && !same_stage
 }
 
+/// Whether a copy's applied pages may be served to a reader. A voter of its
+/// applied membership serves them only once this keeper process certified
+/// its placement (`keeper/certify.rs`): an operator recovery may have left
+/// the copy's applied suffix behind, and a lost voter that restarted with a
+/// snapshot holds that suffix before anything tells it so.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (member && certified)
+))]
+pub(super) fn serves_reads(member: bool, certified: bool) -> bool {
+    member && certified
+}
+
+/// Whether the catalog's latest staged move fences a copy whose effective
+/// configuration is described by the flags. An ordinary move leaves both of
+/// its sides and its joint configuration alone: any older configuration
+/// belongs to a copy that missed a committed move. A recovery goes on only
+/// from its target, so its lost configuration is fenced. A copy without a
+/// configuration cannot campaign or serve, and is never fenced.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (configured && (if recovery { !at_target } else {
+        !(at_old || at_target || joint_of_move)
+    }))
+))]
+pub(super) fn fences_copy(
+    configured: bool,
+    recovery: bool,
+    at_old: bool,
+    at_target: bool,
+    joint_of_move: bool,
+) -> bool {
+    configured
+        && if recovery {
+            !at_target
+        } else {
+            !(at_old || at_target || joint_of_move)
+        }
+}
+
 /// The term of a recovery write: far above the survivor's vote and every
 /// term in its log, so no ballot or entry of the lost history can outrank it.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>

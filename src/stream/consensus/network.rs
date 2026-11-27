@@ -203,6 +203,11 @@ pub(super) enum Request {
     /// configuration its own copy finalized, open or parked, without a
     /// leader. Added last; an older keeper refuses it.
     LocalConfiguration(StreamId),
+    /// A keeper asks the catalog for the latest move staged for `stream`,
+    /// answered with `Reply::Staged`, or `Outcome::Unit` when none was, to
+    /// certify its copy (`keeper/certify.rs`). Added last, so a catalog
+    /// keeper older than this refuses it.
+    Staging(StreamId),
 }
 
 impl Request {
@@ -223,6 +228,7 @@ impl Request {
             | Self::KeeperStatus(stream)
             | Self::AcknowledgeRecovery(stream)
             | Self::LocalConfiguration(stream)
+            | Self::Staging(stream)
             | Self::Configuration(stream) => stream,
             Self::Stage(ref stage) => stage.stream,
             Self::Seal { stream, .. }
@@ -1096,6 +1102,9 @@ impl Rpc {
 /// excludes, instead of an answer that carries its newer vote.
 pub(super) const EXCLUDED: &str = "sender is outside the receiver's placement";
 
+/// Why an uncertified copy does not campaign (`keeper/certify.rs`).
+const UNCERTIFIED: &str = "replica placement is not certified since it opened";
+
 #[derive(Clone)]
 pub(super) struct Network {
     pub control: Rpc,
@@ -1112,6 +1121,9 @@ pub(super) struct Network {
     /// Peers this keeper saw under another media incarnation. Their vote
     /// and pre-vote grants do not count.
     pub reincarnated: Arc<parking_lot::RwLock<HashSet<NodeId>>>,
+    /// Whether the keeper certified this copy's placement. An uncertified
+    /// copy sends no vote or pre-vote, so it never campaigns.
+    pub certified: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl Network {
@@ -1337,6 +1349,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         request: VoteRequest<RaftTypes>,
         option: RPCOption,
     ) -> Result<VoteResponse<RaftTypes>, RPCError<RaftTypes>> {
+        if !(self.network.certified)() {
+            return Err(unreachable(&invalid(UNCERTIFIED)).into());
+        }
         let proposed = request.vote;
         let last_log = request.last_log_id;
         let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
@@ -1365,6 +1380,9 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         request: VoteRequest<RaftTypes>,
         option: RPCOption,
     ) -> Result<VoteResponse<RaftTypes>, RPCError<RaftTypes>> {
+        if !(self.network.certified)() {
+            return Err(unreachable(&invalid(UNCERTIFIED)).into());
+        }
         let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
             self.request(PeerRequest::PreVote(request), &option).await?;
         let response = response.map_err(|error| unreachable(&error))?;

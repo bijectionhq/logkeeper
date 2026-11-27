@@ -77,6 +77,17 @@ impl Catalog {
         })
     }
 
+    /// The latest move staged for `stream`, which certifies a keeper's copy.
+    pub fn staged(&self, stream: StreamId) -> io::Result<Reply> {
+        self.require_trusted()?;
+        Ok(match self.disk.catalog(stream) {
+            Some(entry) => entry
+                .staged
+                .map_or(Reply::Decision(Outcome::Unit), Reply::Staged),
+            None => Reply::Decision(Outcome::Refused(JournalError::NotFound)),
+        })
+    }
+
     pub async fn stage(&self, stage: Stage, placement: &Placement) -> io::Result<Reply> {
         self.require_trusted()?;
         if !placement.stage(&stage) {

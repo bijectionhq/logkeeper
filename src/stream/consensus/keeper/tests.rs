@@ -2309,7 +2309,10 @@ async fn a_restarted_leader_reads_only_after_committing_in_a_new_term() {
         openraft::ServerState::Leader,
         "a restarted leader must not resume its old term"
     );
-    for id in [a, b, c].into_iter().filter(|id| *id != leader) {
+    // No voter heard a leader since it restarted, so they certify their
+    // copies against the catalog before they campaign.
+    let catalog = cluster.catalog;
+    for id in [a, b, c, catalog].into_iter().filter(|id| *id != leader) {
         cluster.restart(id).await;
     }
     assert_eq!(journal.head(stream).await, Ok(Lsn(8)));

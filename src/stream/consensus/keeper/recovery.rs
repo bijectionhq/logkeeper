@@ -7,10 +7,11 @@
 //! them answers with a healthy replica. A lost voter that does not answer is
 //! asked again for longer before it counts as lost: a slow keeper is not a
 //! lost one. Naming the lost voters is the operator's statement that they
-//! are down or fenced, which no probe can prove. It then stages the move in
-//! the catalog, stages an installed empty copy on each of two replacements,
-//! and writes one WAL round on the survivor: a vote for itself in a term
-//! above every term it has seen, and two entries in that term. The first,
+//! are down or fenced, which no probe can prove. It then stages an installed
+//! empty copy on each of two replacements, stages the move in the catalog,
+//! which fences the lost configuration, and writes one WAL round on the
+//! survivor: a vote for itself in a term above every term it has seen, and
+//! two entries in that term. The first,
 //! `Command::Recover`, stages the move and fences the stream under the
 //! recovery writer at an epoch above every applied epoch. The second is the
 //! membership of the survivor and the two replacements. When the survivor
@@ -341,12 +342,6 @@ impl Config {
             )));
         }
 
-        // The catalog orders the new voters first among the stream's
-        // contacts. Clients still reach the survivor through the genesis
-        // voters, so a catalog outage does not block the recovery.
-        if let Err(error) = self.stage_in_catalog(disk, rpc, placement, &stage).await {
-            eprintln!("logkeeper recovery could not stage the catalog entry: {error}");
-        }
         for replacement in target.into_iter().filter(|id| !old.contains(id)) {
             match rpc
                 .call::<Reply>(
@@ -368,6 +363,20 @@ impl Config {
             }
         }
 
+        // The catalog records the move before the survivor writes it. Its
+        // latest staged move is what fences the lost configuration: a lost
+        // voter that restarts asks for it before it campaigns or serves a
+        // read (`keeper/certify.rs`). So the recovery refuses without the
+        // catalog. It stages after the replacements, so a refused
+        // replacement leaves the old configuration unfenced.
+        self.stage_in_catalog(disk, rpc, placement, &stage)
+            .await
+            .map_err(|error| {
+                invalid(format!(
+                    "refused: the catalog must record the recovery so the lost voters stay \
+                     fenced: {error}"
+                ))
+            })?;
         let log_id = |index| {
             LogId::new(
                 openraft::vote::leader_id_std::CommittedLeaderId::new(term),

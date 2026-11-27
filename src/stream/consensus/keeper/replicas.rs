@@ -342,6 +342,7 @@ impl Engine {
     /// and mark. The new generation fences the old group's writes, so its
     /// shutdown need not be awaited.
     pub(super) async fn close_copy(&self, scope: StreamId) {
+        self.certification.forget(scope);
         self.parked.write().remove(&scope);
         self.closed_states.lock().remove(&scope);
         if let Some(group) = self.groups.lock().await.remove(&scope) {

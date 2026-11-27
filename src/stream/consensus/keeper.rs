@@ -1,5 +1,6 @@
 mod admission;
 mod catalog_stream;
+mod certify;
 mod compaction;
 mod incarnation;
 mod ingress;
@@ -370,6 +371,7 @@ impl Config {
             snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
             retire_now: Arc::default(),
             placement_confirmed: parking_lot::Mutex::default(),
+            certification: Arc::default(),
             stop: stop.child_token(),
             #[cfg(test)]
             reject_append: Default::default(),
@@ -456,6 +458,9 @@ pub(super) struct Engine {
     /// checked since this keeper started, and when a check some keeper did
     /// not answer ran; see `confirm_placement`.
     placement_confirmed: parking_lot::Mutex<HashMap<StreamId, Option<Instant>>>,
+    /// The copies this keeper certified or the catalog fenced: see
+    /// `certify`.
+    certification: Arc<certify::Certification>,
     pub(super) stop: CancellationToken,
     #[cfg(test)]
     reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
@@ -593,6 +598,11 @@ impl Engine {
             let compacting = self.clone();
             sockets.spawn(async move {
                 compacting.compaction_loop().await;
+                Ok(())
+            });
+            let certifying = self.clone();
+            sockets.spawn(async move {
+                certifying.certify_loop().await;
                 Ok(())
             });
             if self.catalog_stream.is_some() {
@@ -1061,6 +1071,11 @@ impl Engine {
                 excluded: excluded.clone(),
                 retire: self.retire_now.clone(),
                 reincarnated: self.recognition.reincarnated_peers(),
+                certified: {
+                    let certification = self.certification.clone();
+                    let (stream, generation) = (genesis.stream, state.generation());
+                    Arc::new(move || certification.require(stream, generation))
+                },
             },
             store,
             state.clone(),
@@ -1123,6 +1138,7 @@ impl Engine {
                 if matches!(
                     request,
                     Request::Locate(_)
+                        | Request::Staging(_)
                         | Request::KeeperStatus(_)
                         | Request::PlacementProof(_)
                         | Request::LocalConfiguration(_)
@@ -1272,7 +1288,7 @@ impl Engine {
                 self.record_preference(stream, keeper);
                 Ok(Reply::Decision(Outcome::Unit))
             }
-            Request::Claim(_) | Request::Locate(_) | Request::Stage(_)
+            Request::Claim(_) | Request::Locate(_) | Request::Stage(_) | Request::Staging(_)
                 if self.catalog_stream.is_some() =>
             {
                 self.serve_catalog_stream(request).await
@@ -1280,6 +1296,7 @@ impl Engine {
             Request::Claim(genesis) => self.catalog()?.claim(genesis, &self.placement).await,
             Request::Locate(stream) => self.catalog()?.locate(stream),
             Request::Stage(stage) => self.catalog()?.stage(stage, &self.placement).await,
+            Request::Staging(stream) => self.catalog()?.staged(stream),
             Request::Bootstrap(stream) => self.bootstrap(stream).await,
             request => {
                 let group = self.groups.lock().await.get(&stream).cloned();
@@ -1330,9 +1347,11 @@ impl Engine {
                         limit,
                         wait_ms,
                         ..
-                    } => Ok(Reply::Decision(
-                        group.read(from, limit, wait_ms, Lsn(0)).await,
-                    )),
+                    } => Ok(Reply::Decision(if self.certified(&group) {
+                        group.read(from, limit, wait_ms, Lsn(0)).await
+                    } else {
+                        Outcome::Refused(JournalError::Unavailable)
+                    })),
                     Request::ReadAt {
                         genesis,
                         from,
@@ -1352,7 +1371,10 @@ impl Engine {
                         if genesis != group.genesis {
                             return Err(invalid("page scope differs"));
                         }
-                        if !group.state.serves_applied_pages(self.id.as_u128()) {
+                        if !super::decisions::serves_reads(
+                            group.state.serves_applied_pages(self.id.as_u128()),
+                            self.certified(&group),
+                        ) {
                             return Ok(failure(JournalError::Unavailable));
                         }
                         let outcome = group.read(from, limit, wait_ms, minimum_head).await;
@@ -1609,6 +1631,7 @@ impl Engine {
             match request {
                 Request::Locate(stream) => catalog.locate(stream),
                 Request::Stage(stage) => catalog.stage(stage, &self.placement).await,
+                Request::Staging(stream) => catalog.staged(stream),
                 _ => Err(invalid("invalid internal catalog request")),
             }
         } else {
@@ -1630,10 +1653,16 @@ impl Engine {
             return Ok(failure(JournalError::Deleted));
         }
         let members = self.nodes(genesis.voters);
-        if self.disk.genesis(stream).is_none() {
+        let fresh = self.disk.genesis(stream).is_none();
+        if fresh {
             self.check_identity().await;
         }
         let group = self.group(genesis).await?;
+        // A copy the catalog's genesis registers empty cannot hold a
+        // history any move or recovery left behind.
+        if fresh {
+            self.certification.certify(stream, group.state.generation());
+        }
         let initialized = group.raft.initialize(members).await;
         group.require_healthy()?;
         match initialized {

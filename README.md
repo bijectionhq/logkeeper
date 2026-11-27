@@ -281,11 +281,15 @@ saw committed, and asks every other keeper for its status.
   the two best-ranked live, accepting keepers outside the lost configuration,
   in failure domains distinct from each other and from the survivor's. They
   must answer.
-- **Staging.** It stages the move in the catalog, best effort, so clients see
-  the new voters first among the contacts. Each replacement then stages an
-  installed, empty copy of the stream. A replacement refuses when its own
-  open replica votes in its configuration, which means the survivor's view is
-  stale.
+- **Staging.** Each replacement stages an installed, empty copy of the
+  stream. A replacement refuses when its own open replica votes in its
+  configuration, which means the survivor's view is stale. The command then
+  stages the move in the catalog and refuses if the catalog does not record
+  it: the catalog's record is what fences the lost voters (see below), so a
+  recovery needs the catalog. Clients also see the new voters first among the
+  contacts. A refused replacement leaves the catalog untouched; a recovery
+  that stops after the catalog recorded it leaves the old configuration
+  fenced, so run it again to completion.
 - **The durable step.** One WAL round on the survivor, `Record::Recover`,
   holds a vote for the survivor in a term 2^32 above every term it has seen
   and two entries in that term. `Command::Recover` stages the move and seals
@@ -312,23 +316,49 @@ consumer that sees `Recovered`, or a head below what it was acknowledged,
 must treat it as data loss and rebuild from the journal instead of its own
 previous head.
 
-**Lost voters.** A lost voter that returns with its data finds a placement
-that no longer names it and retires its copy. It cannot win an election: its
-configuration's other members are the survivor, whose term and log are newer
-and whose leader lease refuses votes, and the other lost voter. The recovered
-voters do not answer a peer outside their membership whose term is below
-theirs, so a lost voter never learns the recovered term; the refusal makes it
-check the placement and retire at once. Two lost voters that return together
-would form a quorum of the old configuration, so before a keeper first votes
-in a stream after it starts, it asks every other keeper for the
-configuration its own copy finalized, open or parked, with no leader needed
-(`Request::LocalConfiguration`). When one finalized a newer revision that
-names it nowhere, it refuses the vote and retires; neither lost voter can
-then win. A keeper that does not answer leaves the check open: the vote
-goes ahead and the next vote after 10 seconds asks again. So the window
-remains only while the survivor and both replacements are all unreachable
-from the returning voters; prefer to start lost keepers one at a time, or
-with their data removed, all the same.
+**Lost voters and placement certification.** Two lost voters are a quorum
+of the configuration the recovery left, and a lost voter may still hold the
+lost suffix, even from a snapshot it reopens. Raft cannot tell them from a
+healthy pair, so every copy must be *certified* in the keeper process that
+opened it before it campaigns (its network sends no vote or pre-vote) or
+serves a read (`decisions::serves_reads`). A copy is certified by an append
+from a leader whose vote does not lose to its own (that leader campaigned
+certified), by a bootstrap that registers it empty, or by the catalog: the
+keeper asks for the stream's latest staged move (`Request::Staging`), which
+every replacement and every recovery records before it changes the stream.
+`decisions::fences_copy` fences a copy whose effective configuration is
+neither side of that move, joint or uniform, and for a recovery every
+configuration but its target. A fenced copy retires on the highest placement
+proof another keeper certifies. Certification is kept in memory per copy
+generation and survives parking, so a stream's normal path makes no catalog
+round trip: only a copy that opened without hearing a leader asks, after a
+restart. A catalog outage therefore holds back only such copies: after a
+whole-cluster restart, streams elect once the catalog answers. The
+replicated catalog stream certifies itself.
+
+So a returning lost voter, alone or with the other, never campaigns and
+never serves the lost suffix; it asks the catalog, is fenced and retires,
+even when the survivor has since been replaced and neither lost voter knows
+any current voter. The recovered voters also refuse every frame from a peer
+outside their membership whose vote is below theirs (appends, votes,
+pre-votes, snapshot chunks, hand-offs and parks) without an answer, so a lost
+voter never learns the recovered term. Independently, before a keeper first
+votes in a stream after it starts, it asks every other keeper for the
+configuration its own copy finalized (`Request::LocalConfiguration`), and
+refuses the vote and retires when one finalized a newer revision that names
+it nowhere; that check stays open while a keeper does not answer, which
+certification does not. The TLA+ model in `verification/tla` checks
+certification (`RecoveryBothReturn`, `RecoveryBothReturnLiveness`).
+
+**Residual risk: lost voters that never stopped.** Certification fences
+copies that reopen. A lost voter that kept running through the recovery,
+partitioned from the survivor but in contact with the other lost voter, stays
+certified: the pair keeps leading the old configuration until it touches a
+recovered voter. Closing that needs leases bounded by the catalog, so that a
+catalog outage would stop every stream after the lease; that cost is the
+owner's call. Until then the runbook's rule stands: confirm on each host that
+both lost keepers are down or fenced before recovering
+(`docs/runbooks/lose-two-voters.md`).
 
 **Why readers cannot mix histories.** The recovered entries and every later
 entry carry terms above every term in the survivor's history and, with the
@@ -557,6 +587,12 @@ their term, so a keeper that rejoins after a partition does not depose a
 working leader. A graceful shutdown first transfers every stream the keeper
 leads to a caught-up voter, waiting at most 3 seconds, so a rolling restart
 does not wait out a lease and an election per stream.
+
+Placement certification adds `Request::Staging` to the end of the
+application protocol, whose ALPN stays `logkeeper-consensus/1` so clients
+need no upgrade. A catalog keeper, or replicated catalog voter, older than
+this build refuses the request, and a restarted copy that cannot certify
+does not campaign: upgrade the catalog keepers first.
 
 Verus checks the shipped admission, metering, classification, rotation, batch,
 restart, recovery, repair and keeper incarnation decisions in

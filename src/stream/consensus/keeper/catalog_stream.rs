@@ -235,6 +235,7 @@ impl Engine {
             Request::Claim(genesis) => self.claim_replicated(catalog, &group, genesis).await,
             Request::Locate(stream) => self.locate_replicated(catalog, &group, stream).await,
             Request::Stage(stage) => self.stage_replicated(catalog, &group, stage).await,
+            Request::Staging(stream) => self.staged_replicated(catalog, &group, stream).await,
             _ => Err(invalid("invalid catalog request")),
         }
     }
@@ -252,7 +253,7 @@ impl Engine {
         order.extend(catalog.genesis.voters);
         order.extend(self.placement.domains().keys().copied());
         let end = Instant::now() + REQUEST_TIMEOUT;
-        let write = !matches!(request, Request::Locate(_));
+        let write = !matches!(request, Request::Locate(_) | Request::Staging(_));
         let answer = super::super::catalog::ask(&order, end, |keeper| {
             let request = request.clone();
             async move {
@@ -481,6 +482,28 @@ impl Engine {
         };
         Ok(match fold.entries.get(&stream) {
             Some(entry) => found(entry),
+            None if !fold.seeded => failure(JournalError::Unavailable),
+            None => failure(JournalError::NotFound),
+        })
+    }
+
+    /// The latest move staged for `stream`, read on the leader: a copy that
+    /// a lagging replica certified could miss the recovery that fenced it.
+    async fn staged_replicated(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+        stream: StreamId,
+    ) -> io::Result<Reply> {
+        let (fold, _) = match self.leading(catalog, group, false).await {
+            Ok(view) => view,
+            Err(reply) => return Ok(reply),
+        };
+        Ok(match fold.entries.get(&stream) {
+            Some(entry) => entry
+                .staged
+                .clone()
+                .map_or(Reply::Decision(Outcome::Unit), Reply::Staged),
             None if !fold.seeded => failure(JournalError::Unavailable),
             None => failure(JournalError::NotFound),
         })

@@ -127,15 +127,15 @@ async fn an_aborted_replacement_does_not_wedge_subsequent_repair_on_the_same_kee
 /// Counterexample CE-3 (`verification/tla/RecoverySingleReturnSnap.cfg`):
 ///
 /// After operator recovery from a lagging survivor `a` (`[a, d, f]`), even if
-/// ONLY ONE lost voter `b` returns (`c` stays permanently stopped), a local
-/// snapshot persisted on `b` before loss restores `b`'s applied state on
-/// startup (`StateMachine::open`). Because `Request::ReadAt` checks only
-/// `serves_applied_pages` without a quorum or read barrier, a reader with a
-/// cached route (or local-domain preference) to `b` reads the acknowledged-lost
-/// record `Lsn(2) = "lost-2"` from `b` before `b` retires, and then reads
-/// `Lsn(3) = "recovered-3"` from `[a, d, f]` — observing a mixed history.
+/// only one lost voter `b` returns (`c` stays stopped), a local snapshot
+/// persisted on `b` before the loss restores `b`'s applied state on startup
+/// (`StateMachine::open`). `Request::ReadAt` checked only
+/// `serves_applied_pages`, so a reader with a cached route to `b` read the
+/// lost record `Lsn(2) = "lost-2"` from `b`, then `Lsn(3) = "recovered-3"`
+/// from `[a, d, f]`: a mixed history. A copy now serves reads only once its
+/// placement is certified (`decisions::serves_reads`, `keeper/certify.rs`),
+/// and the catalog's recovery fences `b`, which retires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known protocol failure (CE-3): a single returning lost voter with a persisted snapshot serves the lost suffix via ReadAt before retiring, producing a mixed history"]
 async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suffix() {
     let mut cluster = Cluster::start().await;
     // Order IDs so lost voter `b` precedes survivor `a` in the sorted roster
@@ -212,6 +212,7 @@ async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suf
     // `b` fails first; while `[a, c]` still serve rev 0 `[b, c, a]`, a reader
     // in `b`'s domain reads Lsn(1) from `c` and caches route `[b, c, a]` (with
     // no stale pooled socket to `b`).
+    let gen_b = journal.replica_generation(stream, b).await.unwrap();
     cluster.running.remove(&b).unwrap().stop().await;
     let reader = cluster
         .client(&cluster.credentials)
@@ -275,16 +276,12 @@ async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suf
     // Restart ONLY `b` (`c` stays permanently dead). Wait until `b`'s startup
     // finishes reopening the stream group from its persisted snapshot and its
     // application listener is accepting connections.
+    // `b` reopens its copy from the snapshot that holds the lost suffix.
+    // It has heard from no leader since it opened, so it serves no read
+    // until the catalog certifies it, and the catalog's recovery fences it.
     cluster.restart(b).await;
     let reopened_b = cluster.group(b, stream).await;
     assert_eq!(reopened_b.state.head(), Ok(Lsn(2)));
-    timeout(WAIT, async {
-        while journal.replica_generation(stream, b).await.is_err() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap();
 
     let page2 = reader
         .read(stream, Lsn(2), 1, Duration::ZERO)
@@ -304,23 +301,33 @@ async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suf
         "mixed history observed: single returning lost voter `b` served lost Lsn(2) = \"lost-2\" \
          alongside post-recovery Lsn(3) = \"recovered-3\""
     );
+    timeout(RECOVERY_WAIT, async {
+        while cluster.running[&b]
+            .engine
+            .disk
+            .ownership(stream)
+            .and_then(|book| book.generation())
+            == Some(gen_b)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the fenced lost voter retires its copy");
     cluster.stop_all().await;
 }
 
 /// Counterexample CE-4 (`verification/tla/RecoveryBothReturn.cfg` and
 /// `RecoveryBothReturnLiveness.cfg`):
 ///
-/// After operator recovery from `a` onto `[a, d, f]`, if `a` is later replaced
-/// by `g` (yielding a completely healthy recovered roster `[d, f, g]`) and both
-/// lost voters `b` and `c` return together:
-///   1. `[b, c]` elect a leader of the old configuration `[a, b, c]` and serve
-///      the lost suffix `"lost-2"` (and even accept divergent writes under the
-///      old fence), violating `NoMixedHistory`.
-///   2. Because `a` is no longer in the recovered roster (or stopped) and
-///      neither `b` nor `c` knows about `d`, `f`, or `g`, neither receives
-///      `EXCLUDED`; the old leader skips `retire_removed` and the old follower
-///      keeps refreshing `heard` from its heartbeats, so neither lost voter
-///      EVER retires (`LostVotersEventuallyRetire` violated).
+/// After operator recovery from `a` onto `[a, d, f]`, `a` is replaced by `g`
+/// (`[d, f, g]`) and stopped, and both lost voters `b` and `c` return
+/// together. They used to elect a leader of the old configuration `[a, b,
+/// c]`, serve the lost suffix, and, since neither knows `d`, `f` or `g` and
+/// they heard each other, never retire: a permanent split brain that even
+/// repaired dead `a` onto a fifth keeper. Now neither campaigns before the
+/// catalog certifies it, the catalog's latest move fences `[a, b, c]`
+/// (`decisions::fences_copy`), and both retire on the recovered placement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn returning_lost_voters_retire_and_cannot_form_a_permanent_split_brain_when_survivor_is_replaced()
  {

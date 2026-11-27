@@ -521,7 +521,9 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
 /// on the first stale proof that still names it. Returning lost voters now
 /// refuse to vote once a recovered voter reports its configuration, so the
 /// two are started as if that check had run while every recovered voter was
-/// unreachable, which still lets them form the old quorum.
+/// unreachable, and as if they had stayed certified, which is the residual
+/// case of lost voters that never stopped: only that lets them form the old
+/// quorum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
     let mut cluster = Cluster::start().await;
@@ -595,6 +597,14 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
             .placement_confirmed
             .lock()
             .insert(stream, Some(tokio::time::Instant::now()));
+        // As if they never stopped: certified copies, see `keeper/certify.rs`.
+        if let Some(generation) = engine
+            .disk
+            .ownership(stream)
+            .and_then(|book| book.generation())
+        {
+            engine.certification.certify(stream, generation);
+        }
     };
     cluster.restart_with(b, checked).await;
     cluster.restart_with(c, checked).await;
@@ -649,6 +659,114 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
             .is_none(),
         "excluded lost voter must follow past follower excluder `a` and ignore stale rev-0 proof from {old_leader} to retire"
     );
+    cluster.stop_all().await;
+}
+
+/// Two lost voters that return together while the survivor is a follower
+/// never lead their old configuration, and both retire. This test used to
+/// let them elect an old leader, to check that a copy retires past that
+/// leader's stale proof; certification (`keeper/certify.rs`) now keeps a
+/// stale configuration from leading at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn returning_lost_voters_never_lead_and_retire_past_a_follower_survivor() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, d] = cluster.ids;
+    let f = Uuid::from_u128(7);
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(207);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let fence = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap()
+        .fence;
+    for at in 1..=3 {
+        journal
+            .append(stream, fence, Lsn(at), Bytes::from(format!("rec-{at}")))
+            .await
+            .unwrap();
+    }
+    let group_a = cluster.group(a, stream).await;
+    timeout(WAIT, async {
+        while group_a.state.head() != Ok(Lsn(3)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(group_a);
+
+    for stopped in [b, c, a] {
+        cluster.running.remove(&stopped).unwrap().stop().await;
+    }
+    let report = cluster.configs[&a]
+        .recover_stream(
+            stream,
+            Recovery {
+                acknowledge_data_loss: true,
+                lost: Some([b, c]),
+                with: Some([d, f]),
+                interrupt: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.voters, [a, d, f]);
+
+    cluster.restart(a).await;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(cfg) = journal.configuration(stream).await
+                && cfg.voters == [a, d, f]
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Move leadership of the recovered quorum to replacement `f` (UUID 7,
+    // which sorts after lost voters `b` (2) and `c` (3)), so excluder `a` is a
+    // follower that replies Leader(Some(f)) to PlacementProof.
+    journal.prefer_leader(stream, f).await.unwrap();
+    assert!(wait_for_leader(&cluster, stream, f).await);
+
+    // Pause `a` while `b` and `c` restart. Together they are a quorum of
+    // the old configuration, but neither heard from a leader since it
+    // opened, so neither campaigns until the catalog certifies it, and the
+    // catalog's recovery fences both. They retire on the recovered
+    // placement, past follower `a`.
+    cluster.running.remove(&a).unwrap().stop().await;
+    cluster.restart(b).await;
+    cluster.restart(c).await;
+    cluster.restart(a).await;
+    let retired = timeout(RECOVERY_WAIT, async {
+        loop {
+            let mut gone = true;
+            for id in [b, c] {
+                let engine = &cluster.running[&id].engine;
+                if let Some(group) = engine.groups.lock().await.get(&stream) {
+                    assert_ne!(
+                        group.raft.metrics().borrow_watched().state,
+                        openraft::ServerState::Leader,
+                        "lost voter {id} led the old configuration"
+                    );
+                }
+                gone &= engine
+                    .disk
+                    .ownership(stream)
+                    .and_then(|book| book.generation())
+                    .is_none();
+            }
+            if gone {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(retired.is_ok(), "both fenced lost voters retire");
     cluster.stop_all().await;
 }
 

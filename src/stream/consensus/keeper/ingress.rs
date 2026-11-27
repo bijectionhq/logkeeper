@@ -523,6 +523,14 @@ impl Engine {
                 self.check_entries(&group, &request)?;
                 *group.heard.lock() = tokio::time::Instant::now();
                 let reply = self.append(group.clone(), request, body).await?;
+                // The leader campaigned certified, so its append certifies
+                // this copy unless this copy's vote outranks it.
+                if let AppendReply::Raft(Ok(response)) = &reply
+                    && !matches!(response, AppendEntriesResponse::HigherVote(_))
+                {
+                    self.certification
+                        .certify(group.genesis.stream, group.state.generation());
+                }
                 #[cfg(test)]
                 if matches!(reply, AppendReply::Busy) {
                     self.busy_replies

@@ -257,6 +257,28 @@ fn an_aborted_move_restages_only_for_the_same_source(
     assert(!staged_recovery && !stage_recovery && same_source && !same_stage ==> restages);
 }
 
+// A copy serves applied pages only once its placement is certified, so a
+// lost voter never serves a suffix an operator recovery left behind.
+fn only_certified_members_serve_reads(member: bool, certified: bool) {
+    let serves = serves_reads(member, certified);
+    assert(serves ==> member && certified);
+    assert(!certified ==> !serves);
+}
+
+// The catalog's latest move fences the lost configuration of a recovery and
+// any configuration older than an ordinary move, but never the configuration
+// a stream goes on from, so certification never wedges a healthy copy.
+fn the_catalog_fences_only_superseded_configurations(
+    configured: bool, recovery: bool, at_old: bool, at_target: bool, joint_of_move: bool,
+) {
+    let fenced = fences_copy(configured, recovery, at_old, at_target, joint_of_move);
+    assert(fenced ==> configured);
+    assert(configured && recovery && !at_target ==> fenced);
+    assert(at_target ==> !fenced);
+    assert(!recovery && (at_old || joint_of_move) ==> !fenced);
+    assert(configured && !recovery && !at_old && !at_target && !joint_of_move ==> fenced);
+}
+
 // A replica refuses a peer without a Raft answer only when the peer is
 // outside its effective membership and below its term: a member, or a peer
 // at or above its term, always gets an answer, so the refusal never hides a

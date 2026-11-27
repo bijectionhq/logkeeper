@@ -688,7 +688,10 @@ impl Engine {
             .iter()
             .filter(|(_, group)| {
                 decisions::orphaned(
-                    group.excluded.lock().is_some(),
+                    group.excluded.lock().is_some()
+                        || self
+                            .certification
+                            .fenced(group.genesis.stream, group.state.generation()),
                     group.raft.metrics().borrow_watched().state == ServerState::Leader,
                     now.duration_since(*group.heard.lock()).as_nanos(),
                     self.repair_after.as_nanos(),
@@ -735,8 +738,11 @@ impl Engine {
                 proof.configuration.voters.contains(&self.id),
                 proof.joint.is_some_and(|roster| roster.contains(&self.id)),
             ) {
-                // The refusal came from a stale or lagging peer.
+                // The refusal came from a stale or lagging peer, or the
+                // catalog's move named a configuration this copy has not
+                // reached yet.
                 *group.excluded.lock() = None;
+                self.certification.unfence(stream);
             } else {
                 let result = self
                     .retire_copy(stream, authority, proof.configuration.revision, generation)
