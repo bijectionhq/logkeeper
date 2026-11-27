@@ -518,7 +518,10 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
 }
 
 /// An excluded lost voter retires on the highest placement it can find, not
-/// on the first stale proof that still names it.
+/// on the first stale proof that still names it. Returning lost voters now
+/// refuse to vote once a recovered voter reports its configuration, so the
+/// two are started as if that check had run while every recovered voter was
+/// unreachable, which still lets them form the old quorum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
     let mut cluster = Cluster::start().await;
@@ -587,8 +590,14 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
     // Pause `a` while `b` and `c` restart and elect an old rev-0 quorum leader,
     // then bring `a` back as a follower of `[a, d, f]`.
     cluster.running.remove(&a).unwrap().stop().await;
-    cluster.restart(b).await;
-    cluster.restart(c).await;
+    let checked = |engine: &Engine| {
+        engine
+            .placement_confirmed
+            .lock()
+            .insert(stream, Some(tokio::time::Instant::now()));
+    };
+    cluster.restart_with(b, checked).await;
+    cluster.restart_with(c, checked).await;
     let old_leader = timeout(WAIT, async {
         loop {
             for id in [b, c] {

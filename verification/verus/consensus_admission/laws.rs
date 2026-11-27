@@ -558,6 +558,18 @@ fn only_orphaned_copies_seek_retirement(
     assert(excluded ==> seeks);
 }
 
+// A voter refuses to vote only when another keeper finalized a newer
+// configuration that names it neither as a voter nor as a joint target,
+// so a voter the newer configuration keeps always votes.
+fn a_named_voter_never_refuses_a_vote(
+    local_revision: u64, proof_revision: u64, named_voter: bool, named_joint: bool,
+) {
+    let refuses = refuses_stale_vote(local_revision, proof_revision, named_voter, named_joint);
+    assert(refuses ==> proof_revision > local_revision);
+    assert(named_voter || named_joint ==> !refuses);
+    assert(proof_revision <= local_revision ==> !refuses);
+}
+
 // RetireOnProof.retired_copy_outside_every_quorum: a certified proof
 // retires a copy only at the asked revision and only when neither the
 // configuration nor its joint target names the keeper, so no quorum of

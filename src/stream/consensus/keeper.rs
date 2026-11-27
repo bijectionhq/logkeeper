@@ -369,6 +369,7 @@ impl Config {
             async_append: self.async_append,
             snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
             retire_now: Arc::default(),
+            placement_confirmed: parking_lot::Mutex::default(),
             stop: stop.child_token(),
             #[cfg(test)]
             reject_append: Default::default(),
@@ -451,6 +452,10 @@ pub(super) struct Engine {
     /// Wakes the repair loop when a peer excluded one of this keeper's
     /// replicas, so a removed copy retires at once.
     retire_now: Arc<tokio::sync::Notify>,
+    /// Streams whose copy no other keeper's newer configuration excludes,
+    /// checked since this keeper started, and when a check some keeper did
+    /// not answer ran; see `confirm_placement`.
+    placement_confirmed: parking_lot::Mutex<HashMap<StreamId, Option<Instant>>>,
     pub(super) stop: CancellationToken,
     #[cfg(test)]
     reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
@@ -1120,6 +1125,7 @@ impl Engine {
                     Request::Locate(_)
                         | Request::KeeperStatus(_)
                         | Request::PlacementProof(_)
+                        | Request::LocalConfiguration(_)
                         | Request::StageReplica { .. }
                         | Request::InstallReplica { .. }
                         | Request::StageRecovered { .. }
@@ -1195,6 +1201,23 @@ impl Engine {
                 ))
                 .await;
                 Ok(Reply::Status(self.status(stream).await))
+            }
+            Request::LocalConfiguration(stream) => {
+                let open = self
+                    .groups
+                    .lock()
+                    .await
+                    .get(&stream)
+                    .map(|group| group.state.finalized());
+                let configuration = match open {
+                    Some(configuration) => configuration,
+                    None => self
+                        .closed_states
+                        .lock()
+                        .get(&stream)
+                        .and_then(Closed::finalized),
+                };
+                Ok(Reply::Configured(configuration))
             }
             Request::LocalCopy(_) => Ok(self
                 .disk

@@ -244,7 +244,6 @@ async fn bug_repro_zero_disk_space_leaves_voter_as_zombie_replica() {
 /// configuration `[a, b, c]`. A client holding a cached route to `[a, b, c]`
 /// then observes `head() == Lsn(3)` after `Lsn(5)` was already acknowledged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces post-recovery split-brain residual risk found on soak seed 16"]
 async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_head() {
     let options = ClusterOptions {
         park_after_secs: 3600,

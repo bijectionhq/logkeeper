@@ -318,13 +318,17 @@ configuration's other members are the survivor, whose term and log are newer
 and whose leader lease refuses votes, and the other lost voter. The recovered
 voters do not answer a peer outside their membership whose term is below
 theirs, so a lost voter never learns the recovered term; the refusal makes it
-check the placement and retire at once. If both lost voters return together
-they form a quorum of the old configuration until one of them contacts a
-recovered voter, which is normally its first election round. Clients
-following the catalog and leader hints reach the recovered voters, but a
-client holding a cached route to a lost voter could read the lost history in
-that window. Prefer to start the lost keepers one at a time, or with their
-data removed.
+check the placement and retire at once. Two lost voters that return together
+would form a quorum of the old configuration, so before a keeper first votes
+in a stream after it starts, it asks every other keeper for the
+configuration its own copy finalized, open or parked, with no leader needed
+(`Request::LocalConfiguration`). When one finalized a newer revision that
+names it nowhere, it refuses the vote and retires; neither lost voter can
+then win. A keeper that does not answer leaves the check open: the vote
+goes ahead and the next vote after 10 seconds asks again. So the window
+remains only while the survivor and both replacements are all unreachable
+from the returning voters; prefer to start lost keepers one at a time, or
+with their data removed, all the same.
 
 **Why readers cannot mix histories.** The recovered entries and every later
 entry carry terms above every term in the survivor's history and, with the
@@ -557,7 +561,7 @@ does not wait out a lease and an election per stream.
 Verus checks the shipped admission, metering, classification, rotation, batch,
 restart, recovery, repair and keeper incarnation decisions in
 `src/stream/consensus/decisions.rs` against laws named after the Lean
-theorems. The baseline verifies 76 functions, and 30 production mutations
+theorems. The baseline verifies 122 functions, and 61 production mutations
 each fail their declared contract. See
 `verification/verus/consensus_admission/README.md` for the mapping and the
 unverified stateful glue.

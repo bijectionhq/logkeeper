@@ -114,8 +114,9 @@ incident.
 
 If a lost keeper returns with its data, its copies retire on the first
 contact with a recovered voter. **Start lost keepers one at a time**, or wipe
-them and replace them as new keepers. If both return together, they can form
-a quorum of the old configuration until one of them contacts a recovered
-voter, and a client holding a cached route could read the lost history in
-that window. Durable fencing of lost keepers (review item 13) is not built
-yet.
+them and replace them as new keepers. If both return together, each asks
+every other keeper for its finalized configuration before it first votes,
+refuses to vote once the survivor or a replacement reports the recovered
+one, and retires. Only if the survivor and both replacements are all
+unreachable from them could they still form a quorum of the old
+configuration, and a client holding a cached route read the lost history.

@@ -837,6 +837,24 @@ pub(super) fn orphaned(
     excluded || (!leader && unheard_ns >= repair_after_ns)
 }
 
+/// Whether a voter refuses to vote in a stream because another keeper
+/// certified a newer configuration that names it neither as a voter nor as
+/// the target of a joint change. A voter lost to an operator recovery, or
+/// replaced while it was down, holds an older configuration; with another
+/// such voter it would still form a quorum of that configuration, so it
+/// takes part in no election until it has checked.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (proof_revision > local_revision && !named_voter && !named_joint)
+))]
+pub(super) fn refuses_stale_vote(
+    local_revision: u64,
+    proof_revision: u64,
+    named_voter: bool,
+    named_joint: bool,
+) -> bool {
+    proof_revision > local_revision && !named_voter && !named_joint
+}
+
 /// Whether a certified placement proof retires this keeper's copy: the
 /// proof is of the revision the copy was asked to leave, and neither its
 /// configuration nor the target of its joint change names this keeper.

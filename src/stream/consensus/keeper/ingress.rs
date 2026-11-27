@@ -501,6 +501,9 @@ impl Engine {
                 return Err(invalid(network::EXCLUDED));
             }
         }
+        if matches!(request, PeerRequest::Vote(_) | PeerRequest::PreVote(_)) {
+            self.confirm_placement(&group).await?;
+        }
         match request {
             PeerRequest::Append(request) => {
                 #[cfg(test)]

@@ -37,7 +37,17 @@ struct Running {
 
 impl Running {
     async fn spawn(config: Config, listeners: [TcpListener; 3]) -> Self {
+        Self::spawn_with(config, listeners, |_| ()).await
+    }
+
+    /// Spawns a keeper after `before` adjusts its engine.
+    async fn spawn_with(
+        config: Config,
+        listeners: [TcpListener; 3],
+        before: impl FnOnce(&Engine),
+    ) -> Self {
         let (engine, acceptor) = config.prepare(CancellationToken::new()).await.unwrap();
+        before(&engine);
         let task = tokio::spawn(engine.clone().serve(listeners, acceptor));
         Self { engine, task }
     }
@@ -274,14 +284,20 @@ impl Cluster {
     }
 
     async fn restart(&mut self, id: Uuid) {
+        self.restart_with(id, |_| ()).await;
+    }
+
+    async fn restart_with(&mut self, id: Uuid, before: impl FnOnce(&Engine)) {
         let config = &self.configs[&id];
         let listeners = [
             TcpListener::bind(config.listen).await.unwrap(),
             TcpListener::bind(config.peers[&id]).await.unwrap(),
             TcpListener::bind(config.bulk[&id]).await.unwrap(),
         ];
-        self.running
-            .insert(id, Running::spawn(config.clone(), listeners).await);
+        self.running.insert(
+            id,
+            Running::spawn_with(config.clone(), listeners, before).await,
+        );
     }
 
     async fn stop_all(&mut self) {

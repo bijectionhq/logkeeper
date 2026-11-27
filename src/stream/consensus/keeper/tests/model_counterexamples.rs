@@ -320,7 +320,6 @@ async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suf
 ///      keeps refreshing `heard` from its heartbeats, so neither lost voter
 ///      EVER retires (`LostVotersEventuallyRetire` violated).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known protocol failure (CE-4): returning lost voters form a permanent split-brain quorum and never retire once the survivor is stopped or replaced"]
 async fn returning_lost_voters_retire_and_cannot_form_a_permanent_split_brain_when_survivor_is_replaced()
 {
     let mut cluster = Cluster::start().await;

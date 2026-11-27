@@ -199,6 +199,10 @@ pub(super) enum Request {
         at: Lsn,
         payloads: Vec<bytes::Bytes>,
     },
+    /// A keeper about to vote in `stream` asks another keeper for the
+    /// configuration its own copy finalized, open or parked, without a
+    /// leader. Added last; an older keeper refuses it.
+    LocalConfiguration(StreamId),
 }
 
 impl Request {
@@ -218,6 +222,7 @@ impl Request {
             | Self::Delete(stream)
             | Self::KeeperStatus(stream)
             | Self::AcknowledgeRecovery(stream)
+            | Self::LocalConfiguration(stream)
             | Self::Configuration(stream) => stream,
             Self::Stage(ref stage) => stage.stream,
             Self::Seal { stream, .. }
@@ -434,6 +439,9 @@ pub(super) enum Reply {
         outcome: Outcome,
     },
     Status(super::KeeperStatus),
+    /// The configuration a keeper's own copy finalized, if it holds one.
+    /// Added last.
+    Configured(Option<super::Configuration>),
 }
 
 #[derive(Clone, Serialize, Deserialize)]

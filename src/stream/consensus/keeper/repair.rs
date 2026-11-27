@@ -32,12 +32,19 @@ use uuid::Uuid;
 
 use super::{Engine, Group, NodeId, Reply, Request};
 use crate::stream::consensus::{
-    KeeperStatus,
+    Configuration, KeeperStatus,
     assignment::{self, Health, View},
     decisions,
     network::{Frame, Proof},
 };
+use std::io;
 
+/// How long a keeper waits for each configuration answer before a first
+/// vote.
+const PLACEMENT_TIMEOUT: Duration = Duration::from_millis(500);
+/// How long a keeper votes without asking again after some keeper did not
+/// answer its configuration check.
+const PLACEMENT_RECHECK: Duration = Duration::from_secs(10);
 #[cfg(not(test))]
 const REPAIR_INTERVAL: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -573,6 +580,101 @@ impl Engine {
     /// revision decides, preferring the peer that refused the copy on a tie.
     /// A lost voter's old peers may still certify the placement it lost,
     /// and the peer that refused it may only follow the recovered leader.
+    /// Before this keeper first votes in a stream after it started, asks
+    /// every other keeper for the configuration its own copy of the stream
+    /// finalized. When one finalized a newer configuration that no longer
+    /// names this keeper, this copy refuses the vote and retires.
+    ///
+    /// A voter's own log cannot tell it was removed while it was away. An
+    /// operator recovery replaces two lost voters without them, and the two
+    /// together would still elect each other under the old configuration
+    /// and serve its older history once the survivor is down. The keepers
+    /// that finalized the newer configuration (the survivor and the
+    /// replacements) are the evidence, and they answer from their own
+    /// applied state, open or parked, without a leader. A finalized
+    /// configuration was committed by its quorum. While some keeper does
+    /// not answer, the next vote asks again.
+    pub(super) async fn confirm_placement(&self, group: &Group) -> io::Result<()> {
+        let stream = group.genesis.stream;
+        if self
+            .placement_confirmed
+            .lock()
+            .get(&stream)
+            .is_some_and(|open| open.is_none_or(|at| at.elapsed() < PLACEMENT_RECHECK))
+        {
+            return Ok(());
+        }
+        // A copy reopened before it applied its log has finalized nothing
+        // yet; the genesis configuration is revision 0.
+        let local = group
+            .state
+            .finalized()
+            .map_or(0, |configuration| configuration.revision);
+        let asked = futures::future::join_all(
+            self.placement
+                .domains()
+                .keys()
+                .copied()
+                .filter(|keeper| *keeper != self.id)
+                .map(|keeper| async move {
+                    let reply = self
+                        .rpc
+                        .call::<Reply>(
+                            keeper,
+                            Frame::Client(Request::LocalConfiguration(stream)),
+                            PLACEMENT_TIMEOUT,
+                        )
+                        .await;
+                    (keeper, reply)
+                }),
+        )
+        .await;
+        let mut answered = true;
+        let mut newest: Option<(Uuid, Configuration)> = None;
+        for (keeper, reply) in asked {
+            match reply {
+                Ok(Reply::Configured(Some(configuration)))
+                    if self.placement.roster(&configuration.voters) =>
+                {
+                    if newest
+                        .as_ref()
+                        .is_none_or(|(_, best)| configuration.revision > best.revision)
+                    {
+                        newest = Some((keeper, configuration));
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => answered = false,
+            }
+        }
+        if let Some((keeper, configuration)) = newest
+            && decisions::refuses_stale_vote(
+                local,
+                configuration.revision,
+                configuration.voters.contains(&self.id),
+                false,
+            )
+        {
+            *group.excluded.lock() = Some(keeper);
+            self.retire_now.notify_one();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "keeper {keeper} finalized revision {} of stream {stream:?} without this \
+                     keeper, which holds revision {}",
+                    configuration.revision, local
+                ),
+            ));
+        }
+        // Without every answer the vote goes ahead, and the check runs
+        // again once `PLACEMENT_RECHECK` has passed, so an unreachable keeper
+        // does not slow every election.
+        self.placement_confirmed
+            .lock()
+            .insert(stream, (!answered).then(Instant::now));
+        Ok(())
+    }
+
     async fn retire_removed(&self) {
         let groups = self
             .groups
