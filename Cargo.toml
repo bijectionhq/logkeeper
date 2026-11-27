@@ -62,3 +62,8 @@ required-features = ["stream"]
 name = "consensus-streams"
 path = "verification/measure/consensus_streams.rs"
 required-features = ["consensus-testing"]
+
+[[example]]
+name = "consensus-crash"
+path = "verification/measure/consensus_crash.rs"
+required-features = ["consensus-testing"]

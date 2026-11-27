@@ -294,6 +294,45 @@ impl LocalCluster {
         ConsensusJournal::new(&self.credentials(principal)?, config)
     }
 
+    /// Writes a keeper's configuration as the JSON that `logkeeper keeper
+    /// --config` reads, so a harness can run the keeper as a process of its
+    /// own, for example to kill it. Stop the keeper here first: two
+    /// keepers must never share its media. A timed authority is not written.
+    pub fn write_config(&self, keeper: Uuid) -> io::Result<PathBuf> {
+        let config = self
+            .configs
+            .get(&keeper)
+            .ok_or_else(|| io::Error::other("unknown keeper"))?;
+        let json = serde_json::json!({
+            "keeper": config.keeper,
+            "listen": config.listen,
+            "data": config.data,
+            "tls": {
+                "certificate": config.tls.certificate,
+                "private_key": config.tls.private_key,
+                "ca": config.tls.ca,
+            },
+            "keepers": config.keepers,
+            "peers": config.peers,
+            "bulk": config.bulk,
+            "domains": config.domains,
+            "enrollment": config.enrollment,
+            "catalog": config.catalog,
+            "catalog_voters": config.catalog_voters,
+            "readers": config.readers,
+            "writers": config.writers,
+            "administrators": config.administrators,
+            "max_streams": config.max_streams,
+            "repair_after_secs": config.repair_after_secs,
+            "park_after_secs": config.park_after_secs,
+            "snapshot_send_bytes_per_second": config.snapshot_send_bytes_per_second,
+            "sync_mode": config.sync_mode,
+        });
+        let path = self.dir.path().join(format!("keeper-{keeper}.json"));
+        std::fs::write(&path, serde_json::to_vec_pretty(&json)?)?;
+        Ok(path)
+    }
+
     /// Stops one keeper and waits for it to release its media.
     pub async fn stop(&mut self, keeper: Uuid) -> io::Result<()> {
         let running = self

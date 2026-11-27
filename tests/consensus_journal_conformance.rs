@@ -623,3 +623,30 @@ async fn timed_originals_prove_quorum_sync_before_their_cutoff() {
     cluster.restart(first).await.unwrap();
     cluster.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_written_keeper_configuration_reads_back_for_a_keeper_process() {
+    use logkeeper::stream::consensus::{Config, SyncMode};
+
+    let mut cluster = LocalCluster::start(&PRINCIPALS).await.unwrap();
+    let keeper = cluster.voters()[0];
+    cluster.stop(keeper).await.unwrap();
+    let config = Config::read(&cluster.write_config(keeper).unwrap()).unwrap();
+    assert_eq!(config.keeper, keeper);
+    assert_eq!(config.listen, cluster.keepers()[&keeper]);
+    assert_eq!(config.catalog, cluster.catalog());
+    assert_eq!(config.sync_mode, SyncMode::Fsync);
+    // The keeper serves its media again from the configuration read back.
+    let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap();
+    let stop = tokio_util::sync::CancellationToken::new();
+    let serving = tokio::spawn(config.serve(listener, stop.clone()));
+    let journal = cluster
+        .journal(PRINCIPALS[0], &cluster.journal_config(1 << 20, 4096))
+        .unwrap();
+    let stream = journal_contract::StreamId(7);
+    journal.create(stream).await.unwrap();
+    journal.seal(stream, journal_contract::Epoch(1)).await.unwrap();
+    stop.cancel();
+    serving.await.unwrap().unwrap();
+    cluster.shutdown().await.unwrap();
+}
