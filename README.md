@@ -24,6 +24,11 @@ A deployment that needs its own discovery, credential, or placement policy can e
 
 ## Keeper-hosted consensus streams
 
+To run consensus keepers in production, see the [deployment
+guide](docs/deployment.md) and its [runbooks](docs/runbooks/). Packaging
+(image, systemd unit, Kubernetes manifests, example configs) is in
+[`deploy/consensus/`](deploy/consensus/).
+
 Use the `stream` feature and `logkeeper::stream::consensus::Client` for streams
 whose keepers elect a leader and allocate writer epochs. Each keeper uses its
 own data directory and the same authenticated inventory and catalog UUID.
@@ -705,18 +710,6 @@ pooled connection, at most sixteen in flight to each keeper.
 A keeper paces the bytes it sends in snapshot transfers, across all its
 streams, to `snapshot_send_bytes_per_second` (64 MiB/s by default; zero
 disables pacing), so catch-up and repair do not saturate a cross-zone link.
-
-A keeper's `sync_mode` sets how its durable writes reach stable storage:
-`"full"` (the default) or `"fsync"`. On macOS `"full"` issues `F_FULLFSYNC`,
-which also drains the drive's write cache and so survives power loss;
-`"fsync"` leaves acknowledged records in that cache, a power cut can lose
-them, and it is meant only for benchmarks. On Linux both modes flush alike,
-because `fsync` and `fdatasync` already flush the device cache. The mode is
-process-wide; keepers in one process that ask for different modes all get
-`"full"`. The stream keeper takes the same option. A full flush costs
-milliseconds where `fsync` costs tens of microseconds, so the
-`consensus-testing` `LocalCluster` uses `"fsync"` unless the process
-installed a mode first.
 A `JournalConfig` with a `placement` may name the consumer's own `domain`;
 reads then go first to a voter in that domain, then to the keeper that
 answered last. After each seal such a journal also asks the stream's leader to hand
@@ -780,6 +773,133 @@ full-restart test run against both.
 
 ```sh
 cargo test --locked --features consensus-testing --test consensus_journal_conformance
+```
+
+### Operations
+
+#### Admin listener and Prometheus metrics
+
+Configure an optional separate operational HTTP/1.1 listener via `admin` in the
+keeper JSON configuration:
+
+```json
+  "admin": {
+    "listen": "127.0.0.1:9100",
+    "mtls": false
+  }
+```
+
+- `listen` defaults to `127.0.0.1:9100` when `admin` is present.
+- Plain HTTP (`"mtls": false`, default) is restricted to loopback bind addresses.
+  For remote scraping, set `"mtls": true`: the listener uses the keeper's TLS
+  credentials with mutual TLS 1.3 and restricts access to client certificates
+  listed in `administrators` (other clients receive `403 Forbidden`).
+
+`GET /metrics` exports Prometheus text format (`0.0.4`):
+
+- **Build info:** `logkeeper_build_info{version,keeper,domain,control_alpn,replication_alpn,bulk_alpn}`
+- **Health gauges:** `logkeeper_consensus_wal_healthy`, `logkeeper_consensus_accepting`,
+  `logkeeper_consensus_streams{state="hosted|open|led|parked|quarantined|deleted"}`
+- **Refusals:** `logkeeper_consensus_refusals_total{reason="..."}` for every
+  `Unavailable` refusal reason (`write.*`, `head.*`, `peer.*`).
+- **WAL and commit histograms:**
+  - `logkeeper_consensus_wal_round_records`
+  - `logkeeper_consensus_wal_round_bytes`
+  - `logkeeper_consensus_wal_round_duration_seconds`
+  - `logkeeper_consensus_wal_fsync_duration_seconds{target="segment|boundary"}`
+  - `logkeeper_consensus_commit_duration_seconds`
+- **Replication lag per follower:**
+  `logkeeper_consensus_replication_lag_entries_max{follower}`,
+  `logkeeper_consensus_replication_lag_entries_total{follower}`,
+  `logkeeper_consensus_replication_lag_streams{follower}`.
+- **Elections and votes:** `logkeeper_consensus_elections_total{outcome="started|won"}`,
+  `logkeeper_consensus_votes_total{kind="vote|pre_vote",outcome="granted|denied"}`.
+- **Snapshots:** `logkeeper_consensus_snapshots_sent_total{outcome}`,
+  `logkeeper_consensus_snapshot_bytes_sent_total`,
+  `logkeeper_consensus_snapshots_received_total{outcome}`,
+  `logkeeper_consensus_snapshot_bytes_received_total`,
+  `logkeeper_consensus_snapshots_built_total`.
+- **Repairs:** `logkeeper_consensus_repairs_total{kind="joint|learners|voter",outcome="ok|failed"}`,
+  `logkeeper_consensus_repairs_in_flight`.
+- **Parks and wakes:** `logkeeper_consensus_stream_parks_total`,
+  `logkeeper_consensus_stream_park_declined_total`,
+  `logkeeper_consensus_stream_wakes_total{trigger="peer|client|repair"}`.
+- **Liveness per keeper:** `logkeeper_consensus_keeper_liveness{keeper,domain,state="alive|suspect|dead"}`,
+  `logkeeper_consensus_keeper_accepting{keeper,domain}`,
+  `logkeeper_consensus_keeper_silent_seconds{keeper,domain}`.
+- **Aggregated retention:** `logkeeper_consensus_retained_records_total`,
+  `logkeeper_consensus_retained_records_max`,
+  `logkeeper_consensus_retained_bytes_total`,
+  `logkeeper_consensus_retained_bytes_max`,
+  `logkeeper_consensus_wal_suffix_entries_max`.
+- **Problem stream counts:** `logkeeper_consensus_problem_streams{reason}`.
+
+#### Health, readiness, and safe-to-stop probes
+
+- `GET /live`: `200 OK` while the WAL thread is healthy and the keeper is not
+  shutting down; `503 Service Unavailable` otherwise.
+- `GET /ready`: `200 OK` once startup WAL replay has completed, the keeper
+  liveness table is populated, and every hosted non-deleted replica is healthy
+  and either parked or matched by its leader (caught up and not receiving a
+  snapshot); `503 Service Unavailable` with JSON details otherwise.
+- `GET /safe-to-stop`: `200 OK` when the liveness table is populated and no
+  hosted stream has another voter unreachable or silent; `503 Service
+  Unavailable` listing every blocking `(stream, voter, reason)` otherwise. Use
+  this probe to gate rolling restarts.
+
+#### Problem-streams report
+
+`GET /problems` (alias `GET /problem-streams`) returns a JSON report listing
+every hosted stream currently exhibiting an operational anomaly, tagged with one
+or more of:
+
+- `leaderless`: open stream with no active leader (including an isolated leader
+  that lost quorum).
+- `under_replicated`: voter unreachable/silent or lagging behind the leader.
+- `parked_with_dead_voter`: parked stream whose configuration names a dead voter.
+- `joint_config`: stream currently in a joint membership configuration.
+- `near_suffix_ceiling`: unpurged WAL suffix at or above 75% of the 512-entry cap.
+- `near_record_ceiling`: retained records at or above 75% of the 262,144-record cap.
+- `near_quota_ceiling`: retained bytes at or above 75% of the stream's byte quota.
+- `led_outside_preferred_domain`: open stream currently led outside its writer's
+  preferred failure domain.
+- `quarantined`: local replica is quarantined.
+
+#### Structured logging and audit trail
+
+The consensus keeper emits structured `tracing` events to stderr with `keeper`
+and `stream` fields and rate-limits repeated warnings per key (reporting a
+`dropped` count when the next event is emitted).
+
+- Output is human-readable by default. Select JSON lines via `"log_format": "json"`
+  in the keeper config, `--log-format json` on `logkeeper keeper`, or
+  `LOGKEEPER_LOG_FORMAT=json`.
+- Control verbosity via `LOGKEEPER_LOG` or `RUST_LOG` (default: `info` for
+  `logkeeper`, `warn` for other crates).
+- Administrative actions (`replace`, `prefer_leader`, `acknowledge_recovery`,
+  `retire`, and offline `recovery`) emit structured audit records under target
+  `logkeeper::audit` with `audit=true`, `action`, `actor`, `keeper`, `stream`,
+  and `outcome`.
+
+#### Offline inspection and verification tools
+
+Run these read-only commands against a **stopped** keeper data directory (they
+acquire the exclusive `LOCK` and refuse to run against a live keeper, without
+mutating or truncating any files):
+
+```sh
+# Per-stream vote, membership, log range, applied/snapshot index, fence, head,
+# retained records/bytes, ownership, parked (runtime-only), and quarantined state:
+cargo run --locked --features stream -- keeper inspect --config keeper.json [--stream UUID] [--json]
+
+# Walk both boundary slots, checkpoint digest/references, every WAL segment
+# header and frame CRC, and the running SHA-256 hash chain against the
+# checkpoint and trusted boundary:
+cargo run --locked --features stream -- keeper verify --config keeper.json [--json]
+
+# Decode and summarize frames in a WAL segment (by keeper config + ID, or standalone file):
+cargo run --locked --features stream -- keeper dump-segment --config keeper.json --segment 1 [--limit N] [--json]
+cargo run --locked --features stream -- keeper dump-segment --file ./keeper-1/raft-segments/00000000000000000001.seg [--limit N] [--json]
 ```
 
 ## Integration

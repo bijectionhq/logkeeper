@@ -1,3 +1,7 @@
+> This directory's Terraform module and image deploy the **stream keeper**.
+> For the consensus keeper (RTDB Multi's `logkeeper-consensus://` journal), see
+> [docs/deployment.md](../docs/deployment.md) and [`consensus/`](consensus/).
+
 # Logkeeper stream journal deployment
 
 The module runs three keepers in the caller's VPC, with one keeper per AZ. The journal lives on EC2 NVMe instance store. Route 53 gives each endpoint a stable private DNS name. Give Bijection only the `journal_url` and its client certificate, private key and CA bundle. Pass the URL unchanged to the journal client.
