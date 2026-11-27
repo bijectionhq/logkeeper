@@ -1633,7 +1633,13 @@ fn rounds(
             // Their old segments stay for the checkpoint and the selected
             // snapshots that may still name them.
             for (from, to) in moves {
-                match objects.relocate(from, to) {
+                // Only a selected snapshot can still name the old copy once
+                // the checkpoint moves on.
+                let hold = working
+                    .logs
+                    .get(&from.scope)
+                    .is_some_and(|log| log.snapshot.is_some());
+                match objects.relocate(from, to, hold) {
                     Ok(Some(left)) => {
                         #[cfg(test)]
                         if let Some((_, ReplicaFault::AfterRelocationSwap { entered, resume })) =
@@ -1644,15 +1650,6 @@ fn rounds(
                         {
                             let _ = entered.send(());
                             let _ = resume.recv_timeout(std::time::Duration::from_secs(30));
-                        }
-                        // Only a selected snapshot can still name the old
-                        // copy once the checkpoint moves on.
-                        if working
-                            .logs
-                            .get(&from.scope)
-                            .is_some_and(|log| log.snapshot.is_some())
-                        {
-                            objects.hold_moved(from.scope, left.clone());
                         }
                         wal.retire(left);
                     }

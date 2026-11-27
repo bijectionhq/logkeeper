@@ -427,7 +427,17 @@ impl Objects {
     /// Points the live slice at `from` at `to`, a copy of its bytes, and
     /// returns the segment it left, which the caller keeps until nothing
     /// durable names `from`. `None` when no slice holds `from` any more.
-    pub fn relocate(&self, from: Location, to: Location) -> io::Result<Option<Arc<Segment>>> {
+    ///
+    /// With `hold`, the segment left is also kept until the scope selects a
+    /// snapshot built after this call, in the same critical section as the
+    /// swap: a park pin that sees the slice at `to` then also sees the hold
+    /// on `from`, which the selected snapshot may still name.
+    pub fn relocate(
+        &self,
+        from: Location,
+        to: Location,
+        hold: bool,
+    ) -> io::Result<Option<Arc<Segment>>> {
         if from.scope != to.scope || from.len != to.len || from.crc != to.crc {
             return Err(invalid("relocated slice differs from its source"));
         }
@@ -469,22 +479,17 @@ impl Objects {
             .entry(to.segment)
             .or_default()
             .insert(to.scope);
+        if hold {
+            segments.moves += 1;
+            let number = segments.moves;
+            segments
+                .moved
+                .entry(from.scope)
+                .or_default()
+                .push((number, previous.segment.clone()));
+        }
         drop(state);
         Ok(Some(previous.segment))
-    }
-
-    /// Keeps `segment`, which slices of `scope` left, until `scope` selects
-    /// a snapshot built after this call.
-    pub fn hold_moved(&self, scope: StreamId, segment: Arc<Segment>) {
-        let mut state = self.0.state.lock();
-        state.segments.moves += 1;
-        let number = state.segments.moves;
-        state
-            .segments
-            .moved
-            .entry(scope)
-            .or_default()
-            .push((number, segment));
     }
 
     /// The newest move of `scope`'s slices, or `None` when its selected

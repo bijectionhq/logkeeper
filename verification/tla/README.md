@@ -432,6 +432,18 @@ the checkpoint's cut.
 | `RelocationNoParkPins` | the park mark names nothing | `RootsReadable` violated |
 | `RelocationParkRace` | the swap and the move hold are two steps (`AtomicMoveHold = FALSE`) | `ParkCanReopenAfterRestart` violated |
 
+**Finding R-1 (fixed).** `RelocationParkRace` is how the code was:
+`Objects::relocate` pointed the slice at its copy and released the table
+lock, and the WAL thread registered the move hold afterwards. A park that
+took its pin in between named only `destination` (the pin reads the slice's
+current segment, and no hold was registered yet), the checkpoint moved on,
+and after a restart the restored mark kept the copy parked while `source`,
+which the selected snapshot still names, was reaped: the copy could not
+reopen. The Rust test
+`storage::tests::a_park_mark_keeps_the_selected_snapshot_during_relocation`
+reproduces it with the `ReplicaFault::AfterRelocationSwap` pause.
+`Objects::relocate` now registers the hold under the same lock as the swap.
+
 ## Fidelity review
 
 Changes made to the first version of the model when it was checked against

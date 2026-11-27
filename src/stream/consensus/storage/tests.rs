@@ -219,7 +219,6 @@ async fn a_conflicting_truncation_waits_for_an_append_in_flight() {
 /// reads, even when the pin sees the slice already at its copy. Found by
 /// RelocationParkRace in verification/tla/Relocation.tla.
 #[tokio::test]
-#[ignore = "a park mark captured between the relocation swap and hold registration omits a segment still named by the selected snapshot"]
 async fn a_park_mark_keeps_the_selected_snapshot_during_relocation() {
     let dir = tempfile::tempdir().unwrap();
     let disk = open(dir.path());
