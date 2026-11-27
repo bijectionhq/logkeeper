@@ -1394,7 +1394,19 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        let conv = cluster.wait_converged(stream, &final_voters, WAIT).await;
+        let mut conv = cluster.wait_converged(stream, &final_voters, WAIT).await;
+        // Repair may replace a voter whose media failed while the run waited
+        // for convergence; check the voters it moved to.
+        for _ in 0..2 {
+            if conv.is_ok() {
+                break;
+            }
+            match probe.configuration(stream).await {
+                Ok(cfg) if cfg.voters != final_voters => final_voters = cfg.voters,
+                _ => break,
+            }
+            conv = cluster.wait_converged(stream, &final_voters, WAIT).await;
+        }
         converged.insert(stream, (final_voters, conv));
     }
 
