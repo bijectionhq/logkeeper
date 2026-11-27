@@ -15,7 +15,7 @@ use super::{
     network::Reply,
     placement::Placement,
     state::Outcome,
-    storage::{Disk, Record},
+    storage::{CatalogEntry, Disk, Record},
 };
 
 pub(super) struct Catalog {
@@ -89,14 +89,30 @@ impl Catalog {
     }
 
     pub async fn stage(&self, stage: Stage, placement: &Placement) -> io::Result<Reply> {
-        self.require_trusted()?;
         if !placement.stage(&stage) {
             return Err(invalid("invalid staged placement"));
         }
+        let catalog = Self {
+            disk: self.disk.clone(),
+            claim: self.claim.clone(),
+        };
+        tokio::spawn(async move { catalog.stage_validated(stage).await })
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    async fn stage_validated(&self, stage: Stage) -> io::Result<Reply> {
+        // Hold the lock through durable publication even if its caller goes
+        // away. A competing stage must compare against the committed move.
+        let _guard = self.claim.lock().await;
+        self.require_trusted()?;
         let entry = self
             .disk
             .catalog(stage.stream)
             .ok_or_else(|| invalid("missing catalog entry"))?;
+        if !admits_stage(&entry, &stage) {
+            return Ok(stage_conflict());
+        }
         if entry.staged.as_ref() != Some(&stage) {
             self.disk.write(Record::Stage(stage.clone())).await?;
         }
@@ -133,6 +149,37 @@ impl Catalog {
         }
         Ok(())
     }
+}
+
+/// A new recovery may only start from a roster whose predecessor the catalog
+/// knows. A move at this revision could already be joint or finalized on a
+/// quorum the survivor never contacted. Same-origin recovery retries are
+/// permitted because the successful survivor reports its durable result
+/// locally instead of attempting another stage.
+pub(super) fn admits_stage(entry: &CatalogEntry, stage: &Stage) -> bool {
+    let Some(current) = &entry.staged else {
+        return !stage.recovery() || (stage.source == 0 && stage.old == entry.genesis.voters);
+    };
+    if current == stage {
+        return true;
+    }
+    match stage.source.cmp(&current.source) {
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => {
+            stage.old == current.old
+                && stage.recovery() == current.recovery()
+                && stage.survivor() == current.survivor()
+        }
+        std::cmp::Ordering::Greater => {
+            !stage.recovery()
+                || (current.source.checked_add(1) == Some(stage.source)
+                    && current.target == stage.old)
+        }
+    }
+}
+
+pub(super) fn stage_conflict() -> Reply {
+    Reply::Decision(Outcome::Refused(JournalError::Conflict { head: Lsn(0) }))
 }
 
 /// Asks the replicated catalog's voters in `order`, following leader hints,

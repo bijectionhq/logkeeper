@@ -65,6 +65,7 @@ for each`.
 | `refused: supply two independently signed keeper retirement proofs` | Generate one proof on each lost keeper's original enrolled media |
 | `this keeper is not a voter of the stream's latest configuration` | Run it on the right survivor |
 | `the replicated catalog requires its original quorum or disaster restore` | Follow [catalog and joint quorum loss](#catalog-and-joint-quorum-loss) |
+| `the catalog records a pending move or a different source configuration` | Reconcile against the current membership with its original quorum. The local survivor may have missed a configuration change |
 | `replacements must be two live, accepting keepers ...` | Add keepers, or name them with `--with` |
 | `the selected snapshot is ahead of the log; start and stop this keeper first` | Do exactly that, then retry |
 

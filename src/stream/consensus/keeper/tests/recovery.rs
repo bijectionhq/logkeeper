@@ -1,7 +1,9 @@
 //! Operator recovery of a stream that lost two of its three voters.
 
 use super::*;
-use crate::stream::consensus::{Configuration, ConsensusJournal, JournalConfig, keeper::Recovery};
+use crate::stream::consensus::{
+    Configuration, ConsensusJournal, JournalConfig, Stage, keeper::Recovery,
+};
 
 const RECOVERY_WAIT: Duration = Duration::from_secs(30);
 
@@ -59,6 +61,24 @@ fn legacy_acknowledged() -> Recovery {
     }
 }
 
+async fn remember_peers(cluster: &Cluster, keeper: Uuid, peers: [Uuid; 2]) {
+    timeout(WAIT, async {
+        for peer in peers {
+            while cluster.running[&keeper]
+                .engine
+                .recognition
+                .recorded(peer)
+                .await
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
 fn contract_journal(
     cluster: &Cluster,
     credentials: &Credentials,
@@ -108,21 +128,7 @@ async fn a_survivor_recovers_only_after_retiring_the_partitioned_voters() {
     let stream = StreamId(81);
     let old_fence = written_stream(&cluster, stream, [a, b, c], a, 5).await;
     let journal = cluster.client(&cluster.credentials);
-    timeout(WAIT, async {
-        for peer in [b, c] {
-            while cluster.running[&a]
-                .engine
-                .recognition
-                .recorded(peer)
-                .await
-                .is_none()
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    })
-    .await
-    .unwrap();
+    remember_peers(&cluster, a, [b, c]).await;
     cluster.running.remove(&a).unwrap().stop().await;
 
     // From the recovery host these voters are silent, but together they
@@ -310,6 +316,140 @@ async fn a_survivor_recovers_only_after_retiring_the_partitioned_voters() {
             .append(stream, Epoch(3), Lsn(7), Bytes::from_static(b"still"))
             .await,
         Ok(Lsn(7))
+    );
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_preserves_a_catalog_move_the_survivor_missed() {
+    for replicated_catalog in [false, true] {
+        let mut cluster = if replicated_catalog {
+            Cluster::start_replicated().await
+        } else {
+            Cluster::start().await
+        };
+        let [a, b, c, d] = cluster.ids;
+        let stream = StreamId(87);
+        written_stream(&cluster, stream, [a, b, c], a, 1).await;
+        let original = cluster
+            .client(&cluster.credentials)
+            .configuration(stream)
+            .await
+            .unwrap();
+        remember_peers(&cluster, a, [b, c]).await;
+
+        // The catalog has approved a move, but the survivor has not seen its
+        // joint or final membership. It must not supersede that move.
+        let pending = Stage {
+            stream,
+            source: original.revision,
+            old: original.voters,
+            target: [a, b, d],
+        };
+        assert!(matches!(
+            cluster.running[&b].engine.catalog_request(Request::Stage(pending.clone())).await.unwrap(),
+            Reply::Staged(receipt) if receipt == pending
+        ));
+        for id in [a, b, c] {
+            cluster.running.remove(&id).unwrap().stop().await;
+        }
+        let fence_proofs = [b, c]
+            .into_iter()
+            .map(|lost| cluster.configs[&lost].fence_recovery(lost).unwrap())
+            .collect();
+        let refused = cluster.configs[&a]
+            .recover_stream(
+                stream,
+                Recovery {
+                    fence_proofs,
+                    ..acknowledged()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("catalog records a pending move"),
+            "{refused}"
+        );
+        assert!(matches!(
+            cluster.running[&d].engine.catalog_request(Request::Staging(stream)).await.unwrap(),
+            Reply::Staged(receipt) if receipt == pending
+        ));
+        let catalog_refused = cluster.configs[&a]
+            .recover_stream(catalog_stream::STREAM, Recovery::default())
+            .await
+            .unwrap_err();
+        assert!(
+            catalog_refused
+                .to_string()
+                .contains("original quorum or disaster restore")
+        );
+        cluster.stop_all().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovery_refuses_a_durable_joint_configuration() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, d] = cluster.ids;
+    let stream = StreamId(88);
+    written_stream(&cluster, stream, [a, b, c], a, 1).await;
+    let journal = cluster.client(&cluster.credentials);
+    let original = journal.configuration(stream).await.unwrap();
+    let leader = cluster.leader(stream).await;
+    let survivor = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    let removed = [a, b, c]
+        .into_iter()
+        .find(|id| *id != leader && *id != survivor)
+        .unwrap();
+    let next: [_; 3] = [a, b, c, d]
+        .into_iter()
+        .filter(|id| *id != removed)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    for (id, server) in &cluster.running {
+        if *id != leader {
+            *server.engine.reject_append.write() = Some(Box::new(move |group, _, request| {
+                group == stream
+                    && request.entries.iter().any(|entry| {
+                        matches!(&entry.payload, EntryPayload::Membership(membership)
+                        if membership.get_joint_config().as_slice()
+                            == [next.into_iter().map(|id| id.as_u128()).collect()])
+                    })
+            }));
+        }
+    }
+    let replace =
+        tokio::spawn(async move { journal.replace(stream, original.revision, next).await });
+    let group = cluster.group(survivor, stream).await;
+    timeout(WAIT, async {
+        while group
+            .state
+            .membership()
+            .membership()
+            .get_joint_config()
+            .len()
+            != 2
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(group);
+    replace.abort();
+    cluster.running.remove(&survivor).unwrap().stop().await;
+
+    let refused = cluster.configs[&survivor]
+        .recover_stream(stream, Recovery::default())
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("restore the joint quorum"),
+        "{refused}"
     );
     cluster.stop_all().await;
 }

@@ -516,6 +516,11 @@ impl Config {
         };
         match reply {
             Reply::Staged(receipt) if receipt == *stage => Ok(()),
+            Reply::Decision(Outcome::Refused(journal_contract::JournalError::Conflict {
+                ..
+            })) => Err(invalid(
+                "the catalog records a pending move or a different source configuration; +                             restore the original quorum and resolve membership first",
+            )),
             Reply::Decision(Outcome::Refused(error)) => {
                 Err(invalid(format!("the catalog refused the stage: {error:?}")))
             }

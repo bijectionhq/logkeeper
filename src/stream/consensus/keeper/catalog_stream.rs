@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use super::{Engine, Group, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
 use crate::stream::consensus::{
-    Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, decode, encode,
+    Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, catalog, decode, encode,
     state::{Command, Outcome},
     storage::CatalogEntry,
 };
@@ -473,6 +473,9 @@ impl Engine {
                 .entries
                 .get(&stage.stream)
                 .ok_or_else(|| invalid("missing catalog entry"))?;
+            if !catalog::admits_stage(entry, &stage) {
+                return Ok(catalog::stage_conflict());
+            }
             if entry.staged.as_ref() == Some(&stage) {
                 return Ok(Reply::Staged(stage));
             }
