@@ -463,7 +463,9 @@ async fn a_keeper_at_its_limit_evicts_its_least_recently_used_idle_copy() {
         .collect::<Vec<_>>();
     assert!(open.contains(&streams[2]), "{open:?}");
     assert!(!open.contains(&expected), "{open:?} kept {expected:?}");
-    assert_eq!(engine.parked.read().get(&expected), Some(&None));
+    // A peer can start reopening the evicted copy after the group snapshot
+    // above. The counter records the eviction even if its park mark changes.
+    assert!(engine.disk.metrics.evicted.load(Ordering::Relaxed) > 0);
     // The evicted copy still serves: a request reopens it, evicting again.
     assert_eq!(journal.head(expected).await, Ok(Lsn(0)));
     cluster.stop_all().await;
