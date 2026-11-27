@@ -18,6 +18,9 @@
 //! cargo run --release --features stream --example delay-proxy -- \
 //!     --link 127.0.0.1:7101=127.0.0.1:7001/3/1 --link 127.0.0.1:7102=127.0.0.1:7002/0.5
 //! ```
+//!
+//! For RTDB Multi, `verification/measure/rtdb_zones.py` sets up these links
+//! and reports progress while it verifies each receipt after the timed writes.
 
 use std::{net::SocketAddr, time::Duration};
 
