@@ -1549,8 +1549,7 @@ impl Engine {
         self.require_media()?;
         let owner = self.authorize(identity, &request)?;
         let stream = request.stream();
-        if (matches!(&request, Request::Claim(genesis) if genesis.immutable)
-            || matches!(&request, Request::SealSession { .. }))
+        if matches!(&request, Request::Claim(genesis) if genesis.immutable)
             && !self.disk.write_version_allows(super::CLUSTER_VERSION_V4)
         {
             self.sync_cluster_version().await;

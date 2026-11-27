@@ -347,7 +347,9 @@ impl Engine {
         if target > CLUSTER_VERSION_CURRENT {
             return Err(JournalError::Unsupported);
         }
-        let required_feature = if target > super::super::CLUSTER_VERSION_V2 {
+        let required_feature = if target >= super::super::CLUSTER_VERSION_V4 {
+            features::IMMUTABLE_STREAMS
+        } else if target > super::super::CLUSTER_VERSION_V2 {
             features::RECOVERY_MARKER
         } else {
             features::WRITE_VERSION_GATE
