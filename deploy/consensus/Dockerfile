@@ -8,7 +8,7 @@ FROM toolchain AS build
 ARG TARGETARCH
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=logkeeper-registry,sharing=locked \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=logkeeper-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=logkeeper-target-${TARGETARCH},sharing=locked \
     cargo build --locked --release --features stream --bin logkeeper \
     && install -m 0555 target/release/logkeeper /usr/local/bin/logkeeper
