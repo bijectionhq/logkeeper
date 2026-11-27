@@ -436,16 +436,25 @@ impl Client {
     pub(super) async fn stage_original(
         &self,
         keeper: uuid::Uuid,
-        stream: StreamId,
         revision: u64,
         original: crate::stream::timed::TimedOriginal,
         payload: Bytes,
+        session: Option<WriterFence>,
     ) -> Result<crate::stream::timed::TimedSample> {
-        let request = Request::StageOriginal {
-            stream,
-            revision,
-            original: original.encode().to_vec(),
-            payload,
+        let encoded = original.encode().to_vec();
+        let request = match session {
+            Some(fence) => Request::StageSessionOriginal {
+                fence,
+                revision,
+                original: encoded,
+                payload,
+            },
+            None => Request::StageOriginal {
+                stream: original.stream,
+                revision,
+                original: encoded,
+                payload,
+            },
         };
         match self.keeper_operation(keeper, request).await? {
             Reply::Decision(outcome) => match decision(outcome)? {

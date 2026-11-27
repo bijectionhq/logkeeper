@@ -232,6 +232,9 @@ requests require writer authorization.
 
 ### Timed original proofs
 
+An immutable stream's writer session controls both the provisional durability reservation and the final committed append.
+Retained proof reads remain available independently of the current writer, while a retry through the append API still requires its original session fence.
+
 The `Writer` can be commissioned to prove a timed original append on the same stream. The request binds the stream, sealed writer epoch, next LSN, exact payload SHA-256, exclusive journal cutoff and original receiver certificate SHA-256. The first two keepers in the sealed ensemble stage and sync the original bytes, then independently sign conservative upper bounds for that durability event. Both bounds must be strictly before the original cutoff. The writer publishes the timed entry through the same committed-prefix protocol as other appends.
 
 A staged record without a verified timely sample keeps its exact reservation until durable supersession and never becomes visible on that evidence. Retrying a staged original cannot take a new sample. The ordinary recovery and replacement paths copy the signed original evidence with the chosen entry. A proof read establishes committed visibility through a current quorum, verifies the original signatures against their retained keeper identities, and returns the same bound and evidence digest while the entry remains retained.

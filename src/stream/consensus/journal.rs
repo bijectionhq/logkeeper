@@ -262,8 +262,7 @@ impl ConsensusJournal {
         original: TimedOriginal,
         payload: Bytes,
     ) -> Result<TimedOriginalProof> {
-        self.append_timed_with_fence(Self::fence(original.epoch), original, payload)
-            .await
+        self.append_timed(original, payload, None).await
     }
 
     /// A timed original staged and committed by the immutable stream's writer session.
@@ -279,15 +278,14 @@ impl ConsensusJournal {
             });
         }
         self.client.require_immutable(fence.stream).await?;
-        self.append_timed_with_fence(Self::session_fence(fence), original, payload)
-            .await
+        self.append_timed(original, payload, Some(fence)).await
     }
 
-    async fn append_timed_with_fence(
+    async fn append_timed(
         &self,
-        fence: Fence,
         original: TimedOriginal,
         payload: Bytes,
+        session: Option<WriterFence>,
     ) -> Result<TimedOriginalProof> {
         let timed = self.timed.as_ref().ok_or(JournalError::Unavailable)?;
         let max = timed.max_payload_bytes.ok_or(JournalError::Unavailable)?;
@@ -297,29 +295,42 @@ impl ConsensusJournal {
         if !original.matches(&payload) {
             return Err(JournalError::Unavailable);
         }
-        if let Ok(proof) = self.prove_timed_original(original).await {
-            return Ok(proof);
-        }
-        let configuration = self.client.configuration(original.stream).await?;
-        let mut voters = configuration.voters;
-        voters.sort_unstable();
-        let stage = |keeper| {
-            self.client.stage_original(
-                keeper,
-                original.stream,
-                configuration.revision,
-                original,
-                payload.clone(),
-            )
+        let retained = self
+            .timed_evidence(original)
+            .await
+            .ok()
+            .and_then(|evidence| {
+                let proof = evidence.proof(&*timed.verifier)?;
+                Some((evidence, proof))
+            });
+        let (evidence, proof) = match retained {
+            Some((_, proof)) if session.is_none() => return Ok(proof),
+            Some(retained) => retained,
+            None => {
+                let configuration = self.client.configuration(original.stream).await?;
+                let mut voters = configuration.voters;
+                voters.sort_unstable();
+                let stage = |keeper| {
+                    self.client.stage_original(
+                        keeper,
+                        configuration.revision,
+                        original,
+                        payload.clone(),
+                        session,
+                    )
+                };
+                let (first, second) = futures::try_join!(stage(voters[0]), stage(voters[1]))?;
+                let evidence = TimedEvidence {
+                    origin: super::timed::origin(original, voters, configuration.revision),
+                    samples: [first, second],
+                };
+                let proof = evidence
+                    .proof(&*timed.verifier)
+                    .ok_or(JournalError::Unavailable)?;
+                (evidence, proof)
+            }
         };
-        let (first, second) = futures::try_join!(stage(voters[0]), stage(voters[1]))?;
-        let evidence = TimedEvidence {
-            origin: super::timed::origin(original, voters, configuration.revision),
-            samples: [first, second],
-        };
-        let proof = evidence
-            .proof(&*timed.verifier)
-            .ok_or(JournalError::Unavailable)?;
+        let fence = session.map_or_else(|| Self::fence(original.epoch), Self::session_fence);
         match self
             .client
             .append_original(original.stream, fence, &evidence, payload)
@@ -338,6 +349,13 @@ impl ConsensusJournal {
         original: TimedOriginal,
     ) -> Result<TimedOriginalProof> {
         let timed = self.timed.as_ref().ok_or(JournalError::Unavailable)?;
+        self.timed_evidence(original)
+            .await?
+            .proof(&*timed.verifier)
+            .ok_or(JournalError::Unavailable)
+    }
+
+    async fn timed_evidence(&self, original: TimedOriginal) -> Result<TimedEvidence> {
         let evidence = self
             .client
             .prove_original(original.stream, original.at)
@@ -345,9 +363,7 @@ impl ConsensusJournal {
         if evidence.origin.original != original {
             return Err(JournalError::Unavailable);
         }
-        evidence
-            .proof(&*timed.verifier)
-            .ok_or(JournalError::Unavailable)
+        Ok(evidence)
     }
 
     /// Applies a changed eligible keeper set or draining list. The keeper

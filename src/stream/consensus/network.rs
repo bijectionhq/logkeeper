@@ -12,7 +12,7 @@ use std::{
 
 use bincode::Options;
 use futures::FutureExt;
-use journal_contract::{Epoch, Lsn, RecoveryFence, StreamId, WriterSessionId};
+use journal_contract::{Epoch, Lsn, RecoveryFence, StreamId, WriterFence, WriterSessionId};
 use openraft::{
     BasicNode, EntryPayload, OptionalSend,
     errors::{NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable},
@@ -279,12 +279,19 @@ pub(super) enum Request {
         expected_writer_epoch: Epoch,
         writer_session_id: WriterSessionId,
     },
+    StageSessionOriginal {
+        fence: WriterFence,
+        revision: u64,
+        original: Vec<u8>,
+        payload: bytes::Bytes,
+    },
 }
 
 impl Request {
     pub fn stream(&self) -> StreamId {
         match *self {
             Self::Claim(ref genesis) => genesis.stream,
+            Self::StageSessionOriginal { fence, .. } => fence.stream,
             Self::ReadAt { ref genesis, .. } => genesis.stream,
             Self::StageReplica { ref genesis, .. }
             | Self::InstallReplica { ref genesis, .. }
@@ -392,7 +399,7 @@ pub(super) fn encode_pong(pong: &Pong, version: WireVersion) -> io::Result<Vec<u
 const MAX_FRAME_TAG_V1: u32 = 2;
 const MAX_FRAME_TAG_CURRENT: u32 = 3;
 const MAX_REQUEST_TAG_V1: u32 = 27;
-const MAX_REQUEST_TAG_CURRENT: u32 = 35;
+const MAX_REQUEST_TAG_CURRENT: u32 = 36;
 const MAX_PEER_REQUEST_TAG_V1: u32 = 5;
 const MAX_PEER_REQUEST_TAG_CURRENT: u32 = 5;
 // Genesis encodes a u128 stream ID, three length-prefixed UUID byte strings
@@ -490,7 +497,8 @@ impl Request {
             | Self::ClearQuarantine(_)
             | Self::RecoveryFence(_)
             | Self::AcknowledgeRecoveryWithMarker { .. }
-            | Self::SealSession { .. } => version == WireVersion::Current,
+            | Self::SealSession { .. }
+            | Self::StageSessionOriginal { .. } => version == WireVersion::Current,
             Self::Claim(genesis)
             | Self::ReadAt { genesis, .. }
             | Self::StageReplica { genesis, .. }

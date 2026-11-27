@@ -1520,6 +1520,7 @@ impl Engine {
                     | Request::Append { .. }
                     | Request::AppendBatch { .. }
                     | Request::StageOriginal { .. }
+                    | Request::StageSessionOriginal { .. }
                     | Request::AppendOriginal { .. }
                     | Request::Written { .. }
                     | Request::AcknowledgeRecoveryWithMarker { .. }
@@ -1899,8 +1900,31 @@ impl Engine {
                         payload,
                         ..
                     } => {
-                        self.stage_original(&group, owner.unwrap(), revision, &original, payload)
-                            .await
+                        self.stage_original(
+                            &group,
+                            owner.unwrap(),
+                            revision,
+                            &original,
+                            payload,
+                            None,
+                        )
+                        .await
+                    }
+                    Request::StageSessionOriginal {
+                        fence,
+                        revision,
+                        original,
+                        payload,
+                    } => {
+                        self.stage_original(
+                            &group,
+                            owner.unwrap(),
+                            revision,
+                            &original,
+                            payload,
+                            Some(fence),
+                        )
+                        .await
                     }
                     Request::AppendOriginal {
                         fence,
@@ -1998,9 +2022,13 @@ impl Engine {
         revision: u64,
         original: &[u8],
         payload: Bytes,
+        session: Option<journal_contract::WriterFence>,
     ) -> io::Result<Reply> {
         use crate::stream::timed::{EVIDENCE_BYTES, MAX_TIMED_PAYLOAD, TimedOriginal};
         let refused = |error| Ok(Reply::Decision(Outcome::Refused(error)));
+        if group.genesis.immutable != session.is_some() {
+            return refused(JournalError::Unsupported);
+        }
         let Some(timed) = self.timed.clone() else {
             return refused(JournalError::Unavailable);
         };
@@ -2029,7 +2057,14 @@ impl Engine {
             return refused(JournalError::Unavailable);
         }
         match &view.writer {
-            Some((fence, principal)) if fence.epoch == original.epoch && *principal == owner => (),
+            Some((fence, principal))
+                if fence.epoch == original.epoch
+                    && *principal == owner
+                    && session.is_none_or(|session| {
+                        session.stream == original.stream
+                            && session.writer_epoch == fence.epoch
+                            && session.writer_session_id.0 == fence.writer.as_u128()
+                    }) => {}
             writer => {
                 return refused(JournalError::Fenced {
                     current: writer.as_ref().map_or(Epoch(0), |(fence, _)| fence.epoch),

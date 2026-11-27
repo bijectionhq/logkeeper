@@ -655,3 +655,81 @@ async fn a_written_keeper_configuration_reads_back_for_a_keeper_process() {
     serving.await.unwrap().unwrap();
     cluster.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timed_staging_and_retries_require_the_immutable_writer_session() {
+    use bytes::Bytes;
+    use journal_contract::{Epoch, JournalError, Lsn, StreamId, WriterFence, WriterSessionId};
+    use logkeeper::stream::consensus::CLUSTER_VERSION_V4;
+    use logkeeper::stream::timed::TimedOriginal;
+    use sha2::{Digest, Sha256};
+
+    let mut cluster = LocalCluster::start_timed(&PRINCIPALS).await.unwrap();
+    let config = cluster.journal_config(1 << 20, 4096);
+    let journal = cluster
+        .journal(PRINCIPALS[0], &config)
+        .unwrap()
+        .with_timed_original(cluster.timed_verifier(), Some(2048));
+    let stream = StreamId(82);
+    assert_eq!(
+        journal.finalize_version(CLUSTER_VERSION_V4).await,
+        Ok(CLUSTER_VERSION_V4)
+    );
+    journal.create_immutable(stream).await.unwrap();
+    let fence = journal
+        .seal_session(stream, Epoch(0), WriterSessionId(1))
+        .await
+        .unwrap()
+        .fence;
+    let wrong = WriterFence {
+        writer_session_id: WriterSessionId(2),
+        ..fence
+    };
+    let cutoff = now_micros() + 60_000_000;
+    let original = |payload: &[u8]| TimedOriginal {
+        stream,
+        epoch: Epoch(1),
+        at: Lsn(1),
+        payload_sha256: Sha256::digest(payload).into(),
+        exclusive_journal_cutoff_micros: cutoff,
+        original_receiver_certificate_sha256: [7; 32],
+    };
+    let conflicting = Bytes::from_static(b"wrong session");
+    assert!(matches!(
+        journal
+            .append_session_timed_original(wrong, original(&conflicting), conflicting.clone())
+            .await,
+        Err(JournalError::Fenced { .. }),
+    ));
+    let payload = Bytes::from_static(b"current session");
+    let exact = original(&payload);
+    let proof = journal
+        .append_session_timed_original(fence, exact, payload.clone())
+        .await
+        .unwrap();
+    assert!(proof.original_quorum_sync_upper_micros < cutoff);
+    assert_eq!(
+        journal
+            .append_session_timed_original(fence, exact, payload.clone())
+            .await,
+        Ok(proof)
+    );
+    assert_eq!(
+        journal
+            .append_session_timed_original(wrong, exact, payload.clone())
+            .await,
+        Err(JournalError::Fenced { current: Epoch(1) }),
+    );
+    journal
+        .seal_session(stream, Epoch(1), WriterSessionId(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        journal
+            .append_session_timed_original(fence, exact, payload)
+            .await,
+        Err(JournalError::Fenced { current: Epoch(2) }),
+    );
+    assert_eq!(journal.prove_timed_original(exact).await, Ok(proof));
+    cluster.shutdown().await.unwrap();
+}
