@@ -288,10 +288,14 @@ A stream commits and changes membership with two of its three voters, so it
 stops when two are lost and leader-driven repair cannot help. An operator can
 make the survivor's replica the stream's only history. This can lose
 acknowledged records: a committed record reached two voters, which may have
-been the two lost ones. Stop the surviving keeper, then run, on its host:
+been the two lost ones. Follow the [two-voter-loss runbook](docs/runbooks/lose-two-voters.md)
+to retire both lost keeper identities, obtain their signed proofs, and stop
+the surviving keeper. Then run on the survivor's host:
 
 ```sh
-cargo run --locked --features stream -- keeper recover-stream --config keeper.json --stream STREAM_UUID --acknowledge-data-loss --lost KEEPER_UUID,KEEPER_UUID [--with KEEPER_UUID,KEEPER_UUID]
+cargo run --locked --features stream -- keeper recover-stream --config keeper.json \
+  --stream STREAM_UUID --acknowledge-data-loss --lost LOST1_UUID,LOST2_UUID \
+  --fence-proof LOST1_UUID.fence.json --fence-proof LOST2_UUID.fence.json
 ```
 
 The command takes the keeper's media lock, so it refuses while the keeper
@@ -304,11 +308,11 @@ saw committed, and asks every other keeper for its status.
   still has a quorum, so restart the survivor instead. It also refuses the
   replicated catalog stream. Without `--acknowledge-data-loss` it prints what
   it would do and refuses.
-- **Lost voters.** `--lost` must name the configuration's two other voters:
-  it is the operator's statement that both are down or fenced, which no
-  probe can prove. A lost voter that does not answer the first status request
-  is asked twice more, for 5 s each, before it counts as lost, so a slow
-  keeper is refused as a live one rather than recovered over.
+- **Lost voters.** `--lost` names the configuration's two other voters.
+  Each `--fence-proof` comes from running `keeper fence-recovery` while the
+  voter is stopped. Recovery validates both signatures and verifies the
+  proofs correspond to the original enrolled media. The preview repeats
+  unanswered health probes to help distinguish a slow voter from a silent one.
 - **Replacements.** `--with` names two keepers. Without it the command takes
   the two best-ranked live, accepting keepers outside the lost configuration,
   in failure domains distinct from each other and from the survivor's. They
@@ -317,11 +321,10 @@ saw committed, and asks every other keeper for its status.
   stream. A replacement refuses when its own open replica votes in its
   configuration, which means the survivor's view is stale. The command then
   stages the move in the catalog and refuses if the catalog does not record
-  it: the catalog's record is what fences the lost voters (see below), so a
-  recovery needs the catalog. Clients also see the new voters first among the
-  contacts. A refused replacement leaves the catalog untouched; a recovery
-  that stops after the catalog recorded it leaves the old configuration
-  fenced, so run it again to completion.
+  it. Clients see the new voters first among the contacts and replica
+  certification uses the catalog's placement record. A refused replacement
+  leaves the catalog untouched. If recovery stops after the catalog records
+  the move, run it again to completion.
 - **The durable step.** One WAL round on the survivor, `Record::Recover`,
   holds a vote for the survivor in a term 2^32 above every term it has seen
   and two entries in that term. `Command::Recover` stages the move and seals
@@ -382,15 +385,13 @@ it nowhere; that check stays open while a keeper does not answer, which
 certification does not. The TLA+ model in `verification/tla` checks
 certification (`RecoveryBothReturn`, `RecoveryBothReturnLiveness`).
 
-**Residual risk: lost voters that never stopped.** Certification fences
-copies that reopen. A lost voter that kept running through the recovery,
-partitioned from the survivor but in contact with the other lost voter, stays
-certified: the pair keeps leading the old configuration until it touches a
-recovered voter. Closing that needs leases bounded by the catalog, so that a
-catalog outage would stop every stream after the lease; that cost is the
-owner's call. Until then the runbook's rule stands: confirm on each host that
-both lost keepers are down or fenced before recovering
-(`docs/runbooks/lose-two-voters.md`).
+**Continuously running lost voters.** The retirement command uses the same
+exclusive media lock as the keeper service. It commits an irreversible
+enrollment marker before emitting a signed proof. A partitioned keeper that
+can still serve its old configuration cannot emit that proof. Restarts and
+fresh initialization under a retired identity are refused as long as the
+original trusted registry is preserved. When an original enrollment cannot
+be attested, restore the original quorum or use an isolated disaster restore.
 
 **Why readers cannot mix histories.** The recovered entries and every later
 entry carry terms above every term in the survivor's history and, with the

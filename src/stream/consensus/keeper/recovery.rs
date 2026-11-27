@@ -3,13 +3,11 @@
 //! `logkeeper keeper recover-stream` runs on the stopped survivor's data
 //! directory under its media lock. It replays the survivor's whole log,
 //! asks every other keeper for its status, and refuses unless the operator
-//! acknowledges the data loss, names the two lost voters, and neither of
-//! them answers with a healthy replica. A lost voter that does not answer is
-//! asked again for longer before it counts as lost: a slow keeper is not a
-//! lost one. Naming the lost voters is the operator's statement that they
-//! are down or fenced, which no probe can prove. It then stages an installed
-//! empty copy on each of two replacements, stages the move in the catalog,
-//! which fences the lost configuration, and writes one WAL round on the
+//! acknowledges the data loss, names the two lost voters, and supplies an
+//! authenticated retirement proof for each recorded media incarnation. The
+//! proofs attest permanent enrollment retirement while each keeper was
+//! offline. It then stages an installed empty copy on each of two
+//! replacements, stages the move in the catalog, and writes one WAL round on the
 //! survivor: a vote for itself in a term above every term it has seen, and
 //! two entries in that term. The first,
 //! `Command::Recover`, stages the move and fences the stream under the
@@ -25,7 +23,7 @@ use openraft::{BasicNode, EntryPayload};
 use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
-use super::{Config, Reply, Request, catalog_stream, failure};
+use super::{Config, FenceProof, Reply, Request, catalog_stream, failure};
 use crate::stream::{
     consensus::{
         Entry, LogId, Stage, Vote, assignment,
@@ -53,12 +51,18 @@ pub struct Recovery {
     /// The operator accepts that acknowledged records only the lost voters
     /// held are gone.
     pub acknowledge_data_loss: bool,
-    /// The two voters the operator found down or fenced. They must be the
+    /// The two voters whose keeper identities were retired. They must be the
     /// survivor's configuration's other two voters.
     pub lost: Option<[Uuid; 2]>,
     /// The two replacement keepers. Without them the best-ranked live,
     /// accepting keepers in free failure domains are chosen.
     pub with: Option<[Uuid; 2]>,
+    /// One retirement proof per lost voter.
+    pub fence_proofs: Vec<FenceProof>,
+    /// Exercises protocol compatibility with pre-retirement recovery
+    /// histories whose former voters could still boot.
+    #[cfg(test)]
+    pub(in crate::stream::consensus) legacy_unfenced: bool,
     /// Fails the durable WAL round: 2 before its boundary, 3 after it.
     #[cfg(test)]
     pub(super) interrupt: Option<u8>,
@@ -83,8 +87,8 @@ impl std::fmt::Display for RecoveryReport {
         write!(
             f,
             "stream {:032x} {} from this keeper at head {}: voters {} {} {}, revision {}, \
-             term {}, recovery fence at epoch {}. Lost voters {} and {} must retire their \
-             copies before they rejoin. Start this keeper, then acknowledge the recovery \
+             term {}, recovery fence at epoch {}. Lost voters {} and {} must remain retired. \
+             Start this keeper, then acknowledge the recovery \
              so writers can seal again.",
             self.stream.0,
             if self.written {
@@ -122,7 +126,8 @@ impl Config {
         );
         if stream == catalog_stream::STREAM {
             return Err(invalid(
-                "the replicated catalog cannot be recovered this way",
+                "the replicated catalog requires its original quorum or disaster restore; \
+                 recover-stream cannot rewrite its membership",
             ));
         }
         let enrollment = self.enrollment()?;
@@ -162,7 +167,10 @@ impl Config {
             .configuration
             .filter(|_| replayed.uniform)
             .ok_or_else(|| {
-                invalid("the survivor's latest membership is not a finalized configuration")
+                invalid(
+                    "the survivor's latest membership is not a finalized configuration; \
+                         restore the joint quorum before changing membership",
+                )
             })?;
         let point = disk.recovery_point(stream);
         if let Some(done) = point.written {
@@ -198,6 +206,25 @@ impl Config {
         }
         let old = configuration.voters;
         let others = lost(&old, self.keeper);
+        let named = recovery.lost.is_some_and(|mut lost| {
+            lost.sort_unstable();
+            lost == others
+        });
+        if recovery.acknowledge_data_loss && !named {
+            return Err(invalid(format!(
+                "refused: name both lost voters with --lost {},{}",
+                others[0], others[1],
+            )));
+        }
+        // Preserve regression coverage for installations whose old operator
+        // workflows had already performed a recovery without retiring media.
+        #[cfg(test)]
+        let legacy_unfenced = recovery.legacy_unfenced;
+        #[cfg(not(test))]
+        let legacy_unfenced = false;
+        if recovery.acknowledge_data_loss && !legacy_unfenced {
+            self.verify_recovery_fences(others, &recovery.fence_proofs)?;
+        }
 
         let ask = |keeper: Uuid, limit: Duration| async move {
             let status = timeout(
@@ -221,7 +248,13 @@ impl Config {
         statuses.extend(futures::future::join_all(asked).await);
         // A lost voter that missed the first request may only be slow. It
         // counts as lost only after it also misses the longer ones.
-        for _ in 0..LOST_STATUS_ROUNDS {
+        // An acknowledged recovery already has affirmative retirement
+        // evidence. Retries are only useful in the diagnostic preview.
+        for _ in 0..if recovery.acknowledge_data_loss && !legacy_unfenced {
+            0
+        } else {
+            LOST_STATUS_ROUNDS
+        } {
             let silent = others
                 .into_iter()
                 .filter(|voter| statuses.get(voter).cloned().flatten().is_none())
@@ -318,17 +351,6 @@ impl Config {
         let epoch = decisions::recovery_epoch(replayed.epoch.0)
             .map(Epoch)
             .ok_or_else(|| invalid("the stream's epoch is exhausted"))?;
-        let named = recovery.lost.is_some_and(|mut lost| {
-            lost.sort_unstable();
-            lost == others
-        });
-        if recovery.acknowledge_data_loss && !named {
-            return Err(invalid(format!(
-                "refused: confirm that {} and {} are down or fenced, then name them with \
-                 --lost {},{}",
-                others[0], others[1], others[0], others[1],
-            )));
-        }
         if !decisions::allows_recovery(
             recovery.acknowledge_data_loss && named,
             survivor_votes,
@@ -339,16 +361,14 @@ impl Config {
                  stream {:032x} (head {}) the only history: records only {} and {} held are \
                  lost. The voters would become {target:?} at revision {}, term {term}, with \
                  seals refused under a recovery fence at epoch {} until an administrator \
-                 acknowledges the recovery. To proceed, confirm that {} and {} are down or \
-                 fenced and add --acknowledge-data-loss --lost {},{}",
+                 acknowledges the recovery. To proceed, permanently retire both lost keepers \
+                 and add --acknowledge-data-loss --lost {},{} and a --fence-proof for each",
                 stream.0,
                 head.0,
                 others[0],
                 others[1],
                 stage.source + 1,
                 epoch.0,
-                others[0],
-                others[1],
                 others[0],
                 others[1],
             )));

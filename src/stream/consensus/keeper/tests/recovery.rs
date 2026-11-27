@@ -52,6 +52,13 @@ fn acknowledged() -> Recovery {
     }
 }
 
+fn legacy_acknowledged() -> Recovery {
+    Recovery {
+        legacy_unfenced: true,
+        ..acknowledged()
+    }
+}
+
 fn contract_journal(
     cluster: &Cluster,
     credentials: &Credentials,
@@ -93,7 +100,7 @@ async fn configured(journal: &Client, stream: StreamId, voters: [Uuid; 3]) -> Co
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_survivor_recovers_its_stream_and_the_lost_voters_retire() {
+async fn a_survivor_recovers_only_after_retiring_the_partitioned_voters() {
     use journal_contract::Journal;
 
     let mut cluster = Cluster::start().await;
@@ -101,11 +108,56 @@ async fn a_survivor_recovers_its_stream_and_the_lost_voters_retire() {
     let stream = StreamId(81);
     let old_fence = written_stream(&cluster, stream, [a, b, c], a, 5).await;
     let journal = cluster.client(&cluster.credentials);
-    let generation = journal.replica_generation(stream, b).await.unwrap();
+    timeout(WAIT, async {
+        for peer in [b, c] {
+            while cluster.running[&a]
+                .engine
+                .recognition
+                .recorded(peer)
+                .await
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    cluster.running.remove(&a).unwrap().stop().await;
+
+    // From the recovery host these voters are silent, but together they
+    // still hold quorum and can commit. Their own media locks must not be
+    // available while their services remain online.
+    let mut isolated = cluster.configs[&a].clone();
+    let blackholes = [
+        TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        TcpListener::bind("127.0.0.1:0").await.unwrap(),
+    ];
+    for (lost, listener) in [b, c].into_iter().zip(&blackholes) {
+        isolated
+            .keepers
+            .insert(lost, listener.local_addr().unwrap());
+        assert!(cluster.configs[&lost].fence_recovery(lost).is_err());
+    }
+    let refused = isolated
+        .recover_stream(stream, acknowledged())
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("--fence-proof"), "{refused}");
+    assert_eq!(
+        journal
+            .append(
+                stream,
+                old_fence,
+                Lsn(6),
+                Bytes::from_static(b"lost-suffix")
+            )
+            .await,
+        Ok(Lsn(6))
+    );
     for lost in [b, c] {
         cluster.running.remove(&lost).unwrap().stop().await;
     }
-    cluster.running.remove(&a).unwrap().stop().await;
 
     // Without the acknowledgement nothing is written.
     let refused = cluster.configs[&a]
@@ -116,8 +168,51 @@ async fn a_survivor_recovers_its_stream_and_the_lost_voters_retire() {
         refused.to_string().contains("--acknowledge-data-loss"),
         "{refused}"
     );
+    let proof_b = cluster.configs[&b].fence_recovery(b).unwrap();
+    let proof_c = cluster.configs[&c].fence_recovery(c).unwrap();
+    for proofs in [
+        vec![proof_b.clone()],
+        vec![proof_b.clone(), proof_b.clone()],
+    ] {
+        let refused = cluster.configs[&a]
+            .recover_stream(
+                stream,
+                Recovery {
+                    fence_proofs: proofs,
+                    ..acknowledged()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("retirement proof"),
+            "{refused}"
+        );
+    }
+    let mut forged = serde_json::to_value(&proof_b).unwrap();
+    forged["chain"] = serde_json::to_value(&proof_c).unwrap()["chain"].clone();
+    let refused = cluster.configs[&a]
+        .recover_stream(
+            stream,
+            Recovery {
+                fence_proofs: vec![serde_json::from_value(forged).unwrap(), proof_c.clone()],
+                ..acknowledged()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("belongs to another keeper"),
+        "{refused}"
+    );
     let report = cluster.configs[&a]
-        .recover_stream(stream, acknowledged())
+        .recover_stream(
+            stream,
+            Recovery {
+                fence_proofs: vec![proof_c, proof_b],
+                ..acknowledged()
+            },
+        )
         .await
         .unwrap();
     assert!(report.written);
@@ -183,29 +278,26 @@ async fn a_survivor_recovers_its_stream_and_the_lost_voters_retire() {
     );
     assert_eq!(contract.head(stream).await, Ok(Lsn(6)));
 
-    // A lost voter that returns cannot lead or disturb the stream, and
-    // retires its copy once the certified placement excludes it.
-    cluster.restart(b).await;
-    let led = AtomicBool::new(false);
-    let retired = timeout(RECOVERY_WAIT, async {
-        loop {
-            if let Some(group) = cluster.running[&b].engine.groups.lock().await.get(&stream)
-                && group.raft.metrics().borrow_watched().state == openraft::ServerState::Leader
-            {
-                led.store(true, Ordering::Relaxed);
-            }
-            if journal.replica_generation(stream, b).await != Ok(generation) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await;
-    assert!(retired.is_ok(), "the returning voter retired its copy");
-    assert!(
-        !led.load(Ordering::Relaxed),
-        "the returning voter never led"
-    );
+    for lost in [b, c] {
+        let config = &cluster.configs[&lost];
+        let error = config
+            .clone()
+            .prepare(CancellationToken::new())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("permanently retired"), "{error}");
+        assert!(
+            config.fence_recovery(lost).is_ok(),
+            "proof can be retrieved again"
+        );
+        let archived = config.data.with_extension("retired");
+        std::fs::rename(&config.data, archived).unwrap();
+        assert!(
+            config.initialize().is_err(),
+            "retirement survives media replacement"
+        );
+    }
     assert_eq!(
         journal
             .configuration(stream)
@@ -231,7 +323,7 @@ async fn recovery_is_refused_while_another_voter_holds_a_healthy_replica() {
     cluster.running.remove(&a).unwrap().stop().await;
     // Both other voters are alive: the stream has a quorum.
     let refused = cluster.configs[&a]
-        .recover_stream(stream, acknowledged())
+        .recover_stream(stream, Recovery::default())
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("quorum"), "{refused}");
@@ -243,7 +335,7 @@ async fn recovery_is_refused_while_another_voter_holds_a_healthy_replica() {
         .status_delay
         .store(3_000, Ordering::Relaxed);
     let refused = cluster.configs[&a]
-        .recover_stream(stream, acknowledged())
+        .recover_stream(stream, Recovery::default())
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("quorum"), "{refused}");
@@ -305,7 +397,7 @@ async fn the_recovery_write_is_all_or_nothing_across_a_crash() {
     let mut expected = [a, d, Uuid::from_u128(6)];
     expected.sort_unstable();
     // A crash before the round's boundary leaves no trace of it.
-    let mut before = acknowledged();
+    let mut before = legacy_acknowledged();
     before.with = with;
     before.interrupt = Some(2);
     assert!(
@@ -315,7 +407,7 @@ async fn the_recovery_write_is_all_or_nothing_across_a_crash() {
             .is_err()
     );
     // A crash after the boundary leaves the whole recovery durable.
-    let mut after = acknowledged();
+    let mut after = legacy_acknowledged();
     after.with = with;
     after.interrupt = Some(3);
     assert!(
@@ -481,7 +573,7 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
                 acknowledge_data_loss: true,
                 lost: Some([b, c]),
                 with: Some([d, e]),
-                interrupt: None,
+                ..legacy_acknowledged()
             },
         )
         .await;
@@ -495,7 +587,7 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
                 acknowledge_data_loss: true,
                 lost: Some([b, c]),
                 with: Some([d, f]),
-                interrupt: None,
+                ..legacy_acknowledged()
             },
         )
         .await;
@@ -564,7 +656,7 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
                 acknowledge_data_loss: true,
                 lost: Some([b, c]),
                 with: Some([d, f]),
-                interrupt: None,
+                ..legacy_acknowledged()
             },
         )
         .await
@@ -707,7 +799,7 @@ async fn returning_lost_voters_never_lead_and_retire_past_a_follower_survivor() 
                 acknowledge_data_loss: true,
                 lost: Some([b, c]),
                 with: Some([d, f]),
-                interrupt: None,
+                ..legacy_acknowledged()
             },
         )
         .await
@@ -799,7 +891,7 @@ async fn the_survivor_refuses_a_lost_voters_snapshot_without_its_term() {
         cluster.running.remove(&keeper).unwrap().stop().await;
     }
     let report = cluster.configs[&a]
-        .recover_stream(stream, acknowledged())
+        .recover_stream(stream, legacy_acknowledged())
         .await
         .unwrap();
     assert!(report.written);

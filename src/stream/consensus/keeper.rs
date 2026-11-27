@@ -13,6 +13,7 @@ mod recovery;
 mod repair;
 mod replacement;
 mod replicas;
+mod retirement;
 mod scrub;
 #[cfg(test)]
 mod tests;
@@ -57,6 +58,7 @@ use crate::server::durability::SyncMode;
 use crate::stream::{transport, wire::KeeperId};
 use admission::ReplicationIngress;
 pub use recovery::{Recovery, RecoveryReport};
+pub use retirement::FenceProof;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEAD_REQUESTS: usize = 256;
@@ -718,6 +720,7 @@ impl Engine {
         listeners: [TcpListener; 3],
         admin: Option<(TcpListener, bool)>,
     ) -> io::Result<()> {
+        let _serving_media = self.disk.hold_media_lock()?;
         let mut sockets = JoinSet::new();
         let result = async {
             for (stream, reason) in self.disk.quarantined_streams() {

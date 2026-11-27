@@ -26,14 +26,11 @@ UUID` shows its configuration and which voters answer. Run it also for each
 stream RTDB reports as unavailable (RTDB returns `Unavailable` on seal and
 append).
 
-**Confirm both lost keepers are really gone**, by checking each host
-directly: the process is not running (`systemctl is-active $UNIT` prints
-`inactive` or `failed`), or the machine is powered off or fenced. If a lost
-keeper is merely unreachable, fence it first: stop its unit or isolate its
-host. `recover-stream` asks a silent voter three times over about 14 s before
-it counts it as lost, but a probe cannot tell a fenced keeper from a stalled
-one, so the command also requires you to name both lost keepers with `--lost`
-(step 4). Naming them is your statement that both are down or fenced.
+Inventory every stream on the two lost keepers before retiring either
+identity. Retirement is permanent and applies to all streams, including the
+catalog if the keeper stores a catalog replica. Prefer restoring the existing
+quorum while that is possible. Use the current Logkeeper operator binary
+throughout this procedure. Older operator binaries predate retirement proofs.
 
 ## 2. Stop the survivor
 
@@ -55,35 +52,61 @@ lk keeper recover-stream --config $CONFIG --stream STREAM_UUID
 Expected: exit 1 with `refused without --acknowledge-data-loss. This would
 make this keeper's copy of stream <id> (head <n>) the only history: records
 only <lost-1> and <lost-2> held are lost. The voters would become [...] at
-revision <r>, term <t>, ... To proceed, confirm that <lost-1> and <lost-2> are
-down or fenced and add --acknowledge-data-loss --lost <lost-1>,<lost-2>`.
+revision <r>, term <t>, ... To proceed, permanently retire both lost keepers
+and add --acknowledge-data-loss --lost <lost-1>,<lost-2> and a --fence-proof
+for each`.
 
 **Abort** on any other refusal:
 
 | Message | Meaning |
 | --- | --- |
 | `refused: N other voter(s) ... answer with a healthy replica` | The stream still has a quorum, possibly through a slow keeper you took for lost. Restart this keeper instead |
-| `refused: confirm that <x> and <y> are down or fenced, then name them with --lost x,y` | `--lost` is missing or names other keepers. Fence the named keepers first |
+| `refused: name both lost voters with --lost x,y` | `--lost` is missing or names other keepers |
+| `refused: supply two independently signed keeper retirement proofs` | Generate one proof on each lost keeper's original enrolled media |
 | `this keeper is not a voter of the stream's latest configuration` | Run it on the right survivor |
-| `the replicated catalog cannot be recovered this way` | Catalog recovery does not exist |
+| `the replicated catalog requires its original quorum or disaster restore` | Follow [catalog and joint quorum loss](#catalog-and-joint-quorum-loss) |
 | `replacements must be two live, accepting keepers ...` | Add keepers, or name them with `--with` |
 | `the selected snapshot is ahead of the log; start and stop this keeper first` | Do exactly that, then retry |
 
-A joint configuration is also refused. That case does not exist as a
-recovery path yet (review item 14).
+For a joint configuration, follow [catalog and joint quorum loss](#catalog-and-joint-quorum-loss).
 
-## 4. Recover
+## 4. Retire the lost keeper identities and recover
+
+Confirm each lost keeper's UUID and check that retiring the pair leaves the
+latest catalog configuration with quorum. On each lost keeper's original
+host, or with exclusive control of its original media and trusted registry,
+stop the service and use that keeper's configuration and credentials:
+
+```sh
+sudo systemctl stop "$UNIT"
+lk keeper fence-recovery --config "$CONFIG" \
+  --acknowledge-keeper-retirement LOST_UUID > LOST_UUID.fence.json
+```
+
+The command takes the same exclusive media lock as the service and durably
+retires the enrollment before returning the signed proof. Repeat the command
+if output was interrupted. Transfer both proof files to the survivor. They
+contain public certificates and signatures. The survivor checks each proof's
+certificate against the cluster CA and matches its keeper UUID, catalog UUID,
+and recorded media incarnation. The certificates must still be valid.
+
+If either original enrollment cannot be locked or attested, including after
+permanent loss of its media or key, this workflow stops. An unreachable
+host, stopped service, or powered-off VM alone supplies insufficient evidence.
+Leave the affected streams offline until you can restore their original
+quorums or rebuild under a fresh, isolated cluster identity.
 
 ```sh
 lk keeper recover-stream --config $CONFIG --stream STREAM_UUID --acknowledge-data-loss \
-  --lost LOST_UUID,LOST_UUID [--with KEEPER_UUID,KEEPER_UUID]
+  --lost LOST1_UUID,LOST2_UUID --fence-proof LOST1_UUID.fence.json \
+  --fence-proof LOST2_UUID.fence.json [--with KEEPER_UUID,KEEPER_UUID]
 ```
 
 Expected:
 
 ```text
 stream <id> recovered from this keeper at head <n>: voters <a> <b> <c>, revision <r>, term <t>,
-recovery fence at epoch <e>. Lost voters <x> and <y> must retire their copies before they rejoin.
+recovery fence at epoch <e>. Lost voters <x> and <y> must remain retired.
 Start this keeper, then acknowledge the recovery so writers can seal again.
 ```
 
@@ -116,16 +139,35 @@ RTDB's writer then seals above the fence. It reports
 acknowledged. Record the stream, the head and the lost range with the
 incident.
 
-## 6. The lost keepers
+## 6. Replace the retired keepers
 
-A lost keeper that restarts with its data cannot campaign or serve reads
-for the stream until its copy is certified (commit `59038f5`). It asks the
-catalog for the stream's latest staged move, finds the recovery, is fenced,
-and retires its copy. That holds even if both lost keepers return together
-and neither can reach a current voter. Before it first votes, it also asks
-every other keeper for its finalized configuration.
+Keep the retirement marker in the trusted registry. The safety of the proof
+depends on exclusive ownership of the enrolled identity and a registry that
+never rolls back. Discard any copied credentials for those identities. To
+add capacity, use freshly provisioned keeper UUIDs and keys, then update
+inventory as described in [add and remove a keeper](add-drain-remove-keeper.md).
 
-What remains open is a lost keeper that **never stopped**. It stays certified,
-and with the other lost keeper it can keep leading the old configuration
-until it reaches a recovered voter. Hence the fencing rule in step 1. Wiping
-lost keepers and replacing them as new keepers stays the simplest choice.
+## Catalog and joint quorum loss
+
+The catalog is the placement authority for every stream. If it loses quorum,
+freeze destructive recovery and catalog changes. Identify its latest
+catalog membership from the available keepers' local inspection reports,
+including any joint voter sets, and bring enough original participants back
+on their intact, enrolled media. A replica with a damaged snapshot may use
+`keeper repair-snapshot` with the exact snapshot named by its intact WAL.
+Once a catalog quorum is serving, check catalog-backed status against the
+expected recoverable streams before continuing.
+
+For a stream in a joint configuration, use `keeper inspect --config FILE
+--stream UUID --json` on stopped original voters to identify both sets.
+Restore intact original participants sufficient for a majority of each set,
+restart them, and allow Raft to finalize membership. Check the resulting
+uniform configuration before planning further repairs. A single surviving
+WAL cannot establish which joint transition an unavailable quorum committed.
+
+If either required quorum is irretrievable, preserve the original media and
+registries. Rebuild from application-level backups using a separate catalog,
+fresh keeper identities, credentials and enrollment, and isolated endpoints.
+Validate the restored application state and cut clients over only after the
+old cluster is fenced from clients and writers. Record the unavailable
+suffix against the latest application checkpoint or export.

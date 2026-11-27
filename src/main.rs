@@ -20,9 +20,9 @@ async fn main() -> ExitCode {
         #[cfg(feature = "stream")]
         println!("       logkeeper keeper --config FILE [--log-format human|json]");
         #[cfg(feature = "stream")]
-        println!(
-            "       logkeeper keeper recover-stream --config FILE --stream UUID --acknowledge-data-loss --lost KEEPER,KEEPER [--with KEEPER,KEEPER]"
-        );
+        println!("       {}", &FENCE_USAGE["Usage: ".len()..]);
+        #[cfg(feature = "stream")]
+        println!("       {}", &RECOVER_USAGE["Usage: ".len()..]);
         #[cfg(feature = "stream")]
         println!("       logkeeper keeper inspect --config FILE [--stream UUID] [--json]");
         #[cfg(feature = "stream")]
@@ -72,6 +72,19 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
     }
     #[cfg(feature = "stream")]
     if args.first().is_some_and(|arg| arg == "keeper") {
+        if let [_, action, flag, file, confirm, keeper] = args
+            && action == "fence-recovery"
+            && flag == "--config"
+            && confirm == "--acknowledge-keeper-retirement"
+        {
+            let config = logkeeper::stream::consensus::Config::read(std::path::Path::new(file))?;
+            let proof = config.fence_recovery(uuid::Uuid::parse_str(keeper)?)?;
+            println!("{}", serde_json::to_string(&proof)?);
+            return Ok(());
+        }
+        if args.get(1).is_some_and(|action| action == "fence-recovery") {
+            return Err(FENCE_USAGE.into());
+        }
         if let [_, action, flag, file] = args
             && action == "initialize"
             && flag == "--config"
@@ -255,13 +268,18 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
 }
 
 #[cfg(feature = "stream")]
+const FENCE_USAGE: &str =
+    "Usage: logkeeper keeper fence-recovery --config FILE --acknowledge-keeper-retirement KEEPER";
+
+#[cfg(feature = "stream")]
 const RECOVER_USAGE: &str = "Usage: logkeeper keeper recover-stream --config FILE --stream UUID \
-     --acknowledge-data-loss --lost KEEPER,KEEPER [--with KEEPER,KEEPER]";
+     [--acknowledge-data-loss --lost KEEPER,KEEPER --fence-proof FILE --fence-proof FILE] \
+     [--with KEEPER,KEEPER]";
 
 /// Recovers a stream that lost two of its three voters from this stopped
 /// keeper's replica. Without `--acknowledge-data-loss` it prints what it
-/// would do and refuses. `--lost` names the two lost voters the operator
-/// found down or fenced.
+/// would do and refuses. An acknowledged run requires signed retirement
+/// evidence for the two voters named by `--lost`.
 #[cfg(feature = "stream")]
 async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = None;
@@ -273,6 +291,12 @@ async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error
             "--config" => config = args.next(),
             "--stream" => stream = args.next(),
             "--acknowledge-data-loss" => recovery.acknowledge_data_loss = true,
+            "--fence-proof" if recovery.fence_proofs.len() < 2 => {
+                let path = std::path::Path::new(args.next().ok_or(RECOVER_USAGE)?);
+                recovery
+                    .fence_proofs
+                    .push(logkeeper::stream::consensus::FenceProof::read(path)?);
+            }
             "--with" | "--lost" => {
                 let keepers = args
                     .next()

@@ -31,7 +31,7 @@ pub use super::transport::Credentials;
 pub use crate::server::durability::SyncMode;
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
-pub use keeper::{AdminConfig, Config, Recovery, RecoveryReport};
+pub use keeper::{AdminConfig, Config, FenceProof, Recovery, RecoveryReport};
 pub use logging::LogFormat;
 pub use operator::{
     ADMIN_USAGE, AdminOutcome, ClusterProblems, Operator, OperatorConfig, StreamReport,

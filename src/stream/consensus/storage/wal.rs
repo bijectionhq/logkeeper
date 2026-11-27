@@ -3,10 +3,11 @@
 use crate::stream::consensus::decisions;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::File,
     io::{self, BufReader, Read},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
@@ -472,6 +473,7 @@ pub(in crate::stream::consensus) struct Disk {
     /// Finalized cluster feature level gating new on-disk formats and commands.
     write_version: Arc<AtomicU32>,
     stopped: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<io::Result<()>>>>>,
+    media_lock: Weak<File>,
     pub path: Arc<PathBuf>,
     /// The incarnation of the installed media, new at each installation.
     pub incarnation: Uuid,
@@ -576,6 +578,8 @@ impl Disk {
         let wal_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(test)]
         let writer_delay = wal_delay_ms.clone();
+        let lock = Arc::new(lock);
+        let media_lock = Arc::downgrade(&lock);
         std::thread::Builder::new()
             .name("logkeeper-raft-wal".into())
             .spawn(move || {
@@ -623,6 +627,7 @@ impl Disk {
             inflight: Arc::default(),
             write_version,
             stopped: Arc::new(tokio::sync::Mutex::new(Some(stopped))),
+            media_lock,
             path: Arc::new(path),
             incarnation,
             space,
@@ -638,6 +643,14 @@ impl Disk {
 
     pub fn healthy(&self) -> bool {
         self.healthy.load(Ordering::Acquire)
+    }
+
+    /// Keeps this media exclusively open until the service has stopped its
+    /// listeners and Raft groups, even if the WAL writer fails first.
+    pub fn hold_media_lock(&self) -> io::Result<Arc<File>> {
+        self.media_lock
+            .upgrade()
+            .ok_or_else(|| super::super::invalid("keeper media lock was released"))
     }
 
     /// Whether the media is healthy and keeps up with its WAL rounds.
