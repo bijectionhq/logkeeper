@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use super::{Engine, Group, NodeId, Outcome, Reply, Request, failure, invalid, leader_reply};
 use crate::stream::consensus::Voters;
-use crate::stream::consensus::{LogId, Stage, Vote, state::Command};
+use crate::stream::consensus::{
+    CLUSTER_VERSION_CHECKPOINT_INSTALL, LogId, Stage, Vote, state::Command,
+};
 
 pub(super) const MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -32,7 +34,13 @@ impl Engine {
         };
         let joint = membership.membership().get_joint_config();
         let conflict = || failure(JournalError::Conflict { head });
-        // A stream keeps its replication factor. A five-voter move that keeps
+        let stage = Stage {
+            stream: group.genesis.stream,
+            source: expected,
+            old: configuration.voters,
+            target: voters,
+        };
+        // Data streams keep their replication factor. A five-voter move that keeps
         // one or two voters would read as an operator recovery's stage
         // (`Stage::recovery`), so it is refused; move one voter at a time.
         let kept = voters
@@ -40,10 +48,23 @@ impl Engine {
             .filter(|voter| configuration.voters.contains(voter))
             .count();
         if !self.placement.roster(&voters)
-            || voters.len() != configuration.voters.len()
+            || (voters.len() != configuration.voters.len() && !stage.grows_catalog())
             || (voters.len() == 5 && kept >= 1 && kept < configuration.voters.quorum())
         {
             return Ok(conflict());
+        }
+        if stage.grows_catalog()
+            && !self
+                .disk
+                .write_version_allows(CLUSTER_VERSION_CHECKPOINT_INSTALL)
+        {
+            self.sync_cluster_version().await;
+            if !self
+                .disk
+                .write_version_allows(CLUSTER_VERSION_CHECKPOINT_INSTALL)
+            {
+                return Ok(failure(JournalError::Unsupported));
+            }
         }
         if previous_revision == Some(expected) && configuration.voters == voters {
             return Ok(Reply::Decision(Outcome::Configuration(configuration)));
@@ -67,12 +88,6 @@ impl Engine {
                         return Ok(leader_reply(current.current_leader));
                     }
                     current.vote
-                };
-                let stage = Stage {
-                    stream: group.genesis.stream,
-                    source: expected,
-                    old: configuration.voters,
-                    target: voters,
                 };
                 if !group.state.staged(&stage) {
                     match self.catalog_request(Request::Stage(stage.clone())).await? {

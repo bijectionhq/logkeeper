@@ -65,6 +65,9 @@ const PREV_BULK_ALPN: &[u8] = b"logkeeper-consensus-bulk/2";
 /// Build version advertised in liveness pings and [`KeeperStatus`].
 pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The replicated keeper catalog's reserved stream ID.
+pub const CATALOG_STREAM: StreamId = StreamId(u128::MAX);
+
 /// Cluster feature level before any rolling-upgrade format finalization (N-1).
 pub const CLUSTER_VERSION_V1: u32 = 1;
 /// Cluster feature level for the WAL, parking, and snapshot formats N-1 cannot read.
@@ -360,6 +363,15 @@ impl Stage {
             .count()
     }
 
+    /// The catalog may add two voters while retaining every old voter.
+    /// Its genesis stays unchanged and only the joint transition grows it.
+    fn grows_catalog(&self) -> bool {
+        self.stream == CATALOG_STREAM
+            && self.old.len() == 3
+            && self.target.len() == 5
+            && self.kept() == self.old.len()
+    }
+
     /// Whether the stage is an operator recovery's: it keeps at least one
     /// voter but fewer than a quorum of the old configuration, its
     /// survivors (one of three; one or two of five), and replaces the lost
@@ -389,6 +401,11 @@ impl Stage {
 }
 
 impl Genesis {
+    fn admits_voter_width(&self, voters: Voters) -> bool {
+        voters.len() == self.voters.len()
+            || (self.stream == CATALOG_STREAM && self.voters.len() == 3 && voters.len() == 5)
+    }
+
     fn valid(&self, keepers: &Keepers) -> bool {
         self.stream.0 != 0
             && self.quota_bytes > 0

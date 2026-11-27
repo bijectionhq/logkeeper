@@ -1101,7 +1101,7 @@ impl Disk {
                 .values()
                 .any(|entry| match &entry.payload {
                     openraft::EntryPayload::Membership(membership) => {
-                        !placement.structural_membership(membership)
+                        !placement.structural_membership(stream, membership)
                     }
                     openraft::EntryPayload::Normal(command) => match command.body() {
                         Command::Stage(stage) | Command::StageOwned(stage) => {

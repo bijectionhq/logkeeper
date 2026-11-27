@@ -4,10 +4,11 @@ use std::{
     sync::Arc,
 };
 
+use journal_contract::StreamId;
 use openraft::BasicNode;
 use uuid::Uuid;
 
-use super::{Genesis, Keepers, NodeId, Stage, Voters, decisions, invalid};
+use super::{CATALOG_STREAM, Genesis, Keepers, NodeId, Stage, Voters, decisions, invalid};
 
 /// Operator-certified failure domains, keyed by keeper incarnation.
 pub type Domains = BTreeMap<Uuid, String>;
@@ -114,7 +115,7 @@ impl Placement {
     /// move), while the target roster must satisfy current strict placement.
     pub fn stage(&self, stage: &Stage) -> bool {
         stage.old != stage.target
-            && stage.old.len() == stage.target.len()
+            && (stage.old.len() == stage.target.len() || stage.grows_catalog())
             && self.structural_roster(&stage.old)
             && self.roster(&stage.target)
     }
@@ -122,7 +123,7 @@ impl Placement {
     /// Structural check for historical/replayed stage records.
     pub fn structural_stage(&self, stage: &Stage) -> bool {
         stage.old != stage.target
-            && stage.old.len() == stage.target.len()
+            && (stage.old.len() == stage.target.len() || stage.grows_catalog())
             && self.structural_roster(&stage.old)
             && self.structural_roster(&stage.target)
     }
@@ -145,17 +146,24 @@ impl Placement {
     /// retired keeper; repair moves them to a compliant roster instead.
     pub fn structural_membership(
         &self,
+        stream: StreamId,
         membership: &openraft::Membership<NodeId, BasicNode>,
     ) -> bool {
         let configs = membership.get_joint_config();
         (1..=2).contains(&configs.len())
+            && (configs
+                .iter()
+                .all(|voters| voters.len() == configs[0].len())
+                || matches!(configs.as_slice(), [old, target]
+                    if stream == CATALOG_STREAM
+                        && old.len() == 3
+                        && target.len() == 5
+                        && old.is_subset(target)))
             && membership
                 .nodes()
                 .all(|(id, _)| self.known(Uuid::from_u128(*id)))
             && configs.iter().all(|voters| {
-                roster_of(voters).is_some_and(|voters| {
-                    voters.len() == configs[0].len() && self.structural_roster(&voters)
-                })
+                roster_of(voters).is_some_and(|voters| self.structural_roster(&voters))
             })
     }
 }

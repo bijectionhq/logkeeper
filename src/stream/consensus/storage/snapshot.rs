@@ -149,7 +149,8 @@ impl Image {
             .configuration
             .ok_or_else(|| invalid("snapshot lacks finalized placement"))?;
         let configs = membership.get_joint_config();
-        if placement.structural_membership(membership)
+        if placement.structural_membership(genesis.stream, membership)
+            && genesis.admits_voter_width(current.voters)
             && placement.structural_roster(&current.voters)
             && configs.first().is_some_and(|old| {
                 old.iter()
@@ -196,7 +197,7 @@ impl Image {
     ) -> io::Result<()> {
         let before = self.membership.membership().get_joint_config();
         let after = membership.get_joint_config();
-        if placement.structural_membership(membership)
+        if placement.structural_membership(genesis.stream, membership)
             && match (before.as_slice(), after.as_slice()) {
                 ([], [new]) => new
                     .iter()
@@ -1383,7 +1384,7 @@ impl Inner {
                             .map(uuid::Uuid::from_u128)
                             .collect::<Vec<_>>();
                         let voters = Voters::new(&voters)
-                            .filter(|voters| voters.len() == self.genesis.voters.len())
+                            .filter(|voters| self.genesis.admits_voter_width(*voters))
                             .ok_or_else(|| invalid("invalid finalized voter configuration"))?;
                         if image
                             .configuration
@@ -1590,7 +1591,7 @@ pub(super) fn inspect_stream_readonly(
 ) -> io::Result<StreamStateView> {
     if !placement.structural_genesis(genesis)
         || log.entries.values().any(|entry| match &entry.payload {
-            EntryPayload::Membership(membership) => !placement.structural_membership(membership),
+            EntryPayload::Membership(membership) => !placement.structural_membership(genesis.stream, membership),
             EntryPayload::Normal(command) => match command.body() {
                 Command::Stage(stage) | Command::StageOwned(stage) => {
                     !placement.structural_stage(stage) || stage.stream != genesis.stream
@@ -1670,7 +1671,7 @@ pub(super) fn inspect_stream_readonly(
                         .map(uuid::Uuid::from_u128)
                         .collect::<Vec<_>>();
                     let voters = Voters::new(&voters)
-                        .filter(|voters| voters.len() == genesis.voters.len())
+                        .filter(|voters| genesis.admits_voter_width(*voters))
                         .ok_or_else(|| invalid("invalid finalized voter configuration"))?;
                     if image
                         .configuration

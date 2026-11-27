@@ -53,7 +53,7 @@ use crate::stream::consensus::{
 };
 
 /// The catalog stream's reserved ID.
-pub(in crate::stream::consensus) const STREAM: StreamId = StreamId(u128::MAX);
+pub(in crate::stream::consensus) use crate::stream::consensus::CATALOG_STREAM as STREAM;
 const FENCE: Fence = Fence {
     epoch: Epoch(1),
     writer: Uuid::from_u128(0x6361_7461_6c6f_672d_7772_6974_6572_0001),

@@ -735,7 +735,7 @@ impl Engine {
         for entry in &request.entries {
             let valid = match &entry.payload {
                 openraft::EntryPayload::Membership(membership) => {
-                    self.placement.structural_membership(membership)
+                    self.placement.structural_membership(group.genesis.stream, membership)
                 }
                 openraft::EntryPayload::Normal(command) => match command.body() {
                     Command::Stage(stage) | Command::StageOwned(stage) => {

@@ -128,6 +128,46 @@ async fn without_a_catalog_quorum_creates_fail_and_existing_streams_serve() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_catalog_grows_through_joint_consensus_and_reopens() {
+    let initial = Voters::from([5, 6, 7].map(Uuid::from_u128));
+    let expanded = Voters::from([5, 6, 7, 8, 9].map(Uuid::from_u128));
+    let mut cluster = Cluster::start_addressed(["a", "b", "c", "d"], Some(initial), false, 2).await;
+    let [a, b, c, _] = cluster.ids;
+    let data = Voters::from([a, b, c]);
+    let before = StreamId(123);
+    let client = cluster.client(&cluster.credentials);
+    client.create(before, data, 4096).await.unwrap();
+    let original = client.configuration(STREAM).await.unwrap();
+    assert_eq!(original.voters, initial);
+    assert_eq!(
+        client.replace(STREAM, original.revision, expanded).await,
+        Err(JournalError::Unsupported),
+    );
+    cluster.finalize().await;
+    let current = client.replace(STREAM, original.revision, expanded).await.unwrap();
+    assert_eq!(current.voters, expanded);
+    assert_eq!(
+        client.replace(STREAM, original.revision, expanded).await,
+        Ok(current),
+    );
+
+    // Shut down two original voters and reopen the two added voters with the
+    // original genesis configuration before admitting a new catalog write.
+    for voter in [initial[0], initial[1], expanded[3], expanded[4]] {
+        cluster.running.remove(&voter).unwrap().stop().await;
+    }
+    cluster.restart(expanded[3]).await;
+    cluster.restart(expanded[4]).await;
+    let cold = cluster.client(&cluster.credentials);
+    let after = StreamId(124);
+    cold.create(after, data, 4096).await.unwrap();
+    assert_eq!(cold.claimed_voters(before).await, Ok(Some(data)));
+    assert_eq!(cold.configuration(STREAM).await, Ok(current));
+    assert_eq!(cold.claimed_voters(after).await, Ok(Some(data)));
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn five_voter_catalog_grants_leases_and_creates_after_two_voters_stop() {
     let voters = Voters::from([5, 6, 7, 8, 9].map(Uuid::from_u128));
     let mut cluster = Cluster::start_addressed(["a", "b", "c", "d"], Some(voters), false, 2).await;

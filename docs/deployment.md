@@ -153,9 +153,13 @@ Migrating from a single catalog keeper is a full stop: stop every keeper, add
 `catalog_voters` to every keeper and consumer config, then start them all. The
 `catalog` keeper must be up for the first start. Before bootstrapping five
 voters, upgrade all keepers and consumers to a release that supports five.
-The existing replicated catalog keeps its genesis roster and width. Assign
-new members through Raft replacement. The config remains the genesis roster
-and a list of discovery contacts. See the README section "Keeper-hosted
+An existing three-voter catalog can grow to five online after finalizing
+cluster level 8. Enroll two additional keepers in the inventory, then use
+`logkeeper admin replace` for stream `ffffffff-ffff-ffff-ffff-ffffffffffff`
+with the current revision and a five-voter roster that includes all three
+current voters. The catalog installs both added replicas before committing
+the joint membership. The config continues to name the original genesis
+roster. See the README section "Keeper-hosted
 consensus streams".
 
 ### Co-locating with RTDB
