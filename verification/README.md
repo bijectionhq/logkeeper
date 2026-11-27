@@ -166,8 +166,15 @@ checks cover what Logkeeper adds on top of Raft, each at its own level.
   eligibility, keeper incarnations, park eligibility and the parked answer,
   silent voters, stale learners, repair order, slots and backoff, the load
   ceiling and the two-live-voters rule, leader preference, retirement on a
-  proof, the seal under the recovery fence, and WAL boundary-slot selection
-  and rollback detection. Each law has negative controls, production
+  proof, the seal under the recovery fence, WAL boundary-slot selection
+  and rollback detection, the lease arithmetic with suspend-aware expiry and
+  the recovery wait-out, offload progress per lineage, and the failure-domain
+  spread of three- and five-voter rosters. The
+  [storage](verus/consensus_storage/README.md), [offload](verus/consensus_offload/README.md)
+  and [wire](verus/consensus_wire/README.md) areas verify the segmented WAL's
+  live-byte accounting, compaction selection, salvage scope and commit-index
+  restore, the offload restore plan, and the version gate that keeps N-only
+  values off N-1 connections. Each law has negative controls, production
   mutations the proof must reject.
 - **Lean, abstract protocol.** [`Logkeeper.ConsensusAdditions`](lean/Logkeeper/ConsensusAdditions.lean)
   proves state-machine theorems for any number of steps:
@@ -219,6 +226,10 @@ checks cover what Logkeeper adds on top of Raft, each at its own level.
 | Durable commit index (`Record::Committed`, LKRWAL06) | Not local | `commit_index_follows_its_round`, `crash_replays_a_sound_commit_index` | Not modeled | Not targeted |
 | An ambiguous retry is never refused definitely, across a recovery too | `written_step`, `absorb_recovery` (`consensus_admission`) | `committed_attempt_retry_is_indefinite`, `summary_covers_every_erasing_recovery` (the keeper before the summary: `keeper_lookup_refuses_an_erased_attempt`) | Not modeled | Lost replies (`bugs.rs`); retries across a recovery, trim, snapshot, restart, import and restore in `keeper/tests/authority.rs` and `keeper/tests/offload.rs` |
 | An RTDB follower never resumes across an unseen recovery | Not local | `recheck_keeps_the_applied_prefix`, `follower_never_resumes_across_an_unseen_recovery` | Not modeled | Not targeted |
+| WAL live bytes, compaction selection, salvage scope, commit-index restore | `consensus_storage` (`compactable`, `salvage_scope`, `advance_commit`, `loses_commit`) | Not modeled | Not modeled | WAL crash cuts |
+| Lease expiry on a suspend-aware clock, recovery wait-out over every grant | `sampled_lease_valid`, `recovery_elapsed`, `longest_grant`, `include_recovery_wait` | `EpochLease` | `EpochLeases.tla` | Lease transitions in trace validation |
+| Offload progress per lineage, restore plan | `lineage_offload`, `offloaded_through`, `consensus_offload` | `OffloadPrefix` | Not modeled | Offload transitions in trace validation |
+| No N-only variant on an N-1 connection | `consensus_wire` (`frame_send`, `legacy_sends`, `legacy_payload`); exhaustive classification by the compiler and `network/versions` tests | Not modeled | Not modeled | Not targeted |
 
 The Lean recovery theorem is exact about its scope. While at most one lost
 voter runs, a read or commit that a quorum of the serving replica's
