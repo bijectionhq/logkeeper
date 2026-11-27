@@ -2,7 +2,9 @@
 
 Two finite-state TLA+ specifications cover what Logkeeper adds on top of
 OpenRaft 0.10.1 in `src/stream/consensus/`, and a third models the endgame's
-configuration authority with epoch leases. `check.sh` checks every
+configuration authority with epoch leases. Five small models check single
+mechanisms (async append, compaction relocation, offloaded reads, scoped
+writer sessions, RF 5 survivor ranking). `check.sh` checks every
 configuration with a pinned TLC and exits non-zero when any outcome differs
 from the one it expects, so CI can call it.
 
@@ -516,6 +518,31 @@ is never cut in place: the verified cut goes to a fresh stream ID.
 Abstractions: the lease and revision are one gate per stream (the epoch
 lease mechanics are `EpochLeases`'), and a fence's stream scope stands for
 the structural routing of `append_session_batch` by `fence.stream`.
+
+### `RecoveryRF5.tla`: two survivors, ranking and cut
+
+An abstract RF 5 recovery that `EpochLeases` does not cover: it keeps the
+writer's whole log, chosen tip-first. Here survivors `s` and `t`, lost `a`,
+`b`, `c` running with leases, and three replacements start after the old
+quorum chose two positions; the survivors may disagree on the known commit,
+and one may hold a longer speculative tail at a higher term. The recovery
+picks the survivor that knows the later commit, then the more advanced log
+(fc4855ed), probes the other's progress, cuts at the writer's known commit,
+waits out the leases, and installs the recovered history on the new five.
+The lost voters may keep committing and send old traffic to a survivor
+after any partition heals; identity exclusion refuses it.
+
+| Config | Rule dropped | Result |
+| --- | --- | --- |
+| `RecoveryRF5` | none | `TwoSurvivorsKeepTheirCommits`, `LostIdentitiesExcluded`, `NoMixedHistory`, `ReadRequiresRecoveredQuorum`, `RecoveryServes` pass, 5,736 states |
+| `RecoveryRF5NoExclusion` | no identity exclusion | `TwoSurvivorsKeepTheirCommits` violated |
+| `RecoveryRF5TipFirst` | survivors ranked by tip | `TwoSurvivorsKeepTheirCommits` violated: the cut drops a commit the other survivor knew |
+| `RecoveryRF5NoWait` | no lease wait-out | `NoMixedHistory` violated |
+
+Abstractions: the Raft steps are collapsed (a lost-leader message overwrites
+a survivor's log and commit in one step), and old traffic reaches the
+second survivor only after the probe; before it, what the survivor learns is
+what the probe reports.
 
 ## Fidelity review
 

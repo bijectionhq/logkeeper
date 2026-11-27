@@ -110,6 +110,10 @@ echo "Using Java: $JAVA"
 echo "Using TLC:  $JAR"
 echo
 
+run_case "RecoveryRF5"                "RecoveryRF5.tla" "RecoveryRF5.cfg"               pass liveness
+run_case "RecoveryRF5NoExclusion"     "RecoveryRF5.tla" "RecoveryRF5NoExclusion.cfg"    invariant:TwoSurvivorsKeepTheirCommits
+run_case "RecoveryRF5TipFirst"        "RecoveryRF5.tla" "RecoveryRF5TipFirst.cfg"       invariant:TwoSurvivorsKeepTheirCommits
+run_case "RecoveryRF5NoWait"          "RecoveryRF5.tla" "RecoveryRF5NoWait.cfg"         invariant:NoMixedHistory
 run_case "Relocation"                 "Relocation.tla" "Relocation.cfg"                pass liveness
 run_case "RelocationNoCheckpointPin"  "Relocation.tla" "RelocationNoCheckpointPin.cfg" invariant:RootsReadable
 run_case "RelocationReusePages"       "Relocation.tla" "RelocationReusePages.cfg"      invariant:RootsReadable
