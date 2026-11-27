@@ -3,12 +3,13 @@
 //! (`/problems`, `/problem-streams`).
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     io,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
+use journal_contract::StreamId;
 use openraft::{Instant as _, ServerState, async_runtime::WatchReceiver};
 use serde::Serialize;
 use tokio::{
@@ -24,7 +25,8 @@ use uuid::Uuid;
 use super::{Engine, MAX_LOG_SUFFIX, liveness};
 use crate::stream::{
     consensus::{
-        logging::stream_uuid,
+        RaftTypes,
+        logging::{rate_limit, stream_uuid},
         metrics::{FollowerLag, ScrapeSnapshot},
         state::MAX_RETAINED_RECORDS,
     },
@@ -32,8 +34,11 @@ use crate::stream::{
 };
 
 const MAX_ADMIN_CONNECTIONS: usize = 16;
+/// The whole life of one admin connection: TLS handshake, request and response.
 const ADMIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Request line plus headers; admin requests carry no body.
 const MAX_REQUEST_BYTES: usize = 8192;
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// Flag a stream as near its unpurged WAL suffix ceiling at 75% of `MAX_LOG_SUFFIX`.
 pub(super) const SUFFIX_NEAR_CEILING: usize = (MAX_LOG_SUFFIX as usize * 3) / 4;
 /// Flag a stream as near its retained-record ceiling at 75% of `MAX_RETAINED_RECORDS`.
@@ -41,6 +46,20 @@ pub(super) const RECORD_NEAR_CEILING: u64 = (MAX_RETAINED_RECORDS as u64 * 3) / 
 /// Follower lag in Raft log entries above which a stream is flagged under-replicated
 /// even while heartbeats are still arriving.
 const UNDER_REPLICATED_LAG_ENTRIES: u64 = 64;
+
+/// Every reason `classify_stream_problems` reports. `/metrics` exports each
+/// one, at zero when no stream has it, so alerts see a series to compare.
+pub(super) const PROBLEM_REASONS: [&str; 9] = [
+    "quarantined",
+    "leaderless",
+    "under_replicated",
+    "parked_with_dead_voter",
+    "joint_config",
+    "near_suffix_ceiling",
+    "near_record_ceiling",
+    "near_quota_ceiling",
+    "led_outside_preferred_domain",
+];
 
 #[derive(Debug, Serialize)]
 pub(super) struct LiveReport {
@@ -182,31 +201,55 @@ impl Engine {
         listener: TcpListener,
         acceptor: Option<TlsAcceptor>,
     ) -> io::Result<()> {
+        // The admin listener is auxiliary: neither a failed accept nor a
+        // panicking request may stop the keeper, so it logs and goes on.
         let mut tasks = JoinSet::new();
         let connections = Arc::new(Semaphore::new(MAX_ADMIN_CONNECTIONS));
         loop {
             tokio::select! {
                 _ = self.stop.cancelled() => return Ok(()),
                 result = tasks.join_next(), if !tasks.is_empty() => {
-                    if let Some(Err(error)) = result {
-                        return Err(error.into());
+                    if let Some(Err(error)) = result
+                        && let Some(dropped) = rate_limit("admin.request_panicked", None)
+                    {
+                        tracing::error!(
+                            keeper = %self.id,
+                            error = %error,
+                            dropped = dropped,
+                            "admin request failed"
+                        );
                     }
                 }
-                accepted = async {
-                    let permit = connections
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .expect("open admin semaphore");
-                    let (socket, _) = listener.accept().await?;
-                    Ok::<_, io::Error>((socket, permit))
-                } => {
-                    let (socket, permit) = accepted?;
+                accepted = listener.accept() => {
+                    let socket = match accepted {
+                        Ok((socket, _)) => socket,
+                        Err(error) => {
+                            if let Some(dropped) = rate_limit("admin.accept", None) {
+                                tracing::warn!(
+                                    keeper = %self.id,
+                                    error = %error,
+                                    dropped = dropped,
+                                    "admin accept failed"
+                                );
+                            }
+                            tokio::time::sleep(ACCEPT_BACKOFF).await;
+                            continue;
+                        }
+                    };
+                    // Every slot busy: shed the connection at once instead
+                    // of queueing it behind slow clients.
+                    let Ok(permit) = connections.clone().try_acquire_owned() else {
+                        drop(socket);
+                        continue;
+                    };
                     let engine = self.clone();
                     let acceptor = acceptor.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
-                        let _ = engine.admin_connection(socket, acceptor).await;
+                        // One deadline covers the handshake, the request and
+                        // the response, so a slow client holds a slot for at
+                        // most `ADMIN_TIMEOUT`.
+                        let _ = timeout(ADMIN_TIMEOUT, engine.admin_connection(socket, acceptor)).await;
                     });
                 }
             }
@@ -221,7 +264,7 @@ impl Engine {
         let _ = socket.set_nodelay(true);
         match acceptor {
             Some(acceptor) => {
-                let mut stream = timeout(ADMIN_TIMEOUT, acceptor.accept(socket)).await??;
+                let mut stream = acceptor.accept(socket).await?;
                 let (_, tls) = stream.get_ref();
                 let authorized = transport::leaf(tls.peer_certificates())
                     .and_then(transport::client_identity)
@@ -240,9 +283,8 @@ impl Engine {
         stream: &mut S,
         authorized: bool,
     ) -> io::Result<()> {
-        let request = match timeout(ADMIN_TIMEOUT, read_http_request(stream)).await {
-            Ok(Ok(request)) => request,
-            _ => return Ok(()),
+        let Ok(request) = read_http_request(stream).await else {
+            return Ok(());
         };
         let Some((method, target)) = parse_request_line(&request) else {
             let body = r#"{"error":"bad request"}"#;
@@ -362,6 +404,8 @@ impl Engine {
         let parked = self.parked.read().clone();
         let deleted = self.deleted.read().clone();
         let quarantined = self.quarantined.read().clone();
+        let led_since = self.led_since.lock().clone();
+        let silence_limit = self.heartbeat_silence_limit();
         let matched_window = Duration::from_millis(self.raft_config.election_timeout_max * 2);
 
         let mut hosted_streams = 0usize;
@@ -418,7 +462,12 @@ impl Engine {
                 && metrics.last_applied.map(|id| id.index) == metrics.last_log_index;
             match metrics.state {
                 ServerState::Leader => {
-                    if !applied_caught_up {
+                    if self.lost_quorum(stream, &metrics, &led_since, silence_limit) {
+                        unmatched_streams.push(UnmatchedStream {
+                            stream: stream_uuid(stream),
+                            reason: "leader_without_quorum",
+                        });
+                    } else if !applied_caught_up {
                         unmatched_streams.push(UnmatchedStream {
                             stream: stream_uuid(stream),
                             reason: "leader_applying",
@@ -522,6 +571,21 @@ impl Engine {
 
             let (voters, open_metrics) = if let Some(group) = groups.get(&stream) {
                 let metrics = group.raft.metrics().borrow_watched().clone();
+                // A membership change in flight needs both voter sets; a
+                // stop now can stall it until this keeper returns.
+                if metrics
+                    .membership_config
+                    .membership()
+                    .get_joint_config()
+                    .len()
+                    > 1
+                {
+                    blocking.push(StopBlocker {
+                        stream: stream_uuid(stream),
+                        voter: self.id,
+                        reason: "joint_config",
+                    });
+                }
                 let mut voters = metrics
                     .membership_config
                     .membership()
@@ -621,7 +685,8 @@ impl Engine {
         let mut suffix_entries_max = 0u64;
         let mut follower_lags: BTreeMap<Uuid, (u64, u64, u64)> = BTreeMap::new();
         let mut problems = Vec::new();
-        let mut problem_counts: BTreeMap<&'static str, u64> = BTreeMap::new();
+        let mut problem_counts: BTreeMap<&'static str, u64> =
+            PROBLEM_REASONS.iter().map(|reason| (*reason, 0)).collect();
 
         for genesis in self.disk.streams() {
             let stream = genesis.stream;
@@ -727,6 +792,9 @@ impl Engine {
                         if active_voters * 2 <= voters.len() {
                             leader_lost_quorum = true;
                         }
+                    }
+                    if self.lost_quorum(stream, &metrics, &led_since, silence_limit) {
+                        leader_lost_quorum = true;
                     }
                 }
                 let (records, bytes) = group.state.retained_stats();
@@ -962,6 +1030,29 @@ impl Engine {
             .collect()
     }
 
+    /// Whether this keeper leads `stream` without a quorum: no quorum
+    /// acknowledged it within `silence_limit`. OpenRaft 0.10.1 keeps an
+    /// isolated leader in `ServerState::Leader` until
+    /// `quorum_loss_probe_interval`, while its lease has long expired, so the
+    /// server state alone does not show it.
+    fn lost_quorum(
+        &self,
+        stream: StreamId,
+        metrics: &openraft::RaftMetrics<RaftTypes>,
+        led_since: &HashMap<StreamId, (u64, Instant)>,
+        silence_limit: Duration,
+    ) -> bool {
+        if metrics.state != ServerState::Leader {
+            return false;
+        }
+        match &metrics.last_quorum_acked {
+            Some(acked) => acked.elapsed() >= silence_limit,
+            None => led_since.get(&stream).is_some_and(|(term, since)| {
+                *term == metrics.current_term && since.elapsed() >= silence_limit
+            }),
+        }
+    }
+
     fn heartbeat_silence_limit(&self) -> Duration {
         (liveness::PING_INTERVAL * 3).max(Duration::from_millis(
             self.raft_config.election_timeout_max * 2,
@@ -973,19 +1064,27 @@ async fn read_http_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<S
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
     loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.windows(2).any(|w| w == b"\n\n") {
-            break;
-        }
-        if buf.len() >= MAX_REQUEST_BYTES {
+        let room = MAX_REQUEST_BYTES - buf.len();
+        if room == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "admin HTTP request headers exceed limit",
             ));
+        }
+        let n = stream.read(&mut chunk[..room.min(512)]).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "admin HTTP request ended before its headers",
+            ));
+        }
+        // Only the new bytes and the three before them can complete the
+        // blank line that ends the headers.
+        let from = buf.len().saturating_sub(3);
+        buf.extend_from_slice(&chunk[..n]);
+        let tail = &buf[from..];
+        if tail.windows(4).any(|w| w == b"\r\n\r\n") || tail.windows(2).any(|w| w == b"\n\n") {
+            break;
         }
     }
     String::from_utf8(buf).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
@@ -997,7 +1096,7 @@ fn parse_request_line(request: &str) -> Option<(&str, &str)> {
     let method = parts.next()?;
     let target = parts.next()?;
     let version = parts.next()?;
-    if !version.starts_with("HTTP/1.") {
+    if !version.starts_with("HTTP/1.") || !target.starts_with('/') || parts.next().is_some() {
         return None;
     }
     Some((method, target))
@@ -1017,14 +1116,12 @@ async fn write_http_response<S: AsyncWrite + Unpin>(
          Connection: close\r\n\r\n",
         body.len()
     );
-    timeout(ADMIN_TIMEOUT, async {
-        stream.write_all(header.as_bytes()).await?;
-        if !head_only {
-            stream.write_all(body).await?;
-        }
-        stream.flush().await
-    })
-    .await?
+    stream.write_all(header.as_bytes()).await?;
+    if !head_only {
+        stream.write_all(body).await?;
+    }
+    stream.flush().await?;
+    stream.shutdown().await
 }
 
 #[cfg(test)]
@@ -1112,5 +1209,57 @@ mod tests {
         });
         assert!(parked_dead.contains(&"parked_with_dead_voter"));
         assert!(!parked_dead.contains(&"leaderless"));
+        for reason in problems
+            .iter()
+            .chain(&preferred_mismatch)
+            .chain(&parked_dead)
+        {
+            assert!(PROBLEM_REASONS.contains(reason), "{reason} is not exported");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_reader_bounds_headers_and_needs_their_end() {
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let request = read_http_request(&mut server).await.unwrap();
+        assert_eq!(parse_request_line(&request), Some(("GET", "/metrics")));
+
+        // Headers that never end are cut at the limit.
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(&vec![b'a'; MAX_REQUEST_BYTES + 1])
+            .await
+            .unwrap();
+        assert!(read_http_request(&mut server).await.is_err());
+
+        // A request cut before its blank line is not served.
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        drop(client);
+        assert!(read_http_request(&mut server).await.is_err());
+
+        // The blank line may arrive split across reads.
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let reader = tokio::spawn(async move { read_http_request(&mut server).await });
+        client.write_all(b"GET /live HTTP/1.1\r\n\r").await.unwrap();
+        tokio::task::yield_now().await;
+        client.write_all(b"\n").await.unwrap();
+        assert!(reader.await.unwrap().is_ok());
+
+        for bad in [
+            "GET metrics HTTP/1.1",
+            "GET /metrics HTTP/2",
+            "GET /metrics HTTP/1.1 extra",
+            "GET",
+        ] {
+            assert_eq!(parse_request_line(bad), None, "{bad}");
+        }
     }
 }
