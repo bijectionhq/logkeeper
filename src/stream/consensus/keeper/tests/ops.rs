@@ -121,9 +121,18 @@ async fn admin_plain_http_metrics_health_and_validation() {
     assert_eq!(live["live"], true);
     assert_eq!(live["wal_healthy"], true);
 
-    // /safe-to-stop returns 200 OK while all voters are up.
-    let (code, _, body) = http_get(admin_addr, "/safe-to-stop").await;
-    assert_eq!(code, 200);
+    // /safe-to-stop returns 200 OK once liveness pings discover all voters.
+    let body = timeout(WAIT, async {
+        loop {
+            let (code, _, body) = http_get(admin_addr, "/safe-to-stop").await;
+            if code == 200 {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("safe-to-stop becomes 200 while all voters are up");
     let safe: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(safe["safe"], true);
     assert_eq!(safe["blocking"].as_array().unwrap().len(), 0);
