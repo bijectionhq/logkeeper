@@ -55,6 +55,9 @@ pub(super) struct ClusterOptions {
     /// and 9 (domains g and h) and finalizes the replication-factor
     /// version before the first create.
     pub replication: usize,
+    /// Every keeper offloads to a directory store with small batches, a
+    /// small lag bound and aggressive local retention.
+    pub offload: bool,
 }
 
 impl Default for ClusterOptions {
@@ -69,6 +72,7 @@ impl Default for ClusterOptions {
             client_deadline_ms: 4_000,
             replication: 3,
             ignore_reused_ids: false,
+            offload: false,
         }
     }
 }
@@ -170,7 +174,59 @@ pub(super) struct SimCluster {
     _dir: tempfile::TempDir,
 }
 
+/// The harness's offload store: small objects and batches, a lag bound a
+/// short outage reaches, and retention that keeps about 1 KiB per stream.
+fn offload_config(directory: &std::path::Path) -> crate::stream::consensus::OffloadConfig {
+    serde_json::from_value(serde_json::json!({
+        "url": format!("file://{}", directory.display()),
+        "batch_bytes": 1024,
+        "batch_interval_ms": 150,
+        "max_lag_bytes": 2048,
+        "retain_local_bytes": 1024,
+    }))
+    .unwrap()
+}
+
 impl SimCluster {
+    /// Takes the offload store away (its directory becomes a file) or
+    /// brings it back.
+    pub fn store_outage(&self, down: bool) {
+        let store = self._dir.path().join("offload");
+        let away = self._dir.path().join("offload-away");
+        if down && store.is_dir() {
+            std::fs::rename(&store, &away).unwrap();
+            std::fs::write(&store, b"store outage").unwrap();
+        } else if !down && away.is_dir() {
+            std::fs::remove_file(&store).unwrap();
+            std::fs::rename(&away, &store).unwrap();
+        }
+    }
+
+    /// The offload store as the keepers see it.
+    pub fn offload_store(&self) -> Option<crate::stream::consensus::offload::Store> {
+        self.options.offload.then(|| {
+            crate::stream::consensus::offload::Store::open(&offload_config(
+                &self._dir.path().join("offload"),
+            ))
+            .unwrap()
+        })
+    }
+
+    /// The offload counters summed over the running keepers.
+    pub fn offload_counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.running
+            .values()
+            .filter_map(|running| running.engine.offload.as_ref())
+            .fold((0, 0), |(reads, refused), offload| {
+                let metrics = &offload.store.metrics;
+                (
+                    reads + metrics.remote_reads.load(Relaxed),
+                    refused + metrics.backpressured_appends.load(Relaxed),
+                )
+            })
+    }
+
     pub async fn start(seed: u64, options: ClusterOptions) -> Self {
         let faults = FaultNetwork::new(seed);
         let dir = tempfile::tempdir().unwrap();
@@ -256,7 +312,9 @@ impl SimCluster {
                 timed_authority: None,
                 log_format: Default::default(),
                 admin: None,
-                offload: None,
+                offload: options
+                    .offload
+                    .then(|| offload_config(&dir.path().join("offload"))),
                 sync_mode: crate::server::durability::SyncMode::Fsync,
                 retired: BTreeSet::new(),
             };
@@ -659,7 +717,11 @@ impl SimCluster {
             }),
             Err(JournalError::NotFound) | Err(_) => None,
             Ok(_head) => {
-                let first_page = match state.page(Lsn(1), 512).await {
+                // Records below the local floor were offloaded and dropped
+                // by retention, deterministically on every voter: compare
+                // the local copies from there.
+                let start = state.offload_view().map_or(Lsn(1), |view| view.local_floor);
+                let first_page = match state.page(start, 512).await {
                     Ok(page) => page,
                     Err(JournalError::Trimmed { floor }) => state.page(floor, 512).await.ok()?,
                     Err(JournalError::Deleted) => {
@@ -676,7 +738,26 @@ impl SimCluster {
                 };
                 let floor = first_page.floor;
                 let observed_head = first_page.head;
-                let mut records = first_page.records;
+                // Read the dropped part back from the store through this
+                // keeper's own store path, so durability covers it too.
+                let mut records = Vec::new();
+                let mut below = floor;
+                while below < start {
+                    let remote = state.remote(below)?;
+                    let page = server
+                        .engine
+                        .offload
+                        .as_ref()?
+                        .read(stream, remote, 512)
+                        .await
+                        .ok()?;
+                    let Some((last, _)) = page.records.last() else {
+                        return None;
+                    };
+                    below = Lsn(last.0 + 1);
+                    records.extend(page.records);
+                }
+                records.extend(first_page.records);
                 let mut next = records
                     .last()
                     .map(|(lsn, _)| Lsn(lsn.0 + 1))

@@ -60,6 +60,12 @@ pub(super) enum Violation {
         stream: StreamId,
         detail: String,
     },
+    /// The offload store holds a record that differs from the committed
+    /// log, or `offloaded_through` passed the head.
+    OffloadPrefix {
+        stream: StreamId,
+        detail: String,
+    },
     CrossVoterDivergence {
         stream: StreamId,
         voters: Voters,
@@ -117,6 +123,9 @@ impl fmt::Display for Violation {
             }
             Self::RecoveryViolation { stream, detail } => {
                 write!(f, "RECOVERY violation on {stream:?}: {detail}")
+            }
+            Self::OffloadPrefix { stream, detail } => {
+                write!(f, "OFFLOAD PREFIX violation on {stream:?}: {detail}")
             }
             Self::CrossVoterDivergence {
                 stream,

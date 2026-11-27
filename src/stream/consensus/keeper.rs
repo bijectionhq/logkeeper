@@ -2816,6 +2816,67 @@ impl Group {
         )
     }
 
+    /// A page from `from` that starts below the local floor: records from
+    /// the store, continued past each lineage's end and into the local
+    /// copies, so the page is as full as a local one would be.
+    async fn read_through_store(
+        &self,
+        offload: &offload::Offloader,
+        from: Lsn,
+        limit: usize,
+    ) -> journal_contract::Result<Outcome> {
+        let limit = limit.min(super::MAX_RECORDS_PER_PAGE);
+        let mut page: Option<journal_contract::Page> = None;
+        let mut next = from;
+        let mut bytes = 0usize;
+        loop {
+            let got = page.as_ref().map_or(0, |page| page.records.len());
+            if got >= limit {
+                break;
+            }
+            let part = match self.state.remote(next) {
+                Some(remote) => {
+                    offload
+                        .read(self.genesis.stream, remote, limit - got)
+                        .await?
+                }
+                None if page.is_some() => match self.state.page(next, limit - got).await {
+                    Ok(part) => part,
+                    Err(_) => break,
+                },
+                None => self.state.page(next, limit - got).await?,
+            };
+            let Some(page) = page.as_mut() else {
+                next = part
+                    .records
+                    .last()
+                    .map_or(Lsn(u64::MAX), |(lsn, _)| Lsn(lsn.0 + 1));
+                bytes = part.records.iter().map(|(_, record)| record.len()).sum();
+                page = Some(part);
+                continue;
+            };
+            let mut added = false;
+            for (lsn, record) in part.records {
+                if lsn != next || bytes + record.len() > super::MAX_PAGE {
+                    break;
+                }
+                bytes += record.len();
+                next = Lsn(lsn.0 + 1);
+                page.records.push((lsn, record));
+                added = true;
+            }
+            page.head = page.head.max(part.head);
+            if !added {
+                break;
+            }
+        }
+        Ok(Outcome::Page(page.unwrap_or(journal_contract::Page {
+            floor: from,
+            records: Vec::new(),
+            head: Lsn(0),
+        })))
+    }
+
     async fn read(
         &self,
         from: Lsn,
@@ -2852,12 +2913,8 @@ impl Group {
                 {
                     return Outcome::Refused(JournalError::Unavailable);
                 }
-                if let Some(remote) = self.state.remote(from) {
-                    return offload
-                        .read(self.genesis.stream, remote, limit)
-                        .await
-                        .map(Outcome::Page)
-                        .into();
+                if self.state.remote(from).is_some() {
+                    return self.read_through_store(offload, from, limit).await.into();
                 }
             }
             let page = self.state.page(from, limit).await;

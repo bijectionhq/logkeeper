@@ -55,6 +55,12 @@ enum Profile {
     OperatorRecovery,
     /// Mixed full-chaos schedule combining all non-wipe faults.
     FullMix,
+    /// Continuous offload to a directory store with retention: uploads
+    /// across leader changes and crashes, a store outage with backpressure,
+    /// reads below the local floor, trims racing uploads, and an operator
+    /// recovery that may restore from the store. Run by its own test, not
+    /// in the seed rotation.
+    Offload,
 }
 
 impl Profile {
@@ -164,6 +170,11 @@ enum ClientOp {
         writer: WriterKind,
         stale_epoch: bool,
     },
+    /// Ask the leader to upload everything committed (offload flush),
+    /// concurrently with the other operations of its step.
+    OffloadFlush {
+        stream_idx: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +233,8 @@ enum Step {
     /// when `leader`, write and read through the three that remain, then
     /// restart them.
     LoseTwoOfFive { stream_idx: usize, leader: bool },
+    /// Take the offload store away, or bring it back.
+    StoreOutage { down: bool },
     /// Brief sleep to allow elections, heartbeats, or repairs to advance.
     PauseMs(u64),
 }
@@ -310,14 +323,16 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
         client_deadline_ms: if config.allow_wipe { 2_500 } else { 4_000 },
         ignore_reused_ids: config.ignore_reused_ids,
         replication: config.replication,
+        offload: matches!(profile, Profile::Offload),
     };
 
     let data_ids = [1, 2, 3, 4].map(Uuid::from_u128);
-    let stream_count = if config.allow_wipe || matches!(profile, Profile::OperatorRecovery) {
-        1
-    } else {
-        2
-    };
+    let stream_count =
+        if config.allow_wipe || matches!(profile, Profile::OperatorRecovery | Profile::Offload) {
+            1
+        } else {
+            2
+        };
     let mut streams = Vec::with_capacity(stream_count);
     for idx in 0..stream_count {
         let voters = match (config.replication, idx) {
@@ -768,6 +783,77 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
                 retry_previous: false,
             }]));
         }
+        Profile::Offload => {
+            let append = |writer| ClientOp::AppendBatch {
+                stream_idx: 0,
+                writer,
+                count: 4,
+            };
+            let read = ClientOp::Read {
+                stream_idx: 0,
+                wait_ms: 0,
+            };
+            for _ in 0..3 {
+                steps.push(Step::Ops(vec![append(WriterKind::A), read.clone()]));
+            }
+            steps.push(Step::PauseMs(400));
+            steps.push(Step::Ops(vec![ClientOp::OffloadFlush { stream_idx: 0 }]));
+            // Uploads continue across a leader change and a leader crash.
+            steps.push(Step::PreferLeader {
+                stream_idx: 0,
+                voter_slot: 1 + rng.range(2),
+            });
+            steps.push(Step::Ops(vec![append(WriterKind::A), read.clone()]));
+            steps.push(Step::StopKeeper {
+                keeper_slot: 0,
+                crash: rng.chance(1, 2),
+            });
+            steps.push(Step::Ops(vec![append(WriterKind::A), read.clone()]));
+            steps.push(Step::RestartKeeper { keeper_slot: 0 });
+            // A store outage: uploads fail and backpressure refuses appends.
+            steps.push(Step::StoreOutage { down: true });
+            for _ in 0..8 {
+                steps.push(Step::Ops(vec![
+                    ClientOp::AppendBatch {
+                        stream_idx: 0,
+                        writer: WriterKind::A,
+                        count: 8,
+                    },
+                    read.clone(),
+                ]));
+                steps.push(Step::PauseMs(200));
+            }
+            steps.push(Step::StoreOutage { down: false });
+            steps.push(Step::PauseMs(800));
+            // Trims race uploads and reads below the local floor.
+            for _ in 0..3 {
+                steps.push(Step::Ops(vec![
+                    ClientOp::Trim {
+                        stream_idx: 0,
+                        writer: WriterKind::A,
+                        stale_epoch: false,
+                    },
+                    ClientOp::OffloadFlush { stream_idx: 0 },
+                    read.clone(),
+                    append(WriterKind::A),
+                ]));
+            }
+            if rng.chance(1, 2) {
+                steps.push(Step::PartitionSymmetric {
+                    keeper_slot: 0,
+                    lanes: LaneKey::PEER.to_vec(),
+                });
+                steps.push(Step::Ops(vec![append(WriterKind::A)]));
+                steps.push(Step::HealNetwork);
+            }
+            steps.push(Step::Ops(vec![ClientOp::OffloadFlush { stream_idx: 0 }]));
+            steps.push(Step::OperatorRecovery { stream_idx: 0 });
+            steps.push(Step::Ops(vec![append(WriterKind::B), read.clone()]));
+            steps.push(Step::Ops(vec![
+                ClientOp::OffloadFlush { stream_idx: 0 },
+                read,
+            ]));
+        }
         Profile::FullMix => {
             // Mix randomized ops, per-lane faults, crash/restart, replace, trim.
             steps.push(Step::ImpairLane {
@@ -921,6 +1007,7 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
     // fault runs under enforced liveness leases from the catalog. Five-voter
     // streams need the finalized version, which also enforces leases.
     if plan.options.replication == 5
+        || plan.options.offload
         || env::var("LOGKEEPER_CONSENSUS_LEASES")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     {
@@ -1471,6 +1558,20 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                     cluster.restart(id).await;
                 }
             }
+            Step::StoreOutage { down } => {
+                // Counters live in the keepers, which later steps restart.
+                let (remote_reads, refused) = cluster.offload_counts();
+                if remote_reads > 0 {
+                    cluster.faults.hit("op:remote_read");
+                }
+                if refused > 0 {
+                    cluster.faults.hit("op:offload_backpressure");
+                }
+                cluster.store_outage(*down);
+                if *down {
+                    cluster.faults.hit("fault:store_outage");
+                }
+            }
             Step::PauseMs(ms) => {
                 tokio::time::sleep(Duration::from_millis(*ms)).await;
             }
@@ -1478,6 +1579,7 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
     }
 
     // Heal all faults and restart stopped/crashed keepers for final verification.
+    cluster.store_outage(false);
     cluster.faults.heal_all();
     cluster.clear_disk_faults();
     cluster.restart_all_stopped().await;
@@ -1549,14 +1651,114 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
         converged.insert(stream, (final_voters, conv));
     }
 
+    let mut offload_violation = None;
+    if let Some(store) = cluster.offload_store() {
+        let (remote_reads, refused) = cluster.offload_counts();
+        if remote_reads > 0 {
+            cluster.faults.hit("op:remote_read");
+        }
+        if refused > 0 {
+            cluster.faults.hit("op:offload_backpressure");
+        }
+        for stream in trackers
+            .lock()
+            .iter()
+            .filter(|t| !t.deleted)
+            .map(|t| t.stream)
+            .collect::<Vec<_>>()
+        {
+            if let Err(detail) = check_offloaded_prefix(&probe, &store, stream).await {
+                offload_violation = Some(Violation::OffloadPrefix { stream, detail });
+                break;
+            }
+        }
+    }
     let coverage = cluster.faults.coverage();
     let check_result = history.check_all(&converged);
     cluster.stop_all().await;
+    if let Some(violation) = offload_violation {
+        return Err(violation);
+    }
 
     check_result.map(|()| RunSummary {
         coverage,
         total_ops,
     })
+}
+
+/// Checks that the uploaded prefix is a prefix of the committed log: every
+/// record the store holds for `stream`, under the lineages the leader
+/// reports and from the trim floor on, equals the record a linearizable
+/// read returns at its LSN, and `offloaded_through` never passes the head.
+async fn check_offloaded_prefix(
+    probe: &crate::stream::consensus::Client,
+    store: &crate::stream::consensus::offload::Store,
+    stream: StreamId,
+) -> Result<(), String> {
+    let status = {
+        let end = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match probe.offload_status(stream, true).await {
+                Ok(status) => break status,
+                Err(error) if tokio::time::Instant::now() >= end => {
+                    return Err(format!("no offload status: {error:?}"));
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    };
+    if status.offloaded_through > status.head {
+        return Err(format!(
+            "offloaded_through {} passes the head {}",
+            status.offloaded_through.0, status.head.0
+        ));
+    }
+    let plan = store
+        .plan(stream, &status.lineages, status.floor)
+        .await
+        .map_err(|error| format!("cannot list the store: {error}"))?;
+    let segments = store
+        .segments(stream, &plan)
+        .await
+        .map_err(|error| format!("cannot read the store: {error}"))?;
+    let mut uploaded = BTreeMap::new();
+    for (segment, first, last) in segments {
+        for record in &segment.records {
+            if record.lsn >= first && record.lsn <= last && record.lsn <= status.head {
+                uploaded.insert(record.lsn, record.bytes.clone());
+            }
+        }
+    }
+    if status.offloaded_through >= status.floor
+        && plan.end().is_none_or(|end| end < status.offloaded_through)
+    {
+        return Err(format!(
+            "offloaded_through {} but the store's run ends at {:?}",
+            status.offloaded_through.0,
+            plan.end()
+        ));
+    }
+    let mut next = status.floor;
+    while next <= status.head {
+        let page = probe
+            .read(stream, next, 256, Duration::ZERO)
+            .await
+            .map_err(|error| format!("read from {}: {error:?}", next.0))?;
+        let Some((last, _)) = page.records.last() else {
+            break;
+        };
+        let last = *last;
+        for (lsn, bytes) in page.records {
+            // A timed record is uploaded with its evidence prefix.
+            if let Some(stored) = uploaded.get(&lsn)
+                && !stored.ends_with(&bytes)
+            {
+                return Err(format!("the store's record {} differs from the log", lsn.0));
+            }
+        }
+        next = Lsn(last.0 + 1);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1608,6 +1810,9 @@ async fn run_concurrent_ops(
             writer: WriterKind,
             epoch: Epoch,
             through: Lsn,
+        },
+        OffloadFlush {
+            stream: StreamId,
         },
     }
 
@@ -1734,6 +1939,11 @@ async fn run_concurrent_ops(
                         writer,
                         epoch,
                         through,
+                    });
+                }
+                ClientOp::OffloadFlush { stream_idx } => {
+                    prepared.push(Prepared::OffloadFlush {
+                        stream: lock[stream_idx].stream,
                     });
                 }
             }
@@ -1942,6 +2152,18 @@ async fn run_concurrent_ops(
                         }
                     }
                 }
+                Prepared::OffloadFlush { stream } => {
+                    // Status only: it changes no record, so the history
+                    // does not model it. The final check compares the
+                    // store with the committed log.
+                    match journal_a.client().offload_status(stream, true).await {
+                        Ok(status) if status.offloaded_through <= status.head => {
+                            faults.hit("op:offload_flush");
+                        }
+                        Ok(_) => faults.hit("violation:offloaded_past_head"),
+                        Err(_) => faults.hit("op:offload_flush_refused"),
+                    }
+                }
             }
         }
     });
@@ -2069,6 +2291,57 @@ async fn consensus_fault_harness_ci() {
     );
 }
 
+/// Offload under faults: `Profile::Offload` on `LOGKEEPER_CONSENSUS_SEEDS`
+/// seeds (3 by default) from `LOGKEEPER_CONSENSUS_FIRST_SEED`, with the
+/// usual history checks and the offloaded-prefix check at the end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consensus_fault_harness_offload() {
+    let first = env::var("LOGKEEPER_CONSENSUS_FIRST_SEED").map_or(0, |v| v.parse::<u64>().unwrap());
+    let count = env::var("LOGKEEPER_CONSENSUS_SEEDS").map_or(3, |v| v.parse::<u64>().unwrap());
+    let config = RunConfig {
+        profile: Some(Profile::Offload),
+        ..RunConfig::standard()
+    };
+    let mut coverage = Coverage::new();
+    for seed in first..first + count {
+        let summary = timeout(Duration::from_secs(150), run_seed(seed, &config))
+            .await
+            .unwrap_or_else(|_| panic!("offload fault harness timed out on seed {seed}"))
+            .unwrap_or_else(|(plan, violation)| {
+                panic!(
+                    "offload fault harness FAILED on seed {seed}:\n{violation}\n\
+                     plan steps ({}): {:#?}",
+                    plan.steps.len(),
+                    plan.steps,
+                )
+            });
+        for (event, n) in summary.coverage {
+            *coverage.entry(event).or_default() += n;
+        }
+    }
+    assert!(
+        !coverage.contains_key("violation:offloaded_past_head"),
+        "a flush reported offloaded_through past the head: {coverage:?}"
+    );
+    for required in [
+        "op:offload_flush",
+        "fault:store_outage",
+        "op:remote_read",
+        "op:offload_backpressure",
+        "op:trim_ok",
+        "op:recover_stream",
+    ] {
+        assert!(
+            coverage.contains_key(required),
+            "offload fault harness missed coverage for `{required}`; observed: {coverage:?}"
+        );
+    }
+    eprintln!(
+        "offload fault harness seeds {first}..{}: {coverage:?}",
+        first + count
+    );
+}
+
 /// `LOGKEEPER_CONSENSUS_REPLICATION=5` runs the soak and replay tests on
 /// five-voter streams.
 fn replication_from_env() -> usize {
@@ -2144,6 +2417,7 @@ async fn consensus_fault_harness_large_batches() {
         client_deadline_ms: 8_000,
         ignore_reused_ids: false,
         replication: 3,
+        offload: false,
     };
     let mut cluster = SimCluster::start(seed, options.clone()).await;
     let limits = Limits {
