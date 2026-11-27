@@ -27,11 +27,12 @@ seal and append).
 
 **Confirm both lost keepers are really gone**, by checking each host
 directly: the process is not running (`systemctl is-active $UNIT` prints
-`inactive` or `failed`), or the machine is powered off or fenced. Do not rely
-only on probes. `recover-stream` counts a voter that does not answer its
-status request in time as lost, so a live but overloaded keeper could be
-mistaken for a lost one. If a lost keeper is merely unreachable, fence it
-first: stop its unit or isolate its host.
+`inactive` or `failed`), or the machine is powered off or fenced. If a lost
+keeper is merely unreachable, fence it first: stop its unit or isolate its
+host. `recover-stream` asks a silent voter three times over about 14 s before
+it counts it as lost, but a probe cannot tell a fenced keeper from a stalled
+one, so the command also requires you to name both lost keepers with `--lost`
+(step 4). Naming them is your statement that both are down or fenced.
 
 ## 2. Stop the survivor
 
@@ -53,13 +54,15 @@ lk keeper recover-stream --config $CONFIG --stream STREAM_UUID
 Expected: exit 1 with `refused without --acknowledge-data-loss. This would
 make this keeper's copy of stream <id> (head <n>) the only history: records
 only <lost-1> and <lost-2> held are lost. The voters would become [...] at
-revision <r>, term <t>, ...`.
+revision <r>, term <t>, ... To proceed, confirm that <lost-1> and <lost-2> are
+down or fenced and add --acknowledge-data-loss --lost <lost-1>,<lost-2>`.
 
 **Abort** on any other refusal:
 
 | Message | Meaning |
 | --- | --- |
-| `refused: N other voter(s) ... answer with a healthy replica` | The stream still has a quorum. Restart this keeper instead |
+| `refused: N other voter(s) ... answer with a healthy replica` | The stream still has a quorum, possibly through a slow keeper you took for lost. Restart this keeper instead |
+| `refused: confirm that <x> and <y> are down or fenced, then name them with --lost x,y` | `--lost` is missing or names other keepers. Fence the named keepers first |
 | `this keeper is not a voter of the stream's latest configuration` | Run it on the right survivor |
 | `the replicated catalog cannot be recovered this way` | Catalog recovery does not exist |
 | `replacements must be two live, accepting keepers ...` | Add keepers, or name them with `--with` |
@@ -72,7 +75,7 @@ recovery path yet (review item 14).
 
 ```sh
 lk keeper recover-stream --config $CONFIG --stream STREAM_UUID --acknowledge-data-loss \
-  [--with KEEPER_UUID,KEEPER_UUID]
+  --lost LOST_UUID,LOST_UUID [--with KEEPER_UUID,KEEPER_UUID]
 ```
 
 Expected:

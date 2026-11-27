@@ -42,9 +42,12 @@ async fn written_stream(
     sealed.fence
 }
 
+/// The operator's acknowledgement of a recovery on `a` of a stream on
+/// `[a, b, c]`, naming `b` and `c` lost.
 fn acknowledged() -> Recovery {
     Recovery {
         acknowledge_data_loss: true,
+        lost: Some([2, 3].map(Uuid::from_u128)),
         ..Recovery::default()
     }
 }
@@ -231,15 +234,34 @@ async fn recovery_is_refused_while_another_voter_holds_a_healthy_replica() {
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("quorum"), "{refused}");
-    // One other voter is enough to keep a quorum with the survivor.
+    // One other voter is enough to keep a quorum with the survivor, even
+    // when it answers later than the first status request allows.
     cluster.running.remove(&b).unwrap().stop().await;
+    cluster.running[&c]
+        .engine
+        .status_delay
+        .store(3_000, Ordering::Relaxed);
     let refused = cluster.configs[&a]
         .recover_stream(stream, acknowledged())
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("quorum"), "{refused}");
-    // Named replacements must be live keepers outside the lost roster.
+    // The operator must name the lost voters, and name the right ones.
     cluster.running.remove(&c).unwrap().stop().await;
+    for lost in [None, Some([b, d])] {
+        let refused = cluster.configs[&a]
+            .recover_stream(
+                stream,
+                Recovery {
+                    lost,
+                    ..acknowledged()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("--lost"), "{refused}");
+    }
+    // Named replacements must be live keepers outside the lost roster.
     let mut named = acknowledged();
     named.with = Some([b, d]);
     assert!(
@@ -456,6 +478,7 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
+                lost: Some([b, c]),
                 with: Some([d, e]),
                 interrupt: None,
             },
@@ -469,6 +492,7 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
+                lost: Some([b, c]),
                 with: Some([d, f]),
                 interrupt: None,
             },
@@ -532,6 +556,7 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
+                lost: Some([b, c]),
                 with: Some([d, f]),
                 interrupt: None,
             },

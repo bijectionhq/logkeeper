@@ -360,6 +360,8 @@ impl Config {
             #[cfg(test)]
             read_delay: Default::default(),
             #[cfg(test)]
+            status_delay: Default::default(),
+            #[cfg(test)]
             scoped_reads: Default::default(),
             #[cfg(test)]
             busy_replies: Default::default(),
@@ -436,6 +438,9 @@ pub(super) struct Engine {
     reject_append: parking_lot::RwLock<Option<tests::RejectAppend>>,
     #[cfg(test)]
     read_delay: std::sync::atomic::AtomicU64,
+    /// Milliseconds this keeper waits before answering a status request.
+    #[cfg(test)]
+    status_delay: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     scoped_reads: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -946,7 +951,15 @@ impl Engine {
             ));
         }
         match request {
-            Request::KeeperStatus(stream) => Ok(Reply::Status(self.status(stream).await)),
+            Request::KeeperStatus(stream) => {
+                #[cfg(test)]
+                tokio::time::sleep(Duration::from_millis(
+                    self.status_delay
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                ))
+                .await;
+                Ok(Reply::Status(self.status(stream).await))
+            }
             Request::LocalCopy(_) => Ok(self
                 .disk
                 .ownership(stream)

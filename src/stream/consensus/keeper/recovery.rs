@@ -3,8 +3,11 @@
 //! `logkeeper keeper recover-stream` runs on the stopped survivor's data
 //! directory under its media lock. It replays the survivor's whole log,
 //! asks every other keeper for its status, and refuses unless the operator
-//! acknowledges the data loss and no other voter of the survivor's
-//! configuration answers with a healthy replica. It then stages the move in
+//! acknowledges the data loss, names the two lost voters, and neither of
+//! them answers with a healthy replica. A lost voter that does not answer is
+//! asked again for longer before it counts as lost: a slow keeper is not a
+//! lost one. Naming the lost voters is the operator's statement that they
+//! are down or fenced, which no probe can prove. It then stages the move in
 //! the catalog, stages an installed empty copy on each of two replacements,
 //! and writes one WAL round on the survivor: a vote for itself in a term
 //! above every term it has seen, and two entries in that term. The first,
@@ -36,6 +39,11 @@ use crate::stream::{
 };
 
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Further status requests to a lost voter that did not answer the first,
+/// each given `LOST_STATUS_TIMEOUT`, with `LOST_STATUS_PAUSE` between them.
+const LOST_STATUS_ROUNDS: u32 = 2;
+const LOST_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const LOST_STATUS_PAUSE: Duration = Duration::from_secs(1);
 const STAGING_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the operator asked of a recovery.
@@ -44,6 +52,9 @@ pub struct Recovery {
     /// The operator accepts that acknowledged records only the lost voters
     /// held are gone.
     pub acknowledge_data_loss: bool,
+    /// The two voters the operator found down or fenced. They must be the
+    /// survivor's configuration's other two voters.
+    pub lost: Option<[Uuid; 2]>,
     /// The two replacement keepers. Without them the best-ranked live,
     /// accepting keepers in free failure domains are chosen.
     pub with: Option<[Uuid; 2]>,
@@ -174,30 +185,45 @@ impl Config {
         let old = configuration.voters;
         let others = lost(&old, self.keeper);
 
+        let ask = |keeper: Uuid, limit: Duration| async move {
+            let status = timeout(
+                limit,
+                rpc.call::<Reply>(keeper, Frame::Client(Request::KeeperStatus(stream)), limit),
+            )
+            .await;
+            match status {
+                Ok(Ok(Reply::Status(status))) if status.keeper == keeper => (keeper, Some(status)),
+                _ => (keeper, None),
+            }
+        };
         let mut statuses = BTreeMap::new();
         let asked = placement
             .domains()
             .keys()
             .copied()
             .filter(|keeper| *keeper != self.keeper)
-            .map(|keeper| async move {
-                let status = timeout(
-                    STATUS_TIMEOUT,
-                    rpc.call::<Reply>(
-                        keeper,
-                        Frame::Client(Request::KeeperStatus(stream)),
-                        STATUS_TIMEOUT,
-                    ),
-                )
-                .await;
-                match status {
-                    Ok(Ok(Reply::Status(status))) if status.keeper == keeper => {
-                        (keeper, Some(status))
-                    }
-                    _ => (keeper, None),
-                }
-            });
+            .map(|keeper| ask(keeper, STATUS_TIMEOUT));
         statuses.extend(futures::future::join_all(asked).await);
+        // A lost voter that missed the first request may only be slow. It
+        // counts as lost only after it also misses the longer ones.
+        for _ in 0..LOST_STATUS_ROUNDS {
+            let silent = others
+                .into_iter()
+                .filter(|voter| statuses.get(voter).copied().flatten().is_none())
+                .collect::<Vec<_>>();
+            if silent.is_empty() {
+                break;
+            }
+            tokio::time::sleep(LOST_STATUS_PAUSE).await;
+            let asked = silent
+                .into_iter()
+                .map(|voter| ask(voter, LOST_STATUS_TIMEOUT));
+            for (voter, status) in futures::future::join_all(asked).await {
+                if status.is_some() {
+                    statuses.insert(voter, status);
+                }
+            }
+        }
         let healthy = others
             .iter()
             .filter(|voter| {
@@ -279,19 +305,39 @@ impl Config {
         let epoch = decisions::recovery_epoch(replayed.epoch.0)
             .map(Epoch)
             .ok_or_else(|| invalid("the stream's epoch is exhausted"))?;
-        if !decisions::allows_recovery(recovery.acknowledge_data_loss, survivor_votes, healthy) {
+        let named = recovery.lost.is_some_and(|mut lost| {
+            lost.sort_unstable();
+            lost == others
+        });
+        if recovery.acknowledge_data_loss && !named {
+            return Err(invalid(format!(
+                "refused: confirm that {} and {} are down or fenced, then name them with \
+                 --lost {},{}",
+                others[0], others[1], others[0], others[1],
+            )));
+        }
+        if !decisions::allows_recovery(
+            recovery.acknowledge_data_loss && named,
+            survivor_votes,
+            healthy,
+        ) {
             return Err(invalid(format!(
                 "refused without --acknowledge-data-loss. This would make this keeper's copy of \
                  stream {:032x} (head {}) the only history: records only {} and {} held are \
                  lost. The voters would become {target:?} at revision {}, term {term}, with \
                  seals refused under a recovery fence at epoch {} until an administrator \
-                 acknowledges the recovery",
+                 acknowledges the recovery. To proceed, confirm that {} and {} are down or \
+                 fenced and add --acknowledge-data-loss --lost {},{}",
                 stream.0,
                 head.0,
                 others[0],
                 others[1],
                 stage.source + 1,
                 epoch.0,
+                others[0],
+                others[1],
+                others[0],
+                others[1],
             )));
         }
 

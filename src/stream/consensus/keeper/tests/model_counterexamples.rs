@@ -234,6 +234,7 @@ async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suf
             stream,
             Recovery {
                 acknowledge_data_loss: true,
+                lost: Some([b, c]),
                 with: Some([d, f]),
                 ..Recovery::default()
             },
@@ -371,6 +372,7 @@ async fn returning_lost_voters_retire_and_cannot_form_a_permanent_split_brain_wh
             stream,
             Recovery {
                 acknowledge_data_loss: true,
+                lost: Some([b, c]),
                 with: Some([d, f]),
                 ..Recovery::default()
             },

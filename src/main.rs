@@ -21,7 +21,7 @@ async fn main() -> ExitCode {
         println!("       logkeeper keeper --config FILE");
         #[cfg(feature = "stream")]
         println!(
-            "       logkeeper keeper recover-stream --config FILE --stream UUID --acknowledge-data-loss [--with KEEPER,KEEPER]"
+            "       logkeeper keeper recover-stream --config FILE --stream UUID --acknowledge-data-loss --lost KEEPER,KEEPER [--with KEEPER,KEEPER]"
         );
         return ExitCode::SUCCESS;
     }
@@ -147,11 +147,12 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
 
 #[cfg(feature = "stream")]
 const RECOVER_USAGE: &str = "Usage: logkeeper keeper recover-stream --config FILE --stream UUID \
-     --acknowledge-data-loss [--with KEEPER,KEEPER]";
+     --acknowledge-data-loss --lost KEEPER,KEEPER [--with KEEPER,KEEPER]";
 
 /// Recovers a stream that lost two of its three voters from this stopped
 /// keeper's replica. Without `--acknowledge-data-loss` it prints what it
-/// would do and refuses.
+/// would do and refuses. `--lost` names the two lost voters the operator
+/// found down or fenced.
 #[cfg(feature = "stream")]
 async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = None;
@@ -163,14 +164,19 @@ async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error
             "--config" => config = args.next(),
             "--stream" => stream = args.next(),
             "--acknowledge-data-loss" => recovery.acknowledge_data_loss = true,
-            "--with" => {
+            "--with" | "--lost" => {
                 let keepers = args
                     .next()
                     .ok_or(RECOVER_USAGE)?
                     .split(',')
                     .map(uuid::Uuid::parse_str)
                     .collect::<Result<Vec<_>, _>>()?;
-                recovery.with = Some(<[_; 2]>::try_from(keepers).map_err(|_| RECOVER_USAGE)?);
+                let keepers = Some(<[_; 2]>::try_from(keepers).map_err(|_| RECOVER_USAGE)?);
+                if flag == "--with" {
+                    recovery.with = keepers;
+                } else {
+                    recovery.lost = keepers;
+                }
             }
             _ => return Err(RECOVER_USAGE.into()),
         }

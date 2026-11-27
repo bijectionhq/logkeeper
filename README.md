@@ -259,7 +259,7 @@ acknowledged records: a committed record reached two voters, which may have
 been the two lost ones. Stop the surviving keeper, then run, on its host:
 
 ```sh
-cargo run --locked --features stream -- keeper recover-stream --config keeper.json --stream STREAM_UUID --acknowledge-data-loss [--with KEEPER_UUID,KEEPER_UUID]
+cargo run --locked --features stream -- keeper recover-stream --config keeper.json --stream STREAM_UUID --acknowledge-data-loss --lost KEEPER_UUID,KEEPER_UUID [--with KEEPER_UUID,KEEPER_UUID]
 ```
 
 The command takes the keeper's media lock, so it refuses while the keeper
@@ -272,6 +272,11 @@ saw committed, and asks every other keeper for its status.
   still has a quorum, so restart the survivor instead. It also refuses the
   replicated catalog stream. Without `--acknowledge-data-loss` it prints what
   it would do and refuses.
+- **Lost voters.** `--lost` must name the configuration's two other voters:
+  it is the operator's statement that both are down or fenced, which no
+  probe can prove. A lost voter that does not answer the first status request
+  is asked twice more, for 5 s each, before it counts as lost, so a slow
+  keeper is refused as a live one rather than recovered over.
 - **Replacements.** `--with` names two keepers. Without it the command takes
   the two best-ranked live, accepting keepers outside the lost configuration,
   in failure domains distinct from each other and from the survivor's. They
