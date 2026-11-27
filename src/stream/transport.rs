@@ -730,12 +730,14 @@ impl Credentials {
         let roots = self.root_store()?;
         let (server, public_key) =
             Self::build_server(keeper, &[], chain.clone(), key.clone_key(), roots.clone())?;
-        let client = Self::build_connector(&[], chain, key, roots)?;
+        let client = Self::build_connector(&[], chain.clone(), key, roots.clone())?;
         Ok(KeeperTls {
             server: server.config().as_ref().clone(),
             client: client.config().as_ref().clone(),
             public_key,
             certificate_digest: Sha256::digest(&pem).into(),
+            chain,
+            roots,
         })
     }
 
@@ -757,6 +759,33 @@ pub(super) struct KeeperTls {
     pub client: ClientConfig,
     pub public_key: Vec<u8>,
     pub certificate_digest: [u8; 32],
+    chain: Vec<CertificateDer<'static>>,
+    roots: RootCertStore,
+}
+
+impl KeeperTls {
+    /// Checks the keeper's own certificate as every peer will: it chains to
+    /// the configured CA, it is within its validity window `now`, and it
+    /// names `keeper`. A reload checks this before swapping, so it never
+    /// installs credentials peers would refuse and cut the keeper off.
+    pub fn verify_own(&self, keeper: KeeperId, now: UnixTime) -> io::Result<()> {
+        let (leaf, intermediates) = self
+            .chain
+            .split_first()
+            .ok_or_else(|| invalid("empty keeper certificate chain"))?;
+        let verifier = KeeperVerifier {
+            roots: self.roots.clone(),
+            algorithms: ring::default_provider().signature_verification_algorithms,
+        };
+        let name = ServerName::try_from("logkeeper").map_err(display_error)?;
+        verifier
+            .verify_server_cert(leaf, intermediates, &name, &[], now)
+            .map_err(|error| invalid(&format!("keeper certificate refused: {error}")))?;
+        if keeper_id(leaf)? != keeper {
+            return Err(invalid("keeper certificate names another keeper"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

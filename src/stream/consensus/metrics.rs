@@ -217,6 +217,9 @@ pub(super) struct Metrics {
     pub scrub_corrupt: AtomicU64,
     // Election counters
     pub elections_started: AtomicU64,
+    /// TLS credential reloads installed and refused.
+    pub tls_reloads: AtomicU64,
+    pub tls_reloads_refused: AtomicU64,
     /// Campaigns a voter that led a parked stream started as it reopened.
     pub wake_campaigns: AtomicU64,
     /// Streams a stopping or draining leader handed to a voter and then
@@ -300,6 +303,8 @@ impl Metrics {
             scrub_corrupt: AtomicU64::new(0),
             elections_started: AtomicU64::new(0),
             wake_campaigns: AtomicU64::new(0),
+            tls_reloads: AtomicU64::new(0),
+            tls_reloads_refused: AtomicU64::new(0),
             handoffs: AtomicU64::new(0),
             elections_won: AtomicU64::new(0),
             votes_granted: AtomicU64::new(0),
@@ -635,6 +640,21 @@ impl Metrics {
             "logkeeper_consensus_elections_total{{outcome=\"won\"}} {}",
             self.elections_won.load(Ordering::Relaxed)
         );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_tls_reloads_total TLS credential reloads on SIGHUP, installed or refused (the previous credentials stay)."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_tls_reloads_total counter");
+        for (outcome, counter) in [
+            ("installed", &self.tls_reloads),
+            ("refused", &self.tls_reloads_refused),
+        ] {
+            let _ = writeln!(
+                out,
+                "logkeeper_consensus_tls_reloads_total{{outcome=\"{outcome}\"}} {}",
+                counter.load(Ordering::Relaxed)
+            );
+        }
         let _ = writeln!(
             out,
             "# HELP logkeeper_consensus_leadership_moves_total Campaigns on waking a parked stream and completed leadership hand-offs."

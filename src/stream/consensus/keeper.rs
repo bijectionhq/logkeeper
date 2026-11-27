@@ -510,7 +510,10 @@ impl Config {
         let reload = self.clone();
         let engine = self.prepare(stop).await?;
         #[cfg(unix)]
-        let reloader = engine.tls.listen_for_reload(reload, engine.stop.clone())?;
+        let reloader =
+            engine
+                .tls
+                .listen_for_reload(reload, engine.disk.metrics.clone(), engine.stop.clone())?;
         let result = engine
             .serve([listener, control, bulk], admin_listener)
             .await;

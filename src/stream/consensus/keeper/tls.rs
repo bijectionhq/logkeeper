@@ -79,9 +79,9 @@ impl Tls {
 
     #[cfg(unix)]
     pub(super) fn reload(&self, config: &Config) -> io::Result<()> {
-        let material = config
-            .tls
-            .keeper_tls(super::KeeperId(config.keeper.as_u128()))?;
+        let keeper = super::KeeperId(config.keeper.as_u128());
+        let material = config.tls.keeper_tls(keeper)?;
+        material.verify_own(keeper, tokio_rustls::rustls::pki_types::UnixTime::now())?;
         config.enrollment_with_certificate_digest(material.certificate_digest)?;
         if let Some(timed) = &config.timed_original {
             timed.check_tls_key(&material.public_key)?;
@@ -90,10 +90,39 @@ impl Tls {
         Ok(())
     }
 
+    /// Reloads the credentials, counts the outcome and logs it. A refused
+    /// reload keeps the previous credentials.
+    #[cfg(unix)]
+    pub(super) fn reload_counted(
+        &self,
+        config: &Config,
+        metrics: &crate::stream::consensus::metrics::Metrics,
+    ) -> io::Result<()> {
+        use crate::stream::consensus::metrics::count;
+        let keeper = config.keeper;
+        let reloaded = self.reload(config);
+        match &reloaded {
+            Ok(()) => {
+                count(&metrics.tls_reloads);
+                tracing::info!(%keeper, "reloaded TLS credentials");
+            }
+            Err(error) => {
+                count(&metrics.tls_reloads_refused);
+                tracing::warn!(
+                    %keeper,
+                    %error,
+                    "TLS reload refused; keeping the previous credentials"
+                );
+            }
+        }
+        reloaded
+    }
+
     #[cfg(unix)]
     pub(super) fn listen_for_reload(
         &self,
         config: Config,
+        metrics: Arc<crate::stream::consensus::metrics::Metrics>,
         stop: tokio_util::sync::CancellationToken,
     ) -> io::Result<tokio::task::JoinHandle<()>> {
         use tokio::signal::unix::{SignalKind, signal};
@@ -109,10 +138,12 @@ impl Tls {
                     signal = hangup.recv() => if signal.is_none() { return; }
                 }
                 let (tls, config) = (tls.clone(), config.clone());
-                match tokio::task::spawn_blocking(move || tls.reload(&config)).await {
-                    Ok(Ok(())) => tracing::info!(%keeper, "reloaded TLS credentials"),
-                    Ok(Err(error)) => tracing::warn!(%keeper, %error, "TLS reload refused"),
-                    Err(error) => tracing::error!(%keeper, %error, "TLS reload task failed"),
+                let metrics = metrics.clone();
+                let reloaded =
+                    tokio::task::spawn_blocking(move || tls.reload_counted(&config, &metrics))
+                        .await;
+                if let Err(error) = reloaded {
+                    tracing::error!(%keeper, %error, "TLS reload task failed");
                 }
             }
         }))

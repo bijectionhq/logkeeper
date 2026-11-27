@@ -229,6 +229,80 @@ async fn rotating_tls_keeps_existing_connections_and_publishes_only_authorized_c
     cluster.stop_all().await;
 }
 
+/// A TLS reload checks the new certificate as peers will before installing
+/// it: one outside its validity window, one from another CA and one naming
+/// another keeper are each refused, counted and logged, and the keeper keeps
+/// serving its previous certificate. A good one then installs.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tls_reload_refuses_certificates_peers_would_refuse() {
+    use rcgen::{CertificateParams, ExtendedKeyUsagePurpose, KeyPair, SanType};
+
+    async fn served(addr: SocketAddr, credentials: &Credentials) -> Vec<u8> {
+        let (tls, _) = credentials.client_protocol(b"http/1.1").unwrap();
+        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("logkeeper").unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = tls.connect(name, tcp).await.unwrap();
+        transport::leaf(stream.get_ref().1.peer_certificates())
+            .unwrap()
+            .to_vec()
+    }
+    fn install(
+        config: &Config,
+        uri: &str,
+        issuer: &rcgen::Issuer<'static, KeyPair>,
+        expired: bool,
+    ) {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = vec![SanType::URI(uri.try_into().unwrap())];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+        if expired {
+            params.not_before = rcgen::date_time_ymd(2019, 1, 1);
+            params.not_after = rcgen::date_time_ymd(2020, 1, 1);
+        }
+        let cert = params.signed_by(&key, issuer).unwrap();
+        std::fs::write(&config.tls.certificate, cert.pem()).unwrap();
+        std::fs::write(&config.tls.private_key, key.serialize_pem()).unwrap();
+        // Authorize the new digest, so only the certificate checks decide.
+        provision(config);
+    }
+
+    crate::stream::consensus::logging::test_warnings::allow("TLS reload refused");
+    let (mut cluster, addresses) = start_admin_cluster(true).await;
+    let keeper = cluster.ids[0];
+    let addr = addresses[&keeper];
+    let config = cluster.configs[&keeper].clone();
+    let engine = cluster.running[&keeper].engine.clone();
+    let metrics = engine.disk.metrics.clone();
+    let old = served(addr, &cluster.credentials).await;
+    let own = format!("urn:logkeeper:keeper:{keeper}");
+    let foreign = ca(&cluster._dir.path().join("foreign-ca.pem"));
+    for (uri, issuer, expired, why) in [
+        (own.clone(), &cluster.certificate_issuer, true, "expired"),
+        (own.clone(), &foreign, false, "another CA"),
+        (
+            format!("urn:logkeeper:keeper:{}", cluster.ids[1]),
+            &cluster.certificate_issuer,
+            false,
+            "another keeper",
+        ),
+    ] {
+        install(&config, &uri, issuer, expired);
+        assert!(engine.tls.reload_counted(&config, &metrics).is_err(), "{why}");
+        assert_eq!(served(addr, &cluster.credentials).await, old, "{why}");
+    }
+    assert_eq!(metrics.tls_reloads_refused.load(Ordering::Relaxed), 3);
+    install(&config, &own, &cluster.certificate_issuer, false);
+    engine.tls.reload_counted(&config, &metrics).unwrap();
+    assert_ne!(served(addr, &cluster.credentials).await, old);
+    assert_eq!(metrics.tls_reloads.load(Ordering::Relaxed), 1);
+    cluster.stop_all().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_plain_http_metrics_health_and_validation() {
     let (mut cluster, addrs) = start_admin_cluster(false).await;
