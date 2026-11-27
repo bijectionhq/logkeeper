@@ -45,7 +45,7 @@ use openraft::{BasicNode, EntryPayload};
 use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
-use super::{Config, FenceProof, Reply, Request, catalog_stream, failure};
+use super::{Config, FenceProof, Reply, Request, catalog_stream, failure, lease};
 use crate::stream::consensus::Voters;
 use crate::stream::{
     consensus::{
@@ -601,7 +601,7 @@ impl Config {
         // The recovered configuration serves only after every lease the lost
         // voters held when the catalog committed has ended on their clocks.
         // The survivor stays stopped under this command's media lock.
-        tokio::time::sleep(wait).await;
+        lease::wait_for_expiry(wait).await?;
         let log_id = |index| {
             LogId::new(
                 openraft::vote::leader_id_std::CommittedLeaderId::new(term),

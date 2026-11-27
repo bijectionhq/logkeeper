@@ -475,11 +475,17 @@ catalog is the configuration authority. Each keeper holds one liveness
 lease from it, renewed in the background against its keeper record
 `{epoch, incarnation, fenced streams}` (`Request::RenewLease`, answered by
 the catalog's leader after a read barrier; a catalog follower forwards it).
-The holder measures the lease on its own monotonic clock from the moment it
-sent the granted renewal, for `lease_millis` (30 s) less
+The holder measures the lease on its suspend-aware monotonic clock from the
+moment it sent the granted renewal, for `lease_millis` (30 s) less
 `lease_drift_margin_millis` (3 s), so it always counts the lease expired
 before the authority does; the assumption is clock rates within
-margin / lease of each other, not synchronized clocks. A keeper campaigns,
+margin / lease of each other, without synchronized clocks. Keepers require
+the Linux boottime clock or the macOS raw monotonic clock. A stopped or
+restarted keeper needs a new grant to hold a lease. After the catalog
+acknowledges a recovery, the survivor waits a full lease plus the drift
+margin on both its suspend-aware clock and the prior Tokio monotonic clock.
+A retry starts the full wait again. The suspend guarantee applies after
+every keeper runs the suspend-aware lease code. A keeper campaigns,
 leads or serves reads and writes for a stream only while its lease is
 valid, its epoch is current and the catalog does not fence its copy
 (`decisions::holds_authority`): its network sends no vote, pre-vote, append

@@ -2,8 +2,8 @@
 //!
 //! Each keeper renews one lease with the catalog in the background, so the
 //! cost does not grow with the number of streams. The lease runs on this
-//! keeper's monotonic clock from the moment it sent the renewal the catalog
-//! granted, for the lease duration less the drift margin
+//! keeper's suspend-aware monotonic clock from the moment it sent the renewal
+//! the catalog granted, for the lease duration less the drift margin
 //! (`decisions::lease_valid`). The catalog waits a whole lease plus the
 //! margin after a recovery commits before the recovered configuration
 //! serves, so with clock rates within `margin / duration` of each other the
@@ -41,13 +41,15 @@ use std::{
 
 use journal_contract::StreamId;
 use openraft::async_runtime::WatchReceiver;
-use tokio::time::{Instant, timeout};
+use tokio::time::timeout;
 
 use super::{Engine, Reply, Request, catalog_stream};
 use crate::{
     server::durability::{sync_directory, sync_file},
     stream::consensus::{authority::Grant, decisions},
 };
+
+mod clock;
 
 /// The marker of a keeper that once held an enforced lease.
 pub(super) const ENFORCED_FILE: &str = "lease-enforced";
@@ -58,9 +60,8 @@ const RETRY_MAX: Duration = Duration::from_secs(1);
 pub(in crate::stream::consensus) struct Lease {
     duration: Duration,
     margin: Duration,
-    base: Instant,
-    /// Nanoseconds after `base` when this keeper sent the renewal of its
-    /// current lease, plus one; zero without a lease.
+    /// Local monotonic time when this keeper sent the renewal of its
+    /// current lease, in nanoseconds plus one; zero without a lease.
     sent: AtomicU64,
     /// The lease and margin of the current grant, in nanoseconds: never
     /// longer, nor a smaller margin, than this keeper's own.
@@ -74,7 +75,7 @@ pub(in crate::stream::consensus) struct Lease {
     fenced: parking_lot::RwLock<HashMap<StreamId, u64>>,
     any_fenced: AtomicBool,
     marker: PathBuf,
-    /// Nanoseconds after `base` of the last granted renewal, plus one.
+    /// Local monotonic time of the last granted renewal, in nanoseconds plus one.
     renewed: AtomicU64,
     pub failures: AtomicU64,
     pub lapses: AtomicU64,
@@ -84,19 +85,18 @@ pub(in crate::stream::consensus) struct Lease {
     /// Stops renewals, so a test can make the lease lapse.
     #[cfg(test)]
     pub suspended: AtomicBool,
-    /// This keeper's clock rate in thousandths of real time, to drift it.
     #[cfg(test)]
-    pub rate_permille: AtomicU64,
+    test_clock: Option<Box<dyn Fn() -> Option<u64> + Send + Sync>>,
 }
 
 impl Lease {
     pub fn open(data: &Path, duration: Duration, margin: Duration) -> io::Result<Self> {
+        clock::now().ok_or_else(clock::unavailable)?;
         let marker = data.join(ENFORCED_FILE);
         let enforced = marker.try_exists()?;
         Ok(Self {
             duration,
             margin,
-            base: Instant::now(),
             sent: AtomicU64::new(0),
             granted_duration: AtomicU64::new(nanos(duration)),
             granted_margin: AtomicU64::new(nanos(margin)),
@@ -114,29 +114,16 @@ impl Lease {
             #[cfg(test)]
             suspended: AtomicBool::new(false),
             #[cfg(test)]
-            rate_permille: AtomicU64::new(1000),
+            test_clock: None,
         })
     }
 
-    fn now(&self) -> u64 {
-        let elapsed = nanos(self.base.elapsed());
+    fn now(&self) -> Option<u64> {
         #[cfg(test)]
-        let elapsed = {
-            let rate = u128::from(self.rate_permille.load(Ordering::Relaxed));
-            u64::try_from(u128::from(elapsed) * rate / 1000).unwrap_or(u64::MAX)
-        };
-        elapsed
-    }
-
-    /// This keeper's monotonic clock as the lease reads it, in nanoseconds.
-    fn at(&self, instant: Instant) -> u64 {
-        let elapsed = nanos(instant.saturating_duration_since(self.base));
-        #[cfg(test)]
-        let elapsed = {
-            let rate = u128::from(self.rate_permille.load(Ordering::Relaxed));
-            u64::try_from(u128::from(elapsed) * rate / 1000).unwrap_or(u64::MAX)
-        };
-        elapsed
+        if let Some(clock) = &self.test_clock {
+            return clock();
+        }
+        clock::now()
     }
 
     pub fn duration(&self) -> Duration {
@@ -156,12 +143,14 @@ impl Lease {
     pub fn valid(&self) -> bool {
         let sent = self.sent.load(Ordering::Acquire);
         sent != 0
-            && decisions::lease_valid(
-                sent - 1,
-                self.granted_duration.load(Ordering::Acquire),
-                self.granted_margin.load(Ordering::Acquire),
-                self.now(),
-            )
+            && self.now().is_some_and(|now| {
+                decisions::lease_valid(
+                    sent - 1,
+                    self.granted_duration.load(Ordering::Acquire),
+                    self.granted_margin.load(Ordering::Acquire),
+                    now,
+                )
+            })
     }
 
     /// The configuration revision below which the catalog fences this
@@ -201,22 +190,24 @@ impl Lease {
 
     /// How long ago the last renewal was granted.
     pub fn age(&self) -> Option<Duration> {
-        match self.renewed.load(Ordering::Acquire) {
-            0 => None,
-            renewed => Some(Duration::from_nanos(self.now().saturating_sub(renewed - 1))),
-        }
+        let renewed = self.renewed.load(Ordering::Acquire).checked_sub(1)?;
+        self.now()?.checked_sub(renewed).map(Duration::from_nanos)
     }
 
     /// How much longer the lease is valid.
     pub fn remaining(&self) -> Duration {
         let sent = self.sent.load(Ordering::Acquire);
-        if sent == 0 {
+        let Some(elapsed) = self
+            .now()
+            .and_then(|now| now.checked_sub(sent.checked_sub(1)?))
+        else {
             return Duration::ZERO;
-        }
-        let end = (sent - 1)
-            .saturating_add(self.granted_duration.load(Ordering::Acquire))
-            .saturating_sub(self.granted_margin.load(Ordering::Acquire));
-        Duration::from_nanos(end.saturating_sub(self.now()))
+        };
+        Duration::from_nanos(self.granted_duration.load(Ordering::Acquire))
+            .saturating_sub(Duration::from_nanos(
+                self.granted_margin.load(Ordering::Acquire),
+            ))
+            .saturating_sub(Duration::from_nanos(elapsed))
     }
 
     pub fn fenced_streams(&self) -> usize {
@@ -248,6 +239,10 @@ impl Lease {
         self.enforced.store(true, Ordering::Release);
         Ok(())
     }
+}
+
+pub(super) async fn wait_for_expiry(window: Duration) -> io::Result<()> {
+    clock::wait_for_expiry(window, clock::now).await
 }
 
 /// Whether the lease lets this keeper campaign, lead or serve reads for its
@@ -413,13 +408,16 @@ impl Engine {
         } else {
             0
         };
-        let sent = Instant::now();
         let request = Request::RenewLease {
             keeper: self.id,
             incarnation: self.recognition.own(),
             epoch,
         };
         let attempt = lease.interval().min(super::REQUEST_TIMEOUT);
+        let Some(sent) = lease.now() else {
+            super::super::metrics::count(&lease.failures);
+            return false;
+        };
         match timeout(attempt, self.catalog_request(request)).await {
             Ok(Ok(Reply::Lease(grant))) => self.adopt_lease(sent, epoch, grant).await,
             _ => {
@@ -429,7 +427,7 @@ impl Engine {
         }
     }
 
-    async fn adopt_lease(&self, sent: Instant, asked: u64, grant: Grant) -> bool {
+    async fn adopt_lease(&self, sent: u64, asked: u64, grant: Grant) -> bool {
         let lease = &self.lease;
         if grant.enforced && !lease.enforced() {
             // One small file, once per keeper.
@@ -499,6 +497,10 @@ impl Engine {
             }
             return false;
         }
+        let Some(now) = lease.now() else {
+            super::super::metrics::count(&lease.failures);
+            return false;
+        };
         let own = (nanos(lease.duration), nanos(lease.margin));
         let duration = own.0.min(grant.duration_ms.saturating_mul(1_000_000));
         let margin = own.1.max(grant.margin_ms.saturating_mul(1_000_000));
@@ -506,13 +508,14 @@ impl Engine {
         lease.granted_margin.store(margin, Ordering::Release);
         lease.epoch.store(grant.epoch, Ordering::Release);
         lease.current.store(grant.epoch != 0, Ordering::Release);
-        let sent = lease.at(sent).saturating_add(1);
         // Renewals run one at a time, so a later grant was sent later.
-        lease.sent.fetch_max(sent, Ordering::AcqRel);
+        lease
+            .sent
+            .fetch_max(sent.saturating_add(1), Ordering::AcqRel);
         lease
             .renewed
-            .store(lease.now().saturating_add(1), Ordering::Release);
-        true
+            .store(now.saturating_add(1), Ordering::Release);
+        decisions::lease_valid(sent, duration, margin, now)
     }
 }
 
@@ -549,10 +552,9 @@ mod tests {
     }
 
     fn granted(lease: &Lease) {
-        lease.sent.store(
-            lease.at(Instant::now()).saturating_add(1),
-            Ordering::Release,
-        );
+        lease
+            .sent
+            .store(lease.now().unwrap().saturating_add(1), Ordering::Release);
         lease.current.store(true, Ordering::Release);
         lease.enforced.store(true, Ordering::Release);
     }
@@ -566,8 +568,9 @@ mod tests {
                 .unwrap(),
         );
         // A holder clock 10% slow, the bound for this lease.
-        let lease = Lease::open(dir.path(), duration, margin).unwrap();
-        lease.rate_permille.store(900, Ordering::Relaxed);
+        let mut lease = Lease::open(dir.path(), duration, margin).unwrap();
+        let start = tokio::time::Instant::now();
+        lease.test_clock = Some(Box::new(move || Some(nanos(start.elapsed() * 9 / 10))));
         granted(&lease);
         assert!(lease.valid() && lease.permits(StreamId(1), || 0));
         tokio::time::advance(Duration::from_millis(990)).await;
@@ -580,12 +583,49 @@ mod tests {
         assert!(lease.permits(catalog_stream::STREAM, || 0));
 
         // A true clock lapses at the lease less the margin.
-        let lease = Lease::open(dir.path(), duration, margin).unwrap();
+        let mut lease = Lease::open(dir.path(), duration, margin).unwrap();
+        let start = tokio::time::Instant::now();
+        lease.test_clock = Some(Box::new(move || Some(nanos(start.elapsed()))));
         granted(&lease);
         tokio::time::advance(duration - margin - Duration::from_millis(1)).await;
         assert!(lease.valid());
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(!lease.valid());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_loses_authority_when_the_clock_jumps_during_suspend() {
+        let dir = tempfile::tempdir().unwrap();
+        let duration = Duration::from_secs(30);
+        let margin = Duration::from_secs(3);
+        let mut lease = Lease::open(dir.path(), duration, margin).unwrap();
+        let continuous = Arc::new(AtomicU64::new(1000));
+        lease.test_clock = Some(Box::new({
+            let continuous = continuous.clone();
+            move || {
+                let sample = continuous.load(Ordering::Relaxed);
+                (sample != u64::MAX).then_some(sample)
+            }
+        }));
+        lease.enforce().unwrap();
+        granted(&lease);
+        let scheduler = tokio::time::Instant::now();
+        assert!(lease.permits(StreamId(1), || 0));
+
+        continuous.store(u64::MAX, Ordering::Relaxed);
+        assert!(!lease.permits(StreamId(1), || 0));
+        continuous.store(999, Ordering::Relaxed);
+        assert!(!lease.permits(StreamId(1), || 0));
+        assert_eq!(lease.remaining(), Duration::ZERO);
+
+        continuous.store(1000 + nanos(duration - margin), Ordering::Relaxed);
+        assert_eq!(scheduler.elapsed(), Duration::ZERO);
+        assert!(!lease.permits(StreamId(1), || 0));
+        assert!(lease.permits(catalog_stream::STREAM, || 0));
+
+        let reopened = Lease::open(dir.path(), duration, margin).unwrap();
+        assert!(reopened.enforced());
+        assert!(!reopened.permits(StreamId(1), || 0));
     }
 
     #[tokio::test(start_paused = true)]
