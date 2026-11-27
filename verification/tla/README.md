@@ -87,6 +87,15 @@ by inspection), and what the authority adds:
   nondeterministically: absent, partial or wrong. The recovered members then
   wait out `L + M` on their own clocks. The recovery term is only
   `RecoveryGap = 1` above the survivor's, so nothing relies on the `2^32` gap.
+- **Two survivors (RF 5).** With `OnlyWriterRecovers`, as in the code, only
+  the more advanced survivor gets the recovery round; the other keeps running
+  with its log, term and lease. With `ExcludeLostIds` it refuses the lost
+  voters from the recovery on (`Request::LocalProgressFencing`), and every
+  copy that holds the recovery entry does too, in both directions: a
+  candidate counts no fenced voter's vote and a leader replicates to none.
+  With `SurvivorFence` the catalog also fences the stream for it until it
+  finalized the recovered configuration (`Change::RecoverFrom`): its lease
+  then gates it only while its recovery entry is not committed.
 - **Environment.** Every keeper and the catalog sit on one of two sides; a
   bounded number of arbitrary re-partitions; a permanent catalog outage; a
   second incarnation of one keeper ID (new media) that registers under a
@@ -289,9 +298,11 @@ counts are from TLC 2.19 on 10 workers of the development Mac.
 | `AuthorityOutageNoLease` | control: leases not modeled | `LeadershipLapses` | violated |
 | `AuthorityReusedId` | keeper `k3` reincarnates on new media under a bumped epoch while the first incarnation runs or stops; 6d75fec kept | `CommittedEntriesPreserved`, `ElectionSafety` | pass, 1,011,168 states, 1 min 37 s |
 | `AuthorityReusedIdEpochOnly` | control: the epoch bump without 6d75fec | same | `CommittedEntriesPreserved` violated (finding 3) |
-| `AuthorityRF5` | RF 5: survivors `s`, `t`; lost `a`, `b`, `c`; three replacements; `ExcludeLostIds` | as `AuthorityRecovery` | not exhaustive: no violation in 18.7 million distinct states of breadth-first search (stopped, queue still growing) nor in 95 million states of random simulation (`-simulate -depth 60`, 11 min) |
+| `AuthorityRF5` | RF 5 as the code recovers: survivors `s`, `t`, only the writer gets the recovery round and `t` keeps running with its lease; lost `a`, `b` running, `c` down (`StoppedAtStart`, a smaller cut than the earlier 8-keeper one); three replacements; `ExcludeLostIds`, `SurvivorFence`; `MaxNewTerms = 1` | as `AuthorityRecovery`, plus `FinalizedStaysRecovered` | not run to the end: no violation in 6,887,801 distinct states (stopped for memory). Its safety follows from `AuthorityRF5Exclusion`, whose unmodeled lease for `t` only adds behaviors |
+| `AuthorityRF5Exclusion` | as `AuthorityRF5`, but `t`'s lease is not modeled (always valid and unfenced), so only the identity exclusion protects it | same | pass, 20,548,926 distinct states, depth 33, 36 min 44 s on 6 workers |
+| `AuthorityRF5ExclusionControl` | control: as `AuthorityRF5Exclusion` without the exclusion | same | `NoMixedHistory` violated: 8,286,893 distinct states, 8 min 11 s on 6 workers, a 20-state trace (finding 4) |
 
-`check.sh` runs all but `AuthorityRF5`: the controls and the liveness and
+`check.sh` runs all but the RF 5 configurations, which take too long for it: the controls and the liveness and
 reuse configurations in `fast` mode, and `AuthorityRecovery` and
 `AuthorityOutageSafety` with the deep configurations.
 
@@ -320,23 +331,30 @@ reuse configurations in `fast` mode, and `AuthorityRecovery` and
    (`AuthorityReusedIdEpochOnly`, CE-1 again). With 6d75fec's refusal kept,
    `AuthorityReusedId` passes with the first incarnation still running. The
    reused-ID rule is load-bearing, not only defense in depth.
-4. **With RF 5 and more than one survivor, the term gap (or an identity
-   exclusion) is still needed.** `AuthorityRF5` (two survivors, three lost voters
-   that are a quorum of the old configuration), with recovered copies
-   refusing the recovery's lost voters at any term (`ExcludeLostIds`), shows
-   no violation within its bounded runs; it is too large to finish. Without
-   that, and with a recovery term the lost voters can exceed, this trace
-   breaks it (argued, not model-checked: it needs two re-partitions and
-   terms beyond what TLC explores for eight keepers in reasonable time): a
-   lost leader above the recovery term overwrites survivor `s` before the
-   wait-out ends; after it, survivor `t` leads the recovered configuration
-   and serves the recovered history; `s`, unfenced and back in the old
-   configuration, leads it with the fenced lost voters' votes (votes are not
-   gated) and, at a higher term than `t`, overwrites `t`, which then serves
-   the old history. With one survivor (RF 3) nothing else holds the
-   recovered history, so the overwrite is harmless, which is what the Lean
-   proof covers. The shipped `2^32` gap prevents the trace in practice; the
-   identity exclusion removes the dependence on it.
+4. **With RF 5 and two survivors, the second survivor must refuse the lost
+   voters from the recovery on, or be fenced by the catalog.** In the code
+   only the more advanced survivor writes the recovery round; the other keeps
+   running through the wait-out (`OnlyWriterRecovers`). Without protection,
+   `AuthorityRF5ExclusionControl` finds this trace: after the recovery
+   commits, the lost leader `a`, still on its lease, replicates its old
+   history, with the lost record committed, to survivor `t`; the writer `s`
+   leads the recovered configuration with the replacements, commits and
+   serves the recovered history; `t` then serves the old one. The earlier
+   argued trace (`t` leading the old configuration with the lost voters'
+   votes and overwriting `s` at a higher term) has the same root. Two
+   protections close it, and the code has both from level 9
+   (`CLUSTER_VERSION_EXCLUSION`): the second survivor refuses the lost voters
+   in both directions from the moment the recovery reads its progress
+   (`ExcludeLostIds`, `Request::LocalProgressFencing`), and the catalog
+   fences its copy until it finalized the recovered configuration
+   (`SurvivorFence`, `Change::RecoverFrom`). `FinalizedStaysRecovered` also
+   checks that no copy that finalized the recovery is overwritten. In the
+   implementation the overwrite also trips OpenRaft's commit-index assertion
+   when the writer catches the survivor up; a cluster test reproduced it
+   before the fix (`keeper/tests/authority.rs`,
+   `a_lost_leader_of_five_never_overwrites_the_recovered_history`). With one
+   survivor (RF 3) nothing else holds the recovered history, so the overwrite
+   is harmless, which is what the Lean proof covers.
 5. **The reported loss point can hide a loss.** A recovery keeps the survivor's whole log,
    including records it never knew committed, and reports its head. If the
    survivor led and wrote records it never committed, and the lost voters

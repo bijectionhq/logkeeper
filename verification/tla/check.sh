@@ -129,6 +129,7 @@ run_case "AuthorityLossPoint"          "EpochLeases.tla" "AuthorityLossPoint.cfg
 if [[ "$MODE" != "fast" ]]; then
   run_case "AuthorityRecovery"         "EpochLeases.tla" "AuthorityRecovery.cfg"           pass
   run_case "AuthorityOutageSafety"     "EpochLeases.tla" "AuthorityOutageSafety.cfg"       pass
+  run_case "AuthorityRF5ExclusionControl" "EpochLeases.tla" "AuthorityRF5ExclusionControl.cfg" invariant
 
   run_case "AmnesiaWipe"               "LogkeeperProtocol.tla" "AmnesiaWipe.cfg"                 pass
   run_case "RepairReplaceSafety"       "LogkeeperProtocol.tla" "RepairReplaceSafety.cfg"         pass

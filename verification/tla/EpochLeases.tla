@@ -60,6 +60,8 @@ CONSTANTS
     WaitOut,          \* the recovered configuration waits out L + M
     FenceRule,        \* "AllOld" or "NamedOnly"
     ExcludeLostIds,   \* a recovered copy refuses the lost voters whatever their term
+    OnlyWriterRecovers, \* only the writing survivor gets the recovery round; the others keep running
+    SurvivorFence,    \* the catalog fences the other survivors until they finalize the recovery
     RecoveryGap,      \* the recovery's term jump (2^32 in the code)
     MaxTerm,          \* bound on terms reached before recovery and by lost voters
     MaxNewTerms,      \* bound on elections after the recovery term
@@ -73,6 +75,8 @@ CONSTANTS
     RefuseReusedRegistration, \* 6d75fec: a reused ID never registers from peer traffic
     AllowStop,        \* the first incarnation of ReusedId may stop
     LeasedProcs,      \* processes whose leases are modeled; the others always hold one
+    StoppedAtStart,   \* lost voters already down in the pre-recovery cut (smaller state)
+    LostLeader,       \* the lost voter that leads the pre-recovery cut, or NoProc for any
     NoProc,
     Nil
 
@@ -94,7 +98,8 @@ VARIABLES
     catEpoch, catFenced, catMembers, cfgEpoch,
     recovered, survHist, recTerm, lostIds, reportedHead,
     appendCount, committedOld, committedNew, leaders,
-    newSeen, newObs, mixed
+    newSeen, newObs, mixed,
+    exclusive
 
 netVars == <<side, catUp, partChanges>>
 raftVars == <<alive, copy, term, votedFor, log, commit, role, votes>>
@@ -102,7 +107,7 @@ leaseVars == <<lease, wait, myEpoch>>
 catVars == <<catEpoch, catFenced, catMembers, cfgEpoch>>
 ghostVars == <<recovered, survHist, recTerm, lostIds, reportedHead,
                appendCount, committedOld, committedNew, leaders,
-               newSeen, newObs, mixed>>
+               newSeen, newObs, mixed, exclusive>>
 vars == <<netVars, raftVars, leaseVars, catVars, ghostVars>>
 
 -----------------------------------------------------------------------------
@@ -129,6 +134,9 @@ CfgIdx(lg) == {i \in 1..Len(lg) : lg[i].kind \in {"Cfg", "Rec"}}
 ConfigOf(lg) == IF CfgIdx(lg) = {} THEN {} ELSE lg[MaxOf(CfgIdx(lg))].mem
 Config(p) == ConfigOf(log[p])
 HasRec(lg) == \E i \in 1..Len(lg) : lg[i].kind = "Rec"
+\* The copy finalized the recovered configuration: its recovery entry is
+\* committed and applied.
+Finalized(p) == \E i \in 1..Min(commit[p], Len(log[p])) : log[p][i].kind = "Rec"
 
 HeadLsn(lg) == LET a == {i \in 1..Len(lg) : lg[i].kind = "App"}
                IN IF a = {} THEN 0 ELSE lg[MaxOf(a)].lsn
@@ -154,10 +162,13 @@ NoWait == [st |-> "none", le |-> 0, d |-> 0]
 DoneWait == [st |-> "done", le |-> 0, d |-> 0]
 RunWait == [st |-> "run", le |-> 0, d |-> 0]
 
+\* A lease that fences the stream gates a copy only until it finalized the
+\* recovered configuration (decisions::copy_fenced): a lost voter never does,
+\* and a fenced other survivor does once it caught up from the writer.
 LeaseValid(p) ==
     /\ lease[p].on
     /\ lease[p].epoch = myEpoch[p]
-    /\ ~lease[p].fenced
+    /\ ~(lease[p].fenced /\ ~Finalized(p))
 
 \* One wait-out clock stands for every recovered member's: the one that
 \* finishes first. Letting every member act once it finishes only adds
@@ -171,13 +182,20 @@ WaitDone(p) == ~(IdOf(p) \in NewVoters /\ wait.st = "run")
 \* with leases modeled for every keeper.
 Gate(p) == alive[p] /\ copy[p] /\ (p \in LeasedProcs => LeaseValid(p)) /\ WaitDone(p)
 
-\* decisions::excludes_sender, plus (ExcludeLostIds) a recovered copy's
-\* refusal of the recovery's lost voters at any term.
+\* decisions::excludes_sender: (ExcludeLostIds) a copy that holds the
+\* recovery, or a survivor the recovery fenced the lost voters for
+\* (Request::LocalTipFencing), refuses them at any term, whatever its
+\* configuration; otherwise an outsider below the receiver's term. The same
+\* fence stops the copy sending to them (keeper/ingress.rs, Exclusions), so
+\* every action between two processes checks it both ways.
+IdFenced(recv, sender) ==
+    /\ ExcludeLostIds /\ recovered /\ IdOf(sender) \in lostIds
+    /\ (HasRec(log[recv]) \/ recv \in exclusive)
 Excludes(recv, sender) ==
-    /\ Config(recv) # {}
-    /\ IdOf(sender) \notin Config(recv)
-    /\ \/ term[sender] < term[recv]
-       \/ (ExcludeLostIds /\ recovered /\ IdOf(sender) \in lostIds /\ HasRec(log[recv]))
+    \/ IdFenced(recv, sender)
+    \/ /\ Config(recv) # {}
+       /\ IdOf(sender) \notin Config(recv)
+       /\ term[sender] < term[recv]
 
 \* A process without a copy registers one from peer traffic unless it is a
 \* reused ID (6d75fec).
@@ -209,7 +227,7 @@ Vote(v, c) ==
     /\ role[c] = "Candidate"
     /\ IdOf(v) \in Config(c) /\ IdOf(v) \notin votes[c]
     /\ Accepts(v)
-    /\ ~Excludes(v, c)
+    /\ ~Excludes(v, c) /\ ~IdFenced(c, v)
     /\ \/ term[c] > term[v]
        \/ (term[c] = term[v] /\ votedFor[v] \in {Nil, IdOf(c)})
     /\ UpToDate(log[c], log[v])
@@ -226,7 +244,7 @@ LearnHigherTerm(l, f) ==
     /\ role[l] \in {"Candidate", "Leader"}
     /\ IdOf(f) \in Config(l)
     /\ term[f] > term[l]
-    /\ ~Excludes(f, l)
+    /\ ~Excludes(f, l) /\ ~IdFenced(l, f)
     /\ term' = [term EXCEPT ![l] = term[f]]
     /\ votedFor' = [votedFor EXCEPT ![l] = Nil]
     /\ role' = [role EXCEPT ![l] = "Follower"]
@@ -242,7 +260,7 @@ BecomeLeader(c) ==
     /\ leaders' = leaders \cup {[term |-> term[c], id |-> IdOf(c), world |-> NewWorld(log[c])]}
     /\ UNCHANGED <<netVars, alive, copy, term, votedFor, commit, votes, leaseVars, catVars>>
     /\ UNCHANGED <<recovered, survHist, recTerm, lostIds, reportedHead,
-                   appendCount, committedOld, committedNew, newSeen, newObs, mixed>>
+                   appendCount, committedOld, committedNew, newSeen, newObs, mixed, exclusive>>
 
 \* A leader may step down at any time; fairness makes one whose lease lapsed
 \* step down.
@@ -260,14 +278,14 @@ ClientAppend(l) ==
     /\ UNCHANGED <<netVars, alive, copy, term, votedFor, commit, role, votes,
                    leaseVars, catVars>>
     /\ UNCHANGED <<recovered, survHist, recTerm, lostIds, reportedHead,
-                   committedOld, committedNew, leaders, newSeen, newObs, mixed>>
+                   committedOld, committedNew, leaders, newSeen, newObs, mixed, exclusive>>
 
 Replicate(l, f) ==
     /\ Gate(l) /\ role[l] = "Leader"
     /\ l # f /\ IdOf(f) # IdOf(l) /\ Reach(l, f)
     /\ IdOf(f) \in Config(l)
     /\ Accepts(f)
-    /\ ~Excludes(f, l)
+    /\ ~Excludes(f, l) /\ ~IdFenced(l, f)
     /\ term[f] <= term[l]
     /\ (log[f] # log[l] \/ term[f] < term[l] \/ commit[f] < commit[l]
         \/ role[f] # "Follower" \/ ~copy[f])
@@ -296,7 +314,7 @@ Commit(l) ==
                    /\ UNCHANGED committedNew
     /\ UNCHANGED <<netVars, alive, copy, term, votedFor, log, role, votes, leaseVars, catVars>>
     /\ UNCHANGED <<recovered, survHist, recTerm, lostIds, reportedHead,
-                   appendCount, leaders, newSeen, newObs, mixed>>
+                   appendCount, leaders, newSeen, newObs, mixed, exclusive>>
 
 \* A reader's ReadAt or lease read: the committed prefix of a gated voter.
 \* After a read of the recovered history, any read of a history the recovery
@@ -313,7 +331,7 @@ Read(p) ==
                /\ UNCHANGED <<newSeen, newObs>>
     /\ UNCHANGED <<netVars, raftVars, leaseVars, catVars>>
     /\ UNCHANGED <<recovered, survHist, recTerm, lostIds, reportedHead,
-                   appendCount, committedOld, committedNew, leaders>>
+                   appendCount, committedOld, committedNew, leaders, exclusive>>
 
 -----------------------------------------------------------------------------
 (* Time and leases *)
@@ -412,6 +430,11 @@ ReplacementProcs == {p \in Procs : IdOf(p) \in Replacements}
 FenceSet(named) ==
     IF FenceRule = "AllOld" \/ named = {} THEN OldVoters \ NewVoters ELSE named
 
+\* With OnlyWriterRecovers (the code), the recovery round goes to the most
+\* advanced survivor only. Every other survivor keeps running, with its log,
+\* term and lease, and from the moment the recovery reads its last entry
+\* refuses the lost voters (exclusive); with SurvivorFence the catalog also
+\* fences the stream for it until it finalizes the recovered configuration.
 Recover ==
     /\ AllowRecovery /\ ~recovered /\ catUp
     \* allows_recovery: no other old voter answers the operator, who reaches
@@ -423,29 +446,34 @@ Recover ==
                      \A s2 \in SurvivorProcs : UpToDate(log[s], log[s2])
            tRec == MaxOf({Max(term[s], LastTerm(log[s])) : s \in SurvivorProcs}) + RecoveryGap
            hist == Append(log[src], RecE(tRec, NewVoters, cfgEpoch + 1))
+           written == IF OnlyWriterRecovers THEN {src} ELSE SurvivorProcs
+           others == SurvivorProcs \ written
        IN /\ Len(hist) <= MaxLogLen
           /\ log' = [p \in Procs |->
-                       IF p \in SurvivorProcs THEN hist
+                       IF p \in written THEN hist
                        ELSE IF p \in ReplacementProcs THEN <<>> ELSE log[p]]
           /\ term' = [p \in Procs |->
-                        IF p \in SurvivorProcs THEN tRec
+                        IF p \in written THEN tRec
                         ELSE IF p \in ReplacementProcs THEN 0 ELSE term[p]]
           /\ votedFor' = [p \in Procs |->
-                            IF p \in SurvivorProcs THEN IdOf(src)
+                            IF p \in written THEN IdOf(src)
                             ELSE IF p \in ReplacementProcs THEN Nil ELSE votedFor[p]]
           /\ commit' = [p \in Procs |->
-                          IF p \in SurvivorProcs THEN commit[src]
+                          IF p \in written THEN commit[src]
                           ELSE IF p \in ReplacementProcs THEN 0 ELSE commit[p]]
           /\ copy' = [p \in Procs |-> IF p \in ReplacementProcs THEN TRUE ELSE copy[p]]
           /\ role' = [p \in Procs |->
-                        IF p \in SurvivorProcs \cup ReplacementProcs THEN "Follower" ELSE role[p]]
+                        IF p \in written \cup ReplacementProcs THEN "Follower" ELSE role[p]]
           /\ votes' = [p \in Procs |->
-                         IF p \in SurvivorProcs \cup ReplacementProcs THEN {} ELSE votes[p]]
-          \* The survivors were stopped: they come back without a lease.
-          /\ lease' = [p \in Procs |-> IF p \in SurvivorProcs THEN NoLease ELSE lease[p]]
+                         IF p \in written \cup ReplacementProcs THEN {} ELSE votes[p]]
+          \* The writer was stopped: it comes back without a lease. Another
+          \* survivor keeps running with the lease it holds.
+          /\ lease' = [p \in Procs |-> IF p \in written THEN NoLease ELSE lease[p]]
           /\ wait' = IF WaitOut THEN RunWait ELSE wait
+          /\ exclusive' = IF ExcludeLostIds THEN others ELSE {}
           /\ \E named \in SUBSET (Ids \ NewVoters), dead \in BOOLEAN :
-                /\ catFenced' = [k \in Ids |-> catFenced[k] \/ k \in FenceSet(named)]
+                /\ catFenced' = [k \in Ids |-> catFenced[k] \/ k \in FenceSet(named)
+                                    \/ (SurvivorFence /\ k \in {IdOf(o) : o \in others})]
                 /\ catEpoch' = [k \in Ids |-> IF dead /\ k \in named THEN catEpoch[k] + 1
                                               ELSE catEpoch[k]]
           /\ catMembers' = NewVoters
@@ -486,7 +514,8 @@ Next ==
 \* were cut off.
 \* Every keeper holds a fresh lease. The lost voters sit on side 2, away from
 \* the survivors, the replacements and the catalog.
-FirstLost == IF OldVoters \ Survivors # {} THEN CHOOSE k \in OldVoters \ Survivors : TRUE
+FirstLost == IF LostLeader # NoProc THEN LostLeader
+             ELSE IF OldVoters \ Survivors # {} THEN CHOOSE k \in OldVoters \ Survivors : TRUE
              ELSE CHOOSE k \in OldVoters : TRUE
 
 Init ==
@@ -497,7 +526,7 @@ Init ==
     IN /\ side = [n \in Nodes |-> IF n \in Procs /\ isLost(n) THEN 2 ELSE 1]
        /\ catUp = TRUE
        /\ partChanges = 0
-       /\ alive = [p \in Procs |-> p # ReusedProc]
+       /\ alive = [p \in Procs |-> p # ReusedProc /\ p \notin StoppedAtStart]
        /\ copy = [p \in Procs |-> IdOf(p) \in OldVoters /\ p # ReusedProc]
        /\ term = [p \in Procs |-> IF isLost(p) THEN 2
                                  ELSE IF IdOf(p) \in OldVoters /\ p # ReusedProc THEN 1 ELSE 0]
@@ -529,6 +558,7 @@ Init ==
        /\ newSeen = FALSE
        /\ newObs = <<>>
        /\ mixed = FALSE
+       /\ exclusive = {}
 
 Spec == Init /\ [][Next]_vars
 
@@ -572,6 +602,7 @@ InitReuse ==
        /\ newSeen = FALSE
        /\ newObs = <<>>
        /\ mixed = FALSE
+       /\ exclusive = {}
 
 ReuseSpec == InitReuse /\ [][Next]_vars
 
@@ -616,6 +647,7 @@ InitLossCut ==
        /\ newSeen = FALSE
        /\ newObs = <<>>
        /\ mixed = FALSE
+       /\ exclusive = {}
 
 LossSpec == InitLossCut /\ [][Next]_vars
 
@@ -669,6 +701,11 @@ OneRecoveryRecord ==
 
 Safety == NoMixedHistory /\ CommittedEntriesPreserved /\ ElectionSafety /\ NewWorldLogMatching
 
+\* A copy that finalized the recovered configuration never holds another
+\* history again: no lost leader, and no survivor leading the old
+\* configuration with the lost voters' votes, overwrites it.
+FinalizedStaysRecovered == \A p \in Procs : Finalized(p) => NewWorld(log[p])
+
 TypeOK ==
     /\ \A p \in Procs : lease[p].le \in 0..L /\ lease[p].d \in -D..D
     /\ wait.st \in {"none", "run", "done"} /\ wait.le \in 0..(L + M) /\ wait.d \in -D..D
@@ -690,5 +727,8 @@ FairSpec == Spec /\ OutageFairness
 LeadershipLapses == (~catUp) ~> []NoLeader
 
 Symmetry == Permutations(OldVoters \ (Survivors \cup {FirstLost})) \cup Permutations(Replacements)
+
+\* For a cut that stops some lost voters, which breaks their symmetry.
+ReplacementSymmetry == Permutations(Replacements)
 
 =============================================================================
