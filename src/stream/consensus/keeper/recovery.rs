@@ -402,8 +402,10 @@ impl Config {
                 .await?
             }
             Some(voters) => {
+                // Repair may have replaced every configured voter.
                 let order = voters
                     .into_iter()
+                    .chain(self.keepers.keys().copied())
                     .filter(|voter| *voter != self.keeper)
                     .collect::<Vec<_>>();
                 catalog::ask(&order, Instant::now() + STAGING_TIMEOUT, |voter| {

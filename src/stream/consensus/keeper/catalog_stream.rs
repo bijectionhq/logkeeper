@@ -240,7 +240,8 @@ impl Engine {
     }
 
     /// Asks the replicated catalog, starting with this keeper when it holds
-    /// a replica, then the last writer and the configured voters.
+    /// a replica, then the last writer and the configured voters, then the
+    /// other keepers, since repair may have replaced every configured voter.
     pub(super) async fn ask_catalog_stream(&self, request: Request) -> io::Result<Reply> {
         let catalog = self.catalog_stream()?;
         let mut order = Vec::new();
@@ -249,6 +250,7 @@ impl Engine {
         }
         order.extend(*catalog.leader.lock());
         order.extend(catalog.genesis.voters);
+        order.extend(self.placement.domains().keys().copied());
         let end = Instant::now() + REQUEST_TIMEOUT;
         let write = !matches!(request, Request::Locate(_));
         let answer = super::super::catalog::ask(&order, end, |keeper| {
@@ -265,7 +267,7 @@ impl Engine {
         .await;
         Ok(match answer {
             Some((keeper, reply)) => {
-                if write {
+                if write || !catalog.genesis.voters.contains(&keeper) {
                     *catalog.leader.lock() = Some(keeper);
                 }
                 reply

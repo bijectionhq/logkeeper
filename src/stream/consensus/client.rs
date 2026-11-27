@@ -517,7 +517,8 @@ impl Client {
     }
 
     /// Asks the catalog keeper, or the replicated catalog's voters until one
-    /// answers, giving each call at most `attempt`.
+    /// answers, giving each call at most `attempt`. Repair may have replaced
+    /// every configured voter, so the other keepers follow them.
     async fn ask_catalog(
         &self,
         request: Request,
@@ -541,6 +542,7 @@ impl Client {
             .iter()
             .copied()
             .chain(voters)
+            .chain(self.rpc.keepers().keys().copied())
             .collect::<Vec<_>>();
         let claim = matches!(request, Request::Claim(_));
         let (keeper, reply) = super::catalog::ask(&order, end, |keeper| {
@@ -553,7 +555,9 @@ impl Client {
         })
         .await
         .ok_or(JournalError::Unavailable)?;
-        if claim {
+        // A keeper found past the configured voters is remembered for every
+        // request, since they no longer host the catalog.
+        if claim || !voters.contains(&keeper) {
             *self.catalog_leader.lock() = Some(keeper);
         }
         Ok(reply)

@@ -265,3 +265,56 @@ async fn a_populated_single_catalog_migrates_into_the_replicated_catalog() {
     assert!(legacy.catalog(created).is_none());
     cluster.stop_all().await;
 }
+
+/// Clients and keepers find the replicated catalog after every one of its
+/// configured voters was replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_replicated_catalog_stays_reachable_after_its_voters_are_replaced() {
+    let mut cluster = Cluster::start_replicated().await;
+    let [a, b, c, d] = cluster.ids;
+    let [c1, c2, c3] = cluster.catalog_voters.unwrap();
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(210);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+
+    // Replace all three original catalog voters one by one:
+    // [5, 6, 7] -> [1, 6, 7] -> [1, 2, 7] -> [1, 2, 3].
+    let mut current = journal.configuration(STREAM).await.unwrap();
+    for next in [[a, c2, c3], [a, b, c3], [a, b, c]] {
+        current = journal
+            .replace(STREAM, current.revision, next)
+            .await
+            .unwrap();
+    }
+    assert_eq!(current.voters, [a, b, c]);
+
+    // Retire the removed catalog copies on the three original catalog_voters.
+    let authority = cluster.authority(STREAM, [a, b, c], current.revision).await;
+    for old in [c1, c2, c3] {
+        if let Ok(generation) = journal.replica_generation(STREAM, old).await {
+            journal
+                .retire_copy(STREAM, old, authority, current.revision, generation)
+                .await
+                .unwrap();
+        }
+    }
+
+    // A fresh client and a non-catalog keeper `d` can no longer reach the
+    // healthy catalog quorum on [a, b, c].
+    let cold = cluster.client_within(&cluster.credentials, Duration::from_secs(3));
+    assert_eq!(
+        cold.claimed_voters(stream).await,
+        Ok(Some([a, b, c])),
+        "a cold client must still reach the replicated catalog after its original voters were replaced"
+    );
+    let reply = cluster.running[&d]
+        .engine
+        .ask_catalog_stream(Request::Locate(stream))
+        .await
+        .unwrap();
+    assert!(
+        matches!(reply, Reply::Catalog(genesis, _) if genesis.stream == stream),
+        "non-catalog keeper must still reach the replicated catalog after voter replacement"
+    );
+    cluster.stop_all().await;
+}
