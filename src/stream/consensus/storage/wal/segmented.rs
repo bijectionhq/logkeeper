@@ -50,7 +50,7 @@ pub(super) const MAX_SCOPES: usize = 4096;
 pub(super) const MAX_SUFFIX: usize = 1024;
 pub(in crate::stream::consensus::storage) const CHECKPOINTS: &str = "raft-checkpoints";
 /// N-1 checkpoint format; written until the cluster feature level is finalized
-/// at `CLUSTER_VERSION_CURRENT` so downgrade before finalize stays possible.
+/// at `CLUSTER_VERSION_V2` so downgrade before finalize stays possible.
 const CHECKPOINT_MAGIC: &[u8; 8] = b"LKRWAL04";
 /// N checkpoint format carrying the finalized cluster feature level; gated by
 /// `decisions::write_version_allows`.
@@ -1200,7 +1200,7 @@ fn write_checkpoint(
 ) -> io::Result<CheckpointRef> {
     let body = if crate::stream::consensus::decisions::write_version_allows(
         write_version,
-        crate::stream::consensus::CLUSTER_VERSION_CURRENT,
+        crate::stream::consensus::CLUSTER_VERSION_V2,
     ) {
         let mut body = CHECKPOINT_MAGIC_V5.to_vec();
         options()

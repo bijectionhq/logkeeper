@@ -57,9 +57,14 @@ pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Cluster feature level before any rolling-upgrade format finalization (N-1).
 pub const CLUSTER_VERSION_V1: u32 = 1;
+/// Cluster feature level that allows the formats N-1 cannot read: `LKRWAL05`
+/// checkpoints, durable park marks, `LKRIDX02` snapshot roots and `LKRIMG04`
+/// images. A gate names the level its format needs, not
+/// `CLUSTER_VERSION_CURRENT`, so a later level never moves an older gate.
+pub const CLUSTER_VERSION_V2: u32 = 2;
 /// Cluster feature level enabled once all keepers run this build and an
 /// operator finalizes the upgrade.
-pub const CLUSTER_VERSION_CURRENT: u32 = 2;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V2;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {

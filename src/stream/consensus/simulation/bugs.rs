@@ -417,7 +417,9 @@ async fn bug_repro_cross_epoch_identical_payload_retry_violates_contract() {
 
 /// The epochs of retained records survive a local snapshot and a restart of
 /// every keeper: the same bytes a writer of an earlier epoch committed still
-/// conflict, and the current writer's identical retry still succeeds.
+/// conflict, and the current writer's identical retry still succeeds. Roots
+/// carry epochs only in a finalized cluster (`LKRIDX02`), so it finalizes
+/// first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_epochs_survive_a_snapshot_and_a_full_restart() {
     let options = ClusterOptions {
@@ -433,6 +435,7 @@ async fn record_epochs_survive_a_snapshot_and_a_full_restart() {
         cluster.data_ids[2],
     ];
     let stream = StreamId(250_002);
+    cluster.finalize_version().await;
     let writer_a = cluster.journal(WRITER_A, voters);
     let writer_b = cluster.journal(WRITER_B, voters);
     let record = |at: u64| Bytes::from(format!("record-{at}"));

@@ -1820,7 +1820,8 @@ async fn seekable_transfer_pins_its_exact_old_extents_until_close() {
         .unwrap();
     let (extent, _) = source.state.payload_path().unwrap();
     let path = source.state.snapshot_path().unwrap();
-    assert!(std::fs::read(path).unwrap().starts_with(b"LKRIDX02"));
+    // An unfinalized cluster keeps the root N-1 can open.
+    assert!(std::fs::read(path).unwrap().starts_with(b"LKRIDX01"));
     let mut wire = source.raft.get_snapshot().await.unwrap().unwrap().snapshot;
     let end = wire.seek(std::io::SeekFrom::End(0)).await.unwrap();
     let mut first = [0; 8];

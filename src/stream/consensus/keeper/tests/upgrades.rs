@@ -1384,3 +1384,152 @@ async fn the_scrubber_quarantines_a_corrupt_slice_nobody_reads() {
     );
     cluster.stop_all().await;
 }
+
+/// Snapshot roots and wire images gain record epochs only once the cluster
+/// version is finalized: before it, the leader's root is `LKRIDX01` and a
+/// replacement installs an `LKRIMG03` image, which N-1 reads and which
+/// carries no epochs; after it, the root is `LKRIDX02` and the image is
+/// `LKRIMG04`, so a copy installed from a peer knows which writer appended
+/// each record, as the copy it came from does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_formats_carry_record_epochs_only_after_finalization() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, d] = cluster.ids;
+    let spare = Uuid::from_u128(6);
+    let client = cluster.client(&cluster.credentials);
+
+    let unfinalized = epochs_after_a_snapshot_install(&cluster, StreamId(230), [a, b, c], d).await;
+    assert_eq!(unfinalized.root, *b"LKRIDX01");
+    assert_eq!(unfinalized.image, *b"LKRIMG03");
+    assert_eq!(unfinalized.installed, *b"LKRIMG03");
+    // The image's records have unknown epochs; those replayed from the log
+    // after it are known.
+    assert_eq!(unfinalized.copied.epoch(Lsn(1)), None);
+    assert_ne!(unfinalized.copied, unfinalized.source);
+
+    timeout(WAIT, async {
+        loop {
+            match client.finalize_version(CLUSTER_VERSION_CURRENT).await {
+                Ok(version) => break assert_eq!(version, CLUSTER_VERSION_CURRENT),
+                Err(JournalError::Unavailable) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("finalize refused: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("finalize succeeded once every keeper answered");
+    // Keepers learn the level in a 10 s loop; set it as that loop would.
+    for running in cluster.running.values() {
+        running
+            .engine
+            .disk
+            .set_write_version(CLUSTER_VERSION_CURRENT);
+    }
+
+    let finalized =
+        epochs_after_a_snapshot_install(&cluster, StreamId(231), [a, b, c], spare).await;
+    assert_eq!(finalized.root, *b"LKRIDX02");
+    assert_eq!(finalized.image, *b"LKRIMG04");
+    assert_eq!(finalized.installed, *b"LKRIMG04");
+    assert_eq!(finalized.copied, finalized.source);
+    assert_eq!(finalized.copied.epoch(Lsn(1)), Some(Epoch(1)));
+    assert_eq!(finalized.copied.epoch(Lsn(145)), Some(Epoch(2)));
+    cluster.stop_all().await;
+}
+
+struct InstalledEpochs {
+    root: [u8; 8],
+    image: [u8; 8],
+    installed: [u8; 8],
+    source: crate::stream::consensus::state::EpochRuns,
+    copied: crate::stream::consensus::state::EpochRuns,
+}
+
+/// Writes records 1..=100 under epoch 1 and 101..=145 under epoch 2, waits
+/// for the leader to snapshot and purge, then replaces a follower with
+/// `fresh`, which catches up from the leader's wire image.
+async fn epochs_after_a_snapshot_install(
+    cluster: &Cluster,
+    stream: StreamId,
+    voters: [Uuid; 3],
+    fresh: Uuid,
+) -> InstalledEpochs {
+    use tokio::io::AsyncSeekExt;
+
+    let client = cluster.client(&cluster.credentials);
+    client.create(stream, voters, 64 * 1024).await.unwrap();
+    let first = client
+        .seal(stream, Epoch(0), Uuid::from_u128(60))
+        .await
+        .unwrap()
+        .fence;
+    for at in 1..=100 {
+        client
+            .append(stream, first, Lsn(at), Bytes::from(format!("record-{at}")))
+            .await
+            .unwrap();
+    }
+    let second = client
+        .seal(stream, Epoch(1), Uuid::from_u128(61))
+        .await
+        .unwrap()
+        .fence;
+    for at in 101..=145 {
+        client
+            .append(stream, second, Lsn(at), Bytes::from(format!("record-{at}")))
+            .await
+            .unwrap();
+    }
+    let leader = cluster.leader(stream).await;
+    let source = cluster.group(leader, stream).await;
+    source
+        .raft
+        .wait(Some(WAIT))
+        .metrics(
+            |metrics| metrics.purged.is_some_and(|id| id.index > 0),
+            "the leader purged its log prefix behind a snapshot",
+        )
+        .await
+        .unwrap();
+    let mut root = [0; 8];
+    root.copy_from_slice(&std::fs::read(source.state.snapshot_path().unwrap()).unwrap()[..8]);
+    let mut wire = source.raft.get_snapshot().await.unwrap().unwrap().snapshot;
+    let mut image = [0; 8];
+    wire.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+    wire.read_exact(&mut image).await.unwrap();
+    drop(wire);
+
+    let starting = client.configuration(stream).await.unwrap();
+    let follower = voters.into_iter().find(|id| *id != leader).unwrap();
+    let next = voters.map(|id| if id == follower { fresh } else { id });
+    client
+        .replace(stream, starting.revision, next)
+        .await
+        .unwrap();
+    let copy = cluster.group(fresh, stream).await;
+    let installed = timeout(WAIT, async {
+        loop {
+            if let Some(path) = copy.state.snapshot_path()
+                && let Ok(bytes) = std::fs::read(&path)
+                && bytes.starts_with(b"LKRIMG")
+                && copy.state.head() == Ok(Lsn(145))
+            {
+                let mut magic = [0; 8];
+                magic.copy_from_slice(&bytes[..8]);
+                break magic;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the replacement installed the leader's image");
+    InstalledEpochs {
+        root,
+        image,
+        installed,
+        source: source.state.epoch_runs(),
+        copied: copy.state.epoch_runs(),
+    }
+}

@@ -19,10 +19,13 @@ use crate::stream::consensus::{
     storage::objects::{Key, Location, Object, Objects, Reference},
 };
 
-/// Roots that also store the epochs of the retained records.
+/// Roots that also store the epochs of the retained records. An N format:
+/// written only once the cluster version is finalized, since a keeper from
+/// before it cannot open one.
 pub(super) const MAGIC: &[u8; 8] = b"LKRIDX02";
-/// Roots without epochs, which reopen with unknown record epochs.
-const MAGIC_WITHOUT_EPOCHS: &[u8; 8] = b"LKRIDX01";
+/// Roots without epochs, which reopen with unknown record epochs. Written
+/// until the cluster version is finalized, so a keeper can roll back.
+pub(super) const MAGIC_WITHOUT_EPOCHS: &[u8; 8] = b"LKRIDX01";
 
 /// Whether a selected snapshot starts with an index root.
 pub(super) fn indexed(magic: &[u8; 8]) -> bool {
@@ -103,6 +106,7 @@ pub(super) fn build(
     meta: &SnapshotMeta,
     image: &Image,
     previous: &Dependencies,
+    with_epochs: bool,
 ) -> io::Result<Dependencies> {
     let mut dependencies = Dependencies::default();
     let mut first = image.state.retained_floor().0;
@@ -150,20 +154,22 @@ pub(super) fn build(
         return Err(invalid("snapshot dependency geometry exceeded"));
     }
     objects.publish_files()?;
-    let root = encode(&(
-        Root {
-            genesis: genesis.clone(),
-            meta: meta.clone(),
-            image: image.clone(),
-            pages,
-            legacy: dependencies.legacy.clone(),
-        },
-        image.state.epoch_runs(),
-    ))?;
+    let root = Root {
+        genesis: genesis.clone(),
+        meta: meta.clone(),
+        image: image.clone(),
+        pages,
+        legacy: dependencies.legacy.clone(),
+    };
+    let (magic, root) = if with_epochs {
+        (MAGIC, encode(&(root, image.state.epoch_runs()))?)
+    } else {
+        (MAGIC_WITHOUT_EPOCHS, encode(&root)?)
+    };
     if root.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("snapshot root exceeds its bound"));
     }
-    file.write_all(MAGIC)?;
+    file.write_all(magic)?;
     file.write_all(&root)?;
     Ok(dependencies)
 }

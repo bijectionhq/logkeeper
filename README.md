@@ -495,7 +495,10 @@ index-page dependencies). Directly after the fill, before any restart, the
 same stream measured about 265 bytes per record per voter, including
 write-path state that a restart does not rebuild.
 
-The existing bulk ALPN, 1 MiB chunks and `LKRIMG03` wire image remain supported.
+The existing bulk ALPN and 1 MiB chunks remain supported. The wire image is
+`LKRIMG03` until the cluster version is finalized and `LKRIMG04` after it;
+`LKRIMG04` also carries the epoch each record was written under, so a copy
+installed from a peer knows them as its source does.
 Bulk admission is shared by incoming files and private seekable outbound files.
 It allows four sessions, up to 256 MiB per file and 512 MiB in total, subject to
 available volume space. A sender pins the selected cut and serves the same
@@ -505,12 +508,11 @@ including framing and metadata, when replacement by snapshot is required.
 
 The keeper can reopen a selected `LKRIMG03` image in place. A first local snapshot
 can reference it as an immutable extent. New selected local roots use
-`LKRIDX02`, which also stores the epoch each retained record was written
-under, and new WAL directories use `LKRWAL03`. An `LKRIDX01` root, or an
-`LKRIMG03` image installed from a peer, reopens with no record epochs, so
-until those records are trimmed an append matching one is judged by its
-bytes alone. A keeper before `LKRIDX02` cannot reopen such a root, so do
-not downgrade below it. On first startup, an enrolled
+`LKRIDX01` until the cluster version is finalized and `LKRIDX02` after it,
+which also stores the epoch each retained record was written under; new WAL
+directories use `LKRWAL03`. An `LKRIDX01` root, or an `LKRIMG03` image
+installed from a peer, reopens with no record epochs, so until those records
+are trimmed an append matching one is judged by its bytes alone. On first startup, an enrolled
 framed WAL is migrated through the existing trusted boundary. Budget additional
 free space for the encoded live suffix, two allocation units per entry, 160 KiB
 plus two allocation units per scope, 1 MiB for the root and overhead, and the
@@ -655,9 +657,12 @@ the gate, or `Unavailable`, worth retrying, while one does not answer. Until
 then N writes only N-1 formats, so a keeper can go back to N-1: checkpoints
 stay `LKRWAL04`, no cluster-version record is written, segment compaction
 only asks owners to snapshot and purge instead of writing `Relocate` frames,
-and a parked copy writes no park mark, so it reopens at restart. After it,
-checkpoints become `LKRWAL05`, compaction copies cold slices, parks are
-durable, and N-1 refuses the media. A format a later release adds follows
+a parked copy writes no park mark, so it reopens at restart, snapshot roots
+stay `LKRIDX01` and wire images stay `LKRIMG03`. After it, checkpoints become
+`LKRWAL05`, compaction copies cold slices, parks are durable, roots and images
+carry record epochs (`LKRIDX02`, `LKRIMG04`), and N-1 refuses the media.
+Each gate names the level its format needs (`CLUSTER_VERSION_V2` for all of
+these), never `CLUSTER_VERSION_CURRENT`. A format a later release adds follows
 the same rule: it is written only once `write_version_allows` it, and a
 request it adds is refused on N-1 connections in `Request::supported_on`. Keeper configuration ignores
 an unknown top-level field with a warning, so a configuration may name a
@@ -676,7 +681,7 @@ a replica. Leaders count a configuration that breaks placement
 `keepers`, still serves and is still asked before a recovery or a
 finalization.
 
-The `LKRIMG03` images and the WAL records are unchanged before
+The wire images and the WAL records are unchanged before
 finalization; a test pins the persisted bytes of
 votes, log ids, memberships, entries and snapshot metadata to their 0.9
 encoding. A leader that cannot confirm a recent quorum refuses writes

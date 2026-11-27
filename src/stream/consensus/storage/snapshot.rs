@@ -36,7 +36,7 @@ use crate::stream::{
         Configuration, Entry, Genesis, LogId, MAX_MESSAGE, MAX_RECORD, Membership, RaftTypes,
         SnapshotMeta, Stage, invalid, options, ownership,
         placement::Placement,
-        state::{Command, MAX_RETAINED_RECORDS, Outcome, Payload, State, TIMED_RECORD},
+        state::{Command, EpochRuns, MAX_RETAINED_RECORDS, Outcome, Payload, State, TIMED_RECORD},
     },
     keeper::durability::{sync_directory, sync_file},
 };
@@ -307,7 +307,7 @@ impl Pin {
     /// keeper never meets one and a later N never trusts one an N-1 outran.
     /// The copy then reopens at restart, as N-1 does.
     pub fn persist(&self, disk: &Disk, stream: StreamId) -> io::Result<()> {
-        if !disk.write_version_allows(crate::stream::consensus::CLUSTER_VERSION_CURRENT) {
+        if !disk.write_version_allows(crate::stream::consensus::CLUSTER_VERSION_V2) {
             return Ok(());
         }
         // Segments that slices of the selected snapshot left stay named
@@ -961,6 +961,12 @@ impl StateMachine {
     pub fn applied(&self) -> Option<LogId> {
         self.inner.applied.read().applied
     }
+
+    /// The epochs this replica knows its retained records were written under.
+    #[cfg(test)]
+    pub fn epoch_runs(&self) -> EpochRuns {
+        self.inner.applied.read().state.epoch_runs()
+    }
 }
 
 impl RaftStateMachine<RaftTypes> for StateMachine {
@@ -1186,8 +1192,18 @@ impl Inner {
         let inner = self.clone();
         let snapshot = SnapshotFile::send(meta.clone(), move || {
             let mut transfer = inner.disk.space.transfer()?;
+            // An N-1 receiver reads only `LKRIMG03`: carry the epoch runs
+            // once the cluster version is finalized.
+            let with_epochs = inner
+                .disk
+                .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_V2);
+            let epochs = with_epochs.then(|| active.image.state.epoch_runs());
             let metadata = options()
                 .serialized_size(&(&inner.genesis, &active.meta, &active.image))
+                .and_then(|size| match &epochs {
+                    Some(epochs) => Ok(size + options().serialized_size(epochs)?),
+                    None => Ok(size),
+                })
                 .map_err(io::Error::other)?;
             transfer.grow(
                 active
@@ -1215,6 +1231,7 @@ impl Inner {
                 &inner.genesis,
                 &active.meta,
                 &active.image,
+                with_epochs,
                 |reason| inner.quarantine_corrupt(reason),
             )?;
             temporary.transfer.account(&file.metadata()?);
@@ -1224,9 +1241,12 @@ impl Inner {
             let digest = {
                 let mut wire = inner.wire.lock();
                 wire.retain(|_, digest| digest.strong_count() != 0);
+                // A finalization between two builds of the same image changes
+                // its format and so its bytes: share only an equal digest.
                 let digest = wire
                     .get(&active.meta.snapshot_id)
                     .and_then(Weak::upgrade)
+                    .filter(|shared| **shared == digest)
                     .unwrap_or_else(|| Arc::new(digest));
                 wire.insert(active.meta.snapshot_id.clone(), Arc::downgrade(&digest));
                 digest
@@ -1367,6 +1387,11 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
             Some(prior) if moved.is_none() => prior.dependencies,
             _ => index::Dependencies::default(),
         };
+        // Epoch runs in the root are an N format: until the cluster version
+        // is finalized the root stays `LKRIDX01`, which N-1 opens.
+        let with_epochs = inner
+            .disk
+            .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_V2);
         let scratch = inner.disk.space.scratch(index::SCRATCH).await?;
         let temporary = inner
             .directory
@@ -1385,6 +1410,7 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
                 &meta,
                 &image,
                 &previous,
+                with_epochs,
             )?;
             let selected = prepare_selection(file, &meta)?;
             Ok((
@@ -1736,7 +1762,14 @@ async fn blocking<T: Send + 'static>(
         .and_then(|result| result)
 }
 
+/// Images without the epochs of their records. Written until the cluster
+/// version is finalized, since N-1 reads only this format; a copy installed
+/// from one judges a repeated identical append by its bytes alone.
 const MAGIC: &[u8; 8] = b"LKRIMG03";
+/// Images that also carry the epoch runs of their records, after the
+/// metadata and before the records. An N format, written only once the
+/// cluster version is finalized.
+const MAGIC_WITH_EPOCHS: &[u8; 8] = b"LKRIMG04";
 const STAGED_IMAGE: &str = "lk-stage-";
 const HEADER_BYTES: u64 = 12;
 
@@ -1747,9 +1780,14 @@ fn write_image(
     genesis: &Genesis,
     meta: &SnapshotMeta,
     image: &Image,
+    with_epochs: bool,
     quarantine: impl Fn(&str),
 ) -> io::Result<()> {
-    file.write_all(MAGIC)?;
+    file.write_all(if with_epochs {
+        MAGIC_WITH_EPOCHS
+    } else {
+        MAGIC
+    })?;
     file.write_all(&[0; 4])?;
     let mut crc = crc32fast::Hasher::new();
     {
@@ -1762,6 +1800,11 @@ fn write_image(
         options()
             .serialize_into(&mut writer, &(genesis, meta, image))
             .map_err(io::Error::other)?;
+        if with_epochs {
+            options()
+                .serialize_into(&mut writer, &image.state.epoch_runs())
+                .map_err(io::Error::other)?;
+        }
         for payload in image.state.records() {
             let bytes = payload
                 .load()
@@ -1791,9 +1834,11 @@ fn read_image(
     let mut file = BufReader::new(file);
     let mut header = [0; 12];
     file.read_exact(&mut header)?;
-    if &header[..8] != MAGIC {
-        return Err(invalid("invalid snapshot format"));
-    }
+    let with_epochs = match &header[..8] {
+        magic if magic == MAGIC => false,
+        magic if magic == MAGIC_WITH_EPOCHS => true,
+        _ => return Err(invalid("invalid snapshot format")),
+    };
     let mut crc = crc32fast::Hasher::new();
     let mut reader = HashReader {
         reader: &mut file,
@@ -1804,6 +1849,14 @@ fn read_image(
         .with_limit(MAX_MESSAGE)
         .deserialize_from(&mut reader)
         .map_err(io::Error::other)?;
+    let epochs: EpochRuns = if with_epochs {
+        options()
+            .with_limit(MAX_MESSAGE)
+            .deserialize_from(&mut reader)
+            .map_err(io::Error::other)?
+    } else {
+        EpochRuns::default()
+    };
     image.stage_intent = meta.snapshot_id.starts_with(STAGED_IMAGE);
     if &found != genesis
         || image.applied != meta.last_log_id
@@ -1854,6 +1907,7 @@ fn read_image(
         return Err(invalid("invalid snapshot checksum or length"));
     }
     image.state.restore_records(records, genesis.quota_bytes)?;
+    image.state.restore_epochs(epochs)?;
     Ok((meta, image))
 }
 

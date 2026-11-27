@@ -318,6 +318,28 @@ impl SimCluster {
         journal
     }
 
+    /// Finalizes the cluster version through the catalog and sets it on every
+    /// running keeper, as each keeper's 10 s version loop would.
+    pub async fn finalize_version(&self) {
+        let version = crate::stream::consensus::CLUSTER_VERSION_CURRENT;
+        let client = self.probe_client();
+        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match client.finalize_version(version).await {
+                Ok(finalized) => break assert_eq!(finalized, version),
+                Err(journal_contract::JournalError::Unavailable)
+                    if tokio::time::Instant::now() < end =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(error) => panic!("finalize refused: {error:?}"),
+            }
+        }
+        for running in self.running.values() {
+            running.engine.disk.set_write_version(version);
+        }
+    }
+
     /// Unfiltered client used for final convergence and invariant probing after healing.
     pub fn probe_client(&self) -> Client {
         let client = Client::new(&self.creds_a, self.keepers.clone(), self.catalog, WAIT).unwrap();
