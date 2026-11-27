@@ -26,6 +26,33 @@ jobs:
         env:
           LOGKEEPER_SIM_SEEDS: 10000
         run: cargo +1.94.1 test --locked --workspace --all-features -- --show-output
+  consensus-traces:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Set up Java for consensus trace validation
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Replay consensus fault traces in TLC
+        env:
+          LOGKEEPER_TRACE_CI: 1
+          LOGKEEPER_CONSENSUS_LEASES: 1
+          LOGKEEPER_TRACE_OUTPUT: ${{ runner.temp }}/keeper-traces
+          CARGO_PROFILE_DEV_DEBUG: 0
+          CARGO_INCREMENTAL: 0
+        run: cargo +1.94.1 test --locked --features stream --lib consensus_trace_ci -- --nocapture
+      - name: Preserve rejected consensus traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keeper-traces
+          path: ${{ runner.temp }}/keeper-traces/**/*.ndjson
+          if-no-files-found: ignore
   packaging:
     runs-on: ubuntu-24.04
     steps:

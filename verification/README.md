@@ -156,7 +156,7 @@ comparison.
 ## Consensus keeper additions
 
 The keeper-hosted consensus streams (`src/stream/consensus/`) run OpenRaft
-0.10.1, whose election, log matching and commit rules are trusted. Four
+0.10.1, whose election, log matching and commit rules are trusted. These
 checks cover what Logkeeper adds on top of Raft, each at its own level.
 
 - **Verus, local decisions.** The [consensus admission area](verus/consensus_admission/README.md)
@@ -189,6 +189,10 @@ checks cover what Logkeeper adds on top of Raft, each at its own level.
   `fault-harness` adds `src/stream/consensus/simulation/`: seeded faults
   against seven in-process keepers, with linearizability, durability,
   fencing and cross-voter convergence checked on each history.
+- **TLA+, trace validation.** The [keeper trace replay](tla/TRACE.md) uses the
+  harness to observe the real WAL, state machine and catalog authority. TLC
+  checks the observed vote, append, commit, snapshot, park, lease, recovery,
+  fence and offload transitions against a projection of the consensus models.
 
 | Property | Verus (local) | Lean (abstract) | TLA+ (bounded) | Fault harness |
 | --- | --- | --- | --- | --- |
