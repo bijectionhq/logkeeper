@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import subprocess
@@ -80,6 +81,12 @@ def keeper_group(check, binary, work, logs):
                 self.command(keeper, "initialize")
                 self.configs[keeper] = config
             self.client = self.pki.issue("rtdb-writer", f"URI:{check.PRINCIPAL}", "clientAuth")
+            cert, key = self.client
+            self.operator = work / "operator.json"
+            write_json(self.operator, dict(
+                tls=dict(certificate=str(cert), private_key=str(key), ca=str(self.pki.ca)),
+                keepers=self.addresses["keepers"], catalog=catalog, catalog_voters=catalog_voters,
+            ))
             journal = work / "journal.json"
             write_json(journal, dict(
                 keepers=self.addresses["keepers"], catalog=catalog, voters=self.voters,
@@ -124,6 +131,37 @@ def refuse_restart(keepers, keeper):
         raise RuntimeError(f"retired keeper {keeper} restarted")
 
 
+def finalize(keepers):
+    for attempt in range(10):
+        result = subprocess.run(
+            [keepers.binary, "admin", "finalize-version", "--config", keepers.operator, "--json"],
+            capture_output=True, timeout=10,
+        )
+        if result.returncode == 0:
+            version = json.loads(result.stdout)["cluster_version"]
+            if version < 3:
+                raise RuntimeError(f"recovery markers require cluster version 3, found {version}")
+            return version
+        if attempt < 9:
+            time.sleep(0.5)
+    raise RuntimeError(f"could not finalize the cluster version: {result.stderr.decode()}")
+
+
+def verify_markers(log, streams):
+    markers = {}
+    for line in log.read_text().splitlines():
+        if "code=rtdb/journal-recovered" not in line or "marker_lsn=" not in line:
+            continue
+        fields = dict(re.findall(r"\b(database|head|epoch|marker_lsn)=([0-9a-f-]+)\b", line))
+        database = fields.pop("database")
+        if database in markers or int(fields["marker_lsn"]) != int(fields["head"]) + 1:
+            raise RuntimeError(f"unexpected recovery marker for {database}")
+        markers[database] = fields
+    if markers.keys() != set(streams):
+        raise RuntimeError(f"expected one atomic recovery marker per stream, got {markers}")
+    return markers
+
+
 def rehearse(args, check, work, logs, report):
     keepers = keeper_group(check, args.logkeeper, work, logs)
     rtdb = local_rtdb(check, args.rtdb, work, keepers, logs)
@@ -132,6 +170,7 @@ def rehearse(args, check, work, logs, report):
     try:
         for keeper in keepers.all():
             keepers.start(keeper)
+        report["cluster_version"] = finalize(keepers)
         rtdb.start()
         check.commit(rtdb, args.clients, args.seconds, "before-recovery", phases, receipts)
         if not receipts:
@@ -184,9 +223,11 @@ def rehearse(args, check, work, logs, report):
         if len(receipts) <= report["pre_recovery_receipts"]:
             raise RuntimeError("no acknowledged transactions after recovery")
         check.recheck(rtdb, "final-recheck", phases, receipts)
+        rtdb.stop(kill=True)
+        rtdb.start()
+        check.recheck(rtdb, "after-second-rtdb-restart", phases, receipts)
         report["total_receipts"] = len(receipts)
-        if "journal-recovered" not in (logs / "rtdb.log").read_text():
-            raise RuntimeError("RTDB did not record recovery acknowledgement")
+        report["recovery_markers"] = verify_markers(logs / "rtdb.log", streams)
         if report["rto_seconds"] > args.max_rto_seconds:
             raise RuntimeError("recovery exceeded the configured RTO")
     finally:
