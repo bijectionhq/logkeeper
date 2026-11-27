@@ -1,0 +1,49 @@
+{
+  "keeper": "6f80e62d-88ab-4031-9905-4a60ae9cc8a4",
+  "listen": "10.0.1.10:5441",
+  "data": "/var/lib/logkeeper/media/data",
+  "enrollment": "/var/lib/logkeeper/registry",
+  "tls": {
+    "certificate": "/etc/logkeeper/tls/keeper-0.pem",
+    "private_key": "/etc/logkeeper/tls/keeper-0.key",
+    "ca": "/etc/logkeeper/tls/ca.pem"
+  },
+  "keepers": {
+    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "10.0.1.10:5441",
+    "c174474a-8704-4da9-9283-9fd2f29679e6": "10.0.2.10:5441",
+    "efe8b19f-61fc-424d-b4d0-d67cff989952": "10.0.3.10:5441"
+  },
+  "peers": {
+    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "10.0.1.10:5541",
+    "c174474a-8704-4da9-9283-9fd2f29679e6": "10.0.2.10:5541",
+    "efe8b19f-61fc-424d-b4d0-d67cff989952": "10.0.3.10:5541"
+  },
+  "bulk": {
+    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "10.0.1.10:5641",
+    "c174474a-8704-4da9-9283-9fd2f29679e6": "10.0.2.10:5641",
+    "efe8b19f-61fc-424d-b4d0-d67cff989952": "10.0.3.10:5641"
+  },
+  "domains": {
+    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "zone-a",
+    "c174474a-8704-4da9-9283-9fd2f29679e6": "zone-b",
+    "efe8b19f-61fc-424d-b4d0-d67cff989952": "zone-c"
+  },
+  "catalog": "6f80e62d-88ab-4031-9905-4a60ae9cc8a4",
+  "catalog_voters": [
+    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4",
+    "c174474a-8704-4da9-9283-9fd2f29679e6",
+    "efe8b19f-61fc-424d-b4d0-d67cff989952"
+  ],
+  "readers": [],
+  "writers": [
+    "urn:logkeeper:client:rtdb"
+  ],
+  "administrators": [
+    "urn:logkeeper:client:rtdb",
+    "urn:logkeeper:client:operator"
+  ],
+  "max_streams": 128,
+  "repair_after_secs": 600,
+  "park_after_secs": 600,
+  "snapshot_send_bytes_per_second": 67108864
+}

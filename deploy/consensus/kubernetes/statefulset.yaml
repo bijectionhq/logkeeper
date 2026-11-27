@@ -1,0 +1,182 @@
+# Headless service for the StatefulSet's identity. Clients and peers do not
+# use it: the keeper inventory is IP:port, so keepers run on the host network
+# and are addressed by their node IPs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: logkeeper
+  labels:
+    app.kubernetes.io/name: logkeeper
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: logkeeper
+  ports:
+    - { name: application, port: 5441 }
+    - { name: control, port: 5541 }
+    - { name: bulk, port: 5641 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: logkeeper
+  labels:
+    app.kubernetes.io/name: logkeeper
+spec:
+  serviceName: logkeeper
+  replicas: 3
+  # Keepers become ready only once they reach a peer, so they start together.
+  # Rolling updates still replace one pod at a time, waiting for /ready.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  minReadySeconds: 30
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: logkeeper
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: logkeeper
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # preStop waits up to 240 s for /safe-to-stop; SIGTERM then hands off
+      # leadership (at most 3 s) and flushes the WAL.
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: topology.kubernetes.io/zone
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: logkeeper
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: logkeeper
+      initContainers:
+        - name: install
+          image: logkeeper-consensus:dev
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -ec]
+          args:
+            - |
+              ordinal="${POD_NAME##*-}"
+              id="$(cat "/etc/logkeeper/keepers/keeper-$ordinal.id")"
+              cp "/etc/logkeeper/keepers/keeper-$ordinal.json" /run/logkeeper/keeper.json
+              cp /etc/logkeeper/keepers/placement.json /var/lib/logkeeper/registry/placement.json
+              cp "/etc/logkeeper/keepers/keeper-$ordinal.provision.json" \
+                "/var/lib/logkeeper/registry/$id.provision.json"
+              if [ -e /var/lib/logkeeper/media/data/KEEPER ]; then
+                exit 0
+              fi
+              case ",$LOGKEEPER_INITIALIZE," in
+                *",$id,"*)
+                  echo "installing fresh media for keeper $id"
+                  exec logkeeper keeper initialize --config /run/logkeeper/keeper.json
+                  ;;
+              esac
+              echo "keeper $id has no installed media and is not listed in logkeeper-initialize;" \
+                "a keeper ID is never reused on new media (docs/runbooks/replace-disk.md)" >&2
+              exit 1
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: LOGKEEPER_INITIALIZE
+              valueFrom: { configMapKeyRef: { name: logkeeper-initialize, key: keepers } }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: keepers, mountPath: /etc/logkeeper/keepers, readOnly: true }
+            - { name: tls, mountPath: /etc/logkeeper/tls, readOnly: true }
+            - { name: config, mountPath: /run/logkeeper }
+            - { name: media, mountPath: /var/lib/logkeeper/media }
+            - { name: registry, mountPath: /var/lib/logkeeper/registry }
+      containers:
+        - name: keeper
+          image: logkeeper-consensus:dev
+          imagePullPolicy: IfNotPresent
+          args: [--config, /run/logkeeper/keeper.json]
+          ports:
+            - { name: application, containerPort: 5441 }
+            - { name: control, containerPort: 5541 }
+            - { name: bulk, containerPort: 5641 }
+          resources:
+            requests: { cpu: "2", memory: 4Gi }
+            limits: { memory: 8Gi }
+          startupProbe:
+            exec: { command: [curl, -fsS, -o, /dev/null, "http://127.0.0.1:5741/live"] }
+            periodSeconds: 5
+            failureThreshold: 120
+          livenessProbe:
+            exec: { command: [curl, -fsS, -o, /dev/null, "http://127.0.0.1:5741/live"] }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            exec: { command: [curl, -fsS, -o, /dev/null, "http://127.0.0.1:5741/ready"] }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    i=0
+                    until curl -fsS -o /dev/null http://127.0.0.1:5741/safe-to-stop; do
+                      i=$((i + 1))
+                      if [ "$i" -ge 240 ]; then
+                        echo "safe-to-stop still refused after 240 s; stopping anyway" >&2
+                        exit 0
+                      fi
+                      sleep 1
+                    done
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: tls, mountPath: /etc/logkeeper/tls, readOnly: true }
+            - { name: config, mountPath: /run/logkeeper, readOnly: true }
+            - { name: media, mountPath: /var/lib/logkeeper/media }
+            - { name: registry, mountPath: /var/lib/logkeeper/registry }
+      volumes:
+        - name: keepers
+          configMap: { name: logkeeper-keepers }
+        # Holds keeper-N.pem, keeper-N.key for every N and ca.pem. Every pod
+        # mounts all keys; issue per-pod certificates (for example with the
+        # cert-manager CSI driver) to give each pod only its own.
+        - name: tls
+          secret: { secretName: logkeeper-tls, defaultMode: 0400 }
+        - name: config
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }
+  volumeClaimTemplates:
+    - metadata: { name: media }
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: logkeeper-local
+        resources: { requests: { storage: 400Gi } }
+    - metadata: { name: registry }
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: logkeeper-local
+        resources: { requests: { storage: 1Gi } }

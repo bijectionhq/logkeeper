@@ -1,0 +1,114 @@
+# Local persistent volumes, pre-bound to the StatefulSet's claims so that pod
+# N always lands on node N, whose IP is keeper N's address in the inventory.
+# Each keeper has a media volume (WAL, segments, snapshots) and a separate
+# registry volume (enrollment, WAL boundary, peer incarnations) that must
+# survive loss of the media. Replace node names, paths and sizes.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: logkeeper-local
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: logkeeper-media-0
+spec:
+  capacity: { storage: 400Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: logkeeper-local
+  claimRef: { namespace: logkeeper, name: media-logkeeper-0 }
+  local: { path: /mnt/logkeeper-media }
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: kubernetes.io/hostname, operator: In, values: [keeper-node-a] }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: logkeeper-registry-0
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: logkeeper-local
+  claimRef: { namespace: logkeeper, name: registry-logkeeper-0 }
+  local: { path: /mnt/logkeeper-registry }
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: kubernetes.io/hostname, operator: In, values: [keeper-node-a] }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: logkeeper-media-1
+spec:
+  capacity: { storage: 400Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: logkeeper-local
+  claimRef: { namespace: logkeeper, name: media-logkeeper-1 }
+  local: { path: /mnt/logkeeper-media }
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: kubernetes.io/hostname, operator: In, values: [keeper-node-b] }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: logkeeper-registry-1
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: logkeeper-local
+  claimRef: { namespace: logkeeper, name: registry-logkeeper-1 }
+  local: { path: /mnt/logkeeper-registry }
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: kubernetes.io/hostname, operator: In, values: [keeper-node-b] }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: logkeeper-media-2
+spec:
+  capacity: { storage: 400Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: logkeeper-local
+  claimRef: { namespace: logkeeper, name: media-logkeeper-2 }
+  local: { path: /mnt/logkeeper-media }
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: kubernetes.io/hostname, operator: In, values: [keeper-node-c] }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: logkeeper-registry-2
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: logkeeper-local
+  claimRef: { namespace: logkeeper, name: registry-logkeeper-2 }
+  local: { path: /mnt/logkeeper-registry }
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: kubernetes.io/hostname, operator: In, values: [keeper-node-c] }

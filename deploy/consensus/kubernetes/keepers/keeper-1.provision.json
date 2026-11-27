@@ -1,0 +1,6 @@
+{
+  "keeper": "c174474a-8704-4da9-9283-9fd2f29679e6",
+  "data": "/var/lib/logkeeper/media/data",
+  "domain": "zone-b",
+  "certificate_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+}

@@ -1,0 +1,64 @@
+# Consensus keeper under systemd. Install the binary at
+# /usr/local/bin/logkeeper, the config at /etc/logkeeper/keeper.json, and
+# create /var/lib/logkeeper/{media,registry} owned by the logkeeper user, on
+# separate volumes. Initialize the media once, explicitly:
+#   sudo -u logkeeper logkeeper keeper initialize --config /etc/logkeeper/keeper.json
+[Unit]
+Description=Logkeeper consensus keeper
+Documentation=https://github.com/bijectionhq/logkeeper/blob/main/docs/deployment.md
+Wants=network-online.target
+After=network-online.target local-fs.target
+RequiresMountsFor=/var/lib/logkeeper/media /var/lib/logkeeper/registry
+# A keeper that keeps failing (for example its WAL watchdog ends it on a
+# stalled disk) stops restarting after 5 failures in 10 minutes, so an
+# operator looks at the disk.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=logkeeper
+Group=logkeeper
+ExecStart=/usr/local/bin/logkeeper keeper --config /etc/logkeeper/keeper.json
+# SIGTERM hands every led stream to a caught-up voter (at most 3 s), closes
+# the groups and flushes the WAL. A WAL round that stalls past 20 s ends the
+# process on its own, so 30 s bounds a clean stop.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Hardening.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/logkeeper/media /var/lib/logkeeper/registry
+ReadOnlyPaths=/etc/logkeeper
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+# At most one keeper down for voluntary disruptions: every stream keeps two
+# of its three voters.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: logkeeper
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: logkeeper
+  unhealthyPodEvictionPolicy: IfHealthyBudget
