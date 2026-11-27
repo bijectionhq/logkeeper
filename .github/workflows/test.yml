@@ -3,6 +3,7 @@ name: Test
 on:
   push:
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -11,6 +12,7 @@ jobs:
   test:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
@@ -24,3 +26,21 @@ jobs:
         env:
           LOGKEEPER_SIM_SEEDS: 10000
         run: cargo +1.94.1 test --locked --workspace --all-features -- --show-output
+  packaging:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Kubernetes manifest validators
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 https://dl.k8s.io/v1.31.14/bin/linux/amd64/kubectl -o kubectl
+          echo '8791ec7c8966b61420d55103a5fb948de9f0ca3d7306d789734975ad9704bdb0  kubectl' | sha256sum -c
+          chmod +x kubectl
+          curl -fsSL --retry 3 https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz -o kubeconform-linux-amd64.tar.gz
+          echo 'c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3  kubeconform-linux-amd64.tar.gz' | sha256sum -c
+          tar -xzf kubeconform-linux-amd64.tar.gz kubeconform
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Validate staging and exercise the rollover guard
+        run: |
+          deploy/consensus/tests/validate.sh --kubernetes-only
+          python3 -B -m unittest discover -v -s deploy/consensus/tests

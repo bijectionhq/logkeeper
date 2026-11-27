@@ -14,6 +14,7 @@ Packaging lives in [`deploy/consensus/`](../deploy/consensus/):
 | File | What it is |
 | --- | --- |
 | `Dockerfile` | Multi-stage image, non-root (uid 10001), media and registry volumes, healthcheck on `/live` |
+| `release.py` | Build and verify a commit-pinned OCI image archive for Linux amd64 and arm64 |
 | `logkeeper-consensus.service` | Hardened systemd unit with a 30 s stop timeout |
 | `kubernetes/` | Kustomize bundle for six single-keeper StatefulSets across three zones |
 | `keeper.example.json`, `placement.example.json`, `provision.example.json` | One keeper's config and its registry authority files |
@@ -24,6 +25,38 @@ Packaging lives in [`deploy/consensus/`](../deploy/consensus/):
 `cargo test --features stream --test deploy_examples` checks that the example
 configs parse the way the keeper and the client read them, and that they agree
 with each other.
+
+## Release candidate and qualification
+
+Run the **Consensus qualification** workflow manually on the commit under
+review. It requires the normal CI suite, the fixed fault-injection window in
+both profiles, the full TLC checks, the Lean consensus and correspondence
+checks, and the selected Verus production proofs and controls. The scheduled
+run rotates the fault seed window each week. The reports retain the commit,
+seed ranges and failures. The manual run emits an OCI candidate artifact only
+after the checks pass. The artifact contains `release.json`, the image archive
+and their transport checksums in `SHA256SUMS`. Keep the qualification reports
+with the candidate and the previously qualified digest for rollback.
+
+For a local build, create a Docker Buildx `docker-container` builder with
+[this workflow's BuildKit image](../.github/workflows/consensus-qualification.yml).
+The builder needs both Linux platforms for the standard bundle. Use a new
+output path for each attempt.
+
+```sh
+python3 deploy/consensus/release.py --ref HEAD --builder logkeeper-release --output candidate
+(cd candidate && shasum -a 256 -c SHA256SUMS)
+```
+
+The build takes source files from the specified Git commit and uses the locked
+Cargo dependencies, pinned base images, dated Debian package archives, and
+commit timestamps. Refresh the base digests and Debian snapshot together when
+qualifying updated dependencies. The release record lists the OCI image index
+digest and each platform manifest digest. Compare the OCI digests across
+independent builds using the same builder image and platform set. Verify the
+registry's digest after an authorized staging import, and pin that digest in
+the staging configuration. Distribute the archive and qualification evidence
+through trusted release storage and use `SHA256SUMS` to check transport.
 
 ## What a keeper is
 

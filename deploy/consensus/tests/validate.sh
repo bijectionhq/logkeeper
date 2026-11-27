@@ -21,6 +21,6 @@ else
     echo "kubeconform not found; only the kustomize render was checked" >&2
 fi
 
-if command -v systemd-analyze >/dev/null; then
+if [[ "${1:-}" != --kubernetes-only ]] && command -v systemd-analyze >/dev/null; then
     systemd-analyze verify "$here/logkeeper-consensus.service"
 fi
