@@ -1244,7 +1244,7 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                 for id in lost {
                     cluster.crash(id).await;
                 }
-                let report = cluster.recover_stream_offline(survivor, stream).await;
+                let report = cluster.recover_stream_offline(survivor, lost, stream).await;
                 if let Ok(report) = report {
                     history.record_operator_recovery(stream, report.head, report.epoch);
                     trackers.lock()[*stream_idx].voters = report.voters;

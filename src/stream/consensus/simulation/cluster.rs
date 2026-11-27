@@ -495,11 +495,13 @@ impl SimCluster {
     pub async fn recover_stream_offline(
         &mut self,
         survivor: Uuid,
+        lost: [Uuid; 2],
         stream: StreamId,
     ) -> io::Result<RecoveryReport> {
         self.stop_graceful(survivor).await;
         let mut req = Recovery::default();
         req.acknowledge_data_loss = true;
+        req.lost = Some(lost);
         let report = self.configs[&survivor].recover_stream(stream, req).await;
         self.restart(survivor).await;
         if report.is_ok() {

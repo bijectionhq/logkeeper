@@ -277,7 +277,10 @@ async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_h
     // Lose b and c; recover stream offline on survivor a.
     cluster.crash(b).await;
     cluster.crash(c).await;
-    let report = cluster.recover_stream_offline(a, stream).await.unwrap();
+    let report = cluster
+        .recover_stream_offline(a, [b, c], stream)
+        .await
+        .unwrap();
     let probe = cluster.probe_client();
     timeout(WAIT, async {
         loop {
