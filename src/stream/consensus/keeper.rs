@@ -1261,8 +1261,11 @@ impl Engine {
         }
         for stream in closing {
             // Marked first: a request that races the close is refused
-            // rather than reopening the group.
+            // rather than reopening the group. The writer's preference goes
+            // with the mark, so a closed stream is never seen holding one,
+            // and again after the close in case a request raced it.
             self.deleted.write().insert(stream);
+            self.preferred.lock().remove(&stream);
             self.close_retaining(stream, || (), false).await;
             self.preferred.lock().remove(&stream);
         }
