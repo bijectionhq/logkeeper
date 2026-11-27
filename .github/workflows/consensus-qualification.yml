@@ -149,10 +149,13 @@ jobs:
         run: |
           python3 deploy/consensus/release.py --ref "$GITHUB_SHA" --output candidate
           (cd candidate && sha256sum -c SHA256SUMS)
-      - name: Smoke-test the Linux amd64 image
+      - name: Smoke-test both keeper images
         run: |
-          docker load --platform linux/amd64 --input candidate/logkeeper-consensus.oci.tar
-          docker run --rm "logkeeper-consensus:$GITHUB_SHA" --help
+          for platform in linux/amd64 linux/arm64; do
+            docker load --platform "$platform" --input candidate/logkeeper-consensus.oci.tar
+            docker run --platform "$platform" --rm --entrypoint /usr/local/bin/logkeeper \
+              "logkeeper-consensus:$GITHUB_SHA" --help
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: logkeeper-consensus-${{ github.sha }}

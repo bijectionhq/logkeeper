@@ -23,10 +23,11 @@ RUN --mount=type=bind,from=toolchain,source=/etc/ssl/certs/ca-certificates.crt,t
         -e '/^Signed-By:/a Check-Valid-Until: no' /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::https::CaInfo=/tmp/build-ca-certificates.crt update \
     && apt-get -o Acquire::https::CaInfo=/tmp/build-ca-certificates.crt install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log \
+    && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log /var/log/alternatives.log \
     && groupadd --system --gid 10001 logkeeper \
-    && useradd --system --uid 10001 --gid 10001 --home-dir /var/lib/logkeeper \
+    && useradd --system --no-log-init --uid 10001 --gid 10001 --home-dir /var/lib/logkeeper \
         --shell /usr/sbin/nologin logkeeper \
+    && chage --lastday 0 logkeeper \
     && install -d -o 10001 -g 10001 -m 0700 \
         /var/lib/logkeeper /var/lib/logkeeper/media /var/lib/logkeeper/registry
 COPY --from=build /usr/local/bin/logkeeper /usr/local/bin/logkeeper

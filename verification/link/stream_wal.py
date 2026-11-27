@@ -53,7 +53,7 @@ def publication_events(read):
     calls(write, [("})?;", [])])
     checkpoint_write = calls(write, [
         ("pack.sync(root)?;", pack),
-        ('atomic_file(&root.join("INDEX"), |file| {', index),
+        ('let source = atomic_file(&root.join("INDEX"), |file| {', index),
         ("self.retire_packs(root)", ["retireFiles"]),
     ])
     return calls(function(wal, "    pub fn start_rotation("), [
