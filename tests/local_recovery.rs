@@ -42,10 +42,12 @@ async fn a_spared_cluster_recovers_a_stream_that_lost_two_voters() {
     // With liveness leases finalized, the catalog fences the lost voters
     // and the recovery waits out their leases, so it needs no retirement
     // proofs from their hosts.
+    // Every keeper learns the level before writing, so the survivor records
+    // its commit index and the recovery keeps exactly the committed prefix.
     let version = logkeeper::stream::consensus::CLUSTER_VERSION_CURRENT;
     assert_eq!(
-        retry(|| journal.finalize_version(version)).await,
-        Ok(version)
+        cluster.finalize_version(PRINCIPAL, version).await.unwrap(),
+        version
     );
     let stream = StreamId(0x5eed);
     retry(|| journal.create(stream)).await.unwrap();
@@ -88,18 +90,29 @@ async fn a_spared_cluster_recovers_a_stream_that_lost_two_voters() {
         retry(|| journal.acknowledge_recovery(stream)).await,
         Ok(Lsn(5))
     );
+    // The acknowledgement wrote the recovery's typed entry right after the
+    // last record kept, as the first entry of the recovered epoch.
     let epoch = Epoch(report.epoch.0 + 1);
-    assert_eq!(retry(|| journal.seal(stream, epoch)).await, Ok(Lsn(5)));
+    assert_eq!(retry(|| journal.seal(stream, epoch)).await, Ok(Lsn(6)));
     assert_eq!(
-        retry(|| journal.append(stream, epoch, Lsn(6), record(6))).await,
-        Ok(Lsn(6))
+        retry(|| journal.append(stream, epoch, Lsn(7), record(7))).await,
+        Ok(Lsn(7))
     );
     let page = retry(|| journal.read(stream, Lsn(1), 10, Duration::ZERO))
         .await
         .unwrap();
+    let entry = page.recovery(Lsn(6)).cloned().expect("the recovery's typed entry");
+    assert_eq!(entry.fence.head, Lsn(5));
+    assert_eq!(entry.loss_point, report.loss_point);
+    assert!(entry.exact);
+    assert_eq!(entry.configuration_epoch, report.revision);
+    assert_eq!(entry.marker, None);
+    assert_eq!(page.recoveries.len(), 1);
+    let mut records = page.records;
+    assert_eq!(records.remove(5), (Lsn(6), entry.encode()));
     assert_eq!(
-        page.records,
-        (1..=6).map(|at| (Lsn(at), record(at))).collect::<Vec<_>>()
+        records,
+        [1, 2, 3, 4, 5, 7].map(|at| (Lsn(at), record(at))).to_vec()
     );
     cluster.shutdown().await.unwrap();
 }

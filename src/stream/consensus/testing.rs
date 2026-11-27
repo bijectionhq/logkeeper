@@ -112,28 +112,10 @@ impl LocalCluster {
         let mut five = cluster.voters.to_vec();
         five.append(&mut cluster.spares);
         cluster.voters = Voters::sorted(&five).expect("five voters");
-        cluster.finalize(principals[0]).await?;
+        cluster
+            .finalize_version(principals[0], super::CLUSTER_VERSION_CURRENT)
+            .await?;
         Ok(cluster)
-    }
-
-    /// Finalizes the cluster version as `principal`, an administrator, once
-    /// every keeper answers.
-    async fn finalize(&self, principal: &str) -> io::Result<()> {
-        let client = super::Client::new(
-            &self.credentials(principal)?,
-            self.keepers.clone(),
-            self.catalog,
-            Duration::from_secs(10),
-        )?;
-        let version = super::CLUSTER_VERSION_CURRENT;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while client.finalize_version(version).await != Ok(version) {
-            if tokio::time::Instant::now() > deadline {
-                return Err(io::Error::other("the cluster version did not finalize"));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        Ok(())
     }
 
     async fn start_with(
@@ -527,20 +509,49 @@ impl LocalCluster {
             }
             self.restart(keeper).await?;
         }
+        self.finalize_version(principal, super::CLUSTER_VERSION_CURRENT)
+            .await
+            .map(|_| ())
+    }
+
+    /// Finalizes the cluster feature level `version` through the catalog, as
+    /// an administrator would, retrying while keepers start, and waits until
+    /// every running keeper has learned it. A keeper learns the level from
+    /// the catalog on its own schedule (every 10 s); until then it writes
+    /// none of the formats the level gates, such as its commit indexes,
+    /// which an exact recovery from it needs.
+    pub async fn finalize_version(&self, principal: &str, version: u32) -> io::Result<u32> {
         let journal = self.journal(principal, &self.journal_config(1 << 20, 1024))?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            match journal
-                .finalize_version(super::CLUSTER_VERSION_CURRENT)
-                .await
-            {
-                Ok(_) => return Ok(()),
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let finalized = loop {
+            match journal.finalize_version(version).await {
+                Ok(finalized) => break finalized,
                 Err(_) if std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(error) => return Err(io::Error::other(format!("{error:?}"))),
             }
+        };
+        for keeper in self.running.keys().copied() {
+            loop {
+                match journal
+                    .client()
+                    .keeper_status(keeper, journal_contract::StreamId(0))
+                    .await
+                {
+                    Ok(status) if status.cluster_version >= finalized => break,
+                    _ if std::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    _ => {
+                        return Err(io::Error::other(format!(
+                            "keeper {keeper} did not learn cluster version {finalized}"
+                        )));
+                    }
+                }
+            }
         }
+        Ok(finalized)
     }
 
     /// Stops every keeper.
