@@ -792,4 +792,57 @@ fn backpressure_only_past_the_limit(waiting: u64, limit: u64) {
     assert(!within);
 }
 
+// A lease configuration keeps the holder's validity positive and shorter
+// than the recovery wait. A valid lease was renewed less than a lease less
+// the margin ago on the holder's clock, which is strictly less than the wait
+// a recovered configuration observes before it serves.
+fn a_lease_ends_before_the_recovery_serves(sent: u64, duration: u64, margin: u64, now: u64) {
+    let bounded = lease_bounds(duration, margin);
+    let valid = lease_valid(sent, duration, margin, now);
+    let wait = recovery_wait(duration, margin);
+    assert(bounded ==> duration - margin > margin);
+    assert(valid ==> margin < duration);
+    if valid && now >= sent {
+        assert((now - sent) < duration - margin);
+        if let Some(wait) = wait {
+            assert((now - sent) < wait);
+        }
+    }
+    assert(margin >= duration ==> !valid);
+    assert(now >= sent && now - sent >= duration - margin ==> !valid);
+}
+
+// Authority needs a valid lease, the current epoch and an unfenced copy once
+// leases are enforced; until then the older defences decide alone.
+fn authority_needs_lease_epoch_and_no_fence(
+    enforced: bool, valid: bool, current: bool, fenced: bool,
+) {
+    let holds = holds_authority(enforced, valid, current, fenced);
+    assert(!enforced ==> holds);
+    assert(enforced && !valid ==> !holds);
+    assert(enforced && !current ==> !holds);
+    assert(enforced && fenced ==> !holds);
+    assert(valid && current && !fenced ==> holds);
+}
+
+// The catalog fences only copies older than the recovered revision, so a copy
+// placed on the keeper again by a later move is never fenced.
+fn a_fence_spares_newer_configurations(below: Option<u64>, revision: u64) {
+    let fenced = copy_fenced(below, revision);
+    assert(below is None ==> !fenced);
+    if let Some(floor) = below {
+        assert(revision >= floor ==> !fenced);
+        assert(revision < floor ==> fenced);
+    }
+}
+
+// A replaced media incarnation never renews, and a renewal under a stale
+// epoch never extends a lease: every lease of an older epoch has ended.
+fn a_stale_epoch_or_replaced_media_never_renews(replaced: bool, requested: u64, current: u64) {
+    let granted = grants_lease(replaced, requested, current);
+    assert(replaced ==> !granted);
+    assert(requested != 0 && requested != current ==> !granted);
+    assert(!replaced && requested == current ==> granted);
+}
+
 }

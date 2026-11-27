@@ -559,6 +559,89 @@ pub(super) fn peer_supports(peer_features: u64, required: u64) -> bool {
     (peer_features & required) == required
 }
 
+/// Whether a lease configuration bounds clock drift: the drift margin is
+/// positive and below half the lease, so the holder's validity, a lease less
+/// the margin, stays positive and the recovery wait, a lease plus the
+/// margin, stays longer than it.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (0 < margin && margin < duration && margin < duration - margin)
+))]
+pub(super) fn lease_bounds(duration: u64, margin: u64) -> bool {
+    0 < margin && margin < duration && margin < duration - margin
+}
+
+/// Whether a keeper's liveness lease is valid at `now`, all on the holder's
+/// monotonic clock: it runs from the moment the holder sent the renewal the
+/// authority granted, for the lease duration less the drift margin. So the
+/// holder always counts its lease expired before the authority does.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (margin < duration
+        && (now as int) < sent as int + duration as int - margin as int)
+))]
+pub(super) fn lease_valid(sent: u64, duration: u64, margin: u64, now: u64) -> bool {
+    margin < duration && (now < sent || now - sent < duration - margin)
+}
+
+/// Whether a keeper may campaign, lead or serve reads for a stream: its
+/// liveness lease is valid, its epoch is the catalog's current one, and the
+/// catalog does not fence its copy of the stream. Until the cluster
+/// finalizes leases they are advisory, and the defences that predate them
+/// stay authoritative.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (!enforced || (lease_valid && epoch_current && !fenced))
+))]
+pub(super) fn holds_authority(
+    enforced: bool,
+    lease_valid: bool,
+    epoch_current: bool,
+    fenced: bool,
+) -> bool {
+    !enforced || (lease_valid && epoch_current && !fenced)
+}
+
+/// Whether the catalog fences a keeper's copy of a stream: the keeper's
+/// liveness record fences the stream below configuration revision `below`,
+/// and the copy has finalized an older one. A copy that finalized nothing
+/// counts as revision 0. A copy that a later move placed on the keeper again
+/// finalizes the newer revision and is not fenced.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (below matches Some(floor) && revision < floor)
+))]
+pub(super) fn copy_fenced(below: Option<u64>, revision: u64) -> bool {
+    match below {
+        Some(floor) => revision < floor,
+        None => false,
+    }
+}
+
+/// How long a recovered configuration waits after the catalog committed the
+/// recovery before it serves: a whole lease plus the drift margin, so every
+/// lease a lost keeper held when the recovery committed has ended on that
+/// keeper's own clock, whether or not anyone can reach it.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out matches Some(wait) ==> wait as int == duration as int + margin as int,
+        out is None ==> duration as int + margin as int > u64::MAX as int,
+))]
+pub(super) fn recovery_wait(duration: u64, margin: u64) -> Option<u64> {
+    if duration > u64::MAX - margin {
+        None
+    } else {
+        Some(duration + margin)
+    }
+}
+
+/// Whether the catalog grants a keeper's lease renewal: the media
+/// incarnation it renews under is not one the keeper's record replaced, and
+/// it asks under the record's current epoch, or under zero when a new
+/// keeper process joins and adopts the current epoch.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (!replaced && (requested == 0 || requested == current))
+))]
+pub(super) fn grants_lease(replaced: bool, requested: u64, current: u64) -> bool {
+    !replaced && (requested == 0 || requested == current)
+}
+
 /// The wait after `failures` failed attempts: `base_ms` doubled once per
 /// failure, never above `cap_ms`. Repair and the wake sweep use it so that
 /// one stream that keeps failing yields to the others.
