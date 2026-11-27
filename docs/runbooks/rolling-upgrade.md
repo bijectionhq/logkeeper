@@ -92,7 +92,12 @@ of write unavailability per keeper restart, on the streams that keeper leads.
 7. **Drain leaders, stop, upgrade, start:**
 
    ```sh
-   sudo systemctl stop $UNIT              # SIGTERM: leaders hand off within 3 s, WAL flushed
+   lk admin drain --config operator.json --keeper $KEEPER --wait-secs 120
+   # keeper ...: leads 12 streams    (one line a second on stderr)
+   # mode: draining
+   # led: 0
+   # drained: true
+   sudo systemctl stop $UNIT              # SIGTERM: anything still led hands off within 3 s, WAL flushed
    systemctl show -p Result,ExecMainStatus $UNIT   # Result=success
    sudo install -m 0555 /usr/local/bin/logkeeper /usr/local/bin/logkeeper.prev
    sudo mv /usr/local/bin/logkeeper.next /usr/local/bin/logkeeper
@@ -100,10 +105,17 @@ of write unavailability per keeper restart, on the streams that keeper leads.
    sudo systemctl start $UNIT
    ```
 
-   There is no separate "drain leaders" command. The keeper hands every
-   stream it leads to a caught-up voter as part of SIGTERM, waiting at most
+   `lk admin drain` marks the keeper draining in its data directory, so the
+   mark survives the restart: the keeper hands every stream it leads to a
+   caught-up voter, retrying each second, starts no election of its own,
+   takes no handed-off leadership, and reports that it accepts no new
+   streams. The command waits until the keeper leads nothing, at most
+   `--wait-secs`, and exits non-zero if it still leads some. That is not a
+   reason to abort: under constant writes a hand-off can wait for a
+   follower to match, and SIGTERM hands off whatever is left, waiting at most
    3 s. Streams it could not hand off elect a new leader within an election
-   timeout (450 to 900 ms) after their lease expires. **Abort** and
+   timeout (450 to 900 ms) after their lease expires. Without the admin
+   listener, skip the drain; SIGTERM does it alone. **Abort** and
    investigate the disk if the stop takes longer than 30 s (`Result=timeout`)
    or the unit exits with failure.
 
@@ -123,9 +135,17 @@ of write unavailability per keeper restart, on the streams that keeper leads.
    - the keeper is not ready within 10 minutes;
    - `/problems` on another keeper shows `leaderless`.
 
+   Then let it lead again; the drain mark stays until you clear it:
+
+   ```sh
+   lk admin undrain --config operator.json --keeper $KEEPER   # mode: serving
+   ```
+
    To roll this keeper back: stop it, restore `logkeeper.prev`, and start it
-   again. That works only if the new binary did not migrate the media (see
-   step 3).
+   again. Rollback requires that the media still use a format the previous
+   binary supports (see step 3). A release without operator mode ignores
+   the drain mark. The keeper resumes draining when upgraded again,
+   until you clear the mark.
 
 9. **Soak** for at least `minReadySeconds` (30 s), check `probe problems` on
    all keepers, then continue with the next keeper at step 6.

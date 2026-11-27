@@ -27,6 +27,10 @@ use crate::stream::transport;
 
 /// One admin HTTP request, connect to last byte.
 pub(super) const ADMIN_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often `drain` and `decommission` poll the keeper's progress.
+const DRAIN_POLL: Duration = Duration::from_secs(1);
+/// How long `drain` waits for leadership to move by default.
+const DRAIN_WAIT: Duration = Duration::from_secs(120);
 /// The largest admin answer kept; a `/metrics` page is far smaller.
 const MAX_RESPONSE: u64 = 64 * 1024 * 1024;
 
@@ -420,6 +424,47 @@ impl Operator {
         }
     }
 
+    /// Sets `keeper`'s durable operator mode with `POST path` (`/drain`,
+    /// `/undrain` or `/decommission`) and returns its `/drain` report.
+    pub async fn set_mode(&self, keeper: Uuid, path: &str) -> io::Result<Value> {
+        let (status, report) = self.admin_json(keeper, "POST", path).await?;
+        if status != 200 {
+            return Err(io::Error::other(format!(
+                "keeper {keeper} refused {path} with {status}: {report}"
+            )));
+        }
+        Ok(report)
+    }
+
+    /// `keeper`'s `/drain` report: its mode and what is left to move.
+    pub async fn drain_status(&self, keeper: Uuid) -> io::Result<Value> {
+        Ok(self.admin_json(keeper, "GET", "/drain").await?.1)
+    }
+
+    /// Polls `keeper`'s `/drain` report until `done` is true in it or
+    /// `wait` passes, calling `progress` with each report. Returns the last
+    /// report and whether it is done.
+    pub async fn wait_for(
+        &self,
+        keeper: Uuid,
+        done: &str,
+        wait: Duration,
+        mut progress: impl FnMut(&Value),
+    ) -> io::Result<(Value, bool)> {
+        let end = tokio::time::Instant::now() + wait;
+        loop {
+            let report = self.drain_status(keeper).await?;
+            progress(&report);
+            if report[done] == true {
+                return Ok((report, true));
+            }
+            if tokio::time::Instant::now() >= end {
+                return Ok((report, false));
+            }
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
+    }
+
     /// `GET /status` from one keeper's admin listener.
     pub async fn keeper_status(&self, keeper: Uuid) -> io::Result<Value> {
         Ok(self.admin_json(keeper, "GET", "/status").await?.1)
@@ -531,6 +576,7 @@ Commands:
   acknowledge-recovery --stream UUID
   retire --stream UUID --keeper KEEPER
   problems
+  drain --keeper KEEPER [--wait-secs N] | undrain --keeper KEEPER | drain-status --keeper KEEPER
   clear-quarantine --keeper KEEPER --stream UUID
   finalize-version";
 
@@ -575,6 +621,16 @@ fn stream_flag(flags: &mut BTreeMap<&str, &str>) -> io::Result<StreamId> {
 
 fn keeper_flag(flags: &mut BTreeMap<&str, &str>, name: &str) -> io::Result<Uuid> {
     parse_uuid(flags.remove(name).ok_or_else(|| invalid(ADMIN_USAGE))?)
+}
+
+fn wait_flag(flags: &mut BTreeMap<&str, &str>, default: Duration) -> io::Result<Duration> {
+    match flags.remove("wait-secs") {
+        Some(raw) => raw
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .map_err(|error| invalid(format!("--wait-secs: {error}"))),
+        None => Ok(default),
+    }
 }
 
 fn parse_uuid(raw: &str) -> io::Result<Uuid> {
@@ -684,6 +740,29 @@ impl Operator {
                     ok,
                     json: false,
                 }
+            }
+            "drain" => {
+                let keeper = keeper_flag(&mut flags, "keeper")?;
+                let wait = wait_flag(&mut flags, DRAIN_WAIT)?;
+                self.set_mode(keeper, "/drain").await?;
+                let (report, drained) = self
+                    .wait_for(keeper, "drained", wait, |report| {
+                        eprintln!("keeper {keeper}: leads {} streams", report["led"]);
+                    })
+                    .await?;
+                AdminOutcome {
+                    report,
+                    ok: drained,
+                    json: false,
+                }
+            }
+            "undrain" => {
+                let keeper = keeper_flag(&mut flags, "keeper")?;
+                done(self.set_mode(keeper, "/undrain").await?)
+            }
+            "drain-status" => {
+                let keeper = keeper_flag(&mut flags, "keeper")?;
+                done(self.drain_status(keeper).await?)
             }
             "clear-quarantine" | "finalize-version" => {
                 return Err(io::Error::new(

@@ -52,7 +52,8 @@ groups:
           description: "A WAL round ran past logkeeper_consensus_wal_slow_round_seconds. The keeper hands off its leadership and refuses votes until its rounds are fast again."
 
       - alert: LogkeeperNotAccepting
-        expr: logkeeper_consensus_accepting == 0
+        # A keeper the operator drains or decommissions accepts nothing on purpose.
+        expr: logkeeper_consensus_accepting == 0 and on(instance) logkeeper_consensus_operator_mode{mode="serving"} == 1
         for: 10m
         labels:
           severity: warning

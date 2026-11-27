@@ -61,6 +61,26 @@ pub(super) const PROBLEM_REASONS: [&str; 9] = [
     "led_outside_preferred_domain",
 ];
 
+/// Who an admin request comes from.
+enum Access {
+    /// An `administrators` principal, or anyone on a plain loopback
+    /// listener; it may change the operator mode.
+    Administrator(String),
+    /// Another keeper of the cluster: read-only.
+    Keeper,
+    Denied,
+}
+
+/// The operator mode a `POST` to `path` sets.
+fn mode_change(path: &str) -> Option<super::drain::Mode> {
+    match path {
+        "/drain" => Some(super::drain::Mode::Draining),
+        "/undrain" => Some(super::drain::Mode::Serving),
+        "/decommission" => Some(super::drain::Mode::Decommissioning),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct StatusReport {
     pub keeper: Uuid,
@@ -71,6 +91,8 @@ pub(super) struct StatusReport {
     pub media_responsive: bool,
     pub replayed: bool,
     pub status: crate::stream::consensus::KeeperStatus,
+    /// What the operator set: serving, draining or decommissioning.
+    pub mode: super::drain::Mark,
     pub config: serde_json::Value,
 }
 
@@ -145,8 +167,8 @@ pub(super) struct ProblemReport {
     pub problems: Vec<ProblemStream>,
 }
 
-struct ClosedView {
-    voters: BTreeSet<Uuid>,
+pub(super) struct ClosedView {
+    pub(super) voters: BTreeSet<Uuid>,
     joint: bool,
     records: u64,
     bytes: u64,
@@ -281,28 +303,42 @@ impl Engine {
                 // already holds every replica the admin pages describe and
                 // collects them for `logkeeper keeper debug-bundle`.
                 let leaf = transport::leaf(tls.peer_certificates()).ok();
-                let authorized = leaf.is_some_and(|leaf| {
-                    transport::client_identity(leaf)
-                        .is_ok_and(|id| self.administrators.contains(id.as_str()))
-                        || transport::keeper_id(leaf).is_ok_and(|keeper| {
+                let access = match leaf {
+                    Some(leaf)
+                        if transport::client_identity(leaf)
+                            .is_ok_and(|id| self.administrators.contains(id.as_str())) =>
+                    {
+                        Access::Administrator(
+                            transport::client_identity(leaf)
+                                .map(|id| id.as_str().to_owned())
+                                .unwrap_or_default(),
+                        )
+                    }
+                    Some(leaf)
+                        if transport::keeper_id(leaf).is_ok_and(|keeper| {
                             self.placement
                                 .all_domains()
                                 .contains_key(&uuid::Uuid::from_u128(keeper.0))
-                        })
-                });
-                self.serve_http(&mut stream, authorized).await
+                        }) =>
+                    {
+                        Access::Keeper
+                    }
+                    _ => Access::Denied,
+                };
+                self.serve_http(&mut stream, access).await
             }
             None => {
                 let mut stream = socket;
-                self.serve_http(&mut stream, true).await
+                self.serve_http(&mut stream, Access::Administrator("loopback".into()))
+                    .await
             }
         }
     }
 
     async fn serve_http<S: AsyncRead + AsyncWrite + Unpin>(
-        &self,
+        self: &Arc<Self>,
         stream: &mut S,
-        authorized: bool,
+        access: Access,
     ) -> io::Result<()> {
         let Ok(request) = read_http_request(stream).await else {
             return Ok(());
@@ -318,6 +354,36 @@ impl Engine {
             )
             .await;
         };
+        let path = target.split('?').next().unwrap_or(target);
+        if method == "POST"
+            && let Some(mode) = mode_change(path)
+        {
+            let Access::Administrator(actor) = access else {
+                let body = r#"{"error":"only administrators change the operator mode"}"#;
+                return write_http_response(
+                    stream,
+                    "403 Forbidden",
+                    "application/json",
+                    body.as_bytes(),
+                    false,
+                )
+                .await;
+            };
+            if let Err(error) = self.set_mode(mode, &actor).await {
+                let body = serde_json::to_vec(&serde_json::json!({ "error": error.to_string() }))
+                    .unwrap_or_default();
+                return write_http_response(
+                    stream,
+                    "500 Internal Server Error",
+                    "application/json",
+                    &body,
+                    false,
+                )
+                .await;
+            }
+            let body = serde_json::to_vec(&self.drain_report().await).unwrap_or_default();
+            return write_http_response(stream, "200 OK", "application/json", &body, false).await;
+        }
         let head_only = match method {
             "GET" => false,
             "HEAD" => true,
@@ -333,7 +399,7 @@ impl Engine {
                 .await;
             }
         };
-        if !authorized {
+        if matches!(access, Access::Denied) {
             let body = r#"{"error":"unauthorized admin client"}"#;
             return write_http_response(
                 stream,
@@ -344,8 +410,11 @@ impl Engine {
             )
             .await;
         }
-        let path = target.split('?').next().unwrap_or(target);
         match path {
+            "/drain" => {
+                let body = serde_json::to_vec(&self.drain_report().await).unwrap_or_default();
+                write_http_response(stream, "200 OK", "application/json", &body, head_only).await
+            }
             "/metrics" => {
                 let body = self.render_metrics().await;
                 write_http_response(
@@ -435,6 +504,7 @@ impl Engine {
             media_responsive: self.disk.responsive(),
             replayed: self.replayed.load(Ordering::Acquire),
             status: self.keeper_status().await,
+            mode: self.mode.mark(),
             config: self.summary.clone(),
         }
     }
@@ -1005,7 +1075,7 @@ impl Engine {
         }
 
         let wal_healthy = self.disk.healthy();
-        let accepting = self.disk.responsive() && self.disk.space.accepts_streams();
+        let accepting = self.accepting();
         let liveness = self.liveness_snapshot(accepting);
         let replication_lag = follower_lags
             .into_iter()
@@ -1032,6 +1102,7 @@ impl Engine {
             wal_healthy,
             media_responsive: self.disk.responsive(),
             accepting,
+            mode: self.mode.mode().name(),
             streams_hosted: total_hosted,
             streams_open,
             streams_led,
@@ -1061,7 +1132,9 @@ impl Engine {
     /// What the admin pages need of each closed (parked or closing) replica.
     /// A closing one still holds its state machine; a pinned one keeps only
     /// its finalized configuration, so its retention reads as zero.
-    fn closed_views(&self) -> std::collections::HashMap<journal_contract::StreamId, ClosedView> {
+    pub(super) fn closed_views(
+        &self,
+    ) -> std::collections::HashMap<journal_contract::StreamId, ClosedView> {
         self.closed_states
             .lock()
             .iter()

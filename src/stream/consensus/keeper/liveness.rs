@@ -634,6 +634,9 @@ impl Engine {
     /// as the followers' leases from the old leader end, instead of after a
     /// further election timeout.
     async fn campaign_after_wake(&self, group: &Group) {
+        if self.mode.draining() {
+            return;
+        }
         let Ok(vote) = group.raft.with_raft_state(|state| *state.vote_ref()).await else {
             return;
         };

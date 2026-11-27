@@ -2,9 +2,15 @@
 
 The keeper inventory (`keepers`, `peers`, `bulk`, `domains`) is static. It is
 read at startup and must equal `placement.json` in each keeper's registry.
-Changing it means restarting every keeper, one at a time. Draining is done by
-the consumer: RTDB moves streams off keepers listed in `draining` in its
-`JournalConfig`. There is no durable drain state on the keepers (T20).
+Changing it means restarting every keeper, one at a time.
+
+There are two kinds of drain:
+- **Leadership drain** (`lk admin drain`) is durable on the keeper. The
+  keeper hands off every stream it leads, starts no election, and reports
+  that it accepts no new streams, so new placements and repairs skip it. Its
+  replicas stay where they are. `lk admin undrain` reverses it.
+- **Replica drain** moves the streams themselves. RTDB moves the streams it
+  writes off keepers listed in `draining` in its `JournalConfig`.
 
 ## Add a keeper
 
@@ -61,6 +67,15 @@ restart.
 
 ## Drain a keeper
 
+Start with a leadership drain, so the keeper stops leading and nothing new
+lands on it while its streams move:
+
+```sh
+lk admin drain --config operator.json --keeper UUID
+# mode: draining
+# drained: true
+```
+
 Only streams whose RTDB writer is running move. RTDB reconciles a database's
 stream only while it writes that database, at most one voter per stream every
 5 s. Fixed `voters` rosters never move.
@@ -99,7 +114,8 @@ stream only while it writes that database, at most one voter per stream every
    `repair_after_secs`.
 
 Abort criteria: `hosted` stops decreasing for 10 minutes while RTDB logs
-`deferred`. Remove the UUID from `draining` to cancel.
+`deferred`. Remove the UUID from `draining` and run `lk admin undrain` to
+cancel.
 
 ## Remove a keeper
 

@@ -644,8 +644,7 @@ Most are items in the consensus design's review tables.
 | --- | --- | --- |
 | DNS names in the inventory | Keepers need stable IPs; Kubernetes uses host networking | Static IPs, pinned nodes |
 | Runtime inventory change (T19) | Adding a keeper restarts every keeper | Plan the count; restart one at a time |
-| Leadership drain without stopping | "Drain leaders" happens only inside SIGTERM, within 3 s | Gate on `/safe-to-stop`, then stop |
-| Durable drain and decommission state (T20) | Drain lives only in the consumer's `draining` list | Edit RTDB's `JournalConfig` |
+| Durable decommission state (T20) | A leadership drain is durable (`logkeeper admin drain`), but moving replicas off a keeper lives only in the consumer's `draining` list | Edit RTDB's `JournalConfig` |
 | Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
 | TLS reload without restart (T12) | Certificate rotation restarts each keeper | Rolling restart |
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |

@@ -408,6 +408,18 @@ impl Metrics {
             "logkeeper_consensus_accepting {}",
             u8::from(scrape.accepting)
         );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_operator_mode The operator mode the keeper is in (1), by mode."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_operator_mode gauge");
+        for mode in ["serving", "draining", "decommissioning"] {
+            let _ = writeln!(
+                out,
+                "logkeeper_consensus_operator_mode{{mode=\"{mode}\"}} {}",
+                u8::from(scrape.mode == mode)
+            );
+        }
 
         // Refusals
         let _ = writeln!(
@@ -1155,6 +1167,8 @@ pub(super) struct ScrapeSnapshot {
     pub wal_healthy: bool,
     pub media_responsive: bool,
     pub accepting: bool,
+    /// The operator mode: `serving`, `draining` or `decommissioning`.
+    pub mode: &'static str,
     pub streams_hosted: usize,
     pub streams_open: usize,
     pub streams_led: usize,
@@ -1276,6 +1290,7 @@ mod tests {
             wal_healthy: true,
             media_responsive: true,
             accepting: true,
+            mode: "serving",
             streams_hosted: 5,
             streams_open: 4,
             streams_led: 2,

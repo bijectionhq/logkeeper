@@ -4,22 +4,30 @@ use super::ops::start_admin_cluster;
 use super::*;
 use crate::stream::consensus::{Configuration, Operator, OperatorConfig, admin_command};
 
-pub(super) fn operator(
+pub(super) fn operator_config(
     cluster: &Cluster,
     admin: &BTreeMap<Uuid, SocketAddr>,
-    mtls: bool,
-) -> Operator {
-    Operator::new(OperatorConfig {
+) -> OperatorConfig {
+    OperatorConfig {
         tls: cluster.credentials.clone(),
         keepers: cluster.keepers.clone(),
         catalog: cluster.catalog,
         catalog_voters: cluster.catalog_voters,
         admin: admin.clone(),
-        admin_mtls: mtls,
+        admin_mtls: true,
         placement: None,
         deadline_ms: 10_000,
-    })
-    .unwrap()
+    }
+}
+
+pub(super) fn operator(
+    cluster: &Cluster,
+    admin: &BTreeMap<Uuid, SocketAddr>,
+    mtls: bool,
+) -> Operator {
+    let mut config = operator_config(cluster, admin);
+    config.admin_mtls = mtls;
+    Operator::new(config).unwrap()
 }
 
 /// Writes an operator configuration file for `admin_command`.
@@ -161,5 +169,87 @@ async fn admin_cli_creates_inspects_moves_and_retires_a_stream() {
     let unknown = admin(&["problems", "--config", &file, "--bogus", "1"]).await;
     assert!(unknown.is_err());
 
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_moves_leadership_off_a_keeper_and_survives_restart() {
+    let (mut cluster, addrs) = start_admin_cluster(true).await;
+    let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
+    let client = cluster.client(&cluster.credentials);
+    let mut streams = Vec::new();
+    for _ in 0..3 {
+        let stream = StreamId(Uuid::new_v4().as_u128());
+        client.create(stream, voters, 1 << 26).await.unwrap();
+        streams.push(stream);
+    }
+    let drained = cluster.leader_after_head(&client, streams[0]).await;
+    let operator = operator(&cluster, &addrs, true);
+
+    // Only an administrator changes the mode; a writer is refused.
+    let mut other = operator_config(&cluster, &addrs);
+    other.tls = cluster.other.clone();
+    let refused = Operator::new(other)
+        .unwrap()
+        .set_mode(drained, "/drain")
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("403"), "{refused}");
+
+    let report = operator.set_mode(drained, "/drain").await.unwrap();
+    assert_eq!(report["mode"], "draining");
+    let (report, done) = operator
+        .wait_for(drained, "drained", WAIT, |_| ())
+        .await
+        .unwrap();
+    assert!(done, "{report}");
+    for stream in &streams {
+        let sealed = client
+            .seal(*stream, Epoch(0), Uuid::new_v4())
+            .await
+            .unwrap();
+        client
+            .append(*stream, sealed.fence, Lsn(1), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    assert!(
+        !client
+            .keeper_status(drained, streams[0])
+            .await
+            .unwrap()
+            .accepting
+    );
+    let (_, _, metrics) =
+        super::ops::https_get(addrs[&drained], &cluster.credentials, "/metrics").await;
+    assert!(metrics.contains("logkeeper_consensus_operator_mode{mode=\"draining\"} 1"));
+
+    // The mark is durable: after a restart the keeper still leads nothing,
+    // even once its streams elect again.
+    cluster.running.remove(&drained).unwrap().stop().await;
+    cluster.restart(drained).await;
+    let report = operator.drain_status(drained).await.unwrap();
+    assert_eq!(report["mode"], "draining");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for stream in &streams {
+        client.head(*stream).await.unwrap();
+    }
+    let report = operator.drain_status(drained).await.unwrap();
+    assert_eq!(report["led"], 0, "{report}");
+    assert_eq!(report["drained"], true);
+
+    let report = operator.set_mode(drained, "/undrain").await.unwrap();
+    assert_eq!(report["mode"], "serving");
+    timeout(WAIT, async {
+        while !client
+            .keeper_status(drained, streams[0])
+            .await
+            .is_ok_and(|status| status.accepting)
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("an undrained keeper accepts streams again");
     cluster.stop_all().await;
 }

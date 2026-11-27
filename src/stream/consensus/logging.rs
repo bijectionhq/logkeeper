@@ -500,6 +500,20 @@ pub(super) fn audit_prefer_leader(
     );
 }
 
+/// Audit log for an operator mode change (drain, undrain, decommission).
+pub(super) fn audit_mode(keeper: Uuid, actor: &str, mode: &str) {
+    tracing::info!(
+        target: "logkeeper::audit",
+        audit = true,
+        action = "operator_mode",
+        keeper = %keeper,
+        actor = %actor,
+        mode = %mode,
+        outcome = "ok",
+        "admin action operator_mode"
+    );
+}
+
 /// Audit log for clearing a recovery fence (`acknowledge_recovery`).
 pub(super) fn audit_acknowledge_recovery(
     keeper: Uuid,

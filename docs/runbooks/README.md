@@ -22,6 +22,7 @@ The commands assume the systemd layout from `deploy/consensus/`:
 
 ```sh
 CONFIG=/etc/logkeeper/keeper.json     # this host's keeper config
+KEEPER=$(jq -r .keeper "$CONFIG")     # this host's keeper UUID
 ADMIN=http://127.0.0.1:5741           # this host's admin listener
 UNIT=logkeeper-consensus              # systemd unit
 lk() { sudo -u logkeeper /usr/local/bin/logkeeper "$@"; }

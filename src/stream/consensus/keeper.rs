@@ -4,6 +4,7 @@ mod bundle;
 mod catalog_stream;
 mod certify;
 mod compaction;
+mod drain;
 mod incarnation;
 mod ingress;
 mod liveness;
@@ -451,10 +452,12 @@ impl Config {
         );
         let id = self.keeper;
         let registry = self.enrollment.clone();
-        let (disk, recognition) = tokio::task::spawn_blocking(move || {
+        let data = self.data.clone();
+        let (disk, recognition, mode) = tokio::task::spawn_blocking(move || {
             let disk = Disk::open(enrollment)?;
             let recognition = incarnation::Recognition::open(&registry, id, disk.incarnation)?;
-            Ok::<_, io::Error>((disk, recognition))
+            let mode = drain::OperatorMode::open(&data)?;
+            Ok::<_, io::Error>((disk, recognition, mode))
         })
         .await??;
         let raft_config = openraft::Config {
@@ -505,6 +508,7 @@ impl Config {
                 .map(|voters| catalog_stream::CatalogStream::new(voters, self.catalog)),
             disk,
             recognition,
+            mode,
             rpc,
             control,
             bulk,
@@ -577,6 +581,8 @@ pub(super) struct Engine {
     pub(super) disk: Disk,
     /// The media incarnations of this keeper and its peers.
     recognition: incarnation::Recognition,
+    /// Whether the operator drains or decommissions this keeper.
+    mode: drain::OperatorMode,
     rpc: Rpc,
     control: Rpc,
     bulk: Rpc,
@@ -805,6 +811,11 @@ impl Engine {
             let versioning = self.clone();
             sockets.spawn(async move {
                 versioning.cluster_version_loop().await;
+                Ok(())
+            });
+            let draining = self.clone();
+            sockets.spawn(async move {
+                draining.drain_loop().await;
                 Ok(())
             });
             if self.catalog_stream.is_some() {
@@ -1353,8 +1364,10 @@ impl Engine {
             leader_matched: parking_lot::Mutex::new(None),
             proposals: Arc::default(),
             excluded,
+            draining: self.mode.flag.clone(),
             stop: self.stop.child_token(),
         });
+        self.apply_mode(&group);
         self.groups
             .lock()
             .await
@@ -2052,6 +2065,8 @@ pub(super) struct Group {
     proposals: Arc<Proposals>,
     /// The last peer that refused this replica as outside its placement.
     excluded: Arc<parking_lot::Mutex<Option<uuid::Uuid>>>,
+    /// Set while the operator drains this keeper: it starts no election.
+    draining: Arc<std::sync::atomic::AtomicBool>,
     stop: CancellationToken,
 }
 
@@ -2157,6 +2172,7 @@ impl Group {
                 changed = metrics.changed() => if changed.is_err() { return; },
                 changed = collisions.changed() => if changed.is_err() { return; },
                 _ = retry => {
+                    if self.draining.load(std::sync::atomic::Ordering::Acquire) { continue; }
                     if !self.state.healthy() || self.raft.trigger().elect(false).await.is_err() { return; }
                 }
             }

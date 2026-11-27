@@ -1035,8 +1035,30 @@ configuration:
   request and response; request headers are limited to 8 KiB and a request
   body is never read. A failing or panicking request never stops the keeper.
 - Endpoints: `GET` or `HEAD` `/metrics`, `/live`, `/ready`, `/safe-to-stop`,
-  `/problems` (alias `/problem-streams`) and `/status`. Anything else answers
-  `404`; other methods `405`.
+  `/problems` (alias `/problem-streams`), `/status` and `/drain`; `POST`
+  `/drain`, `/undrain` and `/decommission` set the operator mode (below) and
+  answer the `/drain` report. Only an administrator (or anyone on a plain
+  loopback listener) may `POST`; other keepers get `403`. Anything else
+  answers `404`; other methods `405`.
+
+#### Operator mode: drain
+
+A keeper is `serving`, `draining` or `decommissioning`. The mode is a file,
+`operator-mode.json`, in its data directory, written and synced before it
+takes effect, so it survives restarts until the operator clears it. A
+draining keeper:
+
+- hands every stream it leads to a voter that matched its log and whose
+  keeper accepts streams, retrying every second;
+- starts no election of its own (OpenRaft's election timer is off, and it
+  does not campaign after waking a parked stream); it still votes, so the
+  other voters elect without it;
+- reports `accepting: false`, so placement and repair choose other keepers,
+  and no leader hands it a stream, even one its writer prefers.
+
+Do not drain all three voters of a stream at once: none of them would
+campaign. `GET /drain` reports `mode`, `led`, `hosted`, `voter_streams` and
+`drained` (draining and leading nothing).
 
 #### Admin CLI
 
@@ -1060,6 +1082,9 @@ report is incomplete.
 | `acknowledge-recovery --stream UUID` | Clears an operator recovery's fence and prints the head |
 | `retire --stream UUID --keeper K` | Retires `K`'s copy of a stream whose configuration no longer names it, certified by the leader |
 | `problems` | Every keeper's `/problems`, merged by stream, and which keepers did not answer |
+| `drain --keeper K [--wait-secs N]` | Marks `K` draining and waits (120 s by default) until it leads nothing; non-zero exit if it still leads some |
+| `undrain --keeper K` | Clears the mark: `K` elects, leads and takes placements again |
+| `drain-status --keeper K` | `K`'s mode, the streams it leads and hosts, and those it votes in |
 | `clear-quarantine`, `finalize-version` | Reserved for the upgrades work; refused on this build |
 
 Administrators may now also send `PreferLeader`, which used to be a writer's
@@ -1078,6 +1103,7 @@ liveness families grow with the square of the cluster size.
 | --- | --- |
 | `logkeeper_build_info{version,keeper,domain,control_alpn,replication_alpn,bulk_alpn}` | Build and wire versions, always 1 |
 | `logkeeper_consensus_wal_healthy`, `_media_responsive`, `_accepting` | WAL thread running; no WAL round past the slow-round gate recently; keeper accepts new streams (what it reports to placement) |
+| `logkeeper_consensus_operator_mode{mode="serving\|draining\|decommissioning"}` | 1 for the operator mode the keeper is in |
 | `logkeeper_consensus_streams{state="hosted\|open\|led\|parked\|quarantined\|deleted"}` | Replica counts |
 | `logkeeper_consensus_problem_streams{reason}` | Hosted streams per `/problems` reason, every reason exported, zero included |
 | `logkeeper_consensus_refusals_total{reason}` | Requests refused `Unavailable`, by reason (`write.*`, `head.*`, `peer.*`) |
@@ -1145,7 +1171,7 @@ default; select JSON lines with `"log_format": "json"`, `--log-format json` or
 A message never spans lines: newlines in it are escaped.
 
 Administrative actions (`replace`, `prefer_leader`, `acknowledge_recovery`,
-`retire`, the repair loop's own replacements and retirements, and offline
+`retire`, `operator_mode`, the repair loop's own replacements and retirements, and offline
 `recovery`) log an audit record under target `logkeeper::audit` with
 `audit=true`, `action`, `actor`, `keeper`, `stream` and `outcome`.
 
@@ -1210,7 +1236,7 @@ rules read the keeper's own gates rather than copying them:
 | `LogkeeperKeeperDead` | critical | peers have not heard from a keeper for the repair delay | leaders replace it; restore or retire the host |
 | `LogkeeperWalUnhealthy` | critical | the WAL thread stopped | restart the keeper; run `verify` if it will not start |
 | `LogkeeperMediaSlow` | warning | a WAL round passed 2.5 s within the last 10 s, for 1 m | the keeper already handed off its leadership; check the disk |
-| `LogkeeperNotAccepting` | warning | the keeper accepts no new streams for 10 m | slow media, a stopped WAL, or a full volume |
+| `LogkeeperNotAccepting` | warning | a serving (not drained) keeper accepts no new streams for 10 m | slow media, a stopped WAL, or a full volume |
 | `LogkeeperCriticalInvariant` | critical | `critical!` fired | collect a debug bundle and the `logkeeper::critical` lines |
 | `LogkeeperFsyncSlow` | warning | fsync p99 above 40% of the slow-round gate for 10 m | check the disk and its neighbours |
 | `LogkeeperWalRoundNearSlowGate` | warning | WAL round p99 above half the slow-round gate for 10 m | as above |

@@ -126,6 +126,12 @@ impl Engine {
         (queue.pending.len(), oldest, queue.backoff.len())
     }
 
+    /// Whether this keeper takes new streams and leaderships: its media is
+    /// healthy, responsive and has room, and the operator is not draining it.
+    pub(super) fn accepting(&self) -> bool {
+        self.disk.responsive() && self.disk.space.accepts_streams() && !self.mode.draining()
+    }
+
     /// This keeper's status without a replica.
     pub(super) async fn keeper_status(&self) -> KeeperStatus {
         let groups = self.groups.lock().await;
@@ -135,7 +141,7 @@ impl Engine {
             .count();
         KeeperStatus {
             keeper: self.id,
-            accepting: self.disk.responsive() && self.disk.space.accepts_streams(),
+            accepting: self.accepting(),
             streams: groups.len() as u32,
             led: led as u32,
             replica: None,
@@ -175,7 +181,7 @@ impl Engine {
         };
         KeeperStatus {
             keeper: self.id,
-            accepting: self.disk.responsive() && self.disk.space.accepts_streams(),
+            accepting: self.accepting(),
             streams: groups.len() as u32,
             led: led as u32,
             replica,
@@ -569,11 +575,12 @@ impl Engine {
     }
 
     /// A keeper whose media is unhealthy, slow or full cannot accept the
-    /// writes of the streams it leads, even when their followers have room.
+    /// writes of the streams it leads, even when their followers have room,
+    /// and a draining keeper must not lead.
     /// It hands each to a follower that has matched its log and whose keeper
     /// accepts streams. Slow media sheds at once, not at the next pass.
     pub(super) async fn shed_leadership_when_full(&self) {
-        if self.disk.responsive() && self.disk.space.accepts_streams() {
+        if self.accepting() {
             return;
         }
         let groups = self
@@ -628,7 +635,8 @@ impl Engine {
         keeper: Uuid,
     ) -> std::io::Result<Reply> {
         let stream = group.genesis.stream;
-        if group.raft.metrics().borrow_watched().state == ServerState::Leader {
+        let leading = group.raft.metrics().borrow_watched().state == ServerState::Leader;
+        if leading {
             self.record_preference(stream, keeper);
             let followers = group
                 .state
@@ -645,6 +653,17 @@ impl Engine {
                 )
             }))
             .await;
+        }
+        // A keeper that takes no new leaderships (draining, slow or full)
+        // keeps the preference for later but is not handed the stream now.
+        if leading
+            && keeper != self.id
+            && self
+                .reachable(keeper)
+                .await
+                .is_some_and(|status| !status.accepting)
+        {
+            return Ok(Reply::Decision(super::Outcome::Unit));
         }
         Ok(group.prefer_leader(keeper).await)
     }
