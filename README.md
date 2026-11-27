@@ -393,7 +393,12 @@ including framing and metadata, when replacement by snapshot is required.
 
 The keeper can reopen a selected `LKRIMG03` image in place. A first local snapshot
 can reference it as an immutable extent. New selected local roots use
-`LKRIDX01` and new WAL directories use `LKRWAL03`. On first startup, an enrolled
+`LKRIDX02`, which also stores the epoch each retained record was written
+under, and new WAL directories use `LKRWAL03`. An `LKRIDX01` root, or an
+`LKRIMG03` image installed from a peer, reopens with no record epochs, so
+until those records are trimmed an append matching one is judged by its
+bytes alone. A keeper before `LKRIDX02` cannot reopen such a root, so do
+not downgrade below it. On first startup, an enrolled
 framed WAL is migrated through the existing trusted boundary. Budget additional
 free space for the encoded live suffix, two allocation units per entry, 160 KiB
 plus two allocation units per scope, 1 MiB for the root and overhead, and the

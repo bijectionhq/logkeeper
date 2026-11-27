@@ -232,6 +232,61 @@ pub(super) struct Live {
     bytes: u64,
     #[serde(skip)]
     records: VecDeque<Payload>,
+    /// The epochs the retained records were written under. Snapshots
+    /// store them beside the image.
+    #[serde(skip)]
+    epochs: EpochRuns,
+}
+
+/// The most epoch runs a stream retains. A writer that seals more often
+/// than this between trims forgets the epochs of its oldest records.
+pub(super) const MAX_EPOCH_RUNS: usize = 1024;
+
+/// The epochs retained records were written under, as runs: the first LSN
+/// of each run and the epoch of its writer. Records before the first run
+/// have no known epoch: an image that predates the runs restored them, or
+/// more than `MAX_EPOCH_RUNS` runs followed them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct EpochRuns(VecDeque<(Lsn, Epoch)>);
+
+impl EpochRuns {
+    /// The epoch the record at `at` was written under, when known.
+    pub fn epoch(&self, at: Lsn) -> Option<Epoch> {
+        let runs = self.0.partition_point(|(first, _)| *first <= at);
+        runs.checked_sub(1).map(|run| self.0[run].1)
+    }
+
+    /// Notes records written from `at` under `epoch`.
+    fn note(&mut self, at: Lsn, epoch: Epoch) {
+        if self.0.back().is_some_and(|(_, last)| *last == epoch) {
+            return;
+        }
+        self.0.push_back((at, epoch));
+        if self.0.len() > MAX_EPOCH_RUNS {
+            self.0.pop_front();
+        }
+    }
+
+    /// Forgets runs that end below `floor`.
+    fn trim(&mut self, floor: Lsn) {
+        while self.0.len() > 1 && self.0[1].0 <= floor {
+            self.0.pop_front();
+        }
+    }
+
+    /// Whether these runs can describe records retained up to `head`.
+    fn valid(&self, head: Lsn) -> bool {
+        self.0.len() <= MAX_EPOCH_RUNS
+            && self
+                .0
+                .iter()
+                .all(|(first, _)| first.0 >= 1 && *first <= head)
+            && self
+                .0
+                .iter()
+                .zip(self.0.iter().skip(1))
+                .all(|(run, next)| run.0 < next.0 && run.1 < next.1)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -359,8 +414,15 @@ impl State {
             }
             if at >= live.floor && at <= live.head {
                 let retained = &live.records[(at.0 - live.floor.0) as usize];
+                // An identical retry repeats this epoch's record; the same
+                // bytes an earlier epoch wrote conflict, as in the contract.
+                // A record of unknown epoch is judged by its bytes alone.
                 return Ok(
                     if !retained.timed()
+                        && live
+                            .epochs
+                            .epoch(at)
+                            .is_none_or(|epoch| epoch == fence.epoch)
                         && retained.len() == payload.len()
                         && retained.load()? == payload
                     {
@@ -486,6 +548,7 @@ impl State {
                         floor: Lsn(1),
                         bytes: 0,
                         records: VecDeque::new(),
+                        epochs: EpochRuns::default(),
                     });
                     Ok(Outcome::Unit)
                 }
@@ -631,6 +694,26 @@ impl State {
         Ok(())
     }
 
+    /// The epochs of the retained records, for a snapshot.
+    pub fn epoch_runs(&self) -> EpochRuns {
+        self.live()
+            .ok()
+            .map_or_else(EpochRuns::default, |live| live.epochs.clone())
+    }
+
+    /// Restores the epochs a snapshot stored beside its image.
+    pub fn restore_epochs(&mut self, epochs: EpochRuns) -> io::Result<()> {
+        if let Self::Live(live) = self {
+            if !epochs.valid(live.head) {
+                return Err(super::invalid("invalid retained epoch runs"));
+            }
+            live.epochs = epochs;
+        } else if epochs != EpochRuns::default() {
+            return Err(super::invalid("epoch runs without a live stream"));
+        }
+        Ok(())
+    }
+
     fn live(&self) -> Result<&Live> {
         match self {
             Self::Absent => Err(JournalError::NotFound),
@@ -740,6 +823,7 @@ impl Live {
             .filter(|used| *used <= quota_bytes)
             .ok_or(JournalError::Full { floor: self.floor })?;
         self.records.push_back(payload);
+        self.epochs.note(at, self.epoch());
         self.bytes = used;
         self.head = at;
         Ok(Outcome::At(at))
@@ -769,7 +853,15 @@ impl Live {
         let retained = if at > self.head { 0 } else { retained };
         for (index, payload) in payloads.iter().take(retained).enumerate() {
             let record = &self.records[(at.0 - self.floor.0) as usize + index];
-            if record.timed() || record.len() != payload.len() || record.load()? != *payload {
+            let lsn = Lsn(at.0 + index as u64);
+            if record.timed()
+                || self
+                    .epochs
+                    .epoch(lsn)
+                    .is_some_and(|epoch| epoch != self.epoch())
+                || record.len() != payload.len()
+                || record.load()? != *payload
+            {
                 return Ok(Err(conflict));
             }
         }
@@ -801,6 +893,7 @@ impl Live {
                 timed: false,
             });
         }
+        self.epochs.note(Lsn(at.0 + retained as u64), self.epoch());
         self.bytes = used;
         self.head = Lsn(last);
         Ok(Ok(Outcome::At(Lsn(last))))
@@ -819,6 +912,7 @@ impl Live {
                 self.records.shrink_to_fit();
             }
             self.floor = Lsn(through.0 + 1);
+            self.epochs.trim(self.floor);
         }
         Ok(Outcome::Unit)
     }

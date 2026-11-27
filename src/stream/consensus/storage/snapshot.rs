@@ -1064,7 +1064,7 @@ fn read_selected(
     let mut magic = [0; 8];
     file.read_exact(&mut magic)?;
     file.rewind()?;
-    if &magic == index::MAGIC {
+    if index::indexed(&magic) {
         return index::open(file, directory, selected, genesis, objects);
     }
     let (meta, image) = read_image(file, genesis, selected.digest, u64::MAX)?;

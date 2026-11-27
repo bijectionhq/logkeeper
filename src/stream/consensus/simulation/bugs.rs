@@ -15,7 +15,7 @@ use std::{
 
 use bytes::Bytes;
 use journal_contract::{
-    Epoch, Identity, Journal, Lsn, StreamId,
+    Epoch, Identity, Journal, JournalError, Lsn, StreamId,
     conformance::history::{Call, Op, Value, linearizable},
     reference::Limits,
 };
@@ -335,7 +335,6 @@ async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_h
 /// `Epoch(2)` appending identical bytes at an LSN written under `Epoch(1)`
 /// receives `Ok(at)` instead of `Err(JournalError::Conflict { head })`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces unfixed contract-conformance bug found on soak seed 25"]
 async fn bug_repro_cross_epoch_identical_payload_retry_violates_contract() {
     let options = ClusterOptions {
         park_after_secs: 3600,
@@ -413,4 +412,55 @@ async fn bug_repro_cross_epoch_identical_payload_retry_violates_contract() {
         "contract violated: cross-epoch append of identical bytes at Lsn(1) under Epoch(2) \
          returned {cross_epoch:?} instead of Err(Conflict {{ head: Lsn(1) }})"
     );
+}
+
+/// The epochs of retained records survive a local snapshot and a restart of
+/// every keeper: the same bytes a writer of an earlier epoch committed still
+/// conflict, and the current writer's identical retry still succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_epochs_survive_a_snapshot_and_a_full_restart() {
+    let options = ClusterOptions {
+        park_after_secs: 3600,
+        repair_after_secs: 60,
+        quota_bytes: 4 * 1024 * 1024,
+        ..ClusterOptions::default()
+    };
+    let mut cluster = SimCluster::start(250_002, options).await;
+    let voters = [
+        cluster.data_ids[0],
+        cluster.data_ids[1],
+        cluster.data_ids[2],
+    ];
+    let stream = StreamId(250_002);
+    let writer_a = cluster.journal(WRITER_A, voters);
+    let writer_b = cluster.journal(WRITER_B, voters);
+    let record = |at: u64| Bytes::from(format!("record-{at}"));
+
+    settle!(writer_a.create(stream)).unwrap();
+    assert_eq!(settle!(writer_a.seal(stream, Epoch(1))), Ok(Lsn(0)));
+    for at in 1..=100 {
+        assert_eq!(
+            settle!(writer_a.append(stream, Epoch(1), Lsn(at), record(at))),
+            Ok(Lsn(at))
+        );
+    }
+    assert_eq!(settle!(writer_b.seal(stream, Epoch(2))), Ok(Lsn(100)));
+    // Enough entries past the 128-entry snapshot policy that every voter
+    // reopens from a local snapshot.
+    for at in 101..=300 {
+        assert_eq!(
+            settle!(writer_b.append(stream, Epoch(2), Lsn(at), record(at))),
+            Ok(Lsn(at))
+        );
+    }
+    for id in voters {
+        cluster.stop_graceful(id).await;
+    }
+    cluster.restart_all_stopped().await;
+
+    let earlier = settle!(writer_b.append(stream, Epoch(2), Lsn(50), record(50)));
+    let retry = settle!(writer_b.append(stream, Epoch(2), Lsn(250), record(250)));
+    cluster.stop_all().await;
+    assert_eq!(earlier, Err(JournalError::Conflict { head: Lsn(300) }));
+    assert_eq!(retry, Ok(Lsn(250)));
 }

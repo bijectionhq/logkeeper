@@ -15,11 +15,19 @@ use serde::{Deserialize, Serialize};
 use super::{Genesis, Image, Payload, Selected, SnapshotMeta, invalid, sha256};
 use crate::stream::consensus::{
     decode, encode,
-    state::{MAX_RETAINED_RECORDS, TIMED_RECORD},
+    state::{EpochRuns, MAX_RETAINED_RECORDS, TIMED_RECORD},
     storage::objects::{Key, Location, Object, Objects, Reference},
 };
 
-pub(super) const MAGIC: &[u8; 8] = b"LKRIDX01";
+/// Roots that also store the epochs of the retained records.
+pub(super) const MAGIC: &[u8; 8] = b"LKRIDX02";
+/// Roots without epochs, which reopen with unknown record epochs.
+const MAGIC_WITHOUT_EPOCHS: &[u8; 8] = b"LKRIDX01";
+
+/// Whether a selected snapshot starts with an index root.
+pub(super) fn indexed(magic: &[u8; 8]) -> bool {
+    magic == MAGIC || magic == MAGIC_WITHOUT_EPOCHS
+}
 const PAGE: usize = 128;
 const MAX_PAGES: usize = MAX_RETAINED_RECORDS / PAGE + 1;
 const MAX_PAGE_BYTES: usize = 16 * 1024;
@@ -142,13 +150,16 @@ pub(super) fn build(
         return Err(invalid("snapshot dependency geometry exceeded"));
     }
     objects.publish_files()?;
-    let root = encode(&Root {
-        genesis: genesis.clone(),
-        meta: meta.clone(),
-        image: image.clone(),
-        pages,
-        legacy: dependencies.legacy.clone(),
-    })?;
+    let root = encode(&(
+        Root {
+            genesis: genesis.clone(),
+            meta: meta.clone(),
+            image: image.clone(),
+            pages,
+            legacy: dependencies.legacy.clone(),
+        },
+        image.state.epoch_runs(),
+    ))?;
     if root.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("snapshot root exceeds its bound"));
     }
@@ -166,10 +177,16 @@ pub(super) fn open(
 ) -> io::Result<(SnapshotMeta, Image, Dependencies)> {
     let mut bytes = Vec::new();
     file.take(MAX_ROOT_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_ROOT_BYTES || !bytes.starts_with(MAGIC) {
+    if bytes.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("invalid indexed snapshot root"));
     }
-    let mut root: Root = decode(&bytes[MAGIC.len()..])?;
+    let (mut root, epochs): (Root, EpochRuns) = if bytes.starts_with(MAGIC) {
+        decode(&bytes[MAGIC.len()..])?
+    } else if bytes.starts_with(MAGIC_WITHOUT_EPOCHS) {
+        (decode(&bytes[MAGIC.len()..])?, EpochRuns::default())
+    } else {
+        return Err(invalid("invalid indexed snapshot root"));
+    };
     root.image.stage_intent = root.meta.snapshot_id.starts_with(super::STAGED_IMAGE);
     if &root.genesis != genesis
         || root.meta.last_log_id != Some(selected.log_id)
@@ -236,6 +253,7 @@ pub(super) fn open(
     root.image
         .state
         .restore_records(records, genesis.quota_bytes)?;
+    root.image.state.restore_epochs(epochs)?;
     Ok((root.meta, root.image, dependencies))
 }
 
