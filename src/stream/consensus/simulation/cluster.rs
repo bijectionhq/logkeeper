@@ -636,12 +636,29 @@ impl SimCluster {
     ) -> Result<Vec<VoterSnapshot>, Vec<Option<VoterSnapshot>>> {
         let probe = self.probe_client();
         let outcome = timeout(limit, async {
+            let mut stopped_since = BTreeMap::new();
             loop {
-                // Bail out early if any voter's OpenRaft core has panicked.
+                // Bail out early if any voter's OpenRaft core stays stopped
+                // (a panic, or a storage error its keeper does not recover).
                 for &v in voters {
-                    if let Some(server) = self.running.get(&v)
-                        && let Some(group) = server.engine.groups.lock().await.get(&stream)
-                        && group.raft.metrics().borrow_watched().running_state.is_err()
+                    let stopped =
+                        match self.running.get(&v) {
+                            Some(server) => {
+                                server.engine.groups.lock().await.get(&stream).is_some_and(
+                                    |group| {
+                                        group.raft.metrics().borrow_watched().running_state.is_err()
+                                    },
+                                )
+                            }
+                            None => false,
+                        };
+                    if !stopped {
+                        stopped_since.remove(&v);
+                    } else if stopped_since
+                        .entry(v)
+                        .or_insert_with(tokio::time::Instant::now)
+                        .elapsed()
+                        > Duration::from_secs(5)
                     {
                         return None;
                     }

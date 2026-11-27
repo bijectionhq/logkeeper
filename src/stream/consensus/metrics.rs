@@ -43,6 +43,7 @@ counters! {
     unparked_by_client: "stream.unparked_by_client",
     unparked_for_repair: "stream.unparked_for_repair",
     park_declined: "stream.park_declined",
+    reopened_stopped: "stream.reopened_stopped",
 }
 
 pub(super) static COUNTERS: Counters = Counters::new();

@@ -131,7 +131,7 @@ impl Engine {
             groups
                 .iter()
                 .find(|group| group.genesis.stream == stream)
-                .map(|group| group.state.healthy())
+                .map(|group| group.state.healthy() && !group.stopped())
                 .or_else(|| {
                     (self.disk.healthy()
                         && !self.deleted.read().contains(&stream)

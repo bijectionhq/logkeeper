@@ -705,13 +705,33 @@ impl Engine {
         }
     }
 
+    /// Closes a copy whose Raft core stopped, so the next request or peer
+    /// message opens it again from its durable state. OpenRaft stops a
+    /// group for good on any log storage error, such as a vote refused
+    /// below the protocol space floor, while the keeper's media stays
+    /// healthy; without this the copy would stay a voter that never
+    /// answers. The copy stays as it is while the space is still short.
+    async fn close_stopped(&self, group: &Group) -> io::Result<()> {
+        let stream = group.genesis.stream;
+        if !self.disk.healthy() || !self.disk.space.accepts_protocol() {
+            return Err(invalid("stream replica stopped and its media has no room"));
+        }
+        super::metrics::count(&super::metrics::COUNTERS.reopened_stopped);
+        eprintln!("logkeeper reopens stream {stream:?}, whose Raft core stopped");
+        self.close_retaining(stream, || ()).await;
+        Ok(())
+    }
+
     async fn group(&self, genesis: Genesis) -> io::Result<Arc<Group>> {
         self.require_media()?;
         if self.quarantined.read().contains(&genesis.stream) {
             return Err(invalid("stream replica is quarantined"));
         }
-        if let Some(group) = self.groups.lock().await.get(&genesis.stream).cloned() {
-            return group.for_genesis(&genesis);
+        let existing = self.groups.lock().await.get(&genesis.stream).cloned();
+        match existing {
+            Some(group) if !group.stopped() => return group.for_genesis(&genesis),
+            Some(group) => self.close_stopped(&group).await?,
+            None => {}
         }
         let opening = self.opening(genesis.stream).await?;
         let _guard = opening.lock().await;
@@ -991,6 +1011,14 @@ impl Engine {
             Request::Bootstrap(stream) => self.bootstrap(stream).await,
             request => {
                 let group = self.groups.lock().await.get(&stream).cloned();
+                if let Some(stopped) = group.as_ref().filter(|group| group.stopped()) {
+                    // Reopen the copy; it elects a leader and the client
+                    // retries.
+                    if self.group(stopped.genesis.clone()).await.is_err() {
+                        return Ok(failure(JournalError::Unavailable));
+                    }
+                    return Ok(Reply::Leader(None));
+                }
                 let Some(group) = group else {
                     if self.deleted.read().contains(&stream) {
                         let refused = Outcome::Refused(JournalError::Deleted);
@@ -1432,6 +1460,12 @@ impl Group {
                     .iter()
                     .all(|(id, matched)| ignored(*id) || matched.map(|id| id.index) == last)
             })
+    }
+
+    /// Whether OpenRaft stopped this group's core, after a storage error
+    /// or a panic.
+    fn stopped(&self) -> bool {
+        self.raft.metrics().borrow_watched().running_state.is_err()
     }
 
     fn require_healthy(&self) -> io::Result<()> {

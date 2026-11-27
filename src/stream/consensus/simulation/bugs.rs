@@ -26,6 +26,24 @@ use super::{
     cluster::{ClusterOptions, READER, SimCluster, WAIT, WRITER_A, WRITER_B},
 };
 
+/// Retries a setup call while a loaded machine answers `Unavailable`, for at
+/// most 30 s. Only for idempotent calls outside the race under test.
+macro_rules! settle {
+    ($call:expr) => {{
+        let end = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match $call.await {
+                Err(journal_contract::JournalError::Unavailable)
+                    if tokio::time::Instant::now() < end =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await
+                }
+                result => break result,
+            }
+        }
+    }};
+}
+
 /// Minimal reproduction of the linearizability bug found on soak seed 24
 /// (`Profile::NetworkAndMembership`).
 ///
@@ -57,11 +75,11 @@ async fn bug_repro_append_retry_after_dropped_reply_returns_fenced_after_committ
     let id_a = Identity::from_static(WRITER_A);
     let id_b = Identity::from_static(WRITER_B);
 
-    writer_a.create(stream).await.unwrap();
-    assert_eq!(writer_a.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
+    settle!(writer_a.create(stream)).unwrap();
+    assert_eq!(settle!(writer_a.seal(stream, Epoch(1))), Ok(Lsn(0)));
     let p1 = Bytes::from_static(b"one");
     assert_eq!(
-        writer_a.append(stream, Epoch(1), Lsn(1), p1.clone()).await,
+        settle!(writer_a.append(stream, Epoch(1), Lsn(1), p1.clone())),
         Ok(Lsn(1))
     );
 
@@ -152,7 +170,6 @@ async fn bug_repro_append_retry_after_dropped_reply_returns_fenced_after_committ
 /// disk space returns. The voter never replicates again and automatic repair
 /// never replaces it, causing permanent cross-voter divergence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces unfixed zombie-replica bug found on soak seed 14"]
 async fn bug_repro_zero_disk_space_leaves_voter_as_zombie_replica() {
     let options = ClusterOptions {
         park_after_secs: 3600,
@@ -168,12 +185,10 @@ async fn bug_repro_zero_disk_space_leaves_voter_as_zombie_replica() {
     let stream = StreamId(140_001);
     let writer = cluster.journal(WRITER_A, voters);
 
-    writer.create(stream).await.unwrap();
-    assert_eq!(writer.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
+    settle!(writer.create(stream)).unwrap();
+    assert_eq!(settle!(writer.seal(stream, Epoch(1))), Ok(Lsn(0)));
     assert_eq!(
-        writer
-            .append(stream, Epoch(1), Lsn(1), Bytes::from_static(b"one"))
-            .await,
+        settle!(writer.append(stream, Epoch(1), Lsn(1), Bytes::from_static(b"one"))),
         Ok(Lsn(1))
     );
 
@@ -182,17 +197,19 @@ async fn bug_repro_zero_disk_space_leaves_voter_as_zombie_replica() {
     // a follower, whose new-term Vote / Blank entry fails with StorageFull on
     // `leader` and kills its OpenRaft RaftCore.
     cluster.set_disk_zero(leader, true);
-    let _ = timeout(Duration::from_secs(6), async {
-        while cluster.leader(stream).await == Some(leader) {
+    let _ = timeout(WAIT, async {
+        while cluster
+            .leader(stream)
+            .await
+            .is_none_or(|current| current == leader)
+        {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await;
 
     assert_eq!(
-        writer
-            .append(stream, Epoch(1), Lsn(2), Bytes::from_static(b"two"))
-            .await,
+        settle!(writer.append(stream, Epoch(1), Lsn(2), Bytes::from_static(b"two"))),
         Ok(Lsn(2))
     );
     // Disk space recovers.
@@ -247,18 +264,16 @@ async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_h
     let writer_b = cluster.journal(WRITER_B, voters);
     let reader = cluster.journal(READER, voters);
 
-    writer_a.create(stream).await.unwrap();
-    assert_eq!(writer_a.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
+    settle!(writer_a.create(stream)).unwrap();
+    assert_eq!(settle!(writer_a.seal(stream, Epoch(1))), Ok(Lsn(0)));
     for at in 1..=3 {
         assert_eq!(
-            writer_a
-                .append(stream, Epoch(1), Lsn(at), Bytes::from(format!("r{at}")))
-                .await,
+            settle!(writer_a.append(stream, Epoch(1), Lsn(at), Bytes::from(format!("r{at}")))),
             Ok(Lsn(at))
         );
     }
     // Reader caches the pre-recovery route [a, b, c].
-    assert_eq!(reader.head(stream).await, Ok(Lsn(3)));
+    assert_eq!(settle!(reader.head(stream)), Ok(Lsn(3)));
 
     // Lose b and c; recover stream offline on survivor a.
     cluster.crash(b).await;
@@ -283,15 +298,11 @@ async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_h
     let next_epoch = Epoch(report.epoch.0 + 1);
     assert!(writer_b.seal(stream, next_epoch).await.is_ok());
     assert_eq!(
-        writer_b
-            .append(stream, next_epoch, Lsn(4), Bytes::from_static(b"after-4"))
-            .await,
+        settle!(writer_b.append(stream, next_epoch, Lsn(4), Bytes::from_static(b"after-4"))),
         Ok(Lsn(4))
     );
     assert_eq!(
-        writer_b
-            .append(stream, next_epoch, Lsn(5), Bytes::from_static(b"after-5"))
-            .await,
+        settle!(writer_b.append(stream, next_epoch, Lsn(5), Bytes::from_static(b"after-5"))),
         Ok(Lsn(5))
     );
 
@@ -343,16 +354,14 @@ async fn bug_repro_cross_epoch_identical_payload_retry_violates_contract() {
     let id_a = Identity::from_static(WRITER_A);
     let id_b = Identity::from_static(WRITER_B);
 
-    writer_a.create(stream).await.unwrap();
-    assert_eq!(writer_a.seal(stream, Epoch(1)).await, Ok(Lsn(0)));
+    settle!(writer_a.create(stream)).unwrap();
+    assert_eq!(settle!(writer_a.seal(stream, Epoch(1))), Ok(Lsn(0)));
     let payload = Bytes::from_static(b"same-bytes");
     assert_eq!(
-        writer_a
-            .append(stream, Epoch(1), Lsn(1), payload.clone())
-            .await,
+        settle!(writer_a.append(stream, Epoch(1), Lsn(1), payload.clone())),
         Ok(Lsn(1))
     );
-    assert_eq!(writer_b.seal(stream, Epoch(2)).await, Ok(Lsn(1)));
+    assert_eq!(settle!(writer_b.seal(stream, Epoch(2))), Ok(Lsn(1)));
     let cross_epoch = writer_b
         .append(stream, Epoch(2), Lsn(1), payload.clone())
         .await;

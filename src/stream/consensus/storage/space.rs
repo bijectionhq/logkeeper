@@ -199,6 +199,13 @@ impl Space {
         self.available(&state, 64 * MIB, ORDINARY_FLOOR).is_ok()
     }
 
+    /// Whether a protocol write, such as a vote, still finds room above the
+    /// protocol floor.
+    pub fn accepts_protocol(&self) -> bool {
+        let state = self.0.state.lock();
+        self.available(&state, 0, PROTOCOL_FLOOR).is_ok()
+    }
+
     fn available(&self, state: &Ledger, bytes: u64, floor: u64) -> io::Result<()> {
         if !fits(self.measured_space()?, state.pending, bytes, floor) {
             return Err(exhausted());
