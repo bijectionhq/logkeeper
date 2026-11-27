@@ -871,10 +871,11 @@ async fn debug_bundle_collects_every_keeper_over_mtls_and_inspects_offline() {
     let local = voters[0];
     let mut config = cluster.configs[&local].clone();
     let admin = config.admin.as_mut().unwrap();
+    // The other keepers are listed by name, resolved when collecting.
     admin.cluster = addrs
         .iter()
         .filter(|(id, _)| **id != local)
-        .map(|(id, at)| (*id, *at))
+        .map(|(id, at)| (*id, format!("localhost:{}", at.port()).parse().unwrap()))
         .collect();
     let raw = serde_json::json!({
         "keeper": local,
@@ -882,7 +883,10 @@ async fn debug_bundle_collects_every_keeper_over_mtls_and_inspects_offline() {
     });
     // A listener nothing answers on is recorded, not fatal.
     let silent = free_loopback();
-    let bundle = config.debug_bundle(&raw, &[silent], None).await.unwrap();
+    let bundle = config
+        .debug_bundle(&raw, &[silent.into()], None)
+        .await
+        .unwrap();
     let entries = untar(&bundle);
     let config_json: serde_json::Value =
         serde_json::from_slice(&entries["logkeeper-debug/config.json"]).unwrap();

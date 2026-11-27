@@ -23,9 +23,7 @@ spec:
       labels:
         app.kubernetes.io/name: logkeeper
     spec:
-      hostNetwork: true
       automountServiceAccountToken: false
-      dnsPolicy: ClusterFirstWithHostNet
       # SIGTERM hands off leadership and flushes the WAL.
       terminationGracePeriodSeconds: 45
       securityContext:

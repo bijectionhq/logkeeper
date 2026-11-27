@@ -1,6 +1,9 @@
-# Headless service for the StatefulSet's identity. Clients and peers do not
-# use it: the keeper inventory is IP:port, so keepers run on the host network
-# and are addressed by their node IPs.
+# Headless service that names each keeper's pod: keeper N is
+# logkeeper-N-0.logkeeper.logkeeper.svc.cluster.local in every inventory, and
+# a rescheduled pod is found again under its name at the next connect. The
+# name never decides identity: each connection checks the keeper URI in the
+# peer's certificate. Addresses are published before pods are ready, because
+# a keeper turns ready only once it reaches a peer.
 apiVersion: v1
 kind: Service
 metadata:

@@ -2,7 +2,6 @@
 """Check one keeper's safe-to-stop report and optionally evict that pod."""
 
 import argparse
-import ipaddress
 import json
 import re
 import subprocess
@@ -11,6 +10,7 @@ import time
 
 APP_LABELS = {"app.kubernetes.io/name": "logkeeper"}
 TLS_DIR = "/etc/logkeeper/tls"
+SERVICE = "logkeeper"
 
 
 class RollError(Exception):
@@ -42,9 +42,10 @@ class Cluster:
         output = self.run(*args)
         return json.loads(output) if output else None
 
-    def safe_to_stop(self, pod, host_ip):
-        address = ipaddress.ip_address(host_ip)
-        host = f"[{address}]" if address.version == 6 else str(address)
+    def safe_to_stop(self, pod):
+        # The pod's stable name under the headless service, which its
+        # certificate carries as a DNS SAN; its IP changes with each pod.
+        host = f"{pod}.{SERVICE}.{self.namespace}.svc.cluster.local"
         return json.loads(self.run(
             "exec", pod, "-c", "keeper", "--", "curl", "--noproxy", "*",
             "--silent", "--show-error", "--fail-with-body", "--max-time", "8",
@@ -97,7 +98,7 @@ def rollover(cluster, keeper, evict, timeout):
     if any(meta.get("labels", {}).get(key) != value for key, value in APP_LABELS.items()):
         raise RollError(f"{name} is outside the logkeeper PodDisruptionBudget")
     uid = meta["uid"]
-    report = cluster.safe_to_stop(name, pod["status"]["hostIP"])
+    report = cluster.safe_to_stop(name)
     if report.get("safe") is not True:
         raise RollError(f"{name} refused safe-to-stop\n{json.dumps(report)}")
     print(f"{name} passed safe-to-stop\n{json.dumps(report)}", flush=True)

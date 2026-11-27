@@ -71,9 +71,20 @@ shared segmented WAL. It listens on three TCP ports, each with mutual TLS 1.3:
 | Bulk and replication | `bulk` | Keepers only: AppendEntries batches and snapshot files | Bulk `/3`, `/2`. Replication `/4`, `/3` |
 | Admin | `admin.listen` | Probes, metrics scrapers, operators | Plain HTTP on loopback, or mTLS |
 
-A keeper binds the `peers` and `bulk` addresses that its own inventory lists
-for itself. Every address in the inventory is an `IP:port` (`SocketAddr`), and
-DNS names are not accepted, so each keeper needs a stable IP address.
+Every address in the inventory (`keepers`, `peers`, `bulk`, and `admin.cluster`)
+is `IP:port` or `name:port`. A DNS name resolves at every connect, trying each
+address it returns, so a keeper that comes back on a new IP (a rescheduled pod)
+is found again under the same name. The name is never trusted for identity:
+every connection checks that the peer's certificate URI names the keeper the
+route was for, and refuses it otherwise. A keeper binds the `peers` and `bulk`
+addresses its own inventory lists for itself: an IP address as given, a name
+on `0.0.0.0` at its port. `listen` stays an IP address. Addresses are compared
+as text, so two names for one endpoint, or a name and the IP it resolves to,
+are not detected as duplicates: the keeper does not resolve names when it
+reads its configuration, since a name may not resolve yet (a pod not yet
+scheduled). Such a mistake is still caught at connect time, because a route
+that reaches the wrong keeper is refused. Give each keeper one spelling
+everywhere.
 
 A stream has three voters in three distinct failure domains. It commits with
 two. Each stream's leader:
@@ -440,33 +451,35 @@ keepers are up.
 
 The [Kustomize bundle](../deploy/consensus/kubernetes/) is a staging template
 for six keepers on six dedicated nodes, with two nodes per zone. Each keeper
-has its own singleton StatefulSet, node IP, and TLS Secret. Its two retained
-local PVs bind to the same host and point to separate media and enrollment
-filesystems. All six pods have required hostname anti-affinity. Zone selectors
-put two keepers in each zone, and the three initial catalog voters occupy three
-different zones. Clients and peers connect to the node addresses in the
-inventory. The headless Service provides StatefulSet identity.
-DNS names also work in keeper inventories. For this template use the stable
-node addresses that match the workload placement and server certificates.
+has its own singleton StatefulSet and TLS Secret. Its two retained local PVs
+bind to the same host and point to separate media and enrollment filesystems.
+All six pods have required hostname anti-affinity. Zone selectors put two
+keepers in each zone, and the three initial catalog voters occupy three
+different zones. Pods run on the pod network. Every inventory lists keeper N
+by its pod's name under the headless `logkeeper` Service,
+`logkeeper-N-0.logkeeper.logkeeper.svc.cluster.local`, for the application,
+control, bulk and admin ports, so a rescheduled pod with a new IP is found
+again. The Service sets `publishNotReadyAddresses: true`, because a keeper
+turns ready only once it reaches a peer, and peers must resolve it before
+that. Each keeper listens on `0.0.0.0`. Rename the hosts in `keepers/*.json`
+if you deploy into another namespace.
 
-1. Prepare six dedicated staging nodes. Provide the host networking permission
-   required by the namespace, set the zone labels, mount their two filesystems,
+1. Prepare six dedicated staging nodes. Set the zone labels, mount their two filesystems,
    and verify that UID/GID `10001` can write to both mounts. Set the hostname,
    path and storage size for each PV in `volumes.yaml`. Keep registry storage
    and its recovery copies independent of keeper media.
-2. Set each workload's zone selector and the corresponding keeper's node IP
-   in **every** inventory. Keep `placement.json`, each provision document and
+2. Set each workload's zone selector. Keep `placement.json`, each provision document and
    the RTDB journal and operator configs in agreement. Allow application port
    `5441` from approved clients and keepers, control and bulk ports `5541` and
    `5641` between keepers, and admin port `5741` from approved operators,
-   scrapers and keepers. Restrict these host-network listeners with node or
-   network controls. The probe listener on loopback port `5742` serves only
+   scrapers and keepers, with NetworkPolicies. The probe listener on loopback port `5742` serves only
    `/live` and `/ready`.
 3. In the staging namespace, create six Secrets named `logkeeper-tls-0`
    through `logkeeper-tls-5`. Give each Secret keys `tls.crt`, `tls.key` and
    `ca.crt` for that keeper only. Give the leaf both client and server usages,
-   the keeper's URI SAN, and its node IP as an IP SAN so that the rollover
-   guard can verify the admin server. Set the `certificate_sha256` of each
+   the keeper's URI SAN, and its pod name
+   (`logkeeper-N-0.logkeeper.logkeeper.svc.cluster.local`) as a DNS SAN so
+   that the rollover guard can verify the admin server. Set the `certificate_sha256` of each
    provision document to the SHA-256 hash of its `tls.crt` file. Set the
    metrics principal in `admin.metrics_readers` if enabling metrics collection.
 4. In the staging Kustomization, set an `images` mapping for
@@ -721,7 +734,6 @@ Most are items in the consensus design's review tables.
 
 | Missing | Effect | Workaround |
 | --- | --- | --- |
-| DNS names in the inventory | Keepers need stable IPs; Kubernetes uses host networking | Static IPs, pinned nodes |
 | Runtime inventory change (T19) | Adding a keeper restarts every keeper | Plan the count; restart one at a time |
 | Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |

@@ -1,6 +1,6 @@
 {
   "keeper": "c174474a-8704-4da9-9283-9fd2f29679e6",
-  "listen": "10.0.2.10:5441",
+  "listen": "0.0.0.0:5441",
   "data": "/var/lib/logkeeper/media/data",
   "enrollment": "/var/lib/logkeeper/registry",
   "tls": {
@@ -9,28 +9,28 @@
     "ca": "/etc/logkeeper/tls/ca.crt"
   },
   "keepers": {
-    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "10.0.1.10:5441",
-    "c174474a-8704-4da9-9283-9fd2f29679e6": "10.0.2.10:5441",
-    "efe8b19f-61fc-424d-b4d0-d67cff989952": "10.0.3.10:5441",
-    "8ca95c75-0b78-4816-9211-4938a683e2a2": "10.0.1.11:5441",
-    "b269357f-71ed-4e76-a8fb-6de12a660230": "10.0.2.11:5441",
-    "f5151f9d-aba8-4fe6-a111-2574f1cd1415": "10.0.3.11:5441"
+    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "logkeeper-0-0.logkeeper.logkeeper.svc.cluster.local:5441",
+    "c174474a-8704-4da9-9283-9fd2f29679e6": "logkeeper-1-0.logkeeper.logkeeper.svc.cluster.local:5441",
+    "efe8b19f-61fc-424d-b4d0-d67cff989952": "logkeeper-2-0.logkeeper.logkeeper.svc.cluster.local:5441",
+    "8ca95c75-0b78-4816-9211-4938a683e2a2": "logkeeper-3-0.logkeeper.logkeeper.svc.cluster.local:5441",
+    "b269357f-71ed-4e76-a8fb-6de12a660230": "logkeeper-4-0.logkeeper.logkeeper.svc.cluster.local:5441",
+    "f5151f9d-aba8-4fe6-a111-2574f1cd1415": "logkeeper-5-0.logkeeper.logkeeper.svc.cluster.local:5441"
   },
   "peers": {
-    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "10.0.1.10:5541",
-    "c174474a-8704-4da9-9283-9fd2f29679e6": "10.0.2.10:5541",
-    "efe8b19f-61fc-424d-b4d0-d67cff989952": "10.0.3.10:5541",
-    "8ca95c75-0b78-4816-9211-4938a683e2a2": "10.0.1.11:5541",
-    "b269357f-71ed-4e76-a8fb-6de12a660230": "10.0.2.11:5541",
-    "f5151f9d-aba8-4fe6-a111-2574f1cd1415": "10.0.3.11:5541"
+    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "logkeeper-0-0.logkeeper.logkeeper.svc.cluster.local:5541",
+    "c174474a-8704-4da9-9283-9fd2f29679e6": "logkeeper-1-0.logkeeper.logkeeper.svc.cluster.local:5541",
+    "efe8b19f-61fc-424d-b4d0-d67cff989952": "logkeeper-2-0.logkeeper.logkeeper.svc.cluster.local:5541",
+    "8ca95c75-0b78-4816-9211-4938a683e2a2": "logkeeper-3-0.logkeeper.logkeeper.svc.cluster.local:5541",
+    "b269357f-71ed-4e76-a8fb-6de12a660230": "logkeeper-4-0.logkeeper.logkeeper.svc.cluster.local:5541",
+    "f5151f9d-aba8-4fe6-a111-2574f1cd1415": "logkeeper-5-0.logkeeper.logkeeper.svc.cluster.local:5541"
   },
   "bulk": {
-    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "10.0.1.10:5641",
-    "c174474a-8704-4da9-9283-9fd2f29679e6": "10.0.2.10:5641",
-    "efe8b19f-61fc-424d-b4d0-d67cff989952": "10.0.3.10:5641",
-    "8ca95c75-0b78-4816-9211-4938a683e2a2": "10.0.1.11:5641",
-    "b269357f-71ed-4e76-a8fb-6de12a660230": "10.0.2.11:5641",
-    "f5151f9d-aba8-4fe6-a111-2574f1cd1415": "10.0.3.11:5641"
+    "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "logkeeper-0-0.logkeeper.logkeeper.svc.cluster.local:5641",
+    "c174474a-8704-4da9-9283-9fd2f29679e6": "logkeeper-1-0.logkeeper.logkeeper.svc.cluster.local:5641",
+    "efe8b19f-61fc-424d-b4d0-d67cff989952": "logkeeper-2-0.logkeeper.logkeeper.svc.cluster.local:5641",
+    "8ca95c75-0b78-4816-9211-4938a683e2a2": "logkeeper-3-0.logkeeper.logkeeper.svc.cluster.local:5641",
+    "b269357f-71ed-4e76-a8fb-6de12a660230": "logkeeper-4-0.logkeeper.logkeeper.svc.cluster.local:5641",
+    "f5151f9d-aba8-4fe6-a111-2574f1cd1415": "logkeeper-5-0.logkeeper.logkeeper.svc.cluster.local:5641"
   },
   "domains": {
     "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "zone-a",
@@ -62,18 +62,18 @@
   "sync_mode": "full",
   "log_format": "json",
   "admin": {
-    "listen": "10.0.2.10:5741",
+    "listen": "0.0.0.0:5741",
     "mtls": true,
     "probe_listen": "127.0.0.1:5742",
     "metrics_readers": [
       "urn:logkeeper:client:metrics"
     ],
     "cluster": {
-      "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "10.0.1.10:5741",
-      "efe8b19f-61fc-424d-b4d0-d67cff989952": "10.0.3.10:5741",
-      "8ca95c75-0b78-4816-9211-4938a683e2a2": "10.0.1.11:5741",
-      "b269357f-71ed-4e76-a8fb-6de12a660230": "10.0.2.11:5741",
-      "f5151f9d-aba8-4fe6-a111-2574f1cd1415": "10.0.3.11:5741"
+      "6f80e62d-88ab-4031-9905-4a60ae9cc8a4": "logkeeper-0-0.logkeeper.logkeeper.svc.cluster.local:5741",
+      "efe8b19f-61fc-424d-b4d0-d67cff989952": "logkeeper-2-0.logkeeper.logkeeper.svc.cluster.local:5741",
+      "8ca95c75-0b78-4816-9211-4938a683e2a2": "logkeeper-3-0.logkeeper.logkeeper.svc.cluster.local:5741",
+      "b269357f-71ed-4e76-a8fb-6de12a660230": "logkeeper-4-0.logkeeper.logkeeper.svc.cluster.local:5741",
+      "f5151f9d-aba8-4fe6-a111-2574f1cd1415": "logkeeper-5-0.logkeeper.logkeeper.svc.cluster.local:5741"
     }
   }
 }

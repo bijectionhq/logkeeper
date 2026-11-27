@@ -7,7 +7,6 @@
 use std::{
     collections::BTreeMap,
     io,
-    net::SocketAddr,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -16,6 +15,7 @@ use serde::Serialize;
 use tokio_rustls::TlsConnector;
 
 use super::Config;
+use crate::stream::consensus::Address;
 use crate::stream::wire::KeeperId;
 
 /// The admin paths collected from each keeper, and the file each lands in.
@@ -41,7 +41,7 @@ struct Manifest {
 #[derive(Serialize)]
 struct Collected {
     keeper: Option<uuid::Uuid>,
-    address: SocketAddr,
+    address: Address,
     /// Per path: the HTTP status, or the error that kept it from answering.
     answers: BTreeMap<&'static str, String>,
 }
@@ -98,7 +98,7 @@ impl Config {
     pub async fn debug_bundle(
         &self,
         raw: &serde_json::Value,
-        extra: &[SocketAddr],
+        extra: &[Address],
         offline: Option<PathBuf>,
     ) -> io::Result<Vec<u8>> {
         let mut archive = Tar::default();
@@ -106,14 +106,14 @@ impl Config {
         redact(&mut config);
         archive.add("config.json", &serde_json::to_vec_pretty(&config)?);
 
-        let mut endpoints = Vec::<(Option<uuid::Uuid>, SocketAddr)>::new();
+        let mut endpoints = Vec::<(Option<uuid::Uuid>, Address)>::new();
         if let Some(admin) = &self.admin {
-            endpoints.push((Some(self.keeper), admin.listen));
-            endpoints.extend(admin.cluster.iter().map(|(id, at)| (Some(*id), *at)));
+            endpoints.push((Some(self.keeper), admin.listen.into()));
+            endpoints.extend(admin.cluster.iter().map(|(id, at)| (Some(*id), at.clone())));
         }
-        endpoints.extend(extra.iter().map(|at| (None, *at)));
-        endpoints.sort_by_key(|(_, at)| *at);
-        endpoints.dedup_by_key(|(_, at)| *at);
+        endpoints.extend(extra.iter().map(|at| (None, at.clone())));
+        endpoints.sort_by(|(_, left), (_, right)| left.cmp(right));
+        endpoints.dedup_by(|(_, left), (_, right)| left == right);
         let tls = match &self.admin {
             Some(admin) if admin.mtls => Some(
                 self.tls
@@ -126,7 +126,7 @@ impl Config {
             async move {
                 let mut answers = Vec::new();
                 for (path, _) in PATHS {
-                    answers.push(fetch(*at, tls.clone(), path).await);
+                    answers.push(fetch(at, tls.clone(), path).await);
                 }
                 answers
             }
@@ -152,7 +152,7 @@ impl Config {
             }
             collected.push(Collected {
                 keeper: *keeper,
-                address: *at,
+                address: at.clone(),
                 answers: summary,
             });
         }
@@ -240,12 +240,8 @@ fn secret(key: &str) -> bool {
 }
 
 /// GETs `path` from an admin listener: its HTTP status and body.
-async fn fetch(
-    at: SocketAddr,
-    tls: Option<TlsConnector>,
-    path: &str,
-) -> io::Result<(u16, Vec<u8>)> {
-    crate::stream::consensus::operator::admin_request(&at.to_string(), tls, None, "GET", path).await
+async fn fetch(at: &Address, tls: Option<TlsConnector>, path: &str) -> io::Result<(u16, Vec<u8>)> {
+    crate::stream::consensus::operator::admin_request(at.as_str(), tls, None, "GET", path).await
 }
 
 /// A minimal ustar writer: regular files only, names under 100 bytes.

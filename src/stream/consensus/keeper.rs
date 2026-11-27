@@ -124,9 +124,10 @@ pub struct AdminConfig {
     #[serde(default)]
     pub mtls: bool,
     /// The admin listeners of the other keepers, which
-    /// `logkeeper keeper debug-bundle` collects from.
+    /// `logkeeper keeper debug-bundle` collects from: `IP:port` or
+    /// `name:port`, resolved when the bundle is collected.
     #[serde(default)]
-    pub cluster: BTreeMap<uuid::Uuid, SocketAddr>,
+    pub cluster: BTreeMap<uuid::Uuid, super::Address>,
     /// Client URI principals authorized for metrics and health over mTLS.
     #[serde(default)]
     pub metrics_readers: Vec<String>,

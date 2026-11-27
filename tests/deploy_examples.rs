@@ -33,7 +33,16 @@ fn check_keeper(config: &Config) {
         .chain(config.bulk.values())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(addresses.len(), config.keepers.len() * 3);
-    assert_eq!(config.keepers[&config.keeper], config.listen);
+    // An IP inventory entry is the listen address itself; a named one is
+    // published by DNS, and the keeper listens on every interface at its port.
+    let own = &config.keepers[&config.keeper];
+    match own.socket_addr() {
+        Some(address) => assert_eq!(address, config.listen),
+        None => {
+            assert!(config.listen.ip().is_unspecified());
+            assert_eq!(config.listen.port(), own.port());
+        }
+    }
     let voters = config
         .catalog_voters
         .expect("production runs a replicated catalog");
@@ -91,16 +100,12 @@ fn kubernetes_keepers_share_one_inventory() {
                 Config::read(&deploy(&format!("kubernetes/keepers/keeper-{n}.json"))).unwrap();
             check_keeper(&config);
             let admin = config.admin.as_ref().expect("keeper admin and probes");
-            assert_eq!(admin.listen.ip(), config.listen.ip());
-            assert_eq!(admin.listen.port(), 5741);
+            assert_eq!(admin.listen, "0.0.0.0:5741".parse().unwrap());
             assert!(admin.mtls);
             assert_eq!(admin.probe_listen, Some("127.0.0.1:5742".parse().unwrap()));
-            for peer in &admin.cluster {
-                assert_eq!(
-                    Some(peer.1.ip()),
-                    config.keepers[peer.0].socket_addr().map(|addr| addr.ip())
-                );
-                assert_eq!(peer.1.port(), 5741);
+            for (peer, at) in &admin.cluster {
+                let host = config.keepers[peer].as_str().rsplit_once(':').unwrap().0;
+                assert_eq!(at.as_str(), format!("{host}:5741"));
             }
             assert_eq!(admin.cluster.len(), 5);
             check_authority(
@@ -111,9 +116,36 @@ fn kubernetes_keepers_share_one_inventory() {
             let id = std::fs::read_to_string(deploy(&format!("kubernetes/keepers/keeper-{n}.id")))
                 .unwrap();
             assert_eq!(id.trim(), config.keeper.to_string());
+            // Pods run on the pod network and are addressed by their names
+            // under the headless service.
+            assert_eq!(
+                config.keepers[&config.keeper].as_str(),
+                format!("logkeeper-{n}-0.logkeeper.logkeeper.svc.cluster.local:5441")
+            );
+            for address in config
+                .keepers
+                .values()
+                .chain(config.peers.values())
+                .chain(config.bulk.values())
+            {
+                assert!(
+                    address.is_name()
+                        && address
+                            .as_str()
+                            .contains(".logkeeper.logkeeper.svc.cluster.local:"),
+                    "{address}"
+                );
+            }
             config
         })
         .collect::<Vec<_>>();
+    let statefulset =
+        std::fs::read_to_string(deploy("kubernetes/keeper-base/statefulset.yaml")).unwrap();
+    assert!(!statefulset.contains("hostNetwork"));
+    assert!(statefulset.contains("serviceName: logkeeper"));
+    let service = std::fs::read_to_string(deploy("kubernetes/service.yaml")).unwrap();
+    assert!(service.contains("clusterIP: None"));
+    assert!(service.contains("publishNotReadyAddresses: true"));
     for config in &configs[1..] {
         assert_eq!(config.keepers, configs[0].keepers);
         assert_eq!(config.peers, configs[0].peers);

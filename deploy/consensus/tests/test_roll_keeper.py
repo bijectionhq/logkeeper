@@ -49,7 +49,7 @@ class RolloverTest(unittest.TestCase):
 
     def test_check_only(self):
         self.rollover(evict=False)
-        self.cluster.safe_to_stop.assert_called_once_with("logkeeper-0-0", "10.0.1.10")
+        self.cluster.safe_to_stop.assert_called_once_with("logkeeper-0-0")
         self.cluster.evict.assert_not_called()
 
     def test_safe_to_stop_refused(self):

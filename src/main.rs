@@ -349,7 +349,7 @@ async fn debug_bundle(args: &[String]) -> Result<(), Box<dyn std::error::Error +
             "--admin" => admin.push(
                 iter.next()
                     .ok_or(DEBUG_BUNDLE_USAGE)?
-                    .parse::<std::net::SocketAddr>()?,
+                    .parse::<logkeeper::stream::consensus::Address>()?,
             ),
             "--data" => data = iter.next().map(std::path::PathBuf::from),
             "--out" => out = iter.next().map(std::path::PathBuf::from),
