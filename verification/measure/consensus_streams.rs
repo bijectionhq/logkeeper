@@ -13,6 +13,11 @@
 //!     --streams 100 --active 8 --seconds 10
 //! ```
 //!
+//! `--cold N` makes the active writers trim each batch once written, and
+//! after every N batches across them writes one record to the next idle
+//! stream, which keeps it: the disk then holds mostly dead segments that
+//! cold records pin unless they are compacted.
+//!
 //! `--fill N` first writes N 64-byte records to stream 1 in 256-record
 //! batches and reports the process's resident memory with that stream open
 //! and, with `--park-after`, once it parked.
@@ -34,6 +39,7 @@ struct Args {
     park: Option<u64>,
     sync_mode: SyncMode,
     fill: u64,
+    cold: u64,
 }
 
 fn args() -> Args {
@@ -46,6 +52,7 @@ fn args() -> Args {
         park: None,
         sync_mode: SyncMode::Full,
         fill: 0,
+        cold: 0,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -63,6 +70,7 @@ fn args() -> Args {
                 args.sync_mode = serde_json::from_value(value.into()).unwrap();
             }
             "--fill" => args.fill = value.parse().unwrap(),
+            "--cold" => args.cold = value.parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -207,10 +215,19 @@ async fn main() {
     let deadline = started + Duration::from_secs_f64(args.seconds);
     let record = Bytes::from(vec![7; args.record]);
     let mut writers = tokio::task::JoinSet::new();
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let idle = (args.active + 1..=args.streams).collect::<Vec<_>>();
+    let cold_next = std::sync::Arc::new(parking_lot::Mutex::new(
+        idle.iter()
+            .map(|id| (*id, 1u64))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    ));
     for id in 1..=args.active {
         let journal = journal.clone();
         let record = record.clone();
         let batch = args.batch;
+        let (cold, written, cold_next, idle) =
+            (args.cold, written.clone(), cold_next.clone(), idle.clone());
         writers.spawn(async move {
             let stream = StreamId(u128::from(id));
             let mut next = 1u64;
@@ -223,6 +240,28 @@ async fn main() {
                 journal.append_batch(stream, Epoch(1), group).await.unwrap();
                 latencies.push(sent.elapsed());
                 next += batch;
+                if cold > 0 {
+                    journal.trim(stream, Epoch(1), Lsn(next - 1)).await.unwrap();
+                    let count = written.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if count % cold == 0 && !idle.is_empty() {
+                        let target = idle[(count / cold) as usize % idle.len()];
+                        let at = {
+                            let mut next = cold_next.lock();
+                            let at = next[&target];
+                            next.insert(target, at + 1);
+                            at
+                        };
+                        journal
+                            .append(
+                                StreamId(u128::from(target)),
+                                Epoch(1),
+                                Lsn(at),
+                                record.clone(),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
             }
             latencies
         });
