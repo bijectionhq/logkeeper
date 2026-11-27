@@ -4,12 +4,16 @@ set -euo pipefail
 # Run all exhaustive TLA+ checks for Logkeeper's consensus protocol additions.
 # Usage:
 #   ./verification/tla/check.sh            # run all configs
-#   ./verification/tla/check.sh fast       # skip the two ~1 min deep safety configs
+#   ./verification/tla/check.sh fast       # skip the five deep safety configs
+#
+# Exits non-zero when any configuration does not match its expected outcome:
+# a property violated where it should hold, or a control that stopped failing.
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 MODE="${1:-all}"
 
 JAR="$("$ROOT/fetch-tla.sh")"
+WORKERS="${TLC_WORKERS:-auto}"
 
 find_java() {
   if [[ -n "${JAVA_BIN:-}" && -x "${JAVA_BIN}" ]]; then
@@ -49,7 +53,7 @@ run_case() {
   meta="$(mktemp -d "${TMPDIR:-/tmp}/tlc-${name}.XXXXXX")"
   trap 'rm -rf "$meta"' RETURN
 
-  local args=(-Xmx2g -XX:+UseParallelGC -jar "$JAR" -workers auto -deadlock -metadir "$meta")
+  local args=(-Xmx2g -XX:+UseParallelGC -jar "$JAR" -workers "$WORKERS" -deadlock -metadir "$meta")
   if [[ "$extra" == "liveness" ]]; then
     args+=(-lncheck final)
   fi
@@ -101,25 +105,23 @@ echo "Using Java: $JAVA"
 echo "Using TLC:  $JAR"
 echo
 
-# 1. Core safety & liveness checks (expected PASS)
+# Every property holds on the fixed protocol. The counterexamples the model
+# found (CE-1 to CE-4, see README.md) are fixed, so their configurations now
+# pass, and no configuration is expected to fail.
 run_case "RaftParkSafety"              "LogkeeperProtocol.tla" "RaftParkSafety.cfg"              pass
 run_case "ParkedRepairLiveness"        "LogkeeperProtocol.tla" "ParkedRepairLiveness.cfg"        pass liveness
+run_case "AbortedReplaceLiveness"      "LogkeeperProtocol.tla" "AbortedReplaceLiveness.cfg"      pass liveness
 run_case "RecoverySingleReturnNoSnap"  "LogkeeperProtocol.tla" "RecoverySingleReturnNoSnap.cfg"  pass
+run_case "RecoverySingleReturnSnap"    "LogkeeperProtocol.tla" "RecoverySingleReturnSnap.cfg"    pass
 run_case "RecoverySingleReturnLiveness" "LogkeeperProtocol.tla" "RecoverySingleReturnLiveness.cfg" pass liveness
+run_case "RecoveryBothReturnLiveness"  "LogkeeperProtocol.tla" "RecoveryBothReturnLiveness.cfg"  pass liveness
 
 if [[ "$MODE" != "fast" ]]; then
+  run_case "AmnesiaWipe"               "LogkeeperProtocol.tla" "AmnesiaWipe.cfg"                 pass
   run_case "RepairReplaceSafety"       "LogkeeperProtocol.tla" "RepairReplaceSafety.cfg"         pass
+  run_case "RecoveryBothReturn"        "LogkeeperProtocol.tla" "RecoveryBothReturn.cfg"          pass
+  run_case "AbortedJointRestageSafety" "LogkeeperProtocol.tla" "AbortedJointRestageSafety.cfg"   pass
   run_case "CatalogSafety"             "CatalogStream.tla"     "CatalogSafety.cfg"               pass
-fi
-
-# 2. Counterexample checks (calibration + discovered bugs, expected CE)
-run_case "AmnesiaWipe"                 "LogkeeperProtocol.tla" "AmnesiaWipe.cfg"                 invariant
-run_case "AbortedReplaceLiveness"      "LogkeeperProtocol.tla" "AbortedReplaceLiveness.cfg"      liveness liveness
-run_case "RecoverySingleReturnSnap"    "LogkeeperProtocol.tla" "RecoverySingleReturnSnap.cfg"    invariant
-run_case "RecoveryBothReturnLiveness"  "LogkeeperProtocol.tla" "RecoveryBothReturnLiveness.cfg"  liveness liveness
-
-if [[ "$MODE" != "fast" ]]; then
-  run_case "RecoveryBothReturn"        "LogkeeperProtocol.tla" "RecoveryBothReturn.cfg"          invariant
 fi
 
 echo

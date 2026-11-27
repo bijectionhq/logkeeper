@@ -91,7 +91,14 @@ VARIABLES
     lostSuffix,       \* SUBSET [lsn, val, term]: committed apps acknowledged lost by recovery
     postRecApps,      \* SUBSET [lsn, val, term]: apps committed after recovery
     readerHistory,    \* SUBSET [lsn, val, term]: entries observed by readers after recovery
-    retiredVoted      \* BOOLEAN: a retired copy ever granted a vote
+    retiredVoted,     \* BOOLEAN: a retired copy ever granted a vote
+
+    \* --- Media incarnations and placement certification (keeper/incarnation.rs,
+    \*     keeper/certify.rs) ---
+    reused,           \* [Keepers -> BOOLEAN] keeper ID reused on new media (6d75fec)
+    certified,        \* [Keepers -> BOOLEAN] copy certified since it opened (volatile)
+    fenced,           \* [Keepers -> BOOLEAN] the catalog fenced this copy's configuration
+    catalogStage      \* Nil or [stage, recovery]: the catalog's latest staged move
 
 vars == <<
     alive, deadView, crashCount, registered, vote, log, snapIdx, ownership,
@@ -99,8 +106,10 @@ vars == <<
     excluded, heardLeader, votesGranted, activeStage, staleLearners,
     recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
     appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
-    readerHistory, retiredVoted
+    readerHistory, retiredVoted, reused, certified, fenced, catalogStage
 >>
+
+fenceVars == <<reused, certified, fenced, catalogStage>>
 
 -----------------------------------------------------------------------------
 (* Helper operators *)
@@ -182,6 +191,21 @@ CanVote(k) ==
         member    == (k \in AllVoters(m))
         genVoter  == (k \in GenesisVoters)
     IN installed /\ (IsRecoveringCopy(k) \/ (IF m.configured THEN member ELSE genVoter))
+
+\* decisions::fences_copy (keeper/certify.rs): the catalog's latest staged move
+\* fences a copy whose effective configuration is neither side of that move.
+\* A recovery fences its lost configuration too: only its target goes on.
+\* A copy without a configuration (an empty recovery replacement) cannot
+\* campaign or serve, so it is never fenced.
+FencedByCatalog(k) ==
+    LET m == EffectiveMembership(k)
+        cs == catalogStage
+    IN /\ cs # Nil
+       /\ m.configured
+       /\ IF cs.recovery
+          THEN ~(~m.isJoint /\ m.voters1 = cs.stage.target)
+          ELSE ~( (~m.isJoint /\ m.voters1 \in {cs.stage.old, cs.stage.target})
+                \/ (m.isJoint /\ m.voters1 = cs.stage.old /\ m.voters2 = cs.stage.target))
 
 \* Application entries contained in prefix 1..upto of log l, as [lsn, val, term] triples
 AppEntriesWithTermIn(l, upto) ==
@@ -302,6 +326,10 @@ Init ==
     /\ postRecApps   = {}
     /\ readerHistory = {}
     /\ retiredVoted  = FALSE
+    /\ reused        = [k \in Keepers |-> FALSE]
+    /\ certified     = [k \in Keepers |-> k \in GenesisVoters]
+    /\ fenced        = [k \in Keepers |-> FALSE]
+    /\ catalogStage  = Nil
 
 Symmetry == Permutations(GenesisVoters) \cup Permutations(Keepers \ GenesisVoters)
 
@@ -311,7 +339,8 @@ Symmetry == Permutations(GenesisVoters) \cup Permutations(Keepers \ GenesisVoter
 \* Whether voter v would grant a PreVote for candidate c at proposed term tProp
 PreVoteWouldGrant(v, c, tProp) ==
     /\ alive[v]
-    /\ ((registered[v] /\ ownership[v].current # Nil) \/ (~registered[v] /\ v \in GenesisVoters))
+    /\ ((registered[v] /\ ownership[v].current # Nil)
+        \/ (~registered[v] /\ v \in GenesisVoters /\ ~reused[v]))
     /\ ~ExcludesSender(v, c, tProp)
     /\ IF registered[v] THEN CanVote(v) ELSE (v \in GenesisVoters)
     /\ (lease[v] = Nil \/ lease[v] = c)
@@ -346,11 +375,14 @@ PreVoteExcluded(c, v) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Candidate starts an election after PreVote succeeds (or campaign_after_wake)
 StartCampaign(c) ==
     /\ alive[c] /\ groupState[c] = "Open" /\ role[c] # "Leader"
     /\ ownership[c].current # Nil /\ ownership[c].current.installed
+    \* network.rs: an uncertified copy sends no vote or pre-vote
+    /\ certified[c]
     /\ LET m == EffectiveMembership(c)
            tNew == vote[c].term + 1
        IN /\ m.configured /\ c \in AllVoters(m)
@@ -369,6 +401,7 @@ StartCampaign(c) ==
                    heardLeader, activeStage, staleLearners, recovered, recoveryAcked,
                    lostVoters, returnedLost, survivorId, appendCount, leadersPerTerm,
                    committedApps, lostSuffix, postRecApps, readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Voter v handles VoteRequest from candidate c.
 \* Models:
@@ -389,7 +422,7 @@ HandleVote(v, c) ==
           \* Step 1: group(genesis) admission (keeper.rs:669-690)
           \* Detached replica (registered /\ current = Nil) is refused ("replica is detached")
           /\ (registered[v] => ownership[v].current # Nil)
-          /\ (~registered[v] => v \in GenesisVoters)
+          /\ (~registered[v] => (v \in GenesisVoters /\ ~reused[v]))
           /\ LET regV == TRUE
                  ownV == IF registered[v] THEN ownership[v] ELSE DefaultOwnership
                  \* If parked, reopen and demote self-committed vote
@@ -434,6 +467,7 @@ HandleVote(v, c) ==
                    lostVoters, returnedLost, survivorId, appendCount,
                    leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory>>
+    /\ UNCHANGED fenceVars
 
 \* Candidate c wins election once a quorum of its effective membership granted votes.
 \* OpenRaft commits vote and appends Blank no-op entry (or commits in new term).
@@ -455,6 +489,7 @@ BecomeLeader(c) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Leader lease expires on follower k (allows new elections / pre-votes)
 ExpireLease(k) ==
@@ -468,6 +503,7 @@ ExpireLease(k) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* OpenRaft 0.10 quorum_loss_probe_interval: leader steps down when it cannot reach a quorum
 LeaderStepDown(l) ==
@@ -484,6 +520,7 @@ LeaderStepDown(l) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 -----------------------------------------------------------------------------
 (* 2. Client writes, log replication, commit, and apply *)
@@ -503,6 +540,7 @@ ClientAppend(l, v) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Administrator or writer acknowledges an operator recovery (clears recovery fence)
 AcknowledgeRecovery(l) ==
@@ -517,6 +555,7 @@ AcknowledgeRecovery(l) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Leader l replicates entries (or sends empty heartbeat) to follower/learner f.
 \* Models:
@@ -531,7 +570,7 @@ ReplicateOrHeartbeat(l, f) ==
     /\ LET mL == EffectiveMembership(l)
        IN f \in AllNodes(mL)
     /\ (registered[f] => ownership[f].current # Nil)
-    /\ (~registered[f] => f \in GenesisVoters)
+    /\ (~registered[f] => (f \in GenesisVoters /\ ~reused[f]))
     /\ LET isEmpty == (log[f] = log[l])
            wasParked == (groupState[f] = "Parked")
        IN IF wasParked /\ isEmpty THEN
@@ -550,7 +589,7 @@ ReplicateOrHeartbeat(l, f) ==
                    /\ commitIdx'  = IF wasParked THEN [commitIdx EXCEPT ![f] = snapIdx[f]] ELSE commitIdx
                    /\ appliedIdx' = IF wasParked THEN [appliedIdx EXCEPT ![f] = snapIdx[f]] ELSE appliedIdx
                    /\ excluded'   = [excluded EXCEPT ![l] = f]
-                   /\ UNCHANGED <<log, role, lease, heardLeader>>
+                   /\ UNCHANGED <<log, role, lease, heardLeader, certified>>
                 ELSE
                    /\ VoteLeq(baseVote, vote[l])
                    \* Avoid pure stuttering when f already matches l's vote, log, commit, and lease
@@ -563,6 +602,9 @@ ReplicateOrHeartbeat(l, f) ==
                    /\ role'       = [role EXCEPT ![f] = "Follower"]
                    /\ lease'      = [lease EXCEPT ![f] = l]
                    /\ heardLeader' = [heardLeader EXCEPT ![f] = TRUE]
+                   \* keeper/certify.rs: an append its leader's vote outranks
+                   \* certifies the follower's copy
+                   /\ certified' = [certified EXCEPT ![f] = TRUE]
                    /\ log'        = [log EXCEPT ![f] = log[l]]
                    /\ LET newCommit == Min(commitIdx[l], Len(log[l]))
                           baseCommit == IF wasParked THEN snapIdx[f] ELSE commitIdx[f]
@@ -580,6 +622,34 @@ ReplicateOrHeartbeat(l, f) ==
                    staleLearners, recovered, recoveryAcked, lostVoters, returnedLost,
                    survivorId, appendCount, leadersPerTerm, committedApps, lostSuffix,
                    postRecApps, readerHistory, retiredVoted>>
+    /\ UNCHANGED <<reused, fenced, catalogStage>>
+
+\* A leader or candidate l sends f any frame that carries its vote (append,
+\* snapshot chunk, vote, pre-vote, hand-off or park) and f answers with its
+\* own, newer vote, so l adopts f's term and becomes a follower. A frame
+\* that f excludes (decisions::excludes_sender) gets no Raft answer and
+\* teaches l nothing. Before the snapshot fix, keeper/ingress.rs checked only
+\* appends, votes and pre-votes, so a lost leader's snapshot chunk taught it
+\* the recovery term (recovery::the_survivor_refuses_a_lost_voters_snapshot_
+\* without_its_term); with every vote-carrying frame checked, this one
+\* action stands for all of them.
+LearnHigherTerm(l, f) ==
+    /\ alive[l] /\ groupState[l] = "Open" /\ role[l] \in {"Leader", "Candidate"}
+    /\ alive[f] /\ f # l /\ groupState[f] = "Open"
+    /\ registered[f] /\ ownership[f].current # Nil
+    /\ vote[f].term > vote[l].term
+    /\ ~ExcludesSender(f, l, vote[l].term)
+    /\ vote' = [vote EXCEPT ![l] = [term |-> vote[f].term, votedFor |-> Nil, committed |-> FALSE]]
+    /\ role' = [role EXCEPT ![l] = "Follower"]
+    /\ lease' = [lease EXCEPT ![l] = Nil]
+    /\ activeStage' = [activeStage EXCEPT ![l] = Nil]
+    /\ votesGranted' = [votesGranted EXCEPT ![l] = {}]
+    /\ UNCHANGED <<alive, crashCount, deadView, registered, log, snapIdx, ownership,
+                   groupState, closedCfg, commitIdx, appliedIdx, excluded,
+                   heardLeader, staleLearners, recovered, recoveryAcked,
+                   lostVoters, returnedLost, survivorId, appendCount, leadersPerTerm,
+                   committedApps, lostSuffix, postRecApps, readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Leader advances commitIdx when a quorum of its effective membership holds entry i
 \* from its current term (Raft commit rule + joint consensus quorum).
@@ -622,6 +692,7 @@ AdvanceCommit(l) ==
                    heardLeader, votesGranted, activeStage, staleLearners,
                    recovered, lostVoters, returnedLost, survivorId, appendCount,
                    leadersPerTerm, readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Replica applies committed entries and updates Ownership::Observe high-water mark
 \* (storage/snapshot.rs:686-706)
@@ -643,6 +714,7 @@ ApplyEntries(k) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Replica takes a local snapshot of its applied state (persists applied state across restart)
 TakeSnapshot(k) ==
@@ -656,6 +728,7 @@ TakeSnapshot(k) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 -----------------------------------------------------------------------------
 (* 3. Parking, unparking, keeper liveness, and wake sweep (park.rs, liveness.rs) *)
@@ -691,6 +764,7 @@ ParkStream(l) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Holder-driven wake sweep (liveness.rs:158-245):
 \* Reopens a parked copy whose finalized config names exactly 1 dead keeper.
@@ -707,6 +781,7 @@ WakeForDead(k) ==
                    staleLearners, recovered, recoveryAcked, lostVoters, returnedLost,
                    survivorId, appendCount, leadersPerTerm, committedApps, lostSuffix,
                    postRecApps, readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Client request arrives at a parked replica and reopens it (keeper.rs:933)
 ClientUnpark(k) ==
@@ -721,6 +796,7 @@ ClientUnpark(k) ==
                    staleLearners, recovered, recoveryAcked, lostVoters, returnedLost,
                    survivorId, appendCount, leadersPerTerm, committedApps, lostSuffix,
                    postRecApps, readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Liveness ping table updates (liveness.rs:124-151)
 DetectDead(k, j) ==
@@ -733,6 +809,7 @@ DetectDead(k, j) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 DetectAlive(k, j) ==
     /\ (AllowReplace \/ AllowPark)
@@ -744,6 +821,7 @@ DetectAlive(k, j) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 -----------------------------------------------------------------------------
 (* 4. Leader-driven repair, staged joint replacement, stale learners, retirement *)
@@ -766,16 +844,25 @@ ProposeStageOwned(l, deadV, repl) ==
              IN /\ AppliedStage(l) # st
                 /\ log' = [log EXCEPT ![l] = Append(log[l], StageOwnedEntry(vote[l].term, st))]
                 /\ activeStage' = [activeStage EXCEPT ![l] = st]
+                \* replacement.rs: the catalog records the stage before StageOwned
+                /\ catalogStage' = [stage |-> st, recovery |-> FALSE]
     /\ UNCHANGED <<alive, crashCount, deadView, registered, vote, snapIdx, ownership,
                    groupState, closedCfg, role, commitIdx, appliedIdx, lease,
                    excluded, heardLeader, votesGranted, staleLearners,
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED <<reused, certified, fenced>>
 
 \* Replacement executes StageReplica on target repl and adds repl as learner (replacement.rs:85-115,
 \* replicas.rs:81-110, ownership.rs:129-148).
-\* NOTE: Exact ownership.rs check: revision = stage.source + 1 <= high => refused (stale)!
+\* ownership.rs Change::Stage: revision = stage.source + 1 <= high is refused
+\* (stale), except decisions::restages_replacement: a copy that another
+\* ordinary move from the same source and configuration staged is restaged
+\* into a new generation. The authority's committed proof names this stage at
+\* that source with no joint configuration, so the other move's joint
+\* configuration can never commit. The durable vote is the stream's, not the
+\* generation's (storage/wal.rs Record::Ownership), so the restage keeps it.
 StageReplicaAndAddLearner(l, repl) ==
     /\ AllowReplace
     /\ alive[l] /\ groupState[l] = "Open" /\ role[l] = "Leader"
@@ -790,8 +877,13 @@ StageReplicaAndAddLearner(l, repl) ==
           /\ LET own == ownership[repl]
                  sameStage == (own.current # Nil /\ own.current.stage = st)
                  newRev == st.source + 1
-                 \* ownership.rs:134: if revision <= self.high { return Err(stale()); }
-                 allowed == sameStage \/ newRev > own.high
+                 restage == /\ own.current # Nil
+                            /\ own.current.stage # Nil
+                            /\ ~own.current.isRecovery
+                            /\ own.current.stage.source = st.source
+                            /\ own.current.stage.old = st.old
+                            /\ newRev = own.high
+                 allowed == sameStage \/ newRev > own.high \/ restage
                  newGen == IF sameStage THEN own.gen ELSE own.gen + 1
                  newOwn == IF sameStage THEN own
                            ELSE [high |-> newRev,
@@ -816,10 +908,14 @@ StageReplicaAndAddLearner(l, repl) ==
                 /\ appliedIdx' = IF sameStage THEN appliedIdx ELSE [appliedIdx EXCEPT ![repl] = 0]
                 /\ role'       = IF sameStage THEN role ELSE [role EXCEPT ![repl] = "Follower"]
                 /\ activeStage' = [activeStage EXCEPT ![l] = st]
+                \* A new generation is a new copy: it is certified afresh.
+                /\ certified' = IF sameStage THEN certified ELSE [certified EXCEPT ![repl] = FALSE]
+                /\ fenced'    = IF sameStage THEN fenced ELSE [fenced EXCEPT ![repl] = FALSE]
     /\ UNCHANGED <<alive, crashCount, deadView, vote, closedCfg, lease, excluded, heardLeader,
                    votesGranted, staleLearners, recovered, recoveryAcked,
                    lostVoters, returnedLost, survivorId, appendCount, leadersPerTerm,
                    committedApps, lostSuffix, postRecApps, readerHistory, retiredVoted>>
+    /\ UNCHANGED <<reused, catalogStage>>
 
 \* Replacement aborts after StageReplica (e.g., deadline expires before InstallReplica/joint)
 AbortReplacement(l) ==
@@ -833,6 +929,7 @@ AbortReplacement(l) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Leader sends InstallReplica once learner repl has matched log[l], then proposes JointCfg
 \* (replacement.rs:136-167, replicas.rs:170-204)
@@ -859,6 +956,7 @@ InstallAndProposeJoint(l, repl) ==
                    votesGranted, activeStage, staleLearners, recovered, recoveryAcked,
                    lostVoters, returnedLost, survivorId, appendCount, leadersPerTerm,
                    committedApps, lostSuffix, postRecApps, readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Leader finalizes a committed joint configuration (Work::Joint / replacement.rs:167,262)
 ProposeFinalize(l) ==
@@ -877,6 +975,7 @@ ProposeFinalize(l) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Stale learner removal (repair.rs:215-229, 354-374):
 \* Leader removes a learner left by an aborted replacement (activeStage[l] = Nil).
@@ -898,6 +997,7 @@ RemoveStaleLearner(l, lrn) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Follower's heard-from-leader timer expires (>= repair_after) when no live leader
 \* of k's membership is heartbeating k.
@@ -915,6 +1015,7 @@ HeardTimeout(k) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 \* Self-retirement on certified placement proof (repair.rs:565-623, replicas.rs:206-247,
 \* ownership.rs:164-182).
@@ -923,7 +1024,9 @@ RetireRemoved(k, auth) ==
     /\ AllowRetire
     /\ alive[k] /\ groupState[k] = "Open"
     /\ ownership[k].current # Nil
-    /\ (excluded[k] # Nil \/ (role[k] # "Leader" /\ ~heardLeader[k]))
+    \* repair.rs retire_removed: excluded by a peer, silent past the repair
+    \* delay, or fenced by the catalog (keeper/certify.rs)
+    /\ (excluded[k] # Nil \/ fenced[k] \/ (role[k] # "Leader" /\ ~heardLeader[k]))
     /\ alive[auth] /\ auth # k /\ groupState[auth] = "Open" /\ role[auth] = "Leader"
     \* If excluded[k] is itself a live leader, it is asked first (repair.rs:592)
     /\ (excluded[k] # Nil /\ alive[excluded[k]] /\ groupState[excluded[k]] = "Open"
@@ -934,7 +1037,9 @@ RetireRemoved(k, auth) ==
           /\ IF k \in AllVoters(proof) THEN
                 \* Authority still names k: clear excluded flag (repair.rs:605-607)
                 /\ excluded' = [excluded EXCEPT ![k] = Nil]
-                /\ UNCHANGED <<ownership, log, snapIdx, groupState, role, commitIdx, appliedIdx, lease>>
+                /\ fenced' = [fenced EXCEPT ![k] = FALSE]
+                /\ UNCHANGED <<ownership, log, snapIdx, groupState, role, commitIdx, appliedIdx, lease,
+                               certified>>
              ELSE
                 \* ownership.rs:171-182 Change::Detach check:
                 /\ proof.rev >= ownership[k].high
@@ -954,10 +1059,13 @@ RetireRemoved(k, auth) ==
                 /\ appliedIdx' = [appliedIdx EXCEPT ![k] = 0]
                 /\ lease' = [lease EXCEPT ![k] = Nil]
                 /\ excluded' = [excluded EXCEPT ![k] = Nil]
+                /\ certified' = [certified EXCEPT ![k] = FALSE]
+                /\ fenced' = [fenced EXCEPT ![k] = FALSE]
     /\ UNCHANGED <<alive, crashCount, deadView, registered, vote, closedCfg, heardLeader,
                    votesGranted, activeStage, staleLearners, recovered, recoveryAcked,
                    lostVoters, returnedLost, survivorId, appendCount, leadersPerTerm,
                    committedApps, lostSuffix, postRecApps, readerHistory, retiredVoted>>
+    /\ UNCHANGED <<reused, catalogStage>>
 
 -----------------------------------------------------------------------------
 (* 5. Stop, restart, and wipe-and-reinitialize under same ID *)
@@ -981,10 +1089,14 @@ StopKeeper(k) ==
     /\ votesGranted' = [votesGranted EXCEPT ![k] = {}]
     /\ activeStage' = [activeStage EXCEPT ![k] = Nil]
     /\ staleLearners' = [staleLearners EXCEPT ![k] = {}]
+    \* Certification is in memory: a restarted copy is certified afresh.
+    /\ certified' = [certified EXCEPT ![k] = FALSE]
+    /\ fenced' = [fenced EXCEPT ![k] = FALSE]
     /\ UNCHANGED <<registered, vote, log, snapIdx, ownership, closedCfg,
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED <<reused, catalogStage>>
 
 \* Restart keeper k: opens registered non-detached stream with vote demotion
 \* (keeper.rs:437-445, storage/mod.rs:125-145).
@@ -1009,11 +1121,15 @@ RestartKeeper(k) ==
                    staleLearners, recovered, recoveryAcked, lostVoters, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED fenceVars
 
-\* Calibration action for confirmed amnesia bug (commit 98f32fe):
 \* Keeper k loses both its data and registry volumes and is re-initialized under
-\* its old ID k. It rejoins with empty disk state (vote=0, log=<<>>, unregistered),
-\* and auto-registers on its first peer RPC if k \in GenesisVoters.
+\* its old ID k. It rejoins with empty disk state (vote=0, log=<<>>, unregistered).
+\* Before 6d75fec it registered an empty voter on its first peer RPC because
+\* k \in GenesisVoters (the amnesia bug, CE-1). Since 6d75fec its peers report
+\* that they first saw it under another media incarnation, it marks itself
+\* reused, and decisions::registers refuses every registration from peer
+\* traffic: it takes replicas only through staging (keeper/incarnation.rs).
 WipeAndReinit(k) ==
     /\ AllowWipe
     /\ ~alive[k]
@@ -1025,11 +1141,15 @@ WipeAndReinit(k) ==
     /\ ownership' = [ownership EXCEPT ![k] = EmptyOwnership]
     /\ groupState' = [groupState EXCEPT ![k] = "Closed"]
     /\ closedCfg' = [closedCfg EXCEPT ![k] = {}]
+    /\ reused' = [reused EXCEPT ![k] = TRUE]
+    /\ certified' = [certified EXCEPT ![k] = FALSE]
+    /\ fenced' = [fenced EXCEPT ![k] = FALSE]
     /\ UNCHANGED <<deadView, crashCount, role, commitIdx, appliedIdx, lease, excluded,
                    heardLeader, votesGranted, activeStage, staleLearners,
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED catalogStage
 
 -----------------------------------------------------------------------------
 (* 6. Offline operator recovery (recovery.rs, decisions.rs, replicas.rs) *)
@@ -1088,6 +1208,11 @@ OperatorRecover(surv, r1, r2) ==
                       /\ commitIdx'  = [commitIdx EXCEPT ![r1] = 0, ![r2] = 0]
                       /\ appliedIdx' = [appliedIdx EXCEPT ![r1] = 0, ![r2] = 0]
                       /\ recovered'  = TRUE
+                      \* recovery.rs: the catalog must record the recovery stage
+                      \* before the survivor's durable round, or the command refuses
+                      /\ catalogStage' = [stage |-> st, recovery |-> TRUE]
+                      /\ certified'  = [certified EXCEPT ![r1] = FALSE, ![r2] = FALSE]
+                      /\ fenced'     = [fenced EXCEPT ![r1] = FALSE, ![r2] = FALSE]
                       /\ lostVoters' = others
                       /\ survivorId' = surv
                       \* Explicitly separate acknowledged lost suffix from survivor's preserved history
@@ -1099,17 +1224,43 @@ OperatorRecover(surv, r1, r2) ==
                    votesGranted, activeStage, staleLearners, recoveryAcked,
                    returnedLost, appendCount, leadersPerTerm, postRecApps,
                    readerHistory, retiredVoted>>
+    /\ UNCHANGED reused
+
+-----------------------------------------------------------------------------
+(* 6b. Placement certification against the catalog (keeper/certify.rs) *)
+
+\* An uncertified open copy asks the catalog for the stream's latest staged
+\* move before it campaigns or serves reads. A copy the move fences is marked
+\* for retirement; any other copy is certified until it closes.
+CatalogCheck(k) ==
+    /\ alive[k] /\ groupState[k] = "Open"
+    /\ ownership[k].current # Nil /\ ownership[k].current.installed
+    /\ ~certified[k] /\ ~fenced[k]
+    /\ IF FencedByCatalog(k)
+       THEN /\ fenced' = [fenced EXCEPT ![k] = TRUE]
+            /\ UNCHANGED certified
+       ELSE /\ certified' = [certified EXCEPT ![k] = TRUE]
+            /\ UNCHANGED fenced
+    /\ UNCHANGED <<alive, crashCount, deadView, registered, vote, log, snapIdx, ownership,
+                   groupState, closedCfg, role, commitIdx, appliedIdx, lease,
+                   excluded, heardLeader, votesGranted, activeStage, staleLearners,
+                   recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
+                   appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
+                   readerHistory, retiredVoted>>
+    /\ UNCHANGED <<reused, catalogStage>>
 
 -----------------------------------------------------------------------------
 (* 7. Client ReadAt observation (keeper.rs:955-983, client/reading.rs) *)
 
 \* A reader calls ReadAt on any live keeper k with an open group where
-\* serves_applied_pages(k) holds (k is a voter in its applied membership).
-\* Note: keeper.rs:974 does NOT require a quorum or leader barrier for ReadAt!
+\* serves_applied_pages(k) holds: k is a voter in its applied membership and
+\* its copy is certified (decisions::serves_reads, the CE-3 fix). ReadAt still
+\* needs no quorum or leader barrier.
 ClientRead(k) ==
     /\ AllowClientReads /\ recovered
     /\ alive[k] /\ groupState[k] = "Open"
     /\ ownership[k].current # Nil /\ ownership[k].current.installed
+    /\ certified[k]
     /\ LET m == AppliedMembership(k)
            appsT == AppEntriesWithTermIn(log[k], appliedIdx[k])
            relevant == appsT \cap (lostSuffix \cup postRecApps)
@@ -1122,6 +1273,7 @@ ClientRead(k) ==
                    recovered, recoveryAcked, lostVoters, returnedLost, survivorId,
                    appendCount, leadersPerTerm, committedApps, lostSuffix, postRecApps,
                    retiredVoted>>
+    /\ UNCHANGED fenceVars
 
 -----------------------------------------------------------------------------
 (* Next-state relation *)
@@ -1137,6 +1289,7 @@ Next ==
     \/ \E l \in Keepers : AcknowledgeRecovery(l)
     \/ \E l, f \in Keepers : ReplicateOrHeartbeat(l, f)
     \/ \E l \in Keepers : AdvanceCommit(l)
+    \/ \E l, f \in Keepers : LearnHigherTerm(l, f)
     \/ \E k \in Keepers : TakeSnapshot(k)
     \/ \E l \in Keepers : ParkStream(l)
     \/ \E k \in Keepers : WakeForDead(k)
@@ -1156,6 +1309,7 @@ Next ==
     \/ \E k \in Keepers : WipeAndReinit(k)
     \/ \E s, r1, r2 \in Keepers : OperatorRecover(s, r1, r2)
     \/ \E k \in Keepers : ClientRead(k)
+    \/ \E k \in Keepers : CatalogCheck(k)
 
 Spec == Init /\ [][Next]_vars
 
@@ -1198,12 +1352,20 @@ LogMatching ==
             log[a][i].term = log[b][i].term =>
                 \A j \in 1..i : log[a][j] = log[b][j]
 
+\* 6. A lost voter's copy never learns a term of the recovered history
+\*    (Lean RecoveryFence.lost_replicas_stay_below_the_recovery_term).
+LostStayBelowRecoveryTerm ==
+    recovered =>
+        \A k \in lostVoters :
+            ownership[k].current # Nil => vote[k].term < RecoveryGap
+
 \* Combined core safety invariant
 Safety ==
     /\ ElectionSafety
     /\ CommittedEntriesPreserved
     /\ RetiredNeverVotes
     /\ NoMixedHistory
+    /\ LostStayBelowRecoveryTerm
 
 -----------------------------------------------------------------------------
 (* Liveness Properties (checked under fairness in focused liveness configs) *)
@@ -1253,6 +1415,7 @@ ProgressStep ==
     \/ \E k \in Keepers : HeardTimeout(k)
     \/ \E k, a \in Keepers : RetireRemoved(k, a)
     \/ \E c, v \in Keepers : PreVoteExcluded(c, v)
+    \/ \E k \in Keepers : CatalogCheck(k)
 
 RepairFairness == WF_vars(ProgressStep)
 
@@ -1304,6 +1467,10 @@ InitParkedDead ==
         /\ postRecApps   = {}
         /\ readerHistory = {}
         /\ retiredVoted  = FALSE
+        /\ reused        = [k \in Keepers |-> FALSE]
+        /\ certified     = [k \in Keepers |-> k \in {k1, k2}]
+        /\ fenced        = [k \in Keepers |-> FALSE]
+        /\ catalogStage  = Nil
 
 \* Next-state relation for parked-stream repair liveness: excludes ClientUnpark
 \* and repeated re-parking so we verify that the automatic wake sweep + repair
@@ -1322,6 +1489,7 @@ ParkedRepairNext ==
     \/ \E l, r \in Keepers : StageReplicaAndAddLearner(l, r)
     \/ \E l, r \in Keepers : InstallAndProposeJoint(l, r)
     \/ \E l \in Keepers : ProposeFinalize(l)
+    \/ \E k \in Keepers : CatalogCheck(k)
 
 FairParkedDeadSpec ==
     InitParkedDead /\ [][ParkedRepairNext]_vars
@@ -1376,11 +1544,81 @@ InitAbortedReplace ==
        /\ postRecApps   = {}
        /\ readerHistory = {}
        /\ retiredVoted  = FALSE
+       /\ reused        = [k \in Keepers |-> FALSE]
+       /\ certified     = [k \in Keepers |-> k \in {k2, k3}]
+       /\ fenced        = [k \in Keepers |-> FALSE]
+       /\ catalogStage  = [stage |-> abortedStage, recovery |-> FALSE]
 
 FairAbortedReplaceSpec ==
     InitAbortedReplace /\ [][ParkedRepairNext]_vars
     /\ WF_vars(ParkedRepairNext)
     /\ WF_vars(\E l \in Keepers : AdvanceCommit(l))
+
+\* Reachable state for CE-2 safety: k2 led {k1,k2,k3} in term 1, committed
+\* StageOwned(S1) replacing k3 with k4, staged and installed k4, and appended
+\* the joint configuration of S1 on itself and k4 only. Then k2 stopped, so
+\* the joint entry is uncommitted while k4 has voted under it in term 1. A
+\* later leader of {k1,k3} may move k2 off onto k4 from the same source,
+\* which restages k4's installed copy of S1.
+InitAbortedJoint ==
+    LET k1 == CHOOSE x \in GenesisVoters : TRUE
+        k2 == CHOOSE x \in GenesisVoters \ {k1} : TRUE
+        k3 == CHOOSE x \in GenesisVoters \ {k1, k2} : TRUE
+        k4 == CHOOSE x \in Keepers \ GenesisVoters : TRUE
+        s1 == [source |-> 0, old |-> GenesisVoters, target |-> {k1, k2, k4}]
+        base == <<InitCfgEntry, BlankEntry(1), StageOwnedEntry(1, s1)>>
+        learn == Append(base, CfgEntry(1, "InitCfg", GenesisVoters, {}, {k4}, 0))
+        joint == Append(learn, CfgEntry(1, "JointCfg", GenesisVoters, s1.target, {}, 0))
+        k4Own == [high |-> 1, gen |-> 1,
+                  current |-> [gen |-> 1, rev |-> 1, stage |-> s1,
+                               installed |-> TRUE, isRecovery |-> FALSE],
+                  retiredGens |-> {}]
+    IN /\ alive         = [k \in Keepers |-> (k # k2)]
+       /\ deadView      = [k \in Keepers |-> {}]
+       /\ crashCount    = 1
+       /\ registered    = [k \in Keepers |-> k \in GenesisVoters \cup {k4}]
+       /\ vote          = [k \in Keepers |-> IF k \in GenesisVoters \cup {k4}
+                                             THEN [term |-> 1, votedFor |-> k2, committed |-> TRUE]
+                                             ELSE InitVote]
+       /\ log           = [k \in Keepers |->
+                             IF k \in {k2, k4} THEN joint
+                             ELSE IF k = k1 THEN learn
+                             ELSE IF k = k3 THEN base
+                             ELSE <<>>]
+       /\ snapIdx       = [k \in Keepers |-> 0]
+       /\ ownership     = [k \in Keepers |->
+                             IF k \in GenesisVoters THEN DefaultOwnership
+                             ELSE IF k = k4 THEN k4Own
+                             ELSE EmptyOwnership]
+       /\ groupState    = [k \in Keepers |-> IF k \in {k1, k3, k4} THEN "Open" ELSE "Closed"]
+       /\ closedCfg     = [k \in Keepers |-> IF k \in GenesisVoters THEN GenesisVoters ELSE {}]
+       /\ role          = [k \in Keepers |-> "Follower"]
+       /\ commitIdx     = [k \in Keepers |-> IF k \in {k1, k4} THEN 4 ELSE IF k = k3 THEN 3 ELSE 0]
+       /\ appliedIdx    = [k \in Keepers |-> IF k \in {k1, k4} THEN 4 ELSE IF k = k3 THEN 3 ELSE 0]
+       /\ lease         = [k \in Keepers |-> Nil]
+       /\ excluded      = [k \in Keepers |-> Nil]
+       /\ heardLeader   = [k \in Keepers |-> TRUE]
+       /\ votesGranted  = [k \in Keepers |-> {}]
+       /\ activeStage   = [k \in Keepers |-> Nil]
+       /\ staleLearners = [k \in Keepers |-> {}]
+       /\ recovered     = FALSE
+       /\ recoveryAcked = FALSE
+       /\ lostVoters    = {}
+       /\ returnedLost  = {}
+       /\ survivorId    = Nil
+       /\ appendCount   = 0
+       /\ leadersPerTerm = [t \in 0..(MaxTerm + 1) |-> IF t = 1 THEN {k2} ELSE {}]
+       /\ committedApps = {}
+       /\ lostSuffix    = {}
+       /\ postRecApps   = {}
+       /\ readerHistory = {}
+       /\ retiredVoted  = FALSE
+       /\ reused        = [k \in Keepers |-> FALSE]
+       /\ certified     = [k \in Keepers |-> k \in {k1, k3, k4}]
+       /\ fenced        = [k \in Keepers |-> FALSE]
+       /\ catalogStage  = [stage |-> s1, recovery |-> FALSE]
+
+AbortedJointSpec == InitAbortedJoint /\ [][Next]_vars
 
 \* Reachable pre-recovery state: {k1,k2,k3} elected k2 in term 1 and committed
 \* App(lsn=1, "v1") on {k2,k3}; survivor k1 missed that entry (holds only InitCfg).
@@ -1435,6 +1673,10 @@ InitPreRecovery ==
        /\ postRecApps   = {}
        /\ readerHistory = {}
        /\ retiredVoted  = FALSE
+       /\ reused        = [k \in Keepers |-> FALSE]
+       /\ certified     = [k \in Keepers |-> FALSE]
+       /\ fenced        = [k \in Keepers |-> FALSE]
+       /\ catalogStage  = Nil
 
 PreRecoveryNext ==
     \/ (\E s, r1, r2 \in Keepers : OperatorRecoverFrom(s, r1, r2))
@@ -1515,6 +1757,10 @@ InitPostRecovery ==
        /\ postRecApps   = {}
        /\ readerHistory = {}
        /\ retiredVoted  = FALSE
+       /\ reused        = [k \in Keepers |-> FALSE]
+       /\ certified     = [k \in Keepers |-> k \in {k4, k5}]
+       /\ fenced        = [k \in Keepers |-> FALSE]
+       /\ catalogStage  = [stage |-> st, recovery |-> TRUE]
 
 PostRecRetireNext ==
     \/ \E c, v \in Keepers : PreVoteExcluded(c, v)
@@ -1525,6 +1771,7 @@ PostRecRetireNext ==
     \/ \E l \in Keepers : AdvanceCommit(l)
     \/ \E k \in Keepers : HeardTimeout(k)
     \/ \E k, a \in Keepers : RetireRemoved(k, a)
+    \/ \E k \in Keepers : CatalogCheck(k)
 
 FairPostRecoverySpec ==
     InitPostRecovery /\ [][PostRecRetireNext]_vars /\ WF_vars(PostRecRetireNext)
