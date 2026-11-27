@@ -698,6 +698,7 @@ impl Disk {
 
     /// Whether the finalized cluster feature level allows writing a format or
     /// command requiring `required`.
+    #[cfg(test)]
     pub fn write_version_allows(&self, required: u32) -> bool {
         decisions::write_version_allows(self.cluster_version(), required)
     }

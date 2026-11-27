@@ -600,6 +600,7 @@ impl Credentials {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(super) fn server_protocol(
         &self,
         keeper: KeeperId,

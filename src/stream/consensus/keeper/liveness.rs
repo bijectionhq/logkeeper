@@ -194,6 +194,7 @@ impl Engine {
     }
 
     /// Feature bits advertised by `keeper`, or 0 when unknown or N-1.
+    #[cfg(test)]
     pub(super) fn peer_features(&self, keeper: Uuid) -> u64 {
         if keeper == self.id {
             return features::SUPPORTED;
@@ -206,6 +207,7 @@ impl Engine {
     }
 
     /// Whether `keeper` advertises every feature bit in `required`.
+    #[cfg(test)]
     pub(super) fn peer_supports(&self, keeper: Uuid, required: u64) -> bool {
         decisions::peer_supports(self.peer_features(keeper), required)
     }

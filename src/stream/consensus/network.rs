@@ -1425,12 +1425,24 @@ impl Rpc {
             None
         };
         let cached = self.inner.idle.lock().get_mut(&target).and_then(Vec::pop);
-        let reused = cached.is_some();
-        let (mut channel, mut version) = match cached {
-            Some(entry) => entry,
-            None => self.connect(target, address).await?,
+        let (mut channel, mut version, mut reused) = match cached {
+            Some((channel, version)) => (channel, version, true),
+            None => {
+                let (channel, version) = self.connect(target, address).await?;
+                (channel, version, false)
+            }
         };
-        let encoded = request.encode_for(version)?;
+        let encoded = match request.encode_for(version) {
+            Ok(encoded) => encoded,
+            Err(error) if reused && error.kind() == io::ErrorKind::Unsupported => {
+                // The peer may have been upgraded since this idle connection
+                // was negotiated at N-1; probe once on a fresh connection.
+                (channel, version) = self.connect(target, address).await?;
+                reused = false;
+                request.encode_for(version)?
+            }
+            Err(error) => return Err(error),
+        };
         let mut result = Self::round_trip_raw(&mut channel, &encoded).await;
         // The receiver may have closed an idle pooled connection. Peer
         // messages are idempotent, so they retry once on a fresh one.
