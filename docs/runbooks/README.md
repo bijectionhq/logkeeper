@@ -9,7 +9,7 @@ Read [the deployment guide](../deployment.md) first.
 | [Rolling upgrade](rolling-upgrade.md) | A new keeper release |
 | [Add, drain or remove a keeper](add-drain-remove-keeper.md) | Changing the keeper set |
 | [Replace a failed disk](replace-disk.md) | A keeper's media is lost or replaced |
-| [Lose two of three voters](lose-two-voters.md) | A stream has one surviving voter |
+| [Lose two of three voters](lose-two-voters.md) | A stream has one surviving voter, or a five-voter stream has one or two |
 | [Corruption](corruption.md) | Verify failures, quarantined streams, a disabled keeper |
 | [Certificate rotation](certificate-rotation.md) | Keeper, client or CA certificates |
 | [Capacity expansion](capacity-expansion.md) | More disk, more streams, more keepers |

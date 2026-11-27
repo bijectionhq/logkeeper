@@ -86,13 +86,14 @@ scheduled). Such a mistake is still caught at connect time, because a route
 that reaches the wrong keeper is refused. Give each keeper one spelling
 everywhere.
 
-A stream has three voters in three distinct failure domains. It commits with
-two. Each stream's leader:
+A stream has three voters in three distinct failure domains, or five
+voters (see [when to use five voters](#when-to-use-five-voters)). It commits
+with a quorum: two of three, three of five. Each stream's leader:
 
 - places, repairs and parks the stream;
 - replaces a voter that has been silent for `repair_after_secs` (600 s by
-  default) with a live keeper in a free domain, but only while two voters are
-  live;
+  default) with a live keeper in a free domain, one voter at a time, but only
+  while a quorum of voters is live;
 - parks the stream on every voter once it has been idle for `park_after_secs`
   (600 s by default).
 
@@ -209,8 +210,8 @@ The ceilings that bound retained bytes:
 - **Unpurged log suffix:** at most 512 entries per stream.
 
 A stream at its ceiling holds at most `min(quota_bytes, 262,144 x record
-size)`. With 3 voters per stream and N keepers, a keeper hosts on average
-`3 x streams / N` streams.
+size)`. With R voters per stream (3 or 5) and N keepers, a keeper hosts on
+average `R x streams / N` streams.
 
 RTDB's journals stay far below the ceiling in steady state. RTDB checkpoints to
 object storage and trims each stream when its retained suffix reaches 131,072
@@ -285,10 +286,88 @@ What these figures mean for sizing:
 
 A starting point for a production keeper serving up to 128 active RTDB
 databases is 4 cores, 8 GiB of RAM, and a dedicated NVMe of
-`streams x 3 / N x quota_bytes x 1.4` plus 1 GiB. The Kubernetes manifest
+`streams x R / N x quota_bytes x 1.4` plus 1 GiB, with R = 3, or 5 for
+five-voter streams. The Kubernetes manifest
 requests 2 cores and 4 GiB and caps memory at 8 GiB. Measure on your own
 hardware before you commit to these numbers. The example runs unchanged on
 Linux.
+
+### When to use five voters
+
+A stream's replication factor is fixed when it is created: 3 by default, or
+5 with `replication_factor: 5` in the consumer's `JournalConfig` (or `admin
+create --replication-factor 5`).
+
+| | Three voters | Five voters |
+| --- | --- | --- |
+| Commits with | 2 | 3 |
+| Keeps writing after losing | any 1 voter | any 2 voters |
+| Needs operator recovery after losing | 2 | 3 |
+| Disk, memory and write CPU, per stream, cluster-wide | 3 copies | 5 copies (5/3 as much) |
+| Commit latency | the faster of 2 followers | the 2nd-fastest of 4 followers |
+| Domains | 3 distinct | 5 distinct when available, else at least 3 with at most 2 in any one |
+| Keepers for automatic repair | 4+ (spares in free domains) | 6+ |
+| Keepers for `recover-stream` | survivor + 2 spares outside the stream | survivors + 3 or 4 spares outside the stream |
+
+Use five voters for the streams whose loss would be expensive and that must
+stay writable through two concurrent failures: a disk dying while another
+keeper is down for maintenance, a zone outage during a rolling upgrade, or a
+second failure before repair finishes (`repair_after_secs`, 600 s by
+default, plus catch-up). Typical candidates are the replicated catalog's
+consumers, a cell's control journal and small, critical RTDB databases.
+Keep three voters for bulk streams, where the extra two copies cost disk,
+memory and CPU on every write for little gain.
+
+Placement of five voters:
+
+- With five or more failure domains, every voter has its own domain.
+- With three or four domains, voters share domains so that none holds more
+  than two: 2+2+1 over three domains, 2+1+1+1 over four. Losing any one
+  domain then leaves at least three voters, a quorum. Losing two domains of
+  three can stop the stream, as with three voters.
+- Two domains cannot hold five voters without one holding three, so the
+  catalog refuses the genesis. Three voters always need three domains.
+- Repair picks a replacement in the emptiest domain first.
+
+Before creating a five-voter stream:
+
+1. Upgrade every keeper to a build with the `REPLICATION_FACTOR` feature.
+2. Finalize: `lk admin finalize-version --config operator.json`. The catalog
+   refuses five-voter geneses with `Unsupported` until the cluster has
+   finalized level 7 (`CLUSTER_VERSION_REPLICATION`), because older keepers
+   cannot read a five-voter roster. After finalizing, the cluster can no
+   longer go back to the previous binary.
+3. Size for `R = 5` in the formulas above and run at least six keepers in
+   three or more zones, so repair has somewhere to go.
+
+The measured cost of five voters against three is in the table below
+(`LK_MEASURE_VOTERS=5`, see [measurements](#five-voter-measurements)).
+
+### Five-voter measurements
+
+Measured with `measure_consensus_append_throughput` (`cargo test --release
+--features stream --lib measure_consensus -- --ignored --nocapture`, with
+`LK_MEASURE_SECONDS=10` and `LK_MEASURE_VOTERS=3` or `5`) on a MacBook Pro M1
+at Logkeeper `05940d3`: seven keepers in one process on one SSD, plain
+`fsync`, no network latency, one record per append, each stream appending
+serially. Single runs; repeat on your hardware.
+
+| Workload | 3 voters: records/s, p50, p99 | 5 voters: records/s, p50, p99 | 5 vs 3 throughput |
+| --- | --- | --- | --- |
+| 1 stream, 256 B | 1,945, 0.36 ms, 5.0 ms | 1,511, 0.51 ms, 3.2 ms | 0.78x |
+| 8 streams, 256 B | 3,123, 1.1 ms, 29 ms | 2,001, 3.1 ms, 14 ms | 0.64x |
+| 32 streams, 256 B | 3,587, 5.0 ms, 39 ms | 2,081, 14 ms, 35 ms | 0.58x |
+| 32 streams, 4 KiB | 2,223, 10 ms, 62 ms | 1,628, 18 ms, 48 ms | 0.73x |
+| 8 streams, 64 KiB | 831, 4.5 ms, 71 ms | 1,165, 6.4 ms, 18 ms | 1.40x (noise) |
+
+On one host every voter shares the CPU and the disk, so five voters cost
+about two thirds more fsyncs and replication work per record and throughput
+drops to roughly 0.6 to 0.8 of three voters when the host is the
+bottleneck. The 64 KiB row ran faster with five voters, which is run-to-run
+variance rather than a property of five voters. Across zones, the commit waits
+for the second-fastest of four followers instead of the faster of two, so
+expect median latency to track the second-nearest zone. Budget five voters
+at 5/3 the disk, memory and write CPU of three, cluster-wide.
 
 ## Identity and credentials
 
@@ -685,14 +764,15 @@ What exists:
   store alone, into a new stream ID, and reports the records it kept.
 
 - **Replication** is the durability mechanism. Every acknowledged record is
-  on two of three voters in distinct domains, and leader-driven repair restores
-  the third.
+  on a quorum of the voters in distinct domains (two of three, three of
+  five), and leader-driven repair restores the others.
 - **`keeper repair-snapshot --config FILE --stream UUID --snapshot FILE`**
   restores the exact snapshot bytes that the local WAL's digest names, onto a
   stopped keeper whose WAL is intact. It is for a damaged snapshot file, not
   for disaster recovery.
-- **`keeper recover-stream`** rebuilds a legacy mutable stream from its last surviving voter
-  after two are lost, accepting possible loss of acknowledged records. With
+- **`keeper recover-stream`** rebuilds a legacy mutable stream from its surviving voters
+  after a quorum is lost (two of three, three or four of five), accepting
+  possible loss of acknowledged records. With
   offload it also takes the store's committed run when that is longer, and
   reports the exact loss point.
 - **RTDB checkpoints** in object storage hold each database's state up to its

@@ -1,4 +1,8 @@
-# Lose two of three voters
+# Lose two of three voters (or three of five)
+
+This runbook is written for three-voter streams. A five-voter stream
+follows the same steps once it loses three or more voters; the differences
+are in [five-voter streams](#five-voter-streams) at the end.
 
 This procedure applies to legacy mutable streams.
 For an immutable stream, restore its original quorum or install a verified application cut under a fresh stream ID.
@@ -239,3 +243,30 @@ fresh keeper identities, credentials and enrollment, and isolated endpoints.
 Validate the restored application state and cut clients over only after the
 old cluster is fenced from clients and writers. Record the unavailable
 suffix against the latest application checkpoint or export.
+
+## Five-voter streams
+
+A five-voter stream keeps writing after losing two voters, so nothing here
+applies until it loses a third. Repair replaces lost voters one at a time
+while three are live. After three or four are lost:
+
+- **Survivors.** With one survivor, run the steps above on it. With two,
+  run `recover-stream` on the **more advanced** survivor: the one whose last
+  log entry is later, or the lower keeper ID on a tie. Stop only that one;
+  keep the other running so the command can ask it for its last entry. On
+  the less advanced survivor the command refuses with `refused: surviving
+  voter <x> holds the more advanced log ...; stop it and recover from it
+  instead`: restart it, stop `<x>` and run there. The other survivor keeps
+  its seat in the recovered configuration and catches up; an uncommitted
+  suffix of its own is replaced.
+- **`--lost`** names every voter that answers with no healthy replica:
+  three with two survivors, four with one, each retired with
+  `keeper fence-recovery` and passed with its own `--fence-proof`.
+- **Replacements.** One per lost voter, outside the lost configuration,
+  spread with the survivors (free domains first, at most two voters per
+  domain). Without `--with` the command chooses them; it refuses when too
+  few live, accepting keepers exist, so keep at least three or four spare
+  keepers in the cluster beyond each stream's five voters.
+- **Refusal** `refused: N other voter(s) ... answer with a healthy replica`
+  appears when two other voters are healthy: with the survivor they form a
+  quorum of five, so restart this keeper instead.
