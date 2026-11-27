@@ -4,7 +4,8 @@
 
 use bytes::Bytes;
 use journal_contract::{
-    Epoch, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId,
+    CheckpointAnchor, Epoch, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence,
+    WriterSessionId,
 };
 use openraft::raft::{AppendEntriesRequest, TransferLeaderRequest, VoteRequest};
 use serde::Serialize;
@@ -311,6 +312,15 @@ fn request(tag: usize) -> Option<Request> {
         },
         42 => Request::LocalTip(STREAM),
         43 => Request::NamedStreams(uuid::Uuid::from_u128(1)),
+        44 => Request::TrimCheckpoint {
+            stream: STREAM,
+            fence: fence(),
+            anchor: CheckpointAnchor {
+                announced_at: Lsn(2),
+                covered_through: Lsn(1),
+                record_sha256: [1; 32],
+            },
+        },
         _ => return None,
     })
 }

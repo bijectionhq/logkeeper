@@ -3,6 +3,7 @@ mod admission;
 mod bundle;
 mod catalog_stream;
 mod certify;
+mod checkpoint_trim;
 mod compaction;
 mod drain;
 mod incarnation;
@@ -1686,7 +1687,8 @@ impl Engine {
                     | Request::AppendOriginal { .. }
                     | Request::Written { .. }
                     | Request::AcknowledgeRecoveryWithMarker { .. }
-                    | Request::Trim { .. } => writer,
+                    | Request::Trim { .. }
+                    | Request::TrimCheckpoint { .. } => writer,
                     // An administrator may move leadership; it writes nothing.
                     Request::PreferLeader { .. } => writer || admin,
                     // An administrator may acknowledge a recovery, but only a
@@ -2215,6 +2217,9 @@ impl Engine {
                             owner: owner.unwrap(),
                             through,
                         })
+                        .await),
+                    Request::TrimCheckpoint { fence, anchor, .. } => Ok(group
+                        .trim_checkpoint(fence, owner.unwrap(), anchor, self.offload.as_deref())
                         .await),
                     Request::Delete(_) => Ok(group.write(Command::Delete).await),
                     Request::AcknowledgeRecovery(_) => {

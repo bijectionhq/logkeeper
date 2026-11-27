@@ -7,8 +7,8 @@ use std::{collections::BTreeSet, io, path::Path, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use journal_contract::{
-    BoxFuture, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, Result, SealReceipt,
-    StreamId, WriterFence, WriterSessionId,
+    BoxFuture, CheckpointAnchor, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, Result,
+    SealReceipt, StreamId, WriterFence, WriterSessionId,
 };
 use parking_lot::RwLock;
 
@@ -741,6 +741,17 @@ impl Journal for ConsensusJournal {
                 .trim(fence.stream, Self::session_fence(fence), through)
                 .await
         })
+    }
+
+    fn trim_checkpoint(
+        &self,
+        fence: WriterFence,
+        anchor: CheckpointAnchor,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(
+            self.client
+                .trim_checkpoint(fence.stream, Self::session_fence(fence), anchor),
+        )
     }
 
     fn read_page(

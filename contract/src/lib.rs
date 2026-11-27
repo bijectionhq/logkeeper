@@ -78,6 +78,15 @@ pub struct WriterFence {
     pub writer_session_id: WriterSessionId,
 }
 
+/// The exact committed record that allows an application to discard a prefix.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointAnchor {
+    pub announced_at: Lsn,
+    pub covered_through: Lsn,
+    pub record_sha256: [u8; 32],
+}
+
 /// The fence and the committed head chosen at the instant of sealing.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,8 +217,19 @@ pub trait Journal: Send + Sync {
         Box::pin(async { Err(JournalError::Unsupported) })
     }
 
-    /// Trims a stream under its current writer session.
+    /// Compatibility trim under the current writer session.
     fn trim_session(&self, _fence: WriterFence, _through: Lsn) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Trims an immutable stream under its current writer session after
+    /// verifying the exact committed announcement. The application verifies
+    /// that this announcement can recover every record it covers.
+    fn trim_checkpoint(
+        &self,
+        _fence: WriterFence,
+        _anchor: CheckpointAnchor,
+    ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { Err(JournalError::Unsupported) })
     }
 

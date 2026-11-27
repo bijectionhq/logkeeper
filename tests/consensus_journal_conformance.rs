@@ -13,6 +13,88 @@ const PRINCIPALS: [&str; 3] = [
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immutable_trim_checks_the_exact_checkpoint_and_current_writer() {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use journal_contract::{CheckpointAnchor, Epoch, JournalError, Lsn, StreamId, WriterSessionId};
+    use sha2::{Digest, Sha256};
+
+    let mut cluster = LocalCluster::start_replicated_catalog(&PRINCIPALS)
+        .await
+        .unwrap();
+    let config = cluster.journal_config(1 << 20, 4096);
+    let writer = cluster.journal(PRINCIPALS[0], &config).unwrap();
+    let stream = StreamId(68);
+    writer.create_immutable(stream).await.unwrap();
+    let original = writer
+        .seal_session(stream, Epoch(0), WriterSessionId(1))
+        .await
+        .unwrap();
+    let checkpoint = Bytes::from_static(b"checkpoint record");
+    writer
+        .append_session_batch(
+            original.fence,
+            Lsn(1),
+            vec![Bytes::from_static(b"covered"), checkpoint.clone()],
+        )
+        .await
+        .unwrap();
+
+    let anchor = CheckpointAnchor {
+        announced_at: Lsn(2),
+        covered_through: Lsn(1),
+        record_sha256: Sha256::digest(&checkpoint).into(),
+    };
+    for invalid in [
+        CheckpointAnchor {
+            record_sha256: [0; 32],
+            ..anchor
+        },
+        CheckpointAnchor {
+            covered_through: Lsn(2),
+            ..anchor
+        },
+        CheckpointAnchor {
+            announced_at: Lsn(3),
+            ..anchor
+        },
+    ] {
+        assert_eq!(
+            writer.trim_checkpoint(original.fence, invalid).await,
+            Err(JournalError::Conflict { head: Lsn(2) })
+        );
+    }
+    let current = writer
+        .seal_session(stream, original.fence.writer_epoch, WriterSessionId(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        writer.trim_checkpoint(original.fence, anchor).await,
+        Err(JournalError::Fenced {
+            current: current.fence.writer_epoch
+        })
+    );
+    assert_eq!(
+        writer
+            .read_page(stream, Lsn(1), Lsn(2), 2, Duration::ZERO)
+            .await
+            .unwrap()
+            .floor,
+        Lsn(1)
+    );
+    writer.trim_checkpoint(current.fence, anchor).await.unwrap();
+    writer.trim_checkpoint(current.fence, anchor).await.unwrap();
+    let page = writer
+        .read_page(stream, Lsn(2), Lsn(2), 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.floor, Lsn(2));
+    assert_eq!(page.records, [(Lsn(2), checkpoint)]);
+    cluster.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consensus_journal_satisfies_the_contract() {
     let mut cluster = LocalCluster::start(&PRINCIPALS).await.unwrap();
     let config = cluster.journal_config(

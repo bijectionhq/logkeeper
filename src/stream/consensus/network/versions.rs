@@ -78,7 +78,8 @@ impl Request {
             | Self::FenceKeeper(_)
             | Self::RecoverStream { .. }
             | Self::LocalTip(_)
-            | Self::NamedStreams(_) => WireVersion::Current,
+            | Self::NamedStreams(_)
+            | Self::TrimCheckpoint { .. } => WireVersion::Current,
         }
     }
 }

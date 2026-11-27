@@ -13,8 +13,8 @@ use std::{
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use journal_contract::{
-    Epoch, JournalError, Lsn, RecoveryFence, Result, SealReceipt, StreamId, WriterFence,
-    WriterSessionId,
+    CheckpointAnchor, Epoch, JournalError, Lsn, RecoveryFence, Result, SealReceipt, StreamId,
+    WriterFence, WriterSessionId,
 };
 use parking_lot::Mutex;
 use tokio::time::{Instant, sleep};
@@ -375,12 +375,30 @@ impl Client {
     /// unanswered may have taken effect before a competing seal, so a
     /// `Fenced` refusal of its retry leaves the outcome unknown.
     pub async fn trim(&self, stream: StreamId, fence: Fence, through: Lsn) -> Result<()> {
-        let uncertain = AtomicBool::default();
-        let request = Request::Trim {
+        self.commit_trim(Request::Trim {
             stream,
             fence,
             through,
-        };
+        })
+        .await
+    }
+
+    pub async fn trim_checkpoint(
+        &self,
+        stream: StreamId,
+        fence: Fence,
+        anchor: CheckpointAnchor,
+    ) -> Result<()> {
+        self.commit_trim(Request::TrimCheckpoint {
+            stream,
+            fence,
+            anchor,
+        })
+        .await
+    }
+
+    async fn commit_trim(&self, request: Request) -> Result<()> {
+        let uncertain = AtomicBool::default();
         match self
             .decide(request, Instant::now() + self.deadline, ATTEMPT, &uncertain)
             .await

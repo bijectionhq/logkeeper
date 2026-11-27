@@ -12,7 +12,9 @@ use std::{
 
 use bincode::Options;
 use futures::FutureExt;
-use journal_contract::{Epoch, Lsn, RecoveryFence, StreamId, WriterFence, WriterSessionId};
+use journal_contract::{
+    CheckpointAnchor, Epoch, Lsn, RecoveryFence, StreamId, WriterFence, WriterSessionId,
+};
 use openraft::{
     BasicNode, EntryPayload, OptionalSend,
     errors::{NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable},
@@ -333,6 +335,11 @@ pub(super) enum Request {
     /// genesis or latest staged move names it, answered with
     /// `Reply::Named`. Sent only by that keeper. Added last.
     NamedStreams(uuid::Uuid),
+    TrimCheckpoint {
+        stream: StreamId,
+        fence: Fence,
+        anchor: CheckpointAnchor,
+    },
 }
 
 impl Request {
@@ -375,6 +382,7 @@ impl Request {
             | Self::ProveOriginal { stream, .. }
             | Self::Read { stream, .. }
             | Self::Trim { stream, .. }
+            | Self::TrimCheckpoint { stream, .. }
             | Self::RetireCopy { stream, .. }
             | Self::PreferLeader { stream, .. }
             | Self::Written { stream, .. }
