@@ -293,3 +293,55 @@ async fn drain_moves_leadership_off_a_keeper_and_survives_restart() {
     .expect("an undrained keeper accepts streams again");
     cluster.stop_all().await;
 }
+
+/// A draining voter starts no election of its own, but it campaigns as a
+/// last resort when it is the only voter that can win: here the leader
+/// died after committing an entry that only the draining voter shares, so
+/// the third voter's log is behind and the draining voter refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draining_voter_campaigns_when_no_other_voter_can_win() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(232);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal.prefer_leader(stream, c).await.unwrap();
+    assert!(wait_for_leader(&cluster, stream, c).await);
+    let fence = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(9))
+        .await
+        .unwrap()
+        .fence;
+    cluster.running[&a]
+        .engine
+        .set_mode(super::super::drain::Mode::Draining, "test")
+        .await
+        .unwrap();
+    // `b` misses everything `c` sends from now on.
+    let leader = c.as_u128();
+    *cluster.running[&b].engine.reject_append.write() = Some(Box::new(move |group, sender, _| {
+        group == stream && sender == leader
+    }));
+    assert_eq!(
+        journal
+            .append(stream, fence, Lsn(1), Bytes::from_static(b"one"))
+            .await,
+        Ok(Lsn(1))
+    );
+    // `c` crashes rather than stopping, so it hands nothing off.
+    let crashed = cluster.running.remove(&c).unwrap();
+    crashed.engine.crash.store(true, Ordering::Release);
+    crashed.stop().await;
+    let head = timeout(WAIT, async {
+        loop {
+            match journal.head(stream).await {
+                Ok(head) => break head,
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("the stream elected a leader with a draining voter");
+    assert_eq!(head, Lsn(1));
+    cluster.stop_all().await;
+}

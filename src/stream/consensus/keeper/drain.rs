@@ -26,6 +26,9 @@ use crate::server::durability::{sync_directory, sync_file};
 pub(super) const MODE_FILE: &str = "operator-mode.json";
 /// How often a draining keeper retries handing off what it still leads.
 pub(super) const DRAIN_INTERVAL: Duration = Duration::from_secs(1);
+/// Election timeouts a stream may go without a leader before a draining
+/// voter campaigns for it as a last resort.
+const LEADERLESS_TIMEOUTS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -228,8 +231,10 @@ impl Engine {
 
     /// While draining, hands off every led stream each `DRAIN_INTERVAL`.
     pub(super) async fn drain_loop(self: &Arc<Self>) {
+        let mut leaderless = std::collections::HashMap::new();
         loop {
             if self.mode.draining() {
+                self.campaign_when_leaderless(&mut leaderless).await;
                 self.evict_leaders(DRAIN_INTERVAL, true).await;
                 self.fence_decommissioned().await;
                 tokio::select! {
@@ -269,6 +274,49 @@ impl Engine {
             )))
             | Ok(super::Reply::Unsupported(_)) => self.mode.fenced.store(true, Ordering::Release),
             _ => (),
+        }
+    }
+
+    /// A draining keeper starts no election of its own, but it may be the
+    /// only voter that can win one: when the other voters' logs are behind
+    /// its own or their keepers are down. A stream with no leader for
+    /// `LEADERLESS_TIMEOUTS` election timeouts, or whose leader's keeper is
+    /// suspected dead for as long, gets one campaign from it;
+    /// once it leads, the drain loop hands the stream off as usual.
+    async fn campaign_when_leaderless(
+        &self,
+        leaderless: &mut std::collections::HashMap<
+            journal_contract::StreamId,
+            tokio::time::Instant,
+        >,
+    ) {
+        let limit =
+            Duration::from_millis(self.raft_config.election_timeout_max) * LEADERLESS_TIMEOUTS;
+        let now = tokio::time::Instant::now();
+        let groups = self.groups.lock().await.clone();
+        leaderless.retain(|stream, _| groups.contains_key(stream));
+        for (stream, group) in groups {
+            // A follower keeps naming a leader that died until a new vote
+            // reaches it, which pre-vote prevents when nobody can win, so a
+            // leader whose keeper stopped answering pings counts as none.
+            let leader = group.raft.metrics().borrow_watched().current_leader;
+            if leader.is_some_and(|leader| {
+                leader == self.id.as_u128() || !self.suspect(uuid::Uuid::from_u128(leader))
+            }) {
+                leaderless.remove(&stream);
+                continue;
+            }
+            let since = *leaderless.entry(stream).or_insert(now);
+            if now.duration_since(since) >= limit {
+                leaderless.insert(stream, now);
+                if group.raft.trigger().elect(false).await.is_ok() {
+                    tracing::info!(
+                        keeper = %self.id,
+                        stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                        "draining keeper campaigns for a stream left without a leader"
+                    );
+                }
+            }
         }
     }
 

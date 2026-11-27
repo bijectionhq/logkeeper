@@ -288,7 +288,7 @@ impl Engine {
 
     /// Whether `keeper` missed its last pings, a much shorter signal than
     /// `dead` that only decides who campaigns first.
-    fn suspect(&self, keeper: Uuid) -> bool {
+    pub(super) fn suspect(&self, keeper: Uuid) -> bool {
         keeper != self.id
             && self.liveness.lock().silent(keeper, Instant::now()) >= PING_INTERVAL * MISSED_PINGS
     }
