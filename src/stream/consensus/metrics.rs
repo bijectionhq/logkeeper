@@ -217,6 +217,8 @@ pub(super) struct Metrics {
     pub scrub_corrupt: AtomicU64,
     // Election counters
     pub elections_started: AtomicU64,
+    /// Write pauses a leader took to hand a stream off.
+    pub handoff_pauses: AtomicU64,
     /// TLS credential reloads installed and refused.
     pub tls_reloads: AtomicU64,
     pub tls_reloads_refused: AtomicU64,
@@ -303,6 +305,7 @@ impl Metrics {
             scrub_corrupt: AtomicU64::new(0),
             elections_started: AtomicU64::new(0),
             wake_campaigns: AtomicU64::new(0),
+            handoff_pauses: AtomicU64::new(0),
             tls_reloads: AtomicU64::new(0),
             tls_reloads_refused: AtomicU64::new(0),
             handoffs: AtomicU64::new(0),
@@ -657,7 +660,7 @@ impl Metrics {
         }
         let _ = writeln!(
             out,
-            "# HELP logkeeper_consensus_leadership_moves_total Campaigns on waking a parked stream and completed leadership hand-offs."
+            "# HELP logkeeper_consensus_leadership_moves_total Campaigns on waking a parked stream, completed leadership hand-offs, and write pauses taken for a hand-off."
         );
         let _ = writeln!(
             out,
@@ -666,6 +669,7 @@ impl Metrics {
         for (reason, counter) in [
             ("wake_campaign", &self.wake_campaigns),
             ("handoff", &self.handoffs),
+            ("handoff_pause", &self.handoff_pauses),
         ] {
             let _ = writeln!(
                 out,

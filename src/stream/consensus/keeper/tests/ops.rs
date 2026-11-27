@@ -292,7 +292,10 @@ async fn a_tls_reload_refuses_certificates_peers_would_refuse() {
         ),
     ] {
         install(&config, &uri, issuer, expired);
-        assert!(engine.tls.reload_counted(&config, &metrics).is_err(), "{why}");
+        assert!(
+            engine.tls.reload_counted(&config, &metrics).is_err(),
+            "{why}"
+        );
         assert_eq!(served(addr, &cluster.credentials).await, old, "{why}");
     }
     assert_eq!(metrics.tls_reloads_refused.load(Ordering::Relaxed), 3);

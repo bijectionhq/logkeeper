@@ -146,6 +146,13 @@ pub struct AdminConfig {
     pub probe_listen: Option<SocketAddr>,
 }
 
+/// Entries a draining leader's closest accepting voter may lag before the
+/// leader pauses writes to hand off to it; further behind, it waits for a
+/// later drain cycle instead of stalling writes.
+const HANDOFF_LAG: u64 = 64;
+/// The longest a draining leader pauses writes for one hand-off.
+const DRAIN_HANDOFF_PAUSE: Duration = Duration::from_millis(200);
+
 /// How long a keeper keeps retrying a listening port that is in use.
 const BIND_RETRY: Duration = Duration::from_secs(5);
 
@@ -510,10 +517,11 @@ impl Config {
         let reload = self.clone();
         let engine = self.prepare(stop).await?;
         #[cfg(unix)]
-        let reloader =
-            engine
-                .tls
-                .listen_for_reload(reload, engine.disk.metrics.clone(), engine.stop.clone())?;
+        let reloader = engine.tls.listen_for_reload(
+            reload,
+            engine.disk.metrics.clone(),
+            engine.stop.clone(),
+        )?;
         let result = engine
             .serve([listener, control, bulk], admin_listener)
             .await;
@@ -1079,14 +1087,37 @@ impl Engine {
                 if targets.is_empty() {
                     return;
                 }
+                // A draining keeper retries every cycle, so it pauses writes
+                // only for a target close behind the leader: waiting for a
+                // lagging one would stall writes for most of every cycle.
+                // A stopping keeper has one chance and pauses up to `limit`.
+                let pause = if require_accepting {
+                    let current = metrics.borrow_watched().clone();
+                    let last = current.last_log_index.unwrap_or(0);
+                    let closest = current
+                        .replication
+                        .iter()
+                        .flatten()
+                        .filter(|(id, _)| targets.contains(id))
+                        .map(|(_, matched)| matched.map_or(0, |log| log.index))
+                        .max()
+                        .unwrap_or(0);
+                    if last.saturating_sub(closest) > HANDOFF_LAG {
+                        return;
+                    }
+                    DRAIN_HANDOFF_PAUSE
+                } else {
+                    limit
+                };
                 let Ok(_membership) = group.membership.try_lock() else {
                     return;
                 };
-                // Bound the write pause by the hand-off deadline. A busy
-                // stream's followers can now catch up to the last proposal.
+                // Pause writes so the target can match the last proposal.
                 let Ok(_writes) = group.writes.acquire_many(MAX_PENDING_WRITES as u32).await else {
                     return;
                 };
+                super::metrics::count(&self.disk.metrics.handoff_pauses);
+                let resume = tokio::time::Instant::now() + pause;
                 loop {
                     let current = metrics.borrow_watched().clone();
                     if current.state != openraft::ServerState::Leader {
@@ -1107,8 +1138,9 @@ impl Engine {
                         }
                         break;
                     }
-                    if metrics.changed().await.is_err() {
-                        return;
+                    tokio::select! {
+                        changed = metrics.changed() => if changed.is_err() { return; },
+                        () = tokio::time::sleep_until(resume) => return,
                     }
                 }
                 while metrics.borrow_watched().state == openraft::ServerState::Leader {

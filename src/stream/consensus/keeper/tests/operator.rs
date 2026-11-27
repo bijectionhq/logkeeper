@@ -355,3 +355,81 @@ async fn a_draining_voter_campaigns_when_no_other_voter_can_win() {
     assert_eq!(head, Lsn(1));
     cluster.stop_all().await;
 }
+
+/// A draining leader whose only accepting voter lags takes no write pause
+/// for it: writes keep flowing (the worst stall is printed) and the
+/// hand-off waits for a cycle where that voter has caught up. The third
+/// voter, itself draining, still acknowledges writes but takes no
+/// leadership.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn draining_does_not_stall_writes_while_the_target_lags() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(233);
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 24)
+        .await
+        .unwrap();
+    journal.prefer_leader(stream, a).await.unwrap();
+    assert!(wait_for_leader(&cluster, stream, a).await);
+    let fence = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(9))
+        .await
+        .unwrap()
+        .fence;
+    cluster.running[&c]
+        .engine
+        .set_mode(super::super::drain::Mode::Draining, "test")
+        .await
+        .unwrap();
+    // `b` takes neither appends nor snapshots from `a`, so it stays behind.
+    let leader = a.as_u128();
+    *cluster.running[&b].engine.reject_append.write() = Some(Box::new(move |group, sender, _| {
+        group == stream && sender == leader
+    }));
+    let held = cluster.group(b, stream).await.state.occupy_transfers();
+    /// Appends for `seconds` from `at`, returning the slowest append.
+    async fn writes(
+        journal: &Client,
+        stream: StreamId,
+        fence: Fence,
+        at: &mut u64,
+        seconds: u64,
+    ) -> Duration {
+        let mut worst = Duration::ZERO;
+        let end = tokio::time::Instant::now() + Duration::from_secs(seconds);
+        while tokio::time::Instant::now() < end {
+            let started = tokio::time::Instant::now();
+            journal
+                .append(stream, fence, Lsn(*at), Bytes::from_static(b"record"))
+                .await
+                .unwrap();
+            worst = worst.max(started.elapsed());
+            *at += 1;
+        }
+        worst
+    }
+    let mut at = 1;
+    let baseline = writes(&journal, stream, fence, &mut at, 2).await;
+    let metrics = cluster.running[&a].engine.disk.metrics.clone();
+    cluster.running[&a]
+        .engine
+        .set_mode(super::super::drain::Mode::Draining, "test")
+        .await
+        .unwrap();
+    // Three drain cycles of writes while `b` stays behind.
+    let draining = writes(&journal, stream, fence, &mut at, 3).await;
+    eprintln!(
+        "worst append stall: {baseline:?} before draining, {draining:?} while draining past \
+         a lagging target"
+    );
+    assert_eq!(metrics.handoff_pauses.load(Ordering::Relaxed), 0);
+    assert_eq!(cluster.leader(stream).await, a);
+    // Once `b` catches up, the next cycle hands the stream to it.
+    drop(held);
+    *cluster.running[&b].engine.reject_append.write() = None;
+    assert!(wait_for_leader(&cluster, stream, b).await);
+    assert!(metrics.handoff_pauses.load(Ordering::Relaxed) >= 1);
+    cluster.stop_all().await;
+}
