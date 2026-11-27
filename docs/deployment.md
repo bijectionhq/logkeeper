@@ -619,6 +619,21 @@ earlier media format.
 The procedure is in the [rolling-upgrade runbook](runbooks/rolling-upgrade.md).
 The [rolling-upgrade test](../tests/rolling_upgrade.rs) runs it in process.
 
+### Immutable stream histories
+
+After every active keeper advertises immutable-stream support, finalize cluster version 4.
+The journal contract can then create a stream with `create_immutable`.
+Its durable genesis selects the history mode for that stream ID.
+Each writer residence holds a distinct session, and its seal binds the next epoch to that session and the exact committed head.
+Append, trim, and timed reservations carry the resulting session fence.
+A consumer following a committed head can request a page that covers that head and resume at the next position.
+
+Replica repair and joint membership changes preserve the same stream ID and history.
+When the original quorum is permanently lost, a recovery that accepts a cut uses a fresh stream ID.
+Consumers such as RTDB can restore an application cut and authorize a successor for the stable database name through a separately available authority.
+The application's archived cut sets the recovery point.
+Same-stream recovery is available for legacy mutable streams.
+
 ## Backup and restore
 
 What exists:
@@ -630,7 +645,7 @@ What exists:
   restores the exact snapshot bytes that the local WAL's digest names, onto a
   stopped keeper whose WAL is intact. It is for a damaged snapshot file, not
   for disaster recovery.
-- **`keeper recover-stream`** rebuilds a stream from its last surviving voter
+- **`keeper recover-stream`** rebuilds a legacy mutable stream from its last surviving voter
   after two are lost, accepting possible loss of acknowledged records.
 - **RTDB checkpoints** in object storage hold each database's state up to its
   last checkpoint. The journal holds only the suffix after it.
@@ -658,6 +673,7 @@ Recommendations:
    checkpoint ticket tied to its source custody. Verify a cold application
    restore with the original processes and journals absent before counting
    a checkpoint ticket as a portable backup.
+   RTDB Multi's portable backup rehearsal uses an authenticated archive and independently available key custody to seed a fresh immutable stream.
 3. Back up the operator artifacts: keeper configs, `placement.json`,
    provision files, the CA and client certificates, and the inventory of which
    UUIDs are in service and which are retired. Do not back up private keys of

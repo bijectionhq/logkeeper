@@ -1,5 +1,9 @@
 # Lose two of three voters
 
+This procedure applies to legacy mutable streams.
+For an immutable stream, restore its original quorum or install a verified application cut under a fresh stream ID.
+If the application exposes a stable name, publish the successor only after it has fenced the previous incarnation at every serving endpoint.
+
 A stream needs two voters to commit and to change membership. After it loses
 two, leader-driven repair holds, and only an operator can make the survivor's
 copy the stream's only history. **This can lose acknowledged records:** a
@@ -63,6 +67,7 @@ for each`.
 | `refused: N other voter(s) ... answer with a healthy replica` | The stream still has a quorum, possibly through a slow keeper you took for lost. Restart this keeper instead |
 | `refused: name both lost voters with --lost x,y` | `--lost` is missing or names other keepers |
 | `refused: supply two independently signed keeper retirement proofs` | Generate one proof on each lost keeper's original enrolled media |
+| `immutable histories require their original quorum or a successor with a fresh stream ID` | Restore the original quorum or create a successor with a verified application cut |
 | `this keeper is not a voter of the stream's latest configuration` | Run it on the right survivor |
 | `the replicated catalog requires its original quorum or disaster restore` | Follow [catalog and joint quorum loss](#catalog-and-joint-quorum-loss) |
 | `the catalog records a pending move or a different source configuration` | Reconcile against the current membership with its original quorum. The local survivor may have missed a configuration change |
