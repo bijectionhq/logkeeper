@@ -16,6 +16,10 @@ without an answer by `decisions::excludes_sender`. Raft's leader completeness
 for the recovered group (a leader of the recovered membership holds the
 committed recovery entries) is a step guard, not a theorem here.
 
+This module proves the shipped mechanism, which relies on an election budget
+below the `2^32` gap and, for barrier reads, at most one running lost voter.
+`EpochLease` proves the endgame's lease model without either assumption.
+
 `recovered_replicas_never_mix` and `lost_replicas_stay_below_the_recovery_term`
 hold for every replica on every trace. `barrier_reads_never_mix` shows that a
 read or commit confirmed by a quorum of the serving replica's configuration

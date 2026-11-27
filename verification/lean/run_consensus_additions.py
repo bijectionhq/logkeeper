@@ -12,7 +12,10 @@ sys.path.insert(0, str(ROOT.parent))
 from study_tools import check_lean_mutation, check_lean_theorems
 
 
-MODULES = {"RecoveryFence": 10, "Parking": 7, "RetireOnProof": 4, "CatalogClaim": 6}
+MODULES = {
+    "RecoveryFence": 10, "Parking": 7, "RetireOnProof": 4, "CatalogClaim": 6,
+    "EpochLease": 10, "OffloadPrefix": 10,
+}
 
 CONTROLS = [
     (
@@ -68,6 +71,42 @@ CONTROLS = [
         "  if copy.generation = generation ∧ retires proof keeper revision = true then",
         "  if copy.generation ≤ generation + 1 ∧ retires proof keeper revision = true then",
         "    (copy.stage.retire copy.generation proof keeper revision).detached = false := by",
+    ),
+    (
+        "EpochLease", "act-as-the-wait-out-ends",
+        "  ∀ lost member t u, g.lostActs lost t → g.newActs member u → t < u",
+        "  ∀ lost member t u, g.lostActs lost t → g.newActs member u → t ≤ u",
+        "  exact Nat.lt_irrefl u (Nat.lt_of_le_of_lt past before)",
+    ),
+    (
+        "EpochLease", "margin-below-drift",
+        "    {holder waiter : Clock D H} (margin : D ≤ M) (horizon : L + M + D ≤ H)",
+        "    {holder waiter : Clock D H} (margin : D ≤ M + 1) (horizon : L + M + D ≤ H)",
+        "  omega -- the lease ends before the wait-out",
+    ),
+    (
+        "EpochLease", "read-without-a-lease",
+        "      s.Lost keeper → g.lostActs keeper st.time →\n      Step s g st (observe",
+        "      s.Lost keeper → True →\n      Step s g st (observe",
+        "  | lostRead keeper _ lost acts => exact absurd ⟨lost, acts⟩ (closed keeper)",
+    ),
+    (
+        "EpochLease", "lost-voter-writes-the-recovery",
+        "      s.Lost keeper → g.lostActs keeper st.time → entry ≠ s.recovery →",
+        "      s.Lost keeper → g.lostActs keeper st.time → True →",
+        "        have grown := recFree_append (untouched_lost before lost) distinct",
+    ),
+    (
+        "OffloadPrefix", "upload-unapplied-records",
+        "      o.through + count ≤ o.applied →",
+        "      o.through + count ≤ o.committed.length →",
+        "      refine ⟨by simp; omega, within, appliedCommitted,",
+    ),
+    (
+        "OffloadPrefix", "restore-the-whole-survivor-log",
+        "  if o.through ≤ survivor.commit then (survivor.log.take survivor.commit).drop o.floor",
+        "  if o.through ≤ survivor.commit then survivor.log.drop o.floor",
+        "    · next covers =>\n        rw [Nat.max_eq_right covers]",
     ),
     (
         "CatalogClaim", "reply-with-the-proposal",
