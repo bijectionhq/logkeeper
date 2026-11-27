@@ -91,7 +91,7 @@ stream only while it writes that database, at most one voter per stream every
 
    Removed copies retire themselves, so `hosted` reaches 0 once every move
    has committed and retirement has run. Without **[ops]**, check each
-   stream's `configuration` with `ConsensusJournal::configuration`.
+   stream with `lk admin status --config operator.json --stream UUID`.
 
    Streams that RTDB does not write (databases with no running writer) do
    not move. Wake their writers or accept that they stay. If the keeper is a

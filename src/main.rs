@@ -33,6 +33,11 @@ async fn main() -> ExitCode {
         );
         #[cfg(feature = "stream")]
         println!("       {}", &DEBUG_BUNDLE_USAGE["Usage: ".len()..]);
+        #[cfg(feature = "stream")]
+        println!(
+            "       {}",
+            &logkeeper::stream::consensus::ADMIN_USAGE["Usage: ".len()..]
+        );
         return ExitCode::SUCCESS;
     }
     match run(&args).await {
@@ -45,6 +50,22 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    #[cfg(feature = "stream")]
+    if args.first().is_some_and(|arg| arg == "admin") {
+        let outcome = logkeeper::stream::consensus::admin_command(&args[1..]).await?;
+        if outcome.json {
+            println!("{}", serde_json::to_string_pretty(&outcome.report)?);
+        } else {
+            print!(
+                "{}",
+                logkeeper::stream::consensus::render_report(&outcome.report)
+            );
+        }
+        if !outcome.ok {
+            return Err("the command did not fully succeed; see the report".into());
+        }
+        return Ok(());
+    }
     #[cfg(feature = "stream")]
     if args.first().is_some_and(|arg| arg == "keeper") {
         if let [_, action, flag, file] = args

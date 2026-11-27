@@ -9,15 +9,10 @@ use std::{
     io,
     net::SocketAddr,
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
-    time::timeout,
-};
 use tokio_rustls::TlsConnector;
 
 use super::Config;
@@ -32,10 +27,6 @@ const PATHS: [(&str, &str); 6] = [
     ("/safe-to-stop", "safe-to-stop.json"),
     ("/live", "live.json"),
 ];
-/// One admin request, connect to last byte.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// The largest admin answer kept; a `/metrics` page is far smaller.
-const MAX_RESPONSE: u64 = 64 * 1024 * 1024;
 const REDACTED: &str = "<redacted>";
 
 #[derive(Serialize)]
@@ -244,50 +235,7 @@ async fn fetch(
     tls: Option<TlsConnector>,
     path: &str,
 ) -> io::Result<(u16, Vec<u8>)> {
-    timeout(FETCH_TIMEOUT, async {
-        let socket = TcpStream::connect(at).await?;
-        match tls {
-            Some(connector) => {
-                let name = tokio_rustls::rustls::pki_types::ServerName::try_from("logkeeper")
-                    .map_err(io::Error::other)?;
-                let mut stream = connector.connect(name, socket).await?;
-                exchange(&mut stream, path).await
-            }
-            None => {
-                let mut stream = socket;
-                exchange(&mut stream, path).await
-            }
-        }
-    })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "admin request timed out"))?
-}
-
-async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    path: &str,
-) -> io::Result<(u16, Vec<u8>)> {
-    let request = format!("GET {path} HTTP/1.1\r\nHost: logkeeper\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await?;
-    stream.flush().await?;
-    let mut raw = Vec::new();
-    stream.take(MAX_RESPONSE + 1).read_to_end(&mut raw).await?;
-    if raw.len() as u64 > MAX_RESPONSE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "admin answer is too large",
-        ));
-    }
-    let split = raw
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "admin answer has no headers"))?;
-    let status = std::str::from_utf8(&raw[..split])
-        .ok()
-        .and_then(|head| head.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "admin answer has no status"))?;
-    Ok((status, raw[split + 4..].to_vec()))
+    crate::stream::consensus::operator::admin_request(at, tls, None, "GET", path).await
 }
 
 /// A minimal ustar writer: regular files only, names under 100 bytes.

@@ -10,6 +10,7 @@ mod keeper;
 pub mod logging;
 mod metrics;
 mod network;
+mod operator;
 mod ownership;
 mod placement;
 #[cfg(test)]
@@ -32,6 +33,10 @@ pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
 pub use keeper::{AdminConfig, Config, Recovery, RecoveryReport};
 pub use logging::LogFormat;
+pub use operator::{
+    ADMIN_USAGE, AdminOutcome, ClusterProblems, Operator, OperatorConfig, StreamReport,
+    admin_command, render as render_report,
+};
 pub use placement::Domains;
 pub use storage::{InspectReport, SegmentDump, VerifyReport, dump_segment_file};
 pub use timed::TimedAuthority;

@@ -31,6 +31,7 @@ Packaging lives in [`deploy/consensus/`](../deploy/consensus/):
 | `kubernetes/` | Kustomize base: StatefulSet, pre-bound local volumes, PodDisruptionBudget, generated keeper configs |
 | `keeper.example.json`, `placement.example.json`, `provision.example.json` | One keeper's config and its registry authority files |
 | `rtdb-journal.example.json` | The RTDB side: a Logkeeper `JournalConfig` |
+| `operator.example.json` | What `logkeeper admin` reads: the operator's credentials and every keeper's application and admin address |
 | `tests/validate.sh` | Renders and validates the manifests |
 
 `cargo test --features stream --test deploy_examples` checks that the example
@@ -395,8 +396,15 @@ catalog at its first start. Until that seed is done, creates fail with
 through create, seal, append, head and read with the operator principal, and
 then delete it. For example, adapt the README's first-write snippet, or run
 the [rolling-upgrade test](../tests/rolling_upgrade.rs) against a local
-cluster. Logkeeper has no admin CLI client yet, so this check is a small
-Rust program against `ConsensusJournal`. Without **[ops]**, check liveness
+cluster. `logkeeper admin` covers the administrative half:
+
+```sh
+logkeeper admin create --config operator.json --stream $UUID --quota-bytes 67108864
+logkeeper admin status --config operator.json --stream $UUID   # configuration, leader, head, replicas
+logkeeper admin problems --config operator.json                # every keeper's /problems, merged
+```
+
+Seal, append and read need a writer, which `logkeeper admin` is not. Without **[ops]**, check liveness
 with the keeper's stderr. Every 5 s it prints refusal counters, and
 `peer.unreachable` at startup is expected until all keepers are up.
 
@@ -515,8 +523,8 @@ first.
 **Recovery.** After `recover-stream`, RTDB's next seal gets
 `JournalError::Recovered`, which RTDB reports as `rtdb/journal-recovered`.
 RTDB at its current pin does not acknowledge it by itself. An operator
-acknowledges with `ConsensusJournal::acknowledge_recovery` (writer or
-administrator). The
+acknowledges with `logkeeper admin acknowledge-recovery --stream UUID`
+(or `ConsensusJournal::acknowledge_recovery`; writer or administrator). The
 [two-voter-loss runbook](runbooks/lose-two-voters.md) has the steps.
 
 ## Monitoring **[ops]**
@@ -631,7 +639,6 @@ Most are items in the consensus design's review tables.
 | DNS names in the inventory | Keepers need stable IPs; Kubernetes uses host networking | Static IPs, pinned nodes |
 | Runtime inventory change (T19) | Adding a keeper restarts every keeper | Plan the count; restart one at a time |
 | Leadership drain without stopping | "Drain leaders" happens only inside SIGTERM, within 3 s | Gate on `/safe-to-stop`, then stop |
-| Admin CLI client | Create, replace, keeper status, acknowledge recovery and finalize need a Rust program against `ConsensusJournal` | Write one; RTDB does placement itself |
 | Durable drain and decommission state (T20) | Drain lives only in the consumer's `draining` list | Edit RTDB's `JournalConfig` |
 | Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
 | TLS reload without restart (T12) | Certificate rotation restarts each keeper | Rolling restart |

@@ -134,8 +134,9 @@ unavailability per keeper restart, on the streams that keeper leads.
 
 10. **Finalize [upgrades]:** this allows the new durable formats. It is
     refused unless every active keeper advertises the write-version gate.
-    There is no CLI for it. Call it from a Rust program with an administrator
-    principal:
+    `lk admin finalize-version` is reserved for it but refuses until the
+    cluster feature level from the upgrades work is on `main`. Until then,
+    call it from a Rust program with an administrator principal:
 
     ```rust,ignore
     let finalized = journal.finalize_version(TARGET).await?;   // ConsensusJournal

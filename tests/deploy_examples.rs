@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use logkeeper::stream::consensus::{Config, JournalConfig};
+use logkeeper::stream::consensus::{Config, JournalConfig, OperatorConfig};
 use serde_json::Value;
 
 fn deploy(path: &str) -> PathBuf {
@@ -130,4 +130,22 @@ fn rtdb_journal_example_matches_the_keepers() {
     for role in [&keeper.writers, &keeper.administrators] {
         assert!(role.iter().any(|uri| uri == "urn:logkeeper:client:rtdb"));
     }
+}
+
+#[test]
+fn operator_example_matches_the_keepers() {
+    let operator = OperatorConfig::read(&deploy("operator.example.json")).unwrap();
+    let keeper = Config::read(&deploy("keeper.example.json")).unwrap();
+    assert_eq!(operator.keepers, keeper.keepers);
+    assert_eq!(operator.catalog, keeper.catalog);
+    assert_eq!(operator.catalog_voters, keeper.catalog_voters);
+    assert_eq!(operator.placement.as_ref(), Some(&keeper.domains));
+    assert!(operator.admin.keys().eq(keeper.keepers.keys()));
+    assert!(operator.admin_mtls);
+    assert!(
+        keeper
+            .administrators
+            .iter()
+            .any(|uri| uri == "urn:logkeeper:client:operator")
+    );
 }

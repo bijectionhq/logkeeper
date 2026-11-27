@@ -28,6 +28,10 @@ lk() { sudo -u logkeeper /usr/local/bin/logkeeper "$@"; }
 probe() { curl -sS -o /dev/stderr -w '%{http_code}\n' "$ADMIN/$1"; }
 ```
 
+`lk admin ... --config operator.json` runs the operator's client; the file
+holds an administrator certificate and every keeper's application and admin
+address (see `deploy/consensus/operator.example.json`).
+
 `probe ready` prints the JSON body and then the HTTP status: `200` means
 yes, and `503` means no. On Kubernetes, run the same commands inside the pod
 with `kubectl -n logkeeper exec logkeeper-N -c keeper -- curl -sS
@@ -44,5 +48,6 @@ of these appears on a keeper:
 Then work out why before you continue.
 
 Without **[ops]**, use the keeper's stderr (`journalctl -u $UNIT`): it prints
-refusal counters every 5 s. For per-stream health, use
-`ConsensusJournal::keeper_status` and `configuration` from a Rust program.
+refusal counters every 5 s. For per-stream health, use `lk admin status
+--stream UUID`, which reads the configuration, leader, head and each voter's
+replica over the application lane.

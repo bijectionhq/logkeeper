@@ -460,6 +460,15 @@ impl Client {
         }
     }
 
+    /// The keeper that last decided a request on `stream`, which was its
+    /// leader then.
+    pub fn leader(&self, stream: StreamId) -> Option<uuid::Uuid> {
+        self.routes
+            .lock()
+            .get(&stream)
+            .and_then(|route| route.leader)
+    }
+
     /// The voters the catalog assigned to `stream`, or `None` when the
     /// catalog has none.
     pub(super) async fn claimed_voters(&self, stream: StreamId) -> Result<Option<[uuid::Uuid; 3]>> {

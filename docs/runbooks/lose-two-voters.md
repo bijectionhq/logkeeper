@@ -21,8 +21,9 @@ On the surviving keeper **[ops]**:
 probe problems | jq -r '.problems[] | select(.reasons | index("leaderless")) | .stream'
 ```
 
-Without **[ops]**, use `ConsensusJournal::configuration` and `keeper_status`
-for each stream RTDB reports as unavailable (RTDB returns `Unavailable` on
+Then, for each such stream, `lk admin status --config operator.json --stream
+UUID` shows its configuration and which voters answer. Without **[ops]**, use
+`lk admin status` for each stream RTDB reports as unavailable (RTDB returns `Unavailable` on
 seal and append).
 
 **Confirm both lost keepers are really gone**, by checking each host
@@ -99,11 +100,15 @@ until probe ready | grep -qx 200; do sleep 5; done
 The stream is sealed under a recovery fence. Every `seal` returns
 `JournalError::Recovered { head }`, which RTDB reports as the fault
 `rtdb/journal-recovered`. At its current pin, RTDB does not acknowledge by
-itself. A writer or administrator principal calls:
+itself. Acknowledge with an administrator (or writer) principal:
 
-```rust,ignore
-let head = journal.acknowledge_recovery(stream).await?;   // ConsensusJournal
+```sh
+lk admin acknowledge-recovery --config operator.json --stream UUID
+# stream: UUID
+# head: 1234
 ```
+
+From a program, `ConsensusJournal::acknowledge_recovery(stream)` does the same.
 
 RTDB's writer then seals above the fence. It reports
 `rtdb/journal-shortened` with the lost range if the head is below what it had

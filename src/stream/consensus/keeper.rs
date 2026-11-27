@@ -1311,9 +1311,10 @@ impl Engine {
                     | Request::AppendBatch { .. }
                     | Request::StageOriginal { .. }
                     | Request::AppendOriginal { .. }
-                    | Request::PreferLeader { .. }
                     | Request::Written { .. }
                     | Request::Trim { .. } => writer,
+                    // An administrator may move leadership; it writes nothing.
+                    Request::PreferLeader { .. } => writer || admin,
                     // An administrator may acknowledge a recovery, but only a
                     // writer may write to the stream.
                     Request::AcknowledgeRecovery(_) => writer || admin,

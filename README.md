@@ -915,10 +915,10 @@ for the fault model and checked invariants.
 
 ### Operations
 
-Every operational surface of a consensus keeper is read-only: the admin
-listener (metrics, probes, problem report, status), structured logs and audit
-records, the offline tools that read a stopped data directory, and the debug
-bundle that collects all of them. Alert rules and a dashboard live in
+The admin listener (metrics, probes, problem report, status), structured logs
+and audit records, the offline tools that read a stopped data directory, and
+the debug bundle that collects all of them are read-only. `logkeeper admin`
+is the operator's client for the administrative requests. Alert rules and a dashboard live in
 `deploy/prometheus/logkeeper-alerts.yml` and `deploy/grafana/logkeeper.json`.
 
 #### Admin listener
@@ -955,6 +955,33 @@ configuration:
 - Endpoints: `GET` or `HEAD` `/metrics`, `/live`, `/ready`, `/safe-to-stop`,
   `/problems` (alias `/problem-streams`) and `/status`. Anything else answers
   `404`; other methods `405`.
+
+#### Admin CLI
+
+`logkeeper admin COMMAND --config operator.json [--json]` runs one
+administrative request. The file (see `deploy/consensus/operator.example.json`)
+holds a client certificate whose URI is in the keepers' `administrators`, the
+keepers' application addresses, the catalog and its voters, and, for the
+commands that read them, every keeper's admin listener (`admin`, with
+`admin_mtls`, default `true`). Over mTLS each admin listener must present the
+certificate of the keeper it is listed under. Output is `key: value` lines, or
+JSON with `--json`; the exit status is non-zero when a command fails or a
+report is incomplete.
+
+| Command | What it does |
+| --- | --- |
+| `create --stream UUID --quota-bytes N [--voters A,B,C]` | Creates the stream on the voters, or on three keepers of the file's `placement` in distinct domains. Safe to retry with the same arguments |
+| `status --stream UUID` | Configuration, leader, head, each voter's replica (`healthy`, `quarantined`, `none`, `unknown`) and the voters' `/problems` entries for it |
+| `status --keeper UUID` | That keeper's `/status` |
+| `replace --stream UUID --old K --new K` | Replaces one voter of the current configuration; `--expected REV --voters A,B,C` names the whole target |
+| `prefer-leader --stream UUID --keeper K` | Asks the leader to hand leadership to `K` (subject to the 60 s hold-down) |
+| `acknowledge-recovery --stream UUID` | Clears an operator recovery's fence and prints the head |
+| `retire --stream UUID --keeper K` | Retires `K`'s copy of a stream whose configuration no longer names it, certified by the leader |
+| `problems` | Every keeper's `/problems`, merged by stream, and which keepers did not answer |
+| `clear-quarantine`, `finalize-version` | Reserved for the upgrades work; refused on this build |
+
+Administrators may now also send `PreferLeader`, which used to be a writer's
+request; it moves leadership and writes nothing.
 
 #### Metrics
 

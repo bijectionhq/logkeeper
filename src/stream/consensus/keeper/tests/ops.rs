@@ -5,18 +5,22 @@ use super::*;
 use crate::stream::consensus::AdminConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn free_loopback() -> SocketAddr {
+pub(super) fn free_loopback() -> SocketAddr {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
 }
 
-async fn http_get(addr: SocketAddr, path: &str) -> (u16, String, String) {
+pub(super) async fn http_get(addr: SocketAddr, path: &str) -> (u16, String, String) {
     http_request(addr, "GET", path).await
 }
 
-async fn http_request(addr: SocketAddr, method: &str, path: &str) -> (u16, String, String) {
+pub(super) async fn http_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+) -> (u16, String, String) {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let req = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.unwrap();
@@ -26,7 +30,11 @@ async fn http_request(addr: SocketAddr, method: &str, path: &str) -> (u16, Strin
     parse_http_response(&raw)
 }
 
-async fn https_get(addr: SocketAddr, creds: &Credentials, path: &str) -> (u16, String, String) {
+pub(super) async fn https_get(
+    addr: SocketAddr,
+    creds: &Credentials,
+    path: &str,
+) -> (u16, String, String) {
     let (connector, _) = creds.client_protocol(b"http/1.1").unwrap();
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap();
@@ -54,7 +62,7 @@ fn parse_http_response(raw: &[u8]) -> (u16, String, String) {
     (code, head.to_owned(), body.to_owned())
 }
 
-async fn start_admin_cluster(mtls: bool) -> (Cluster, BTreeMap<Uuid, SocketAddr>) {
+pub(super) async fn start_admin_cluster(mtls: bool) -> (Cluster, BTreeMap<Uuid, SocketAddr>) {
     let mut cluster = Cluster::start().await;
     cluster.stop_all().await;
     let mut addrs = BTreeMap::new();
