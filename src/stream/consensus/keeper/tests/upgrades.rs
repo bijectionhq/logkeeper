@@ -1614,3 +1614,43 @@ async fn epochs_after_a_snapshot_install(
         copied: copy.state.epoch_runs(),
     }
 }
+
+/// A retired keeper still in the inventory may still host replicas, and a
+/// finalized level allows replicated commands it must decode, so
+/// finalization asks it too: while it does not answer, nothing finalizes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finalization_waits_for_a_retired_keeper_still_in_the_inventory() {
+    use std::collections::BTreeSet;
+
+    use crate::stream::consensus::storage::Authority;
+
+    let mut cluster = Cluster::start().await;
+    let [a, _, _, d] = cluster.ids;
+    cluster.stop_all().await;
+    let retired = BTreeSet::from([d]);
+    std::fs::write(
+        cluster.configs[&a].enrollment.join("placement.json"),
+        serde_json::to_vec(&Authority {
+            catalog: cluster.catalog,
+            domains: cluster.configs[&a].domains.clone(),
+            retired: retired.clone(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    for config in cluster.configs.values_mut() {
+        config.retired = retired.clone();
+    }
+    for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
+        if id != d {
+            cluster.restart(id).await;
+        }
+    }
+    let client = cluster.client(&cluster.credentials);
+    assert_eq!(
+        client.finalize_version(CLUSTER_VERSION_CURRENT).await,
+        Err(JournalError::Unavailable)
+    );
+    assert_eq!(client.cluster_version().await, Ok(CLUSTER_VERSION_V1));
+    cluster.stop_all().await;
+}

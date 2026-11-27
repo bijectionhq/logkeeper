@@ -359,9 +359,11 @@ impl Engine {
         } else {
             features::WRITE_VERSION_GATE
         };
+        // Retired keepers still in the inventory may still host replicas,
+        // and finalization allows replicated commands they must decode.
         let peers = self
             .placement
-            .domains()
+            .all_domains()
             .keys()
             .copied()
             .filter(|keeper| *keeper != self.id)
