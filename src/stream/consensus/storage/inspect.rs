@@ -107,8 +107,7 @@ pub struct StreamInspection {
     pub retained_records: u64,
     pub retained_bytes: u64,
     pub ownership: OwnershipInfo,
-    /// Parking is runtime-only and cleared across restarts, so always `false`
-    /// on a stopped directory.
+    /// A valid park mark matches the replica's selected snapshot.
     pub parked: bool,
     pub quarantined: bool,
     pub quarantine_reason: Option<String>,
@@ -203,7 +202,7 @@ impl fmt::Display for InspectReport {
             )?;
             writeln!(
                 f,
-                "  status: parked={} (not persisted across restarts) quarantined={} reason={:?}",
+                "  status: parked={} quarantined={} reason={:?}",
                 s.parked, s.quarantined, s.quarantine_reason
             )?;
         }
@@ -225,6 +224,7 @@ pub(in crate::stream::consensus) fn inspect(
         ));
     }
     let objects = Objects::open_readonly(media.data());
+    let quarantine = media.quarantined_streams()?;
     let (state, slot) = segmented::open_readonly(&media, &objects)?;
     let mut streams = Vec::new();
     for (&stream, genesis) in &state.genesis {
@@ -258,7 +258,10 @@ pub(in crate::stream::consensus) fn inspect(
                 .map(|stage| stage.target.to_vec()),
         };
 
-        let inspection = if log.ownership.generation().is_none() {
+        let parked = log.ownership.generation().is_some_and(|generation| {
+            snapshot::is_parked(media.data(), stream, generation, log.snapshot, &objects)
+        });
+        let mut inspection = if log.ownership.generation().is_none() {
             StreamInspection {
                 stream: stream_uuid(stream),
                 genesis_voters: genesis.voters.to_vec(),
@@ -317,7 +320,7 @@ pub(in crate::stream::consensus) fn inspect(
                     retained_records: view.retained_records,
                     retained_bytes: view.retained_bytes,
                     ownership,
-                    parked: false,
+                    parked,
                     quarantined: false,
                     quarantine_reason: None,
                 },
@@ -348,6 +351,10 @@ pub(in crate::stream::consensus) fn inspect(
                 },
             }
         };
+        if let Some(reason) = quarantine.get(&stream) {
+            inspection.quarantined = true;
+            inspection.quarantine_reason = Some(reason.clone());
+        }
         streams.push(inspection);
     }
     Ok(InspectReport {

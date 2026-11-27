@@ -170,6 +170,12 @@ pub(super) struct Media {
     identity: Identity,
 }
 
+impl Media {
+    pub(super) fn quarantined_streams(&self) -> io::Result<BTreeMap<StreamId, String>> {
+        Ok(self.enrollment.quarantine_store()?.streams())
+    }
+}
+
 /// The media incarnations a keeper has seen its peers under, trusted on
 /// first contact. It lives in the registry, beside the enrollment, so a
 /// peer's records of this keeper outlive this keeper's media: a keeper

@@ -352,33 +352,10 @@ impl Pin {
         else {
             return Ok(None);
         };
-        let path = ownership::directory(&disk.path, stream, generation).join(PARK_FILE);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let (body, crc) = bytes
-            .split_last_chunk::<4>()
-            .ok_or_else(|| invalid("short park mark"))?;
-        if crc32fast::hash(body) != u32::from_le_bytes(*crc) || !body.starts_with(PARK_MARK) {
-            return Err(invalid("park mark failed its checksum"));
-        }
-        let mark: Mark = options()
-            .with_limit(MAX_MARK_BYTES)
-            .deserialize(&body[PARK_MARK.len()..])
-            .map_err(io::Error::other)?;
         let current = disk.log(stream, |log| log.snapshot);
-        let same = match (mark.selected, current) {
-            (None, None) => true,
-            (Some(mark), Some(current)) => {
-                mark.log_id == current.log_id && mark.digest == current.digest
-            }
-            _ => false,
-        };
-        if !same {
+        let Some(mark) = matching_park_mark(&disk.path, stream, generation, current)? else {
             return Ok(None);
-        }
+        };
         let files = disk.objects.hold(stream);
         let segments = mark
             .segments
@@ -416,6 +393,50 @@ struct Mark {
     selected: Option<Selected>,
     finalized: Option<Configuration>,
     segments: Vec<u64>,
+}
+
+fn matching_park_mark(
+    root: &Path,
+    stream: StreamId,
+    generation: u64,
+    current: Option<Selected>,
+) -> io::Result<Option<Mark>> {
+    let path = ownership::directory(root, stream, generation).join(PARK_FILE);
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let (body, crc) = bytes
+        .split_last_chunk::<4>()
+        .ok_or_else(|| invalid("short park mark"))?;
+    if crc32fast::hash(body) != u32::from_le_bytes(*crc) || !body.starts_with(PARK_MARK) {
+        return Err(invalid("park mark failed its checksum"));
+    }
+    let mark: Mark = options()
+        .with_limit(MAX_MARK_BYTES)
+        .deserialize(&body[PARK_MARK.len()..])
+        .map_err(io::Error::other)?;
+    let matches = match (mark.selected, current) {
+        (None, None) => true,
+        (Some(mark), Some(current)) => {
+            mark.log_id == current.log_id && mark.digest == current.digest
+        }
+        _ => false,
+    };
+    Ok(matches.then_some(mark))
+}
+
+pub(super) fn is_parked(
+    root: &Path,
+    stream: StreamId,
+    generation: u64,
+    current: Option<Selected>,
+    objects: &super::objects::Objects,
+) -> bool {
+    matching_park_mark(root, stream, generation, current).is_ok_and(|mark| {
+        mark.is_some_and(|mark| mark.segments.iter().all(|&id| objects.segment(id).is_ok()))
+    })
 }
 
 /// Captures an applied state before handing snapshot work to a background task.

@@ -286,6 +286,8 @@ async fn a_parked_stream_stays_parked_across_a_restart_and_opens_lazily() {
 
     for id in [a, b, c] {
         cluster.running.remove(&id).unwrap().stop().await;
+        let inspection = cluster.configs[&id].inspect(Some(parked)).unwrap();
+        assert!(inspection.streams[0].parked);
         cluster.restart(id).await;
     }
     // Roll and checkpoint segments while the parked copies stay closed and
