@@ -595,6 +595,16 @@ async fn offline_inspect_verify_and_dump_segment() {
 
     let target = voters[0];
     let config = cluster.configs[&target].clone();
+    // A follower applies the last entry after the leader answered.
+    let group = cluster.group(target, stream).await;
+    timeout(WAIT, async {
+        while group.state.head() != Ok(Lsn(8)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the target applied every record");
+    drop(group);
 
     // Must refuse while the keeper is still running (LOCK held).
     assert!(config.inspect(None).is_err());

@@ -73,6 +73,12 @@ const ALLOWED: &[&str] = &[
     // directory, or after a failed test dropped it.
     "object cleanup deferred&&No such file or directory",
     "could not record peer incarnations&&No such file or directory",
+    // Liveness leases: a test that stops or cuts off the catalog, fences a
+    // keeper, decommissions one, or recovers over lost voters.
+    "liveness lease lapsed",
+    "the catalog bumped this keeper's epoch",
+    "the catalog fenced this copy",
+    "the catalog knows this keeper under another incarnation",
     // Offload tests: an injected corrupt object, and a store not yet
     // reachable.
     "offloaded read failed&&offloaded object checksum mismatch",
