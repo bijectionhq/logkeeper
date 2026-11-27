@@ -117,7 +117,10 @@ async fn parking_stops_the_closed_group_before_it_returns() {
 /// leader's heartbeats for long: it reopens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_parked_by_a_declined_park_reopens() {
-    let mut cluster = parking_cluster(None).await;
+    // A leader parks past a follower it counts dead. Under machine load a
+    // 2 s repair delay can count the declining follower dead, so this test
+    // keeps every keeper alive for a minute.
+    let mut cluster = parking_cluster(Some(60)).await;
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(209);
@@ -128,8 +131,8 @@ async fn a_follower_parked_by_a_declined_park_reopens() {
     let engine_a = cluster.running[&a].engine.clone();
     let engine_b = cluster.running[&b].engine.clone();
     let group_c = cluster.group(c, stream).await;
-    // `a` and `b` are idle; `c` keeps serving a client and declines.
-    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // `c` keeps serving a client from the start, so every park round,
+    // whether this test's or the repair loop's, finds `b` idle and `c` not.
     let busy = CancellationToken::new();
     tokio::spawn({
         let busy = busy.clone();
@@ -140,9 +143,15 @@ async fn a_follower_parked_by_a_declined_park_reopens() {
             }
         }
     });
-    engine_a.park_idle().await;
+    timeout(WAIT, async {
+        while !engine_b.parked.read().contains_key(&stream) {
+            engine_a.park_idle().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("b accepted a park that c declined");
     assert!(engine_a.groups.lock().await.contains_key(&stream));
-    assert!(engine_b.parked.read().contains_key(&stream));
 
     timeout(WAIT, async {
         while engine_b.parked.read().contains_key(&stream)
