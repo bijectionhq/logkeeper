@@ -231,6 +231,11 @@ impl LocalCluster {
         &self.keepers
     }
 
+    /// The directory holding every keeper's data, registry and credentials.
+    pub fn directory(&self) -> &Path {
+        self.dir.path()
+    }
+
     /// The contract configuration for streams placed on the three voters.
     pub fn journal_config(&self, quota_bytes: u64, max_record_bytes: usize) -> JournalConfig {
         JournalConfig {

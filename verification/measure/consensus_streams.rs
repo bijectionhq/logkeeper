@@ -3,8 +3,9 @@
 //! Starts a local cluster of three voters and a catalog keeper in one process,
 //! creates `--streams` streams, and keeps `--active` of them writing
 //! `--batch`-record batches for `--seconds`. Prints one JSON line with commits
-//! per second, batch latency percentiles and process CPU time, so runs with
-//! more idle streams show the per-stream cost.
+//! per second, batch latency percentiles, process CPU time, peak resident
+//! memory and the bytes the keepers hold on disk, so runs with more idle
+//! streams show the per-stream cost.
 //!
 //! ```sh
 //! cargo run --release --features consensus-testing --example consensus-streams -- \
@@ -56,10 +57,40 @@ fn args() -> Args {
     args
 }
 
-fn cpu_seconds() -> f64 {
+fn usage() -> libc::rusage {
     // SAFETY: getrusage writes into the zeroed struct it is given.
     let mut usage = unsafe { std::mem::zeroed::<libc::rusage>() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    usage
+}
+
+/// Peak resident memory of the whole process, in MiB.
+fn peak_rss_mib() -> f64 {
+    let peak = usage().ru_maxrss as f64;
+    // macOS reports bytes, Linux KiB.
+    if cfg!(target_vendor = "apple") {
+        peak / (1024.0 * 1024.0)
+    } else {
+        peak / 1024.0
+    }
+}
+
+/// Bytes of every regular file under `path`.
+fn disk_bytes(path: &std::path::Path) -> u64 {
+    std::fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|entry| match entry.file_type() {
+                Ok(kind) if kind.is_dir() => disk_bytes(&entry.path()),
+                Ok(_) => entry.metadata().map_or(0, |metadata| metadata.len()),
+                Err(_) => 0,
+            })
+            .sum()
+    })
+}
+
+fn cpu_seconds() -> f64 {
+    let usage = usage();
     let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
     seconds(usage.ru_utime) + seconds(usage.ru_stime)
 }
@@ -125,7 +156,8 @@ async fn main() {
     println!(
         "{{\"streams\": {}, \"active\": {}, \"batch\": {}, \"record\": {}, \"seconds\": {:.2}, \
          \"batches_per_second\": {:.1}, \"records_per_second\": {:.1}, \"p50_ms\": {:.2}, \
-         \"p99_ms\": {:.2}, \"cpu_cores\": {:.2}}}",
+         \"p99_ms\": {:.2}, \"cpu_cores\": {:.2}, \"peak_rss_mib\": {:.1}, \
+         \"disk_mib\": {:.1}}}",
         args.streams,
         args.active,
         args.batch,
@@ -136,6 +168,8 @@ async fn main() {
         percentile(0.5),
         percentile(0.99),
         cpu / elapsed,
+        peak_rss_mib(),
+        disk_bytes(cluster.directory()) as f64 / (1024.0 * 1024.0),
     );
     cluster.shutdown().await.unwrap();
 }
