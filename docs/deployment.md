@@ -153,14 +153,44 @@ Migrating from a single catalog keeper is a full stop: stop every keeper, add
 `catalog_voters` to every keeper and consumer config, then start them all. The
 `catalog` keeper must be up for the first start. Before bootstrapping five
 voters, upgrade all keepers and consumers to a release that supports five.
-An existing three-voter catalog can grow to five online after finalizing
-cluster level 8. Enroll two additional keepers in the inventory, then use
-`logkeeper admin replace` for stream `ffffffff-ffff-ffff-ffff-ffffffffffff`
-with the current revision and a five-voter roster that includes all three
-current voters. The catalog installs both added replicas before committing
-the joint membership. The config continues to name the original genesis
-roster. See the README section "Keeper-hosted
-consensus streams".
+See the README section "Keeper-hosted consensus streams".
+
+The examples and the Kubernetes manifests list five catalog voters: five of
+the six keepers, two each in two zones and one in the third. A three-voter
+catalog still starts, but every keeper logs a warning at start, the catalog's
+leader repeats it every few minutes, `logkeeper_consensus_catalog_voters`
+reads 3, and the alert `LogkeeperCatalogBelowFiveVoters` fires after an hour.
+The gauge reports the catalog's live membership as each keeper knows it (its
+catalog replica's finalized configuration, else the configured genesis), so
+it reads 5 once the catalog grew, even though the configs still name three.
+
+#### Growing the catalog from three to five voters
+
+The catalog grows online, through joint consensus, while it keeps serving
+leases, creation and staging:
+
+1. Upgrade every keeper and consumer to a release with cluster level 8, then
+   finalize it: `logkeeper admin finalize-version`. A catalog refuses to grow
+   before that (`Unsupported`).
+2. Pick two more voters among the enrolled keepers so that no failure domain
+   holds more than two of the five. Add keepers first if the inventory has
+   fewer than five (adding a keeper restarts every keeper, one at a time).
+3. Read the catalog's current revision: `logkeeper admin status --stream
+   ffffffff-ffff-ffff-ffff-ffffffffffff`.
+4. Grow it: `logkeeper admin replace --stream
+   ffffffff-ffff-ffff-ffff-ffffffffffff --expected REVISION --voters
+   A,B,C,D,E`, the three current voters and the two new ones. The catalog
+   installs replicas on both new voters before it commits the joint
+   membership, then finalizes the five. A retried command with the same
+   revision answers the configuration already reached.
+5. Check `logkeeper_consensus_catalog_voters` reads 5 on every keeper and the
+   alert clears.
+
+Leave `catalog_voters` in every config as it was: it names the catalog's
+genesis, which a grown catalog keeps, and a keeper refuses a configuration
+that differs from its durable genesis. Clients find the new voters through
+the old ones' leader hints. Only the width can grow; a catalog never shrinks
+from five to three.
 
 ### Co-locating with RTDB
 

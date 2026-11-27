@@ -220,7 +220,12 @@ distinct domains to survive the loss of any two domains. The catalog is the conf
 whose leases every keeper needs to lead (see "Lost voters that never
 stopped" below), so a keeper refuses to start with the `catalog` keeper
 alone unless its configuration sets `allow_single_catalog: true`, for
-development clusters.
+development clusters. A three-voter catalog still starts, with a warning at
+every start (and from its leader every few minutes), the gauge
+`logkeeper_consensus_catalog_voters` at 3 and the alert
+`LogkeeperCatalogBelowFiveVoters`. Grow it to five online through joint
+consensus (`docs/deployment.md`, "Growing the catalog from three to five
+voters"); the gauge reports the live membership, so it reads 5 once grown.
 
 `lease_millis` (30000) is how long a keeper's liveness lease lasts and
 `lease_drift_margin_millis` (3000) how much shorter its holder counts it;
@@ -269,9 +274,10 @@ read the stream but not write, seal, trim or delete it.
 **Migration:** stop every keeper, add `catalog_voters` to every keeper and
 consumer configuration, and restart. To bootstrap a five-voter catalog,
 use a release that supports five on every keeper and consumer before this
-first start. The catalog's genesis roster is fixed after bootstrap. Changing
-the list on an established replicated catalog cannot resize it. Use normal
-Raft membership replacement to move catalog replicas at the same width.
+first start. The catalog's genesis roster is fixed after bootstrap: changing
+the list on an established replicated catalog is refused. A three-voter
+catalog grows to five online instead, through joint consensus, once level 8
+is finalized (`docs/deployment.md`).
 The first record of the replicated
 catalog is a seed that the `catalog` keeper appends as its leader: a
 checkpoint of its single-keeper entries, which may be empty, and a seed
@@ -1635,6 +1641,7 @@ rules read the keeper's own gates rather than copying them:
 | `LogkeeperLeaseLapsed` | critical | an enforced lease lapsed for 30 s | the keeper leads and serves nothing; if every keeper fires, restore the catalog's majority |
 | `LogkeeperLeaseRenewalFailures` | warning | over 5 renewals failed in 5 m | `logkeeper_consensus_lease_age_seconds` shows how close the lease is to lapsing |
 | `LogkeeperLeaseRefused` | warning | the catalog refused a renewal | an epoch bump (fence, recovery, new media) or replaced media; replaced media needs a new keeper ID |
+| `LogkeeperCatalogBelowFiveVoters` | warning | `logkeeper_consensus_catalog_voters` below 5 for 1 h | grow the catalog to five (`docs/deployment.md`); one voter is a development catalog keeper |
 
 `deploy/grafana/logkeeper.json` (data source and keeper variables) charts the
 same families in four rows: overview, writes and commit stages, WAL and disk,

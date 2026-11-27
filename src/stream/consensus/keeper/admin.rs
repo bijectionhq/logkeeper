@@ -1156,6 +1156,7 @@ impl Engine {
             repair_oldest_secs: repair_oldest.as_secs_f64(),
             repair_backoff,
             lease: self.lease_scrape(),
+            catalog_voters: self.catalog_voter_count().await,
         };
         (report, scrape)
     }

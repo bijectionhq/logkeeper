@@ -575,6 +575,15 @@ impl Config {
                 "five catalog voters must be spread across failure domains",
             ));
         }
+        if self.catalog_voters.is_some_and(|voters| voters.len() == 3) {
+            tracing::warn!(
+                keeper = %id,
+                "the catalog's genesis has three voters, so it survives the loss of only one. \
+                 New deployments use five; grow this catalog to five online \
+                 (docs/deployment.md, \"Growing the catalog from three to five voters\"). \
+                 logkeeper_consensus_catalog_voters reports the live membership: five once grown"
+            );
+        }
         let lease = Arc::new(lease::Lease::open(
             &self.data,
             Duration::from_millis(self.lease_millis),

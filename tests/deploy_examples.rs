@@ -47,11 +47,15 @@ fn check_keeper(config: &Config) {
         .catalog_voters
         .expect("production runs a replicated catalog");
     assert!(voters.is_sorted() && voters.contains(&config.catalog));
-    let domains = voters
-        .iter()
-        .map(|voter| &config.domains[voter])
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(domains.len(), 3);
+    // New deployments run five catalog voters, at most two in any failure
+    // domain, so losing one domain leaves a majority.
+    assert_eq!(voters.len(), 5);
+    let mut per_domain = std::collections::BTreeMap::new();
+    for voter in voters.iter() {
+        *per_domain.entry(&config.domains[voter]).or_insert(0) += 1;
+    }
+    assert!(per_domain.len() >= 3);
+    assert!(per_domain.values().all(|count| *count <= 2));
     for uri in config
         .readers
         .iter()

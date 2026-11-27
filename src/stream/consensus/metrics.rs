@@ -1116,6 +1116,16 @@ impl Metrics {
             let _ = writeln!(out, "# TYPE {name} {kind}");
             let _ = writeln!(out, "{name} {value}");
         }
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_catalog_voters The catalog's voters as this keeper knows them: five in production, three for a catalog still to grow, one for a development catalog keeper."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_catalog_voters gauge");
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_catalog_voters {}",
+            scrape.catalog_voters
+        );
         // Absent until a renewal was granted, so an alert on age needs no
         // sentinel.
         if let Some(age) = lease.age_secs {
@@ -1391,6 +1401,9 @@ pub(super) struct ScrapeSnapshot {
     pub repair_backoff: usize,
     /// The keeper's liveness lease with the catalog.
     pub lease: LeaseScrape,
+    /// The catalog's voters as this keeper knows them
+    /// (`Engine::catalog_voter_count`).
+    pub catalog_voters: usize,
 }
 
 /// What the scrape reports of the keeper's liveness lease.
@@ -1553,6 +1566,7 @@ mod tests {
                 epoch: 3,
                 ..Default::default()
             },
+            catalog_voters: 5,
         }
     }
 

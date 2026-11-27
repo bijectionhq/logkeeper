@@ -139,6 +139,9 @@ async fn a_live_catalog_grows_through_joint_consensus_and_reopens() {
     client.create(before, data, 4096).await.unwrap();
     let original = client.configuration(STREAM).await.unwrap();
     assert_eq!(original.voters, initial);
+    // Each keeper reports the catalog's live membership
+    // (`logkeeper_consensus_catalog_voters`): three until it grows.
+    assert_eq!(cluster.running[&a].engine.catalog_voter_count().await, 3);
     assert_eq!(
         client.replace(STREAM, original.revision, expanded).await,
         Err(JournalError::Unsupported),
@@ -149,6 +152,16 @@ async fn a_live_catalog_grows_through_joint_consensus_and_reopens() {
         .await
         .unwrap();
     assert_eq!(current.voters, expanded);
+    for voter in expanded {
+        let engine = &cluster.running[&voter].engine;
+        timeout(WAIT, async {
+            while engine.catalog_voter_count().await != 5 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a grown catalog reports five voters, though configs name three");
+    }
     assert_eq!(
         client.replace(STREAM, original.revision, expanded).await,
         Ok(current),

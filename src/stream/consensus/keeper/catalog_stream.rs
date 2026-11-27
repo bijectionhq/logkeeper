@@ -276,6 +276,22 @@ impl Engine {
             .ok_or_else(|| invalid("keeper has no replicated catalog"))
     }
 
+    /// The catalog's voters as this keeper knows them: the finalized
+    /// membership of its catalog replica, which counts a catalog grown from
+    /// three to five; the configured genesis without one; one for a single
+    /// catalog keeper.
+    pub(super) async fn catalog_voter_count(&self) -> usize {
+        let Some(catalog) = &self.catalog_stream else {
+            return 1;
+        };
+        self.catalog_group()
+            .await
+            .and_then(|group| group.state.finalized())
+            .map_or(catalog.genesis.voters.len(), |configuration| {
+                configuration.voters.len()
+            })
+    }
+
     async fn catalog_group(&self) -> Option<std::sync::Arc<Group>> {
         self.groups.lock().await.get(&STREAM).cloned()
     }
@@ -973,6 +989,21 @@ impl Engine {
         };
         if group.raft.metrics().borrow_watched().state != ServerState::Leader {
             return;
+        }
+        // The leader keeps reminding while the live catalog has three voters.
+        if group
+            .state
+            .finalized()
+            .is_some_and(|configuration| configuration.voters.len() == 3)
+            && let Some(dropped) =
+                crate::stream::consensus::logging::rate_limit("catalog.three_voters", Some(STREAM))
+        {
+            tracing::warn!(
+                keeper = %self.id,
+                dropped = dropped,
+                "the catalog runs three voters and survives the loss of only one: grow it to five \
+                 (docs/deployment.md, \"Growing the catalog from three to five voters\")"
+            );
         }
         if let Ok((fold, _)) = self.caught_up(catalog, &group).await
             && fold.seeded

@@ -266,6 +266,15 @@ groups:
           summary: "The catalog refused {{ $labels.instance }}'s lease renewal"
           description: "The keeper's epoch was bumped (an operator fence, a recovery that declared it dead, or new media under its ID), or another media incarnation replaced it. A bumped keeper rejoins and certifies its copies again; replaced media never renews: give it a new keeper ID."
 
+      - alert: LogkeeperCatalogBelowFiveVoters
+        expr: max(logkeeper_consensus_catalog_voters) < 5
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The catalog runs {{ $value }} voter(s); production runs five"
+          description: "Three catalog voters survive the loss of only one, and the catalog is the configuration authority every keeper's lease depends on. Grow the catalog to five online (docs/deployment.md, \"Growing the catalog from three to five voters\"). One voter is a development catalog keeper, which production refuses."
+
   - name: logkeeper-offload
     rules:
       - alert: LogkeeperOffloadLagging

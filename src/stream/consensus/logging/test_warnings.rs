@@ -79,6 +79,9 @@ const ALLOWED: &[&str] = &[
     "the catalog bumped this keeper's epoch",
     "the catalog fenced this copy",
     "an operator recovery fenced the lost voters of this copy by identity",
+    // A test catalog of three voters, as a cluster still to grow to five.
+    "the catalog's genesis has three voters",
+    "the catalog runs three voters",
     "the catalog knows this keeper under another incarnation",
     // Offload tests: an injected corrupt object, and a store not yet
     // reachable.
