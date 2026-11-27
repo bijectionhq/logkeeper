@@ -7,6 +7,9 @@
 //! client principals and can stop and restart individual keepers.
 //! [`LocalCluster::start_replicated_catalog`] instead hosts the catalog as a
 //! consensus stream on two voters and the catalog keeper.
+//! [`LocalCluster::start_spared`] adds two spare keepers in the second and
+//! third voters' domains, so that a stream that lost two voters can be
+//! recovered with [`LocalCluster::recover_stream`].
 //!
 //! Its keepers flush with plain `fsync` unless the process installed a
 //! [`SyncMode`] before starting the cluster, so tests stay fast on macOS.
@@ -36,8 +39,8 @@ use crate::stream::{
 };
 
 use super::{
-    AdminConfig, Config, ConsensusJournal, Credentials, Domains, JournalConfig, Keepers, SyncMode,
-    TimedAuthority,
+    AdminConfig, Config, ConsensusJournal, Credentials, Domains, JournalConfig, Keepers, Recovery,
+    RecoveryReport, SyncMode, TimedAuthority,
     storage::{Authority, Provision, hex, sha256},
 };
 
@@ -46,7 +49,8 @@ struct Running {
     task: JoinHandle<io::Result<()>>,
 }
 
-/// Three voters and a catalog keeper serving on loopback.
+/// Three voters and a catalog keeper serving on loopback, and optionally
+/// two spare keepers.
 pub struct LocalCluster {
     verifier: Arc<dyn TimedOriginalVerifier>,
     offset: Arc<AtomicI64>,
@@ -57,6 +61,7 @@ pub struct LocalCluster {
     running: BTreeMap<Uuid, Running>,
     keepers: Keepers,
     voters: [Uuid; 3],
+    spares: Vec<Uuid>,
     catalog: Uuid,
     catalog_voters: Option<[Uuid; 3]>,
     issued: Mutex<BTreeMap<String, Credentials>>,
@@ -66,26 +71,34 @@ impl LocalCluster {
     /// Starts the keepers. Every listed principal may read, write and
     /// administer streams.
     pub async fn start(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false, 600, false).await
+        Self::start_with(principals, false, 600, false, false).await
     }
 
     /// Starts the keepers with a replicated catalog on voters 1 and 2 and
     /// the catalog keeper, which seeds it.
     pub async fn start_replicated_catalog(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false, 600, true).await
+        Self::start_with(principals, false, 600, true, false).await
     }
 
     /// Starts the keepers so that a stream idle for `park_after_secs` is
     /// parked on every voter.
     pub async fn start_parking(principals: &[&str], park_after_secs: u64) -> io::Result<Self> {
-        Self::start_with(principals, false, park_after_secs, false).await
+        Self::start_with(principals, false, park_after_secs, false, false).await
     }
 
     /// Starts the keepers with timed-original authority: each keeper signs
     /// with its own Ed25519 key and samples a wall clock shifted by
     /// [`LocalCluster::shift_timed_clock`].
     pub async fn start_timed(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, true, 600, false).await
+        Self::start_with(principals, true, 600, false, false).await
+    }
+
+    /// Starts the keepers and two spares: keepers 5 and 6, in the domains of
+    /// voters 2 and 3. Five keepers in three domains, plus the catalog
+    /// keeper, are enough to recover a stream that lost voters 2 and 3 onto
+    /// voter 1 and the spares.
+    pub async fn start_spared(principals: &[&str]) -> io::Result<Self> {
+        Self::start_with(principals, false, 600, false, true).await
     }
 
     async fn start_with(
@@ -93,6 +106,7 @@ impl LocalCluster {
         timed: bool,
         park_after_secs: u64,
         replicated: bool,
+        spared: bool,
     ) -> io::Result<Self> {
         let dir = tempfile::tempdir()?;
         let roots = dir.path().join("ca.pem");
@@ -100,10 +114,26 @@ impl LocalCluster {
         let voters = [1, 2, 3].map(Uuid::from_u128);
         let catalog = Uuid::from_u128(4);
         let catalog_voters = replicated.then_some([voters[0], voters[1], catalog]);
-        let roster = voters.into_iter().chain([catalog]).collect::<Vec<_>>();
+        let spares = if spared {
+            vec![Uuid::from_u128(5), Uuid::from_u128(6)]
+        } else {
+            Vec::new()
+        };
+        let roster = voters
+            .into_iter()
+            .chain([catalog])
+            .chain(spares.iter().copied())
+            .collect::<Vec<_>>();
         let domains: Domains = roster
             .iter()
-            .zip(["zone-a", "zone-b", "zone-c", "directory"])
+            .zip([
+                "zone-a",
+                "zone-b",
+                "zone-c",
+                "directory",
+                "zone-b",
+                "zone-c",
+            ])
             .map(|(id, domain)| (*id, domain.into()))
             .collect();
         let enrollment = dir.path().join("registry");
@@ -159,6 +189,7 @@ impl LocalCluster {
             running: BTreeMap::new(),
             keepers: keepers.clone(),
             voters,
+            spares,
             catalog,
             catalog_voters,
             issued: Mutex::default(),
@@ -242,6 +273,12 @@ impl LocalCluster {
         self.voters
     }
 
+    /// The spare keepers of a cluster started with
+    /// [`LocalCluster::start_spared`]; empty otherwise.
+    pub fn spares(&self) -> &[Uuid] {
+        &self.spares
+    }
+
     pub fn catalog(&self) -> Uuid {
         self.catalog
     }
@@ -287,7 +324,7 @@ impl LocalCluster {
     }
 
     /// A contract configuration that places each stream on three of the
-    /// four keepers, each in its own failure domain.
+    /// keepers, each in its own failure domain.
     pub fn placement_config(&self, quota_bytes: u64, max_record_bytes: usize) -> JournalConfig {
         let domains = self
             .configs
@@ -384,6 +421,32 @@ impl LocalCluster {
         let task = tokio::spawn(config.serve(listener, stop.clone()));
         self.running.insert(keeper, Running { stop, task });
         Ok(())
+    }
+
+    /// Runs `logkeeper keeper recover-stream --acknowledge-data-loss --lost
+    /// LOST` on the stopped keeper `survivor`, which then has to be
+    /// restarted. The two replacements are chosen among the live keepers in
+    /// free domains, such as the spares of [`LocalCluster::start_spared`].
+    #[allow(clippy::field_reassign_with_default)]
+    pub async fn recover_stream(
+        &self,
+        survivor: Uuid,
+        stream: journal_contract::StreamId,
+        mut lost: [Uuid; 2],
+    ) -> io::Result<RecoveryReport> {
+        if self.running.contains_key(&survivor) {
+            return Err(io::Error::other("stop the surviving keeper first"));
+        }
+        lost.sort_unstable();
+        // Built by assignment: the struct has a field private to unit tests.
+        let mut recovery = Recovery::default();
+        recovery.acknowledge_data_loss = true;
+        recovery.lost = Some(lost);
+        self.configs
+            .get(&survivor)
+            .ok_or_else(|| io::Error::other("unknown keeper"))?
+            .recover_stream(stream, recovery)
+            .await
     }
 
     /// Stops every keeper.

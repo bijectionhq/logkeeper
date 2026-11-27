@@ -1,0 +1,97 @@
+//! A consumer recovers a stream that lost two of its three voters on a
+//! `LocalCluster` with spares, through the generic journal contract: the
+//! operator runs `recover-stream` on the stopped survivor, a writer meets
+//! `Recovered`, acknowledges it, seals again and keeps writing on the
+//! survivor and two spares.
+#![cfg(feature = "consensus-testing")]
+
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use journal_contract::{Epoch, Journal, JournalError, Lsn, StreamId};
+use logkeeper::stream::consensus::testing::LocalCluster;
+
+const PRINCIPAL: &str = "urn:logkeeper:client:local-recovery";
+const DEADLINE: Duration = Duration::from_secs(60);
+
+async fn retry<T, F: std::future::Future<Output = Result<T, JournalError>>>(
+    call: impl Fn() -> F,
+) -> Result<T, JournalError> {
+    let started = Instant::now();
+    loop {
+        match call().await {
+            Err(JournalError::Unavailable) if started.elapsed() < DEADLINE => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            result => return result,
+        }
+    }
+}
+
+fn record(at: u64) -> Bytes {
+    Bytes::from(format!("record-{at}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spared_cluster_recovers_a_stream_that_lost_two_voters() {
+    let mut cluster = LocalCluster::start_spared(&[PRINCIPAL]).await.unwrap();
+    let [survivor, b, c] = cluster.voters();
+    assert_eq!(cluster.spares().len(), 2);
+    let config = cluster.journal_config(1 << 20, 1024);
+    let journal = cluster.journal(PRINCIPAL, &config).unwrap();
+    let stream = StreamId(0x5eed);
+    retry(|| journal.create(stream)).await.unwrap();
+    assert_eq!(retry(|| journal.seal(stream, Epoch(1))).await, Ok(Lsn(0)));
+    for at in 1..=5 {
+        assert_eq!(
+            retry(|| journal.append(stream, Epoch(1), Lsn(at), record(at))).await,
+            Ok(Lsn(at))
+        );
+    }
+    // Every voter holds the records before two of them are lost.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    cluster.stop(b).await.unwrap();
+    cluster.stop(c).await.unwrap();
+    assert!(
+        cluster
+            .recover_stream(survivor, stream, [b, c])
+            .await
+            .is_err(),
+        "a running survivor must not be recovered"
+    );
+    cluster.stop(survivor).await.unwrap();
+    let report = cluster
+        .recover_stream(survivor, stream, [c, b])
+        .await
+        .unwrap();
+    assert!(report.written);
+    assert_eq!(report.head, Lsn(5));
+    // The replacements are two live keepers outside the lost configuration,
+    // in domains distinct from each other and from the survivor's.
+    assert!(report.voters.contains(&survivor));
+    assert!(!report.voters.contains(&b) && !report.voters.contains(&c));
+    cluster.restart(survivor).await.unwrap();
+
+    assert_eq!(
+        retry(|| journal.seal(stream, Epoch(2))).await,
+        Err(JournalError::Recovered { head: Lsn(5) })
+    );
+    assert_eq!(
+        retry(|| journal.acknowledge_recovery(stream)).await,
+        Ok(Lsn(5))
+    );
+    let epoch = Epoch(report.epoch.0 + 1);
+    assert_eq!(retry(|| journal.seal(stream, epoch)).await, Ok(Lsn(5)));
+    assert_eq!(
+        retry(|| journal.append(stream, epoch, Lsn(6), record(6))).await,
+        Ok(Lsn(6))
+    );
+    let page = retry(|| journal.read(stream, Lsn(1), 10, Duration::ZERO))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.records,
+        (1..=6).map(|at| (Lsn(at), record(at))).collect::<Vec<_>>()
+    );
+    cluster.shutdown().await.unwrap();
+}
