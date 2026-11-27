@@ -3070,6 +3070,79 @@ async fn a_leader_with_slow_media_hands_off_refuses_hand_offs_and_accepts_nothin
     cluster.stop_all().await;
 }
 
+/// A leader whose own vote regressed (its campaign at a higher term reached
+/// a peer, but its save never landed) and that then won a lower term steps
+/// down when that peer answers with the higher vote, and campaigns above
+/// it. OpenRaft alone kept leading under the lower vote, tripping its
+/// "leader.vote >= state.vote" debug assertion and stopping the core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_steps_down_when_a_peer_holds_its_own_newer_vote() {
+    use openraft::raft::VoteRequest;
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(59);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let leader = cluster.leader_after_head(&journal, stream).await;
+    let follower = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    let led = cluster.group(leader, stream).await;
+    let term = led.raft.metrics().borrow_watched().current_term;
+    // The follower now holds the leader's vote at a term the leader never
+    // persisted, as after the leader's failed vote save.
+    let lost = term + 50;
+    let copy = cluster.group(follower, stream).await;
+    cluster.running[&follower]
+        .engine
+        .peer(
+            leader.as_u128(),
+            copy.genesis.clone(),
+            PeerRequest::Vote(VoteRequest::new(
+                openraft::Vote::new(lost, leader.as_u128()),
+                copy.raft
+                    .metrics()
+                    .borrow_watched()
+                    .last_log_index
+                    .and(copy.state.applied()),
+            )),
+            None,
+        )
+        .await
+        .unwrap();
+    let fence = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(9))
+        .await
+        .unwrap()
+        .fence;
+    timeout(WAIT, async {
+        loop {
+            if journal
+                .append(stream, fence, Lsn(1), Bytes::from_static(b"one"))
+                .await
+                == Ok(Lsn(1))
+                && cluster
+                    .group(cluster.leader(stream).await, stream)
+                    .await
+                    .raft
+                    .metrics()
+                    .borrow_watched()
+                    .current_term
+                    > lost
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the stream is led above the regressed vote");
+    assert!(
+        led.raft.metrics().borrow_watched().running_state.is_ok(),
+        "the former leader's core kept running"
+    );
+    cluster.stop_all().await;
+}
+
 /// Slow keepers still vote. When the media of two of three voters stall
 /// together and the third, responsive, leader stops, the two slow voters
 /// still elect one of themselves; if they refused each other's votes, the

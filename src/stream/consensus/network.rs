@@ -1771,11 +1771,18 @@ impl Peer {
         } else {
             &self.network.control
         };
+        let sender = match &frame {
+            Frame::Peer(_, PeerRequest::Append(request)) => request.vote.leader_id().voted_for,
+            _ => unreachable!("an append part is an append frame"),
+        };
         match rpc
             .call(uuid::Uuid::from_u128(self.target), frame, option.hard_ttl())
             .await
         {
-            Ok(AppendReply::Raft(Ok(reply))) => Ok(reply.into_append_result(range.0, range.1)),
+            Ok(AppendReply::Raft(Ok(reply))) => {
+                Ok(disown_regressed_vote(reply, sender, self.target)
+                    .into_append_result(range.0, range.1))
+            }
             Ok(AppendReply::Raft(Err(error))) => Err(unreachable(&error).into()),
             Ok(AppendReply::Busy) => {
                 super::metrics::count(&self.network.state.metrics().peer_busy);
@@ -1792,6 +1799,34 @@ impl Peer {
                 Err(unreachable(&error).into())
             }
         }
+    }
+}
+
+/// A follower that answers a leader with a higher vote naming the leader
+/// itself holds a vote the leader cast and lost: OpenRaft sends a
+/// candidate's vote requests before its own vote is durable, so when that
+/// save fails (a disk below its protocol floor), the core stops and the
+/// replica reopens from an older vote, while peers keep the newer one. The
+/// leader then wins a lower term with one voter, and the other answers
+/// `HigherVote` with the leader's own id. OpenRaft takes a higher vote that
+/// names this node as its own campaign and keeps leading under the old one
+/// (a debug assertion, "leader.vote >= state.vote"), so that voter never
+/// accepts it again.
+///
+/// The reply is passed on as the same term voting for the follower that
+/// sent it, which steps the leader down and lets it campaign above that
+/// term. That follower voted for this node in that term, so it cannot be a
+/// candidate there, and no vote is granted on the strength of it.
+fn disown_regressed_vote(
+    reply: AppendEntriesResponse<RaftTypes>,
+    sender: NodeId,
+    target: NodeId,
+) -> AppendEntriesResponse<RaftTypes> {
+    match reply {
+        AppendEntriesResponse::HigherVote(vote) if vote.leader_id().voted_for == sender => {
+            AppendEntriesResponse::HigherVote(Vote::new(vote.leader_id().term, target))
+        }
+        other => other,
     }
 }
 
