@@ -20,6 +20,7 @@ use tracing::{
     field::{Field, Visit},
     level_filters::LevelFilter,
     span::{Attributes, Id, Record},
+    subscriber::Interest,
 };
 use uuid::Uuid;
 
@@ -153,6 +154,16 @@ impl KeeperSubscriber {
 }
 
 impl Subscriber for KeeperSubscriber {
+    // The filter is fixed for the process, so each callsite's verdict is
+    // cached once instead of being asked again at every event.
+    fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
+        if self.allowed(metadata) {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         self.allowed(metadata)
     }
@@ -261,7 +272,16 @@ fn format_human(timestamp: &str, level: &str, target: &str, visitor: &FieldVisit
     let mut out = String::with_capacity(128);
     let _ = write!(&mut out, "{timestamp} {level} {target}:");
     if let Some(message) = &visitor.message {
-        let _ = write!(&mut out, " {message}");
+        // One event is one line: a message that embeds an error's own
+        // newlines must not forge another log line.
+        out.push(' ');
+        for ch in message.chars() {
+            match ch {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                _ => out.push(ch),
+            }
+        }
     }
     for (name, value) in &visitor.fields {
         let _ = write!(&mut out, " {name}=");
@@ -279,7 +299,11 @@ fn format_human(timestamp: &str, level: &str, target: &str, visitor: &FieldVisit
                 let _ = write!(&mut out, "{v}");
             }
             FieldValue::Str(v) => {
-                if v.is_empty() || v.contains(char::is_whitespace) || v.contains('"') {
+                if v.is_empty()
+                    || v.contains(char::is_whitespace)
+                    || v.contains('"')
+                    || v.contains(char::is_control)
+                {
                     let _ = write!(&mut out, "{v:?}");
                 } else {
                     out.push_str(v);
@@ -599,9 +623,13 @@ mod tests {
                 "structured human event"
             );
             audit_acknowledge_recovery(keeper, stream, "urn:logkeeper:client:admin", "ok");
+            let error = "first\nINFO forged: line";
+            tracing::warn!(error = %error, "{error}");
         });
         let captured = std::mem::take(&mut *lines.lock());
-        assert_eq!(captured.len(), 2);
+        assert_eq!(captured.len(), 3);
+        assert!(captured.iter().all(|line| !line.contains('\n')));
+        assert!(captured[2].contains("first\\nINFO forged: line"));
         assert!(captured[0].contains(" INFO "));
         assert!(captured[0].contains("structured human event"));
         assert!(captured[0].contains(&format!("keeper={keeper}")));
