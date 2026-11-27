@@ -391,3 +391,104 @@ async fn an_administrator_that_is_not_a_writer_cannot_write() {
     assert_eq!(owner.head(stream).await, Ok(Lsn(0)));
     cluster.stop_all().await;
 }
+
+/// A recovery that staged one replacement and failed on the other can be
+/// retried with a different second replacement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, d] = cluster.ids;
+    let (e, f) = (Uuid::from_u128(6), Uuid::from_u128(7));
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(205);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let fence = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap()
+        .fence;
+    for at in 1..=3 {
+        journal
+            .append(stream, fence, Lsn(at), Bytes::from(format!("rec-{at}")))
+            .await
+            .unwrap();
+    }
+    let group_a = cluster.group(a, stream).await;
+    timeout(WAIT, async {
+        while group_a.state.head() != Ok(Lsn(3)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(group_a);
+
+    // Fill keeper `e`'s single stream slot so KeeperStatus still reports it
+    // live and accepting, while StageRecovered fails on `e` after succeeding
+    // on `d` (which sorts before `e`).
+    let filler = StreamId(299);
+    journal.create(filler, [b, c, e], 4096).await.unwrap();
+    cluster.running.remove(&e).unwrap().stop().await;
+    cluster.configs.get_mut(&e).unwrap().max_streams = 1;
+    cluster.restart(e).await;
+    timeout(WAIT, async {
+        while !cluster.running[&e]
+            .engine
+            .groups
+            .lock()
+            .await
+            .contains_key(&filler)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    for stopped in [b, c, a] {
+        cluster.running.remove(&stopped).unwrap().stop().await;
+    }
+
+    // Attempt 1 stages `d` (high = 1) and fails on `e` (QuotaExceeded) before
+    // writing Record::Recover on `a`.
+    let first = cluster.configs[&a]
+        .recover_stream(
+            stream,
+            Recovery {
+                acknowledge_data_loss: true,
+                with: Some([d, e]),
+                interrupt: None,
+            },
+        )
+        .await;
+    assert!(first.is_err(), "first attempt must fail on full keeper e");
+
+    // Attempt 2 retries with `d` and healthy replacement `f`.
+    let retry = cluster.configs[&a]
+        .recover_stream(
+            stream,
+            Recovery {
+                acknowledge_data_loss: true,
+                with: Some([d, f]),
+                interrupt: None,
+            },
+        )
+        .await;
+    assert_eq!(retry.unwrap().voters, [a, d, f]);
+    // The recovered stream comes up on the survivor and both replacements.
+    cluster.restart(a).await;
+    timeout(RECOVERY_WAIT, async {
+        while journal
+            .configuration(stream)
+            .await
+            .map(|current| current.voters)
+            != Ok([a, d, f])
+            || journal.head(stream).await != Ok(Lsn(3))
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the retried recovery serves on its voters");
+    cluster.stop_all().await;
+}

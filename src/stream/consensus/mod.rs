@@ -145,6 +145,16 @@ impl Stage {
                 .count()
                 == 1
     }
+
+    /// The voter a stage keeps from its old configuration when it keeps
+    /// exactly one, as a recovery does.
+    fn survivor(&self) -> Option<uuid::Uuid> {
+        let mut kept = self.old.iter().filter(|voter| self.target.contains(voter));
+        match (kept.next(), kept.next()) {
+            (Some(survivor), None) => Some(*survivor),
+            _ => None,
+        }
+    }
 }
 
 impl Genesis {

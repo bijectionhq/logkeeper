@@ -250,6 +250,24 @@ pub(super) fn allows_recovery(
 /// would need billions more elections than it saw to reach this one.
 pub const RECOVERY_TERM_GAP: u64 = 4_294_967_296; // 2^32
 
+/// Whether an operator recovery's stage replaces the recovery stage an
+/// earlier attempt left on a replacement, at the same revision. A recovery
+/// stages its replacements before the survivor writes anything, and a
+/// survivor that wrote its recovery never stages again, so a copy staged by
+/// an attempt from the same survivor, source revision and lost
+/// configuration was never written to. Any other stage at that revision is
+/// refused: it may come from another survivor of a split history.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (staged_recovery && retried_recovery && same_origin)
+))]
+pub(super) fn restages_recovery(
+    staged_recovery: bool,
+    retried_recovery: bool,
+    same_origin: bool,
+) -> bool {
+    staged_recovery && retried_recovery && same_origin
+}
+
 /// The term of a recovery write: far above the survivor's vote and every
 /// term in its log, so no ballot or entry of the lost history can outrank it.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>

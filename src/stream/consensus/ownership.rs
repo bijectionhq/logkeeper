@@ -9,7 +9,7 @@ use std::{
 use journal_contract::StreamId;
 use serde::{Deserialize, Serialize};
 
-use super::{LogId, Stage};
+use super::{LogId, Stage, decisions};
 
 const MAX_DETACHED: usize = 16;
 
@@ -120,7 +120,29 @@ impl Ownership {
                     copy.installed = true;
                     return Ok(false);
                 }
-                let changed = self.apply(Change::Stage(stage), has_cut)?;
+                // A retried recovery restages the copy an aborted attempt
+                // left at the same revision. Keepers older than this refuse
+                // the record when they replay it.
+                let staged = self.current.as_ref().and_then(|copy| copy.stage.as_ref());
+                let changed = match staged {
+                    Some(staged)
+                        if decisions::restages_recovery(
+                            staged.recovery(),
+                            stage.recovery(),
+                            staged.stream == stage.stream
+                                && staged.source == stage.source
+                                && staged.old == stage.old
+                                && staged.survivor() == stage.survivor(),
+                        ) =>
+                    {
+                        let revision = stage.source.checked_add(1).ok_or_else(stale)?;
+                        if revision < self.high {
+                            return Err(stale());
+                        }
+                        self.stage_copy(stage, revision)?
+                    }
+                    _ => self.apply(Change::Stage(stage), has_cut)?,
+                };
                 if let Some(copy) = self.current.as_mut() {
                     copy.installed = true;
                 }
@@ -134,17 +156,7 @@ impl Ownership {
                 if revision <= self.high {
                     return Err(stale());
                 }
-                let generation = self.greatest_generation.checked_add(1).ok_or_else(stale)?;
-                self.detach_current()?;
-                self.greatest_generation = generation;
-                self.high = revision;
-                self.current = Some(Copy {
-                    generation,
-                    revision,
-                    stage: Some(stage),
-                    installed: false,
-                });
-                Ok(true)
+                self.stage_copy(stage, revision)
             }
             Change::Install {
                 stage,
@@ -200,6 +212,22 @@ impl Ownership {
         }
     }
 
+    /// Detaches the current copy and stages an empty one in a new
+    /// generation.
+    fn stage_copy(&mut self, stage: Stage, revision: u64) -> io::Result<bool> {
+        let generation = self.greatest_generation.checked_add(1).ok_or_else(stale)?;
+        self.detach_current()?;
+        self.greatest_generation = generation;
+        self.high = revision;
+        self.current = Some(Copy {
+            generation,
+            revision,
+            stage: Some(stage),
+            installed: false,
+        });
+        Ok(true)
+    }
+
     fn detach_current(&mut self) -> io::Result<()> {
         if self.current.is_some() && self.detached.len() == MAX_DETACHED {
             return Err(io::Error::new(
@@ -223,5 +251,59 @@ pub(super) fn directory(data: &Path, stream: StreamId, generation: u64) -> PathB
         data.join(format!("{:032x}", stream.0))
     } else {
         data.join(format!("{:032x}-{generation:016x}", stream.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stage(old: [u128; 3], target: [u128; 3]) -> Stage {
+        Stage {
+            stream: StreamId(1),
+            source: 0,
+            old: old.map(uuid::Uuid::from_u128),
+            target: target.map(uuid::Uuid::from_u128),
+        }
+    }
+
+    fn recovered(first: &Stage) -> Ownership {
+        let mut book = Ownership {
+            current: None,
+            ..Ownership::default()
+        };
+        assert!(
+            book.apply(Change::Recover(first.clone()), |_| false)
+                .unwrap()
+        );
+        book
+    }
+
+    #[test]
+    fn a_retried_recovery_restages_the_copy_of_an_aborted_attempt() {
+        let first = stage([1, 2, 3], [1, 4, 5]);
+        let mut book = recovered(&first);
+        let retry = stage([1, 2, 3], [1, 4, 6]);
+        assert!(
+            book.apply(Change::Recover(retry.clone()), |_| false)
+                .unwrap()
+        );
+        assert!(book.contains_stage(&retry) && book.installed());
+        assert_eq!(book.generation(), Some(2));
+        assert_eq!(book.detached(), [1]);
+        assert_eq!(book.high_water(), 1);
+    }
+
+    #[test]
+    fn another_stage_at_the_same_revision_stays_refused() {
+        let first = stage([1, 2, 3], [1, 4, 5]);
+        // Another survivor of the same lost configuration.
+        let other = stage([1, 2, 3], [2, 4, 6]);
+        let mut book = recovered(&first);
+        assert!(book.apply(Change::Recover(other), |_| false).is_err());
+        // An ordinary move at the same revision.
+        let moved = stage([1, 2, 3], [1, 2, 4]);
+        assert!(book.apply(Change::Stage(moved), |_| false).is_err());
+        assert!(book.contains_stage(&first));
     }
 }

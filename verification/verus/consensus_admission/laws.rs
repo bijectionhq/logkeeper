@@ -233,6 +233,17 @@ fn recovery_outranks_the_lost_history(vote_term: u64, log_term: u64, epoch: u64)
     }
 }
 
+// A replacement restages a recovery copy at the revision it already holds
+// only for a retry of the same survivor's recovery, which never wrote to
+// that copy; any other stage at that revision stays refused.
+fn a_recovery_restages_only_its_own_aborted_copy(
+    staged_recovery: bool, retried_recovery: bool, same_origin: bool,
+) {
+    let restages = restages_recovery(staged_recovery, retried_recovery, same_origin);
+    assert(restages ==> staged_recovery && retried_recovery && same_origin);
+    assert(!same_origin ==> !restages);
+}
+
 // A replica refuses a peer without a Raft answer only when the peer is
 // outside its effective membership and below its term: a member, or a peer
 // at or above its term, always gets an answer, so the refusal never hides a
