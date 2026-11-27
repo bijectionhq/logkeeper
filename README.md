@@ -236,10 +236,25 @@ that still lacks `catalog_voters` can still reach the `catalog` keeper, but
 it does not follow a leader hint, so its creates fail while another keeper
 leads.
 
-Detected snapshot damage quarantines the affected replica across restarts.
+A retained record, segment slice or snapshot that fails its checksum or does
+not decode quarantines the replica durably: a marker in the registry
+(`<keeper-uuid>.quarantine.json`) that survives restarts. The keeper reports
+the replica unhealthy in `KeeperStatus`, so the stream's leader replaces it,
+and answers `JournalError::Corrupted`. Another failure, such as a read error,
+takes the replica out of service only until the keeper restarts. An
+administrator clears a marker online (`Client::clear_quarantine`,
+`ConsensusJournal::clear_quarantine`) or offline on a stopped keeper. Clear
+it only once repair has replaced or restored the replica: a cleared copy
+votes again with whatever it still holds.
+
+```sh
+cargo run --locked --features stream -- keeper clear-quarantine --config keeper.json --stream STREAM_UUID
+```
+
 Detected corruption of the keeper identity, WAL, or its trusted boundary
-disables the keeper. With the keeper stopped and the WAL intact, restore only
-the exact bytes named by the local WAL's snapshot digest.
+disables the keeper under strict default startup. With the keeper stopped and
+the WAL intact, restore only the exact bytes named by the local WAL's snapshot
+digest:
 
 ```sh
 cargo run --locked --features stream -- keeper repair-snapshot --config keeper.json --stream STREAM_UUID --snapshot BACKUP_FILE
@@ -248,7 +263,24 @@ cargo run --locked --features stream -- keeper repair-snapshot --config keeper.j
 Repair preserves the local term, vote, and log suffix. An indexed snapshot
 backup also needs its exact referenced index pages, extents and any legacy
 image. Restore those dependencies at their original names before repairing the
-root. An unverifiable basis requires a fresh keeper incarnation.
+root.
+
+When a WAL segment is damaged and strict startup refuses the keeper, offline
+salvage on the stopped keeper lets it start again:
+
+```sh
+cargo run --locked --features stream -- keeper salvage --config keeper.json
+```
+
+Damage in a segment wholly before the WAL checkpoint costs only the streams
+the checkpoint names as holding payload in it. Those are quarantined and the
+rest keep serving, since every vote and ownership change is in the
+checkpoint. A damaged frame past the checkpoint could have held any
+stream's vote, trim or deletion, so salvage quarantines every stream on the
+keeper, and it refuses on a keeper that holds catalog records. Either way it
+writes a clean checkpoint and boundary, the keeper starts strictly, and
+repair replaces the quarantined replicas. Strict startup is unchanged.
+An unverifiable basis requires a fresh keeper incarnation.
 
 ### Recovering a stream that lost two of its three voters
 
@@ -573,14 +605,64 @@ completeness as a premise, in the Lean worktree's
 
 Keepers run OpenRaft 0.10.1. Its peer messages differ from 0.9 under
 bincode, and the control and replication lanes carry multiplexed batch
-frames, so the peer ALPNs are `logkeeper-consensus-control/8`,
-`logkeeper-consensus-replication/3` and `logkeeper-consensus-bulk/2`. A keeper
-on an older version fails the TLS handshake with `no_application_protocol`
-instead of failing to decode. Mixed versions are unsupported: upgrade all
-keepers in a group together. The application protocol, `LKRIMG03` images
-and the on-disk WAL format are unchanged; a test pins the persisted bytes of
+frames.
+
+**Rolling upgrades (N and N-1).** Each lane has an ALPN for this release (N)
+and keeps the previous release's (N-1): application
+`logkeeper-consensus/2` and `/1`, control `logkeeper-consensus-control/9` and
+`/8`, replication `logkeeper-consensus-replication/4` and `/3`, bulk
+`logkeeper-consensus-bulk/3` and `/2`. Every listener accepts both, and
+clients and peers offer N then N-1. On an N-1 connection a keeper speaks the
+N-1 codec: its liveness ping is the N-1 `Liveness` frame, its replies and
+`KeeperStatus` take their N-1 layout, and it maps errors N-1 does not know
+(`Unsupported`, `Corrupted`) to `Unavailable`; requests N-1 does not know are
+refused locally. Those degrade safely against an N-1 keeper: the
+returning-voter check (`LocalConfiguration`) counts it as not answering and
+asks again, and a copy that must certify itself through an N-1 catalog
+(`Staging`) stays uncertified, so it neither campaigns nor serves reads
+until a leader's append certifies it. So upgrade the catalog keeper, or the
+catalog voters, first. On an N connection, pings and `KeeperStatus` also carry the
+keeper's `build_version`, `features` bits and finalized `cluster_version`, and
+an unknown request or frame gets a typed `Unsupported` without closing the
+connection. A keeper two releases apart fails the TLS handshake with
+`no_application_protocol`; it counts as alive, accepts no new streams and is
+never repaired, so a version mismatch never triggers repair. Only adjacent
+releases mix: upgrade from N-1 to N, one keeper at a time
+(`docs/runbooks/rolling-upgrade.md`). The compatibility tests run real
+binaries of the N-1 commit against this one.
+
+**Write-version gate.** The catalog holds a finalized cluster feature level,
+1 until an administrator finalizes. `Client::finalize_version(2)` probes
+every keeper in the inventory and refuses with `Unsupported` while one lacks
+the gate, or `Unavailable`, worth retrying, while one does not answer. Until
+then N writes only N-1 formats, so a keeper can go back to N-1: checkpoints
+stay `LKRWAL04`, no cluster-version record is written, segment compaction
+only asks owners to snapshot and purge instead of writing `Relocate` frames,
+and a parked copy writes no park mark, so it reopens at restart. After it,
+checkpoints become `LKRWAL05`, compaction copies cold slices, parks are
+durable, and N-1 refuses the media. A format a later release adds follows
+the same rule: it is written only once `write_version_allows` it, and a
+request it adds is refused on N-1 connections in `Request::supported_on`. Keeper configuration ignores
+an unknown top-level field with a warning, so a configuration may name a
+newer release's setting first; nested settings and `JournalConfig` stay
+strict.
+
+**Placement changes and retired keepers.** The rule of three active keepers
+in distinct failure domains applies only where a roster is chosen: a new
+genesis, a stage's target and a recovery's replacements. Replay, snapshots,
+ingress and proofs only check that the voters are three sorted keepers the
+inventory knows, so a domain reassignment or a retirement never quarantines
+a replica. Leaders count a configuration that breaks placement
+(`placement.violation`), and repair moves it, waking it if it is parked.
+`retired` keepers in `placement.json`, `Config`, `JournalConfig` and
+`Client::with_retired` take no new streams; a draining one, still in
+`keepers`, still serves and is still asked before a recovery or a
+finalization.
+
+The `LKRIMG03` images and the WAL records are unchanged before
+finalization; a test pins the persisted bytes of
 votes, log ids, memberships, entries and snapshot metadata to their 0.9
-encoding. A leader that cannot confirm a recent quorum now refuses writes
+encoding. A leader that cannot confirm a recent quorum refuses writes
 and answers that it has no leader; after 1.8 seconds without a quorum it
 gives way to a new leader. Followers run a pre-vote round before raising
 their term, so a keeper that rejoins after a partition does not depose a
@@ -595,9 +677,9 @@ this build refuses the request, and a restarted copy that cannot certify
 does not campaign: upgrade the catalog keepers first.
 
 Verus checks the shipped admission, metering, classification, rotation, batch,
-restart, recovery, repair and keeper incarnation decisions in
+restart, recovery, repair, keeper incarnation and upgrade-gate decisions in
 `src/stream/consensus/decisions.rs` against laws named after the Lean
-theorems. The baseline verifies 122 functions, and 61 production mutations
+theorems. The baseline verifies 133 functions, and 68 production mutations
 each fail their declared contract. See
 `verification/verus/consensus_admission/README.md` for the mapping and the
 unverified stateful glue.
