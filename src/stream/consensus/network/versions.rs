@@ -79,7 +79,9 @@ impl Request {
             | Self::RecoverStream { .. }
             | Self::LocalTip(_)
             | Self::NamedStreams(_)
-            | Self::TrimCheckpoint { .. } => WireVersion::Current,
+            | Self::TrimCheckpoint { .. }
+            | Self::InstallCheckpoint { .. }
+            | Self::SelectedCheckpoint(_) => WireVersion::Current,
         }
     }
 }
@@ -152,7 +154,9 @@ pub(in crate::stream::consensus) fn outcome_introduced(outcome: &Outcome) -> Wir
         | Outcome::Configuration(_)
         | Outcome::OriginalSample(_)
         | Outcome::OriginalEvidence(_) => WireVersion::Previous,
-        Outcome::RecoveryFence(_) | Outcome::Offload(_) => WireVersion::Current,
+        Outcome::RecoveryFence(_) | Outcome::Offload(_) | Outcome::Checkpoint(_) => {
+            WireVersion::Current
+        }
         Outcome::Refused(error) => error_introduced(error),
     }
 }

@@ -13,7 +13,8 @@ use std::{
 use bincode::Options;
 use futures::FutureExt;
 use journal_contract::{
-    CheckpointAnchor, Epoch, Lsn, RecoveryFence, StreamId, WriterFence, WriterSessionId,
+    CheckpointAnchor, CheckpointInstallation, Epoch, Lsn, RecoveryFence, StreamId, WriterFence,
+    WriterSessionId,
 };
 use openraft::{
     BasicNode, EntryPayload, OptionalSend,
@@ -340,6 +341,12 @@ pub(super) enum Request {
         fence: Fence,
         anchor: CheckpointAnchor,
     },
+    InstallCheckpoint {
+        stream: StreamId,
+        fence: Fence,
+        checkpoint: CheckpointInstallation,
+    },
+    SelectedCheckpoint(StreamId),
 }
 
 impl Request {
@@ -361,6 +368,7 @@ impl Request {
             | Self::KeeperStatus(stream)
             | Self::AcknowledgeRecovery(stream)
             | Self::RecoveryFence(stream)
+            | Self::SelectedCheckpoint(stream)
             | Self::LocalConfiguration(stream)
             | Self::Staging(stream)
             | Self::ClearQuarantine(stream)
@@ -383,6 +391,7 @@ impl Request {
             | Self::Read { stream, .. }
             | Self::Trim { stream, .. }
             | Self::TrimCheckpoint { stream, .. }
+            | Self::InstallCheckpoint { stream, .. }
             | Self::RetireCopy { stream, .. }
             | Self::PreferLeader { stream, .. }
             | Self::Written { stream, .. }

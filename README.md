@@ -872,6 +872,15 @@ keeper refuses it as an invalid UUID instead of misreading it, and a
 three-voter roster encodes exactly as before. Nothing carrying a five-voter
 roster is encoded for an N-1 connection.
 
+**Atomic checkpoint installation.** Finalize level 8
+(`CLUSTER_VERSION_CHECKPOINT_INSTALL`) after every keeper advertises
+`CHECKPOINT_INSTALL` and application writers support the checkpoint APIs.
+This enables immutable checkpoint installation and selected checkpoint
+state in WAL replay and snapshots. An immutable stream refuses unchecked
+trim once the catalog finalizes this level. A checked selection of an
+existing announcement remains available for a staged checkpoint. Level 8
+preserves unchecked trim for legacy mutable streams.
+
 **Wire variants.** Variants of `Frame`, `Request`, `PeerRequest`, `Reply`,
 `Outcome` and `JournalError` are only ever appended, and each is classified
 by the wire version that introduced it in `network/versions.rs`, an
@@ -1546,8 +1555,12 @@ logkeeper = { git = "https://github.com/bijectionhq/logkeeper", tag = "v0.2.0" }
 
 A single authority allocates increasing epochs for a stream and supplies an ensemble with intersecting write quorums.
 The caller owns checkpoint publication and sets the safe trim boundary.
-For immutable histories, `Journal::trim_checkpoint` checks the SHA-256 of the exact committed announcement and retains that record.
-The keeper reads the announcement from local storage or offload and orders the cut under the current writer session.
+For immutable histories, `Journal::install_checkpoint` commits the application-certified
+announcement and its recovery floor in one quorum decision. `Journal::selected_checkpoint`
+returns the selected position and floor after a restart, and an exact retry
+returns its receipt while that checkpoint remains selected.
+`Journal::trim_checkpoint` verifies a staged announcement against local storage
+or offload before selecting it under the current writer session.
 The journal owns the persisted promise, commit position, and record retention for that stream.
 The server, client and journal format ship together.
 Version 0.2 adds the durable journal identity handshake from [RTDB](https://github.com/bijectionhq/rtdb/commit/65d0a3d9f1340372d4bd71453b7af980fe02b91f).

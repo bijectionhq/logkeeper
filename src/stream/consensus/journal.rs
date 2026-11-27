@@ -7,8 +7,9 @@ use std::{collections::BTreeSet, io, path::Path, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use journal_contract::{
-    BoxFuture, CheckpointAnchor, Epoch, Journal, JournalError, Lsn, Page, RecoveryFence, Result,
-    SealReceipt, StreamId, WriterFence, WriterSessionId,
+    BoxFuture, CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, Journal,
+    JournalError, Lsn, Page, RecoveryFence, Result, SealReceipt, StreamId, WriterFence,
+    WriterSessionId,
 };
 use parking_lot::RwLock;
 
@@ -752,6 +753,30 @@ impl Journal for ConsensusJournal {
             self.client
                 .trim_checkpoint(fence.stream, Self::session_fence(fence), anchor),
         )
+    }
+
+    fn install_checkpoint(
+        &self,
+        fence: WriterFence,
+        checkpoint: CheckpointInstallation,
+    ) -> BoxFuture<'_, Result<CheckpointReceipt>> {
+        Box::pin(async move {
+            if checkpoint.record.len() > self.max_record_bytes {
+                return Err(JournalError::TooLarge {
+                    max: self.max_record_bytes,
+                });
+            }
+            self.client
+                .install_checkpoint(fence.stream, Self::session_fence(fence), checkpoint)
+                .await
+        })
+    }
+
+    fn selected_checkpoint(
+        &self,
+        stream: StreamId,
+    ) -> BoxFuture<'_, Result<Option<CheckpointReceipt>>> {
+        Box::pin(self.client.selected_checkpoint(stream))
     }
 
     fn read_page(

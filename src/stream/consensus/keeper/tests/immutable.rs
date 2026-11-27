@@ -1,6 +1,6 @@
 use super::*;
 use crate::stream::consensus::{ConsensusJournal, JournalConfig};
-use journal_contract::{Journal, WriterSessionId};
+use journal_contract::{CheckpointInstallation, CheckpointReceipt, Journal, WriterSessionId};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn immutable_streams_keep_exact_seal_receipts_across_snapshots_and_restart() {
@@ -164,8 +164,20 @@ async fn immutable_streams_keep_exact_seal_receipts_across_snapshots_and_restart
     );
     assert_eq!(
         journal.trim_session(replacement.fence, Lsn(2)).await,
-        Ok(())
+        Err(JournalError::Unsupported)
     );
+    journal
+        .install_checkpoint(
+            replacement.fence,
+            CheckpointInstallation {
+                operation_id: 1,
+                checkpoint_lsn: Lsn(4),
+                covered_through_lsn: Lsn(2),
+                record: Bytes::from_static(b"checkpoint"),
+            },
+        )
+        .await
+        .unwrap();
     assert_eq!(
         journal
             .append_session_batch(replacement.fence, Lsn(2), vec![Bytes::from_static(b"lost")])
@@ -179,6 +191,146 @@ async fn immutable_streams_keep_exact_seal_receipts_across_snapshots_and_restart
     assert_eq!(
         retained.records,
         vec![(Lsn(3), Bytes::from_static(b"first"))]
+    );
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn atomic_checkpoint_reclaims_a_full_stream_and_survives_a_snapshot_restart() {
+    use crate::stream::consensus::CLUSTER_VERSION_REPLICATION;
+    use crate::stream::keeper::record_charge;
+
+    let mut cluster = Cluster::start_replicated().await;
+    cluster.finalize_to(CLUSTER_VERSION_REPLICATION).await;
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(9643);
+    let client = cluster.client(&cluster.credentials);
+    let records = vec![Bytes::from(vec![1; 4096]); 2];
+    client
+        .create_stream(
+            stream,
+            Voters::from([a, b, c]),
+            2 * record_charge(4096),
+            true,
+        )
+        .await
+        .unwrap();
+    let sealed = client
+        .seal_session(stream, Epoch(0), WriterSessionId(1))
+        .await
+        .unwrap();
+    let fence = Fence {
+        epoch: sealed.fence.writer_epoch,
+        writer: Uuid::from_u128(sealed.fence.writer_session_id.0),
+    };
+    assert_eq!(
+        client
+            .append_batch(stream, fence, Lsn(1), records.clone())
+            .await,
+        Ok(Lsn(2))
+    );
+    let checkpoint = CheckpointInstallation {
+        operation_id: 1,
+        checkpoint_lsn: Lsn(3),
+        covered_through_lsn: Lsn(1),
+        record: Bytes::from(vec![2; 4096]),
+    };
+    assert_eq!(client.trim(stream, fence, Lsn(0)).await, Ok(()));
+    assert_eq!(
+        client
+            .install_checkpoint(stream, fence, checkpoint.clone())
+            .await,
+        Err(JournalError::Unsupported),
+    );
+    cluster.finalize().await;
+    assert_eq!(
+        client.trim(stream, fence, Lsn(1)).await,
+        Err(JournalError::Unsupported)
+    );
+    assert_eq!(
+        client
+            .append(stream, fence, Lsn(3), checkpoint.record.clone())
+            .await,
+        Err(JournalError::Full { floor: Lsn(1) }),
+    );
+    let too_large = CheckpointInstallation {
+        record: Bytes::from(vec![2; 4097]),
+        ..checkpoint.clone()
+    };
+    assert_eq!(
+        client.install_checkpoint(stream, fence, too_large).await,
+        Err(JournalError::Full { floor: Lsn(1) }),
+    );
+    assert_eq!(client.selected_checkpoint(stream).await, Ok(None));
+    assert_eq!(
+        client
+            .read(stream, Lsn(1), 2, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        vec![(Lsn(1), records[0].clone()), (Lsn(2), records[1].clone())]
+    );
+
+    let receipt = CheckpointReceipt {
+        checkpoint_lsn: Lsn(3),
+        covered_through_lsn: Lsn(1),
+        logical_floor_lsn: Lsn(2),
+    };
+    assert_eq!(
+        client
+            .install_checkpoint(stream, fence, checkpoint.clone())
+            .await,
+        Ok(receipt)
+    );
+    assert_eq!(client.selected_checkpoint(stream).await, Ok(Some(receipt)));
+    for voter in [a, b, c] {
+        let group = cluster.group(voter, stream).await;
+        timeout(WAIT, async {
+            while group.state.selected_checkpoint() != Ok(Some(receipt)) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let index = group.state.applied().unwrap();
+        group.raft.trigger().snapshot().await.unwrap();
+        timeout(WAIT, group.state.wait_for_snapshot(index))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    cluster.stop_all().await;
+    for keeper in cluster.configs.keys().copied().collect::<Vec<_>>() {
+        cluster.restart(keeper).await;
+    }
+    assert_eq!(client.selected_checkpoint(stream).await, Ok(Some(receipt)));
+    assert_eq!(
+        client
+            .install_checkpoint(stream, fence, checkpoint.clone())
+            .await,
+        Ok(receipt)
+    );
+    assert_eq!(
+        client
+            .install_checkpoint(
+                stream,
+                fence,
+                CheckpointInstallation {
+                    record: Bytes::from_static(b"different"),
+                    ..checkpoint.clone()
+                },
+            )
+            .await,
+        Err(JournalError::Conflict { head: Lsn(3) }),
+    );
+    let page = client
+        .read(stream, Lsn(2), 2, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.floor, Lsn(2));
+    assert_eq!(
+        page.records,
+        vec![(Lsn(2), records[1].clone()), (Lsn(3), checkpoint.record)]
     );
     cluster.stop_all().await;
 }

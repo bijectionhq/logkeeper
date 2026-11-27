@@ -111,7 +111,7 @@ fn objects(directory: &std::path::Path) -> Vec<std::path::PathBuf> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trim_checkpoint_verifies_an_announcement_below_the_local_floor() {
-    use journal_contract::{CheckpointAnchor, WriterSessionId};
+    use journal_contract::{CheckpointAnchor, CheckpointReceipt, WriterSessionId};
     use sha2::{Digest, Sha256};
 
     let store = tempfile::tempdir().unwrap();
@@ -151,6 +151,14 @@ async fn trim_checkpoint_verifies_an_announcement_below_the_local_floor() {
         .trim_checkpoint(stream, fence, anchor)
         .await
         .unwrap();
+    assert_eq!(
+        journal.selected_checkpoint(stream).await,
+        Ok(Some(CheckpointReceipt {
+            checkpoint_lsn: Lsn(20),
+            covered_through_lsn: Lsn(19),
+            logical_floor_lsn: Lsn(20),
+        }))
+    );
 
     assert_eq!(
         journal.read(stream, Lsn(19), 1, Duration::ZERO).await,

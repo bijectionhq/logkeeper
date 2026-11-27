@@ -87,6 +87,28 @@ pub struct CheckpointAnchor {
     pub record_sha256: [u8; 32],
 }
 
+/// The announcement to commit together with a new replay floor. The
+/// authenticated application writer certifies that its dependencies exist
+/// and stay retained for the lifetime of this selected checkpoint.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointInstallation {
+    pub operation_id: u128,
+    /// The expected next position, also used to authenticate the record.
+    pub checkpoint_lsn: Lsn,
+    pub covered_through_lsn: Lsn,
+    pub record: Bytes,
+}
+
+/// The recovery base and first retained position selected in one decision.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointReceipt {
+    pub checkpoint_lsn: Lsn,
+    pub covered_through_lsn: Lsn,
+    pub logical_floor_lsn: Lsn,
+}
+
 /// The fence and the committed head chosen at the instant of sealing.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +252,25 @@ pub trait Journal: Send + Sync {
         _fence: WriterFence,
         _anchor: CheckpointAnchor,
     ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// Commits and selects this announcement and advances the floor in one
+    /// decision under the current writer fence. An exact retry resolves
+    /// while this checkpoint is selected.
+    fn install_checkpoint(
+        &self,
+        _fence: WriterFence,
+        _checkpoint: CheckpointInstallation,
+    ) -> BoxFuture<'_, Result<CheckpointReceipt>> {
+        Box::pin(async { Err(JournalError::Unsupported) })
+    }
+
+    /// The selected recovery base in a linearizable immutable stream view.
+    fn selected_checkpoint(
+        &self,
+        _stream: StreamId,
+    ) -> BoxFuture<'_, Result<Option<CheckpointReceipt>>> {
         Box::pin(async { Err(JournalError::Unsupported) })
     }
 

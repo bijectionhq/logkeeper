@@ -17,13 +17,18 @@ use std::{
 };
 
 use bytes::Bytes;
-use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryFence, Result, WriterSessionId};
+use journal_contract::{
+    CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, JournalError, Lsn, Page,
+    RecoveryFence, Result, WriterSessionId,
+};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::{Fence, Genesis, MAX_PAGE, MAX_RECORD, MAX_RECORDS_PER_PAGE, Sealed, Stage};
 use crate::stream::keeper::record_charge;
 use crate::stream::timed::{EVIDENCE_BYTES, TimedEvidence};
+
+mod checkpoint;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
@@ -103,6 +108,19 @@ pub enum Command {
     /// committed run the whole history: an operator recovery from object
     /// store plus survivor, or a restore into a fresh stream.
     Restore(Restore),
+    /// A selected checkpoint and its announcement share one application entry.
+    /// The installation ends in the announcement bytes, like `Append`.
+    InstallCheckpoint {
+        fence: Fence,
+        owner: String,
+        checkpoint: CheckpointInstallation,
+    },
+    /// Selects a previously committed announcement checked by the leader.
+    SelectCheckpoint {
+        fence: Fence,
+        owner: String,
+        anchor: CheckpointAnchor,
+    },
 }
 
 /// A new offload lineage: see `Command::Restore`.
@@ -201,6 +219,16 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
             retain_from: Lsn,
         },
         Restore(Restore),
+        InstallCheckpoint {
+            fence: Fence,
+            owner: String,
+            checkpoint: CheckpointInstallation,
+        },
+        SelectCheckpoint {
+            fence: Fence,
+            owner: String,
+            anchor: CheckpointAnchor,
+        },
     }
     Application::deserialize(decoder).map(Box::new)
 }
@@ -262,6 +290,12 @@ impl std::fmt::Display for Command {
                 lineage, through, ..
             } => write!(f, "Offloaded({lineage}, {through:?})"),
             Self::Restore(restore) => write!(f, "Restore({}, {:?})", restore.lineage, restore.head),
+            Self::InstallCheckpoint { checkpoint, .. } => {
+                write!(f, "InstallCheckpoint({:?})", checkpoint.checkpoint_lsn)
+            }
+            Self::SelectCheckpoint { anchor, .. } => {
+                write!(f, "SelectCheckpoint({:?})", anchor.announced_at)
+            }
         }
     }
 }
@@ -282,6 +316,7 @@ pub enum Outcome {
     /// A stream's offload progress, answering `Request::OffloadStatus`.
     /// Added last; never an applied command's outcome.
     Offload(super::OffloadStatus),
+    Checkpoint(Option<CheckpointReceipt>),
 }
 
 impl From<Result<Outcome>> for Outcome {
@@ -299,6 +334,13 @@ pub(super) enum State {
     Immutable {
         live: Live,
         sealed_head_lsn: Lsn,
+    },
+    /// Appended as a separate snapshot variant to preserve the encoding of
+    /// immutable histories selected before this release.
+    Checkpointed {
+        live: Live,
+        sealed_head_lsn: Lsn,
+        selected: checkpoint::Selection,
     },
 }
 
@@ -583,6 +625,14 @@ impl State {
         genesis: &Genesis,
         segment: Arc<super::storage::Object>,
     ) -> io::Result<Outcome> {
+        if let Command::InstallCheckpoint {
+            fence,
+            owner,
+            checkpoint,
+        } = command
+        {
+            return self.install_checkpoint(fence, &owner, checkpoint, segment, genesis);
+        }
         if let Command::AcknowledgeRecoveryWithMarker { fence, at, payload } = command {
             if genesis.immutable {
                 return Ok(Outcome::Refused(JournalError::Unsupported));
@@ -756,7 +806,9 @@ impl State {
                     };
                     Ok(Outcome::Unit)
                 }
-                Self::Live(_) | Self::Immutable { .. } => Ok(Outcome::Unit),
+                Self::Live(_) | Self::Immutable { .. } | Self::Checkpointed { .. } => {
+                    Ok(Outcome::Unit)
+                }
                 Self::Deleted => Err(JournalError::Deleted),
             };
         }
@@ -770,6 +822,20 @@ impl State {
         } = command
         {
             return self.seal_session(expected_writer_epoch, writer_session_id, owner);
+        }
+        if let Command::SelectCheckpoint {
+            fence,
+            owner,
+            anchor,
+        } = command
+        {
+            return self.select_announcement(fence, &owner, anchor);
+        }
+        if matches!(
+            (&*self, &command),
+            (Self::Checkpointed { .. }, Command::Trim { .. })
+        ) {
+            return Err(JournalError::Unsupported);
         }
         let live = self.live_mut()?;
         match command {
@@ -816,7 +882,9 @@ impl State {
             | Command::Admitted(..)
             | Command::AppendBatch { .. }
             | Command::AppendOriginal { .. }
-            | Command::AcknowledgeRecoveryWithMarker { .. } => unreachable!(),
+            | Command::AcknowledgeRecoveryWithMarker { .. }
+            | Command::InstallCheckpoint { .. }
+            | Command::SelectCheckpoint { .. } => unreachable!(),
         }
     }
 
@@ -826,10 +894,15 @@ impl State {
         writer_session_id: WriterSessionId,
         owner: String,
     ) -> Result<Outcome> {
-        let Self::Immutable {
+        let (Self::Immutable {
             live,
             sealed_head_lsn,
-        } = self
+        }
+        | Self::Checkpointed {
+            live,
+            sealed_head_lsn,
+            ..
+        }) = self
         else {
             self.live()?;
             return Err(JournalError::Unsupported);
@@ -863,7 +936,7 @@ impl State {
 
     /// Installs the recovery fence above the current epoch.
     pub fn recover(&mut self) -> Result<Outcome> {
-        if matches!(self, Self::Immutable { .. }) {
+        if matches!(self, Self::Immutable { .. } | Self::Checkpointed { .. }) {
             return Err(JournalError::Unsupported);
         }
         let live = self.live_mut()?;
@@ -1077,9 +1150,15 @@ impl State {
             Self::Immutable {
                 live,
                 sealed_head_lsn,
+            }
+            | Self::Checkpointed {
+                live,
+                sealed_head_lsn,
+                ..
             } => {
                 genesis.immutable
                     && *sealed_head_lsn <= live.head
+                    && self.selection().is_none_or(|selected| selected.valid(live))
                     && match &live.writer {
                         Some((fence, owner)) => {
                             fence.epoch != Epoch(0)
@@ -1177,7 +1256,9 @@ impl State {
     fn live(&self) -> Result<&Live> {
         match self {
             Self::Absent => Err(JournalError::NotFound),
-            Self::Live(live) | Self::Immutable { live, .. } => Ok(live),
+            Self::Live(live) | Self::Immutable { live, .. } | Self::Checkpointed { live, .. } => {
+                Ok(live)
+            }
             Self::Deleted => Err(JournalError::Deleted),
         }
     }
@@ -1185,7 +1266,9 @@ impl State {
     fn live_mut(&mut self) -> Result<&mut Live> {
         match self {
             Self::Absent => Err(JournalError::NotFound),
-            Self::Live(live) | Self::Immutable { live, .. } => Ok(live),
+            Self::Live(live) | Self::Immutable { live, .. } | Self::Checkpointed { live, .. } => {
+                Ok(live)
+            }
             Self::Deleted => Err(JournalError::Deleted),
         }
     }
@@ -1420,11 +1503,15 @@ impl Live {
             .checked_add(charge)
             .filter(|used| *used <= quota_bytes)
             .ok_or(JournalError::Full { floor: self.floor })?;
+        self.record_append(at, payload, used);
+        Ok(Outcome::At(at))
+    }
+
+    fn record_append(&mut self, at: Lsn, payload: Payload, used: u64) {
         self.records.push_back(payload);
         self.epochs.note(at, self.epoch());
         self.bytes = used;
         self.head = at;
-        Ok(Outcome::At(at))
     }
 
     /// Appends a contiguous group atomically. Records already retained must

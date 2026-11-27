@@ -749,6 +749,10 @@ impl Engine {
                             && stage.recovery()
                     }
                     Command::Append { payload, .. } => payload.len() <= MAX_RECORD,
+                    Command::InstallCheckpoint { checkpoint, .. } => {
+                        group.genesis.immutable && checkpoint.record.len() <= MAX_RECORD
+                    }
+                    Command::SelectCheckpoint { .. } => group.genesis.immutable,
                     Command::AcknowledgeRecoveryWithMarker { payload, fence, at } => {
                         payload.len() <= MAX_RECORD && fence.head.0.checked_add(1) == Some(at.0)
                     }

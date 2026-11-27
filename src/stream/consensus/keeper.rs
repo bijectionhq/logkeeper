@@ -1700,6 +1700,7 @@ impl Engine {
                     | Request::KeeperStatus(_)
                     | Request::ClusterVersion
                     | Request::Head(_)
+                    | Request::SelectedCheckpoint(_)
                     | Request::RecoveryFence(_)
                     | Request::Configuration(_)
                     | Request::Read { .. }
@@ -1714,7 +1715,8 @@ impl Engine {
                     | Request::Written { .. }
                     | Request::AcknowledgeRecoveryWithMarker { .. }
                     | Request::Trim { .. }
-                    | Request::TrimCheckpoint { .. } => writer,
+                    | Request::TrimCheckpoint { .. }
+                    | Request::InstallCheckpoint { .. } => writer,
                     // An administrator may move leadership; it writes nothing.
                     Request::PreferLeader { .. } => writer || admin,
                     // An administrator may acknowledge a recovery, but only a
@@ -2014,6 +2016,7 @@ impl Engine {
                 }
                 let reply = match request {
                     Request::Head(_) => Ok(group.head().await),
+                    Request::SelectedCheckpoint(_) => Ok(group.selected_checkpoint().await),
                     Request::RecoveryFence(_) => Ok(group.recovery_fence().await),
                     Request::OffloadStatus { flush, .. } => {
                         Ok(self.offload_status(&group, flush).await)
@@ -2237,15 +2240,16 @@ impl Engine {
                             Err(error) => Outcome::Refused(error),
                         }))
                     }
-                    Request::Trim { fence, through, .. } => Ok(group
-                        .write(Command::Trim {
-                            fence,
-                            owner: owner.unwrap(),
-                            through,
-                        })
+                    Request::Trim { fence, through, .. } => Ok(self
+                        .compatibility_trim(&group, fence, owner.unwrap(), through)
                         .await),
-                    Request::TrimCheckpoint { fence, anchor, .. } => Ok(group
-                        .trim_checkpoint(fence, owner.unwrap(), anchor, self.offload.as_deref())
+                    Request::TrimCheckpoint { fence, anchor, .. } => Ok(self
+                        .select_checkpoint(&group, fence, owner.unwrap(), anchor)
+                        .await),
+                    Request::InstallCheckpoint {
+                        fence, checkpoint, ..
+                    } => Ok(self
+                        .install_checkpoint(&group, fence, owner.unwrap(), checkpoint)
                         .await),
                     Request::Delete(_) => Ok(group.write(Command::Delete).await),
                     Request::AcknowledgeRecovery(_) => {

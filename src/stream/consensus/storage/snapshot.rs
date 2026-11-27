@@ -459,6 +459,12 @@ impl StateMachine {
         })
     }
 
+    pub fn selected_checkpoint(
+        &self,
+    ) -> journal_contract::Result<Option<journal_contract::CheckpointReceipt>> {
+        self.inner.applied.read().state.selected_checkpoint()
+    }
+
     pub fn reserve_command(
         &self,
         command: &Command,

@@ -1136,6 +1136,7 @@ pub(super) fn internal(request: &Request) -> bool {
                 | Request::AppendOriginal { .. }
                 | Request::Trim { .. }
                 | Request::TrimCheckpoint { .. }
+                | Request::InstallCheckpoint { .. }
                 | Request::Delete(_)
                 | Request::AcknowledgeRecovery(_)
                 | Request::Written { .. }

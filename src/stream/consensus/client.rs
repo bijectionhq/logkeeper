@@ -13,8 +13,8 @@ use std::{
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use journal_contract::{
-    CheckpointAnchor, Epoch, JournalError, Lsn, RecoveryFence, Result, SealReceipt, StreamId,
-    WriterFence, WriterSessionId,
+    CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, JournalError, Lsn,
+    RecoveryFence, Result, SealReceipt, StreamId, WriterFence, WriterSessionId,
 };
 use parking_lot::Mutex;
 use tokio::time::{Instant, sleep};
@@ -395,6 +395,40 @@ impl Client {
             anchor,
         })
         .await
+    }
+
+    pub async fn install_checkpoint(
+        &self,
+        stream: StreamId,
+        fence: Fence,
+        checkpoint: CheckpointInstallation,
+    ) -> Result<CheckpointReceipt> {
+        let uncertain = AtomicBool::default();
+        let request = Request::InstallCheckpoint {
+            stream,
+            fence,
+            checkpoint,
+        };
+        match self
+            .decide(request, Instant::now() + self.deadline, ATTEMPT, &uncertain)
+            .await
+        {
+            Ok(Outcome::Checkpoint(Some(receipt))) => Ok(receipt),
+            Err(JournalError::Fenced { .. } | JournalError::Conflict { .. })
+                if uncertain.load(Ordering::Relaxed) =>
+            {
+                Err(JournalError::Unavailable)
+            }
+            Err(error) => Err(error),
+            Ok(_) => Err(JournalError::Unavailable),
+        }
+    }
+
+    pub async fn selected_checkpoint(&self, stream: StreamId) -> Result<Option<CheckpointReceipt>> {
+        match self.operation(Request::SelectedCheckpoint(stream)).await? {
+            Outcome::Checkpoint(receipt) => Ok(receipt),
+            _ => Err(JournalError::Unavailable),
+        }
     }
 
     async fn commit_trim(&self, request: Request) -> Result<()> {

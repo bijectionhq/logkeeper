@@ -89,8 +89,10 @@ pub const CLUSTER_VERSION_LEASES: u32 = CLUSTER_VERSION_V6;
 pub const CLUSTER_VERSION_V7: u32 = 7;
 /// The level five-voter streams wait for.
 pub const CLUSTER_VERSION_REPLICATION: u32 = CLUSTER_VERSION_V7;
+/// Enables atomic checkpoint selection and removes unchecked immutable trim.
+pub const CLUSTER_VERSION_CHECKPOINT_INSTALL: u32 = 8;
 /// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V7;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_CHECKPOINT_INSTALL;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -118,6 +120,8 @@ pub mod features {
     pub const LEASES: u64 = 1 << 8;
     /// Reads and serves five-voter rosters (`voters.rs`).
     pub const REPLICATION_FACTOR: u64 = 1 << 9;
+    /// Supports checkpoint installation and its durable selection.
+    pub const CHECKPOINT_INSTALL: u64 = 1 << 10;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 = VERSION_NEGOTIATION
@@ -128,7 +132,8 @@ pub mod features {
         | IMMUTABLE_STREAMS
         | OFFLOAD
         | LEASES
-        | REPLICATION_FACTOR;
+        | REPLICATION_FACTOR
+        | CHECKPOINT_INSTALL;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;

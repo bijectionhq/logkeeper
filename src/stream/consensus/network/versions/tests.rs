@@ -4,8 +4,8 @@
 
 use bytes::Bytes;
 use journal_contract::{
-    CheckpointAnchor, Epoch, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence,
-    WriterSessionId,
+    CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, JournalError, Lsn, Page,
+    RecoveryFence, StreamId, WriterFence, WriterSessionId,
 };
 use openraft::raft::{AppendEntriesRequest, TransferLeaderRequest, VoteRequest};
 use serde::Serialize;
@@ -321,6 +321,17 @@ fn request(tag: usize) -> Option<Request> {
                 record_sha256: [1; 32],
             },
         },
+        45 => Request::InstallCheckpoint {
+            stream: STREAM,
+            fence: fence(),
+            checkpoint: CheckpointInstallation {
+                operation_id: 1,
+                checkpoint_lsn: Lsn(2),
+                covered_through_lsn: Lsn(1),
+                record: Bytes::from_static(b"checkpoint"),
+            },
+        },
+        46 => Request::SelectedCheckpoint(STREAM),
         _ => return None,
     })
 }
@@ -467,6 +478,11 @@ fn outcome(tag: usize) -> Option<Outcome> {
             head: Lsn(0),
             epoch: Epoch(0),
         }),
+        10 => Outcome::Checkpoint(Some(CheckpointReceipt {
+            checkpoint_lsn: Lsn(2),
+            covered_through_lsn: Lsn(1),
+            logical_floor_lsn: Lsn(2),
+        })),
         _ => return None,
     })
 }
