@@ -783,3 +783,124 @@ async fn an_immutable_stream_offloads_and_reads_below_its_local_floor_but_refuse
     );
     cluster.stop_all().await;
 }
+
+/// A backup round trip keeps a write-once stream write-once: an export of
+/// an immutable stream imports as an immutable stream, and restore-stream
+/// rebuilds one as immutable too. Each keeps writer-session fencing: the
+/// source's session is fenced, a legacy seal is refused, and a new session
+/// seals above the source's epoch and appends after its history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_immutable_stream_restores_and_imports_as_immutable() {
+    let store = tempfile::tempdir().unwrap();
+    let config = offload_config(store.path());
+    let mut cluster = Cluster::start_offloaded(&config).await;
+    let journal = cluster.client(&cluster.credentials);
+    let [a, b, c, d] = cluster.ids;
+    let source = StreamId(52);
+    journal
+        .create_immutable(source, [a, b, c], 1 << 24)
+        .await
+        .unwrap();
+    let session = journal_contract::WriterSessionId(78);
+    let seal = journal
+        .seal_session(source, Epoch(0), session)
+        .await
+        .unwrap();
+    let old = Fence {
+        epoch: seal.fence.writer_epoch,
+        writer: Uuid::from_u128(session.0),
+    };
+    append_range(&journal, source, old, 1, 30).await;
+    flushed(&journal, source, 30).await;
+
+    let work = tempfile::tempdir().unwrap();
+    let operator = operator_file(&cluster, store.path(), work.path());
+    let export = work.path().join("export");
+    let source_id = Uuid::from_u128(source.0).to_string();
+    let voters = format!("{b},{c},{d}");
+    let exported = super::operator::admin(&[
+        "export-stream",
+        "--config",
+        &operator,
+        "--stream",
+        &source_id,
+        "--to",
+        export.to_str().unwrap(),
+    ])
+    .await
+    .unwrap();
+    assert!(exported.ok, "{:?}", exported.report);
+
+    let imported = StreamId(53);
+    let restored = StreamId(54);
+    let imported_id = Uuid::from_u128(imported.0).to_string();
+    let restored_id = Uuid::from_u128(restored.0).to_string();
+    let import = super::operator::admin(&[
+        "import-stream",
+        "--config",
+        &operator,
+        "--from",
+        export.to_str().unwrap(),
+        "--stream",
+        &imported_id,
+        "--quota-bytes",
+        "16777216",
+        "--voters",
+        &voters,
+    ])
+    .await
+    .unwrap();
+    assert!(import.ok, "{:?}", import.report);
+    assert_eq!(import.report["immutable"], true);
+    let restore = super::operator::admin(&[
+        "restore-stream",
+        "--config",
+        &operator,
+        "--from-stream",
+        &source_id,
+        "--stream",
+        &restored_id,
+        "--quota-bytes",
+        "16777216",
+        "--voters",
+        &voters,
+        "--acknowledge-data-loss",
+    ])
+    .await
+    .unwrap();
+    assert!(restore.ok, "{:?}", restore.report);
+    assert_eq!(restore.report["immutable"], true);
+
+    for (stream, next) in [(imported, 79), (restored, 80)] {
+        assert_eq!(journal.require_immutable(stream).await, Ok(()));
+        check(&read_all(&journal, stream, 1, 30).await, 1, 30);
+        // The source's writer session does not carry over.
+        assert!(matches!(
+            journal
+                .append(stream, old, Lsn(31), Bytes::from_static(b"stale"))
+                .await,
+            Err(JournalError::Fenced { .. })
+        ));
+        // An immutable stream takes no legacy seal.
+        assert_eq!(
+            journal
+                .seal(stream, old.epoch, Uuid::from_u128(90))
+                .await
+                .err(),
+            Some(JournalError::Unsupported)
+        );
+        let sealed = journal
+            .seal_session(stream, old.epoch, journal_contract::WriterSessionId(next))
+            .await
+            .unwrap();
+        assert!(sealed.fence.writer_epoch > old.epoch);
+        let fence = Fence {
+            epoch: sealed.fence.writer_epoch,
+            writer: Uuid::from_u128(next),
+        };
+        append_range(&journal, stream, fence, 31, 35).await;
+        flushed(&journal, stream, 35).await;
+        check(&read_all(&journal, stream, 1, 35).await, 1, 35);
+    }
+    cluster.stop_all().await;
+}

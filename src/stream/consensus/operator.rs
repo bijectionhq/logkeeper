@@ -179,6 +179,16 @@ impl Operator {
         voters: Option<[Uuid; 3]>,
         quota_bytes: u64,
     ) -> io::Result<Configuration> {
+        self.create_kind(stream, voters, quota_bytes, false).await
+    }
+
+    async fn create_kind(
+        &self,
+        stream: StreamId,
+        voters: Option<[Uuid; 3]>,
+        quota_bytes: u64,
+        immutable: bool,
+    ) -> io::Result<Configuration> {
         let voters = match (voters, &self.config.placement) {
             (Some(voters), _) => voters,
             (None, Some(placement)) => assignment::choose(stream, placement).ok_or_else(|| {
@@ -190,10 +200,14 @@ impl Operator {
                 ));
             }
         };
-        self.client
-            .create(stream, voters, quota_bytes)
-            .await
-            .map_err(journal_error)?;
+        let created = if immutable {
+            self.client
+                .create_immutable(stream, voters, quota_bytes)
+                .await
+        } else {
+            self.client.create(stream, voters, quota_bytes).await
+        };
+        created.map_err(journal_error)?;
         self.client
             .configuration(stream)
             .await
@@ -752,19 +766,26 @@ impl Operator {
                         .transpose()
                         .map_err(|error| invalid(format!("--floor: {error}")))?
                         .unwrap_or(1);
-                    (
-                        super::offload::transfer::read_store(
-                            &store,
-                            StreamId(source.as_u128()),
-                            journal_contract::Lsn(floor),
-                        )
-                        .await?,
-                        json!(source),
+                    let mut loaded = super::offload::transfer::read_store(
+                        &store,
+                        StreamId(source.as_u128()),
+                        journal_contract::Lsn(floor),
                     )
+                    .await?;
+                    loaded.immutable = super::offload::transfer::immutable(
+                        &self.client,
+                        StreamId(source.as_u128()),
+                    )
+                    .await?;
+                    (loaded, json!(source))
                 };
                 no_remaining_flags(command, &flags)?;
                 super::offload::transfer::stage(&store, target, &loaded).await?;
-                let configuration = self.create(target, voters, quota).await?;
+                // A restore or import keeps the source's kind: an immutable
+                // history stays immutable, under writer-session fencing.
+                let configuration = self
+                    .create_kind(target, voters, quota, loaded.immutable)
+                    .await?;
                 let head = self
                     .client
                     .restore_from_offload(target, loaded.floor, loaded.head, loaded.epoch)
@@ -777,6 +798,7 @@ impl Operator {
                     "floor": loaded.floor.0,
                     "head": head.0,
                     "epoch": loaded.epoch.0,
+                    "immutable": loaded.immutable,
                     "kept": format!("records {}..={}", loaded.floor.0, loaded.head.0),
                 }))
             }

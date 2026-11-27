@@ -798,7 +798,14 @@ impl State {
                 through,
                 retain_from,
             } => Ok(live.offloaded(lineage, through, retain_from)),
-            Command::Restore(_) if genesis.immutable => Err(JournalError::Unsupported),
+            // An immutable history is never rewritten, but a restore or
+            // import into a fresh immutable stream, never sealed or
+            // written, creates it with the source's records.
+            Command::Restore(restore)
+                if genesis.immutable && !(restore.replace && live.fresh()) =>
+            {
+                Err(JournalError::Unsupported)
+            }
             Command::Restore(restore) => Ok(live.restore(restore)),
             Command::SealSession { .. }
             | Command::Create
@@ -1260,6 +1267,11 @@ impl Live {
             .lineages
             .push((restore.lineage, Lsn(self.offload.through.0 + 1)));
         Outcome::At(self.head)
+    }
+
+    /// Whether nothing was ever sealed, written or restored here.
+    fn fresh(&self) -> bool {
+        self.writer.is_none() && self.head == Lsn(0) && self.offload.lineage == 0
     }
 
     fn epoch(&self) -> Epoch {

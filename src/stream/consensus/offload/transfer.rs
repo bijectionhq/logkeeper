@@ -33,6 +33,10 @@ pub struct Manifest {
     /// The writer epoch when the export was taken.
     pub epoch: Epoch,
     pub parts: Vec<Part>,
+    /// Whether the exported stream is immutable, so an import keeps its
+    /// kind. Exports from before this field are of mutable streams.
+    #[serde(default)]
+    pub immutable: bool,
 }
 
 /// One copied segment object and the records of it the export uses.
@@ -51,6 +55,18 @@ pub struct Loaded {
     pub head: Lsn,
     pub epoch: Epoch,
     pub batches: Vec<Vec<Record>>,
+    /// Whether the source stream is immutable: the restored or imported
+    /// stream is created with the same kind.
+    pub immutable: bool,
+}
+
+/// Whether the catalog claimed `stream` as immutable.
+pub async fn immutable(client: &Client, stream: StreamId) -> io::Result<bool> {
+    match client.require_immutable(stream).await {
+        Ok(()) => Ok(true),
+        Err(journal_contract::JournalError::Unsupported) => Ok(false),
+        Err(error) => Err(journal_error(error)),
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -116,6 +132,7 @@ pub async fn export(
         head: status.head,
         epoch: status.epoch,
         parts,
+        immutable: immutable(client, stream).await?,
     };
     let encoded = serde_json::to_vec_pretty(&manifest)?;
     std::fs::write(directory.join(MANIFEST), encoded)?;
@@ -170,6 +187,7 @@ pub fn read_export(directory: &Path) -> io::Result<Loaded> {
         head: manifest.head,
         epoch: manifest.epoch,
         batches,
+        immutable: manifest.immutable,
     })
 }
 
@@ -196,11 +214,14 @@ pub async fn read_store(store: &Store, source: StreamId, floor: Lsn) -> io::Resu
                 .collect(),
         );
     }
+    // The store holds records, not the stream's kind: the caller takes it
+    // from the catalog's claim for the source.
     Ok(Loaded {
         floor,
         head,
         epoch,
         batches,
+        immutable: false,
     })
 }
 
