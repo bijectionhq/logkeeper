@@ -1759,3 +1759,108 @@ async fn the_survivor_that_knows_the_later_commit_recovers_over_a_longer_log() {
     }
     cluster.stop_all().await;
 }
+
+/// An append whose reply was lost, retried across an operator recovery
+/// that erased it. The attempt committed at LSN 3 on the voters the
+/// recovery lost, and the survivor never learned it: the recovery keeps
+/// LSN 2 and reports that loss point exactly. The retry is refused
+/// `Fenced`, and the writer's `Written` lookup finds no matching record at
+/// LSN 3, first because the head is 2 and then because the typed recovery
+/// entry sits there. Both answers say only what survives now, not whether
+/// an attempt committed before the recovery erased it, so the refusal is
+/// not definite. The client must answer `Unavailable` or `Recovered`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "bug: a Written lookup treats the history a recovery rewrote as the one the attempt \
+            ran against, so a retry across the recovery is refused Fenced as if it never \
+            committed (VERIFY-LEAN-REPORT, JournalContract.lean)"]
+async fn a_retry_across_a_recovery_that_erased_its_attempt_is_not_refused_definitely() {
+    let mut cluster = Cluster::start_replicated().await;
+    cluster.finalize().await;
+    leased(&cluster).await;
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(0xA8);
+    let journal = cluster.client(&cluster.credentials);
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 20)
+        .await
+        .unwrap();
+    let sealed = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap();
+    let record = |at: u64| Bytes::from(format!("record-{at}"));
+    for at in 1..=2 {
+        journal
+            .append(stream, sealed.fence, Lsn(at), record(at))
+            .await
+            .unwrap();
+    }
+    let survivor = cluster.group(c, stream).await;
+    timeout(WAIT, async {
+        while survivor.state.head() != Ok(Lsn(2)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(survivor);
+    // The survivor stops, and the other two voters commit LSN 3. Its
+    // reply stands for the one the writer lost.
+    cluster.running.remove(&c).unwrap().stop().await;
+    assert_eq!(
+        journal
+            .append(stream, sealed.fence, Lsn(3), record(3))
+            .await,
+        Ok(Lsn(3))
+    );
+    for keeper in [a, b] {
+        cluster.running.remove(&keeper).unwrap().stop().await;
+    }
+    let report = cluster.configs[&c]
+        .recover_stream(
+            stream,
+            Recovery {
+                acknowledge_data_loss: true,
+                lost: Some(vec![a, b]),
+                unreachable: vec![a, b],
+                ..Recovery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(report.written);
+    assert_eq!(
+        report.head,
+        Lsn(2),
+        "the recovery erased the committed LSN 3"
+    );
+    cluster.restart(c).await;
+    configured(&journal, stream, report.voters).await;
+
+    // While the recovery fence stands.
+    let fenced = journal
+        .append_after(stream, sealed.fence, Lsn(3), record(3), true)
+        .await;
+    // Once the administrator acknowledged it: LSN 3 is the typed entry.
+    assert_eq!(journal.acknowledge_recovery(stream).await, Ok(Lsn(2)));
+    let page = journal
+        .read(stream, Lsn(3), 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(page.recovery(Lsn(3)).is_some(), "{page:?}");
+    let acknowledged = journal
+        .append_after(stream, sealed.fence, Lsn(3), record(3), true)
+        .await;
+    let indefinite = |result: &Result<Lsn, JournalError>| {
+        matches!(
+            result,
+            Err(JournalError::Unavailable | JournalError::Recovered { .. })
+        )
+    };
+    assert!(
+        indefinite(&fenced) && indefinite(&acknowledged),
+        "a retry whose attempt the recovery erased was answered {fenced:?} under the fence \
+         and {acknowledged:?} after it"
+    );
+    cluster.stop_all().await;
+}
