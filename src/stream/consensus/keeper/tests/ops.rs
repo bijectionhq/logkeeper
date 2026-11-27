@@ -121,6 +121,39 @@ async fn metrics_principal_and_loopback_probe_have_limited_access() {
     cluster.stop_all().await;
 }
 
+/// The plain loopback admin listener takes mode changes from local tools
+/// only: a POST that a web page could send (with `Origin` or `Sec-Fetch-*`,
+/// or through a rebound dotted host name) is refused and leaves the mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_admin_mode_changes_refuse_browser_requests() {
+    let (mut cluster, addresses) = start_admin_cluster(false).await;
+    let keeper = cluster.ids[0];
+    let addr = addresses[&keeper];
+    let post = |headers: String| async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!("POST /drain HTTP/1.1\r\n{headers}Connection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        parse_http_response(&raw).0
+    };
+    let port = addr.port();
+    for headers in [
+        format!("Host: localhost:{port}\r\nOrigin: http://evil.example\r\n"),
+        format!("Host: localhost:{port}\r\nSec-Fetch-Site: cross-site\r\n"),
+        format!("Host: evil.example:{port}\r\n"),
+    ] {
+        assert_eq!(post(headers.clone()).await, 403, "{headers}");
+        assert!(
+            !cluster.running[&keeper].engine.mode.draining(),
+            "{headers}"
+        );
+    }
+    assert_eq!(post(format!("Host: localhost:{port}\r\n")).await, 200);
+    assert!(cluster.running[&keeper].engine.mode.draining());
+    cluster.stop_all().await;
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotating_tls_keeps_existing_connections_and_publishes_only_authorized_credentials() {

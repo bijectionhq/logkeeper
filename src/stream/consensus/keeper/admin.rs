@@ -337,7 +337,7 @@ impl Engine {
                 let access = if probe_only {
                     Access::Probe
                 } else {
-                    Access::Administrator("loopback".into())
+                    Access::Administrator(LOOPBACK_ACTOR.into())
                 };
                 self.serve_http(&mut stream, access).await
             }
@@ -378,6 +378,17 @@ impl Engine {
                 )
                 .await;
             };
+            if actor == LOOPBACK_ACTOR && !local_tool_request(&request) {
+                let body = r#"{"error":"plain HTTP mode changes come only from local tools"}"#;
+                return write_http_response(
+                    stream,
+                    "403 Forbidden",
+                    "application/json",
+                    body.as_bytes(),
+                    false,
+                )
+                .await;
+            }
             if let Err(error) = self.set_mode(mode, &actor).await {
                 let body = serde_json::to_vec(&serde_json::json!({ "error": error.to_string() }))
                     .unwrap_or_default();
@@ -1255,6 +1266,57 @@ async fn read_http_request<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<S
     String::from_utf8(buf).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid utf-8"))
 }
 
+/// The actor of a request on the plain loopback admin listener.
+const LOOPBACK_ACTOR: &str = "loopback";
+
+/// Whether a request to the plain loopback listener comes from a local
+/// tool rather than a web page. Any local process may change the mode
+/// there; a browser on the same host must not. Browsers send `Origin` and
+/// `Sec-Fetch-*` on every POST, which a cross-site form or `fetch` cannot
+/// suppress, and a page that rebinds its own DNS name to 127.0.0.1 still
+/// names that dotted host in `Host`. So a mode change needs no such headers
+/// and a `Host` that is a loopback address or a single-label name such as
+/// `localhost` or the CLI's `logkeeper`.
+fn local_tool_request(request: &str) -> bool {
+    let mut host = None;
+    for line in request.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name == "origin" || name.starts_with("sec-fetch-") {
+            return false;
+        }
+        if name == "host" {
+            if host.is_some() {
+                return false;
+            }
+            host = Some(value.trim());
+        }
+    }
+    let Some(host) = host else {
+        return false;
+    };
+    let name = match host.strip_prefix('[') {
+        Some(bracketed) => bracketed.split_once(']').map_or("", |(ip, _)| ip),
+        None => host.rsplit_once(':').map_or(host, |(name, port)| {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                name
+            } else {
+                host
+            }
+        }),
+    };
+    match name.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => {
+            !name.is_empty()
+                && !name.contains('.')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        }
+    }
+}
+
 fn parse_request_line(request: &str) -> Option<(&str, &str)> {
     let line = request.lines().next()?;
     let mut parts = line.split_whitespace();
@@ -1292,6 +1354,35 @@ async fn write_http_response<S: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_mode_changes_come_only_from_local_tools() {
+        let request = |headers: &str| format!("POST /drain HTTP/1.1\r\n{headers}\r\n");
+        for local in [
+            "Host: logkeeper\r\n",
+            "Host: keeper\r\n",
+            "Host: localhost:5741\r\n",
+            "Host: 127.0.0.1:5741\r\n",
+            "Host: [::1]:5741\r\n",
+        ] {
+            assert!(local_tool_request(&request(local)), "{local}");
+        }
+        for remote in [
+            // No Host, a dotted name (DNS rebinding), a non-loopback IP.
+            "",
+            "Host: evil.example\r\n",
+            "Host: evil.example:5741\r\n",
+            "Host: 10.0.0.1:5741\r\n",
+            // Headers every browser sends on a cross-site or same-origin POST.
+            "Host: localhost\r\nOrigin: http://evil.example\r\n",
+            "Host: localhost\r\norigin: null\r\n",
+            "Host: localhost\r\nSec-Fetch-Site: cross-site\r\n",
+            // Two Host headers.
+            "Host: localhost\r\nHost: evil.example\r\n",
+        ] {
+            assert!(!local_tool_request(&request(remote)), "{remote}");
+        }
+    }
 
     #[test]
     fn classify_stream_problems_detects_all_categories() {
