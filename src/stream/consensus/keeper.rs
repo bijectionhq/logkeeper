@@ -382,8 +382,14 @@ impl Config {
             }
             if admin.listen.port() != 0
                 && (admin.listen == self.listen
-                    || self.peers.get(&self.keeper) == Some(&admin.listen)
-                    || self.bulk.get(&self.keeper) == Some(&admin.listen))
+                    || self
+                        .peers
+                        .get(&self.keeper)
+                        .is_some_and(|peer| peer.bind_addr() == admin.listen)
+                    || self
+                        .bulk
+                        .get(&self.keeper)
+                        .is_some_and(|bulk| bulk.bind_addr() == admin.listen))
             {
                 return Err(invalid(
                     "admin listener address must be separate from consensus listeners",
@@ -410,8 +416,10 @@ impl Config {
             .bulk
             .get(&self.keeper)
             .ok_or_else(|| invalid("missing local bulk address"))?;
-        let control = TcpListener::bind(peer).await?;
-        let bulk = TcpListener::bind(bulk).await?;
+        // An IP address binds as given; a DNS name binds every interface
+        // on its port, since the keeper may not know its IP for the name.
+        let control = TcpListener::bind(peer.bind_addr()).await?;
+        let bulk = TcpListener::bind(bulk.bind_addr()).await?;
         let admin_listener = match &self.admin {
             Some(admin) => Some((TcpListener::bind(admin.listen).await?, admin.mtls)),
             None => None,

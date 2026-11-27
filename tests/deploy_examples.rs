@@ -33,7 +33,7 @@ fn check_keeper(config: &Config) {
         .chain(config.bulk.values())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(addresses.len(), config.keepers.len() * 3);
-    assert_eq!(config.listen, config.keepers[&config.keeper]);
+    assert_eq!(config.keepers[&config.keeper], config.listen);
     let voters = config
         .catalog_voters
         .expect("production runs a replicated catalog");

@@ -172,7 +172,12 @@ mod tests {
         let keepers = ids
             .into_iter()
             .enumerate()
-            .map(|(i, id)| (id, ([127, 0, 0, 1], 6000 + i as u16).into()))
+            .map(|(i, id)| {
+                (
+                    id,
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 6000 + i as u16)).into(),
+                )
+            })
             .collect();
         let domains = ids
             .into_iter()

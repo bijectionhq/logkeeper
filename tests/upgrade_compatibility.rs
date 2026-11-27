@@ -238,9 +238,9 @@ impl ProcessCluster {
         let mut peers = Keepers::new();
         let mut bulk = Keepers::new();
         for id in roster {
-            keepers.insert(id, free_port());
-            peers.insert(id, free_port());
-            bulk.insert(id, free_port());
+            keepers.insert(id, free_port().into());
+            peers.insert(id, free_port().into());
+            bulk.insert(id, free_port().into());
         }
 
         let client_credentials = issue_cert(
@@ -452,7 +452,7 @@ impl ProcessCluster {
             .spawn()
             .expect("spawn keeper process");
         self.children.insert(id, child);
-        let addr = self.keepers[&id];
+        let addr = self.keepers[&id].clone();
         timeout(Duration::from_secs(15), async {
             loop {
                 if let Some(child) = self.children.get_mut(&id)
@@ -460,7 +460,7 @@ impl ProcessCluster {
                 {
                     panic!("keeper {id} ({binary:?}) exited early with {status}");
                 }
-                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                if tokio::net::TcpStream::connect(addr.as_str()).await.is_ok() {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;

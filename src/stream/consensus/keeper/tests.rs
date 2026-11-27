@@ -96,6 +96,28 @@ impl Cluster {
     }
 
     async fn start_with(domains: [&str; 4], catalog_voters: Option<[Uuid; 3]>) -> Self {
+        Self::start_addressed(domains, catalog_voters, false).await
+    }
+
+    /// Lists every keeper in the inventory as `localhost:port`, a DNS name
+    /// resolved at each connect, instead of an IP address.
+    async fn start_named() -> Self {
+        Self::start_addressed(["a", "b", "c", "d"], None, true).await
+    }
+
+    async fn start_addressed(
+        domains: [&str; 4],
+        catalog_voters: Option<[Uuid; 3]>,
+        named: bool,
+    ) -> Self {
+        let address = |listener: &TcpListener| -> crate::stream::consensus::Address {
+            let local = listener.local_addr().unwrap();
+            if named {
+                format!("localhost:{}", local.port()).parse().unwrap()
+            } else {
+                local.into()
+            }
+        };
         let dir = tempfile::tempdir().unwrap();
         let roots = dir.path().join("ca.pem");
         let ca = ca(&roots);
@@ -129,9 +151,9 @@ impl Cluster {
             let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let control = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let snapshot = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            keepers.insert(id, app.local_addr().unwrap());
-            peers.insert(id, control.local_addr().unwrap());
-            bulk.insert(id, snapshot.local_addr().unwrap());
+            keepers.insert(id, address(&app));
+            peers.insert(id, address(&control));
+            bulk.insert(id, address(&snapshot));
             listeners.insert(id, [app, control, snapshot]);
         }
         let mut configs = BTreeMap::new();
@@ -147,7 +169,7 @@ impl Cluster {
             );
             let config = Config {
                 keeper: id,
-                listen: keepers[&id],
+                listen: listener[0].local_addr().unwrap(),
                 data: dir.path().join(format!("data-{id}")),
                 tls,
                 keepers: keepers.clone(),
@@ -306,8 +328,12 @@ impl Cluster {
         let config = &self.configs[&id];
         let listeners = [
             TcpListener::bind(config.listen).await.unwrap(),
-            TcpListener::bind(config.peers[&id]).await.unwrap(),
-            TcpListener::bind(config.bulk[&id]).await.unwrap(),
+            TcpListener::bind(config.peers[&id].bind_addr())
+                .await
+                .unwrap(),
+            TcpListener::bind(config.bulk[&id].bind_addr())
+                .await
+                .unwrap(),
         ];
         self.running.insert(
             id,
@@ -1132,7 +1158,7 @@ async fn saturated_application_and_bulk_sockets_leave_a_durable_peer_path() {
         (
             &bulk,
             Lane::Bulk,
-            destination.bulk[&follower],
+            destination.bulk[&follower].socket_addr().unwrap(),
             MAX_BULK_CONNECTIONS,
         ),
     ] {

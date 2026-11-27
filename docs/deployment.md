@@ -38,9 +38,16 @@ shared segmented WAL. It listens on three TCP ports, each with mutual TLS 1.3:
 | Bulk and replication | `bulk` | Keepers only: AppendEntries batches and snapshot files | Bulk `/3`, `/2`. Replication `/4`, `/3` |
 | Admin | `admin.listen` | Probes, metrics scrapers, operators | Plain HTTP on loopback, or mTLS |
 
-A keeper binds the `peers` and `bulk` addresses that its own inventory lists
-for itself. Every address in the inventory is an `IP:port` (`SocketAddr`), and
-DNS names are not accepted, so each keeper needs a stable IP address.
+Every address in the inventory (`keepers`, `peers`, `bulk`) is `IP:port` or
+`name:port`. A DNS name resolves at every connect, trying each address it
+returns, so a keeper that comes back on a new IP (a rescheduled pod) is found
+again under the same name. The name is never trusted for identity: every
+connection checks that the peer's certificate URI names the keeper the route
+was for, and refuses it otherwise. A keeper binds the `peers` and `bulk`
+addresses its own inventory lists for itself: an IP address as given, a name
+on `0.0.0.0` at its port. `listen` stays an IP address. Two different names
+for one endpoint are not detected as duplicates, so give each keeper one
+spelling everywhere.
 
 A stream has three voters in three distinct failure domains. It commits with
 two. Each stream's leader:
@@ -410,9 +417,13 @@ Kustomize base. Render it with `kubectl kustomize`, and validate it with
 `deploy/consensus/tests/validate.sh`. The design choices follow from the
 keeper's rules:
 
-- **Host network, pre-bound local volumes.** The inventory is `IP:port` and
-  the keeper binds its own inventory addresses. So each pod runs on the host
-  network, and its address is its node's IP. `volumes.yaml` pre-binds pod N's
+- **Host network, pre-bound local volumes.** The manifests list each keeper
+  by its node's IP, so each pod runs on the host network. The inventory now
+  also accepts DNS names, so pods can instead be listed by their headless
+  service names (`logkeeper-N.logkeeper.<namespace>.svc.cluster.local:port`,
+  with `publishNotReadyAddresses: true` so peers resolve a keeper before it
+  is ready) and drop host networking; the manifests have not moved to that
+  yet. `volumes.yaml` pre-binds pod N's
   claims (`media-logkeeper-N`, `registry-logkeeper-N`) to local volumes on
   node N, which pins pod N to the node whose IP is in keeper N's config.
 - **Stable keeper ID per pod.** The `install` init container takes the pod
@@ -617,7 +628,6 @@ Most are items in the consensus design's review tables.
 
 | Missing | Effect | Workaround |
 | --- | --- | --- |
-| DNS names in the inventory | Keepers need stable IPs; Kubernetes uses host networking | Static IPs, pinned nodes |
 | Runtime inventory change (T19) | Adding a keeper restarts every keeper | Plan the count; restart one at a time |
 | Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |

@@ -11,8 +11,8 @@ Both modes survive restart and block new replica registration on the keeper.
 ## Add a keeper
 
 1. **Choose identities.** Draw a new UUID and pick the keeper's domain, a
-   stable IP and three ports. Every address in the inventory must be
-   distinct. Issue its certificate with URI SAN `urn:logkeeper:keeper:<uuid>`
+   stable IP or DNS name and three ports. Every address in the inventory
+   must be distinct. Issue its certificate with URI SAN `urn:logkeeper:keeper:<uuid>`
    (serverAuth and clientAuth).
 
 2. **Update the inventory everywhere.** Add the new UUID to `keepers`,

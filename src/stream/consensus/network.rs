@@ -1045,7 +1045,7 @@ impl Connections {
     async fn connect(
         &self,
         target: uuid::Uuid,
-        address: &std::net::SocketAddr,
+        address: &super::Address,
     ) -> io::Result<(Channel, WireVersion)> {
         let tls = match &self.tls {
             Connector::Fixed(tls) => tls.clone(),
@@ -1067,7 +1067,7 @@ impl Connections {
     async fn run(
         self: Arc<Self>,
         target: uuid::Uuid,
-        address: std::net::SocketAddr,
+        address: super::Address,
         queue: mpsc::UnboundedReceiver<Outgoing>,
     ) {
         #[cfg(test)]
@@ -1427,7 +1427,7 @@ impl Rpc {
             .get(&target)
             .ok_or_else(|| invalid("unknown keeper"))?;
         if matches!(self.inner.lane, Lane::Control | Lane::Replication) {
-            return self.multiplexed(target, *address, request).await;
+            return self.multiplexed(target, address.clone(), request).await;
         }
         let peer_lane = self.inner.lane != Lane::Application;
         let _permit = if peer_lane {
@@ -1481,7 +1481,7 @@ impl Rpc {
     async fn connect(
         &self,
         target: uuid::Uuid,
-        address: &std::net::SocketAddr,
+        address: &super::Address,
     ) -> io::Result<(Channel, WireVersion)> {
         self.inner.connect(target, address).await
     }
@@ -1492,7 +1492,7 @@ impl Rpc {
     async fn multiplexed(
         &self,
         target: uuid::Uuid,
-        address: std::net::SocketAddr,
+        address: super::Address,
         mut frame: Frame,
     ) -> io::Result<(WireVersion, Vec<u8>)> {
         let channel = self
@@ -1519,7 +1519,7 @@ impl Rpc {
                 let mut queue = channel.queue.lock();
                 if queue.as_ref().is_none_or(mpsc::UnboundedSender::is_closed) {
                     let (sender, receiver) = mpsc::unbounded_channel();
-                    tokio::spawn(self.inner.clone().run(target, address, receiver));
+                    tokio::spawn(self.inner.clone().run(target, address.clone(), receiver));
                     *queue = Some(sender);
                 }
                 if let Err(mpsc::error::SendError(outgoing)) =

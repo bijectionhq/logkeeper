@@ -933,3 +933,56 @@ async fn debug_bundle_collects_every_keeper_over_mtls_and_inspects_offline() {
         serde_json::from_slice(&entries["logkeeper-debug/offline/verify.json"]).unwrap();
     assert_eq!(verify["ok"], true);
 }
+
+/// Keepers listed by DNS name resolve at each connect, and the certificate,
+/// not the name, says which keeper answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inventory_dns_names_resolve_at_connect_and_identity_comes_from_certificates() {
+    let mut cluster = Cluster::start_named().await;
+    assert!(cluster.keepers.values().all(|address| address.is_name()));
+    let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(Uuid::new_v4().as_u128());
+    client.create(stream, voters, 1 << 26).await.unwrap();
+    let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
+    client
+        .append(stream, sealed.fence, Lsn(1), Bytes::from_static(b"named"))
+        .await
+        .unwrap();
+
+    // A restarted keeper binds its named peer and bulk ports on every
+    // interface, and its peers find it again under the same names.
+    let leader = cluster.leader_after_head(&client, stream).await;
+    cluster.running.remove(&leader).unwrap().stop().await;
+    cluster.restart(leader).await;
+    client
+        .append(stream, sealed.fence, Lsn(2), Bytes::from_static(b"again"))
+        .await
+        .unwrap();
+    timeout(WAIT, async {
+        while !client
+            .keeper_status(leader, stream)
+            .await
+            .is_ok_and(|status| status.replica == Some(true))
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the restarted keeper serves its replica under its name");
+
+    // A name that reaches another keeper is refused: the certificate there
+    // names a different keeper than the route.
+    let mut misrouted = cluster.keepers.clone();
+    let wrong = misrouted[&voters[1]].clone();
+    misrouted.insert(voters[0], wrong);
+    let confused = Client::new(
+        &cluster.credentials,
+        misrouted,
+        cluster.catalog,
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(confused.keeper_status(voters[0], stream).await.is_err());
+    cluster.stop_all().await;
+}

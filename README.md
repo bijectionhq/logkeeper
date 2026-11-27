@@ -72,6 +72,13 @@ For example, the first of four keepers can use this file.
 }
 ```
 
+Inventory addresses (`keepers`, `peers`, `bulk`, and the operator file's
+`admin`) are `IP:port` or `name:port`. A name resolves at every connect; the
+peer's certificate URI, not the name, decides which keeper answered, and a
+route whose name reaches another keeper is refused. A keeper binds its own
+named `peers` and `bulk` ports on `0.0.0.0`. `Keepers` maps UUIDs to
+`consensus::Address`, which converts from a `SocketAddr` with `.into()`.
+
 Issue each keeper a certificate with URI SAN `urn:logkeeper:keeper:<uuid>`,
 usable for both TLS client and server authentication. The CA assigns a unique
 keeper UUID to each incarnation. Issue the application a client certificate

@@ -204,7 +204,9 @@ async fn full_batches_snapshot_across_many_index_pages_and_survive_restart() {
         .unwrap();
     assert_eq!(
         page.records,
-        (head - 3..=head).map(|at| (Lsn(at), record(at))).collect::<Vec<_>>()
+        (head - 3..=head)
+            .map(|at| (Lsn(at), record(at)))
+            .collect::<Vec<_>>()
     );
     cluster.shutdown().await.unwrap();
 }
@@ -633,7 +635,7 @@ async fn a_written_keeper_configuration_reads_back_for_a_keeper_process() {
     cluster.stop(keeper).await.unwrap();
     let config = Config::read(&cluster.write_config(keeper).unwrap()).unwrap();
     assert_eq!(config.keeper, keeper);
-    assert_eq!(config.listen, cluster.keepers()[&keeper]);
+    assert_eq!(cluster.keepers()[&keeper], config.listen);
     assert_eq!(config.catalog, cluster.catalog());
     assert_eq!(config.sync_mode, SyncMode::Fsync);
     // The keeper serves its media again from the configuration read back.
@@ -645,7 +647,10 @@ async fn a_written_keeper_configuration_reads_back_for_a_keeper_process() {
         .unwrap();
     let stream = journal_contract::StreamId(7);
     journal.create(stream).await.unwrap();
-    journal.seal(stream, journal_contract::Epoch(1)).await.unwrap();
+    journal
+        .seal(stream, journal_contract::Epoch(1))
+        .await
+        .unwrap();
     stop.cancel();
     serving.await.unwrap().unwrap();
     cluster.shutdown().await.unwrap();

@@ -118,9 +118,9 @@ impl LocalCluster {
         )?;
         let [mut keepers, mut peers, mut bulk] = [(); 3].map(|_| Keepers::new());
         for id in &roster {
-            keepers.insert(*id, free_port()?);
-            peers.insert(*id, free_port()?);
-            bulk.insert(*id, free_port()?);
+            keepers.insert(*id, free_port()?.into());
+            peers.insert(*id, free_port()?.into());
+            bulk.insert(*id, free_port()?.into());
         }
         let principals = principals
             .iter()
@@ -175,7 +175,7 @@ impl LocalCluster {
             )?;
             let config = Config {
                 keeper: id,
-                listen: keepers[&id],
+                listen: keepers[&id].socket_addr().unwrap(),
                 data: cluster.dir.path().join(format!("data-{id}")),
                 tls,
                 keepers: keepers.clone(),
