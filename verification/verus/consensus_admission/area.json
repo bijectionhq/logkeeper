@@ -1340,8 +1340,8 @@
       "mutate": [
         {
           "file": "src/stream/consensus/decisions.rs",
-          "find": "now - sent < duration - margin)",
-          "replace": "now - sent < duration)"
+          "find": "now - sent < duration - margin\n}",
+          "replace": "now - sent < duration\n}"
         }
       ],
       "expect": [
@@ -1533,6 +1533,24 @@
         {
           "file": "src/stream/consensus/decisions.rs",
           "function": "creates_replication",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 157
+    },
+    "lease-before-send": {
+      "defect": "count a lease valid on a clock reading before its send time",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "sent <= now && now - sent < duration - margin\n}",
+          "replace": "(now < sent || now - sent < duration - margin)\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "lease_valid",
           "category": "postcondition not satisfied"
         }
       ],

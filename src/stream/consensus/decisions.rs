@@ -579,13 +579,14 @@ pub(super) fn lease_bounds(duration: u64, margin: u64) -> bool {
 /// Whether a keeper's liveness lease is valid at `now`, all on the holder's
 /// monotonic clock: it runs from the moment the holder sent the renewal the
 /// authority granted, for the lease duration less the drift margin. So the
-/// holder always counts its lease expired before the authority does.
+/// holder always counts its lease expired before the authority does. A
+/// clock reading before the send time is not trusted: the lease is invalid.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (margin < duration
+    ensures out == (margin < duration && sent <= now
         && (now as int) < sent as int + duration as int - margin as int)
 ))]
 pub(super) fn lease_valid(sent: u64, duration: u64, margin: u64, now: u64) -> bool {
-    margin < duration && (now < sent || now - sent < duration - margin)
+    margin < duration && sent <= now && now - sent < duration - margin
 }
 
 /// Whether a keeper may campaign, lead or serve reads for a stream: its

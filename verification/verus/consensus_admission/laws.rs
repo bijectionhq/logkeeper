@@ -873,6 +873,7 @@ fn a_lease_ends_before_the_recovery_serves(sent: u64, duration: u64, margin: u64
         }
     }
     assert(margin >= duration ==> !valid);
+    assert(now < sent ==> !valid);
     assert(now >= sent && now - sent >= duration - margin ==> !valid);
 }
 
