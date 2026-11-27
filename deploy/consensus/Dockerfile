@@ -8,9 +8,13 @@ FROM toolchain AS build
 ARG TARGETARCH
 WORKDIR /src
 COPY . .
+# Git archives preserve commit timestamps. Force Cargo to recompile the
+# workspace crates when this source layer changes, even if the shared cache
+# holds a binary built more recently from another commit.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=logkeeper-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=logkeeper-target-${TARGETARCH},sharing=locked \
-    cargo build --locked --release --features stream --bin logkeeper \
+    cargo clean --release --package logkeeper --package journal-contract \
+    && cargo build --locked --release --features stream --bin logkeeper \
     && install -m 0555 target/release/logkeeper /usr/local/bin/logkeeper
 
 FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
