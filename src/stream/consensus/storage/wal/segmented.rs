@@ -55,6 +55,10 @@ const CHECKPOINT_MAGIC: &[u8; 8] = b"LKRWAL04";
 /// N checkpoint format carrying the finalized cluster feature level; gated by
 /// `decisions::write_version_allows`.
 const CHECKPOINT_MAGIC_V5: &[u8; 8] = b"LKRWAL05";
+/// The format that also carries each stream's durable commit index
+/// (`Record::Committed`); written once the cluster finalized
+/// `CLUSTER_VERSION_LEASES`, the level that writes those frames.
+const CHECKPOINT_MAGIC_V6: &[u8; 8] = b"LKRWAL06";
 const MAX_CHECKPOINT: u64 = 1024 * 1024 * 1024;
 #[cfg(not(test))]
 const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
@@ -128,12 +132,34 @@ pub(in crate::stream::consensus::storage) struct Checkpoint {
     pub chain: [u8; 32],
     pub leaves: Vec<(StreamId, Leaf)>,
     pub segments: BTreeMap<u64, BTreeSet<StreamId>>,
+    /// Each stream's durable commit index. Outside the earlier layouts:
+    /// only `CheckpointV6` carries it.
+    #[serde(skip)]
+    pub committed: BTreeMap<StreamId, LogId>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct CheckpointV5 {
     cluster_version: u32,
     checkpoint: Checkpoint,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckpointV6 {
+    cluster_version: u32,
+    checkpoint: Checkpoint,
+    committed: BTreeMap<StreamId, LogId>,
+}
+
+impl State {
+    /// Restores the commit indexes a checkpoint carries, after its leaves.
+    fn restore_committed(&mut self, committed: BTreeMap<StreamId, LogId>) {
+        for (stream, id) in committed {
+            if let Some(log) = self.logs.get_mut(&stream) {
+                log.committed = Some(id);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -340,14 +366,16 @@ impl Segmented {
         let directory = objects.segment_directory().to_owned();
         let (mut state, position, chain, pins) = match slot.checkpoint {
             Some(reference) => {
-                let (checkpoint, cluster_version) = read_checkpoint(&checkpoints, reference)?;
+                let (mut checkpoint, cluster_version) = read_checkpoint(&checkpoints, reference)?;
                 let mut state = State {
                     cluster_version,
                     ..State::default()
                 };
+                let committed = std::mem::take(&mut checkpoint.committed);
                 for (scope, leaf) in checkpoint.leaves {
                     leaf.restore(scope, objects, &mut state)?;
                 }
+                state.restore_committed(committed);
                 objects.restore_segment_scopes(checkpoint.segments);
                 let pins = state
                     .logs
@@ -481,7 +509,8 @@ impl Segmented {
 
         let (mut state, from, mut chain) = match slot.checkpoint {
             Some(reference) => {
-                let (checkpoint, cluster_version) = read_checkpoint(&checkpoints, reference)?;
+                let (mut checkpoint, cluster_version) = read_checkpoint(&checkpoints, reference)?;
+                let committed = std::mem::take(&mut checkpoint.committed);
                 segment_scopes = checkpoint.segments.clone();
                 objects.restore_segment_scopes(checkpoint.segments.clone());
                 // Check every segment header the checkpoint knows about.
@@ -511,6 +540,7 @@ impl Segmented {
                         }
                     }
                 }
+                state.restore_committed(committed);
                 (state, checkpoint.position, checkpoint.chain)
             }
             None => (
@@ -1183,6 +1213,11 @@ fn capture(
             chain,
             leaves,
             segments,
+            committed: state
+                .logs
+                .iter()
+                .filter_map(|(stream, log)| log.committed.map(|id| (*stream, id)))
+                .collect(),
         },
         pins,
     ))
@@ -1198,7 +1233,31 @@ fn write_checkpoint(
     space: &Space,
     write_version: u32,
 ) -> io::Result<CheckpointRef> {
+    let copy = || Checkpoint {
+        position: checkpoint.position,
+        chain: checkpoint.chain,
+        leaves: checkpoint.leaves.clone(),
+        segments: checkpoint.segments.clone(),
+        committed: BTreeMap::new(),
+    };
     let body = if crate::stream::consensus::decisions::write_version_allows(
+        write_version,
+        crate::stream::consensus::CLUSTER_VERSION_LEASES,
+    ) {
+        let mut body = CHECKPOINT_MAGIC_V6.to_vec();
+        options()
+            .with_limit(MAX_CHECKPOINT)
+            .serialize_into(
+                &mut body,
+                &CheckpointV6 {
+                    cluster_version: write_version,
+                    checkpoint: copy(),
+                    committed: checkpoint.committed.clone(),
+                },
+            )
+            .map_err(io::Error::other)?;
+        body
+    } else if crate::stream::consensus::decisions::write_version_allows(
         write_version,
         crate::stream::consensus::CLUSTER_VERSION_V2,
     ) {
@@ -1209,12 +1268,7 @@ fn write_checkpoint(
                 &mut body,
                 &CheckpointV5 {
                     cluster_version: write_version,
-                    checkpoint: Checkpoint {
-                        position: checkpoint.position,
-                        chain: checkpoint.chain,
-                        leaves: checkpoint.leaves.clone(),
-                        segments: checkpoint.segments.clone(),
-                    },
+                    checkpoint: copy(),
                 },
             )
             .map_err(io::Error::other)?;
@@ -1259,14 +1313,16 @@ pub(in crate::stream::consensus::storage) fn open_readonly(
     let directory = objects.segment_directory().to_owned();
     let (mut state, position, chain) = match slot.checkpoint {
         Some(reference) => {
-            let (checkpoint, cluster_version) = read_checkpoint(&checkpoints, reference)?;
+            let (mut checkpoint, cluster_version) = read_checkpoint(&checkpoints, reference)?;
             let mut state = State {
                 cluster_version,
                 ..State::default()
             };
+            let committed = std::mem::take(&mut checkpoint.committed);
             for (scope, leaf) in checkpoint.leaves {
                 leaf.restore(scope, objects, &mut state)?;
             }
+            state.restore_committed(committed);
             (state, checkpoint.position, checkpoint.chain)
         }
         None => (
@@ -1333,6 +1389,15 @@ pub(in crate::stream::consensus::storage) fn read_checkpoint(
         return Err(invalid(
             "WAL checkpoint does not match its trusted boundary",
         ));
+    }
+    if bytes.starts_with(CHECKPOINT_MAGIC_V6) {
+        let v6: CheckpointV6 = options()
+            .with_limit(MAX_CHECKPOINT)
+            .deserialize(&bytes[CHECKPOINT_MAGIC_V6.len()..])
+            .map_err(io::Error::other)?;
+        let mut checkpoint = v6.checkpoint;
+        checkpoint.committed = v6.committed;
+        return Ok((checkpoint, v6.cluster_version));
     }
     if bytes.starts_with(CHECKPOINT_MAGIC_V5) {
         let v5: CheckpointV5 = options()

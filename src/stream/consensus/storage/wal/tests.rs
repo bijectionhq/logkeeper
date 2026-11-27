@@ -1062,3 +1062,167 @@ async fn a_relocated_segment_outlives_the_checkpoint_that_names_it() {
         reopened.shutdown().await.unwrap();
     }
 }
+
+/// A stream with a replica generation and `count` entries from index 0.
+async fn owned_entries(disk: &Disk, count: u64) -> (StreamId, u64) {
+    let genesis = genesis();
+    let stream = genesis.stream;
+    let stage = Stage {
+        stream,
+        source: 1,
+        old: genesis.voters,
+        target: genesis.voters,
+    };
+    disk.protocol(Record::Register(genesis)).await.unwrap();
+    disk.protocol(Record::Vote(stream, Vote::new_committed(2, 1)))
+        .await
+        .unwrap();
+    disk.maintenance(Record::Ownership(stream, Change::Stage(stage)))
+        .await
+        .unwrap();
+    let generation = disk.current_generation(stream).unwrap();
+    for index in 0..count {
+        disk.write(Record::Owned(
+            generation,
+            Box::new(Record::Append(
+                stream,
+                vec![entry(index, Bytes::from_static(b"x"))],
+            )),
+        ))
+        .await
+        .unwrap();
+    }
+    (stream, generation)
+}
+
+fn committed(disk: &Disk, stream: StreamId) -> Option<u64> {
+    disk.log(stream, |log| log.committed.map(|id| id.index))
+}
+
+/// The commit index rides in the next round that runs anyway, so it is
+/// durable exactly when that round is: a crash before the round's boundary
+/// loses both the round's append and the index, one after keeps both.
+#[tokio::test]
+async fn a_commit_index_is_durable_exactly_with_the_round_that_carries_it() {
+    for cut in [None, Some(6), Some(5), Some(2), Some(3)] {
+        let dir = tempfile::tempdir().unwrap();
+        let enrollment = install(dir.path(), genesis().voters[0]);
+        let disk = Disk::open(enrollment()).unwrap();
+        disk.set_write_version(crate::stream::consensus::CLUSTER_VERSION_LEASES);
+        let (stream, generation) = owned_entries(&disk, 3).await;
+        disk.note_committed(stream, generation, entry(1, Bytes::new()).log_id);
+        if let Some(cut) = cut {
+            disk.interrupt_next(stream, cut);
+        }
+        let written = disk
+            .write(Record::Owned(
+                generation,
+                Box::new(Record::Append(
+                    stream,
+                    vec![entry(3, Bytes::from_static(b"x"))],
+                )),
+            ))
+            .await;
+        assert_eq!(written.is_ok(), cut.is_none(), "cut {cut:?}");
+        let _ = disk.shutdown().await;
+        drop(disk);
+        let durable = cut.is_none_or(|cut| cut == 3);
+        let reopened = Disk::open(enrollment()).unwrap();
+        reopened.log(stream, |log| {
+            assert_eq!(
+                log.entries.len(),
+                if durable { 4 } else { 3 },
+                "cut {cut:?}"
+            );
+        });
+        assert_eq!(
+            committed(&reopened, stream),
+            durable.then_some(1),
+            "cut {cut:?}"
+        );
+        let point = reopened.recovery_point(stream);
+        assert_eq!(
+            point.committed.map(|id| id.index),
+            durable.then_some(1),
+            "cut {cut:?}"
+        );
+        reopened.shutdown().await.unwrap();
+    }
+}
+
+/// An idle keeper writes a noted commit index in a round of its own, and a
+/// stopping one in its last round; neither before leases are finalized.
+#[tokio::test]
+async fn an_idle_or_stopping_keeper_writes_its_commit_index_only_once_leases_are_finalized() {
+    let dir = tempfile::tempdir().unwrap();
+    let enrollment = install(dir.path(), genesis().voters[0]);
+    let disk = Disk::open(enrollment()).unwrap();
+    let (stream, generation) = owned_entries(&disk, 3).await;
+    disk.note_committed(stream, generation, entry(0, Bytes::new()).log_id);
+    disk.flush_committed().await.unwrap();
+    tokio::time::sleep(COMMITTED_FLUSH * 3).await;
+    assert_eq!(committed(&disk, stream), None, "gated below leases");
+    disk.shutdown().await.unwrap();
+    let reopened = Disk::open(enrollment()).unwrap();
+    assert_eq!(committed(&reopened, stream), None);
+
+    // The note kept while gated is written once the level allows it.
+    reopened.set_write_version(crate::stream::consensus::CLUSTER_VERSION_LEASES);
+    reopened.note_committed(stream, generation, entry(1, Bytes::new()).log_id);
+    tokio::time::timeout(COMMITTED_FLUSH * 10, async {
+        while committed(&reopened, stream) != Some(1) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("an idle keeper wrote its commit index");
+    // An index never moves back, and a stopping keeper writes the last one.
+    reopened.note_committed(stream, generation, entry(0, Bytes::new()).log_id);
+    reopened.note_committed(stream, generation, entry(2, Bytes::new()).log_id);
+    reopened.shutdown().await.unwrap();
+    let reopened = Disk::open(enrollment()).unwrap();
+    assert_eq!(committed(&reopened, stream), Some(2));
+    reopened.shutdown().await.unwrap();
+}
+
+/// A checkpoint taken after the commit index's frame carries it, and one
+/// taken below leases does not; a truncation or an overwrite past it, which
+/// only a recovery's other survivor sees, forgets it.
+#[tokio::test]
+async fn a_checkpoint_carries_the_commit_index_and_a_truncation_past_it_drops_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let enrollment = install(dir.path(), genesis().voters[0]);
+    let disk = Disk::open(enrollment()).unwrap();
+    disk.set_write_version(crate::stream::consensus::CLUSTER_VERSION_LEASES);
+    let (stream, generation) = owned_entries(&disk, 3).await;
+    disk.note_committed(stream, generation, entry(2, Bytes::new()).log_id);
+    disk.flush_committed().await.unwrap();
+    assert_eq!(committed(&disk, stream), Some(2));
+    disk.checkpoint_now().await.unwrap();
+    let body = fs::read(&checkpoint_files(dir.path())[0]).unwrap();
+    assert!(body.starts_with(b"LKRWAL06"));
+    // Frames after the checkpoint name other streams' state only.
+    disk.protocol(Record::Vote(stream, Vote::new_committed(3, 1)))
+        .await
+        .unwrap();
+    disk.shutdown().await.unwrap();
+    let reopened = Disk::open(enrollment()).unwrap();
+    assert_eq!(committed(&reopened, stream), Some(2), "from the checkpoint");
+
+    reopened
+        .write(Record::Owned(
+            generation,
+            Box::new(Record::Truncate(stream, 2)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(committed(&reopened, stream), None);
+    reopened.shutdown().await.unwrap();
+    let reopened = Disk::open(enrollment()).unwrap();
+    assert_eq!(committed(&reopened, stream), None);
+    // No snapshot or purge cut names a committed point either.
+    reopened.log(stream, |log| {
+        assert_eq!(log.durable_committed(), None);
+    });
+    reopened.shutdown().await.unwrap();
+}

@@ -406,7 +406,8 @@ async fn write_version_gate_keeps_v1_checkpoints_until_finalized_in_replicated_a
         ));
 
         // Keepers observe the finalized cluster version via liveness sync and
-        // begin writing LKRWAL05 checkpoints.
+        // begin writing checkpoints in the finalized format, which carries
+        // commit indexes from CLUSTER_VERSION_LEASES on.
         timeout(WAIT, async {
             while !cluster.running[&a]
                 .engine
@@ -437,7 +438,7 @@ async fn write_version_gate_keeps_v1_checkpoints_until_finalized_in_replicated_a
             .map(|entry| entry.unwrap().path())
             .collect();
         assert_eq!(files.len(), 1);
-        assert_eq!(&std::fs::read(&files[0]).unwrap()[..8], b"LKRWAL05");
+        assert_eq!(&std::fs::read(&files[0]).unwrap()[..8], b"LKRWAL06");
 
         // Finalized version survives full cluster restart.
         cluster.stop_all().await;

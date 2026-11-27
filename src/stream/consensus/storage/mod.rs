@@ -44,6 +44,10 @@ struct Log {
     vote: Option<Vote>,
     purged: Option<LogId>,
     snapshot: Option<snapshot::Selected>,
+    /// The highest log ID this replica durably knows committed, from its
+    /// `Record::Committed` frames. Lags the commit index OpenRaft holds in
+    /// memory; the selected snapshot and the purge cut are committed too.
+    committed: Option<LogId>,
     entries: BTreeMap<u64, Entry>,
     ownership: super::ownership::Ownership,
     segments: BTreeMap<u64, std::sync::Arc<objects::Object>>,
@@ -76,6 +80,33 @@ struct AcceptedAppend {
 }
 
 pub(super) struct FollowerGuard(Arc<FollowerAppend>);
+
+impl Log {
+    /// What this replica durably knows committed: its `Record::Committed`
+    /// frames, its selected snapshot and its purge cut. A frame whose entry
+    /// the log no longer holds as written is ignored.
+    pub(super) fn durable_committed(&self) -> Option<LogId> {
+        let recorded = self.committed.filter(|committed| {
+            self.entries
+                .get(&committed.index)
+                .is_some_and(|entry| entry.log_id == *committed)
+                || self
+                    .purged
+                    .is_some_and(|purged| purged.index >= committed.index)
+                || self
+                    .snapshot
+                    .is_some_and(|snapshot| snapshot.log_id.index >= committed.index)
+        });
+        [
+            recorded,
+            self.purged,
+            self.snapshot.map(|snapshot| snapshot.log_id),
+        ]
+        .into_iter()
+        .flatten()
+        .max_by_key(|id| id.index)
+    }
+}
 
 impl FollowerAppend {
     pub fn admit(
@@ -255,6 +286,25 @@ impl RaftLogStorage<RaftTypes> for LogStore {
                 Err(error)
             }
         }
+    }
+
+    /// Notes the commit index without a WAL write of its own: the next WAL
+    /// round carries it as a `Record::Committed` frame once the cluster
+    /// finalized `CLUSTER_VERSION_LEASES`, and an idle keeper writes it
+    /// within `wal::COMMITTED_FLUSH` (`Disk::note_committed`).
+    async fn save_committed(&mut self, committed: Option<LogId>) -> io::Result<()> {
+        if let Some(committed) = committed {
+            self.disk
+                .note_committed(self.stream, self.generation, committed);
+        }
+        Ok(())
+    }
+
+    /// The durable commit index, which OpenRaft re-applies through on open.
+    /// Only a log ID this replica's log still holds, or that its snapshot or
+    /// purge cut covers.
+    async fn read_committed(&mut self) -> io::Result<Option<LogId>> {
+        Ok(self.disk.log(self.stream, Log::durable_committed))
     }
 
     async fn truncate_after(&mut self, last_log_id: Option<LogId>) -> io::Result<()> {

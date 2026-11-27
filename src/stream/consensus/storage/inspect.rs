@@ -1000,6 +1000,12 @@ fn summarize_record(record: &Record) -> String {
             format!("Truncate(stream={}, since={since})", stream_uuid(*stream))
         }
         Record::ClusterVersion(version) => format!("ClusterVersion(version={version})"),
+        Record::Committed(stream, log_id) => format!(
+            "Committed(stream={}, term={}, index={})",
+            stream_uuid(*stream),
+            log_id.leader_id.term,
+            log_id.index
+        ),
         Record::Purge(stream, log_id) => format!(
             "Purge(stream={}, term={}, index={})",
             stream_uuid(*stream),

@@ -54,6 +54,14 @@ const MAINTENANCE_QUEUE: usize = 16;
 const REPLICATION_QUEUE: usize = 16;
 const FOLLOWER_SUFFIX_LIMIT: usize = segmented::MAX_SUFFIX - 16;
 const MAX_CONTACTS: usize = 128;
+/// How long a noted commit index waits for a round that runs anyway before
+/// an idle keeper writes it in a round of its own.
+pub(in crate::stream::consensus) const COMMITTED_FLUSH: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// Commit indexes OpenRaft reported that the WAL does not hold yet, with the
+/// replica generation that reported each.
+type Noted = parking_lot::Mutex<BTreeMap<StreamId, (u64, LogId)>>;
 
 #[derive(Serialize, Deserialize)]
 pub(in crate::stream::consensus) enum Record {
@@ -84,6 +92,12 @@ pub(in crate::stream::consensus) enum Record {
     /// Only written once an operator finalizes past V1, so N-1 binaries can
     /// still open the WAL before finalize.
     ClusterVersion(u32),
+    /// The highest log ID of the stream this replica knows committed. Written
+    /// lazily in rounds that run anyway, and only once the cluster finalized
+    /// `CLUSTER_VERSION_LEASES`, so N-1 binaries can still open the WAL
+    /// before finalize. Added after `ClusterVersion`. An operator recovery
+    /// keeps the survivor's log only through it (`keeper/recovery.rs`).
+    Committed(StreamId, LogId),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -206,6 +220,15 @@ impl State {
                     log.segments.split_off(&first);
                     log.entries
                         .extend(entries.into_iter().map(|entry| (entry.log_id.index, entry)));
+                    if log.committed.is_some_and(|known| {
+                        known.index >= first
+                            && log
+                                .entries
+                                .get(&known.index)
+                                .is_none_or(|entry| entry.log_id != known)
+                    }) {
+                        log.committed = None;
+                    }
                 }
             }
             Record::Recover(stream, vote, entries) => {
@@ -220,6 +243,15 @@ impl State {
                 self.apply(Record::Append(stream, entries))?;
             }
             Record::Relocate(..) => (),
+            Record::Committed(stream, committed) => {
+                let log = self.log_mut(stream)?;
+                if log
+                    .committed
+                    .is_none_or(|known| known.index < committed.index)
+                {
+                    log.committed = Some(committed);
+                }
+            }
             Record::Truncate(stream, since) => {
                 let log = self.log_mut(stream)?;
                 if log.purged.is_some_and(|id| id.index >= since) {
@@ -227,6 +259,11 @@ impl State {
                 }
                 log.entries.split_off(&since);
                 log.segments.split_off(&since);
+                // Raft never truncates a committed entry. A frame that names
+                // one anyway no longer describes this log.
+                if log.committed.is_some_and(|known| known.index >= since) {
+                    log.committed = None;
+                }
             }
             Record::Purge(stream, through) => {
                 let log = self.log_mut(stream)?;
@@ -266,6 +303,7 @@ impl State {
                 if log.ownership.apply(change, has_cut)? {
                     log.snapshot = None;
                     log.purged = None;
+                    log.committed = None;
                     log.entries.clear();
                     log.segments.clear();
                 }
@@ -438,6 +476,7 @@ impl Record {
             | Self::Snapshot(stream, _)
             | Self::Contacts(stream, _)
             | Self::Recover(stream, ..)
+            | Self::Committed(stream, _)
             | Self::Ownership(stream, _) => *stream,
             Self::Relocate(from, _) => from.scope,
         }
@@ -472,6 +511,9 @@ struct Work {
 
 enum Message {
     Write(Work),
+    /// Writes the noted commit indexes if no round carried them lately, or
+    /// at once with a reply.
+    Flush(Option<oneshot::Sender<io::Result<()>>>),
     #[cfg(test)]
     Checkpoint(oneshot::Sender<io::Result<()>>),
     Shutdown,
@@ -490,6 +532,7 @@ pub(in crate::stream::consensus) struct Disk {
     inflight: Arc<parking_lot::Mutex<BTreeMap<StreamId, Arc<super::inflight::Inflight>>>>,
     /// Finalized cluster feature level gating new on-disk formats and commands.
     write_version: Arc<AtomicU32>,
+    noted: Arc<Noted>,
     stopped: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<io::Result<()>>>>>,
     media_lock: Weak<File>,
     pub path: Arc<PathBuf>,
@@ -575,6 +618,8 @@ impl Disk {
         let write_version = Arc::new(AtomicU32::new(initial_version));
         let writer_healthy = healthy.clone();
         let writer_version = write_version.clone();
+        let noted = Arc::new(Noted::default());
+        let writer_noted = noted.clone();
         let watchdog = super::watchdog::Watchdog::new();
         watchdog.spawn(
             healthy.clone(),
@@ -616,6 +661,7 @@ impl Disk {
                     &writer_space,
                     &writer_healthy,
                     &writer_version,
+                    &writer_noted,
                     &writer_watchdog,
                     &writer_metrics,
                     #[cfg(test)]
@@ -633,6 +679,11 @@ impl Disk {
                 }
                 let _ = finished.send(result);
             })?;
+        spawn_committed_flush(
+            maintenance.downgrade(),
+            Arc::downgrade(&noted),
+            Arc::downgrade(&write_version),
+        )?;
         Ok(Self {
             state,
             work,
@@ -644,6 +695,7 @@ impl Disk {
             watchdog,
             inflight: Arc::default(),
             write_version,
+            noted,
             stopped: Arc::new(tokio::sync::Mutex::new(Some(stopped))),
             media_lock,
             path: Arc::new(path),
@@ -737,6 +789,28 @@ impl Disk {
     /// command requiring `required`.
     pub fn write_version_allows(&self, required: u32) -> bool {
         decisions::write_version_allows(self.cluster_version(), required)
+    }
+
+    /// Notes that `stream`'s replica of `generation` knows it committed
+    /// through `committed`. The WAL writes it lazily (`Record::Committed`).
+    pub fn note_committed(&self, stream: StreamId, generation: u64, committed: LogId) {
+        let mut noted = self.noted.lock();
+        let slot = noted.entry(stream).or_insert((generation, committed));
+        if slot.0 != generation || slot.1.index < committed.index {
+            *slot = (generation, committed);
+        }
+    }
+
+    /// Writes the noted commit indexes now, in a round of their own if no
+    /// other write is queued. Only once leases are finalized.
+    #[cfg(test)]
+    pub async fn flush_committed(&self) -> io::Result<()> {
+        let (done, reply) = oneshot::channel();
+        self.maintenance
+            .send(Message::Flush(Some(done)))
+            .await
+            .map_err(io::Error::other)?;
+        reply.await.map_err(io::Error::other)?
     }
 
     #[cfg(test)]
@@ -1135,7 +1209,22 @@ impl Disk {
 
     /// What an operator recovery needs from this keeper's log of `stream`.
     pub fn recovery_point(&self, stream: StreamId) -> RecoveryPoint {
+        let noted = self.noted.lock().get(&stream).copied();
         self.log(stream, |log| {
+            // A running keeper also knows what it noted and has not written.
+            let noted = noted
+                .filter(|(generation, id)| {
+                    log.ownership.generation() == Some(*generation)
+                        && log
+                            .entries
+                            .get(&id.index)
+                            .is_some_and(|entry| entry.log_id == *id)
+                })
+                .map(|(_, id)| id);
+            let committed = [log.durable_committed(), noted]
+                .into_iter()
+                .flatten()
+                .max_by_key(|id| id.index);
             let vote_term = log.vote.map_or(0, |vote| vote.leader_id().term);
             let last = log.entries.last_key_value().map(|(_, entry)| entry.log_id);
             let tip = last.or(log.purged);
@@ -1169,6 +1258,7 @@ impl Disk {
                 vote_term,
                 log_term,
                 tip,
+                committed,
                 snapshot_ahead: snapshot
                     .is_some_and(|snapshot| tip.is_none_or(|tip| snapshot.index > tip.index)),
                 written,
@@ -1191,6 +1281,10 @@ pub(in crate::stream::consensus) struct RecoveryPoint {
     /// The highest term of the last entry, purge cut or selected snapshot.
     pub log_term: u64,
     pub tip: Option<LogId>,
+    /// The highest log ID this keeper knows committed: durably, from its
+    /// `Record::Committed` frames, snapshot and purge cut, and, while it
+    /// runs, what it noted since. Never past `tip`.
+    pub committed: Option<LogId>,
     /// The selected snapshot covers entries past the log's tip.
     pub snapshot_ahead: bool,
     /// The stage of a recovery an earlier run already wrote.
@@ -1254,6 +1348,7 @@ fn run(
     space: &Space,
     health: &AtomicBool,
     write_version: &AtomicU32,
+    noted: &Noted,
     watchdog: &super::watchdog::Watchdog,
     metrics: &crate::stream::consensus::metrics::Metrics,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
@@ -1267,6 +1362,7 @@ fn run(
         objects,
         space,
         write_version,
+        noted,
         watchdog,
         metrics,
         #[cfg(test)]
@@ -1286,15 +1382,23 @@ fn rounds(
     objects: &Objects,
     space: &Space,
     write_version: &AtomicU32,
+    noted: &Noted,
     watchdog: &super::watchdog::Watchdog,
     metrics: &crate::stream::consensus::metrics::Metrics,
     #[cfg(test)] replica_fault: &parking_lot::Mutex<Option<(StreamId, ReplicaFault)>>,
     #[cfg(test)] wal_delay_ms: &std::sync::atomic::AtomicU64,
 ) -> io::Result<()> {
     let mut finish = false;
+    // When the last round with frames committed.
+    let mut last_round = std::time::Instant::now();
     while let Some(message) = queues.recv() {
-        let first = match message {
-            Message::Write(first) => first,
+        let mut round = Vec::new();
+        let mut flushed = Vec::new();
+        match message {
+            Message::Write(first) => round.push(first),
+            // A round ran lately and the next one carries the noted indexes.
+            Message::Flush(None) if last_round.elapsed() < COMMITTED_FLUSH / 2 => continue,
+            Message::Flush(done) => flushed.extend(done),
             #[cfg(test)]
             Message::Checkpoint(done) => {
                 let version = write_version.load(Ordering::Acquire);
@@ -1302,22 +1406,25 @@ fn rounds(
                 let _ = done.send(result);
                 continue;
             }
-            Message::Shutdown => break,
-        };
+            // The last round carries what was noted since the one before.
+            Message::Shutdown => finish = true,
+        }
         let round_start = std::time::Instant::now();
         let _round = watchdog.begin();
-        let mut round = vec![first];
         let mut bytes = 0;
+        if let Some(first) = round.first() {
+            bytes += bincode::serialized_size(&first.record).map_err(io::Error::other)?;
+        }
         #[cfg(test)]
         let mut checkpoint_waiters = Vec::new();
-        while round.len() < MAX_ROUND_RECORDS {
-            bytes += bincode::serialized_size(&round.last().unwrap().record)
-                .map_err(io::Error::other)?;
-            if bytes >= MAX_ROUND_BYTES as u64 {
-                break;
-            }
+        while !finish && round.len() < MAX_ROUND_RECORDS && bytes < MAX_ROUND_BYTES as u64 {
             match queues.try_recv() {
-                Some(Message::Write(work)) => round.push(work),
+                Some(Message::Write(work)) => {
+                    bytes += bincode::serialized_size(&work.record).map_err(io::Error::other)?;
+                    round.push(work);
+                }
+                // This round carries the noted indexes anyway.
+                Some(Message::Flush(done)) => flushed.extend(done),
                 #[cfg(test)]
                 Some(Message::Checkpoint(done)) => checkpoint_waiters.push(done),
                 Some(Message::Shutdown) => {
@@ -1420,6 +1527,16 @@ fn rounds(
                 Err(error) => return Err(error),
             }
         }
+        let committed = if decisions::write_version_allows(
+            write_version
+                .load(Ordering::Acquire)
+                .max(working.cluster_version),
+            crate::stream::consensus::CLUSTER_VERSION_LEASES,
+        ) {
+            stage_committed(noted, &state.read(), &working, wal, objects)?
+        } else {
+            Vec::new()
+        };
         #[cfg(test)]
         if let Some((entered, resume)) = held {
             let _ = entered.send(());
@@ -1430,7 +1547,7 @@ fn rounds(
                 wal.interrupt(2);
             }
         }
-        if !changed.is_empty() {
+        if !changed.is_empty() || !committed.is_empty() {
             #[cfg(test)]
             {
                 let delay = wal_delay_ms.load(Ordering::Relaxed);
@@ -1440,6 +1557,7 @@ fn rounds(
             }
             let round_records = replies.len() as u64;
             let round_bytes = wal.commit(objects, &changed, metrics)?;
+            last_round = std::time::Instant::now();
             metrics.wal_round_records.observe(round_records);
             metrics.wal_round_bytes.observe(round_bytes);
             let round_duration = round_start.elapsed();
@@ -1480,7 +1598,22 @@ fn rounds(
                 installed.catalog.extend(working.catalog);
                 installed.logs.extend(working.logs);
                 installed.cluster_version = installed.cluster_version.max(working.cluster_version);
+                for (stream, generation, id) in &committed {
+                    if let Some(log) = installed.logs.get_mut(stream)
+                        && log.ownership.generation() == Some(*generation)
+                        && log.committed.is_none_or(|known| known.index < id.index)
+                    {
+                        log.committed = Some(*id);
+                    }
+                }
             });
+            let mut pending = noted.lock();
+            for (stream, generation, id) in committed {
+                if pending.get(&stream) == Some(&(generation, id)) {
+                    pending.remove(&stream);
+                }
+            }
+            drop(pending);
             let _ = write_version.fetch_max(working.cluster_version, Ordering::AcqRel);
             wal.maybe_checkpoint(
                 &state.read(),
@@ -1492,6 +1625,9 @@ fn rounds(
         for (reply, _reservation) in replies {
             let _ = reply.send(Ok(()));
         }
+        for done in flushed {
+            let _ = done.send(Ok(()));
+        }
         #[cfg(test)]
         for done in checkpoint_waiters {
             let version = write_version.load(Ordering::Acquire);
@@ -1501,6 +1637,101 @@ fn rounds(
             break;
         }
     }
+    Ok(())
+}
+
+/// Stages a `Record::Committed` frame for each noted commit index the WAL
+/// does not hold yet, once the log holds the entry it names. Forgets notes
+/// that no longer apply: a stream gone or moved to another generation, an
+/// index already durable, or an entry the log holds otherwise.
+fn stage_committed(
+    noted: &Noted,
+    installed: &State,
+    working: &State,
+    wal: &mut Segmented,
+    objects: &Objects,
+) -> io::Result<Vec<(StreamId, u64, LogId)>> {
+    let mut pending = noted.lock();
+    let mut staged = Vec::new();
+    let mut stale = Vec::new();
+    for (&stream, &(generation, id)) in pending.iter() {
+        let Some(log) = working
+            .logs
+            .get(&stream)
+            .or_else(|| installed.logs.get(&stream))
+        else {
+            stale.push(stream);
+            continue;
+        };
+        if log.ownership.generation() != Some(generation)
+            || log.committed.is_some_and(|known| known.index >= id.index)
+        {
+            stale.push(stream);
+            continue;
+        }
+        let holds = log
+            .entries
+            .get(&id.index)
+            .is_some_and(|entry| entry.log_id == id)
+            || log.purged.is_some_and(|purged| purged.index >= id.index)
+            || log
+                .snapshot
+                .is_some_and(|snapshot| snapshot.log_id.index >= id.index);
+        if !holds {
+            // A leader can learn an entry committed before its own write of
+            // it lands; it is noted again once it does if it is not now.
+            if log
+                .entries
+                .last_key_value()
+                .is_some_and(|(&last, _)| last >= id.index)
+            {
+                stale.push(stream);
+            }
+            continue;
+        }
+        let record = Record::Owned(generation, Box::new(Record::Committed(stream, id)));
+        wal.stage(&record, objects)?;
+        staged.push((stream, generation, id));
+    }
+    for stream in stale {
+        pending.remove(&stream);
+    }
+    Ok(staged)
+}
+
+/// Asks the WAL writer every `COMMITTED_FLUSH`, while commit indexes wait
+/// and leases are finalized, to write them if no round did meanwhile. Stops
+/// once the WAL does.
+fn spawn_committed_flush(
+    lane: mpsc::WeakSender<Message>,
+    noted: Weak<Noted>,
+    version: Weak<AtomicU32>,
+) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("logkeeper-raft-commit".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(COMMITTED_FLUSH);
+                let (Some(noted), Some(version), Some(lane)) =
+                    (noted.upgrade(), version.upgrade(), lane.upgrade())
+                else {
+                    return;
+                };
+                if noted.lock().is_empty()
+                    || !decisions::write_version_allows(
+                        version.load(Ordering::Acquire),
+                        crate::stream::consensus::CLUSTER_VERSION_LEASES,
+                    )
+                {
+                    continue;
+                }
+                if let Err(mpsc::error::TrySendError::Closed(_)) =
+                    lane.try_send(Message::Flush(None))
+                {
+                    return;
+                }
+            }
+        })?;
     Ok(())
 }
 
