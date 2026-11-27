@@ -915,130 +915,211 @@ for the fault model and checked invariants.
 
 ### Operations
 
-#### Admin listener and Prometheus metrics
+Every operational surface of a consensus keeper is read-only: the admin
+listener (metrics, probes, problem report, status), structured logs and audit
+records, the offline tools that read a stopped data directory, and the debug
+bundle that collects all of them. Alert rules and a dashboard live in
+`deploy/prometheus/logkeeper-alerts.yml` and `deploy/grafana/logkeeper.json`.
 
-Configure an optional separate operational HTTP/1.1 listener via `admin` in the
-keeper JSON configuration:
+#### Admin listener
+
+Enable a separate HTTP/1.1 admin listener with `admin` in the keeper
+configuration:
 
 ```json
   "admin": {
     "listen": "127.0.0.1:9100",
-    "mtls": false
+    "mtls": false,
+    "cluster": {
+      "<keeper uuid>": "10.0.1.12:9100",
+      "<keeper uuid>": "10.0.2.12:9100"
+    }
   }
 ```
 
-- `listen` defaults to `127.0.0.1:9100` when `admin` is present.
-- Plain HTTP (`"mtls": false`, default) is restricted to loopback bind addresses.
-  For remote scraping, set `"mtls": true`: the listener uses the keeper's TLS
-  credentials with mutual TLS 1.3 and restricts access to client certificates
-  listed in `administrators` (other clients receive `403 Forbidden`).
+- `listen` defaults to `127.0.0.1:9100`. It must differ from the keeper's
+  client, peer and bulk listeners.
+- Plain HTTP (`"mtls": false`, the default) may only bind a loopback address.
+  To scrape from another host, set `"mtls": true`: the listener then serves TLS
+  1.3 with the keeper's credentials and requires a client certificate signed by
+  the cluster CA. It serves principals listed in `administrators` and the other
+  keepers of the cluster (so `debug-bundle` can run on any keeper), and answers
+  every other client `403 Forbidden`. Kubernetes HTTP probes cannot present a
+  client certificate, so with mTLS probe through a sidecar or an exec probe.
+- `cluster` names the admin listeners of the other keepers. Only
+  `logkeeper keeper debug-bundle` reads it.
+- The listener serves at most 16 connections at once and sheds the next one
+  immediately. One 5 s deadline covers each connection's TLS handshake,
+  request and response; request headers are limited to 8 KiB and a request
+  body is never read. A failing or panicking request never stops the keeper.
+- Endpoints: `GET` or `HEAD` `/metrics`, `/live`, `/ready`, `/safe-to-stop`,
+  `/problems` (alias `/problem-streams`) and `/status`. Anything else answers
+  `404`; other methods `405`.
 
-`GET /metrics` exports Prometheus text format (`0.0.4`):
+#### Metrics
 
-- **Build info:** `logkeeper_build_info{version,keeper,domain,control_alpn,replication_alpn,bulk_alpn}`
-- **Health gauges:** `logkeeper_consensus_wal_healthy`, `logkeeper_consensus_accepting`,
-  `logkeeper_consensus_streams{state="hosted|open|led|parked|quarantined|deleted"}`
-- **Refusals:** `logkeeper_consensus_refusals_total{reason="..."}` for every
-  `Unavailable` refusal reason (`write.*`, `head.*`, `peer.*`).
-- **WAL and commit histograms:**
-  - `logkeeper_consensus_wal_round_records`
-  - `logkeeper_consensus_wal_round_bytes`
-  - `logkeeper_consensus_wal_round_duration_seconds`
-  - `logkeeper_consensus_wal_fsync_duration_seconds{target="segment|boundary"}`
-  - `logkeeper_consensus_commit_duration_seconds`
-- **Replication lag per follower:**
-  `logkeeper_consensus_replication_lag_entries_max{follower}`,
-  `logkeeper_consensus_replication_lag_entries_total{follower}`,
-  `logkeeper_consensus_replication_lag_streams{follower}`.
-- **Elections and votes:** `logkeeper_consensus_elections_total{outcome="started|won"}`,
-  `logkeeper_consensus_votes_total{kind="vote|pre_vote",outcome="granted|denied"}`.
-- **Snapshots:** `logkeeper_consensus_snapshots_sent_total{outcome}`,
-  `logkeeper_consensus_snapshot_bytes_sent_total`,
-  `logkeeper_consensus_snapshots_received_total{outcome}`,
-  `logkeeper_consensus_snapshot_bytes_received_total`,
-  `logkeeper_consensus_snapshots_built_total`.
-- **Repairs:** `logkeeper_consensus_repairs_total{kind="joint|learners|voter",outcome="ok|failed"}`,
-  `logkeeper_consensus_repairs_in_flight`.
-- **Parks and wakes:** `logkeeper_consensus_stream_parks_total`,
-  `logkeeper_consensus_stream_park_declined_total`,
-  `logkeeper_consensus_stream_wakes_total{trigger="peer|client|repair"}`.
-- **Liveness per keeper:** `logkeeper_consensus_keeper_liveness{keeper,domain,state="alive|suspect|dead"}`,
-  `logkeeper_consensus_keeper_accepting{keeper,domain}`,
-  `logkeeper_consensus_keeper_silent_seconds{keeper,domain}`.
-- **Aggregated retention:** `logkeeper_consensus_retained_records_total`,
-  `logkeeper_consensus_retained_records_max`,
-  `logkeeper_consensus_retained_bytes_total`,
-  `logkeeper_consensus_retained_bytes_max`,
-  `logkeeper_consensus_wal_suffix_entries_max`.
-- **Problem stream counts:** `logkeeper_consensus_problem_streams{reason}`.
+`GET /metrics` serves the Prometheus text format (`0.0.4`). A scrape computes
+its gauges from the keeper's state at that moment; nothing runs between
+scrapes, so an unscraped keeper pays nothing. Labels are bounded: `keeper`,
+`follower` and `domain` take one value per keeper in the inventory, the other
+labels a fixed set. Each keeper reports every keeper's liveness, so the
+liveness families grow with the square of the cluster size.
 
-#### Health, readiness, and safe-to-stop probes
+| Family | Meaning |
+| --- | --- |
+| `logkeeper_build_info{version,keeper,domain,control_alpn,replication_alpn,bulk_alpn}` | Build and wire versions, always 1 |
+| `logkeeper_consensus_wal_healthy`, `_media_responsive`, `_accepting` | WAL thread running; no WAL round past the slow-round gate recently; keeper accepts new streams (what it reports to placement) |
+| `logkeeper_consensus_streams{state="hosted\|open\|led\|parked\|quarantined\|deleted"}` | Replica counts |
+| `logkeeper_consensus_problem_streams{reason}` | Hosted streams per `/problems` reason, every reason exported, zero included |
+| `logkeeper_consensus_refusals_total{reason}` | Requests refused `Unavailable`, by reason (`write.*`, `head.*`, `peer.*`) |
+| `logkeeper_consensus_commit_duration_seconds` | Leader write latency, admission to Raft decision |
+| `logkeeper_consensus_commit_stage_seconds{stage="queue\|wal\|replication\|apply"}` | The same latency by stage: WAL queue wait, the durable WAL round, the leader's durable append to the start of its apply (follower appends, quorum commit, apply queue), and one apply batch |
+| `logkeeper_consensus_slow_proposals`, `_oldest_proposal_seconds`, `_slow_proposals_total` | Proposals in flight for at least 1 s, the oldest one's age, and proposals that took that long to commit or fail |
+| `logkeeper_consensus_wal_round_records`, `_wal_round_bytes`, `_wal_round_duration_seconds` | Per WAL round: records, bytes, duration |
+| `logkeeper_consensus_wal_fsync_duration_seconds{target="segment\|boundary"}` | fdatasync latency |
+| `logkeeper_consensus_wal_slow_round_seconds`, `_wal_round_limit_seconds` | The 2.5 s slow-round gate (the keeper hands off leadership and refuses votes) and the 20 s watchdog limit (the keeper exits) |
+| `logkeeper_consensus_disk_available_bytes`, `_disk_reserved_bytes`, `_disk_ordinary_floor_bytes` | Volume free space, bytes reserved for writes in flight, and the floor below which ordinary writes are refused |
+| `logkeeper_consensus_replication_lag_entries_max{follower}`, `_total{follower}`, `_streams{follower}` | Raft entries each follower lags behind across the streams this keeper leads |
+| `logkeeper_consensus_elections_total{outcome="started\|won"}`, `logkeeper_consensus_votes_total{kind,outcome}` | Elections and the votes and pre-votes this keeper answered |
+| `logkeeper_consensus_snapshots_sent_total{outcome}`, `_snapshots_received_total{outcome}`, `_snapshot_bytes_sent_total`, `_snapshot_bytes_received_total`, `_snapshots_built_total` | Snapshot transfers |
+| `logkeeper_consensus_repairs_total{kind="joint\|learners\|voter",outcome}`, `_repairs_in_flight` | Automatic repairs |
+| `logkeeper_consensus_repair_pending_streams`, `_repair_oldest_pending_seconds`, `_repair_backoff_streams` | Led streams that need a repair, how long the oldest has waited, and streams backing off after a failed repair |
+| `logkeeper_consensus_stream_parks_total`, `_stream_park_declined_total`, `_stream_wakes_total{trigger="peer\|client\|repair"}` | Parking |
+| `logkeeper_consensus_keeper_liveness{keeper,domain,state="alive\|suspect\|dead"}`, `_keeper_accepting{keeper,domain}`, `_keeper_silent_seconds{keeper,domain}` | This keeper's view of every keeper |
+| `logkeeper_consensus_retained_records_total`, `_max`, `_retained_bytes_total`, `_max`, `_wal_suffix_entries_max` | Retention summed and at the largest stream |
+| `logkeeper_consensus_critical_total` | Critical invariant violations (see below) |
 
-- `GET /live`: `200 OK` while the WAL thread is healthy and the keeper is not
-  shutting down; `503 Service Unavailable` otherwise.
-- `GET /ready`: `200 OK` once startup WAL replay has completed, the keeper
-  liveness table is populated, and every hosted non-deleted replica is healthy
-  and either parked or matched by its leader (caught up and not receiving a
-  snapshot); `503 Service Unavailable` with JSON details otherwise.
-- `GET /safe-to-stop`: `200 OK` when the liveness table is populated and no
-  hosted stream has another voter unreachable or silent; `503 Service
-  Unavailable` listing every blocking `(stream, voter, reason)` otherwise. Use
-  this probe to gate rolling restarts.
+#### Probes
+
+- `GET /live`: `200` while the WAL thread runs and the keeper is not stopping,
+  else `503`.
+- `GET /ready`: `200` once startup replay finished, the liveness table has
+  heard from a peer, no hosted replica is quarantined, and every hosted replica
+  is parked or caught up with a leader that matched it within two election
+  timeouts. A leader that no quorum acknowledged within the silence limit
+  counts as `leader_without_quorum`: OpenRaft 0.10.1 keeps an isolated leader
+  in the `Leader` state until its quorum-loss probe, long after its lease
+  expired. `503` lists each unmatched stream and why.
+- `GET /safe-to-stop`: `200` when the liveness table is populated and no
+  hosted stream has another voter unreachable or silent, or a joint
+  configuration in flight. `503` lists each blocking `(stream, voter, reason)`.
+  Gate rolling restarts on it: stop one keeper at a time, and wait for the
+  restarted keeper's `/ready` before checking the next one.
+- `GET /status`: the `KeeperStatus` the keeper reports to its peers, its
+  version and ALPNs, WAL and media health, and its settings with the private
+  key path redacted.
 
 #### Problem-streams report
 
-`GET /problems` (alias `GET /problem-streams`) returns a JSON report listing
-every hosted stream currently exhibiting an operational anomaly, tagged with one
-or more of:
+`GET /problems` lists every hosted stream with an anomaly, each tagged with
+one or more reasons:
 
-- `leaderless`: open stream with no active leader (including an isolated leader
-  that lost quorum).
-- `under_replicated`: voter unreachable/silent or lagging behind the leader.
-- `parked_with_dead_voter`: parked stream whose configuration names a dead voter.
-- `joint_config`: stream currently in a joint membership configuration.
-- `near_suffix_ceiling`: unpurged WAL suffix at or above 75% of the 512-entry cap.
-- `near_record_ceiling`: retained records at or above 75% of the 262,144-record cap.
-- `near_quota_ceiling`: retained bytes at or above 75% of the stream's byte quota.
-- `led_outside_preferred_domain`: open stream currently led outside its writer's
-  preferred failure domain.
-- `quarantined`: local replica is quarantined.
+- `leaderless`: open, with no leader or a leader no quorum acknowledges.
+- `under_replicated`: a voter is unreachable, silent, or 64 or more entries
+  behind its leader.
+- `parked_with_dead_voter`: parked while its configuration names a dead voter.
+- `joint_config`: in a joint membership configuration.
+- `near_suffix_ceiling`: unpurged WAL suffix at 75% or more of its 512 entries.
+- `near_record_ceiling`: retained records at 75% or more of 262,144.
+- `near_quota_ceiling`: retained bytes at 75% or more of its byte quota.
+- `led_outside_preferred_domain`: led outside its writer's preferred domain.
+- `quarantined`: the local replica is quarantined.
 
-#### Structured logging and audit trail
+#### Logs, audit records and critical violations
 
-The consensus keeper emits structured `tracing` events to stderr with `keeper`
-and `stream` fields and rate-limits repeated warnings per key (reporting a
-`dropped` count when the next event is emitted).
+The keeper logs structured `tracing` events to stderr, with `keeper` and
+`stream` fields. A repeated warning is logged at most every 5 s per key and
+stream; the next one carries the `dropped` count. Human-readable lines are the
+default; select JSON lines with `"log_format": "json"`, `--log-format json` or
+`LOGKEEPER_LOG_FORMAT=json`. `LOGKEEPER_LOG` or `RUST_LOG` set the level
+(default `info` for `logkeeper`, `warn` for other crates such as `openraft`).
+A message never spans lines: newlines in it are escaped.
 
-- Output is human-readable by default. Select JSON lines via `"log_format": "json"`
-  in the keeper config, `--log-format json` on `logkeeper keeper`, or
-  `LOGKEEPER_LOG_FORMAT=json`.
-- Control verbosity via `LOGKEEPER_LOG` or `RUST_LOG` (default: `info` for
-  `logkeeper`, `warn` for other crates).
-- Administrative actions (`replace`, `prefer_leader`, `acknowledge_recovery`,
-  `retire`, and offline `recovery`) emit structured audit records under target
-  `logkeeper::audit` with `audit=true`, `action`, `actor`, `keeper`, `stream`,
-  and `outcome`.
+Administrative actions (`replace`, `prefer_leader`, `acknowledge_recovery`,
+`retire`, the repair loop's own replacements and retirements, and offline
+`recovery`) log an audit record under target `logkeeper::audit` with
+`audit=true`, `action`, `actor`, `keeper`, `stream` and `outcome`.
 
-#### Offline inspection and verification tools
+A state only a keeper bug can reach (a committed catalog record that does not
+decode, a panicking WAL checkpoint writer or admin request) goes through
+`critical!`: tests panic on it, while production logs it at `error` under
+target `logkeeper::critical`, counts it in
+`logkeeper_consensus_critical_total`, and carries on with its own recovery.
 
-Run these read-only commands against a **stopped** keeper data directory (they
-acquire the exclusive `LOCK` and refuse to run against a live keeper, without
-mutating or truncating any files):
+#### Offline inspection and verification
+
+These read-only commands need a **stopped** keeper: they take the exclusive
+`LOCK` of its data directory and refuse to run beside a live keeper. They
+create, truncate and migrate nothing.
 
 ```sh
-# Per-stream vote, membership, log range, applied/snapshot index, fence, head,
-# retained records/bytes, ownership, parked (runtime-only), and quarantined state:
-cargo run --locked --features stream -- keeper inspect --config keeper.json [--stream UUID] [--json]
+# Per stream: vote, membership, log range, applied and snapshot index, fence,
+# head, retained records and bytes, ownership, and quarantine. Parking is not
+# persisted, so a stopped keeper reports no stream parked.
+logkeeper keeper inspect --config keeper.json [--stream UUID] [--json]
 
-# Walk both boundary slots, checkpoint digest/references, every WAL segment
-# header and frame CRC, and the running SHA-256 hash chain against the
-# checkpoint and trusted boundary:
-cargo run --locked --features stream -- keeper verify --config keeper.json [--json]
+# Both boundary slots, the checkpoint digest and references, every WAL
+# segment header and frame CRC, and the running SHA-256 chain against the
+# checkpoint and the trusted boundary. Exits non-zero when verification fails.
+logkeeper keeper verify --config keeper.json [--json]
 
-# Decode and summarize frames in a WAL segment (by keeper config + ID, or standalone file):
-cargo run --locked --features stream -- keeper dump-segment --config keeper.json --segment 1 [--limit N] [--json]
-cargo run --locked --features stream -- keeper dump-segment --file ./keeper-1/raft-segments/00000000000000000001.seg [--limit N] [--json]
+# The frames of one WAL segment, by keeper and segment ID or by file.
+logkeeper keeper dump-segment --config keeper.json --segment 1 [--limit N] [--json]
+logkeeper keeper dump-segment --file ./keeper-1/raft-segments/00000000000000000001.seg [--limit N] [--json]
 ```
+
+#### Debug bundle
+
+```sh
+logkeeper keeper debug-bundle --config keeper.json [--admin ADDR]... [--data DIR] [--out FILE]
+```
+
+writes one tar archive (`logkeeper-debug-<keeper>-<unix time>.tar` by
+default) holding:
+
+- `config.json`: the configuration file with every key, secret, password,
+  token and credential value replaced by `<redacted>`;
+- `keepers/<keeper>/{metrics.txt,problems.json,status.json,ready.json,safe-to-stop.json,live.json}`
+  from this keeper's admin listener, every listener in `admin.cluster`, and
+  each `--admin ADDR`, over mTLS with the keeper's own certificate when
+  `admin.mtls` is set;
+- `offline/inspect.json` and `offline/verify.json` when `--data` names a
+  stopped keeper's data directory;
+- `manifest.json`: which endpoints answered each path, and the error of each
+  one that did not. An unreachable keeper does not fail the bundle.
+
+#### Alerts and dashboard
+
+Scrape each keeper's admin listener as `job="logkeeper"` and load
+`deploy/prometheus/logkeeper-alerts.yml`. A test renders `/metrics` and fails
+when the rules or the dashboard name a series the keeper does not export. The
+rules read the keeper's own gates rather than copying them:
+
+| Alert | Severity | Fires when | First response |
+| --- | --- | --- | --- |
+| `LogkeeperKeeperDown` | critical | a scrape target is down for 2 m | check the process and its admin listener |
+| `LogkeeperKeeperDead` | critical | peers have not heard from a keeper for the repair delay | leaders replace it; restore or retire the host |
+| `LogkeeperWalUnhealthy` | critical | the WAL thread stopped | restart the keeper; run `verify` if it will not start |
+| `LogkeeperMediaSlow` | warning | a WAL round passed 2.5 s within the last 10 s, for 1 m | the keeper already handed off its leadership; check the disk |
+| `LogkeeperNotAccepting` | warning | the keeper accepts no new streams for 10 m | slow media, a stopped WAL, or a full volume |
+| `LogkeeperCriticalInvariant` | critical | `critical!` fired | collect a debug bundle and the `logkeeper::critical` lines |
+| `LogkeeperFsyncSlow` | warning | fsync p99 above 40% of the slow-round gate for 10 m | check the disk and its neighbours |
+| `LogkeeperWalRoundNearSlowGate` | warning | WAL round p99 above half the slow-round gate for 10 m | as above |
+| `LogkeeperWalRoundNearWatchdog` | critical | WAL round p99 above a quarter of the 20 s watchdog for 2 m | move load off the keeper before the watchdog ends it |
+| `LogkeeperDiskHeadroomLow` / `Critical` | warning / critical | free bytes above reservations under 4× / 1.5× the ordinary floor | trim streams or grow the volume |
+| `LogkeeperDiskFillingUp` | warning | the 6 h trend reaches the floor within a day | as above |
+| `LogkeeperStreamLeaderless` | critical | a hosted stream has had no leader for 1 m | `/problems`, then the voters' liveness |
+| `LogkeeperStreamUnderReplicated` | warning | for 5 m | repair replaces a voter silent for the repair delay |
+| `LogkeeperParkedStreamDeadVoter` | warning | for 10 m | the wake sweep should reopen it for repair; check `/problems` |
+| `LogkeeperQuarantinedReplica` | critical | a replica is quarantined | its leader repairs it; `verify` the stopped keeper |
+| `LogkeeperJointConfigStuck` | warning | a joint configuration lasts 15 m | check the target voters' liveness |
+| `LogkeeperStreamNearRecordCeiling` / `NearSuffixCeiling` / `NearQuota` | warning | a stream passes 75% of a ceiling | the writer should trim; for the suffix, check snapshots |
+| `LogkeeperRepairQueueStuck` | warning | a repair waited over 15 m | `logkeeper_consensus_repair_backoff_streams` and the repair log lines |
+| `LogkeeperSlowProposals` | warning | proposals stay in flight over 1 s for 5 m | `logkeeper_consensus_commit_stage_seconds` names the stage |
+
+`deploy/grafana/logkeeper.json` (data source and keeper variables) charts the
+same families in four rows: overview, writes and commit stages, WAL and disk,
+and replication and repair.
 
 ## Integration
 
