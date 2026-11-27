@@ -123,6 +123,9 @@ if [[ "$MODE" != "fast" ]]; then
   run_case "AsyncAppendLiveness"      "AsyncAppend.tla" "AsyncAppendLiveness.cfg"       pass liveness
   run_case "AsyncAppendNoIdleFlush"   "AsyncAppend.tla" "AsyncAppendNoIdleFlush.cfg"    liveness liveness
 fi
+run_case "OffloadRetention"           "OffloadRetention.tla" "OffloadRetention.cfg"           pass liveness
+run_case "OffloadRetentionNoBarrier"  "OffloadRetention.tla" "OffloadRetentionNoBarrier.cfg"  invariant:NoPostTrimRemoteRead
+run_case "OffloadRetentionNoRecheck"  "OffloadRetention.tla" "OffloadRetentionNoRecheck.cfg"  invariant:NoPostTrimRemoteRead
 
 if [[ "$MODE" == "additions" ]]; then
   echo

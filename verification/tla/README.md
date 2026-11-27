@@ -471,6 +471,24 @@ Abstractions: one leader for the whole run (elections are
 truncation is not modeled, and one `Record::Committed` round per step (a
 torn round lands the marker with its records or not at all).
 
+### `OffloadRetention.tla`: reads below the local floor
+
+Two keepers, three records, uploads to the store, retention that drops
+local copies once the run is offloaded, trims, one leader change and a store
+outage (3f15f877). A read below a keeper's local floor and above its applied
+trim floor is served from the store only by the leader, after a read barrier
+that waits until the trim committed at the barrier is applied, and after it
+checks the floor again; any other keeper, or a failed barrier, answers
+`Unavailable`. The barrier is abstracted to "the keeper is the leader when
+it starts and when it completes": a deposed leader's barrier fails on the
+quorum.
+
+| Config | Rule dropped | Result |
+| --- | --- | --- |
+| `OffloadRetention` | none | `RetentionCovered`, `RemoteReadHadBarrier`, `NoPostTrimRemoteRead` (never a record trimmed before the read was invoked), `RemoteRechecksFloor`, `RemoteReturnsExactBytes`, `RemoteRequestSettles` pass, 11,545 states |
+| `OffloadRetentionNoBarrier` | any keeper serves from the store, as before 3f15f877 | `NoPostTrimRemoteRead` violated |
+| `OffloadRetentionNoRecheck` | no floor check after the barrier | `NoPostTrimRemoteRead` violated |
+
 ## Fidelity review
 
 Changes made to the first version of the model when it was checked against
