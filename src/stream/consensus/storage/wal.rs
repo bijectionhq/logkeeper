@@ -1077,6 +1077,7 @@ impl Queues {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run(
     mut wal: Segmented,
     state: &RwLock<State>,

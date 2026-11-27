@@ -734,29 +734,27 @@ impl Engine {
                             if ticks % 20 == 0 {
                                 engine.close_settled_deletions().await;
                             }
-                            if let Err(error) = engine.disk.reap_objects().await {
-                                if let Some(dropped) =
+                            if let Err(error) = engine.disk.reap_objects().await
+                                && let Some(dropped) =
                                     super::logging::rate_limit("keeper.object_cleanup", None)
-                                {
-                                    tracing::warn!(
-                                        keeper = %engine.id,
-                                        error = %error,
-                                        dropped = dropped,
-                                        "object cleanup deferred"
-                                    );
-                                }
+                            {
+                                tracing::warn!(
+                                    keeper = %engine.id,
+                                    error = %error,
+                                    dropped = dropped,
+                                    "object cleanup deferred"
+                                );
                             }
-                            if let Err(error) = engine.reclaim_detached(&mut cursor).await {
-                                if let Some(dropped) =
+                            if let Err(error) = engine.reclaim_detached(&mut cursor).await
+                                && let Some(dropped) =
                                     super::logging::rate_limit("keeper.replica_cleanup", None)
-                                {
-                                    tracing::warn!(
-                                        keeper = %engine.id,
-                                        error = %error,
-                                        dropped = dropped,
-                                        "replica cleanup deferred"
-                                    );
-                                }
+                            {
+                                tracing::warn!(
+                                    keeper = %engine.id,
+                                    error = %error,
+                                    dropped = dropped,
+                                    "replica cleanup deferred"
+                                );
                             }
                         },
                     }
