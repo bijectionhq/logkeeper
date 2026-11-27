@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 mod legacy;
-mod segmented;
+pub(super) mod segmented;
 use segmented::{Segmented, Tuning};
 #[cfg(test)]
 mod tests;
@@ -105,10 +105,10 @@ impl CatalogEntry {
 }
 
 #[derive(Clone, Default)]
-struct State {
-    genesis: BTreeMap<StreamId, Genesis>,
-    catalog: BTreeMap<StreamId, CatalogEntry>,
-    logs: BTreeMap<StreamId, Log>,
+pub(super) struct State {
+    pub(super) genesis: BTreeMap<StreamId, Genesis>,
+    pub(super) catalog: BTreeMap<StreamId, CatalogEntry>,
+    pub(super) logs: BTreeMap<StreamId, Log>,
 }
 
 impl State {

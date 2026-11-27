@@ -1341,6 +1341,185 @@ pub(in crate::stream::consensus) struct Replayed {
     pub epoch: Epoch,
 }
 
+/// Read-only inspection of one stream's snapshot and replayed suffix state.
+pub(super) struct StreamStateView {
+    pub snapshot_applied: Option<LogId>,
+    pub applied: Option<LogId>,
+    pub voters: Vec<uuid::Uuid>,
+    pub joint_voters: Option<Vec<uuid::Uuid>>,
+    pub learners: Vec<uuid::Uuid>,
+    pub configuration: Option<Configuration>,
+    pub fence: Option<(super::super::Fence, String)>,
+    pub recovering: bool,
+    pub head: Option<Lsn>,
+    pub floor: Option<Lsn>,
+    pub stream_state: &'static str,
+    pub retained_records: u64,
+    pub retained_bytes: u64,
+}
+
+/// Inspects a single stream's snapshot and WAL suffix strictly read-only,
+/// returning `Err` if startup would quarantine the replica.
+pub(super) fn inspect_stream_readonly(
+    data: &Path,
+    objects: &super::objects::Objects,
+    genesis: &Genesis,
+    log: &super::Log,
+    placement: &Placement,
+) -> io::Result<StreamStateView> {
+    if !placement.genesis(genesis)
+        || log.entries.values().any(|entry| match &entry.payload {
+            EntryPayload::Membership(membership) => !placement.membership(membership),
+            EntryPayload::Normal(command) => match command.body() {
+                Command::Stage(stage) | Command::StageOwned(stage) => {
+                    !placement.stage(stage) || stage.stream != genesis.stream
+                }
+                Command::Recover(stage) => {
+                    !placement.stage(stage) || stage.stream != genesis.stream || !stage.recovery()
+                }
+                Command::Admitted(..) => true,
+                _ => false,
+            },
+            _ => false,
+        })
+    {
+        return Err(invalid("persisted stream placement is invalid"));
+    }
+    let generation = log
+        .ownership
+        .generation()
+        .ok_or_else(|| invalid("replica is detached"))?;
+    let directory =
+        crate::stream::consensus::ownership::directory(data, genesis.stream, generation);
+    let mut image = if let Some(selected) = log.snapshot {
+        let (_, image, _) = read_selected(
+            File::open(selected.path(&directory))?,
+            &directory,
+            genesis,
+            selected,
+            objects,
+        )?;
+        image.verify_placement(placement, genesis)?;
+        image
+    } else {
+        Image::default()
+    };
+    let snapshot_applied = image.applied;
+    if log.purged.is_some_and(|purged| {
+        snapshot_applied.is_none_or(|id| {
+            id < purged || id.index < purged.index || (id.index == purged.index && id != purged)
+        })
+    }) {
+        return Err(invalid("purged log lacks a durable snapshot"));
+    }
+    for entry in log.entries.values() {
+        if snapshot_applied.is_some_and(|applied| entry.log_id.index <= applied.index) {
+            continue;
+        }
+        match entry.payload.clone() {
+            EntryPayload::Blank => (),
+            EntryPayload::Normal(command) => match command.into_body() {
+                Command::Stage(stage) => {
+                    image.stage(stage, genesis, placement, false);
+                }
+                Command::StageOwned(stage) => {
+                    image.stage(stage, genesis, placement, true);
+                }
+                Command::Recover(stage) => {
+                    image.recover(stage, genesis, placement);
+                }
+                Command::Admitted(..) => return Err(invalid("nested application ticket")),
+                command => {
+                    let segment = log
+                        .segments
+                        .get(&entry.log_id.index)
+                        .cloned()
+                        .ok_or_else(|| invalid("applied command has no durable WAL segment"))?;
+                    image.state.apply(command, genesis, segment)?;
+                }
+            },
+            EntryPayload::Membership(membership) => {
+                image.verify_transition(&membership, placement, genesis)?;
+                if let [voters] = membership.get_joint_config().as_slice() {
+                    let voters = voters
+                        .iter()
+                        .copied()
+                        .map(uuid::Uuid::from_u128)
+                        .collect::<Vec<_>>();
+                    let voters = <[_; 3]>::try_from(voters)
+                        .map_err(|_| invalid("invalid finalized voter configuration"))?;
+                    if image
+                        .configuration
+                        .is_none_or(|current| current.voters != voters)
+                    {
+                        image.previous_revision =
+                            image.configuration.map(|current| current.revision);
+                        let revision = if image.stage_intent {
+                            image
+                                .stage
+                                .as_ref()
+                                .and_then(|stage| stage.source.checked_add(1))
+                                .ok_or_else(|| {
+                                    invalid("finalized move lacks its target revision")
+                                })?
+                        } else {
+                            entry.log_id.index
+                        };
+                        image.stage = None;
+                        image.stage_intent = false;
+                        image.configuration = Some(Configuration { revision, voters });
+                    }
+                }
+                image.membership = Membership::new(Some(entry.log_id), membership);
+            }
+        }
+        image.applied = Some(entry.log_id);
+    }
+    let membership = image.membership.membership();
+    let configs = membership.get_joint_config();
+    let voters = configs
+        .first()
+        .map(|set| set.iter().copied().map(uuid::Uuid::from_u128).collect())
+        .unwrap_or_default();
+    let joint_voters = configs
+        .get(1)
+        .map(|set| set.iter().copied().map(uuid::Uuid::from_u128).collect());
+    let all_voters = membership
+        .voter_ids()
+        .collect::<std::collections::BTreeSet<_>>();
+    let learners = membership
+        .nodes()
+        .map(|(id, _)| *id)
+        .filter(|id| !all_voters.contains(id))
+        .map(uuid::Uuid::from_u128)
+        .collect();
+    let (stream_state, head, floor) = match image.state.head() {
+        Ok(head) => ("live", Some(head), Some(image.state.retained_floor())),
+        Err(JournalError::Deleted) => ("deleted", None, None),
+        Err(JournalError::NotFound) => ("absent", None, None),
+        Err(_) => ("unknown", None, None),
+    };
+    let (retained_records, retained_bytes) = image.state.retained_stats();
+    Ok(StreamStateView {
+        snapshot_applied,
+        applied: image.applied,
+        voters,
+        joint_voters,
+        learners,
+        configuration: image.configuration,
+        fence: image
+            .state
+            .writer()
+            .map(|(fence, owner)| (fence, owner.to_owned())),
+        recovering: image.state.recovering(),
+        head,
+        floor,
+        stream_state,
+        retained_records,
+        retained_bytes,
+    })
+}
+
 pub(in crate::stream::consensus) async fn replay(
     disk: &Disk,
     genesis: Genesis,

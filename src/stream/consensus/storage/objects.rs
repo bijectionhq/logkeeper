@@ -225,6 +225,16 @@ impl Objects {
         })))
     }
 
+    /// Opens an object handle against a stopped directory without creating
+    /// directories or syncing metadata.
+    pub fn open_readonly(data: &Path) -> Self {
+        Self(Arc::new(Inner {
+            root: data.join("objects"),
+            segments: data.join(segment::DIRECTORY),
+            state: Mutex::new(State::default()),
+        }))
+    }
+
     pub fn segment_directory(&self) -> &Path {
         &self.0.segments
     }

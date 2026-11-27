@@ -48,7 +48,7 @@ use crate::stream::{
 
 pub(super) const MAX_SCOPES: usize = 4096;
 pub(super) const MAX_SUFFIX: usize = 1024;
-const CHECKPOINTS: &str = "raft-checkpoints";
+pub(in crate::stream::consensus::storage) const CHECKPOINTS: &str = "raft-checkpoints";
 const CHECKPOINT_MAGIC: &[u8; 8] = b"LKRWAL04";
 const MAX_CHECKPOINT: u64 = 1024 * 1024 * 1024;
 #[cfg(not(test))]
@@ -82,28 +82,28 @@ impl Default for Tuning {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub(super) struct Position {
+pub(in crate::stream::consensus::storage) struct Position {
     pub segment: u64,
     pub offset: u64,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Checkpoint {
-    position: Position,
-    chain: [u8; 32],
-    leaves: Vec<(StreamId, Leaf)>,
-    segments: BTreeMap<u64, BTreeSet<StreamId>>,
+pub(in crate::stream::consensus::storage) struct Checkpoint {
+    pub position: Position,
+    pub chain: [u8; 32],
+    pub leaves: Vec<(StreamId, Leaf)>,
+    pub segments: BTreeMap<u64, BTreeSet<StreamId>>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Leaf {
-    genesis: Option<Genesis>,
-    catalog: Option<CatalogEntry>,
-    vote: Option<Vote>,
-    purged: Option<LogId>,
-    snapshot: Option<Selected>,
-    ownership: Option<crate::stream::consensus::ownership::Ownership>,
-    entries: BTreeMap<u64, Reference>,
+pub(in crate::stream::consensus::storage) struct Leaf {
+    pub genesis: Option<Genesis>,
+    pub catalog: Option<CatalogEntry>,
+    pub vote: Option<Vote>,
+    pub purged: Option<LogId>,
+    pub snapshot: Option<Selected>,
+    pub ownership: Option<crate::stream::consensus::ownership::Ownership>,
+    pub entries: BTreeMap<u64, Reference>,
 }
 
 /// Buffers a round's frames for the active segment.
@@ -852,7 +852,60 @@ fn write_checkpoint(
     Ok(reference)
 }
 
-fn read_checkpoint(directory: &Path, reference: CheckpointRef) -> io::Result<Checkpoint> {
+/// Loads the segmented WAL state strictly read-only from `media`, verifying
+/// the checkpoint and every frame up to the active boundary without mutating
+/// or truncating any files.
+pub(in crate::stream::consensus::storage) fn open_readonly(
+    media: &Media,
+    objects: &Objects,
+) -> io::Result<(State, Slot)> {
+    let (_, active) = media.read_boundary_slots()?;
+    let slot = active.ok_or_else(|| invalid("WAL boundary has no intact slot"))?;
+    let incarnation = media.incarnation();
+    let checkpoints = media.data().join(CHECKPOINTS);
+    let directory = objects.segment_directory().to_owned();
+    let (mut state, position, chain) = match slot.checkpoint {
+        Some(reference) => {
+            let checkpoint = read_checkpoint(&checkpoints, reference)?;
+            let mut state = State::default();
+            for (scope, leaf) in checkpoint.leaves {
+                leaf.restore(scope, objects, &mut state)?;
+            }
+            (state, checkpoint.position, checkpoint.chain)
+        }
+        None => (
+            State::default(),
+            Position {
+                segment: FIRST,
+                offset: HEADER,
+            },
+            segment::seed(incarnation),
+        ),
+    };
+    let boundary = Position {
+        segment: slot.segment,
+        offset: slot.offset,
+    };
+    if position > boundary || position.offset < HEADER || boundary.offset < HEADER {
+        return Err(invalid("WAL checkpoint lies past its trusted boundary"));
+    }
+    replay(
+        &directory,
+        incarnation,
+        &mut state,
+        objects,
+        position,
+        chain,
+        &slot,
+    )?;
+    state.check_hard_state()?;
+    Ok((state, slot))
+}
+
+pub(in crate::stream::consensus::storage) fn read_checkpoint(
+    directory: &Path,
+    reference: CheckpointRef,
+) -> io::Result<Checkpoint> {
     let mut bytes = Vec::new();
     File::open(directory.join(checkpoint_name(reference.id)))
         .map_err(|error| {

@@ -63,6 +63,19 @@ pub(super) fn check_header(file: &mut impl Read, id: u64, incarnation: Uuid) -> 
     Ok(())
 }
 
+/// Reads and parses a segment header without requiring a known ID or incarnation.
+pub(super) fn read_header(file: &mut impl Read) -> io::Result<(u64, Uuid)> {
+    let mut found = [0; HEADER as usize];
+    file.read_exact(&mut found)
+        .map_err(|_| invalid("WAL segment lost its header"))?;
+    if &found[..8] != MAGIC {
+        return Err(invalid("WAL segment has invalid magic"));
+    }
+    let id = u64::from_le_bytes(found[8..16].try_into().unwrap());
+    let incarnation = Uuid::from_bytes(found[16..32].try_into().unwrap());
+    Ok((id, incarnation))
+}
+
 pub(super) fn seed(incarnation: Uuid) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"logkeeper segment chain");
@@ -133,6 +146,59 @@ pub(super) fn next(file: &mut impl Read) -> io::Result<Frame> {
         return Ok(Frame::Torn);
     }
     Ok(Frame::Complete { header, body })
+}
+
+pub(super) enum RawFrame {
+    Complete {
+        header: [u8; 8],
+        body: Vec<u8>,
+        expected_crc: u32,
+        actual_crc: u32,
+    },
+    End,
+    Torn {
+        reason: String,
+    },
+}
+
+/// Reads the next frame while reporting CRC mismatches distinctly from EOF/short reads.
+pub(super) fn next_raw(file: &mut impl Read) -> io::Result<RawFrame> {
+    let mut header = [0; FRAME_HEADER as usize];
+    let mut read = 0;
+    while read < header.len() {
+        match file.read(&mut header[read..]) {
+            Ok(0) if read == 0 => return Ok(RawFrame::End),
+            Ok(0) => {
+                return Ok(RawFrame::Torn {
+                    reason: format!("truncated frame header ({read} of {FRAME_HEADER} bytes)"),
+                });
+            }
+            Ok(count) => read += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+            Err(error) => return Err(error),
+        }
+    }
+    let len = u32::from_le_bytes(header[..4].try_into().unwrap());
+    let expected_crc = u32::from_le_bytes(header[4..].try_into().unwrap());
+    if len == 0 || u64::from(len) > MAX_FRAME {
+        return Ok(RawFrame::Torn {
+            reason: format!("invalid frame length {len}"),
+        });
+    }
+    let mut body = Vec::new();
+    file.take(u64::from(len)).read_to_end(&mut body)?;
+    if body.len() != len as usize {
+        return Ok(RawFrame::Torn {
+            reason: format!("truncated frame body ({} of {len} bytes)", body.len()),
+        });
+    }
+    let actual_crc = crc32fast::hash(&body);
+    Ok(RawFrame::Complete {
+        header,
+        body,
+        expected_crc,
+        actual_crc,
+    })
 }
 
 pub(super) fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {

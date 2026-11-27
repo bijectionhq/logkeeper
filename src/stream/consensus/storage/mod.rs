@@ -1,4 +1,5 @@
 mod inflight;
+pub(crate) mod inspect;
 mod media;
 mod objects;
 mod segment;
@@ -23,6 +24,8 @@ use super::network::has_application_entries;
 use super::{Entry, Genesis, LogId, RaftTypes, Vote};
 
 pub(super) use inflight::Inflight;
+pub use inspect::{InspectReport, SegmentDump, VerifyReport, dump_segment_file};
+pub(super) use inspect::{dump_segment_for_keeper, inspect, verify};
 pub(super) use media::{Authority, Enrollment, Incarnations};
 #[cfg(any(test, feature = "consensus-testing"))]
 pub(super) use media::{Provision, hex, sha256};

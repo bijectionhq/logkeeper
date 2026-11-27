@@ -33,6 +33,7 @@ pub use journal::{ConsensusJournal, JournalConfig};
 pub use keeper::{AdminConfig, Config, Recovery, RecoveryReport};
 pub use logging::LogFormat;
 pub use placement::Domains;
+pub use storage::{InspectReport, SegmentDump, VerifyReport, dump_segment_file};
 pub use timed::TimedAuthority;
 
 pub(super) const ALPN: &[u8] = b"logkeeper-consensus/1";

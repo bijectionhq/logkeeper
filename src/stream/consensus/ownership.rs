@@ -107,6 +107,18 @@ impl Ownership {
         self.retired == Some((revision, generation))
     }
 
+    pub fn retired_info(&self) -> Option<(u64, u64)> {
+        self.retired
+    }
+
+    pub fn current_revision(&self) -> Option<u64> {
+        self.current.as_ref().map(|copy| copy.revision)
+    }
+
+    pub fn current_stage(&self) -> Option<&Stage> {
+        self.current.as_ref().and_then(|copy| copy.stage.as_ref())
+    }
+
     // Returns true when the old log and its selected snapshot cease to own
     // the replica. The durable vote remains at its enclosing log.
     pub fn apply(&mut self, change: Change, has_cut: impl Fn(LogId) -> bool) -> io::Result<bool> {

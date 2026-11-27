@@ -307,6 +307,43 @@ impl Enrollment {
         Ok((media, lock, Opened::Current))
     }
 
+    /// Opens enrolled keeper media exclusively for offline inspection without
+    /// modifying or migrating any file on disk.
+    pub(super) fn open_readonly(self) -> io::Result<(Media, File, Opened)> {
+        let lock = OpenOptions::new()
+            .write(true)
+            .open(self.data.join("LOCK"))?;
+        lock.try_lock_exclusive()?;
+        let identity: Identity = read_json(&self.enrolled())?;
+        let installed: Identity = read_json(&self.data.join("KEEPER"))?;
+        let legacy = identity.format == LEGACY_FORMAT;
+        if identity.keeper != installed.keeper
+            || identity.catalog != installed.catalog
+            || identity.incarnation != installed.incarnation
+            || identity.keeper != self.keeper
+            || identity.catalog != self.catalog
+            || identity.incarnation.is_nil()
+            || !matches!(
+                (identity.format.as_str(), installed.format.as_str()),
+                (FORMAT, FORMAT) | (FORMAT, LEGACY_FORMAT) | (LEGACY_FORMAT, LEGACY_FORMAT)
+            )
+        {
+            return Err(invalid("missing or foreign installed keeper media"));
+        }
+        let media = Media {
+            enrollment: self,
+            identity,
+        };
+        if legacy {
+            let boundary: Boundary = read_json(&media.enrollment.legacy_boundary())?;
+            if boundary.incarnation != media.identity.incarnation || boundary.generation.is_nil() {
+                return Err(invalid("WAL boundary belongs to another media incarnation"));
+            }
+            return Ok((media, lock, Opened::Legacy(boundary)));
+        }
+        Ok((media, lock, Opened::Current))
+    }
+
     fn enrolled(&self) -> PathBuf {
         self.registry.join(format!("{}.enrolled", self.keeper))
     }
@@ -383,6 +420,27 @@ impl Media {
             },
             last,
         ))
+    }
+
+    /// Reads both boundary slots read-only and returns them along with the
+    /// active (highest sequence) slot, if any slot is intact.
+    pub fn read_boundary_slots(&self) -> io::Result<([Option<Slot>; 2], Option<Slot>)> {
+        let mut file = File::open(self.enrollment.boundaries())?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(2 * SLOT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() != 2 * SLOT_BYTES {
+            return Err(invalid("WAL boundary slots have the wrong size"));
+        }
+        let incarnation = self.identity.incarnation;
+        let slot0 = Slot::decode(&bytes[..SLOT_BYTES], incarnation, 0);
+        let slot1 = Slot::decode(&bytes[SLOT_BYTES..], incarnation, SLOT_BYTES);
+        let active = [slot0, slot1]
+            .into_iter()
+            .flatten()
+            .max_by_key(|slot| slot.sequence);
+        Ok(([slot0, slot1], active))
     }
 
     fn create_boundaries(&self, slot: &Slot) -> io::Result<()> {

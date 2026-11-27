@@ -188,6 +188,33 @@ impl Config {
         self.enrollment()?.initialize()
     }
 
+    /// Inspects every stream (or one stream when `filter` is `Some`) in this
+    /// stopped keeper's data directory strictly read-only.
+    pub fn inspect(&self, filter: Option<StreamId>) -> io::Result<storage::InspectReport> {
+        let placement = self.validate()?;
+        let enrollment = self.enrollment()?;
+        storage::inspect(enrollment, &placement, filter)
+    }
+
+    /// Walks every WAL segment frame CRC, checkpoint digest, and running hash
+    /// chain against the trusted boundary slots on this stopped keeper.
+    pub fn verify(&self) -> io::Result<storage::VerifyReport> {
+        self.validate()?;
+        let enrollment = self.enrollment()?;
+        storage::verify(enrollment)
+    }
+
+    /// Dumps segment `segment_id` from this stopped keeper's WAL directory.
+    pub fn dump_segment(
+        &self,
+        segment_id: u64,
+        limit: Option<usize>,
+    ) -> io::Result<storage::SegmentDump> {
+        self.validate()?;
+        let enrollment = self.enrollment()?;
+        storage::dump_segment_for_keeper(enrollment, segment_id, limit)
+    }
+
     pub async fn repair_snapshot(&self, stream: StreamId, backup: &Path) -> io::Result<()> {
         let placement = self.validate()?;
         self.tls

@@ -422,3 +422,259 @@ async fn ready_accepts_parked_streams_and_problems_detects_parked_with_dead_vote
 
     cluster.stop_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_inspect_verify_and_dump_segment() {
+    let mut cluster = Cluster::start().await;
+    let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(Uuid::new_v4().as_u128());
+    let writer_id = Uuid::new_v4();
+
+    client
+        .create(stream, voters, 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let sealed = client.seal(stream, Epoch(0), writer_id).await.unwrap();
+    for i in 1..=8 {
+        client
+            .append(
+                stream,
+                sealed.fence,
+                Lsn(i),
+                Bytes::from(format!("record-{i}")),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(client.head(stream).await.unwrap(), Lsn(8));
+
+    let target = voters[0];
+    let config = cluster.configs[&target].clone();
+
+    // Must refuse while the keeper is still running (LOCK held).
+    assert!(config.inspect(None).is_err());
+    assert!(config.verify().is_err());
+    assert!(config.dump_segment(1, None).is_err());
+
+    // Stop the keeper so offline tools can acquire the exclusive lock.
+    cluster.stop_all().await;
+
+    // 1. Inspect every field on the stopped directory.
+    let report = config.inspect(Some(stream)).unwrap();
+    assert_eq!(report.keeper, target);
+    assert_eq!(report.streams.len(), 1);
+    let info = &report.streams[0];
+    assert_eq!(info.stream, Uuid::from_u128(stream.0));
+    assert!(info.vote.is_some());
+    assert_eq!(info.membership.voters, voters.to_vec());
+    assert!(info.membership.joint_voters.is_none());
+    assert!(info.log_range.last_index.is_some());
+    assert!(info.applied.is_some());
+    let fence = info.fence.as_ref().expect("fence present");
+    assert_eq!(fence.epoch, 1);
+    assert_eq!(fence.writer, writer_id);
+    assert_eq!(fence.owner, OWNER);
+    assert!(!fence.recovery_fence);
+    assert_eq!(info.head, Some(8));
+    assert_eq!(info.floor, Some(1));
+    assert_eq!(info.stream_state, "live");
+    assert_eq!(info.retained_records, 8);
+    assert!(info.retained_bytes > 0);
+    assert_eq!(info.ownership.generation, Some(0));
+    assert!(info.ownership.installed);
+    assert!(!info.parked);
+    assert!(!info.quarantined);
+    // Display and JSON both work cleanly.
+    let text = report.to_string();
+    assert!(text.contains(&info.stream.to_string()));
+    assert!(serde_json::to_string(&report).is_ok());
+
+    // 2. Verify clean WAL segments, frame CRCs, and hash chain against boundary slots.
+    let verified = config.verify().unwrap();
+    assert!(
+        verified.ok,
+        "unexpected verify errors: {:?}",
+        verified.errors
+    );
+    assert!(verified.boundary_chain_verified);
+    assert!(verified.segments_checked >= 1);
+    assert!(verified.frames_checked >= 10);
+    assert_eq!(verified.unpublished_tail_bytes, 0);
+    assert!(verified.to_string().contains("verify OK"));
+
+    // 3. Dump segment by config+id and standalone file path.
+    let dump = config.dump_segment(1, None).unwrap();
+    assert_eq!(dump.segment_id, 1);
+    assert!(!dump.frames.is_empty());
+    assert!(dump.frames.iter().all(|f| f.crc_ok));
+    assert!(dump.frames.iter().any(|f| f.summary.contains("Register(")));
+    assert!(dump.frames.iter().any(|f| f.summary.contains("Vote(")));
+    assert!(dump.frames.iter().any(|f| f.summary.contains("Append(")));
+    assert!(dump.truncated_tail_offset.is_none());
+
+    let seg_path = config
+        .data
+        .join("raft-segments")
+        .join("00000000000000000001.seg");
+    let limited = crate::stream::consensus::dump_segment_file(&seg_path, Some(3)).unwrap();
+    assert_eq!(limited.frames.len(), 3);
+    assert_eq!(limited.incarnation, dump.incarnation);
+
+    // 4. Verify tolerates an unpublished torn tail past the boundary, and dump_segment reports it.
+    let original_seg = std::fs::read(&seg_path).unwrap();
+    {
+        let mut with_tail = original_seg.clone();
+        with_tail.extend_from_slice(&[0xff, 0x00, 0x11, 0x22, 0x33]);
+        std::fs::write(&seg_path, &with_tail).unwrap();
+    }
+    let with_tail_verify = config.verify().unwrap();
+    assert!(with_tail_verify.ok, "errors: {:?}", with_tail_verify.errors);
+    assert_eq!(with_tail_verify.unpublished_tail_bytes, 5);
+    let tail_dump = config.dump_segment(1, None).unwrap();
+    assert_eq!(
+        tail_dump.truncated_tail_offset,
+        Some(original_seg.len() as u64)
+    );
+
+    // 5. Corrupt a committed frame byte inside segment 1: verify must fail with CRC + chain mismatch.
+    let mut corrupted = original_seg.clone();
+    let flip_at = 32 + 8 + 1; // inside first frame body
+    corrupted[flip_at] ^= 0x55;
+    std::fs::write(&seg_path, &corrupted).unwrap();
+    let bad_verify = config.verify().unwrap();
+    assert!(!bad_verify.ok);
+    assert!(
+        bad_verify.errors.iter().any(|e| e.contains("CRC mismatch")),
+        "expected CRC mismatch in {:?}",
+        bad_verify.errors
+    );
+    assert!(
+        bad_verify.errors.iter().any(|e| e.contains("hash chain")),
+        "expected hash chain mismatch in {:?}",
+        bad_verify.errors
+    );
+    let bad_dump = config.dump_segment(1, Some(1)).unwrap();
+    assert!(!bad_dump.frames[0].crc_ok);
+
+    // Restore segment 1 and corrupt the boundary file -> verify detects no intact slot.
+    std::fs::write(&seg_path, &original_seg).unwrap();
+    let boundary_path = config.enrollment.join(format!("{target}.boundary"));
+    let original_boundary = std::fs::read(&boundary_path).unwrap();
+    std::fs::write(&boundary_path, vec![0u8; original_boundary.len()]).unwrap();
+    let bad_boundary = config.verify().unwrap();
+    assert!(!bad_boundary.ok);
+    assert!(
+        bad_boundary
+            .errors
+            .iter()
+            .any(|e| e.contains("no intact slot")),
+        "expected no intact slot error in {:?}",
+        bad_boundary.errors
+    );
+
+    // Restore boundary and verify clean again.
+    std::fs::write(&boundary_path, &original_boundary).unwrap();
+    assert!(config.verify().unwrap().ok);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_inspect_reports_quarantined_replica_on_missing_snapshot() {
+    let mut cluster = Cluster::start().await;
+    let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(Uuid::new_v4().as_u128());
+
+    client
+        .create(stream, voters, 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
+    for i in 1..=5 {
+        client
+            .append(stream, sealed.fence, Lsn(i), Bytes::from_static(b"snap"))
+            .await
+            .unwrap();
+    }
+    let target = voters[0];
+    let group = cluster.group(target, stream).await;
+    group.raft.trigger().snapshot().await.unwrap();
+    let snap_path = timeout(WAIT, async {
+        loop {
+            if let Some(path) = group.state.snapshot_path() {
+                return path;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("snapshot built");
+    drop(group);
+
+    let config = cluster.configs[&target].clone();
+    cluster.stop_all().await;
+
+    // Delete the selected snapshot file to simulate media corruption.
+    std::fs::remove_file(&snap_path).unwrap();
+
+    let report = config.inspect(Some(stream)).unwrap();
+    assert_eq!(report.streams.len(), 1);
+    assert!(report.streams[0].quarantined);
+    assert!(report.streams[0].quarantine_reason.is_some());
+    assert_eq!(report.streams[0].stream_state, "quarantined");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_verify_checks_checkpoint_and_multi_segment_chain() {
+    let mut cluster = Cluster::start().await;
+    let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(Uuid::new_v4().as_u128());
+
+    client
+        .create(stream, voters, 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
+    // In test mode, SEGMENT_BYTES and CHECKPOINT_BYTES are 256 KiB; write ~600 KiB
+    // so the keeper rolls segments and publishes a WAL checkpoint.
+    let payload = Bytes::from(vec![0xab; 32 * 1024]);
+    for i in 1..=20 {
+        client
+            .append(stream, sealed.fence, Lsn(i), payload.clone())
+            .await
+            .unwrap();
+    }
+    let target = voters[0];
+    let config = cluster.configs[&target].clone();
+    cluster.stop_all().await;
+
+    let report = config.verify().unwrap();
+    assert!(report.ok, "unexpected verify errors: {:?}", report.errors);
+    assert!(report.segments_checked >= 2);
+    assert!(report.checkpoint.is_some(), "expected WAL checkpoint");
+    assert!(report.checkpoint_chain_verified);
+    assert!(report.boundary_chain_verified);
+
+    // Corrupting the published checkpoint file must cause verify to fail.
+    let ckpt_id = report.checkpoint.as_ref().unwrap().id;
+    let ckpt_path = config
+        .data
+        .join("raft-checkpoints")
+        .join(format!("{ckpt_id}.ckpt"));
+    let original_ckpt = std::fs::read(&ckpt_path).unwrap();
+    let mut corrupt_ckpt = original_ckpt.clone();
+    corrupt_ckpt[10] ^= 0xff;
+    std::fs::write(&ckpt_path, &corrupt_ckpt).unwrap();
+
+    let bad = config.verify().unwrap();
+    assert!(!bad.ok);
+    assert!(
+        bad.errors.iter().any(|e| e.contains("checkpoint")),
+        "expected checkpoint error in {:?}",
+        bad.errors
+    );
+
+    std::fs::write(&ckpt_path, &original_ckpt).unwrap();
+    assert!(config.verify().unwrap().ok);
+}

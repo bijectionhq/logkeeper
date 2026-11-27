@@ -18,10 +18,18 @@ async fn main() -> ExitCode {
     if args.as_slice() == ["--help"] {
         println!("{USAGE}");
         #[cfg(feature = "stream")]
-        println!("       logkeeper keeper --config FILE");
+        println!("       logkeeper keeper --config FILE [--log-format human|json]");
         #[cfg(feature = "stream")]
         println!(
             "       logkeeper keeper recover-stream --config FILE --stream UUID --acknowledge-data-loss --lost KEEPER,KEEPER [--with KEEPER,KEEPER]"
+        );
+        #[cfg(feature = "stream")]
+        println!("       logkeeper keeper inspect --config FILE [--stream UUID] [--json]");
+        #[cfg(feature = "stream")]
+        println!("       logkeeper keeper verify --config FILE [--json]");
+        #[cfg(feature = "stream")]
+        println!(
+            "       logkeeper keeper dump-segment (--config FILE --segment ID | --file PATH) [--limit N] [--json]"
         );
         return ExitCode::SUCCESS;
     }
@@ -67,6 +75,15 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
         }
         if args.get(1).is_some_and(|action| action == "recover-stream") {
             return recover_stream(&args[2..]).await;
+        }
+        if args.get(1).is_some_and(|action| action == "inspect") {
+            return inspect_keeper(&args[2..]);
+        }
+        if args.get(1).is_some_and(|action| action == "verify") {
+            return verify_keeper(&args[2..]);
+        }
+        if args.get(1).is_some_and(|action| action == "dump-segment") {
+            return dump_segment(&args[2..]);
         }
         let mut config_file = None;
         let mut log_format = None;
@@ -213,6 +230,111 @@ async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error
     logkeeper::stream::consensus::logging::init(config.log_format);
     let recovered = config.recover_stream(stream, recovery).await?;
     println!("{recovered}");
+    Ok(())
+}
+
+#[cfg(feature = "stream")]
+const INSPECT_USAGE: &str =
+    "Usage: logkeeper keeper inspect --config FILE [--stream UUID] [--json]";
+#[cfg(feature = "stream")]
+const VERIFY_USAGE: &str = "Usage: logkeeper keeper verify --config FILE [--json]";
+#[cfg(feature = "stream")]
+const DUMP_SEGMENT_USAGE: &str = "Usage: logkeeper keeper dump-segment (--config FILE --segment ID | --file PATH) [--limit N] [--json]";
+
+#[cfg(feature = "stream")]
+fn inspect_keeper(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = None;
+    let mut stream = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--config" => config = iter.next(),
+            "--stream" => stream = iter.next(),
+            "--json" => json = true,
+            _ => return Err(INSPECT_USAGE.into()),
+        }
+    }
+    let Some(config) = config else {
+        return Err(INSPECT_USAGE.into());
+    };
+    let filter = match stream {
+        Some(raw) => Some(journal_contract::StreamId(
+            uuid::Uuid::parse_str(raw)?.as_u128(),
+        )),
+        None => None,
+    };
+    let report = logkeeper::stream::consensus::Config::read(std::path::Path::new(config))?
+        .inspect(filter)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{report}");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "stream")]
+fn verify_keeper(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--config" => config = iter.next(),
+            "--json" => json = true,
+            _ => return Err(VERIFY_USAGE.into()),
+        }
+    }
+    let Some(config) = config else {
+        return Err(VERIFY_USAGE.into());
+    };
+    let report =
+        logkeeper::stream::consensus::Config::read(std::path::Path::new(config))?.verify()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{report}");
+    }
+    if !report.ok {
+        return Err("keeper media verification failed".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "stream")]
+fn dump_segment(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = None;
+    let mut segment = None;
+    let mut file = None;
+    let mut limit = None;
+    let mut json = false;
+    let mut iter = args.iter();
+    while let Some(flag) = iter.next() {
+        match flag.as_str() {
+            "--config" => config = iter.next(),
+            "--segment" => segment = Some(iter.next().ok_or(DUMP_SEGMENT_USAGE)?.parse::<u64>()?),
+            "--file" => file = iter.next(),
+            "--limit" => limit = Some(iter.next().ok_or(DUMP_SEGMENT_USAGE)?.parse::<usize>()?),
+            "--json" => json = true,
+            _ => return Err(DUMP_SEGMENT_USAGE.into()),
+        }
+    }
+    let dump = match (config, segment, file) {
+        (Some(config), Some(segment), None) => {
+            logkeeper::stream::consensus::Config::read(std::path::Path::new(config))?
+                .dump_segment(segment, limit)?
+        }
+        (None, None, Some(path)) => {
+            logkeeper::stream::consensus::dump_segment_file(std::path::Path::new(path), limit)?
+        }
+        _ => return Err(DUMP_SEGMENT_USAGE.into()),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&dump)?);
+    } else {
+        print!("{dump}");
+    }
     Ok(())
 }
 
