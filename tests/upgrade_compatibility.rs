@@ -202,8 +202,12 @@ impl ProcessCluster {
         let roots = dir.path().join("ca.pem");
         let issuer = create_ca(&roots);
 
-        let voters = [1, 2, 3].map(Uuid::from_u128);
-        let catalog = Uuid::from_u128(4);
+        // Use realistic high bits so peer dispatch cannot mistake UUID
+        // bytes for a request variant tag.
+        let keeper_id =
+            |suffix: u128| Uuid::from_u128(0xc421_f8b2_3655_4841_846a_4ab8_02ab_f000 | suffix);
+        let voters = [1, 2, 3].map(keeper_id);
+        let catalog = keeper_id(4);
         let catalog_voters = replicated_catalog.then_some([voters[0], voters[1], catalog]);
         let roster = [voters[0], voters[1], voters[2], catalog];
         let domains: Domains = roster

@@ -15,6 +15,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The rolling-upgrade tests build the pinned previous binary.
+          fetch-depth: 0
       - name: Select Rust
         run: rustup toolchain install 1.94.1 --profile minimal
       - name: Test the workspace and simulate 10,000 stream journals

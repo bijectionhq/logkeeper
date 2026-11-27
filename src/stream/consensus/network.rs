@@ -379,8 +379,9 @@ const MAX_REQUEST_TAG_V1: u32 = 27;
 const MAX_REQUEST_TAG_CURRENT: u32 = 32;
 const MAX_PEER_REQUEST_TAG_V1: u32 = 5;
 const MAX_PEER_REQUEST_TAG_CURRENT: u32 = 5;
-/// Serialized size of `Genesis` under fixint bincode: StreamId(16) + [Uuid; 3](48) + u64(8).
-const GENESIS_WIRE_BYTES: usize = 16 + 48 + 8;
+// Genesis encodes a u128 stream ID, three length-prefixed UUID byte strings
+// (u64 length and 16 bytes each), and a u64 quota.
+const GENESIS_WIRE_BYTES: usize = 16 + 3 * (8 + 16) + 8;
 
 pub(super) enum DecodedFrame {
     Frame(Frame),
