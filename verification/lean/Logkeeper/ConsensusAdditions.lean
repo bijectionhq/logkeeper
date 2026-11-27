@@ -4,3 +4,4 @@ import Logkeeper.ConsensusAdditions.RetireOnProof
 import Logkeeper.ConsensusAdditions.CatalogClaim
 import Logkeeper.ConsensusAdditions.EpochLease
 import Logkeeper.ConsensusAdditions.OffloadPrefix
+import Logkeeper.ConsensusAdditions.SegmentedWAL

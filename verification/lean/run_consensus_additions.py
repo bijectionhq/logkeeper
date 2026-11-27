@@ -14,7 +14,7 @@ from study_tools import check_lean_mutation, check_lean_theorems
 
 MODULES = {
     "RecoveryFence": 10, "Parking": 7, "RetireOnProof": 4, "CatalogClaim": 6,
-    "EpochLease": 10, "OffloadPrefix": 11,
+    "EpochLease": 10, "OffloadPrefix": 11, "SegmentedWAL": 13,
 }
 
 CONTROLS = [
@@ -113,6 +113,30 @@ CONTROLS = [
         "  (catalog stream).getD genesis",
         "  ((catalog stream).map (fun _ => genesis)).getD genesis",
         "    | some held => simp [apply, current]",
+    ),
+    (
+        "SegmentedWAL", "truncate-keeps-a-stale-commit-index",
+        "decide (since ≤ known.index)",
+        "decide (since < known.index)",
+        "      rw [List.getElem?_take_of_lt (by omega), sound id committed]",
+    ),
+    (
+        "SegmentedWAL", "append-keeps-a-replaced-commit-index",
+        "decide (first ≤ known.index ∧",
+        "decide (first < known.index ∧",
+        "        · exact kept above",
+    ),
+    (
+        "SegmentedWAL", "replay-without-the-chain",
+        "if frames.length = count ∧ capturedFrames ++ frames = slot.chain then",
+        "if frames.length = count then",
+        "          exact absurd same.2 (changed frames read)",
+    ),
+    (
+        "SegmentedWAL", "commit-an-absent-entry",
+        "    (∀ id, frame.record = .committed id → state.entries[id.index]? = some id) ∧",
+        "    True ∧",
+        "    exact prior _ (sound_step _ _ sound disciplined.1) disciplined.2",
     ),
 ]
 
