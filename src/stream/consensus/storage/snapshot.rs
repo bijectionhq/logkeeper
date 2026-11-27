@@ -40,7 +40,7 @@ use crate::stream::{
         placement::Placement,
         state::{
             Command, EpochRuns, MAX_RETAINED_WITH_HEADROOM, Outcome, Payload, RecordKind,
-            Recoveries, State, quota_with_headroom,
+            Recoveries, State, TimedRecord, quota_with_headroom,
         },
     },
     keeper::durability::{sync_directory, sync_file},
@@ -930,7 +930,6 @@ impl StateMachine {
         })
     }
 
-    /// The retained timed record at `at`, from the applied image.
     /// Whether a writer of `epoch` appended exactly `payloads` from `at`:
     /// the last LSN when it did, `Conflict` when it did not, and
     /// `Unavailable` when this replica cannot tell. When the retained
@@ -1034,7 +1033,7 @@ impl StateMachine {
         }
     }
 
-    pub fn timed_record(&self, at: Lsn) -> journal_contract::Result<Payload> {
+    pub fn timed_record(&self, at: Lsn) -> journal_contract::Result<TimedRecord> {
         if !self.healthy() {
             return Err(JournalError::Unavailable);
         }

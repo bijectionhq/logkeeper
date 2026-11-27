@@ -368,8 +368,9 @@ impl ConsensusJournal {
         }
     }
 
-    /// Reopens the retained proof of a timed original, for example after a
-    /// writer takeover. The retained evidence must name the exact original.
+    /// Reopens the proof of a committed timed original from the log or offload
+    /// store until a trim moves the logical floor past it. The retained evidence
+    /// must name the exact original.
     pub async fn prove_timed_original(
         &self,
         original: TimedOriginal,

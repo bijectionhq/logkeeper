@@ -39,10 +39,10 @@ use super::{Engine, Group, Reply, catalog_stream};
 use crate::stream::{
     consensus::{
         CLUSTER_VERSION_OFFLOAD, MAX_PAGE, MAX_RECORDS_PER_PAGE, decisions,
-        offload::{LineageRecord, OffloadConfig, Store},
+        offload::{LineageRecord, OffloadConfig, Record, Store},
         state::{Command, Outcome, RecordKind, Remote},
     },
-    timed::EVIDENCE_BYTES,
+    timed::{EVIDENCE_BYTES, TimedEvidence},
 };
 
 const TICK: Duration = Duration::from_millis(100);
@@ -138,13 +138,12 @@ impl Offloader {
         }
     }
 
-    /// Reads one page below the local floor from the store.
-    pub async fn read(
+    async fn read_records(
         &self,
         stream: StreamId,
         remote: Remote,
         limit: usize,
-    ) -> Result<Page, JournalError> {
+    ) -> Result<Vec<Record>, JournalError> {
         let metrics = &self.store.metrics;
         let records = self
             .store
@@ -177,6 +176,17 @@ impl Offloader {
                 }
             })?;
         crate::stream::consensus::metrics::count(&metrics.remote_reads);
+        Ok(records)
+    }
+
+    /// Reads one page below the local floor from the store.
+    pub async fn read(
+        &self,
+        stream: StreamId,
+        remote: Remote,
+        limit: usize,
+    ) -> Result<Page, JournalError> {
+        let records = self.read_records(stream, remote, limit).await?;
         let mut recoveries = Vec::new();
         let records = records
             .into_iter()
@@ -204,6 +214,33 @@ impl Offloader {
             head: remote.head,
             recoveries,
         })
+    }
+
+    pub async fn original_evidence(
+        &self,
+        stream: StreamId,
+        remote: Remote,
+    ) -> Result<Vec<u8>, JournalError> {
+        let mut records = self.read_records(stream, remote, 1).await?;
+        let record = records.pop().ok_or(JournalError::Unavailable)?;
+        if record.lsn != remote.from {
+            return Err(JournalError::Corrupted);
+        }
+        if record.kind != RecordKind::Timed {
+            return Err(JournalError::Unavailable);
+        }
+        let (evidence, payload) = record
+            .bytes
+            .split_at_checked(EVIDENCE_BYTES)
+            .ok_or(JournalError::Corrupted)?;
+        let original = TimedEvidence::decode(evidence)
+            .ok_or(JournalError::Corrupted)?
+            .origin
+            .original;
+        if original.stream != stream || original.at != remote.from || !original.matches(payload) {
+            return Err(JournalError::Corrupted);
+        }
+        Ok(evidence.to_vec())
     }
 }
 

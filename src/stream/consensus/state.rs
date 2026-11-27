@@ -609,6 +609,11 @@ pub(super) struct Remote {
     pub head: Lsn,
 }
 
+pub(super) enum TimedRecord {
+    Local(Payload),
+    Offloaded(Remote),
+}
+
 /// What the uploader needs from a stream's applied state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct OffloadView {
@@ -1333,19 +1338,7 @@ impl State {
     /// the record: the store's objects of its lineage. `None` when the
     /// record is held locally, trimmed, or past the head.
     pub fn remote(&self, from: Lsn) -> Option<Remote> {
-        let live = self.live().ok()?;
-        let logical = live.logical_floor();
-        if from < logical || from >= live.floor || from > live.head {
-            return None;
-        }
-        let (lineage, end) = live.offload.lineage_of(from);
-        Some(Remote {
-            lineage,
-            from,
-            until: Lsn((live.floor.0 - 1).min(end.0).min(live.head.0)),
-            floor: logical,
-            head: live.head,
-        })
+        self.live().ok()?.remote(from)
     }
 
     /// The applied offload progress, for the uploader.
@@ -1450,21 +1443,24 @@ impl State {
         Some((*fence, owner))
     }
 
-    /// The retained timed record at `at`. A position below the floor is
-    /// trimmed, and an ordinary or missing record has no original evidence.
-    pub fn timed_record(&self, at: Lsn) -> Result<Payload> {
+    /// Selects the proof's source and retention boundary from one applied image.
+    pub fn timed_record(&self, at: Lsn) -> Result<TimedRecord> {
         let live = self.live()?;
-        if at < live.floor {
-            return Err(JournalError::Trimmed { floor: live.floor });
+        let floor = live.logical_floor();
+        if at < floor {
+            return Err(JournalError::Trimmed { floor });
         }
         if at > live.head {
             return Err(JournalError::Conflict { head: live.head });
+        }
+        if let Some(remote) = live.remote(at) {
+            return Ok(TimedRecord::Offloaded(remote));
         }
         let record = &live.records[(at.0 - live.floor.0) as usize];
         if !record.timed() {
             return Err(JournalError::Unavailable);
         }
-        Ok(record.clone())
+        Ok(TimedRecord::Local(record.clone()))
     }
 
     /// The bytes a new timed record of `payload_len` would charge, if the
@@ -2106,6 +2102,21 @@ impl Live {
             self.offload.floor = Some(Lsn(through.0 + 1)).filter(|floor| *floor < self.floor);
         }
         Ok(Outcome::Unit)
+    }
+
+    fn remote(&self, from: Lsn) -> Option<Remote> {
+        let floor = self.logical_floor();
+        if from < floor || from >= self.floor || from > self.head {
+            return None;
+        }
+        let (lineage, end) = self.offload.lineage_of(from);
+        Some(Remote {
+            lineage,
+            from,
+            until: Lsn((self.floor.0 - 1).min(end.0).min(self.head.0)),
+            floor,
+            head: self.head,
+        })
     }
 
     fn read(&self, from: Lsn, limit: usize) -> Result<ReadPage> {

@@ -856,3 +856,92 @@ async fn timed_staging_and_retries_require_the_immutable_writer_session() {
     assert_eq!(journal.prove_timed_original(exact).await, Ok(proof));
     cluster.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timed_original_proof_survives_local_eviction_until_checkpoint_trim() {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use journal_contract::{
+        CheckpointInstallation, Epoch, JournalError, Lsn, StreamId, WriterSessionId,
+    };
+    use logkeeper::stream::timed::TimedOriginal;
+    use sha2::{Digest, Sha256};
+
+    let objects = tempfile::tempdir().unwrap();
+    let offload = serde_json::from_value(serde_json::json!({
+        "url": format!("file://{}", objects.path().display()),
+        "batch_interval_ms": 3_600_000,
+        "retain_local_bytes": 0,
+    }))
+    .unwrap();
+    let mut cluster = LocalCluster::start_timed(&PRINCIPALS).await.unwrap();
+    cluster
+        .enable_offload(PRINCIPALS[0], offload)
+        .await
+        .unwrap();
+    let journal = cluster
+        .journal(PRINCIPALS[0], &cluster.journal_config(1 << 20, 4096))
+        .unwrap()
+        .with_timed_original(cluster.timed_verifier(), Some(2048));
+    let stream = StreamId(83);
+    journal.create_immutable(stream).await.unwrap();
+    let writer = journal
+        .seal_session(stream, Epoch(0), WriterSessionId(1))
+        .await
+        .unwrap();
+    let payload = Bytes::from_static(b"offloaded timed original");
+    let original = TimedOriginal {
+        stream,
+        at: Lsn(1),
+        epoch: writer.fence.writer_epoch,
+        payload_sha256: Sha256::digest(&payload).into(),
+        exclusive_journal_cutoff_micros: now_micros() + 60_000_000,
+        original_receiver_certificate_sha256: [9; 32],
+    };
+    let accepted = journal
+        .append_session_timed_original(writer.fence, original, payload.clone())
+        .await
+        .unwrap();
+    assert_eq!(journal.prove_timed_original(original).await, Ok(accepted));
+
+    let status = journal.client().offload_status(stream, true).await.unwrap();
+    assert_eq!(status.offloaded_through, original.at);
+    assert_eq!(status.floor, original.at);
+    assert_eq!(status.local_floor, Lsn(2));
+    assert_eq!(
+        journal
+            .read(stream, original.at, 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        vec![(original.at, payload)]
+    );
+    assert_eq!(journal.prove_timed_original(original).await, Ok(accepted));
+    let different = TimedOriginal {
+        payload_sha256: [5; 32],
+        ..original
+    };
+    assert_eq!(
+        journal.prove_timed_original(different).await,
+        Err(JournalError::Unavailable)
+    );
+
+    journal
+        .install_checkpoint(
+            writer.fence,
+            CheckpointInstallation {
+                operation_id: 2,
+                checkpoint_lsn: Lsn(2),
+                covered_through_lsn: original.at,
+                record: Bytes::from_static(b"covering checkpoint"),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.prove_timed_original(original).await,
+        Err(JournalError::Trimmed { floor: Lsn(2) })
+    );
+    cluster.shutdown().await.unwrap();
+}

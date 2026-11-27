@@ -56,7 +56,7 @@ use super::{
     invalid,
     network::{Lane, Network, Reply, Request, Rpc},
     placement::Placement,
-    state::{Command, Outcome},
+    state::{Command, Outcome, TimedRecord},
     storage::{self, Authority, Disk, Enrollment, FollowerAppend, LogStore, Record, StateMachine},
 };
 use crate::server::durability::SyncMode;
@@ -2332,25 +2332,11 @@ impl Engine {
                         if let Err(reply) = group.barrier(Instant::now() + REQUEST_TIMEOUT).await {
                             return Ok(reply);
                         }
-                        Ok(Reply::Decision(match group.state.timed_record(at) {
-                            Ok(record) => {
-                                match tokio::task::spawn_blocking(move || record.load()).await {
-                                    Ok(Ok(bytes)) => Outcome::OriginalEvidence(
-                                        bytes[..crate::stream::timed::EVIDENCE_BYTES].to_vec(),
-                                    ),
-                                    Ok(Err(error))
-                                        if error.kind() == io::ErrorKind::InvalidData =>
-                                    {
-                                        group.state.quarantine_corrupt(&error.to_string());
-                                        self.quarantined.write().insert(stream);
-                                        Outcome::Refused(JournalError::Corrupted)
-                                    }
-                                    Ok(Err(_)) => Outcome::Refused(JournalError::Unavailable),
-                                    Err(_) => Outcome::Refused(JournalError::Unavailable),
-                                }
-                            }
+                        let outcome = match self.original_evidence(&group, stream, at).await {
+                            Ok(evidence) => Outcome::OriginalEvidence(evidence),
                             Err(error) => Outcome::Refused(error),
-                        }))
+                        };
+                        Ok(Reply::Decision(outcome))
                     }
                     Request::Trim { fence, through, .. } => Ok(self
                         .compatibility_trim(&group, fence, owner.unwrap(), through)
@@ -2427,6 +2413,32 @@ impl Engine {
                     return Ok(failure(JournalError::Unavailable));
                 }
                 Ok(reply)
+            }
+        }
+    }
+
+    async fn original_evidence(
+        &self,
+        group: &Group,
+        stream: StreamId,
+        at: Lsn,
+    ) -> Result<Vec<u8>, JournalError> {
+        match group.state.timed_record(at)? {
+            TimedRecord::Offloaded(remote) => {
+                let offload = self.offload.as_ref().ok_or(JournalError::Unavailable)?;
+                offload.original_evidence(stream, remote).await
+            }
+            TimedRecord::Local(record) => {
+                let loaded = tokio::task::spawn_blocking(move || record.load()).await;
+                match loaded {
+                    Ok(Ok(bytes)) => Ok(bytes[..crate::stream::timed::EVIDENCE_BYTES].to_vec()),
+                    Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                        group.state.quarantine_corrupt(&error.to_string());
+                        self.quarantined.write().insert(stream);
+                        Err(JournalError::Corrupted)
+                    }
+                    Ok(Err(_)) | Err(_) => Err(JournalError::Unavailable),
+                }
             }
         }
     }
