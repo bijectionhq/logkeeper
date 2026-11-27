@@ -36,7 +36,7 @@ use crate::stream::{
 };
 
 use super::{
-    Config, ConsensusJournal, Credentials, Domains, JournalConfig, Keepers, SyncMode,
+    AdminConfig, Config, ConsensusJournal, Credentials, Domains, JournalConfig, Keepers, SyncMode,
     TimedAuthority,
     storage::{Authority, Provision, hex, sha256},
 };
@@ -209,7 +209,13 @@ impl LocalCluster {
                     }) as Arc<dyn TimedOriginalClock>),
                 }),
                 log_format: Default::default(),
-                admin: None,
+                // Every local keeper serves the plain loopback admin
+                // listener, so tests can follow the operator's probes.
+                admin: Some(AdminConfig {
+                    listen: free_port()?,
+                    mtls: false,
+                    cluster: Default::default(),
+                }),
             };
             provision(&config)?;
             config.initialize()?;
@@ -244,6 +250,15 @@ impl LocalCluster {
 
     pub fn keepers(&self) -> &Keepers {
         &self.keepers
+    }
+
+    /// The plain HTTP admin listener of `keeper`, on loopback.
+    pub fn admin(&self, keeper: Uuid) -> SocketAddr {
+        self.configs[&keeper]
+            .admin
+            .as_ref()
+            .expect("local keepers serve an admin listener")
+            .listen
     }
 
     /// The directory holding every keeper's data, registry and credentials.
