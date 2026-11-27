@@ -1,5 +1,5 @@
 {
-  "summary": "Verify the shipped consensus admission, metering, classification, rotation, batch and restart, operator recovery, recovery restage and recovery fence, keeper incarnation, slow media, parking, repair queue, placement load, leader preference, retirement, stale-vote, WAL boundary and offload decisions against the PeerBudget, Headroom, RestartRead, Parking, RetireOnProof and RecoveryFence laws.",
+  "summary": "Verify the shipped consensus admission, metering, classification, rotation, batch and restart, operator recovery, recovery restage and recovery fence, keeper incarnation, slow media, parking, repair queue, placement load, leader preference, retirement, stale-vote, WAL boundary, offload and typed recovery entry decisions against the PeerBudget, Headroom, RestartRead, Parking, RetireOnProof, RecoveryFence and RecoveryEntry laws.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 166,
+  "min_verified_functions": 177,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -1705,6 +1705,124 @@
         {
           "file": "src/stream/consensus/decisions.rs",
           "function": "reported_loss_point",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "write-entry-after-other-records": {
+      "defect": "write a recovery entry after records of the recovery epoch",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    } else if epoch == fence_epoch && head == fence_head && matches_record {",
+          "replace": "    } else if epoch == fence_epoch && matches_record {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_entry_step",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "answer-retry-while-fenced": {
+      "defect": "answer a recovery entry as a retry while its fence stands",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    } else if !pending {",
+          "replace": "    } else if true {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_entry_step",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_entry_step",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "recovery_entry_step",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "forge-entry-by-append": {
+      "defect": "retain appended client bytes as a recovery entry",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        RecordOrigin::Append | RecordOrigin::Marker => RetainedKind::Data,",
+          "replace": "        RecordOrigin::Append => RetainedKind::Recovery,\n        RecordOrigin::Marker => RetainedKind::Data,"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "retained_kind",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "seal-as-recovery-writer": {
+      "defect": "let a client seal as the reserved recovery writer",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    !nil && !reserved\n",
+          "replace": "    !nil\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "client_may_seal_as",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "unbounded-recovery-headroom": {
+      "defect": "let a recovery entry take a stream past its quota without bound",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        (RECOVERY_HEADROOM_RECORDS, RECOVERY_HEADROOM_BYTES)",
+          "replace": "        (RECOVERY_HEADROOM_RECORDS, u64::MAX)"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "retains_record",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 150
+    },
+    "headroom-for-ordinary-records": {
+      "defect": "give ordinary records the recovery headroom",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        (0, 0)\n",
+          "replace": "        (RECOVERY_HEADROOM_RECORDS, RECOVERY_HEADROOM_BYTES)\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "retains_record",
           "category": "postcondition not satisfied"
         }
       ],

@@ -2235,13 +2235,19 @@ impl Engine {
                     // writer, so no client can stand in its fence.
                     Request::Seal {
                         expected, writer, ..
-                    } if !writer.is_nil() && writer != super::state::RECOVERY_WRITER => Ok(group
-                        .write(Command::Seal {
-                            expected,
-                            writer,
-                            owner: owner.unwrap(),
-                        })
-                        .await),
+                    } if super::decisions::client_may_seal_as(
+                        writer.is_nil(),
+                        writer == super::state::RECOVERY_WRITER,
+                    ) =>
+                    {
+                        Ok(group
+                            .write(Command::Seal {
+                                expected,
+                                writer,
+                                owner: owner.unwrap(),
+                            })
+                            .await)
+                    }
                     Request::Append {
                         fence, at, payload, ..
                     } => {

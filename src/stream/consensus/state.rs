@@ -1,15 +1,9 @@
 //! Deterministic decisions over the committed journal view.
 
 pub(super) const MAX_RETAINED_RECORDS: usize = 262_144;
-/// How far typed recovery entries may take a stream past its byte quota.
-/// A stream exactly at its quota must still take the one entry that clears
-/// its recovery fence, or the fence never clears; ordinary writes stay
-/// within the quota, so only recovery entries, one per recovery, ever use
-/// this headroom.
-pub(super) const RECOVERY_HEADROOM_BYTES: u64 = 64 * 1024;
-/// How far typed recovery entries may take a stream past
-/// `MAX_RETAINED_RECORDS`, as `RECOVERY_HEADROOM_BYTES` for bytes.
-pub(super) const RECOVERY_HEADROOM_RECORDS: usize = 16;
+use super::decisions::{
+    EntryStep, RECOVERY_HEADROOM_BYTES, RECOVERY_HEADROOM_RECORDS, RecordOrigin, RetainedKind,
+};
 /// The most records any retained state holds: the ordinary limit and the
 /// recovery entries' headroom. Snapshot geometry admits this many.
 pub(super) const MAX_RETAINED_WITH_HEADROOM: usize =
@@ -695,6 +689,16 @@ pub enum RecordKind {
     Recovery,
 }
 
+impl From<RetainedKind> for RecordKind {
+    fn from(kind: RetainedKind) -> Self {
+        match kind {
+            RetainedKind::Data => Self::Data,
+            RetainedKind::Timed => Self::Timed,
+            RetainedKind::Recovery => Self::Recovery,
+        }
+    }
+}
+
 impl RecordKind {
     /// The bits this kind sets in a framed record length.
     pub(super) fn flag(self) -> u32 {
@@ -910,7 +914,7 @@ impl State {
                 offset,
                 len,
                 crc: crc32fast::hash(&payload),
-                kind: RecordKind::Data,
+                kind: super::decisions::retained_kind(RecordOrigin::Append).into(),
             };
             return Ok(live.append(at, retained, genesis.quota_bytes).into());
         }
@@ -965,7 +969,7 @@ impl State {
                 offset,
                 len,
                 crc: crc32fast::hash(&record),
-                kind: RecordKind::Timed,
+                kind: super::decisions::retained_kind(RecordOrigin::Timed).into(),
             };
             return Ok(live.append(at, retained, genesis.quota_bytes).into());
         }
@@ -1155,7 +1159,9 @@ impl State {
             .map(Epoch)
             .ok_or(JournalError::Fenced { current })?;
         let writer = uuid::Uuid::from_u128(writer_session_id.0);
-        if writer.is_nil() || writer == RECOVERY_WRITER || owner.is_empty() {
+        if !super::decisions::client_may_seal_as(writer.is_nil(), writer == RECOVERY_WRITER)
+            || owner.is_empty()
+        {
             return Err(JournalError::Fenced { current });
         }
         let fence = Fence { epoch, writer };
@@ -1395,11 +1401,14 @@ impl State {
     /// stream can still hold it.
     pub fn fits_timed(&self, payload_len: usize, quota_bytes: u64) -> bool {
         self.live().is_ok_and(|live| {
-            live.records.len() < MAX_RETAINED_RECORDS
-                && live
-                    .bytes
-                    .checked_add(record_charge(EVIDENCE_BYTES + payload_len))
-                    .is_some_and(|used| used <= quota_bytes)
+            super::decisions::retains_record(
+                false,
+                live.records.len(),
+                MAX_RETAINED_RECORDS,
+                live.bytes,
+                record_charge(EVIDENCE_BYTES + payload_len),
+                quota_bytes,
+            )
         })
     }
 
@@ -1718,7 +1727,7 @@ impl Live {
             offset,
             len,
             crc: crc32fast::hash(&payload),
-            kind: RecordKind::Data,
+            kind: super::decisions::retained_kind(RecordOrigin::Marker).into(),
         };
         match self.append(at, record, quota_bytes) {
             Ok(_) => Ok(self.acknowledge_recovery().into()),
@@ -1738,38 +1747,57 @@ impl Live {
         segment: Arc<super::storage::Object>,
         quota_bytes: u64,
     ) -> io::Result<Outcome> {
-        let conflict = Outcome::Refused(JournalError::Conflict { head: self.head });
-        let Some(decoded) = RecoveryEntry::decode(&entry) else {
-            return Ok(conflict);
+        let decoded = RecoveryEntry::decode(&entry);
+        let names_command = decoded
+            .as_ref()
+            .is_some_and(|decoded| decoded.fence == fence && decoded.at() == at);
+        let pending = self.recorded.filter(|_| self.recovering());
+        let matches_record = match (&decoded, pending) {
+            (Some(decoded), Some(Recorded { record, exact })) => {
+                decoded.configuration_epoch == record.epoch
+                    && decoded.loss_point == record.loss_point
+                    && decoded.exact == exact
+                    && decoded.source == record.source
+                    && decoded.time_unix_ms == record.time_unix_ms
+            }
+            _ => false,
         };
-        if decoded.fence != fence || decoded.at() != at || fence.head.0 == u64::MAX {
-            return Ok(conflict);
-        }
-        let Some(Recorded { record, exact }) = self.recorded.filter(|_| self.recovering()) else {
-            if at < self.floor {
+        // Only a retry after the fence cleared reads the retained bytes.
+        let retained_identical = pending.is_none()
+            && names_command
+            && at >= self.floor
+            && at <= self.head
+            && match self.records.get((at.0 - self.floor.0) as usize) {
+                Some(retained) => {
+                    retained.kind() == RecordKind::Recovery
+                        && retained.len() == entry.len()
+                        && retained.load()? == entry
+                }
+                None => false,
+            };
+        let step = super::decisions::recovery_entry_step(
+            names_command,
+            fence.epoch.0,
+            fence.head.0,
+            at.0,
+            pending.is_some(),
+            self.epoch().0,
+            self.head.0,
+            self.floor.0,
+            matches_record,
+            retained_identical,
+        );
+        match step {
+            EntryStep::Conflict => {
+                return Ok(Outcome::Refused(JournalError::Conflict { head: self.head }));
+            }
+            EntryStep::Trimmed => {
                 return Ok(Outcome::Refused(JournalError::Trimmed {
                     floor: self.floor,
                 }));
             }
-            if at <= self.head
-                && let Some(retained) = self.records.get((at.0 - self.floor.0) as usize)
-                && retained.kind() == RecordKind::Recovery
-                && retained.len() == entry.len()
-                && retained.load()? == entry
-            {
-                return Ok(Outcome::At(at));
-            }
-            return Ok(conflict);
-        };
-        if self.epoch() != fence.epoch
-            || self.head != fence.head
-            || decoded.configuration_epoch != record.epoch
-            || decoded.loss_point != record.loss_point
-            || decoded.exact != exact
-            || decoded.source != record.source
-            || decoded.time_unix_ms != record.time_unix_ms
-        {
-            return Ok(conflict);
+            EntryStep::Retry => return Ok(Outcome::At(at)),
+            EntryStep::Write => (),
         }
         let len = entry.len() as u32;
         let offset = segment.len().checked_sub(u64::from(len)).ok_or_else(|| {
@@ -1780,16 +1808,11 @@ impl Live {
             offset,
             len,
             crc: crc32fast::hash(&entry),
-            kind: RecordKind::Recovery,
+            kind: super::decisions::retained_kind(RecordOrigin::RecoveryEntry).into(),
         };
         // The entry must be written for the stream to make progress, so it
         // may use the recovery headroom past the quota and record limit.
-        match self.append_within(
-            at,
-            retained,
-            quota_with_headroom(quota_bytes),
-            MAX_RETAINED_WITH_HEADROOM,
-        ) {
+        match self.retain(at, retained, quota_bytes, true) {
             Ok(_) => {
                 self.recorded = None;
                 let _ = self.acknowledge_recovery();
@@ -1844,17 +1867,19 @@ impl Live {
     }
 
     fn append(&mut self, at: Lsn, payload: Payload, quota_bytes: u64) -> Result<Outcome> {
-        self.append_within(at, payload, quota_bytes, MAX_RETAINED_RECORDS)
+        self.retain(at, payload, quota_bytes, false)
     }
 
-    /// Appends `payload` at `at` if the stream stays within `quota_bytes`
-    /// and `max_records`.
-    fn append_within(
+    /// Appends `payload` at `at` if the stream still retains it
+    /// (`decisions::retains_record`): within `quota_bytes` and
+    /// `MAX_RETAINED_RECORDS`, and for a typed recovery entry (`entry`)
+    /// also within the recovery headroom.
+    fn retain(
         &mut self,
         at: Lsn,
         payload: Payload,
         quota_bytes: u64,
-        max_records: usize,
+        entry: bool,
     ) -> Result<Outcome> {
         let conflict = JournalError::Conflict { head: self.head };
         if at < self.floor {
@@ -1866,16 +1891,18 @@ impl Live {
         if payload.len() > MAX_RECORD {
             return Err(JournalError::TooLarge { max: MAX_RECORD });
         }
-        if self.records.len() >= max_records {
+        let charge = record_charge(payload.len());
+        if !super::decisions::retains_record(
+            entry,
+            self.records.len(),
+            MAX_RETAINED_RECORDS,
+            self.bytes,
+            charge,
+            quota_bytes,
+        ) {
             return Err(JournalError::Full { floor: self.floor });
         }
-        let charge = record_charge(payload.len());
-        let used = self
-            .bytes
-            .checked_add(charge)
-            .filter(|used| *used <= quota_bytes)
-            .ok_or(JournalError::Full { floor: self.floor })?;
-        self.record_append(at, payload, used);
+        self.record_append(at, payload, self.bytes + charge);
         Ok(Outcome::At(at))
     }
 
@@ -1950,7 +1977,7 @@ impl Live {
                 offset: *offset,
                 len: payload.len() as u32,
                 crc: crc32fast::hash(payload),
-                kind: RecordKind::Data,
+                kind: super::decisions::retained_kind(RecordOrigin::Append).into(),
             });
         }
         self.epochs.note(Lsn(at.0 + retained as u64), self.epoch());

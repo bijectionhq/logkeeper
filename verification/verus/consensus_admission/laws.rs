@@ -732,6 +732,87 @@ fn retirement_never_removes_a_named_copy(same_revision: bool, named_voter: bool,
     assert(named_voter || named_joint ==> !retires);
 }
 
+// RecoveryEntry.first_of_the_recovery_epoch: a typed recovery entry is
+// written only while its recorded recovery's fence stands, at the fence's
+// head + 1, before any other record of that epoch, and with the record's
+// fields, so it clears exactly that fence.
+fn a_recovery_entry_is_the_first_entry_of_its_epoch(
+    names_command: bool, fence_epoch: u64, fence_head: u64, at: u64, pending: bool, epoch: u64,
+    head: u64, floor: u64, matches_record: bool, retained_identical: bool,
+) {
+    let step = recovery_entry_step(
+        names_command, fence_epoch, fence_head, at, pending, epoch, head, floor, matches_record,
+        retained_identical,
+    );
+    assert(step is Write ==> pending && names_command && matches_record);
+    assert(step is Write
+        ==> epoch == fence_epoch && head == fence_head && at as int == fence_head as int + 1);
+    // A stale fence, a later head, a foreign record or a cleared fence
+    // never writes.
+    assert(epoch != fence_epoch ==> !(step is Write));
+    assert(head != fence_head ==> !(step is Write));
+    assert(!matches_record ==> !(step is Write));
+    assert(!pending ==> !(step is Write));
+    // Once the fence cleared, only an identical retained entry answers.
+    assert(step is Retry ==> !pending && retained_identical && floor <= at && at <= head);
+}
+
+// RecoveryEntry.writes_when_due: the recorded recovery's own entry, asked
+// at the fence's head + 1 while the fence stands, is written.
+fn the_recorded_entry_is_written(fence_epoch: u64, fence_head: u64, floor: u64, identical: bool)
+    requires fence_head < u64::MAX,
+{
+    let step = recovery_entry_step(
+        true, fence_epoch, fence_head, (fence_head + 1) as u64, true, fence_epoch, fence_head,
+        floor, true, identical,
+    );
+    assert(step is Write);
+}
+
+// RecoveryEntry.unforgeable: no append, batch, timed record or marker of
+// client bytes is retained as a recovery entry, and no client seals as the
+// reserved recovery writer.
+fn no_client_write_forges_a_recovery_entry(nil: bool) {
+    let append = retained_kind(RecordOrigin::Append);
+    assert(append is Data);
+    let timed = retained_kind(RecordOrigin::Timed);
+    assert(timed is Timed);
+    let marker = retained_kind(RecordOrigin::Marker);
+    assert(marker is Data);
+    let entry = retained_kind(RecordOrigin::RecoveryEntry);
+    assert(entry is Recovery);
+    let reserved = client_may_seal_as(nil, true);
+    assert(!reserved);
+    let ordinary = client_may_seal_as(false, false);
+    assert(ordinary);
+}
+
+// RecoveryEntry.headroom: an ordinary record never takes a stream past its
+// quota or record limit; a recovery entry takes it past them by at most the
+// fixed headroom, and a stream exactly at its quota and limit still takes
+// an entry that fits the headroom.
+fn the_recovery_headroom_is_bounded(
+    records: usize, max_records: usize, bytes: u64, charge: u64, quota: u64,
+) {
+    let ordinary = retains_record(false, records, max_records, bytes, charge, quota);
+    assert(ordinary ==> records < max_records && bytes as int + charge as int <= quota as int);
+    let entry = retains_record(true, records, max_records, bytes, charge, quota);
+    assert(entry ==> (records as int) < max_records as int + RECOVERY_HEADROOM_RECORDS as int
+        && bytes as int + charge as int <= quota as int + RECOVERY_HEADROOM_BYTES as int);
+}
+
+fn a_full_stream_still_takes_its_recovery_entry(max_records: usize, quota: u64, charge: u64)
+    requires
+        max_records as int + RECOVERY_HEADROOM_RECORDS as int <= usize::MAX as int,
+        quota as int + RECOVERY_HEADROOM_BYTES as int <= u64::MAX as int,
+        0 < charge <= 65_536,
+{
+    let ordinary = retains_record(false, max_records, max_records, quota, charge, quota);
+    assert(!ordinary);
+    let entry = retains_record(true, max_records, max_records, quota, charge, quota);
+    assert(entry);
+}
+
 // RecoveryFence: while an operator recovery's fence stands, every seal is
 // refused with `Recovered`. Otherwise a seal installs a fence one above the
 // epoch it expected only when that epoch is current, so the new epoch is

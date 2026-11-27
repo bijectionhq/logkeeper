@@ -1284,6 +1284,171 @@ pub(super) fn seal_step(recovering: bool, current: u64, expected: u64) -> SealSt
     }
 }
 
+/// Whether a client may seal as `writer`: never as the nil writer, and
+/// never as the reserved writer of an operator recovery's fence, so no
+/// client stands in that fence or writes as the recovery.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (!nil && !reserved)
+))]
+pub(super) fn client_may_seal_as(nil: bool, reserved: bool) -> bool {
+    !nil && !reserved
+}
+
+/// The command a retained record comes from.
+pub(super) enum RecordOrigin {
+    /// An append or an append batch of client bytes.
+    Append,
+    /// A timed original: its evidence, then client bytes.
+    Timed,
+    /// The opaque marker an acknowledgement below the typed entry's level
+    /// writes, which is client bytes.
+    Marker,
+    /// `Command::RecoveryEntry`, the typed entry of a recorded recovery.
+    RecoveryEntry,
+}
+
+/// What a retained record is (`state::RecordKind`).
+pub(super) enum RetainedKind {
+    Data,
+    Timed,
+    Recovery,
+}
+
+/// The kind a record from `origin` is retained as. Only the typed entry's
+/// own command retains the recovery kind, so no append, batch, timed
+/// record or marker of client bytes can forge one, whatever its bytes.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        (out is Recovery) == (origin is RecoveryEntry),
+        (out is Timed) == (origin is Timed),
+))]
+pub(super) fn retained_kind(origin: RecordOrigin) -> RetainedKind {
+    match origin {
+        RecordOrigin::Append | RecordOrigin::Marker => RetainedKind::Data,
+        RecordOrigin::Timed => RetainedKind::Timed,
+        RecordOrigin::RecoveryEntry => RetainedKind::Recovery,
+    }
+}
+
+/// How far typed recovery entries may take a stream past its byte quota.
+/// A stream exactly at its quota must still take the one entry that clears
+/// its recovery fence, or the fence never clears; ordinary records stay
+/// within the quota, so only recovery entries, one per recovery, ever use
+/// this headroom.
+pub const RECOVERY_HEADROOM_BYTES: u64 = 65_536; // 64 KiB
+/// How far typed recovery entries may take a stream past its retained
+/// record limit, as `RECOVERY_HEADROOM_BYTES` for bytes.
+pub const RECOVERY_HEADROOM_RECORDS: usize = 16;
+
+/// Whether a stream holding `records` records that charge `bytes` retains
+/// one more record charging `charge`. Ordinary records stay within
+/// `max_records` and `quota`. A typed recovery entry (`entry`), which must
+/// be written for the stream to make progress, may also use the recovery
+/// headroom, and nothing more.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out ==> (records as int) < max_records as int
+                + (if entry { RECOVERY_HEADROOM_RECORDS as int } else { 0 })
+            && bytes as int + charge as int <= quota as int
+                + (if entry { RECOVERY_HEADROOM_BYTES as int } else { 0 }),
+        (records as int) < max_records as int
+                + (if entry { RECOVERY_HEADROOM_RECORDS as int } else { 0 })
+            && bytes as int + charge as int <= quota as int
+                + (if entry { RECOVERY_HEADROOM_BYTES as int } else { 0 })
+            && max_records as int + RECOVERY_HEADROOM_RECORDS as int <= usize::MAX as int
+            && quota as int + RECOVERY_HEADROOM_BYTES as int <= u64::MAX as int ==> out,
+        RECOVERY_HEADROOM_RECORDS == 16 && RECOVERY_HEADROOM_BYTES == 65_536,
+))]
+pub(super) fn retains_record(
+    entry: bool,
+    records: usize,
+    max_records: usize,
+    bytes: u64,
+    charge: u64,
+    quota: u64,
+) -> bool {
+    let (extra_records, extra_bytes) = if entry {
+        (RECOVERY_HEADROOM_RECORDS, RECOVERY_HEADROOM_BYTES)
+    } else {
+        (0, 0)
+    };
+    let records_limit = if max_records > usize::MAX - extra_records {
+        usize::MAX
+    } else {
+        max_records + extra_records
+    };
+    let bytes_limit = if quota > u64::MAX - extra_bytes {
+        u64::MAX
+    } else {
+        quota + extra_bytes
+    };
+    records < records_limit && bytes <= bytes_limit && charge <= bytes_limit - bytes
+}
+
+/// How the stream state machine decides `Command::RecoveryEntry`.
+pub(super) enum EntryStep {
+    /// Write the entry at the position asked and clear the recorded fence.
+    Write,
+    /// The same entry is already retained there: return its position and
+    /// change nothing.
+    Retry,
+    /// The position is below the retained floor.
+    Trimmed,
+    /// Refuse with `Conflict`.
+    Conflict,
+}
+
+/// Decides a typed recovery entry for a fence of `fence_epoch` that kept
+/// the records through `fence_head`, asked at `at`. `names_command` says
+/// the entry's encoding names that fence and position; `pending` that a
+/// recorded recovery's fence stands; `epoch` and `head` are the stream's;
+/// `matches_record` says the entry carries that recorded recovery's
+/// fields; `retained_identical` that a recovery record with exactly these
+/// bytes is retained at `at`.
+///
+/// The entry is written only as the first entry of the recovery epoch,
+/// right after the last record kept, while that recovery's fence stands
+/// and with that recovery's fields, so it clears exactly that fence. Once
+/// the fence is gone an identical retry returns the position and nothing
+/// else is written.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out is Write <==> names_command && fence_head < u64::MAX && at == fence_head + 1
+            && pending && epoch == fence_epoch && head == fence_head && matches_record,
+        out is Retry <==> names_command && fence_head < u64::MAX && at == fence_head + 1
+            && !pending && floor <= at && at <= head && retained_identical,
+        out is Trimmed <==> names_command && fence_head < u64::MAX && at == fence_head + 1
+            && !pending && at < floor,
+))]
+pub(super) fn recovery_entry_step(
+    names_command: bool,
+    fence_epoch: u64,
+    fence_head: u64,
+    at: u64,
+    pending: bool,
+    epoch: u64,
+    head: u64,
+    floor: u64,
+    matches_record: bool,
+    retained_identical: bool,
+) -> EntryStep {
+    if !names_command || fence_head == u64::MAX || at != fence_head + 1 {
+        EntryStep::Conflict
+    } else if !pending {
+        if at < floor {
+            EntryStep::Trimmed
+        } else if at <= head && retained_identical {
+            EntryStep::Retry
+        } else {
+            EntryStep::Conflict
+        }
+    } else if epoch == fence_epoch && head == fence_head && matches_record {
+        EntryStep::Write
+    } else {
+        EntryStep::Conflict
+    }
+}
+
 /// The boundary slot a restart trusts: the intact slot with the higher
 /// sequence, 0 or 1, preferring the second on a tie. `None` when neither
 /// slot is intact.
