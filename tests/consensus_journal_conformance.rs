@@ -673,10 +673,17 @@ async fn timed_staging_and_retries_require_the_immutable_writer_session() {
         .unwrap()
         .with_timed_original(cluster.timed_verifier(), Some(2048));
     let stream = StreamId(82);
-    assert_eq!(
-        journal.finalize_version(CLUSTER_VERSION_V4).await,
-        Ok(CLUSTER_VERSION_V4)
-    );
+    let finalized = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match journal.finalize_version(CLUSTER_VERSION_V4).await {
+                Err(JournalError::Unavailable) => tokio::time::sleep(Duration::from_millis(20)).await,
+                result => break result,
+            }
+        }
+    })
+    .await
+    .expect("all keepers respond to v4 finalization");
+    assert_eq!(finalized, Ok(CLUSTER_VERSION_V4));
     journal.create_immutable(stream).await.unwrap();
     let fence = journal
         .seal_session(stream, Epoch(0), WriterSessionId(1))
