@@ -663,7 +663,12 @@ impl Engine {
                     }
                     Ok(None) => (),
                     Err(error) => {
-                        eprintln!("logkeeper ignored the park mark of {stream:?}: {error}");
+                        tracing::warn!(
+                            keeper = %self.id,
+                            stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                            error = %error,
+                            "ignored the park mark"
+                        );
                     }
                 }
                 if let Err(error) = self.group(genesis.clone()).await {
@@ -1160,7 +1165,12 @@ impl Engine {
                 .map_err(io::Error::other)
                 .and_then(|result| result);
                 if let Err(error) = forgotten {
-                    eprintln!("logkeeper park mark of {stream:?} not removed: {error}");
+                    tracing::warn!(
+                        keeper = %self.id,
+                        stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                        error = %error,
+                        "park mark not removed"
+                    );
                 }
                 state
             }

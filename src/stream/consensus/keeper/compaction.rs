@@ -107,14 +107,20 @@ impl Engine {
             match self.disk.relocate_segment(id, budget).await {
                 Ok(0) => break,
                 Ok(copied) => {
-                    super::super::metrics::add(
-                        &self.disk.metrics.compacted_bytes,
-                        copied,
-                    );
+                    super::super::metrics::add(&self.disk.metrics.compacted_bytes, copied);
                     budget = budget.saturating_sub(copied);
                 }
                 Err(error) => {
-                    eprintln!("logkeeper segment compaction deferred: {error}");
+                    if let Some(dropped) =
+                        crate::stream::consensus::logging::rate_limit("compaction.deferred", None)
+                    {
+                        tracing::warn!(
+                            keeper = %self.id,
+                            error = %error,
+                            dropped = dropped,
+                            "segment compaction deferred"
+                        );
+                    }
                     break;
                 }
             }

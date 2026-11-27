@@ -483,6 +483,33 @@ impl Metrics {
             self.reopened_stopped.load(Ordering::Relaxed)
         );
 
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_stream_evictions_total Idle replicas closed to stay under the open-stream limit."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_stream_evictions_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_stream_evictions_total {}",
+            self.evicted.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_wal_compacted_bytes_total Live bytes copied out of cold WAL segments by compaction."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_wal_compacted_bytes_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_wal_compacted_bytes_total {}",
+            self.compacted_bytes.load(Ordering::Relaxed)
+        );
+
         // Elections & votes
         let _ = writeln!(
             out,

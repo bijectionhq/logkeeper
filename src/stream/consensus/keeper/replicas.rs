@@ -325,7 +325,12 @@ impl Engine {
                 .map_err(io::Error::other)
                 .and_then(|result| result)
             {
-                eprintln!("logkeeper park mark of {scope:?} not written: {error}");
+                tracing::warn!(
+                    keeper = %self.id,
+                    stream = %crate::stream::consensus::logging::stream_uuid(scope),
+                    error = %error,
+                    "park mark not written"
+                );
             }
         }
         let mut closed = self.closed_states.lock();

@@ -1280,7 +1280,7 @@ fn rounds(
                     }
                     Ok(None) => (),
                     // The copy stays unused; the old one is still read.
-                    Err(error) => eprintln!("logkeeper kept a slice in place: {error}"),
+                    Err(error) => tracing::warn!(error = %error, "kept a WAL slice in place"),
                 }
             }
             #[cfg(test)]
