@@ -5,6 +5,7 @@ Read [the deployment guide](../deployment.md) first.
 
 | Runbook | When |
 | --- | --- |
+| [Staging qualification](production-qualification.md) | Evidence for a production readiness review |
 | [Rolling upgrade](rolling-upgrade.md) | A new keeper release |
 | [Add, drain or remove a keeper](add-drain-remove-keeper.md) | Changing the keeper set |
 | [Replace a failed disk](replace-disk.md) | A keeper's media is lost or replaced |

@@ -619,7 +619,10 @@ Recommendations:
 1. Treat the journal as a replicated log, not a backup target. Run six
    keepers (two per zone) so repair has somewhere to go.
 2. Back up what RTDB needs to rebuild: object-storage checkpoints with
-   versioning and object lock, and RTDB's own `rtdb admin export`.
+   versioning and object lock. RTDB Multi's `rtdb admin export` returns a
+   checkpoint ticket tied to its source custody. Verify a cold application
+   restore with the original processes and journals absent before counting
+   a checkpoint ticket as a portable backup.
 3. Back up the operator artifacts: keeper configs, `placement.json`,
    provision files, the CA and client certificates, and the inventory of which
    UUIDs are in service and which are retired. Do not back up private keys of
@@ -638,4 +641,4 @@ Most are items in the consensus design's review tables.
 | Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |
 | Online backup and export | See [backup](#backup-and-restore) | RTDB checkpoints |
-| Catalog-bounded leases | A lost keeper that never stopped stays certified and, with the other lost keeper, can keep leading the old configuration. Restarting lost keepers are fenced by placement certification | Fence both lost keepers before `recover-stream` (`--lost` states it) |
+| Disaster restore without original enrollment | An inaccessible old pair cannot produce retirement proofs. One survivor cannot safely repair the old quorum | Restore enough original participants, or rebuild a fresh isolated cell from a qualified application backup |
