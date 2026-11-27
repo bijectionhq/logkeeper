@@ -13,7 +13,7 @@ COPY . .
 # holds a binary built more recently from another commit.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=logkeeper-registry-${TARGETARCH},sharing=locked \
     --mount=type=cache,target=/src/target,id=logkeeper-target-${TARGETARCH},sharing=locked \
-    cargo clean --release --package logkeeper --package journal-contract \
+    cargo clean --locked --release --package logkeeper --package journal-contract \
     && cargo build --locked --release --features stream --bin logkeeper \
     && install -m 0555 target/release/logkeeper /usr/local/bin/logkeeper
 
@@ -21,7 +21,10 @@ FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad
 # The dated Debian archives fix curl, ca-certificates, and their dependencies.
 # APT verifies the archived Release signatures using Debian's system keyring.
 # The optional ldconfig auxiliary cache records builder inode metadata.
+# Keep cached runtime layers scoped to the epoch used by the OCI exporter.
+# Otherwise the layer can contain timestamps older than that export's clamp.
 ARG DEBIAN_SNAPSHOT=20261127T000000Z
+ARG SOURCE_DATE_EPOCH
 RUN --mount=type=bind,from=toolchain,source=/etc/ssl/certs/ca-certificates.crt,target=/tmp/build-ca-certificates.crt \
     sed -i \
         -e "s|^URIs: http://deb.debian.org/\(.*\)|URIs: https://snapshot.debian.org/archive/\1/${DEBIAN_SNAPSHOT}/|" \
