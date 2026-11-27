@@ -162,12 +162,16 @@ to this one, catalog keepers first, under writes, then
    normal load. Until you finalize, rollback is the same procedure with the
    previous binary.
 
-11. **Finalize.** Once every active keeper supports the write-version gate
-    and the cluster has soaked, enable the new durable formats:
+11. **Finalize.** Once every keeper in the inventory supports the target
+    version and the cluster has soaked, enable the new durable formats.
+    Before finalizing level 8 or higher, check that every application allowed
+    to write an immutable stream uses checkpoint installation or verified
+    checkpoint selection. Include standby writers and application versions
+    reserved for rollback. Unchecked trim returns `Unsupported` for
+    immutable streams after finalization.
 
     ```sh
     lk admin finalize-version --config operator.json
-    # cluster_version: 3
     ```
 
     It is refused with `Unsupported` while a keeper in the inventory,
