@@ -560,6 +560,12 @@ pub(in crate::stream::consensus) enum ReplicaFault {
         entered: oneshot::Sender<()>,
         resume: std::sync::mpsc::Receiver<()>,
     },
+    /// Pauses the WAL thread once a relocated slice of the scope reads its
+    /// copy, before the relocation's round goes on.
+    AfterRelocationSwap {
+        entered: oneshot::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    },
     /// Fails the next round that holds a local write of the scope, at the
     /// given WAL cut.
     Interrupt(u8),
@@ -1493,7 +1499,9 @@ fn rounds(
                     *id == scope
                         && !matches!(
                             fault,
-                            ReplicaFault::Interrupt(_) | ReplicaFault::Hold { .. }
+                            ReplicaFault::Interrupt(_)
+                                | ReplicaFault::Hold { .. }
+                                | ReplicaFault::AfterRelocationSwap { .. }
                         )
                 }) {
                     match fault {
@@ -1504,7 +1512,9 @@ fn rounds(
                         gate @ ReplicaFault::BeforeSettlement { .. } => {
                             before_settlement = Some(gate)
                         }
-                        ReplicaFault::Interrupt(_) | ReplicaFault::Hold { .. } => {
+                        ReplicaFault::Interrupt(_)
+                        | ReplicaFault::Hold { .. }
+                        | ReplicaFault::AfterRelocationSwap { .. } => {
                             unreachable!("local write fault")
                         }
                     }
@@ -1625,6 +1635,16 @@ fn rounds(
             for (from, to) in moves {
                 match objects.relocate(from, to) {
                     Ok(Some(left)) => {
+                        #[cfg(test)]
+                        if let Some((_, ReplicaFault::AfterRelocationSwap { entered, resume })) =
+                            replica_fault.lock().take_if(|(scope, fault)| {
+                                *scope == from.scope
+                                    && matches!(fault, ReplicaFault::AfterRelocationSwap { .. })
+                            })
+                        {
+                            let _ = entered.send(());
+                            let _ = resume.recv_timeout(std::time::Duration::from_secs(30));
+                        }
                         // Only a selected snapshot can still name the old
                         // copy once the checkpoint moves on.
                         if working

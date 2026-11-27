@@ -4,7 +4,10 @@ use std::{fs, path::Path, time::Duration};
 
 use bytes::Bytes;
 use journal_contract::{Epoch, Lsn};
-use openraft::{EntryPayload, storage::RaftLogStorage as _};
+use openraft::{
+    EntryPayload, Membership,
+    storage::{RaftLogStorage as _, RaftSnapshotBuilder as _, RaftStateMachine as _},
+};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -209,6 +212,133 @@ async fn a_conflicting_truncation_waits_for_an_append_in_flight() {
     let reopened = open(dir.path());
     assert_eq!(durable(&reopened, 1), [0, 1]);
     reopened.shutdown().await.unwrap();
+}
+
+/// A replica parked while compaction relocates its snapshot's extent: the
+/// park mark must name the source segment that the selected snapshot still
+/// reads, even when the pin sees the slice already at its copy. Found by
+/// RelocationParkRace in verification/tla/Relocation.tla.
+#[tokio::test]
+#[ignore = "a park mark captured between the relocation swap and hold registration omits a segment still named by the selected snapshot"]
+async fn a_park_mark_keeps_the_selected_snapshot_during_relocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let disk = open(dir.path());
+    disk.set_write_version(crate::stream::consensus::CLUSTER_VERSION_V2);
+    let mut store = leader(&disk, 1).await;
+    let scope = store.stream;
+    let mut log = (0..4).map(entry).collect::<Vec<_>>();
+    let nodes = (1..=3u128)
+        .map(|id| (id, openraft::BasicNode::new(format!("k{id}:7000"))))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    log[0].payload = EntryPayload::Membership(
+        Membership::new(vec![nodes.keys().copied().collect()], nodes).unwrap(),
+    );
+    log[1].payload = EntryPayload::Normal(Command::Create);
+    log[2].payload = EntryPayload::Normal(Command::Seal {
+        expected: Epoch(0),
+        writer: Uuid::from_u128(4),
+        owner: "urn:logkeeper:client:writer".into(),
+    });
+    let EntryPayload::Normal(Command::Append { at, .. }) = &mut log[3].payload else {
+        unreachable!();
+    };
+    *at = Lsn(1);
+    let through = log[3].log_id;
+    append(&mut store, log.clone())
+        .await
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .state
+        .apply(futures::stream::iter(
+            log.into_iter().map(|entry| Ok((entry, None))),
+        ))
+        .await
+        .unwrap();
+    drop(
+        store
+            .state
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap(),
+    );
+    store.purge(through).await.unwrap();
+    let (source, _) = store.state.payload_path().unwrap();
+    let segment = source
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // Roll the active WAL away from the source and publish a checkpoint
+    // whose replay base is through that roll. The chosen snapshot still
+    // names the original extent.
+    let filler = genesis(2);
+    disk.protocol(Record::Register(filler.clone()))
+        .await
+        .unwrap();
+    disk.protocol(Record::Vote(filler.stream, Vote::new_committed(2, KEEPER)))
+        .await
+        .unwrap();
+    for index in 0..8 {
+        let mut frame = entry(index);
+        let EntryPayload::Normal(Command::Append { payload, .. }) = &mut frame.payload else {
+            unreachable!();
+        };
+        *payload = Bytes::from(vec![0; 128 * 1024]);
+        disk.write(Record::Append(filler.stream, vec![frame]))
+            .await
+            .unwrap();
+    }
+    disk.checkpoint_now().await.unwrap();
+
+    let (entered, swapped) = oneshot::channel();
+    let (resume, held) = std::sync::mpsc::channel();
+    disk.fail_replication_at(
+        scope,
+        ReplicaFault::AfterRelocationSwap {
+            entered,
+            resume: held,
+        },
+    );
+    let writer = disk.clone();
+    let moved = tokio::spawn(async move { writer.relocate_segment(segment, u64::MAX).await });
+    tokio::time::timeout(Duration::from_secs(10), swapped)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(store.state.payload_path().unwrap().0, source);
+
+    store.state.shutdown().await;
+    let pin = store.state.pin();
+    pin.persist(&disk, scope).unwrap();
+    resume.send(()).unwrap();
+    assert!(moved.await.unwrap().unwrap() > 0);
+    assert!(disk.objects.moved_segments(scope).contains(&segment));
+    disk.checkpoint_now().await.unwrap();
+    drop(pin);
+    drop(store);
+    disk.shutdown().await.unwrap();
+    drop(disk);
+
+    let reopened = open(dir.path());
+    let _pin = snapshot::Pin::restore(&reopened, scope).unwrap().unwrap();
+    reopened.enable_reaping();
+    for _ in 0..8 {
+        reopened.reap_objects().await.unwrap();
+    }
+    let state = StateMachine::open(&reopened, genesis(1), placement()).await;
+    reopened.shutdown().await.unwrap();
+    assert!(
+        state.is_ok(),
+        "the parked snapshot must reopen after reaping: {:?}",
+        state.err()
+    );
 }
 
 #[tokio::test]
