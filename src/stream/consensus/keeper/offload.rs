@@ -594,10 +594,14 @@ pub(super) async fn plan_recovery(
     survivor_head: Lsn,
     survivor_epoch: journal_contract::Epoch,
     view: &crate::stream::consensus::state::OffloadView,
+    revision: u64,
 ) -> io::Result<(crate::stream::consensus::state::Restore, OffloadRecovery)> {
     let lineages = view.offload.map();
     let highest = store.lineages(stream).await?.into_iter().max().unwrap_or(0);
-    let lineage = highest.max(view.offload.lineage) + 1;
+    // A recovery's lineage is the stream configuration epoch it installs,
+    // its revision, which the catalog records too, unless the store already
+    // holds that lineage or a later one.
+    let lineage = (highest.max(view.offload.lineage) + 1).max(revision);
     let plan = store.plan(stream, &lineages, view.logical_floor).await?;
     let store_end = plan.end();
     let kept = Lsn(decisions::recovered_head(

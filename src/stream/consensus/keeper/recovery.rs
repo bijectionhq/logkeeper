@@ -418,7 +418,9 @@ impl Config {
         let term = decisions::recovery_term(point.vote_term, point.log_term)
             .ok_or_else(|| invalid("the stream's term is exhausted"))?;
         // With offload, the history is the survivor plus the object store.
-        let offload = self.recovery_offload(stream, head, &replayed).await?;
+        let offload = self
+            .recovery_offload(stream, head, &replayed, stage.source.saturating_add(1))
+            .await?;
         let restored_epoch = offload.as_ref().map_or(replayed.epoch, |(restore, _)| {
             restore.epoch.max(replayed.epoch)
         });
@@ -614,6 +616,7 @@ impl Config {
         stream: StreamId,
         head: Lsn,
         replayed: &storage::Replayed,
+        revision: u64,
     ) -> io::Result<
         Option<(
             crate::stream::consensus::state::Restore,
@@ -624,7 +627,7 @@ impl Config {
             return Ok(None);
         };
         let store = crate::stream::consensus::offload::Store::open(config)?;
-        super::offload::plan_recovery(&store, stream, head, replayed.epoch, view)
+        super::offload::plan_recovery(&store, stream, head, replayed.epoch, view, revision)
             .await
             .map(Some)
             .map_err(|error| {

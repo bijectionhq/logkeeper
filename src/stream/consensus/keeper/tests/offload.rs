@@ -391,7 +391,7 @@ async fn recovery_from_one_survivor_restores_the_longer_object_store_history() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some([b, c]),
+                lost: Some(vec![b, c]),
                 fence_proofs,
                 ..Recovery::default()
             },
@@ -408,7 +408,8 @@ async fn recovery_from_one_survivor_restores_the_longer_object_store_history() {
     assert_eq!(offload.kept_through, Lsn(50));
     assert_eq!(offload.floor, Lsn(1));
     assert!(offload.restored);
-    assert_eq!(offload.lineage, 1);
+    // The recovery's lineage is the configuration revision it installs.
+    assert_eq!(offload.lineage, report.revision);
     assert!(
         report.to_string().contains("records 1..=50 are kept"),
         "{report}"
@@ -437,8 +438,11 @@ async fn recovery_from_one_survivor_restores_the_longer_object_store_history() {
         .fence;
     append_range(&journal, stream, fence, 51, 60).await;
     let status = flushed(&journal, stream, 60).await;
-    assert_eq!(status.lineage, 1);
-    assert_eq!(status.lineages, vec![(0, Lsn(1)), (1, Lsn(51))]);
+    assert_eq!(status.lineage, report.revision);
+    assert_eq!(
+        status.lineages,
+        vec![(0, Lsn(1)), (report.revision, Lsn(51))]
+    );
     check(&read_all(&journal, stream, 1, 60).await, 1, 60);
     cluster.stop_all().await;
 }
