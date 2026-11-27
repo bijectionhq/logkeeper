@@ -90,6 +90,10 @@ fn default_snapshot_send_bytes_per_second() -> u64 {
     64 * 1024 * 1024
 }
 
+fn default_async_append() -> bool {
+    true
+}
+
 /// Installed, authenticated keeper inventory and local service settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,6 +130,10 @@ pub struct Config {
     /// its streams; zero sends without pacing.
     #[serde(default = "default_snapshot_send_bytes_per_second")]
     pub snapshot_send_bytes_per_second: u64,
+    /// A leader replicates its own appends while its WAL write of them is
+    /// still in flight, and counts itself toward commit once it lands.
+    #[serde(default = "default_async_append")]
+    pub async_append: bool,
     /// Installed timed-original trust and, on a signing keeper, its clock
     /// and attestation key, in the stream keeper's mount format.
     #[serde(default)]
@@ -358,6 +366,7 @@ impl Config {
             repairs: parking_lot::Mutex::default(),
             preferred: parking_lot::Mutex::default(),
             park_after: Duration::from_secs(self.park_after_secs),
+            async_append: self.async_append,
             snapshot_rate: super::network::RateLimiter::new(self.snapshot_send_bytes_per_second),
             retire_now: Arc::default(),
             stop: stop.child_token(),
@@ -411,6 +420,7 @@ pub(super) struct Engine {
     quarantined: parking_lot::RwLock<HashSet<StreamId>>,
     max_streams: usize,
     repair_after: Duration,
+    async_append: bool,
     /// The term and time from which this keeper has led each stream.
     led_since: parking_lot::Mutex<HashMap<StreamId, (u64, Instant)>>,
     /// When the leader first saw each learner of each stream it leads.
@@ -985,6 +995,11 @@ impl Engine {
                     .await?
             }
         }
+        // A closed group's appends may still be in flight; open on the
+        // log they leave.
+        let inflight = self.disk.inflight(genesis.stream);
+        inflight.drained().await;
+        inflight.reset();
         let startup = async {
             self.disk.check_placement(genesis.stream, &self.placement)?;
             StateMachine::open(&self.disk, genesis.clone(), self.placement.clone()).await
@@ -1022,6 +1037,8 @@ impl Engine {
             keeper: self.id.as_u128(),
             generation: state.generation(),
             follower: follower.clone(),
+            asynchronous: self.async_append,
+            inflight,
         };
         let (split_vote, collisions) = watch::channel(None);
         let excluded = Arc::new(parking_lot::Mutex::new(None));

@@ -7,6 +7,9 @@
 //! memory and the bytes the keepers hold on disk, so runs with more idle
 //! streams show the per-stream cost. `--sync-mode fsync` measures the
 //! keepers with plain `fsync` instead of the default `full`.
+//! `LOGKEEPER_ASYNC_APPEND=0` measures leaders that sync their own append
+//! before replicating it, and `LOGKEEPER_PEER_DELAY_MS` delays every
+//! replication request to emulate a slower link.
 //!
 //! ```sh
 //! cargo run --release --features consensus-testing --example consensus-streams -- \

@@ -884,6 +884,15 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
     {
         let (entries, responders): (Vec<_>, Vec<_>) =
             entries.try_collect::<Vec<_>>().await?.into_iter().unzip();
+        // A leader can learn an entry is committed from its followers before
+        // its own write of it lands. Applying reads the entry's WAL segment.
+        if let Some(last) = entries.last() {
+            self.inner
+                .disk
+                .inflight(self.inner.genesis.stream)
+                .durable_through(last.log_id.index)
+                .await?;
+        }
         let may_read_snapshot = self.head().is_ok_and(|head| entries.iter().any(|entry| {
             matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } | Command::AppendOriginal { at, .. } if *at <= head))
         }));

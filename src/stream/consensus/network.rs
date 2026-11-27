@@ -1214,6 +1214,10 @@ impl Peer {
         frame: Frame,
         option: &RPCOption,
     ) -> Result<AppendResult<RaftTypes>, RPCError<RaftTypes>> {
+        #[cfg(feature = "consensus-testing")]
+        if let Some(delay) = injected_peer_delay() {
+            tokio::time::sleep(delay).await;
+        }
         let rpc = if lane == Lane::Replication {
             &self.network.replication
         } else {
@@ -1711,4 +1715,18 @@ mod tests {
         .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
+}
+
+/// A round trip that `LOGKEEPER_PEER_DELAY_MS` adds to every replication
+/// request, to measure commit latency across links slower than loopback.
+#[cfg(feature = "consensus-testing")]
+fn injected_peer_delay() -> Option<Duration> {
+    static DELAY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        std::env::var("LOGKEEPER_PEER_DELAY_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    })
 }

@@ -349,6 +349,7 @@ For each keeper, in any order:
    | `park_after_secs` | 600 | How long a stream stays idle before its voters park it |
    | `snapshot_send_bytes_per_second` | 67108864 | Keeper-wide snapshot send rate; 0 means unpaced |
    | `sync_mode` | `full` | `full` (`F_FULLFSYNC` on Apple platforms) or `fsync`; on Linux both flush the device cache. Never use `fsync` on macOS in production |
+   | `async_append` | `true` | A leader replicates its own appends while its WAL write of them is in flight; it counts toward commit only once that write is durable. `false` syncs first, as before |
    | `admin` **[ops]** | none | `{"listen": "127.0.0.1:5741", "mtls": false}` |
    | `log_format` **[ops]** | `human` | `human` or `json` |
 

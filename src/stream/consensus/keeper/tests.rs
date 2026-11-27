@@ -144,6 +144,8 @@ impl Cluster {
                 repair_after_secs: 2,
                 park_after_secs: 3600,
                 snapshot_send_bytes_per_second: 0,
+                async_append: std::env::var("LOGKEEPER_ASYNC_APPEND")
+                    .map_or(true, |value| value != "0"),
                 timed_original: None,
                 sync_mode: SyncMode::Fsync,
                 timed_authority: None,
@@ -2807,6 +2809,98 @@ async fn a_leader_without_space_hands_its_streams_to_a_follower() {
         .disk
         .space
         .set_available(u64::MAX);
+    cluster.stop_all().await;
+}
+
+/// A leader replicates its append before its own WAL write is durable. Its
+/// followers' two durable copies commit it, and a leader that crashes
+/// before its sync returned loses nothing that was committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leader_that_crashes_before_its_own_sync_keeps_the_replicated_commit() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(58);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let sealed = journal
+        .seal(stream, Epoch(0), Uuid::new_v4())
+        .await
+        .unwrap();
+    assert_eq!(
+        journal
+            .append(stream, sealed.fence, Lsn(1), Bytes::from_static(b"one"))
+            .await,
+        Ok(Lsn(1))
+    );
+    let leader = cluster.leader(stream).await;
+    let followers = [a, b, c]
+        .into_iter()
+        .filter(|id| *id != leader)
+        .collect::<Vec<_>>();
+    let led = cluster.group(leader, stream).await;
+    let term = led.raft.metrics().borrow_watched().current_term;
+    let (entered, inside) = tokio::sync::oneshot::channel();
+    let (resume, held) = std::sync::mpsc::channel();
+    cluster.running[&leader].engine.disk.fail_replication_at(
+        stream,
+        storage::ReplicaFault::Hold {
+            entered,
+            resume: held,
+        },
+    );
+    let appending = journal.clone();
+    let append = tokio::spawn(async move {
+        appending
+            .append(stream, sealed.fence, Lsn(2), Bytes::from_static(b"two"))
+            .await
+    });
+    timeout(WAIT, inside).await.unwrap().unwrap();
+    // With the leader's write held, both followers apply the entry: their
+    // two durable copies committed it. A synchronous leader append would
+    // hold replication until the slow-media gate moved leadership away.
+    for follower in &followers {
+        let group = cluster.group(*follower, stream).await;
+        timeout(Duration::from_secs(2), async {
+            while group.state.head() != Ok(Lsn(2)) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a follower applied the entry while the leader's write was held");
+    }
+    // The same leader committed it, and applies only what its own WAL holds.
+    let metrics = led.raft.metrics().borrow_watched().clone();
+    assert_eq!(
+        (metrics.state, metrics.current_term),
+        (openraft::ServerState::Leader, term)
+    );
+    assert_eq!(led.state.head(), Ok(Lsn(1)));
+    assert!(!append.is_finished());
+    // The keeper dies before its sync returned.
+    resume.send(false).unwrap();
+    let crashed = cluster.running.remove(&leader).unwrap();
+    timeout(WAIT, async {
+        while crashed.engine.disk.healthy() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    crashed.engine.stop.cancel();
+    let _ = crashed.task.await;
+    drop((led, crashed.engine));
+    // The writer's retry finds the committed entry under the new leader.
+    assert!(matches!(append.await.unwrap(), Ok(Lsn(2)) | Err(_)));
+    assert_eq!(journal.head(stream).await, Ok(Lsn(2)));
+    cluster.restart(leader).await;
+    let returned = cluster.group(leader, stream).await;
+    timeout(WAIT, async {
+        while returned.state.head() != Ok(Lsn(2)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the restarted keeper caught up past its lost write");
     cluster.stop_all().await;
 }
 

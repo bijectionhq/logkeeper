@@ -435,6 +435,7 @@ pub(in crate::stream::consensus) struct Disk {
     replication: mpsc::Sender<Message>,
     healthy: Arc<AtomicBool>,
     watchdog: Arc<super::watchdog::Watchdog>,
+    inflight: Arc<parking_lot::Mutex<BTreeMap<StreamId, Arc<super::inflight::Inflight>>>>,
     stopped: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<io::Result<()>>>>>,
     pub path: Arc<PathBuf>,
     /// The incarnation of the installed media, new at each installation.
@@ -460,6 +461,13 @@ pub(in crate::stream::consensus) enum ReplicaFault {
     /// Fails the next round that holds a local write of the scope, at the
     /// given WAL cut.
     Interrupt(u8),
+    /// Holds the next round that holds a local write of the scope before its
+    /// data write until `resume` answers: true finishes the round, false fails
+    /// it before its boundary, as a crash before the sync returned would.
+    Hold {
+        entered: oneshot::Sender<()>,
+        resume: std::sync::mpsc::Receiver<bool>,
+    },
 }
 
 impl Disk {
@@ -543,6 +551,7 @@ impl Disk {
             replication,
             healthy,
             watchdog,
+            inflight: Arc::default(),
             stopped: Arc::new(tokio::sync::Mutex::new(Some(stopped))),
             path: Arc::new(path),
             incarnation,
@@ -618,6 +627,21 @@ impl Disk {
         self.enqueue(&self.work, record, None, false).await
     }
 
+    /// Queues an application write and returns at once; the receiver
+    /// resolves once it is durable. Writes queued here land in order.
+    pub async fn submit_application(
+        &self,
+        record: Record,
+    ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
+        allocation(&record)?;
+        self.submit(&self.work, record, None, false).await
+    }
+
+    /// The leader appends of `stream` still in flight.
+    pub fn inflight(&self, stream: StreamId) -> Arc<super::inflight::Inflight> {
+        self.inflight.lock().entry(stream).or_default().clone()
+    }
+
     pub async fn maintenance(&self, record: Record) -> io::Result<()> {
         let bytes = allocation(&record)?;
         let reserve = self.space.maintenance(bytes)?;
@@ -673,6 +697,19 @@ impl Disk {
         space: Option<Reservation>,
         follower: bool,
     ) -> io::Result<()> {
+        self.submit(queue, record, space, follower)
+            .await?
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    async fn submit(
+        &self,
+        queue: &mpsc::Sender<Message>,
+        record: Record,
+        space: Option<Reservation>,
+        follower: bool,
+    ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
         let (done, reply) = oneshot::channel();
         queue
             .send(Message::Write(Work {
@@ -683,7 +720,7 @@ impl Disk {
             }))
             .await
             .map_err(io::Error::other)?;
-        reply.await.map_err(io::Error::other)?
+        Ok(reply)
     }
 
     pub fn protect_objects(&self, stream: StreamId) {
@@ -1068,6 +1105,8 @@ fn rounds(
         let mut moves = Vec::new();
         #[cfg(test)]
         let mut before_settlement = None;
+        #[cfg(test)]
+        let mut held = None;
         for mut work in round {
             let scope = work.record.stream();
             let new = !wal.contains_scope(scope) && !changed.contains(&scope);
@@ -1087,7 +1126,11 @@ fn rounds(
                 reservation.hold_until_reconciled(true);
                 #[cfg(test)]
                 if let Some((_, fault)) = replica_fault.lock().take_if(|(id, fault)| {
-                    *id == scope && !matches!(fault, ReplicaFault::Interrupt(_))
+                    *id == scope
+                        && !matches!(
+                            fault,
+                            ReplicaFault::Interrupt(_) | ReplicaFault::Hold { .. }
+                        )
                 }) {
                     match fault {
                         ReplicaFault::PartialSegment => wal.interrupt(6),
@@ -1097,18 +1140,26 @@ fn rounds(
                         gate @ ReplicaFault::BeforeSettlement { .. } => {
                             before_settlement = Some(gate)
                         }
-                        ReplicaFault::Interrupt(_) => unreachable!("local write fault"),
+                        ReplicaFault::Interrupt(_) | ReplicaFault::Hold { .. } => {
+                            unreachable!("local write fault")
+                        }
                     }
                 }
             } else {
                 work.record.tickets(&mut tickets);
                 #[cfg(test)]
-                if let Some((_, ReplicaFault::Interrupt(cut))) =
-                    replica_fault.lock().take_if(|(id, fault)| {
-                        *id == scope && matches!(fault, ReplicaFault::Interrupt(_))
-                    })
-                {
-                    wal.interrupt(cut);
+                match replica_fault.lock().take_if(|(id, fault)| {
+                    *id == scope
+                        && matches!(
+                            fault,
+                            ReplicaFault::Interrupt(_) | ReplicaFault::Hold { .. }
+                        )
+                }) {
+                    Some((_, ReplicaFault::Interrupt(cut))) => wal.interrupt(cut),
+                    Some((_, ReplicaFault::Hold { entered, resume })) => {
+                        held = Some((entered, resume))
+                    }
+                    _ => (),
                 }
             }
             match working.apply_indexed(work.record, wal, objects) {
@@ -1126,6 +1177,16 @@ fn rounds(
                     let _ = work.done.send(Err(error));
                 }
                 Err(error) => return Err(error),
+            }
+        }
+        #[cfg(test)]
+        if let Some((entered, resume)) = held {
+            let _ = entered.send(());
+            if !resume
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or(true)
+            {
+                wal.interrupt(2);
             }
         }
         if !changed.is_empty() {

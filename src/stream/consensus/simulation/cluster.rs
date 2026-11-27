@@ -235,6 +235,8 @@ impl SimCluster {
                 repair_after_secs: options.repair_after_secs,
                 park_after_secs: options.park_after_secs,
                 snapshot_send_bytes_per_second: 0,
+                async_append: std::env::var("LOGKEEPER_ASYNC_APPEND")
+                    .map_or(true, |value| value != "0"),
                 timed_original: None,
                 timed_authority: None,
                 sync_mode: crate::server::durability::SyncMode::Fsync,

@@ -191,6 +191,9 @@ impl LocalCluster {
                 repair_after_secs: 600,
                 park_after_secs,
                 snapshot_send_bytes_per_second: 0,
+                // `LOGKEEPER_ASYNC_APPEND=0` measures the synchronous leader append.
+                async_append: std::env::var("LOGKEEPER_ASYNC_APPEND")
+                    .map_or(true, |value| value != "0"),
                 timed_original: None,
                 // Test keepers use plain `fsync` unless the process chose a
                 // mode: a full flush costs milliseconds on macOS, and many
