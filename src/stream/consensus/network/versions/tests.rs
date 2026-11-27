@@ -4,8 +4,8 @@
 
 use bytes::Bytes;
 use journal_contract::{
-    CheckpointAnchor, CheckpointInstallation, CheckpointReceipt, Epoch, JournalError, Lsn, Page,
-    RecoveryFence, StreamId, WriterFence, WriterSessionId,
+    CheckpointAnchor, CheckpointCustody, CheckpointHold, CheckpointInstallation, CheckpointReceipt,
+    Epoch, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId,
 };
 use openraft::raft::{AppendEntriesRequest, TransferLeaderRequest, VoteRequest};
 use serde::Serialize;
@@ -350,8 +350,27 @@ fn request(tag: usize) -> Option<Request> {
             lost: vec![uuid::Uuid::from_u128(3)],
             revision: 2,
         },
+        50 => Request::CheckpointCustody {
+            stream: STREAM,
+            change: Some(custody()),
+        },
         _ => return None,
     })
+}
+
+fn custody() -> CheckpointCustody {
+    CheckpointCustody {
+        hold: CheckpointHold {
+            operation_id: 1,
+            installation_sha256: [1; 32],
+            anchor: CheckpointAnchor {
+                announced_at: Lsn(2),
+                covered_through: Lsn(1),
+                record_sha256: [1; 32],
+            },
+        },
+        released: false,
+    }
 }
 
 fn peer_request(tag: usize) -> Option<PeerRequest> {
@@ -502,6 +521,7 @@ fn outcome(tag: usize) -> Option<Outcome> {
             logical_floor_lsn: Lsn(2),
         })),
         11 => Outcome::RecoveryPage(recovery_page()),
+        12 => Outcome::CheckpointCustody(Some(custody())),
         _ => return None,
     })
 }
