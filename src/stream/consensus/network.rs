@@ -380,6 +380,10 @@ pub(super) enum Request {
         stream: StreamId,
         change: Option<CheckpointCustody>,
     },
+    AttestOriginal {
+        stream: StreamId,
+        at: Lsn,
+    },
 }
 
 impl Request {
@@ -425,6 +429,7 @@ impl Request {
             | Self::StageOriginal { stream, .. }
             | Self::AppendOriginal { stream, .. }
             | Self::ProveOriginal { stream, .. }
+            | Self::AttestOriginal { stream, .. }
             | Self::Read { stream, .. }
             | Self::Trim { stream, .. }
             | Self::TrimCheckpoint { stream, .. }

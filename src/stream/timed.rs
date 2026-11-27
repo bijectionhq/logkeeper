@@ -24,6 +24,17 @@ pub struct TimedOriginalProof {
     pub verified_evidence_sha256: [u8; 32],
 }
 
+/// A keeper's attestation that its immutable journal committed a timed original.
+/// The attached stage samples authenticate when its exact bytes reached quorum.
+/// A verifier must supply the enrolled catalog and its historical keeper keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedCommitment {
+    evidence: TimedEvidence,
+    catalog: uuid::Uuid,
+    keeper: KeeperId,
+    signature: [u8; 64],
+}
+
 /// Installed keeper-key trust. Historical keys and their keeper identity bindings
 /// must remain verifiable for as long as their original records are retained.
 pub trait TimedOriginalVerifier: Send + Sync + 'static {
@@ -40,7 +51,8 @@ pub trait TimedOriginalClock: Send + Sync + 'static {
     /// keeper, in the original certificate's guarded journal clock scale.
     fn sync_upper_micros(&self, original: &TimedOriginal) -> Option<i64>;
 
-    /// Sign only with this keeper's independently installed attestation key.
+    /// Signs a keeper-generated stage sample or commitment with this keeper's
+    /// independently installed attestation key.
     fn sign(&self, statement: &[u8]) -> Option<[u8; 64]>;
 }
 
@@ -48,6 +60,7 @@ pub(crate) const ORIGINAL_BYTES: usize = 104;
 pub(crate) const SAMPLE_BYTES: usize = 72;
 const ORIGIN_BYTES: usize = ORIGINAL_BYTES + 16 * 4;
 pub(crate) const EVIDENCE_BYTES: usize = ORIGIN_BYTES + 2 * SAMPLE_BYTES;
+const COMMITMENT_BYTES: usize = EVIDENCE_BYTES + 16 + 16 + 64;
 // Room for distinct timed wire messages and the retained evidence envelope.
 pub(crate) const MAX_TIMED_PAYLOAD: usize = super::codec::PAGE_BYTES - 2 * EVIDENCE_BYTES;
 
@@ -246,6 +259,75 @@ impl TimedEvidence {
                 .max(self.samples[1].upper_micros),
             verified_evidence_sha256: digest.finalize().into(),
         })
+    }
+}
+
+impl TimedCommitment {
+    #[cfg(feature = "stream")]
+    pub(crate) fn sign(
+        evidence: TimedEvidence,
+        catalog: uuid::Uuid,
+        keeper: KeeperId,
+        clock: &dyn TimedOriginalClock,
+        verifier: &dyn TimedOriginalVerifier,
+    ) -> Option<Self> {
+        evidence.proof(verifier)?;
+        let mut commitment = Self {
+            evidence,
+            catalog,
+            keeper,
+            signature: [0; 64],
+        };
+        commitment.signature = clock.sign(&commitment.statement())?;
+        Some(commitment)
+    }
+
+    /// The version 1 bytes to retain with the issuer's durable outcome.
+    pub fn encode(self) -> [u8; COMMITMENT_BYTES] {
+        let mut bytes = [0; COMMITMENT_BYTES];
+        bytes[..EVIDENCE_BYTES].copy_from_slice(&self.evidence.encode());
+        bytes[EVIDENCE_BYTES..EVIDENCE_BYTES + 16].copy_from_slice(self.catalog.as_bytes());
+        bytes[EVIDENCE_BYTES + 16..EVIDENCE_BYTES + 32]
+            .copy_from_slice(&self.keeper.0.to_be_bytes());
+        bytes[EVIDENCE_BYTES + 32..].copy_from_slice(&self.signature);
+        bytes
+    }
+
+    /// Parses saved version 1 bytes. Call `verify` before using the outcome.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; COMMITMENT_BYTES] = bytes.try_into().ok()?;
+        let (evidence, signed) = bytes.split_at(EVIDENCE_BYTES);
+        Some(Self {
+            evidence: TimedEvidence::decode(evidence)?,
+            catalog: uuid::Uuid::from_bytes(signed[..16].try_into().ok()?),
+            keeper: KeeperId(u128::from_be_bytes(signed[16..32].try_into().ok()?)),
+            signature: signed[32..].try_into().ok()?,
+        })
+    }
+
+    /// Verifies an exact commitment without contacting the original journal.
+    pub fn verify(
+        self,
+        catalog: uuid::Uuid,
+        original: TimedOriginal,
+        verifier: &dyn TimedOriginalVerifier,
+    ) -> Option<TimedOriginalProof> {
+        if catalog.is_nil()
+            || self.catalog != catalog
+            || self.keeper.0 == 0
+            || self.evidence.origin.original != original
+            || !verifier.verify(self.keeper, &self.statement(), &self.signature)
+        {
+            return None;
+        }
+        self.evidence.proof(verifier)
+    }
+
+    fn statement(self) -> Vec<u8> {
+        let mut bytes = b"logkeeper/stream/timed-original-commitment/v1\0".to_vec();
+        let encoded = self.encode();
+        bytes.extend_from_slice(&encoded[..COMMITMENT_BYTES - 64]);
+        bytes
     }
 }
 

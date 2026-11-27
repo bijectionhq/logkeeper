@@ -1746,7 +1746,9 @@ impl Engine {
                     | Request::RecoveryFence(_)
                     | Request::Configuration(_)
                     | Request::Read { .. }
-                    | Request::ReadAt { .. } => admin || writer || reader,
+                    | Request::ReadAt { .. }
+                    | Request::ProveOriginal { .. }
+                    | Request::AttestOriginal { .. } => admin || writer || reader,
                     Request::Seal { .. }
                     | Request::SealSession { .. }
                     | Request::Append { .. }
@@ -1764,7 +1766,6 @@ impl Engine {
                     // An administrator may acknowledge a recovery, but only a
                     // writer may write to the stream.
                     Request::AcknowledgeRecovery(_) => writer || admin,
-                    Request::ProveOriginal { .. } => admin || writer || reader,
                     Request::Stage(_)
                     | Request::StageReplica { .. }
                     | Request::InstallReplica { .. }
@@ -2328,15 +2329,34 @@ impl Engine {
                     }
                     // Prove from the leader's applied state after a read
                     // barrier, so a restoring or lagging keeper never answers.
-                    Request::ProveOriginal { at, .. } => {
+                    Request::ProveOriginal { at, .. } | Request::AttestOriginal { at, .. } => {
+                        let attest = matches!(request, Request::AttestOriginal { .. });
+                        if attest {
+                            let version = super::CLUSTER_VERSION_TIMED_COMMITMENT;
+                            if !group.genesis.immutable {
+                                return Ok(failure(JournalError::Unsupported));
+                            }
+                            if !self.disk.write_version_allows(version) {
+                                self.sync_cluster_version().await;
+                                if !self.disk.write_version_allows(version) {
+                                    return Ok(failure(JournalError::Unsupported));
+                                }
+                            }
+                        }
                         if let Err(reply) = group.barrier(Instant::now() + REQUEST_TIMEOUT).await {
                             return Ok(reply);
                         }
-                        let outcome = match self.original_evidence(&group, stream, at).await {
-                            Ok(evidence) => Outcome::OriginalEvidence(evidence),
-                            Err(error) => Outcome::Refused(error),
-                        };
-                        Ok(Reply::Decision(outcome))
+                        let outcome =
+                            self.original_evidence(&group, stream, at)
+                                .await
+                                .and_then(|evidence| {
+                                    if attest {
+                                        self.attest_original(stream, at, &evidence)
+                                    } else {
+                                        Ok(Outcome::OriginalEvidence(evidence))
+                                    }
+                                });
+                        Ok(Reply::Decision(outcome.into()))
                     }
                     Request::Trim { fence, through, .. } => Ok(self
                         .compatibility_trim(&group, fence, owner.unwrap(), through)
@@ -2415,6 +2435,38 @@ impl Engine {
                 Ok(reply)
             }
         }
+    }
+
+    fn attest_original(
+        &self,
+        stream: StreamId,
+        at: Lsn,
+        bytes: &[u8],
+    ) -> Result<Outcome, JournalError> {
+        use crate::stream::timed::{TimedCommitment, TimedEvidence};
+
+        let evidence = TimedEvidence::decode(bytes).ok_or(JournalError::Corrupted)?;
+        if evidence.origin.original.stream != stream || evidence.origin.original.at != at {
+            return Err(JournalError::Corrupted);
+        }
+        let authority = &self
+            .timed
+            .as_ref()
+            .ok_or(JournalError::Unavailable)?
+            .authority;
+        let clock = authority
+            .clock
+            .as_deref()
+            .ok_or(JournalError::Unavailable)?;
+        let commitment = TimedCommitment::sign(
+            evidence,
+            self.catalog_id,
+            KeeperId(self.id.as_u128()),
+            clock,
+            &*authority.verifier,
+        )
+        .ok_or(JournalError::Unavailable)?;
+        Ok(Outcome::TimedCommitment(commitment.encode().to_vec()))
     }
 
     async fn original_evidence(

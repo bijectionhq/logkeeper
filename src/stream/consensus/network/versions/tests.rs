@@ -354,6 +354,10 @@ fn request(tag: usize) -> Option<Request> {
             stream: STREAM,
             change: Some(custody()),
         },
+        51 => Request::AttestOriginal {
+            stream: STREAM,
+            at: Lsn(1),
+        },
         _ => return None,
     })
 }
@@ -522,6 +526,7 @@ fn outcome(tag: usize) -> Option<Outcome> {
         })),
         11 => Outcome::RecoveryPage(recovery_page()),
         12 => Outcome::CheckpointCustody(Some(custody())),
+        13 => Outcome::TimedCommitment(Vec::new()),
         _ => return None,
     })
 }

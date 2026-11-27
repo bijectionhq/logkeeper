@@ -378,6 +378,7 @@ pub enum Outcome {
     /// Added last.
     RecoveryPage(Page),
     CheckpointCustody(Option<CheckpointCustody>),
+    TimedCommitment(Vec<u8>),
 }
 
 impl Outcome {

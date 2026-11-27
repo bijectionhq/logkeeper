@@ -664,6 +664,30 @@ impl Client {
         }
     }
 
+    pub(super) async fn attest_original(
+        &self,
+        original: crate::stream::timed::TimedOriginal,
+        verifier: &dyn crate::stream::timed::TimedOriginalVerifier,
+    ) -> Result<crate::stream::timed::TimedCommitment> {
+        use crate::stream::timed::TimedCommitment;
+
+        if self.cluster_version().await? < super::CLUSTER_VERSION_TIMED_COMMITMENT {
+            return Err(JournalError::Unsupported);
+        }
+        match self
+            .operation(Request::AttestOriginal {
+                stream: original.stream,
+                at: original.at,
+            })
+            .await?
+        {
+            Outcome::TimedCommitment(bytes) => TimedCommitment::decode(&bytes)
+                .filter(|proof| proof.verify(self.catalog, original, verifier).is_some())
+                .ok_or(JournalError::Unavailable),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
     /// Reads the local generation to use in a conditional retirement.
     pub async fn replica_generation(&self, stream: StreamId, keeper: uuid::Uuid) -> Result<u64> {
         match self

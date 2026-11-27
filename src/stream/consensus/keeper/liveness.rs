@@ -348,14 +348,16 @@ impl Engine {
         if target > CLUSTER_VERSION_CURRENT {
             return Err(JournalError::Unsupported);
         }
-        let custody_feature = if target >= super::super::CLUSTER_VERSION_RETRY_RECOVERY {
+        let recovery_features = if target >= super::super::CLUSTER_VERSION_TIMED_COMMITMENT {
+            features::TIMED_COMMITMENT | features::RETRY_RECOVERY | features::CHECKPOINT_CUSTODY
+        } else if target >= super::super::CLUSTER_VERSION_RETRY_RECOVERY {
             features::RETRY_RECOVERY | features::CHECKPOINT_CUSTODY
         } else if target >= super::super::CLUSTER_VERSION_CHECKPOINT_CUSTODY {
             features::CHECKPOINT_CUSTODY
         } else {
             0
         };
-        let required_feature = custody_feature
+        let required_feature = recovery_features
             | if target >= super::super::CLUSTER_VERSION_RECOVERY_ENTRY {
                 features::RECOVERY_ENTRY
                     | features::RECOVERY_EXCLUSION

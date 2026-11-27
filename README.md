@@ -193,6 +193,15 @@ three, three of five) and replaces one voter at a time, and recovery applies
 once a quorum is lost. Timed originals bind a three-voter ensemble, so a
 five-voter stream refuses them with `Unsupported`.
 
+On immutable streams, `attest_timed_original` exports a keeper-signed receipt
+for a committed append after a quorum read barrier. It includes the original
+voters' signed timing samples and binds the catalog and exact timed append.
+Finalize level 13 (`CLUSTER_VERSION_TIMED_COMMITMENT`) and mount signing keys
+on every voter eligible to lead a timed stream. The custodian saves the receipt
+before a covering checkpoint trim or stream retirement. It can verify the
+receipt offline against the enrolled catalog, expected append, and historical
+keeper keys.
+
 Use `configuration` to fetch a revision, then call `replace` with that revision
 and the desired voters: as many as the stream has, keeping a quorum of the
 current ones (an ordinary move replaces one voter at a time). Retry the same revision and target if the

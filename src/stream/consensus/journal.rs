@@ -14,8 +14,8 @@ use journal_contract::{
 use parking_lot::RwLock;
 
 use crate::stream::timed::{
-    EVIDENCE_BYTES, MAX_TIMED_PAYLOAD, TimedEvidence, TimedOriginal, TimedOriginalProof,
-    TimedOriginalVerifier,
+    EVIDENCE_BYTES, MAX_TIMED_PAYLOAD, TimedCommitment, TimedEvidence, TimedOriginal,
+    TimedOriginalProof, TimedOriginalVerifier,
 };
 use serde::Deserialize;
 
@@ -380,6 +380,15 @@ impl ConsensusJournal {
             .await?
             .proof(&*timed.verifier)
             .ok_or(JournalError::Unavailable)
+    }
+
+    /// Exports the original immutable journal's commitment and signed stage
+    /// samples as evidence that can be saved and verified after retirement.
+    pub async fn attest_timed_original(&self, original: TimedOriginal) -> Result<TimedCommitment> {
+        let timed = self.timed.as_ref().ok_or(JournalError::Unavailable)?;
+        self.client
+            .attest_original(original, &*timed.verifier)
+            .await
     }
 
     async fn timed_evidence(&self, original: TimedOriginal) -> Result<TimedEvidence> {

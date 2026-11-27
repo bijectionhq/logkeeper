@@ -854,18 +854,28 @@ async fn timed_staging_and_retries_require_the_immutable_writer_session() {
         Err(JournalError::Fenced { current: Epoch(2) }),
     );
     assert_eq!(journal.prove_timed_original(exact).await, Ok(proof));
+    assert_eq!(
+        journal.attest_timed_original(exact).await,
+        Err(JournalError::Unsupported)
+    );
     cluster.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timed_original_proof_survives_local_eviction_until_checkpoint_trim() {
-    use std::time::Duration;
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     use bytes::Bytes;
     use journal_contract::{
         CheckpointInstallation, Epoch, JournalError, Lsn, StreamId, WriterSessionId,
     };
-    use logkeeper::stream::timed::TimedOriginal;
+    use logkeeper::stream::{
+        timed::{TimedCommitment, TimedOriginal, TimedOriginalVerifier},
+        wire::KeeperId,
+    };
     use sha2::{Digest, Sha256};
 
     let objects = tempfile::tempdir().unwrap();
@@ -880,10 +890,12 @@ async fn timed_original_proof_survives_local_eviction_until_checkpoint_trim() {
         .enable_offload(PRINCIPALS[0], offload)
         .await
         .unwrap();
+    let config = cluster.journal_config(1 << 20, 4096);
+    let verifier = cluster.timed_verifier();
     let journal = cluster
-        .journal(PRINCIPALS[0], &cluster.journal_config(1 << 20, 4096))
+        .journal(PRINCIPALS[0], &config)
         .unwrap()
-        .with_timed_original(cluster.timed_verifier(), Some(2048));
+        .with_timed_original(verifier.clone(), Some(2048));
     let stream = StreamId(83);
     journal.create_immutable(stream).await.unwrap();
     let writer = journal
@@ -899,6 +911,36 @@ async fn timed_original_proof_survives_local_eviction_until_checkpoint_trim() {
         exclusive_journal_cutoff_micros: now_micros() + 60_000_000,
         original_receiver_certificate_sha256: [9; 32],
     };
+    struct StopBeforeCommit {
+        verifier: Arc<dyn TimedOriginalVerifier>,
+        samples: AtomicUsize,
+    }
+    impl TimedOriginalVerifier for StopBeforeCommit {
+        fn verify(&self, keeper: KeeperId, statement: &[u8], signature: &[u8; 64]) -> bool {
+            self.verifier.verify(keeper, statement, signature)
+                && self.samples.fetch_add(1, Ordering::Relaxed) == 0
+        }
+    }
+
+    let stop = Arc::new(StopBeforeCommit {
+        verifier: verifier.clone(),
+        samples: AtomicUsize::new(0),
+    });
+    let stage_only = cluster
+        .journal(PRINCIPALS[0], &config)
+        .unwrap()
+        .with_timed_original(stop.clone(), Some(2048));
+    assert_eq!(
+        stage_only
+            .append_session_timed_original(writer.fence, original, payload.clone())
+            .await,
+        Err(JournalError::Unavailable)
+    );
+    assert_eq!(stop.samples.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        journal.attest_timed_original(original).await,
+        Err(JournalError::Conflict { head: Lsn(0) })
+    );
     let accepted = journal
         .append_session_timed_original(writer.fence, original, payload.clone())
         .await
@@ -926,6 +968,15 @@ async fn timed_original_proof_survives_local_eviction_until_checkpoint_trim() {
         journal.prove_timed_original(different).await,
         Err(JournalError::Unavailable)
     );
+    assert_eq!(
+        journal.attest_timed_original(different).await,
+        Err(JournalError::Unavailable)
+    );
+    let saved = journal
+        .attest_timed_original(original)
+        .await
+        .unwrap()
+        .encode();
 
     journal
         .install_checkpoint(
@@ -943,5 +994,31 @@ async fn timed_original_proof_survives_local_eviction_until_checkpoint_trim() {
         journal.prove_timed_original(original).await,
         Err(JournalError::Trimmed { floor: Lsn(2) })
     );
+    assert_eq!(
+        journal.attest_timed_original(original).await,
+        Err(JournalError::Trimmed { floor: Lsn(2) })
+    );
     cluster.shutdown().await.unwrap();
+
+    let commitment = TimedCommitment::decode(&saved).unwrap();
+    assert_eq!(
+        commitment.verify(config.catalog, original, &*verifier),
+        Some(accepted)
+    );
+    assert_eq!(
+        commitment.verify(uuid::Uuid::from_u128(999), original, &*verifier),
+        None
+    );
+    assert_eq!(
+        commitment.verify(config.catalog, different, &*verifier),
+        None
+    );
+    let mut tampered = saved;
+    *tampered.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        TimedCommitment::decode(&tampered)
+            .unwrap()
+            .verify(config.catalog, original, &*verifier),
+        None
+    );
 }

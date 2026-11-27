@@ -119,8 +119,10 @@ pub const CLUSTER_VERSION_CHECKPOINT_CUSTODY: u32 = 11;
 pub const CLUSTER_VERSION_V12: u32 = 12;
 /// The level the durable recovery summary waits for.
 pub const CLUSTER_VERSION_RETRY_RECOVERY: u32 = CLUSTER_VERSION_V12;
+/// Enables committed timed-original attestations on immutable streams.
+pub const CLUSTER_VERSION_TIMED_COMMITMENT: u32 = 13;
 /// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_RETRY_RECOVERY;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_TIMED_COMMITMENT;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -162,6 +164,8 @@ pub mod features {
     /// Keeps each stream's recovery summary and reads the snapshot formats
     /// that carry it (`CLUSTER_VERSION_RETRY_RECOVERY`).
     pub const RETRY_RECOVERY: u64 = 1 << 14;
+    /// Exports a signed commitment after reading an immutable timed original.
+    pub const TIMED_COMMITMENT: u64 = 1 << 15;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 = VERSION_NEGOTIATION
@@ -177,7 +181,8 @@ pub mod features {
         | RECOVERY_EXCLUSION
         | RECOVERY_ENTRY
         | CHECKPOINT_CUSTODY
-        | RETRY_RECOVERY;
+        | RETRY_RECOVERY
+        | TIMED_COMMITMENT;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
