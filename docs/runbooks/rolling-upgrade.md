@@ -13,14 +13,16 @@ four streams that each append a record every few milliseconds. Before the
 drain and shutdown paths paused writes for their hand-off (`55e94a5`, ten
 runs, 40 restarts), the worst append stall during a restart was 2.35 s and the
 mean 0.66 s, because 16 of 40 hand-offs found no follower matched under
-constant writes and waited out a lease and an election. With the pause
-(Logkeeper `8273aab`, one Mac at load average 3 to 5):
-- three runs of this test, 12 restarts with a drain: worst stall 0.063 s,
-  mean about 0.02 s; every acknowledged record was there afterwards;
-- the [hand-off test](../../tests/leader_handoff.rs), 16 restarts by plain
-  SIGTERM with no drain: every restart handed off, worst stall 0.065 s, mean
-  0.02 s;
-- a keeper was ready again at most 0.23 s after it started.
+constant writes and waited out a lease and an election. With the pause,
+a ten-run sample on Logkeeper `0c44279` (Apple M1 Pro, load average 3 to 7,
+2026-11-27):
+- this test, 40 restarts with a drain: worst append stall 0.064 s, mean
+  0.025 s; `/safe-to-stop` answered at once and a stop took at most 0.11 s;
+  a keeper was ready again at most 0.61 s after it started; every
+  acknowledged record was there afterwards (4,534 to 5,134 per run);
+- the [hand-off test](../../tests/leader_handoff.rs), 80 restarts by plain
+  SIGTERM with no drain: every restart handed off, worst stall 0.043 s, mean
+  0.030 s.
 
 The [compatibility tests](../../tests/upgrade_compatibility.rs) run this
 procedure across real binaries: four keepers move from the previous release
