@@ -55,7 +55,10 @@ impl Running {
         before: impl FnOnce(&Engine),
     ) -> Self {
         let admin_listener = match &config.admin {
-            Some(admin) => Some((TcpListener::bind(admin.listen).await.unwrap(), admin.mtls)),
+            Some(admin) => Some((
+                super::bind_listener(admin.listen).await.unwrap(),
+                admin.mtls,
+            )),
             None => None,
         };
         let engine = config.prepare(CancellationToken::new()).await.unwrap();
@@ -365,11 +368,11 @@ impl Cluster {
     async fn restart_with(&mut self, id: Uuid, before: impl FnOnce(&Engine)) {
         let config = &self.configs[&id];
         let listeners = [
-            TcpListener::bind(config.listen).await.unwrap(),
-            TcpListener::bind(config.peers[&id].bind_addr())
+            super::bind_listener(config.listen).await.unwrap(),
+            super::bind_listener(config.peers[&id].bind_addr())
                 .await
                 .unwrap(),
-            TcpListener::bind(config.bulk[&id].bind_addr())
+            super::bind_listener(config.bulk[&id].bind_addr())
                 .await
                 .unwrap(),
         ];

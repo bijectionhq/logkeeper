@@ -460,7 +460,7 @@ impl LocalCluster {
             .get(&keeper)
             .ok_or_else(|| io::Error::other("unknown keeper"))?
             .clone();
-        let listener = TcpListener::bind(config.listen).await?;
+        let listener = super::keeper::bind_listener(config.listen).await?;
         let stop = CancellationToken::new();
         let task = tokio::spawn(config.serve(listener, stop.clone()));
         self.running.insert(keeper, Running { stop, task });

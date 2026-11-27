@@ -492,3 +492,22 @@ async fn a_keeper_at_its_limit_evicts_its_least_recently_used_idle_copy() {
     assert_eq!(journal.head(expected).await, Ok(Lsn(0)));
     cluster.stop_all().await;
 }
+
+/// A keeper restarting on its fixed port waits for a socket that briefly
+/// holds it instead of failing with AddrInUse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_keeper_waits_for_its_port_to_be_released() {
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = holder.local_addr().unwrap();
+    assert_eq!(
+        TcpListener::bind(address).await.unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(holder);
+    });
+    let listener = super::super::bind_listener(address).await.unwrap();
+    assert_eq!(listener.local_addr().unwrap(), address);
+    release.await.unwrap();
+}

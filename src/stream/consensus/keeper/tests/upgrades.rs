@@ -233,14 +233,17 @@ async fn version_mismatch_counts_as_alive_and_does_not_trigger_repair() {
         .tls
         .server_protocols(KeeperId(c.as_u128()), &[future_alpn])
         .unwrap();
-    let control_listener = TcpListener::bind(c_cfg.peers[&c].bind_addr())
-        .await
-        .unwrap();
+    let control_listener =
+        crate::stream::consensus::keeper::bind_listener(c_cfg.peers[&c].bind_addr())
+            .await
+            .unwrap();
     let app_acceptor = c_cfg
         .tls
         .server_protocols(KeeperId(c.as_u128()), &[b"logkeeper-consensus/99"])
         .unwrap();
-    let app_listener = TcpListener::bind(c_cfg.listen).await.unwrap();
+    let app_listener = crate::stream::consensus::keeper::bind_listener(c_cfg.listen)
+        .await
+        .unwrap();
     let stop = CancellationToken::new();
     let stop_ctrl = stop.clone();
     let ctrl_task = tokio::spawn(async move {

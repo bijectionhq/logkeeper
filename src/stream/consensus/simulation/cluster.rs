@@ -432,11 +432,13 @@ impl SimCluster {
         }
         let config = self.configs[&id].clone();
         let listeners = [
-            TcpListener::bind(config.listen).await.unwrap(),
-            TcpListener::bind(config.peers[&id].bind_addr())
+            crate::stream::consensus::keeper::bind_listener(config.listen)
                 .await
                 .unwrap(),
-            TcpListener::bind(config.bulk[&id].bind_addr())
+            crate::stream::consensus::keeper::bind_listener(config.peers[&id].bind_addr())
+                .await
+                .unwrap(),
+            crate::stream::consensus::keeper::bind_listener(config.bulk[&id].bind_addr())
                 .await
                 .unwrap(),
         ];

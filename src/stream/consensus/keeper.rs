@@ -146,6 +146,33 @@ pub struct AdminConfig {
     pub probe_listen: Option<SocketAddr>,
 }
 
+/// How long a keeper keeps retrying a listening port that is in use.
+const BIND_RETRY: Duration = Duration::from_secs(5);
+
+/// Binds a keeper's fixed listening port, retrying while it is in use. The
+/// listener already reuses addresses in TIME_WAIT; a port can still be held
+/// for a moment by an outgoing connection that drew it from the ephemeral
+/// range after the keeper's previous run released it, as test keepers
+/// restarted next to other tests' clients do.
+pub(in crate::stream::consensus) async fn bind_listener(
+    address: std::net::SocketAddr,
+) -> io::Result<TcpListener> {
+    let end = tokio::time::Instant::now() + BIND_RETRY;
+    let mut delay = Duration::from_millis(10);
+    loop {
+        match TcpListener::bind(address).await {
+            Err(error)
+                if error.kind() == io::ErrorKind::AddrInUse
+                    && tokio::time::Instant::now() + delay < end =>
+            {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_millis(250));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Installed, authenticated keeper inventory and local service settings.
 /// `Config::read` ignores unknown top-level fields with a warning, so a
 /// configuration may name a setting of a newer release before its binary.
@@ -473,10 +500,10 @@ impl Config {
             .ok_or_else(|| invalid("missing local bulk address"))?;
         // An IP address binds as given; a DNS name binds every interface
         // on its port, since the keeper may not know its IP for the name.
-        let control = TcpListener::bind(peer.bind_addr()).await?;
-        let bulk = TcpListener::bind(bulk.bind_addr()).await?;
+        let control = bind_listener(peer.bind_addr()).await?;
+        let bulk = bind_listener(bulk.bind_addr()).await?;
         let admin_listener = match &self.admin {
-            Some(admin) => Some((TcpListener::bind(admin.listen).await?, admin.mtls)),
+            Some(admin) => Some((bind_listener(admin.listen).await?, admin.mtls)),
             None => None,
         };
         #[cfg(unix)]
@@ -821,7 +848,7 @@ impl Engine {
                 sockets.spawn(async move { engine.listen_admin(listener, mtls, false).await });
             }
             if let Some(address) = self.probe_listen {
-                let listener = TcpListener::bind(address).await?;
+                let listener = bind_listener(address).await?;
                 let engine = self.clone();
                 sockets.spawn(async move { engine.listen_admin(listener, false, true).await });
             }
