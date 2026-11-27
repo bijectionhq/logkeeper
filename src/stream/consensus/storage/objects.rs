@@ -289,6 +289,13 @@ impl Objects {
         Ok(object)
     }
 
+    pub(super) fn path_for(&self, key: Key) -> io::Result<PathBuf> {
+        if key.len > MAX_OBJECT_BYTES || key.id.is_nil() {
+            return Err(invalid("invalid immutable object reference"));
+        }
+        Ok(self.0.root.join(key.name()))
+    }
+
     pub fn resolve(&self, reference: Reference) -> io::Result<Arc<Object>> {
         match reference {
             Reference::Object(key) => self.pin(key),
@@ -714,6 +721,10 @@ impl Drop for Hold {
 }
 
 impl Segment {
+    pub(super) fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+        segment::read_at(&self.file, offset, buffer)
+    }
+
     pub fn id(&self) -> u64 {
         self.id
     }

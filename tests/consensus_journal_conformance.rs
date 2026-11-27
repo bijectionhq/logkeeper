@@ -655,3 +655,106 @@ async fn a_written_keeper_configuration_reads_back_for_a_keeper_process() {
     serving.await.unwrap().unwrap();
     cluster.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timed_staging_and_retries_require_the_immutable_writer_session() {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use journal_contract::{Epoch, JournalError, Lsn, StreamId, WriterFence, WriterSessionId};
+    use logkeeper::stream::consensus::CLUSTER_VERSION_V4;
+    use logkeeper::stream::timed::TimedOriginal;
+    use sha2::{Digest, Sha256};
+
+    let mut cluster = LocalCluster::start_timed(&PRINCIPALS).await.unwrap();
+    let config = cluster.journal_config(1 << 20, 4096);
+    let journal = cluster
+        .journal(PRINCIPALS[0], &config)
+        .unwrap()
+        .with_timed_original(cluster.timed_verifier(), Some(2048));
+    let stream = StreamId(82);
+    let finalized = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match journal.finalize_version(CLUSTER_VERSION_V4).await {
+                Err(JournalError::Unavailable) => tokio::time::sleep(Duration::from_millis(20)).await,
+                result => break result,
+            }
+        }
+    })
+    .await
+    .expect("all keepers respond to v4 finalization");
+    assert_eq!(finalized, Ok(CLUSTER_VERSION_V4));
+    journal.create_immutable(stream).await.unwrap();
+    let fence = journal
+        .seal_session(stream, Epoch(0), WriterSessionId(1))
+        .await
+        .unwrap()
+        .fence;
+    let wrong = WriterFence {
+        writer_session_id: WriterSessionId(2),
+        ..fence
+    };
+    let cutoff = now_micros() + 60_000_000;
+    let original = |payload: &[u8]| TimedOriginal {
+        stream,
+        epoch: Epoch(1),
+        at: Lsn(1),
+        payload_sha256: Sha256::digest(payload).into(),
+        exclusive_journal_cutoff_micros: cutoff,
+        original_receiver_certificate_sha256: [7; 32],
+    };
+    // A seal can commit before both selected signers have applied it.
+    let stage = |fence: WriterFence, payload: Bytes| {
+        let original = original(&payload);
+        let journal = &journal;
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let result = journal
+                    .append_session_timed_original(fence, original, payload.clone())
+                    .await;
+                let waiting_for_signer = match &result {
+                    Err(JournalError::Unavailable | JournalError::NotFound) => true,
+                    Err(JournalError::Fenced { current }) => *current < fence.writer_epoch,
+                    _ => false,
+                };
+                if !waiting_for_signer || tokio::time::Instant::now() >= deadline {
+                    return result;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    assert_eq!(
+        stage(wrong, Bytes::from_static(b"wrong session")).await,
+        Err(JournalError::Fenced { current: Epoch(1) }),
+    );
+    let payload = Bytes::from_static(b"current session");
+    let exact = original(&payload);
+    let proof = stage(fence, payload.clone()).await.unwrap();
+    assert!(proof.original_quorum_sync_upper_micros < cutoff);
+    assert_eq!(
+        journal
+            .append_session_timed_original(fence, exact, payload.clone())
+            .await,
+        Ok(proof)
+    );
+    assert_eq!(
+        journal
+            .append_session_timed_original(wrong, exact, payload.clone())
+            .await,
+        Err(JournalError::Fenced { current: Epoch(1) }),
+    );
+    journal
+        .seal_session(stream, Epoch(1), WriterSessionId(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        journal
+            .append_session_timed_original(fence, exact, payload)
+            .await,
+        Err(JournalError::Fenced { current: Epoch(2) }),
+    );
+    assert_eq!(journal.prove_timed_original(exact).await, Ok(proof));
+    cluster.shutdown().await.unwrap();
+}

@@ -1,0 +1,170 @@
+name: Consensus qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      first_seed:
+        description: First seed for the fixed 32-seed window in each profile
+        type: number
+        default: 0
+  schedule:
+    - cron: '23 4 * * 2'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  soak:
+    name: Soak (${{ matrix.profile }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: standard
+            wipe: '0'
+          - profile: wipe
+            wipe: '1'
+    env:
+      LOGKEEPER_CONSENSUS_ALLOW_WIPE: ${{ matrix.wipe }}
+      LOGKEEPER_CONSENSUS_SEEDS: '32'
+      LOGKEEPER_CONSENSUS_KEEP_GOING: '1'
+      FIRST_SEED_INPUT: ${{ inputs.first_seed }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run and record consensus fault-injection seeds
+        run: |
+          mkdir -p qualification
+          if [[ "$GITHUB_EVENT_NAME" == schedule ]]; then
+            week=$(( $(date +%s) / 604800 ))
+            first=$(( week * LOGKEEPER_CONSENSUS_SEEDS ))
+          else
+            first=$FIRST_SEED_INPUT
+          fi
+          [[ "$first" =~ ^(0|[1-9][0-9]{0,14})$ ]]
+          export LOGKEEPER_CONSENSUS_FIRST_SEED="$first"
+          printf 'commit=%s\nfirst_seed=%s\ncount=%s\nallow_wipe=%s\n' \
+            "$(git rev-parse HEAD)" "$first" "$LOGKEEPER_CONSENSUS_SEEDS" "$LOGKEEPER_CONSENSUS_ALLOW_WIPE" \
+            | tee qualification/inputs.txt
+          rustup toolchain install 1.94.1 --profile minimal
+          set -o pipefail
+          cargo +1.94.1 test --locked --features stream --lib consensus_fault_harness_soak -- --ignored --nocapture \
+            2>&1 | tee qualification/soak.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ matrix.profile }}-${{ github.sha }}
+          path: qualification/
+          if-no-files-found: error
+
+  models:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Check all consensus models
+        env:
+          TLC_WORKERS: '2'
+        run: |
+          mkdir -p qualification
+          git rev-parse HEAD > qualification/source-commit.txt
+          set -o pipefail
+          verification/tla/check.sh all 2>&1 | tee qualification/tla.log
+      - name: Collect model runs
+        if: always()
+        run: |
+          if [[ -d verification/tla/.results ]]; then
+            cp -R verification/tla/.results qualification/tla-cases
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: consensus-models-${{ github.sha }}
+          path: qualification/
+          if-no-files-found: error
+
+  proofs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned proof tools
+        id: tools
+        run: |
+          mkdir -p qualification
+          git rev-parse HEAD > qualification/source-commit.txt
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 https://github.com/leanprover/elan/releases/download/v4.4.0/elan-x86_64-unknown-linux-gnu.tar.gz -o elan.tar.gz
+          echo '0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2  elan.tar.gz' | sha256sum -c
+          tar -xzf elan.tar.gz elan-init
+          ./elan-init -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          curl -fsSL --retry 3 https://github.com/verus-lang/verus/releases/download/release/0.2026.11.22.1ce6a59/verus-0.2026.11.22.1ce6a59-x86-linux.zip -o verus.zip
+          echo 'c955d5958877f4f907cce80aa996d4239a481984829d82e325938c7bf242b0db  verus.zip' | sha256sum -c
+          unzip -q verus.zip
+          rustup toolchain install 1.100.0 --profile minimal
+      - name: Check Lean consensus proofs and correspondence
+        run: |
+          set -o pipefail
+          python3 verification/lean/run_consensus_additions.py 2>&1 | tee qualification/lean.log
+          python3 verification/link/run.py 2>&1 | tee qualification/correspondence.log
+      - name: Check production Verus proofs and mutations
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
+        run: |
+          set -o pipefail
+          verus="$RUNNER_TEMP/verus-x86-linux/verus"
+          "$verus" --version | tee qualification/verus-version.txt
+          python3 verification/verus/run.py --verus "$verus" --evidence qualification/verus \
+            consensus_admission prefix_agreement mirrored_voter_media 2>&1 | tee qualification/verus.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: consensus-proofs-${{ github.sha }}
+          path: qualification/
+          if-no-files-found: error
+
+  candidate:
+    if: github.event_name == 'workflow_dispatch'
+    needs: [test, soak, models, proofs]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-docker-action@v5
+        with:
+          daemon-config: '{"features": {"containerd-snapshotter": true}}'
+      - uses: docker/setup-qemu-action@v4
+        with:
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+        with:
+          version: v0.34.1
+          driver-opts: image=moby/buildkit:v0.30.0@sha256:0168606be2315b7c807a03b3d8aa79beefdb31c98740cebdffdfeebf31190c9f
+      - name: Build and verify the candidate OCI archive
+        run: |
+          python3 deploy/consensus/release.py --ref "$GITHUB_SHA" --output candidate
+          (cd candidate && sha256sum -c SHA256SUMS)
+      - name: Smoke-test both keeper images
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            docker load --platform "$platform" --input candidate/logkeeper-consensus.oci.tar
+            help=$(docker run --platform "$platform" --rm --entrypoint /usr/local/bin/logkeeper \
+              "logkeeper-consensus:$GITHUB_SHA" --help)
+            printf '%s\n' "$help"
+            grep -Fq 'keeper fence-recovery' <<< "$help"
+            grep -Fq -- '--fence-proof FILE' <<< "$help"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logkeeper-consensus-${{ github.sha }}
+          path: candidate/
+          if-no-files-found: error

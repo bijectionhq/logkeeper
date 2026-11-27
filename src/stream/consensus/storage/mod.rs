@@ -2,6 +2,7 @@ mod inflight;
 pub(crate) mod inspect;
 mod media;
 mod objects;
+pub(super) mod scrub;
 mod segment;
 mod snapshot;
 mod space;

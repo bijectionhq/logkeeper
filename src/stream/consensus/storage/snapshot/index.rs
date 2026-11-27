@@ -28,13 +28,13 @@ pub(super) const MAGIC: &[u8; 8] = b"LKRIDX02";
 pub(super) const MAGIC_WITHOUT_EPOCHS: &[u8; 8] = b"LKRIDX01";
 
 /// Whether a selected snapshot starts with an index root.
-pub(super) fn indexed(magic: &[u8; 8]) -> bool {
+pub(in crate::stream::consensus::storage) fn indexed(magic: &[u8; 8]) -> bool {
     magic == MAGIC || magic == MAGIC_WITHOUT_EPOCHS
 }
 const PAGE: usize = 128;
 const MAX_PAGES: usize = MAX_RETAINED_RECORDS / PAGE + 1;
 const MAX_PAGE_BYTES: usize = 16 * 1024;
-const MAX_ROOT_BYTES: u64 = 384 * 1024;
+pub(in crate::stream::consensus::storage) const MAX_ROOT_BYTES: u64 = 384 * 1024;
 // The encoded size of one page reference. A full stream's references take
 // under half the root, which leaves the rest for its genesis, metadata and
 // image.
@@ -186,13 +186,7 @@ pub(super) fn open(
     if bytes.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("invalid indexed snapshot root"));
     }
-    let (mut root, epochs): (Root, EpochRuns) = if bytes.starts_with(MAGIC) {
-        decode(&bytes[MAGIC.len()..])?
-    } else if bytes.starts_with(MAGIC_WITHOUT_EPOCHS) {
-        (decode(&bytes[MAGIC.len()..])?, EpochRuns::default())
-    } else {
-        return Err(invalid("invalid indexed snapshot root"));
-    };
+    let (mut root, epochs) = decode_root(&bytes)?;
     root.image.stage_intent = root.meta.snapshot_id.starts_with(super::STAGED_IMAGE);
     if &root.genesis != genesis
         || root.meta.last_log_id != Some(selected.log_id)
@@ -261,6 +255,68 @@ pub(super) fn open(
         .restore_records(records, genesis.quota_bytes)?;
     root.image.state.restore_epochs(epochs)?;
     Ok((root.meta, root.image, dependencies))
+}
+
+fn decode_root(bytes: &[u8]) -> io::Result<(Root, EpochRuns)> {
+    if bytes.len() as u64 > MAX_ROOT_BYTES {
+        return Err(invalid("invalid indexed snapshot root"));
+    }
+    if let Some(body) = bytes.strip_prefix(MAGIC) {
+        decode(body)
+    } else if let Some(body) = bytes.strip_prefix(MAGIC_WITHOUT_EPOCHS) {
+        Ok((decode(body)?, EpochRuns::default()))
+    } else {
+        Err(invalid("invalid indexed snapshot root"))
+    }
+}
+
+/// Walks the authenticated dependency list without opening a replica.
+pub(in crate::stream::consensus::storage) fn scrub_root(
+    bytes: &[u8],
+    stream: StreamId,
+    selected: Selected,
+) -> io::Result<(VecDeque<Key>, VecDeque<[u8; 32]>)> {
+    let (root, _) = decode_root(bytes)?;
+    if root.genesis.stream != stream
+        || root.meta.last_log_id != Some(selected.log_id)
+        || root.pages.len() > MAX_PAGES
+        || root.legacy.len() > 1
+    {
+        return Err(invalid(
+            "indexed snapshot differs from the selected scope or cut",
+        ));
+    }
+    let pages = root.pages.into_iter().map(|page| {
+        if page.object.scope != stream || page.object.len > MAX_PAGE_BYTES as u64 {
+            return Err(invalid("invalid snapshot page reference"));
+        }
+        Ok(page.object)
+    });
+    Ok((
+        pages.collect::<io::Result<_>>()?,
+        root.legacy.into_iter().collect(),
+    ))
+}
+
+pub(in crate::stream::consensus::storage) fn scrub_page(
+    bytes: &[u8],
+    stream: StreamId,
+) -> io::Result<VecDeque<Reference>> {
+    let spans: Vec<Span> = decode(bytes)?;
+    if spans.len() > PAGE {
+        return Err(invalid("invalid snapshot page"));
+    }
+    spans
+        .into_iter()
+        .filter_map(|span| match span.source {
+            Source::Object(key) if key.scope == stream => Some(Ok(Reference::Object(key))),
+            Source::Segment(location) if location.scope == stream => {
+                Some(Ok(Reference::Segment(location)))
+            }
+            Source::Legacy(_) => None,
+            _ => Some(Err(invalid("snapshot page references a different stream"))),
+        })
+        .collect()
 }
 
 impl Span {

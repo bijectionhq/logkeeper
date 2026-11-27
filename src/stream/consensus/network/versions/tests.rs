@@ -3,7 +3,7 @@
 //! variants of the release that is now N-1.
 
 use bytes::Bytes;
-use journal_contract::{Epoch, JournalError, Lsn, Page, StreamId};
+use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId};
 use openraft::raft::{AppendEntriesRequest, TransferLeaderRequest, VoteRequest};
 use serde::Serialize;
 
@@ -97,6 +97,7 @@ fn genesis() -> Genesis {
         stream: STREAM,
         voters: [1, 2, 3].map(uuid::Uuid::from_u128),
         quota_bytes: 4096,
+        immutable: false,
     }
 }
 
@@ -250,6 +251,27 @@ fn request(tag: usize) -> Option<Request> {
         30 => Request::ClusterVersion,
         31 => Request::FinalizeVersion(2),
         32 => Request::ClearQuarantine(STREAM),
+        33 => Request::RecoveryFence(STREAM),
+        34 => Request::AcknowledgeRecoveryWithMarker {
+            stream: STREAM,
+            fence: RecoveryFence { epoch: Epoch(1), head: Lsn(1) },
+            payload: bytes,
+        },
+        35 => Request::SealSession {
+            stream: STREAM,
+            expected_writer_epoch: Epoch(1),
+            writer_session_id: WriterSessionId(7),
+        },
+        36 => Request::StageSessionOriginal {
+            fence: WriterFence {
+                stream: STREAM,
+                writer_epoch: Epoch(1),
+                writer_session_id: WriterSessionId(7),
+            },
+            revision: 1,
+            original: Vec::new(),
+            payload: bytes,
+        },
         _ => return None,
     })
 }
@@ -361,6 +383,7 @@ fn outcome(tag: usize) -> Option<Outcome> {
         5 => Outcome::Configuration(configuration()),
         6 => Outcome::OriginalSample(Vec::new()),
         7 => Outcome::OriginalEvidence(Vec::new()),
+        8 => Outcome::RecoveryFence(None),
         _ => return None,
     })
 }

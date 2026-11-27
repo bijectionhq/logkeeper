@@ -12,7 +12,7 @@ use std::{
 
 use bincode::Options;
 use futures::FutureExt;
-use journal_contract::{Epoch, Lsn, StreamId};
+use journal_contract::{Epoch, Lsn, RecoveryFence, StreamId, WriterFence, WriterSessionId};
 use openraft::{
     BasicNode, EntryPayload, OptionalSend,
     errors::{NetworkError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable},
@@ -47,7 +47,7 @@ use crate::stream::transport::{Channel, connect_protocols, is_alpn_mismatch};
 
 mod versions;
 
-pub(super) use versions::{error_introduced, outcome_introduced};
+pub(super) use versions::outcome_introduced;
 
 /// Wire protocol version negotiated via TLS ALPN. Rolling upgrades support
 /// adjacent versions `Previous` (N-1) and `Current` (N) only. Ordered, so a
@@ -271,12 +271,32 @@ pub(super) enum Request {
     /// Clears a durable corruption quarantine marker on this keeper for
     /// `stream`. Administrators only.
     ClearQuarantine(StreamId),
+    /// A linearizable read of the active recovery fence.
+    RecoveryFence(StreamId),
+    /// Commits the consumer's marker and clears the observed fence together.
+    AcknowledgeRecoveryWithMarker {
+        stream: StreamId,
+        fence: RecoveryFence,
+        payload: bytes::Bytes,
+    },
+    SealSession {
+        stream: StreamId,
+        expected_writer_epoch: Epoch,
+        writer_session_id: WriterSessionId,
+    },
+    StageSessionOriginal {
+        fence: WriterFence,
+        revision: u64,
+        original: Vec<u8>,
+        payload: bytes::Bytes,
+    },
 }
 
 impl Request {
     pub fn stream(&self) -> StreamId {
         match *self {
             Self::Claim(ref genesis) => genesis.stream,
+            Self::StageSessionOriginal { fence, .. } => fence.stream,
             Self::ReadAt { ref genesis, .. } => genesis.stream,
             Self::StageReplica { ref genesis, .. }
             | Self::InstallReplica { ref genesis, .. }
@@ -290,6 +310,7 @@ impl Request {
             | Self::Delete(stream)
             | Self::KeeperStatus(stream)
             | Self::AcknowledgeRecovery(stream)
+            | Self::RecoveryFence(stream)
             | Self::LocalConfiguration(stream)
             | Self::Staging(stream)
             | Self::ClearQuarantine(stream)
@@ -297,6 +318,8 @@ impl Request {
             Self::Stage(ref stage) => stage.stream,
             Self::ClusterVersion | Self::FinalizeVersion(_) => StreamId(0),
             Self::Seal { stream, .. }
+            | Self::SealSession { stream, .. }
+            | Self::AcknowledgeRecoveryWithMarker { stream, .. }
             | Self::Append { stream, .. }
             | Self::AppendBatch { stream, .. }
             | Self::StageOriginal { stream, .. }
@@ -413,9 +436,20 @@ pub(super) fn decode_frame(bytes: &[u8], version: WireVersion) -> io::Result<Dec
             return refuse("request", req_tag);
         }
     }
-    if frame_tag == 1 && bytes.len() >= 4 + GENESIS_WIRE_BYTES + 4 {
-        let start = 4 + GENESIS_WIRE_BYTES;
-        let peer_tag = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
+    let immutable = frame_tag == 1 && bytes.get(4..20) == Some(&[0; 16]);
+    if immutable && version == WireVersion::Previous {
+        return Err(unsupported("immutable genesis requires a newer keeper protocol"));
+    }
+    let prefix = if immutable {
+        super::IMMUTABLE_GENESIS_PREFIX_BYTES
+    } else {
+        0
+    };
+    let peer_start = 4 + GENESIS_WIRE_BYTES + prefix;
+    if frame_tag == 1
+        && let Some(tag) = bytes.get(peer_start..peer_start + 4)
+    {
+        let peer_tag = u32::from_le_bytes(tag.try_into().unwrap());
         if peer_tag >= counts.peer {
             return refuse("peer request", peer_tag);
         }
@@ -452,7 +486,9 @@ impl Frame {
                 Self::Client(request) if !request.supported_on(WireVersion::Previous) => {
                     Err(unsupported("request requires a newer keeper protocol"))
                 }
-                Self::Peer(_, request) if !request.supported_on(WireVersion::Previous) => {
+                Self::Peer(genesis, request)
+                    if genesis.immutable || !request.supported_on(WireVersion::Previous) =>
+                {
                     Err(unsupported("peer request requires a newer keeper protocol"))
                 }
                 frame if frame.introduced() > WireVersion::Previous => {
@@ -673,14 +709,10 @@ pub(super) enum ReplyV1 {
 /// `outcome` for an N-1 peer: a refusal it does not know becomes
 /// `Unavailable`.
 fn outcome_v1(outcome: Outcome) -> Outcome {
-    match outcome {
-        Outcome::Refused(error) if error_introduced(&error) > WireVersion::Previous => {
-            Outcome::Refused(journal_contract::JournalError::Unavailable)
-        }
-        other => {
-            debug_assert_eq!(outcome_introduced(&other), WireVersion::Previous);
-            other
-        }
+    if outcome_introduced(&outcome) > WireVersion::Previous {
+        Outcome::Refused(journal_contract::JournalError::Unavailable)
+    } else {
+        outcome
     }
 }
 
@@ -689,6 +721,11 @@ impl ReplyV1 {
         Ok(match reply {
             Reply::Decision(outcome) => Self::Decision(outcome_v1(outcome)),
             Reply::Leader(leader) => Self::Leader(leader),
+            Reply::Catalog(genesis, _) | Reply::ScopedPage { genesis, .. } if genesis.immutable => {
+                return Err(unsupported(
+                    "immutable genesis requires a newer keeper protocol",
+                ));
+            }
             Reply::Catalog(genesis, contacts) => Self::Catalog(genesis, contacts),
             Reply::Staged(stage) => Self::Staged(stage),
             Reply::Placement(proof) => Self::Placement(proof),

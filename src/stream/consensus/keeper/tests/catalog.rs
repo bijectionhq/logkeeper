@@ -190,6 +190,7 @@ async fn compaction_keeps_lookups_across_a_checkpoint_trim_and_restart() {
             stream: StreamId(1000 + index),
             voters: rosters[index as usize % 4],
             quota_bytes: 4096,
+            immutable: false,
         })
         .collect::<Vec<_>>();
     for genesis in &claimed {

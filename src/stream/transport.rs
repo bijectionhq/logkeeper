@@ -739,11 +739,11 @@ impl Credentials {
         })
     }
 
-    fn key(&self) -> io::Result<PrivateKeyDer<'static>> {
+    pub(super) fn key(&self) -> io::Result<PrivateKeyDer<'static>> {
         PrivateKeyDer::from_pem_file(&self.private_key).map_err(display_error)
     }
 
-    fn root_store(&self) -> io::Result<RootCertStore> {
+    pub(super) fn root_store(&self) -> io::Result<RootCertStore> {
         let mut roots = RootCertStore::empty();
         for certificate in certificates(&self.ca)? {
             roots.add(certificate).map_err(display_error)?;

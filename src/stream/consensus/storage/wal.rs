@@ -3,10 +3,11 @@
 use crate::stream::consensus::decisions;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::File,
     io::{self, BufReader, Read},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
@@ -22,54 +23,6 @@ mod legacy;
 pub(super) mod segmented;
 pub use segmented::SalvageReport;
 use segmented::{Segmented, Tuning};
-
-/// One thing the background scrubber reads back and checks.
-pub(in crate::stream::consensus) struct ScrubTarget(Target);
-
-enum Target {
-    /// A retained log slice or object, checked against its checksum.
-    Object(std::sync::Arc<super::objects::Object>),
-    /// A selected snapshot, checked against its digest with every object
-    /// it names.
-    Snapshot {
-        directory: PathBuf,
-        selected: Selected,
-        genesis: Genesis,
-        objects: Objects,
-    },
-}
-
-impl ScrubTarget {
-    /// The bytes the check reads, for pacing.
-    pub fn len(&self) -> u64 {
-        match &self.0 {
-            Target::Object(object) => object.len(),
-            Target::Snapshot {
-                directory,
-                selected,
-                ..
-            } => std::fs::metadata(selected.path(directory)).map_or(0, |meta| meta.len()),
-        }
-    }
-
-    /// Reads the target back. `InvalidData` means it failed its checksum or
-    /// digest; another error, such as a file a trim removed meanwhile, says
-    /// nothing about the data.
-    pub fn verify(&self) -> io::Result<()> {
-        match &self.0 {
-            Target::Object(object) => object.read().map(drop),
-            Target::Snapshot {
-                directory,
-                selected,
-                genesis,
-                objects,
-            } => {
-                let file = std::fs::File::open(selected.path(directory))?;
-                super::snapshot::verify_selected_file(file, directory, genesis, *selected, objects)
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests;
@@ -256,6 +209,13 @@ impl State {
                 }
             }
             Record::Recover(stream, vote, entries) => {
+                if self
+                    .genesis
+                    .get(&stream)
+                    .is_some_and(|genesis| genesis.immutable)
+                {
+                    return Err(invalid("recovery would rewrite an immutable history"));
+                }
                 self.apply(Record::Vote(stream, vote))?;
                 self.apply(Record::Append(stream, entries))?;
             }
@@ -284,6 +244,16 @@ impl State {
                 self.apply(*record)?;
             }
             Record::Ownership(stream, change) => {
+                if matches!(&change, Change::Recover(_))
+                    && self
+                        .genesis
+                        .get(&stream)
+                        .is_some_and(|genesis| genesis.immutable)
+                {
+                    return Err(invalid(
+                        "recovery staging would rewrite an immutable history",
+                    ));
+                }
                 let log = self.log_mut(stream)?;
                 let has_cut = |cut: LogId| {
                     log.purged == Some(cut)
@@ -521,6 +491,7 @@ pub(in crate::stream::consensus) struct Disk {
     /// Finalized cluster feature level gating new on-disk formats and commands.
     write_version: Arc<AtomicU32>,
     stopped: Arc<tokio::sync::Mutex<Option<oneshot::Receiver<io::Result<()>>>>>,
+    media_lock: Weak<File>,
     pub path: Arc<PathBuf>,
     /// The incarnation of the installed media, new at each installation.
     pub incarnation: Uuid,
@@ -625,6 +596,8 @@ impl Disk {
         let wal_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
         #[cfg(test)]
         let writer_delay = wal_delay_ms.clone();
+        let lock = Arc::new(lock);
+        let media_lock = Arc::downgrade(&lock);
         std::thread::Builder::new()
             .name("logkeeper-raft-wal".into())
             .spawn(move || {
@@ -672,6 +645,7 @@ impl Disk {
             inflight: Arc::default(),
             write_version,
             stopped: Arc::new(tokio::sync::Mutex::new(Some(stopped))),
+            media_lock,
             path: Arc::new(path),
             incarnation,
             space,
@@ -689,6 +663,14 @@ impl Disk {
         self.healthy.load(Ordering::Acquire)
     }
 
+    /// Keeps this media exclusively open until the service has stopped its
+    /// listeners and Raft groups, even if the WAL writer fails first.
+    pub fn hold_media_lock(&self) -> io::Result<Arc<File>> {
+        self.media_lock
+            .upgrade()
+            .ok_or_else(|| super::super::invalid("keeper media lock was released"))
+    }
+
     /// Whether the media is healthy and keeps up with its WAL rounds.
     pub fn responsive(&self) -> bool {
         self.healthy() && self.watchdog.responsive()
@@ -698,33 +680,6 @@ impl Disk {
     /// should wait.
     pub fn near_slow(&self) -> bool {
         self.watchdog.near_slow()
-    }
-
-    /// What the scrubber verifies for `stream`: every retained slice of its
-    /// log, then its selected snapshot and the objects that snapshot names.
-    pub fn scrub_targets(&self, stream: StreamId) -> Vec<ScrubTarget> {
-        let state = self.state.read();
-        let (Some(log), Some(genesis)) = (state.logs.get(&stream), state.genesis.get(&stream))
-        else {
-            return Vec::new();
-        };
-        let mut targets = log
-            .segments
-            .values()
-            .cloned()
-            .map(|object| ScrubTarget(Target::Object(object)))
-            .collect::<Vec<_>>();
-        if let (Some(selected), Some(generation)) = (log.snapshot, log.ownership.generation()) {
-            targets.push(ScrubTarget(Target::Snapshot {
-                directory: crate::stream::consensus::ownership::directory(
-                    &self.path, stream, generation,
-                ),
-                selected,
-                genesis: genesis.clone(),
-                objects: self.objects.clone(),
-            }));
-        }
-        targets
     }
 
     /// Resolves once a WAL round runs past the slow-round limit.
@@ -1119,6 +1074,17 @@ impl Disk {
         self.state.read().genesis.values().cloned().collect()
     }
 
+    pub(super) fn next_log_scope(&self, after: Option<StreamId>) -> Option<StreamId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        self.state
+            .read()
+            .logs
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .next()
+            .map(|(&scope, _)| scope)
+    }
+
     pub fn suffix_len(&self, stream: StreamId) -> usize {
         self.state
             .read()
@@ -1212,6 +1178,10 @@ impl Disk {
 
     pub(super) fn log<T>(&self, stream: StreamId, read: impl FnOnce(&Log) -> T) -> T {
         read(&self.state.read().logs[&stream])
+    }
+
+    pub(super) fn maybe_log<T>(&self, stream: StreamId, read: impl FnOnce(&Log) -> T) -> Option<T> {
+        self.state.read().logs.get(&stream).map(read)
     }
 }
 

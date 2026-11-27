@@ -17,7 +17,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use journal_contract::{Epoch, JournalError, Lsn, Page, Result};
+use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryFence, Result, WriterSessionId};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +76,18 @@ pub enum Command {
     Recover(Stage),
     /// An administrator's acknowledgement that clears the recovery fence.
     AcknowledgeRecovery,
+    /// Appends the consumer's marker and clears exactly this recovery fence.
+    /// Keep the payload last so its retained extent ends with the entry.
+    AcknowledgeRecoveryWithMarker {
+        fence: RecoveryFence,
+        at: Lsn,
+        payload: Bytes,
+    },
+    SealSession {
+        expected_writer_epoch: Epoch,
+        writer_session_id: WriterSessionId,
+        owner: String,
+    },
 }
 
 /// The most records one batch carries.
@@ -144,6 +156,16 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
         },
         Recover(Stage),
         AcknowledgeRecovery,
+        AcknowledgeRecoveryWithMarker {
+            fence: RecoveryFence,
+            at: Lsn,
+            payload: Bytes,
+        },
+        SealSession {
+            expected_writer_epoch: Epoch,
+            writer_session_id: WriterSessionId,
+            owner: String,
+        },
     }
     Application::deserialize(decoder).map(Box::new)
 }
@@ -176,6 +198,12 @@ impl std::fmt::Display for Command {
         match self {
             Self::Create => f.write_str("Create"),
             Self::Seal { expected, .. } => write!(f, "Seal({expected:?})"),
+            Self::SealSession {
+                expected_writer_epoch,
+                ..
+            } => {
+                write!(f, "SealSession({expected_writer_epoch:?})")
+            }
             Self::Append { at, payload, .. } => {
                 write!(f, "Append({at:?}, {} bytes)", payload.len())
             }
@@ -192,6 +220,9 @@ impl std::fmt::Display for Command {
             }
             Self::Recover(stage) => write!(f, "Recover({})", stage.source),
             Self::AcknowledgeRecovery => f.write_str("AcknowledgeRecovery"),
+            Self::AcknowledgeRecoveryWithMarker { fence, .. } => {
+                write!(f, "AcknowledgeRecoveryWithMarker({fence:?})")
+            }
         }
     }
 }
@@ -208,6 +239,7 @@ pub enum Outcome {
     OriginalSample(Vec<u8>),
     /// The retained evidence of a timed original record.
     OriginalEvidence(Vec<u8>),
+    RecoveryFence(Option<RecoveryFence>),
 }
 
 impl From<Result<Outcome>> for Outcome {
@@ -222,6 +254,10 @@ pub(super) enum State {
     Absent,
     Live(Live),
     Deleted,
+    Immutable {
+        live: Live,
+        sealed_head_lsn: Lsn,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -398,6 +434,16 @@ impl State {
         genesis: &Genesis,
         segment: Arc<super::storage::Object>,
     ) -> io::Result<Outcome> {
+        if let Command::AcknowledgeRecoveryWithMarker { fence, at, payload } = command {
+            if genesis.immutable {
+                return Ok(Outcome::Refused(JournalError::Unsupported));
+            }
+            let live = match self.live_mut() {
+                Ok(live) => live,
+                Err(error) => return Ok(Outcome::Refused(error)),
+            };
+            return live.acknowledge_with_marker(fence, at, payload, segment, genesis.quota_bytes);
+        }
         if let Command::Append {
             fence,
             owner,
@@ -419,10 +465,10 @@ impl State {
                 // A record of unknown epoch is judged by its bytes alone.
                 return Ok(
                     if !retained.timed()
-                        && live
-                            .epochs
-                            .epoch(at)
-                            .is_none_or(|epoch| epoch == fence.epoch)
+                        && match live.epochs.epoch(at) {
+                            Some(epoch) => epoch == fence.epoch,
+                            None => !genesis.immutable,
+                        }
                         && retained.len() == payload.len()
                         && retained.load()? == payload
                     {
@@ -532,32 +578,48 @@ impl State {
             }
             extents.reverse();
             return Ok(live
-                .append_batch(at, payloads, &extents, &segment, genesis.quota_bytes)?
+                .append_batch(at, payloads, &extents, &segment, genesis)?
                 .into());
         }
-        Ok(self.decide(command).into())
+        Ok(self.decide(command, genesis).into())
     }
 
-    fn decide(&mut self, command: Command) -> Result<Outcome> {
+    fn decide(&mut self, command: Command, genesis: &Genesis) -> Result<Outcome> {
         if matches!(command, Command::Create) {
             return match self {
                 Self::Absent => {
-                    *self = Self::Live(Live {
+                    let live = Live {
                         writer: None,
                         head: Lsn(0),
                         floor: Lsn(1),
                         bytes: 0,
                         records: VecDeque::new(),
                         epochs: EpochRuns::default(),
-                    });
+                    };
+                    *self = if genesis.immutable {
+                        Self::Immutable {
+                            live,
+                            sealed_head_lsn: Lsn(0),
+                        }
+                    } else {
+                        Self::Live(live)
+                    };
                     Ok(Outcome::Unit)
                 }
-                Self::Live(_) => Ok(Outcome::Unit),
+                Self::Live(_) | Self::Immutable { .. } => Ok(Outcome::Unit),
                 Self::Deleted => Err(JournalError::Deleted),
             };
         }
         if matches!(command, Command::Delete) && matches!(self, Self::Deleted) {
             return Ok(Outcome::Unit);
+        }
+        if let Command::SealSession {
+            expected_writer_epoch,
+            writer_session_id,
+            owner,
+        } = command
+        {
+            return self.seal_session(expected_writer_epoch, writer_session_id, owner);
         }
         let live = self.live_mut()?;
         match command {
@@ -565,7 +627,8 @@ impl State {
                 expected,
                 writer,
                 owner,
-            } => live.seal(expected, writer, owner),
+            } if !genesis.immutable => live.seal(expected, writer, owner),
+            Command::Seal { .. } => Err(JournalError::Unsupported),
             Command::Trim {
                 fence,
                 owner,
@@ -578,16 +641,56 @@ impl State {
                 *self = Self::Deleted;
                 Ok(Outcome::Unit)
             }
-            Command::AcknowledgeRecovery => live.acknowledge_recovery(),
-            Command::Create
+            Command::AcknowledgeRecovery if !genesis.immutable => live.acknowledge_recovery(),
+            Command::AcknowledgeRecovery => Err(JournalError::Unsupported),
+            Command::SealSession { .. }
+            | Command::Create
             | Command::Append { .. }
             | Command::Stage(_)
             | Command::StageOwned(_)
             | Command::Recover(_)
             | Command::Admitted(..)
             | Command::AppendBatch { .. }
-            | Command::AppendOriginal { .. } => unreachable!(),
+            | Command::AppendOriginal { .. }
+            | Command::AcknowledgeRecoveryWithMarker { .. } => unreachable!(),
         }
+    }
+
+    fn seal_session(
+        &mut self,
+        expected_writer_epoch: Epoch,
+        writer_session_id: WriterSessionId,
+        owner: String,
+    ) -> Result<Outcome> {
+        let Self::Immutable {
+            live,
+            sealed_head_lsn,
+        } = self
+        else {
+            self.live()?;
+            return Err(JournalError::Unsupported);
+        };
+        let current = live.epoch();
+        let epoch = expected_writer_epoch
+            .0
+            .checked_add(1)
+            .map(Epoch)
+            .ok_or(JournalError::Fenced { current })?;
+        let writer = uuid::Uuid::from_u128(writer_session_id.0);
+        if writer.is_nil() || writer == RECOVERY_WRITER || owner.is_empty() {
+            return Err(JournalError::Fenced { current });
+        }
+        let fence = Fence { epoch, writer };
+        if expected_writer_epoch == current {
+            live.writer = Some((fence, owner));
+            *sealed_head_lsn = live.head;
+        } else {
+            live.require_writer(fence, &owner)?;
+        }
+        Ok(Outcome::Sealed(Sealed {
+            fence,
+            head: *sealed_head_lsn,
+        }))
     }
 
     pub fn head(&self) -> Result<Lsn> {
@@ -596,6 +699,9 @@ impl State {
 
     /// Installs the recovery fence above the current epoch.
     pub fn recover(&mut self) -> Result<Outcome> {
+        if matches!(self, Self::Immutable { .. }) {
+            return Err(JournalError::Unsupported);
+        }
         let live = self.live_mut()?;
         let epoch = super::decisions::recovery_epoch(live.epoch().0)
             .map(Epoch)
@@ -614,6 +720,14 @@ impl State {
     /// Whether an unacknowledged operator recovery fences the stream.
     pub fn recovering(&self) -> bool {
         self.live().is_ok_and(Live::recovering)
+    }
+
+    pub fn recovery_fence(&self) -> Result<Option<RecoveryFence>> {
+        let live = self.live()?;
+        Ok(live.recovering().then(|| RecoveryFence {
+            epoch: live.epoch(),
+            head: live.head,
+        }))
     }
 
     pub fn read(&self, from: Lsn, limit: usize) -> Result<ReadPage> {
@@ -677,6 +791,29 @@ impl State {
             .map_or((0, 0), |live| (live.records.len() as u64, live.bytes))
     }
 
+    pub fn matches_genesis(&self, genesis: &Genesis) -> bool {
+        match self {
+            Self::Absent | Self::Deleted => true,
+            Self::Live(_) => !genesis.immutable,
+            Self::Immutable {
+                live,
+                sealed_head_lsn,
+            } => {
+                genesis.immutable
+                    && *sealed_head_lsn <= live.head
+                    && match &live.writer {
+                        Some((fence, owner)) => {
+                            fence.epoch != Epoch(0)
+                                && !fence.writer.is_nil()
+                                && fence.writer != RECOVERY_WRITER
+                                && !owner.is_empty()
+                        }
+                        None => *sealed_head_lsn == Lsn(0) && live.head == Lsn(0),
+                    }
+            }
+        }
+    }
+
     pub fn is_deleted(&self) -> bool {
         matches!(self, Self::Deleted)
     }
@@ -692,7 +829,7 @@ impl State {
     }
 
     pub fn restore_records(&mut self, records: VecDeque<Payload>, quota: u64) -> io::Result<()> {
-        if let Self::Live(live) = self {
+        if let Ok(live) = self.live_mut() {
             let bytes = records
                 .iter()
                 .map(|record| record_charge(record.len()))
@@ -747,7 +884,7 @@ impl State {
 
     /// Restores the epochs a snapshot stored beside its image.
     pub fn restore_epochs(&mut self, epochs: EpochRuns) -> io::Result<()> {
-        if let Self::Live(live) = self {
+        if let Ok(live) = self.live_mut() {
             if !epochs.valid(live.head) {
                 return Err(super::invalid("invalid retained epoch runs"));
             }
@@ -761,7 +898,7 @@ impl State {
     fn live(&self) -> Result<&Live> {
         match self {
             Self::Absent => Err(JournalError::NotFound),
-            Self::Live(live) => Ok(live),
+            Self::Live(live) | Self::Immutable { live, .. } => Ok(live),
             Self::Deleted => Err(JournalError::Deleted),
         }
     }
@@ -769,7 +906,7 @@ impl State {
     fn live_mut(&mut self) -> Result<&mut Live> {
         match self {
             Self::Absent => Err(JournalError::NotFound),
-            Self::Live(live) => Ok(live),
+            Self::Live(live) | Self::Immutable { live, .. } => Ok(live),
             Self::Deleted => Err(JournalError::Deleted),
         }
     }
@@ -800,6 +937,62 @@ impl Live {
             self.writer = Some((fence, String::new()));
         }
         Ok(Outcome::At(self.head))
+    }
+
+    fn acknowledge_with_marker(
+        &mut self,
+        fence: RecoveryFence,
+        at: Lsn,
+        payload: Bytes,
+        segment: Arc<super::storage::Object>,
+        quota_bytes: u64,
+    ) -> io::Result<Outcome> {
+        let conflict = Outcome::Refused(JournalError::Conflict { head: self.head });
+        if fence.head.0.checked_add(1) != Some(at.0) {
+            return Ok(conflict);
+        }
+        if !self.recovering() {
+            if at < self.floor {
+                return Ok(Outcome::Refused(JournalError::Trimmed {
+                    floor: self.floor,
+                }));
+            }
+            // A transferred snapshot may have no epoch run for this record.
+            // An exact retry can still return retained bytes without mutating
+            // the stream, as with an ordinary append.
+            if self.epoch() >= fence.epoch
+                && self
+                    .epochs
+                    .epoch(at)
+                    .is_none_or(|epoch| epoch == fence.epoch)
+                && at <= self.head
+                && let Some(record) = self.records.get((at.0 - self.floor.0) as usize)
+                && !record.timed()
+                && record.len() == payload.len()
+                && record.load()? == payload
+            {
+                return Ok(Outcome::At(at));
+            }
+            return Ok(conflict);
+        }
+        if self.epoch() != fence.epoch || self.head != fence.head {
+            return Ok(conflict);
+        }
+        let len = payload.len() as u32;
+        let offset = segment.len().checked_sub(u64::from(len)).ok_or_else(|| {
+            super::invalid("accepted WAL extent does not contain the recovery marker")
+        })?;
+        let record = Payload::Extent {
+            object: segment,
+            offset,
+            len,
+            crc: crc32fast::hash(&payload),
+            timed: false,
+        };
+        match self.append(at, record, quota_bytes) {
+            Ok(_) => Ok(self.acknowledge_recovery().into()),
+            Err(error) => Ok(Outcome::Refused(error)),
+        }
     }
 
     fn seal(&mut self, expected: Epoch, writer: uuid::Uuid, owner: String) -> Result<Outcome> {
@@ -881,7 +1074,7 @@ impl Live {
         payloads: Vec<Bytes>,
         extents: &[u64],
         segment: &Arc<super::storage::Object>,
-        quota_bytes: u64,
+        genesis: &Genesis,
     ) -> io::Result<Result<Outcome>> {
         let conflict = JournalError::Conflict { head: self.head };
         let Some(last) =
@@ -893,16 +1086,19 @@ impl Live {
         if at < self.floor {
             return Ok(Err(JournalError::Trimmed { floor: self.floor }));
         }
+        if genesis.immutable && at <= self.head && last > self.head.0 {
+            return Ok(Err(conflict));
+        }
         let retained = self.head.0.min(last).saturating_sub(at.0.saturating_sub(1)) as usize;
         let retained = if at > self.head { 0 } else { retained };
         for (index, payload) in payloads.iter().take(retained).enumerate() {
             let record = &self.records[(at.0 - self.floor.0) as usize + index];
             let lsn = Lsn(at.0 + index as u64);
             if record.timed()
-                || self
-                    .epochs
-                    .epoch(lsn)
-                    .is_some_and(|epoch| epoch != self.epoch())
+                || match self.epochs.epoch(lsn) {
+                    Some(epoch) => epoch != self.epoch(),
+                    None => genesis.immutable,
+                }
                 || record.len() != payload.len()
                 || record.load()? != *payload
             {
@@ -924,7 +1120,7 @@ impl Live {
             .try_fold(self.bytes, |used, payload| {
                 used.checked_add(record_charge(payload.len()))
             })
-            .filter(|used| *used <= quota_bytes)
+            .filter(|used| *used <= genesis.quota_bytes)
         else {
             return Ok(Err(JournalError::Full { floor: self.floor }));
         };

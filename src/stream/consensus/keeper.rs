@@ -13,6 +13,7 @@ mod recovery;
 mod repair;
 mod replacement;
 mod replicas;
+mod retirement;
 mod scrub;
 #[cfg(test)]
 mod tests;
@@ -57,6 +58,7 @@ use crate::server::durability::SyncMode;
 use crate::stream::{transport, wire::KeeperId};
 use admission::ReplicationIngress;
 pub use recovery::{Recovery, RecoveryReport};
+pub use retirement::FenceProof;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HEAD_REQUESTS: usize = 256;
@@ -737,6 +739,7 @@ impl Engine {
         listeners: [TcpListener; 3],
         admin: Option<(TcpListener, bool)>,
     ) -> io::Result<()> {
+        let _serving_media = self.disk.hold_media_lock()?;
         let mut sockets = JoinSet::new();
         let result = async {
             for (stream, reason) in self.disk.quarantined_streams() {
@@ -1511,15 +1514,19 @@ impl Engine {
                     | Request::KeeperStatus(_)
                     | Request::ClusterVersion
                     | Request::Head(_)
+                    | Request::RecoveryFence(_)
                     | Request::Configuration(_)
                     | Request::Read { .. }
                     | Request::ReadAt { .. } => admin || writer || reader,
                     Request::Seal { .. }
+                    | Request::SealSession { .. }
                     | Request::Append { .. }
                     | Request::AppendBatch { .. }
                     | Request::StageOriginal { .. }
+                    | Request::StageSessionOriginal { .. }
                     | Request::AppendOriginal { .. }
                     | Request::Written { .. }
+                    | Request::AcknowledgeRecoveryWithMarker { .. }
                     | Request::Trim { .. } => writer,
                     // An administrator may move leadership; it writes nothing.
                     Request::PreferLeader { .. } => writer || admin,
@@ -1546,6 +1553,14 @@ impl Engine {
         self.require_media()?;
         let owner = self.authorize(identity, &request)?;
         let stream = request.stream();
+        if matches!(&request, Request::Claim(genesis) if genesis.immutable)
+            && !self.disk.write_version_allows(super::CLUSTER_VERSION_V4)
+        {
+            self.sync_cluster_version().await;
+            if !self.disk.write_version_allows(super::CLUSTER_VERSION_V4) {
+                return Ok(failure(JournalError::Unsupported));
+            }
+        }
         if self.catalog_stream.is_some()
             && matches!(identity, Identity::Client(_))
             && catalog_stream::internal(&request)
@@ -1615,6 +1630,23 @@ impl Engine {
                 let Identity::Keeper(id) = identity else {
                     return Err(invalid("invalid staging sender"));
                 };
+                if genesis.immutable
+                    || self
+                        .disk
+                        .genesis(stream)
+                        .is_some_and(|local| local.immutable)
+                {
+                    return Ok(failure(JournalError::Unsupported));
+                }
+                // The replacement may not hold this stream yet. Validate
+                // its history mode against the catalog's durable claim.
+                match self.catalog_request(Request::Locate(stream)).await? {
+                    Reply::Catalog(claimed, _) if claimed == genesis => (),
+                    Reply::Catalog(claimed, _) if claimed.immutable => {
+                        return Ok(failure(JournalError::Unsupported));
+                    }
+                    _ => return Ok(failure(JournalError::Unavailable)),
+                }
                 self.stage_recovered(uuid::Uuid::from_u128(*id), genesis, stage)
                     .await
             }
@@ -1731,6 +1763,7 @@ impl Engine {
                 group.require_healthy()?;
                 let reply = match request {
                     Request::Head(_) => Ok(group.head().await),
+                    Request::RecoveryFence(_) => Ok(group.recovery_fence().await),
                     Request::Written {
                         fence,
                         at,
@@ -1802,6 +1835,22 @@ impl Engine {
                         result
                     }
                     Request::Create(_) => Ok(group.write(Command::Create).await),
+                    Request::SealSession {
+                        expected_writer_epoch,
+                        writer_session_id,
+                        ..
+                    } => {
+                        if !group.genesis.immutable {
+                            return Ok(failure(JournalError::Unsupported));
+                        }
+                        Ok(group
+                            .write(Command::SealSession {
+                                expected_writer_epoch,
+                                writer_session_id,
+                                owner: owner.unwrap(),
+                            })
+                            .await)
+                    }
                     Request::Seal {
                         expected, writer, ..
                     } if !writer.is_nil() => Ok(group
@@ -1854,8 +1903,31 @@ impl Engine {
                         payload,
                         ..
                     } => {
-                        self.stage_original(&group, owner.unwrap(), revision, &original, payload)
-                            .await
+                        self.stage_original(
+                            &group,
+                            owner.unwrap(),
+                            revision,
+                            &original,
+                            payload,
+                            None,
+                        )
+                        .await
+                    }
+                    Request::StageSessionOriginal {
+                        fence,
+                        revision,
+                        original,
+                        payload,
+                    } => {
+                        self.stage_original(
+                            &group,
+                            owner.unwrap(),
+                            revision,
+                            &original,
+                            payload,
+                            Some(fence),
+                        )
+                        .await
                     }
                     Request::AppendOriginal {
                         fence,
@@ -1909,6 +1981,31 @@ impl Engine {
                         );
                         Ok(reply)
                     }
+                    Request::AcknowledgeRecoveryWithMarker { fence, payload, .. } => {
+                        if !self.disk.write_version_allows(super::CLUSTER_VERSION_V3) {
+                            self.sync_cluster_version().await;
+                            if !self.disk.write_version_allows(super::CLUSTER_VERSION_V3) {
+                                return Ok(failure(JournalError::Unsupported));
+                            }
+                        }
+                        if payload.len() > super::MAX_RECORD {
+                            return Ok(failure(JournalError::TooLarge {
+                                max: super::MAX_RECORD,
+                            }));
+                        }
+                        let Some(at) = fence.head.0.checked_add(1).map(Lsn) else {
+                            return Ok(failure(JournalError::Conflict { head: fence.head }));
+                        };
+                        let reply = group
+                            .write(Command::AcknowledgeRecoveryWithMarker { fence, at, payload })
+                            .await;
+                        let actor = owner.as_deref().unwrap_or("unknown");
+                        let outcome = describe_audit_reply(&reply);
+                        super::logging::audit_acknowledge_recovery(
+                            self.id, stream, actor, &outcome,
+                        );
+                        Ok(reply)
+                    }
                     _ => Err(invalid("invalid application request")),
                 }?;
                 if group.state.is_quarantined() {
@@ -1928,9 +2025,13 @@ impl Engine {
         revision: u64,
         original: &[u8],
         payload: Bytes,
+        session: Option<journal_contract::WriterFence>,
     ) -> io::Result<Reply> {
         use crate::stream::timed::{EVIDENCE_BYTES, MAX_TIMED_PAYLOAD, TimedOriginal};
         let refused = |error| Ok(Reply::Decision(Outcome::Refused(error)));
+        if group.genesis.immutable != session.is_some() {
+            return refused(JournalError::Unsupported);
+        }
         let Some(timed) = self.timed.clone() else {
             return refused(JournalError::Unavailable);
         };
@@ -1959,7 +2060,14 @@ impl Engine {
             return refused(JournalError::Unavailable);
         }
         match &view.writer {
-            Some((fence, principal)) if fence.epoch == original.epoch && *principal == owner => (),
+            Some((fence, principal))
+                if fence.epoch == original.epoch
+                    && *principal == owner
+                    && session.is_none_or(|session| {
+                        session.stream == original.stream
+                            && session.writer_epoch == fence.epoch
+                            && session.writer_session_id.0 == fence.writer.as_u128()
+                    }) => {}
             writer => {
                 return refused(JournalError::Fenced {
                     current: writer.as_ref().map_or(Epoch(0), |(fence, _)| fence.epoch),
@@ -2409,6 +2517,18 @@ impl Group {
                 .written(fence.epoch, at, payloads)
                 .await
                 .map(Outcome::At)
+                .into(),
+        )
+    }
+
+    async fn recovery_fence(&self) -> Reply {
+        if let Err(reply) = self.barrier(Instant::now() + REQUEST_TIMEOUT).await {
+            return reply;
+        }
+        Reply::Decision(
+            self.state
+                .recovery_fence()
+                .map(Outcome::RecoveryFence)
                 .into(),
         )
     }

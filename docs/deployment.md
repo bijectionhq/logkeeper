@@ -14,8 +14,9 @@ Packaging lives in [`deploy/consensus/`](../deploy/consensus/):
 | File | What it is |
 | --- | --- |
 | `Dockerfile` | Multi-stage image, non-root (uid 10001), media and registry volumes, healthcheck on `/live` |
+| `release.py` | Build and verify a commit-pinned OCI image archive for Linux amd64 and arm64 |
 | `logkeeper-consensus.service` | Hardened systemd unit with a 30 s stop timeout |
-| `kubernetes/` | Kustomize base: StatefulSet, pre-bound local volumes, PodDisruptionBudget, generated keeper configs |
+| `kubernetes/` | Kustomize bundle for six single-keeper StatefulSets across three zones |
 | `keeper.example.json`, `placement.example.json`, `provision.example.json` | One keeper's config and its registry authority files |
 | `rtdb-journal.example.json` | The RTDB side: a Logkeeper `JournalConfig` |
 | `operator.example.json` | What `logkeeper admin` reads: the operator's credentials and every keeper's application and admin address |
@@ -24,6 +25,38 @@ Packaging lives in [`deploy/consensus/`](../deploy/consensus/):
 `cargo test --features stream --test deploy_examples` checks that the example
 configs parse the way the keeper and the client read them, and that they agree
 with each other.
+
+## Release candidate and qualification
+
+Run the **Consensus qualification** workflow manually on the commit under
+review. It requires the normal CI suite, the fixed fault-injection window in
+both profiles, the full TLC checks, the Lean consensus and correspondence
+checks, and the selected Verus production proofs and controls. The scheduled
+run rotates the fault seed window each week. The reports retain the commit,
+seed ranges and failures. The manual run emits an OCI candidate artifact only
+after the checks pass. The artifact contains `release.json`, the image archive
+and their transport checksums in `SHA256SUMS`. Keep the qualification reports
+with the candidate and the previously qualified digest for rollback.
+
+For a local build, create a Docker Buildx `docker-container` builder with
+[this workflow's BuildKit image](../.github/workflows/consensus-qualification.yml).
+The builder needs both Linux platforms for the standard bundle. Use a new
+output path for each attempt.
+
+```sh
+python3 deploy/consensus/release.py --ref HEAD --builder logkeeper-release --output candidate
+(cd candidate && shasum -a 256 -c SHA256SUMS)
+```
+
+The build takes source files from the specified Git commit and uses the locked
+Cargo dependencies, pinned base images, dated Debian package archives, and
+commit timestamps. Refresh the base digests and Debian snapshot together when
+qualifying updated dependencies. The release record lists the OCI image index
+digest and each platform manifest digest. Compare the OCI digests across
+independent builds using the same builder image and platform set. Verify the
+registry's digest after an authorized staging import, and pin that digest in
+the staging configuration. Distribute the archive and qualification evidence
+through trusted release storage and use `SHA256SUMS` to check transport.
 
 ## What a keeper is
 
@@ -38,16 +71,9 @@ shared segmented WAL. It listens on three TCP ports, each with mutual TLS 1.3:
 | Bulk and replication | `bulk` | Keepers only: AppendEntries batches and snapshot files | Bulk `/3`, `/2`. Replication `/4`, `/3` |
 | Admin | `admin.listen` | Probes, metrics scrapers, operators | Plain HTTP on loopback, or mTLS |
 
-Every address in the inventory (`keepers`, `peers`, `bulk`) is `IP:port` or
-`name:port`. A DNS name resolves at every connect, trying each address it
-returns, so a keeper that comes back on a new IP (a rescheduled pod) is found
-again under the same name. The name is never trusted for identity: every
-connection checks that the peer's certificate URI names the keeper the route
-was for, and refuses it otherwise. A keeper binds the `peers` and `bulk`
-addresses its own inventory lists for itself: an IP address as given, a name
-on `0.0.0.0` at its port. `listen` stays an IP address. Two different names
-for one endpoint are not detected as duplicates, so give each keeper one
-spelling everywhere.
+A keeper binds the `peers` and `bulk` addresses that its own inventory lists
+for itself. Every address in the inventory is an `IP:port` (`SocketAddr`), and
+DNS names are not accepted, so each keeper needs a stable IP address.
 
 A stream has three voters in three distinct failure domains. It commits with
 two. Each stream's leader:
@@ -412,53 +438,67 @@ keepers are up.
 
 ### Kubernetes
 
-[`deploy/consensus/kubernetes/`](../deploy/consensus/kubernetes/) is a
-Kustomize base. Render it with `kubectl kustomize`, and validate it with
-`deploy/consensus/tests/validate.sh`. The design choices follow from the
-keeper's rules:
+The [Kustomize bundle](../deploy/consensus/kubernetes/) is a staging template
+for six keepers on six dedicated nodes, with two nodes per zone. Each keeper
+has its own singleton StatefulSet, node IP, and TLS Secret. Its two retained
+local PVs bind to the same host and point to separate media and enrollment
+filesystems. All six pods have required hostname anti-affinity. Zone selectors
+put two keepers in each zone, and the three initial catalog voters occupy three
+different zones. Clients and peers connect to the node addresses in the
+inventory. The headless Service provides StatefulSet identity.
+DNS names also work in keeper inventories. For this template use the stable
+node addresses that match the workload placement and server certificates.
 
-- **Host network, pre-bound local volumes.** The manifests list each keeper
-  by its node's IP, so each pod runs on the host network. The inventory now
-  also accepts DNS names, so pods can instead be listed by their headless
-  service names (`logkeeper-N.logkeeper.<namespace>.svc.cluster.local:port`,
-  with `publishNotReadyAddresses: true` so peers resolve a keeper before it
-  is ready) and drop host networking; the manifests have not moved to that
-  yet. `volumes.yaml` pre-binds pod N's
-  claims (`media-logkeeper-N`, `registry-logkeeper-N`) to local volumes on
-  node N, which pins pod N to the node whose IP is in keeper N's config.
-- **Stable keeper ID per pod.** The `install` init container takes the pod
-  ordinal from the pod name. It copies `keepers/keeper-N.json` to the config
-  path, and `placement.json` and `keeper-N.provision.json` into the registry
-  volume. It installs media only if the media has no `KEEPER` file *and* the
-  keeper's UUID is listed in the `logkeeper-initialize` ConfigMap. Otherwise
-  it fails, which is the never-reuse rule.
-- **Zones:** required anti-affinity on `topology.kubernetes.io/zone` and on
-  `kubernetes.io/hostname`.
-- **Probes:** a startup and liveness probe on `/live`, and readiness on
-  `/ready`. Both use `curl` on loopback inside the pod, because a
-  plain admin listener only binds loopback.
-- **Rolling updates:** `podManagementPolicy: Parallel`, so the three pods can
-  find each other at first start. `RollingUpdate` with `maxUnavailable: 1`
-  and `minReadySeconds: 30` replaces one pod at a time and waits for `/ready`.
-- **PodDisruptionBudget:** `maxUnavailable: 1`.
-- **preStop:** waits up to 240 s for `/safe-to-stop`. SIGTERM then
-  hands off leadership. `terminationGracePeriodSeconds: 300` covers both.
-- **Certificates:** one Secret, `logkeeper-tls`, holds every keeper's
-  `keeper-N.pem` and `keeper-N.key`, plus `ca.pem`. A plain StatefulSet cannot
-  mount a different Secret per pod. Use the cert-manager CSI driver, or
-  similar, to give each pod only its own key.
+1. Prepare six dedicated staging nodes. Provide the host networking permission
+   required by the namespace, set the zone labels, mount their two filesystems,
+   and verify that UID/GID `10001` can write to both mounts. Set the hostname,
+   path and storage size for each PV in `volumes.yaml`. Keep registry storage
+   and its recovery copies independent of keeper media.
+2. Set each workload's zone selector and the corresponding keeper's node IP
+   in **every** inventory. Keep `placement.json`, each provision document and
+   the RTDB journal and operator configs in agreement. Allow application port
+   `5441` from approved clients and keepers, control and bulk ports `5541` and
+   `5641` between keepers, and admin port `5741` from approved operators,
+   scrapers and keepers. Restrict these host-network listeners with node or
+   network controls. The probe listener on loopback port `5742` serves only
+   `/live` and `/ready`.
+3. In the staging namespace, create six Secrets named `logkeeper-tls-0`
+   through `logkeeper-tls-5`. Give each Secret keys `tls.crt`, `tls.key` and
+   `ca.crt` for that keeper only. Give the leaf both client and server usages,
+   the keeper's URI SAN, and its node IP as an IP SAN so that the rollover
+   guard can verify the admin server. Set the `certificate_sha256` of each
+   provision document to the SHA-256 hash of its `tls.crt` file. Set the
+   metrics principal in `admin.metrics_readers` if enabling metrics collection.
+4. In the staging Kustomization, set an `images` mapping for
+   `logkeeper-consensus` to the pinned registry image name and digest. List
+   only the six new UUIDs in `logkeeper-initialize` for first bring-up.
+   The init container selects its public config by keeper ordinal. It refuses
+   to start on media with no `KEEPER` marker unless the UUID is explicitly
+   authorized to initialize. Use the [disk replacement runbook](runbooks/replace-disk.md)
+   for lost media.
+5. Render the staged configuration and run `deploy/consensus/tests/validate.sh`
+   with `kubeconform` available. Apply to the staging context and check all
+   six workloads.
 
-Create the Secret, set the node IPs, node names and certificate digests, and
-set `logkeeper-initialize` to the three UUIDs for the first rollout. Then run:
+   ```sh
+   kubectl --context "$STAGING_CONTEXT" apply -k deploy/consensus/kubernetes
+   for keeper in logkeeper-0 logkeeper-1 logkeeper-2 logkeeper-3 logkeeper-4 logkeeper-5; do
+     kubectl --context "$STAGING_CONTEXT" -n logkeeper rollout status "statefulset/$keeper" --timeout=15m || break
+   done
+   kubectl --context "$STAGING_CONTEXT" -n logkeeper get pods,poddisruptionbudgets
+   ```
 
-```sh
-kubectl apply -k deploy/consensus/kubernetes
-kubectl -n logkeeper rollout status statefulset/logkeeper
-```
+6. Empty `logkeeper-initialize` and reapply immediately after bring-up. It is
+   a stable-name ConfigMap so clearing the bootstrap authorization leaves
+   the pod templates alone. Keep the authorization empty during normal
+   operation.
 
-Because the ConfigMap is generated with a hash suffix, empty the
-`logkeeper-initialize` literal in `kustomization.yaml` and apply again once
-all keepers are ready.
+Use the [guarded rollover procedure](runbooks/rolling-upgrade.md#kubernetes)
+for voluntary restarts. StatefulSets use `OnDelete` and the shared
+PodDisruptionBudget permits a single voluntary disruption through the
+Eviction API. The rollover guard checks the keeper's `/safe-to-stop` report
+before submitting the eviction. Node failure and liveness-triggered restarts
+can happen independently of these controls.
 
 ### systemd
 
@@ -579,6 +619,21 @@ earlier media format.
 The procedure is in the [rolling-upgrade runbook](runbooks/rolling-upgrade.md).
 The [rolling-upgrade test](../tests/rolling_upgrade.rs) runs it in process.
 
+### Immutable stream histories
+
+After every active keeper advertises immutable-stream support, finalize cluster version 4.
+The journal contract can then create a stream with `create_immutable`.
+Its durable genesis selects the history mode for that stream ID.
+Each writer residence holds a distinct session, and its seal binds the next epoch to that session and the exact committed head.
+Append, trim, and timed reservations carry the resulting session fence.
+A consumer following a committed head can request a page that covers that head and resume at the next position.
+
+Replica repair and joint membership changes preserve the same stream ID and history.
+When the original quorum is permanently lost, a recovery that accepts a cut uses a fresh stream ID.
+Consumers such as RTDB can restore an application cut and authorize a successor for the stable database name through a separately available authority.
+The application's archived cut sets the recovery point.
+Same-stream recovery is available for legacy mutable streams.
+
 ## Backup and restore
 
 What exists:
@@ -590,7 +645,7 @@ What exists:
   restores the exact snapshot bytes that the local WAL's digest names, onto a
   stopped keeper whose WAL is intact. It is for a damaged snapshot file, not
   for disaster recovery.
-- **`keeper recover-stream`** rebuilds a stream from its last surviving voter
+- **`keeper recover-stream`** rebuilds a legacy mutable stream from its last surviving voter
   after two are lost, accepting possible loss of acknowledged records.
 - **RTDB checkpoints** in object storage hold each database's state up to its
   last checkpoint. The journal holds only the suffix after it.
@@ -614,7 +669,11 @@ Recommendations:
 1. Treat the journal as a replicated log, not a backup target. Run six
    keepers (two per zone) so repair has somewhere to go.
 2. Back up what RTDB needs to rebuild: object-storage checkpoints with
-   versioning and object lock, and RTDB's own `rtdb admin export`.
+   versioning and object lock. RTDB Multi's `rtdb admin export` returns a
+   checkpoint ticket tied to its source custody. Verify a cold application
+   restore with the original processes and journals absent before counting
+   a checkpoint ticket as a portable backup.
+   RTDB Multi's portable backup rehearsal uses an authenticated archive and independently available key custody to seed a fresh immutable stream.
 3. Back up the operator artifacts: keeper configs, `placement.json`,
    provision files, the CA and client certificates, and the inventory of which
    UUIDs are in service and which are retired. Do not back up private keys of
@@ -628,8 +687,9 @@ Most are items in the consensus design's review tables.
 
 | Missing | Effect | Workaround |
 | --- | --- | --- |
+| DNS names in the inventory | Keepers need stable IPs; Kubernetes uses host networking | Static IPs, pinned nodes |
 | Runtime inventory change (T19) | Adding a keeper restarts every keeper | Plan the count; restart one at a time |
 | Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |
 | Online backup and export | See [backup](#backup-and-restore) | RTDB checkpoints |
-| Catalog-bounded leases | A lost keeper that never stopped stays certified and, with the other lost keeper, can keep leading the old configuration. Restarting lost keepers are fenced by placement certification | Fence both lost keepers before `recover-stream` (`--lost` states it) |
+| Disaster restore without original enrollment | An inaccessible old pair cannot produce retirement proofs. One survivor cannot safely repair the old quorum | Restore enough original participants, or rebuild a fresh isolated cell from a qualified application backup |

@@ -490,6 +490,87 @@ fn keeper_config_warns_on_unknown_fields_while_journal_config_stays_strict() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scrub_quarantines_a_parked_snapshot_without_serving_a_read() {
+    use std::os::unix::fs::FileExt;
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let client = cluster.client(&cluster.credentials);
+    let stream = StreamId(221);
+    let sibling = StreamId(222);
+    client.create(stream, [a, b, c], 4096).await.unwrap();
+    client.create(sibling, [a, b, c], 4096).await.unwrap();
+    let fence = client
+        .seal(stream, Epoch(0), Uuid::new_v4())
+        .await
+        .unwrap()
+        .fence;
+    client
+        .append(stream, fence, Lsn(1), Bytes::from_static(b"scrub this"))
+        .await
+        .unwrap();
+
+    let leader = cluster.leader(stream).await;
+    let victim = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
+    cluster.running.remove(&victim).unwrap().stop().await;
+    cluster
+        .configs
+        .get_mut(&victim)
+        .unwrap()
+        .scrub_bytes_per_second = 2 << 20;
+    cluster.restart(victim).await;
+    let group = cluster.group(victim, stream).await;
+    group
+        .raft
+        .wait(Some(WAIT))
+        .metrics(|_| group.state.head() == Ok(Lsn(1)), "victim applied LSN 1")
+        .await
+        .unwrap();
+    let cut = group.state.applied().unwrap();
+    group.raft.trigger().snapshot().await.unwrap();
+    timeout(WAIT, group.state.wait_for_snapshot(cut))
+        .await
+        .unwrap()
+        .unwrap();
+    let (file, offset) = group.state.payload_path().unwrap();
+    let engine = &cluster.running[&victim].engine;
+    engine.park(stream).await;
+    assert!(!engine.groups.lock().await.contains_key(&stream));
+    drop(group);
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file)
+        .unwrap();
+    let mut byte = [0];
+    file.read_exact_at(&mut byte, offset).unwrap();
+    file.write_all_at(&[!byte[0]], offset).unwrap();
+    file.sync_all().unwrap();
+
+    timeout(WAIT, async {
+        while !engine.disk.is_quarantined(stream) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("online scrub must find damage without a read");
+    let report = engine.disk.quarantined_streams();
+    assert!(report[&stream].starts_with("integrity scrub:"));
+    assert!(!engine.is_quarantined(sibling));
+    assert_eq!(client.head(sibling).await.unwrap(), Lsn(0));
+    assert_eq!(
+        client
+            .read(stream, Lsn(1), 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
+        vec![(Lsn(1), Bytes::from_static(b"scrub this"))]
+    );
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn checksum_failure_quarantines_durably_survives_restart_triggers_repair_and_clears() {
     use std::io::{Read, Seek, SeekFrom, Write};
 

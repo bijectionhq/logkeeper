@@ -44,7 +44,8 @@ LSN 1. The **head** is the last committed LSN, or 0 for an empty stream. A
 | `NotFound` | The stream does not exist at the responding authority. |
 | `Deleted` | The stream was deleted. |
 | `Unavailable` | Retry. A mutation's outcome may be unknown. |
-| `Recovered { head: Lsn }` | An operator recovered the stream from a minority after acknowledging data loss. The journal holds `head`, which may be below previously acknowledged positions. `seal` returns it until an administrator acknowledges the recovery. |
+| `Recovered { head: Lsn }` | An operator recovered the stream from a minority after acknowledging data loss. The journal holds `head`, which may be below previously acknowledged positions. `seal` returns it until a writer or an administrator acknowledges the recovery. |
+| `Unsupported` | The journal or its finalized cluster version does not support the requested operation. |
 
 Committed records are contiguous and immutable. Seal covers acknowledged
 appends and prevents lower epochs from committing new records. Head is
@@ -63,6 +64,31 @@ listed in `writers` may create, seal, append, trim or delete. The optional
 takeover policy and applies records through the head returned by seal before
 serving. A stream moved between ensembles admits writes through at most one
 authority across crashes and stale routes.
+
+### Immutable consensus histories
+
+Finalized cluster version 4 admits immutable genesis for fresh streams.
+Create claims the history mode with the stream ID, so re-creating a legacy ID as an immutable history conflicts.
+Opening a claimed stream can check that mode through `require_immutable` without a write.
+The legacy wire and persisted genesis remain decodable, and immutable genesis requires a version-4 keeper.
+
+An immutable stream uses `seal_session` to advance an expected writer epoch.
+The new fence binds the stream, principal, and writer session, and a retry by that session returns the original sealed head while the fence remains current.
+A batch commits only at the next LSN; an exact retained retry returns its last LSN and a partial overlap conflicts.
+`read_page` exposes an explicit minimum applied head through the scoped read path.
+
+Membership changes preserve the stream's committed history.
+If its quorum cannot recover, open the restored application cut in a successor stream with a fresh ID.
+
+### Legacy consensus recovery acknowledgement
+
+A journal that supports operator recovery can expose its active `RecoveryFence { epoch, head }` through a linearizable `recovery_fence` read.
+At finalized cluster version 3 a consensus writer can call `acknowledge_recovery_with_marker(stream, fence, payload)`.
+The operation commits at `fence.head + 1` under `fence.epoch` and clears that exact fence in the same decision.
+If the payload cannot be appended, the fence stays in place.
+A stale token or a different payload cannot change the result of an earlier acknowledgement.
+An identical retry returns the retained marker position.
+An operator-directed acknowledgement can still lift the fence without appending a marker.
 
 ## 3. The keeper protocol
 
@@ -205,6 +231,9 @@ requests require writer authorization.
   connections, so they never delay the shared connection's replies.
 
 ### Timed original proofs
+
+An immutable stream's writer session controls both the provisional durability reservation and the final committed append.
+Retained proof reads remain available independently of the current writer, while a retry through the append API still requires its original session fence.
 
 The `Writer` can be commissioned to prove a timed original append on the same stream. The request binds the stream, sealed writer epoch, next LSN, exact payload SHA-256, exclusive journal cutoff and original receiver certificate SHA-256. The first two keepers in the sealed ensemble stage and sync the original bytes, then independently sign conservative upper bounds for that durability event. Both bounds must be strictly before the original cutoff. The writer publishes the timed entry through the same committed-prefix protocol as other appends.
 

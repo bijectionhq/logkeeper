@@ -536,6 +536,9 @@ impl SimCluster {
         let mut req = Recovery::default();
         req.acknowledge_data_loss = true;
         req.lost = Some(lost);
+        // Explore histories created by older operator recovery tools, whose
+        // replaced keepers can still restart as part of the fault schedule.
+        req.legacy_unfenced = true;
         let report = self.configs[&survivor].recover_stream(stream, req).await;
         self.restart(survivor).await;
         if report.is_ok() {

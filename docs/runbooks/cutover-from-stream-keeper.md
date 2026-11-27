@@ -58,18 +58,18 @@ Phase 2 procedure in reverse.
 
 ## Phase 2: move existing databases
 
-An existing database moves by being re-created in the new cell from its
-checkpoint, for example with `rtdb admin export` in the old cell and
-`rtdb admin restore NAME SOURCE CHECKPOINT_HEX` in the new one. RTDB owns
-these commands and their exact semantics. **Qualify the move on a copy of
-each database class in staging before using it in production.** No Logkeeper
-step is needed: the new database's stream is created on the consensus
-keepers when the new cell opens it. Per database:
+Run only after qualifying an application export and import that work across
+independent RTDB Multi cells. A managed `rtdb admin export NAME BASIS_HEX
+PIN_UUID` returns a ticket whose restore can require the original source
+deployment, catalog, and checkpoint custody. Copying that ticket alone to
+the new cell is insufficient. Rehearse the chosen transfer on a copy of
+each database class. The destination must create fresh journal streams
+with fresh identities. Per database:
 
 1. Quiesce writes to the database in the old cell, then take its final
    checkpoint, so the old journal suffix after it is empty.
-2. Restore into the new cell from that checkpoint, and verify it, for example
-   with row counts and the last transaction IDs.
+2. Import into the new cell from the qualified application artifacts. Verify
+   data, transaction IDs and receipt semantics against the closed source cut.
 3. Switch the database's clients to the new cell.
 4. **Keep the old database and its journal** on the old stream keepers,
    read-only, until Phase 3. Do not delete or trim them.
@@ -98,9 +98,6 @@ So keep the soak short per database, and move databases in small batches.
 
 ## What is missing
 
-- In-place migration of a database's journal between backends (Logkeeper
-  and RTDB).
-- RTDB-side acknowledgement of `Recovered` and `hold_writes_after_recovery`,
-  which the design approves but RTDB has not built at its current pin.
-- Terraform support for `logkeeper-consensus://`: RTDB's
-  `aws/terraform/rtdb-cluster` accepts only `logkeeper+tls://`.
+- In-place migration of a database journal between backends.
+- A qualified cold backup and restore for managed RTDB Multi across separate
+  catalogs. Treat this as a release gate for existing databases.

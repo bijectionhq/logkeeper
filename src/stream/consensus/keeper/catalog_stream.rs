@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 use super::{Engine, Group, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
 use crate::stream::consensus::{
-    Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, decode, encode,
+    Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, catalog, decode, encode,
     state::{Command, Outcome},
     storage::CatalogEntry,
 };
@@ -170,6 +170,7 @@ impl CatalogStream {
             stream: STREAM,
             voters,
             quota_bytes: QUOTA_BYTES,
+            immutable: false,
         };
         Self {
             fold: Mutex::new(Fold::new(&genesis, Lsn(1))),
@@ -473,6 +474,9 @@ impl Engine {
                 .entries
                 .get(&stage.stream)
                 .ok_or_else(|| invalid("missing catalog entry"))?;
+            if !catalog::admits_stage(entry, &stage) {
+                return Ok(catalog::stage_conflict());
+            }
             if entry.staged.as_ref() == Some(&stage) {
                 return Ok(Reply::Staged(stage));
             }
@@ -823,11 +827,13 @@ mod tests {
             stream: STREAM,
             voters: [ids[0], ids[1], ids[2]],
             quota_bytes: QUOTA_BYTES,
+            immutable: false,
         };
         let genesis = |voters| Genesis {
             stream: StreamId(7),
             voters,
             quota_bytes: 4096,
+            immutable: false,
         };
         let first = genesis([ids[0], ids[1], ids[2]]);
         let stage = Stage {

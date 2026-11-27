@@ -1,5 +1,5 @@
 mod file;
-mod index;
+pub(super) mod index;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -14,7 +14,7 @@ use std::{
 
 use bincode::Options;
 use futures::TryStreamExt;
-use journal_contract::{Epoch, JournalError, Lsn, Page, StreamId};
+use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryFence, StreamId};
 use openraft::{
     EntryPayload, OptionalSend, RaftSnapshotBuilder,
     storage::{EntryResponder, RaftStateMachine},
@@ -140,6 +140,9 @@ impl Image {
     }
 
     fn verify_placement(&self, placement: &Placement, genesis: &Genesis) -> io::Result<()> {
+        if !self.state.matches_genesis(genesis) {
+            return Err(invalid("snapshot history differs from its genesis"));
+        }
         let membership = self.membership.membership();
         let current = self
             .configuration
@@ -220,7 +223,7 @@ pub(in crate::stream::consensus) struct StateMachine {
     inner: Arc<Inner>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(in crate::stream::consensus) struct Selected {
     pub log_id: LogId,
     pub(super) digest: [u8; 32],
@@ -692,6 +695,11 @@ impl StateMachine {
         self.inner.applied.read().state.head()
     }
 
+    pub fn recovery_fence(&self) -> journal_contract::Result<Option<RecoveryFence>> {
+        self.head()?;
+        self.inner.applied.read().state.recovery_fence()
+    }
+
     pub async fn page(&self, from: Lsn, limit: usize) -> journal_contract::Result<Page> {
         if self.is_quarantined() {
             return Err(JournalError::Corrupted);
@@ -996,7 +1004,7 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
         let started = std::time::Instant::now();
         let last = entries.last().map(|entry| entry.log_id.index);
         let may_read_snapshot = self.head().is_ok_and(|head| entries.iter().any(|entry| {
-            matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } | Command::AppendOriginal { at, .. } if *at <= head))
+            matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } | Command::AppendOriginal { at, .. } | Command::AcknowledgeRecoveryWithMarker { at, .. } if *at <= head))
         }));
         let outcomes = if may_read_snapshot {
             let inner = self.inner.clone();

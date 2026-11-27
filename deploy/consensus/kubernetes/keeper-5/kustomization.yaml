@@ -1,0 +1,27 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: [../keeper-base]
+nameSuffix: "-5"
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: logkeeper
+        labels:
+          logkeeper.bijectionhq.com/keeper-ordinal: "5"
+      spec:
+        selector:
+          matchLabels:
+            logkeeper.bijectionhq.com/keeper-ordinal: "5"
+        template:
+          metadata:
+            labels:
+              logkeeper.bijectionhq.com/keeper-ordinal: "5"
+          spec:
+            nodeSelector:
+              topology.kubernetes.io/zone: zone-c
+            volumes:
+              - name: tls
+                secret:
+                  secretName: logkeeper-tls-5

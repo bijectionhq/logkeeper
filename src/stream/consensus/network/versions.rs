@@ -26,6 +26,12 @@ impl Request {
     /// The wire version that introduced this request.
     pub(in crate::stream::consensus) fn introduced(&self) -> WireVersion {
         match self {
+            Self::Claim(genesis)
+            | Self::ReadAt { genesis, .. }
+            | Self::StageReplica { genesis, .. }
+            | Self::InstallReplica { genesis, .. }
+            | Self::StageRecovered { genesis, .. }
+                if genesis.immutable => WireVersion::Current,
             Self::Claim(_)
             | Self::Locate(_)
             | Self::Stage(_)
@@ -58,7 +64,11 @@ impl Request {
             | Self::Staging(_)
             | Self::ClusterVersion
             | Self::FinalizeVersion(_)
-            | Self::ClearQuarantine(_) => WireVersion::Current,
+            | Self::ClearQuarantine(_)
+            | Self::RecoveryFence(_)
+            | Self::AcknowledgeRecoveryWithMarker { .. }
+            | Self::SealSession { .. }
+            | Self::StageSessionOriginal { .. } => WireVersion::Current,
         }
     }
 }
@@ -82,6 +92,7 @@ impl Frame {
     pub(in crate::stream::consensus) fn introduced(&self) -> WireVersion {
         match self {
             Self::Client(request) => request.introduced(),
+            Self::Peer(genesis, _) if genesis.immutable => WireVersion::Current,
             Self::Peer(_, request) => request.introduced(),
             Self::Liveness(_) => WireVersion::Previous,
             Self::Ping { .. } => WireVersion::Current,
@@ -109,8 +120,8 @@ impl Reply {
     }
 }
 
-/// The wire version that introduced `outcome`. No outcome is newer than N-1
-/// yet; one that is needs a mapping in `outcome_v1`.
+/// The wire version that introduced `outcome`. Newer outcomes are
+/// translated to `Unavailable` by `outcome_v1`.
 pub(in crate::stream::consensus) fn outcome_introduced(outcome: &Outcome) -> WireVersion {
     match outcome {
         Outcome::Unit
@@ -120,6 +131,7 @@ pub(in crate::stream::consensus) fn outcome_introduced(outcome: &Outcome) -> Wir
         | Outcome::Configuration(_)
         | Outcome::OriginalSample(_)
         | Outcome::OriginalEvidence(_) => WireVersion::Previous,
+        Outcome::RecoveryFence(_) => WireVersion::Current,
         Outcome::Refused(error) => error_introduced(error),
     }
 }

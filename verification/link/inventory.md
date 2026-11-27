@@ -91,6 +91,61 @@ the module named in each Verus area's README.
 | `verification/verus/compact_image/layout.rs` | `compactImageBytesAdmissible` | `Logkeeper.CompactImage.compactImageBytesAdmissible` | Open — typed admission conditions and exact consumed-byte layout projection |
 | `verification/verus/compact_image/layout.rs` | `compactImageLayoutBytes` | `Logkeeper.CompactImage.compactImageLayoutBytes` | Open — typed admission conditions and exact consumed-byte layout projection |
 | `verification/verus/compact_image/layout.rs` | `oldRootsInOrder` | `Logkeeper.CompactImage.strictlyIncreasingKeys` | Open — tuple row projection in the layout proof |
+| `verification/verus/consensus_admission/laws.rs` | `a_checkpoint_past_the_boundary_is_refused` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `a_named_voter_never_refuses_a_vote` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `a_parked_follower_holds_the_leaders_applied_log` | `Parking.accept_requires_exact_log` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `a_parked_replica_reopens_only_for_work` | `Parking.parked_answers_preserve_state` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `a_recently_heard_voter_is_not_silent` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `a_recovery_fence_refuses_every_seal` | `RecoveryFence.fence_refuses_every_seal` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `a_recovery_restages_only_its_own_aborted_copy` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `a_repair_pass_respects_its_slots` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `a_reused_keeper_grants_nothing` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `a_reused_keeper_never_registers` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `a_roster_moves_only_with_two_live_voters` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `accepted_batches_are_consecutive` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `admitted_body_preserves_budgets` | `PeerBudget.reserve_body_preserves_budget` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `an_aborted_move_restages_only_for_the_same_source` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `average_keepers_stay_roomy` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `backoff_is_bounded_and_grows` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `dead_only_after_the_repair_delay` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `distance` | — | Local — consensus admission harness helper or subproof |
+| `verification/verus/consensus_admission/laws.rs` | `grown_is_bounded` | — | Local — consensus admission harness helper or subproof |
+| `verification/verus/consensus_admission/laws.rs` | `grown_never_shrinks` | — | Local — consensus admission harness helper or subproof |
+| `verification/verus/consensus_admission/laws.rs` | `key_less` | — | Local — consensus admission harness helper or subproof |
+| `verification/verus/consensus_admission/laws.rs` | `leadership_moves_only_to_a_matched_voter` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `learners_leave_only_after_the_stale_delay` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `one_sender_leaves_control_work_for_others` | `PeerBudget.saturated_data_admits_control_and_maintenance` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `one_sender_leaves_the_others_their_frames` | `PeerBudget.one_sender_cannot_spend_others_remaining_body_capacity` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `one_sender_leaves_the_others_their_share` | `PeerBudget.one_sender_cannot_spend_others_remaining_body_capacity` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `only_a_quiet_applied_uniform_group_is_idle` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `only_a_settled_idle_leader_parks` | `Parking.leader_parks_only_settled` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `only_another_incarnation_is_a_reuse` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `only_certified_members_serve_reads` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `only_installed_members_vote` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `only_orphaned_copies_seek_retirement` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `only_superseded_outsiders_are_excluded` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `ordinary_admission_keeps_reserved_classes_feasible` | `PeerBudget.saturated_data_admits_control_and_maintenance` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `oversized_batches_shrink` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `payload_append_is_never_control` | `PeerBudget.control_header_cannot_dispatch_payload` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `recovery_needs_acknowledgement_and_no_live_quorum` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `recovery_outranks_the_lost_history` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `release_is_exact` | `PeerBudget.reserve_body_preserves_budget` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `repair_order_prefers_priority_then_rotation` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `replay_detects_a_rolled_back_segment` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `restart_never_restores_leadership` | `RestartRead.present_never_restores_leadership` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `restart_trusts_the_newest_intact_slot` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `restores_leader` | — | Local — consensus admission harness helper or subproof |
+| `verification/verus/consensus_admission/laws.rs` | `retirement_never_removes_a_named_copy` | `RetireOnProof.retired_copy_outside_every_quorum` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `rotation_serves_a_ready_lane_within_five` | `PeerBudget.persistent_lane_served_within_five` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `slow_media_is_never_responsive` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `snapshots_use_bulk` | `PeerBudget.vote_and_empty_append_are_control` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `suffix_admission_respects_the_limit` | `Headroom.Follower.trace_preserves_all_budgets` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `the_catalog_fences_only_superseded_configurations` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `total` | — | Local — consensus admission harness helper or subproof |
+| `verification/verus/consensus_admission/laws.rs` | `total_grows` | — | Local — consensus admission harness helper or subproof |
+| `verification/verus/consensus_admission/laws.rs` | `version_mismatch_never_triggers_repair` | — | Open — the area README documents the production property |
+| `verification/verus/consensus_admission/laws.rs` | `vote_and_metadata_only_append_are_control` | `PeerBudget.vote_and_empty_append_are_control` | Open — the area README relates this law to the model theorem |
+| `verification/verus/consensus_admission/laws.rs` | `write_version_and_peer_feature_gates` | — | Open — the area README documents the production property |
 | `verification/verus/mirrored_voter_media/laws.rs` | `a_mismatched_digest_is_ineligible` | — | Local — digest comparison helper |
 | `verification/verus/mirrored_voter_media/laws.rs` | `a_reply_requires_both_syncs` | `SelectionFence.SyncTrace`, `mirrored`, `reply_requires_both_syncs` | Open — guarded match and projection from physical write log to inductive trace |
 | `verification/verus/mirrored_voter_media/laws.rs` | `a_sync_or_tear_keeps_the_acknowledged_rank` | `SelectionFence.Keeps`, `Step` | Predicate link via `link_keeps` (rank predicate) |
@@ -200,6 +255,8 @@ the module named in each Verus area's README.
 | `verification/verus/ordered_receipt/laws.rs` | `replay_mutation` | `Logkeeper.Protocol.Ordered.replay_mutation` | Equivalence |
 | `verification/verus/ordered_receipt/laws.rs` | `retain_applied` | `Logkeeper.Protocol.Ordered.retain_applied` | Equivalence |
 | `verification/verus/ordered_receipt/laws.rs` | `retains_receipt` | `Logkeeper.Protocol.Ordered.retains_receipt` | Equivalence |
+| `verification/verus/ordered_replay/laws.rs` | `bounded_replay_emits_original_record` | — | Local — ordered replay harness does not name a Lean counterpart |
+| `verification/verus/ordered_replay/laws.rs` | `exhausted_replay_has_the_original_terminal_cut` | — | Local — ordered replay harness does not name a Lean counterpart |
 | `verification/verus/ordered_replay/laws.rs` | `included` | — | Local — ordered replay harness does not name a Lean counterpart |
 | `verification/verus/ordered_replay/laws.rs` | `replay_head_and_page_charge_the_exact_successor` | — | Local — ordered replay harness does not name a Lean counterpart |
 | `verification/verus/ordered_replay/laws.rs` | `resume_requires_exact_cut_in_original_interval` | — | Local — ordered replay harness does not name a Lean counterpart |
@@ -308,6 +365,7 @@ the module named in each Verus area's README.
 | `verification/verus/rotation_slot_evidence/laws.rs` | `recording_a_rotation_vote_preserves_exact_configured_rows` | `SelectionFence.RotationEvidence`, `StrictMajority`, `rotation_evidence_names_a_majority_with_both_exact_reads` | Open — voter evidence and roster/selected prefix composition |
 | `verification/verus/rotation_slot_evidence/laws.rs` | `rotation_evidence_names_a_majority_with_both_exact_reads` | `SelectionFence.RotationEvidence`, `StrictMajority`, `rotation_evidence_names_a_majority_with_both_exact_reads` | Predicate link via `link_distinct_voters` (voter uniqueness and attested `AtFence`. physical reads and roster/selected prefix composition pending) |
 | `verification/verus/rotation_slot_evidence/laws.rs` | `the_wire_preserves_the_fence_and_both_images_in_physical_order` | — | Local — wire ordering and peer registration helper laws |
+| `verification/verus/voter_mirror_body/laws.rs` | `complete_mirror_preserves_original_bytes` | — | Open — production byte correspondence for mirrored voter copies |
 | `verification/verus/voter_slot_header/laws.rs` | `voter_slot_header_rejects_inexact_extent` | `VoterSlotHeader.slotHeaderLengthValid`, `voter_slot_header_rejects_inexact_extent` | Open — fixed-width bit shifts, OR and truncation in `decodeBE` |
 | `verification/verus/voter_slot_header/laws.rs` | `voter_slot_header_round_trips` | `VoterSlotHeader.voter_slot_header_round_trips`, `voter_slot_scope_is_exact` | Predicate link via `link_voterSlotMagic` (magic bytes. headers and word encoding pending) |
 | `verification/verus/voter_slot_header/laws.rs` | `voter_slot_scope_is_exact` | `VoterSlotHeader.voter_slot_header_round_trips`, `voter_slot_scope_is_exact` | Predicate link via `link_voterSlotMagic` (magic bytes. headers and word encoding pending) |

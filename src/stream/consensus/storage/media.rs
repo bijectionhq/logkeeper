@@ -28,6 +28,9 @@ use crate::stream::{
 
 const FORMAT: &str = "logkeeper-raft-3";
 const LEGACY_FORMAT: &str = "logkeeper-raft-2";
+// Old binaries reject this format too. Leave the one-shot enrollment in place
+// so neither an older binary nor a newly emptied data directory can enroll it.
+const RETIRED_FORMAT: &str = "logkeeper-retired";
 const SLOT_MAGIC: &[u8; 8] = b"LKRBND01";
 const SLOT_BYTES: usize = 512;
 
@@ -368,27 +371,10 @@ impl Enrollment {
     }
 
     pub(super) fn open(self) -> io::Result<(Media, File, Opened)> {
-        let lock = OpenOptions::new()
-            .write(true)
-            .open(self.data.join("LOCK"))?;
-        lock.try_lock_exclusive()?;
-        let identity: Identity = read_json(&self.enrolled())?;
-        let installed: Identity = read_json(&self.data.join("KEEPER"))?;
+        let lock = self.lock_offline()?;
+        let (identity, installed) = self.installed_identities()?;
         let legacy = identity.format == LEGACY_FORMAT;
         let unfinished = installed.format == LEGACY_FORMAT;
-        if identity.keeper != installed.keeper
-            || identity.catalog != installed.catalog
-            || identity.incarnation != installed.incarnation
-            || identity.keeper != self.keeper
-            || identity.catalog != self.catalog
-            || identity.incarnation.is_nil()
-            || !matches!(
-                (identity.format.as_str(), installed.format.as_str()),
-                (FORMAT, FORMAT) | (FORMAT, LEGACY_FORMAT) | (LEGACY_FORMAT, LEGACY_FORMAT)
-            )
-        {
-            return Err(invalid("missing or foreign installed keeper media"));
-        }
         // A warm restart can observe either side of an interrupted publication.
         sync_directory(&self.registry)?;
         sync_directory(&self.data)?;
@@ -414,26 +400,9 @@ impl Enrollment {
     /// Opens enrolled keeper media exclusively for offline inspection without
     /// modifying or migrating any file on disk.
     pub(super) fn open_readonly(self) -> io::Result<(Media, File, Opened)> {
-        let lock = OpenOptions::new()
-            .write(true)
-            .open(self.data.join("LOCK"))?;
-        lock.try_lock_exclusive()?;
-        let identity: Identity = read_json(&self.enrolled())?;
-        let installed: Identity = read_json(&self.data.join("KEEPER"))?;
+        let lock = self.lock_offline()?;
+        let (identity, _) = self.installed_identities()?;
         let legacy = identity.format == LEGACY_FORMAT;
-        if identity.keeper != installed.keeper
-            || identity.catalog != installed.catalog
-            || identity.incarnation != installed.incarnation
-            || identity.keeper != self.keeper
-            || identity.catalog != self.catalog
-            || identity.incarnation.is_nil()
-            || !matches!(
-                (identity.format.as_str(), installed.format.as_str()),
-                (FORMAT, FORMAT) | (FORMAT, LEGACY_FORMAT) | (LEGACY_FORMAT, LEGACY_FORMAT)
-            )
-        {
-            return Err(invalid("missing or foreign installed keeper media"));
-        }
         let media = Media {
             enrollment: self,
             identity,
@@ -460,6 +429,52 @@ impl Enrollment {
             .open(self.data.join("LOCK"))?;
         lock.try_lock_exclusive()?;
         Ok(lock)
+    }
+
+    /// Retires the enrolled identity without replaying its WAL. The signed
+    /// evidence only leaves this function after the replacement is durable.
+    pub fn retire<R>(&self, sign: impl FnOnce(Uuid) -> io::Result<R>) -> io::Result<R> {
+        let _lock = self.lock_offline()?;
+        let (mut identity, _) = self.media_identities()?;
+        let proof = sign(identity.incarnation)?;
+        if identity.format == RETIRED_FORMAT {
+            // A retry may follow an error after the rename but before fsync.
+            sync_directory(&self.registry)?;
+        } else {
+            identity.format = RETIRED_FORMAT.into();
+            replace_json(&self.enrolled(), &identity)?;
+        }
+        Ok(proof)
+    }
+
+    fn installed_identities(&self) -> io::Result<(Identity, Identity)> {
+        let identities = self.media_identities()?;
+        if identities.0.format == RETIRED_FORMAT {
+            return Err(invalid("keeper identity is permanently retired"));
+        }
+        Ok(identities)
+    }
+
+    /// Callers hold the media lock while checking both copies of the identity.
+    fn media_identities(&self) -> io::Result<(Identity, Identity)> {
+        let identity: Identity = read_json(&self.enrolled())?;
+        let installed: Identity = read_json(&self.data.join("KEEPER"))?;
+        if identity.keeper != installed.keeper
+            || identity.catalog != installed.catalog
+            || identity.incarnation != installed.incarnation
+            || identity.keeper != self.keeper
+            || identity.catalog != self.catalog
+            || identity.incarnation.is_nil()
+            || !matches!(
+                (identity.format.as_str(), installed.format.as_str()),
+                (FORMAT, FORMAT | LEGACY_FORMAT)
+                    | (LEGACY_FORMAT, LEGACY_FORMAT)
+                    | (RETIRED_FORMAT, FORMAT | LEGACY_FORMAT)
+            )
+        {
+            return Err(invalid("missing or foreign installed keeper media"));
+        }
+        Ok((identity, installed))
     }
 
     fn enrolled(&self) -> PathBuf {

@@ -26,14 +26,18 @@ use std::{collections::BTreeMap, io, net::SocketAddr};
 
 use bincode::Options;
 use journal_contract::{Epoch, Lsn, StreamId};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::{DeserializeOwned, SeqAccess, Visitor},
+    ser::SerializeTuple,
+};
 
 pub use super::transport::Credentials;
 pub use crate::server::durability::SyncMode;
 pub use address::Address;
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
-pub use keeper::{AdminConfig, Config, Recovery, RecoveryReport};
+pub use keeper::{AdminConfig, Config, FenceProof, Recovery, RecoveryReport};
 pub use logging::LogFormat;
 pub use operator::{
     ADMIN_USAGE, AdminOutcome, ClusterProblems, Operator, OperatorConfig, StreamReport,
@@ -57,14 +61,14 @@ pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Cluster feature level before any rolling-upgrade format finalization (N-1).
 pub const CLUSTER_VERSION_V1: u32 = 1;
-/// Cluster feature level that allows the formats N-1 cannot read: `LKRWAL05`
-/// checkpoints, durable park marks, `LKRIDX02` snapshot roots and `LKRIMG04`
-/// images. A gate names the level its format needs, not
-/// `CLUSTER_VERSION_CURRENT`, so a later level never moves an older gate.
+/// Cluster feature level for the WAL, parking, and snapshot formats N-1 cannot read.
 pub const CLUSTER_VERSION_V2: u32 = 2;
-/// Cluster feature level enabled once all keepers run this build and an
-/// operator finalizes the upgrade.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V2;
+/// Cluster feature level for atomic recovery acknowledgement.
+pub const CLUSTER_VERSION_V3: u32 = 3;
+/// Cluster feature level for immutable stream genesis and scoped writer sessions.
+pub const CLUSTER_VERSION_V4: u32 = 4;
+/// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V4;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -79,10 +83,18 @@ pub mod features {
     pub const SOFT_PLACEMENT: u64 = 1 << 3;
     /// Runtime status: the operator is moving replicas off this keeper.
     pub const DECOMMISSIONING: u64 = 1 << 4;
+    /// Supports the Raft command to append a marker and acknowledge recovery.
+    pub const RECOVERY_MARKER: u64 = 1 << 5;
+    /// Supports immutable stream genesis and scoped writer sessions.
+    pub const IMMUTABLE_STREAMS: u64 = 1 << 6;
 
     /// All features supported by this build.
-    pub const SUPPORTED: u64 =
-        VERSION_NEGOTIATION | WRITE_VERSION_GATE | DURABLE_QUARANTINE | SOFT_PLACEMENT;
+    pub const SUPPORTED: u64 = VERSION_NEGOTIATION
+        | WRITE_VERSION_GATE
+        | DURABLE_QUARANTINE
+        | SOFT_PLACEMENT
+        | RECOVERY_MARKER
+        | IMMUTABLE_STREAMS;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
@@ -214,11 +226,82 @@ pub struct Configuration {
     pub voters: [uuid::Uuid; 3],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+const IMMUTABLE_GENESIS_PREFIX: StreamId = StreamId(0);
+const IMMUTABLE_GENESIS_FORMAT: u64 = 4;
+const IMMUTABLE_GENESIS_PREFIX_BYTES: usize = size_of::<u128>() + size_of::<u64>();
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Genesis {
     stream: StreamId,
     voters: [uuid::Uuid; 3],
     quota_bytes: u64,
+    immutable: bool,
+}
+
+// Stream zero was never a valid genesis. The prefixed layout makes a new
+// genesis distinguishable even when it is embedded in a WAL or request,
+// while preserving the original bytes for legacy streams. Older decoders
+// encounter 4 in the length slot of the first UUID, which requires 16 bytes.
+impl Serialize for Genesis {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut tuple = serializer.serialize_tuple(if self.immutable { 5 } else { 3 })?;
+        if self.immutable {
+            tuple.serialize_element(&IMMUTABLE_GENESIS_PREFIX)?;
+            tuple.serialize_element(&IMMUTABLE_GENESIS_FORMAT)?;
+        }
+        tuple.serialize_element(&self.stream)?;
+        tuple.serialize_element(&self.voters)?;
+        tuple.serialize_element(&self.quota_bytes)?;
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Genesis {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct GenesisVisitor;
+
+        impl<'de> Visitor<'de> for GenesisVisitor {
+            type Value = Genesis;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a stream genesis")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Genesis, A::Error> {
+                fn next<'de, T: Deserialize<'de>, A: SeqAccess<'de>>(
+                    elements: &mut A,
+                ) -> Result<T, A::Error> {
+                    elements
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::custom("incomplete stream genesis"))
+                }
+
+                let first = next(&mut elements)?;
+                let immutable = first == IMMUTABLE_GENESIS_PREFIX;
+                let stream = if immutable {
+                    if next::<u64, _>(&mut elements)? != IMMUTABLE_GENESIS_FORMAT {
+                        return Err(serde::de::Error::custom(
+                            "unsupported stream genesis format",
+                        ));
+                    }
+                    next(&mut elements)?
+                } else {
+                    first
+                };
+                if stream == IMMUTABLE_GENESIS_PREFIX {
+                    return Err(serde::de::Error::custom("stream zero is reserved"));
+                }
+                Ok(Genesis {
+                    stream,
+                    voters: next(&mut elements)?,
+                    quota_bytes: next(&mut elements)?,
+                    immutable,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(5, GenesisVisitor)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -302,6 +385,37 @@ fn invalid(message: impl Into<String>) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn immutable_genesis_preserves_legacy_bytes_and_refuses_old_decode() {
+        use super::*;
+
+        #[derive(Serialize, Deserialize)]
+        struct LegacyGenesis {
+            stream: StreamId,
+            voters: [uuid::Uuid; 3],
+            quota_bytes: u64,
+        }
+
+        let previous = LegacyGenesis {
+            stream: StreamId(18),
+            voters: [1, 2, 3].map(uuid::Uuid::from_u128),
+            quota_bytes: 4096,
+        };
+        let mut genesis = Genesis {
+            stream: previous.stream,
+            voters: previous.voters,
+            quota_bytes: previous.quota_bytes,
+            immutable: false,
+        };
+        let bytes = encode(&previous).unwrap();
+        assert_eq!(encode(&genesis).unwrap(), bytes);
+        assert_eq!(decode::<Genesis>(&bytes).unwrap(), genesis);
+        genesis.immutable = true;
+        let bytes = encode(&genesis).unwrap();
+        assert_eq!(decode::<Genesis>(&bytes).unwrap(), genesis);
+        assert!(decode::<LegacyGenesis>(&bytes).is_err());
+    }
     use super::*;
 
     /// Checks `value` against the bytes OpenRaft 0.9.25 wrote for it.

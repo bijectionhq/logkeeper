@@ -1,16 +1,19 @@
-# Three consensus keepers, one per zone. Render with `kubectl kustomize`.
-# Before applying: set the node IPs in keepers/*.json, the node names and
-# disk paths in volumes.yaml, the certificate digests in
-# keepers/*.provision.json, and create the `logkeeper-tls` Secret. See
-# docs/deployment.md. The probes and preStop hook use each keeper's plain
-# admin listener on 127.0.0.1:5741 (`admin` in keepers/*.json).
+# Six consensus keepers, two per failure domain. Render with kubectl kustomize.
+# This fixture uses example hosts and certificate digests. See docs/deployment.md
+# to prepare a staging inventory and scope the credential Secrets.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: logkeeper
 resources:
   - namespace.yaml
   - volumes.yaml
-  - statefulset.yaml
+  - service.yaml
+  - keeper-0
+  - keeper-1
+  - keeper-2
+  - keeper-3
+  - keeper-4
+  - keeper-5
   - poddisruptionbudget.yaml
 configMapGenerator:
   - name: logkeeper-keepers
@@ -24,10 +27,21 @@ configMapGenerator:
       - keepers/keeper-2.json
       - keepers/keeper-2.id
       - keepers/keeper-2.provision.json
+      - keepers/keeper-3.json
+      - keepers/keeper-3.id
+      - keepers/keeper-3.provision.json
+      - keepers/keeper-4.json
+      - keepers/keeper-4.id
+      - keepers/keeper-4.provision.json
+      - keepers/keeper-5.json
+      - keepers/keeper-5.id
+      - keepers/keeper-5.provision.json
       - keepers/placement.json
   # Keeper UUIDs allowed to install fresh media on this rollout, comma
   # separated. Set it for the first bring-up or a replacement keeper, and
   # empty it again once the keeper serves.
   - name: logkeeper-initialize
+    options:
+      disableNameSuffixHash: true
     literals:
       - keepers=
