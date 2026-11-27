@@ -451,6 +451,125 @@ async fn recovery_from_one_survivor_restores_the_longer_object_store_history() {
     cluster.stop_all().await;
 }
 
+/// A survivor that holds uncommitted records at LSNs where the lost voters
+/// later committed, and offloaded, other records: the recovery must keep
+/// the committed records the store holds, or report those LSNs lost. It
+/// keeps the survivor's whole log instead, because the loss point compares
+/// the survivor's head, which counts uncommitted records, with the end of
+/// the store's run (Lean `OffloadPrefix.whole_survivor_log_diverges`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "known bug: recovery keeps a survivor's uncommitted records below the reported head; see AUTHORITY-MODEL-REPORT.md"]
+async fn recovery_keeps_committed_store_records_over_a_survivors_uncommitted_ones() {
+    let store = tempfile::tempdir().unwrap();
+    let mut cluster = Cluster::start_offloaded(&offload_config(store.path())).await;
+    let journal = cluster.client(&cluster.credentials);
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(45);
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 24)
+        .await
+        .unwrap();
+    let fence = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap()
+        .fence;
+    append_range(&journal, stream, fence, 1, 20).await;
+    flushed(&journal, stream, 20).await;
+    let survivor = cluster.leader_after_head(&journal, stream).await;
+    let lost: [Uuid; 2] = [a, b, c]
+        .into_iter()
+        .filter(|id| *id != survivor)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let group = cluster.group(survivor, stream).await;
+    timeout(WAIT, async {
+        while group.state.head() != Ok(Lsn(20)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    super::recovery::remember_peers(&cluster, survivor, lost).await;
+
+    // The leader writes 21..=25 to its own log and never commits them.
+    for id in lost {
+        cluster.running.remove(&id).unwrap().stop().await;
+    }
+    let before = group.raft.metrics().borrow_watched().last_log_index;
+    let uncommitted = (21..=25)
+        .map(|lsn| Bytes::from(format!("uncommitted {lsn}")))
+        .collect::<Vec<_>>();
+    let pending = {
+        let journal = journal.clone();
+        tokio::spawn(async move {
+            let _ = journal
+                .append_batch(stream, fence, Lsn(21), uncommitted)
+                .await;
+        })
+    };
+    timeout(WAIT, async {
+        while group.raft.metrics().borrow_watched().last_log_index <= before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the leader wrote the batch to its log");
+    pending.abort();
+    drop(group);
+    cluster.running.remove(&survivor).unwrap().stop().await;
+
+    // The other two elect each other, commit and offload 21..=23.
+    for id in lost {
+        cluster.restart(id).await;
+    }
+    let journal = cluster.client(&cluster.credentials);
+    append_range(&journal, stream, fence, 21, 23).await;
+    flushed(&journal, stream, 23).await;
+    for id in lost {
+        cluster.running.remove(&id).unwrap().stop().await;
+    }
+
+    let fence_proofs = lost
+        .into_iter()
+        .map(|id| cluster.configs[&id].fence_recovery(id).unwrap())
+        .collect();
+    let report = cluster.configs[&survivor]
+        .recover_stream(
+            stream,
+            Recovery {
+                acknowledge_data_loss: true,
+                lost: Some(lost.to_vec()),
+                fence_proofs,
+                ..Recovery::default()
+            },
+        )
+        .await
+        .unwrap();
+    let offload = report
+        .offload
+        .clone()
+        .expect("the report names the loss point");
+    assert_eq!(offload.store_end, Some(Lsn(23)));
+    cluster.restart(survivor).await;
+    let journal = cluster.client(&cluster.credentials);
+    timeout(Duration::from_secs(30), async {
+        while journal.head(stream).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the recovered stream serves");
+    // Every committed, acknowledged record at or below the kept head reads
+    // back as committed; a record that cannot be kept lies above it.
+    let kept = journal.head(stream).await.unwrap();
+    let records = read_all(&journal, stream, 1, kept.0.min(23)).await;
+    check(&records, 1, kept.0.min(23));
+    assert!(kept >= Lsn(23), "{report}");
+    cluster.stop_all().await;
+}
+
 /// An operator configuration file that names the offload store.
 fn operator_file(cluster: &Cluster, store: &std::path::Path, dir: &std::path::Path) -> String {
     let tls = &cluster.credentials;

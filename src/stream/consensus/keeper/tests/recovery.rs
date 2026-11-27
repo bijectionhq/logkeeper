@@ -1139,3 +1139,113 @@ async fn the_survivor_refuses_a_lost_voters_snapshot_without_its_term() {
     }
     cluster.stop_all().await;
 }
+
+/// A survivor that holds uncommitted records at LSNs where the lost voters
+/// later committed other records. Every record at or below the head the
+/// recovery reports must be one the stream committed, so that a writer that
+/// compares the reported head with what it was acknowledged finds the loss.
+/// The recovery reports the survivor's whole log instead: its head counts
+/// the uncommitted records, the writer's acknowledged LSNs 21..=23 lie at
+/// or below it, and they now hold other records (TLA+
+/// `EpochLeases.LossAboveReportedHead`, Lean
+/// `OffloadPrefix.whole_survivor_log_diverges`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "known bug: recovery keeps a survivor's uncommitted records below the reported head; see AUTHORITY-MODEL-REPORT.md"]
+async fn the_reported_head_never_covers_a_survivors_uncommitted_records() {
+    let mut cluster = Cluster::start().await;
+    cluster.finalize().await;
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(88);
+    let fence = written_stream(&cluster, stream, Voters::from([a, b, c]), a, 20).await;
+    let journal = cluster.client(&cluster.credentials);
+    let survivor = cluster.leader_after_head(&journal, stream).await;
+    let lost: [Uuid; 2] = [a, b, c]
+        .into_iter()
+        .filter(|id| *id != survivor)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let group = cluster.group(survivor, stream).await;
+    timeout(WAIT, async {
+        while group.state.head() != Ok(Lsn(20)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    remember_peers(&cluster, survivor, lost).await;
+
+    // The leader writes 21..=25 to its own log and never commits them.
+    for id in lost {
+        cluster.running.remove(&id).unwrap().stop().await;
+    }
+    let before = group.raft.metrics().borrow_watched().last_log_index;
+    let uncommitted = (21..=25)
+        .map(|lsn| Bytes::from(format!("uncommitted {lsn}")))
+        .collect::<Vec<_>>();
+    let pending = {
+        let journal = journal.clone();
+        tokio::spawn(async move {
+            let _ = journal
+                .append_batch(stream, fence, Lsn(21), uncommitted)
+                .await;
+        })
+    };
+    timeout(WAIT, async {
+        while group.raft.metrics().borrow_watched().last_log_index <= before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the leader wrote the batch to its log");
+    pending.abort();
+    drop(group);
+    cluster.running.remove(&survivor).unwrap().stop().await;
+
+    // The other two elect each other and commit 21..=23, acknowledged.
+    for id in lost {
+        cluster.restart(id).await;
+    }
+    let journal = cluster.client(&cluster.credentials);
+    for at in 21..=23 {
+        timeout(WAIT, async {
+            loop {
+                match journal
+                    .append(stream, fence, Lsn(at), Bytes::from(format!("record-{at}")))
+                    .await
+                {
+                    Ok(lsn) => break assert_eq!(lsn, Lsn(at)),
+                    Err(JournalError::Unavailable) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await
+                    }
+                    Err(error) => panic!("append {at}: {error:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    for id in lost {
+        cluster.running.remove(&id).unwrap().stop().await;
+    }
+
+    let fence_proofs = lost
+        .into_iter()
+        .map(|id| cluster.configs[&id].fence_recovery(id).unwrap())
+        .collect();
+    let report = cluster.configs[&survivor]
+        .recover_stream(
+            stream,
+            Recovery {
+                acknowledge_data_loss: true,
+                lost: Some(lost.to_vec()),
+                fence_proofs,
+                ..Recovery::default()
+            },
+        )
+        .await
+        .unwrap();
+    // 21..=23 were acknowledged and are gone: the loss point lies below them.
+    assert!(report.head < Lsn(21), "{report}");
+    cluster.stop_all().await;
+}
