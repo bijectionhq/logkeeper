@@ -16,6 +16,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=logkeeper-registry-${
 FROM debian:bookworm-slim@sha256:e67eeead736ff7bbe258ef088bff683635c561b1fcfefad0806c1df4ab49ce0e
 # The dated Debian archives fix curl, ca-certificates, and their dependencies.
 # APT verifies the archived Release signatures using Debian's system keyring.
+# The optional ldconfig auxiliary cache records builder inode metadata.
 ARG DEBIAN_SNAPSHOT=20261127T000000Z
 RUN --mount=type=bind,from=toolchain,source=/etc/ssl/certs/ca-certificates.crt,target=/tmp/build-ca-certificates.crt \
     sed -i \
@@ -24,6 +25,7 @@ RUN --mount=type=bind,from=toolchain,source=/etc/ssl/certs/ca-certificates.crt,t
     && apt-get -o Acquire::https::CaInfo=/tmp/build-ca-certificates.crt update \
     && apt-get -o Acquire::https::CaInfo=/tmp/build-ca-certificates.crt install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* /var/log/apt/* /var/log/dpkg.log /var/log/alternatives.log \
+        /var/cache/ldconfig/aux-cache \
     && groupadd --system --gid 10001 logkeeper \
     && useradd --system --no-log-init --uid 10001 --gid 10001 --home-dir /var/lib/logkeeper \
         --shell /usr/sbin/nologin logkeeper \
