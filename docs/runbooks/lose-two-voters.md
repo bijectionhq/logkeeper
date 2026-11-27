@@ -25,6 +25,14 @@ Without **[ops]**, use `ConsensusJournal::configuration` and `keeper_status`
 for each stream RTDB reports as unavailable (RTDB returns `Unavailable` on
 seal and append).
 
+**Confirm both lost keepers are really gone**, by checking each host
+directly: the process is not running (`systemctl is-active $UNIT` prints
+`inactive` or `failed`), or the machine is powered off or fenced. Do not rely
+only on probes. `recover-stream` counts a voter that does not answer its
+status request in time as lost, so a live but overloaded keeper could be
+mistaken for a lost one. If a lost keeper is merely unreachable, fence it
+first: stop its unit or isolate its host.
+
 ## 2. Stop the survivor
 
 `recover-stream` runs on the stopped keeper, under its media lock. Stopping
