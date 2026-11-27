@@ -142,16 +142,26 @@ impl Engine {
         }
         let current = self.disk.ownership(stream).ok_or_else(ownership::stale)?;
         if !(current.contains_stage(&stage) && current.installed()) {
-            if let Some(group) = self.groups.lock().await.get(&stream).cloned() {
-                let metrics = group.raft.metrics().borrow_watched().clone();
-                if metrics
+            let open = self.groups.lock().await.get(&stream).cloned();
+            let votes = match open {
+                Some(group) => group
+                    .raft
+                    .metrics()
+                    .borrow_watched()
                     .membership_config
                     .membership()
                     .voter_ids()
-                    .any(|id| id == self.id.as_u128())
-                {
-                    return Err(invalid("keeper holds a voting replica of the stream"));
-                }
+                    .any(|id| id == self.id.as_u128()),
+                // A parked copy votes as much as an open one.
+                None => self
+                    .closed_states
+                    .lock()
+                    .get(&stream)
+                    .and_then(|state| state.finalized())
+                    .is_some_and(|configuration| configuration.voters.contains(&self.id)),
+            };
+            if votes {
+                return Err(invalid("keeper holds a voting replica of the stream"));
             }
             self.remember_pin(stream).await;
             self.disk
@@ -243,29 +253,63 @@ impl Engine {
             ))
             .await?;
         self.close_copy(scope).await;
+        // The writer's preference only matters to a voter.
+        self.preferred.lock().remove(&scope);
         Ok(Reply::Decision(Outcome::Unit))
     }
 
+    /// Remembers the copy of `scope` about to be detached, open or parked,
+    /// so its directory outlives every reader still holding its state.
     async fn remember_pin(&self, scope: StreamId) {
-        if let Some(group) = self.groups.lock().await.get(&scope) {
+        let open = self
+            .groups
+            .lock()
+            .await
+            .get(&scope)
+            .map(|group| group.state.clone());
+        let state = open.or_else(|| self.closed_states.lock().get(&scope).cloned());
+        if let Some(state) = state {
             self.detached_pins
                 .lock()
-                .insert((scope, group.state.generation()), group.state.lifetime());
+                .insert((scope, state.generation()), state.lifetime());
         }
     }
 
-    /// Closes a parked or deleted stream's group while keeping its replica.
+    /// Closes a parked or deleted stream's group while keeping its replica,
+    /// and runs `mark` once the group is out of `groups`. False when the
+    /// stream had no open group.
+    ///
     /// The closed state machine stays referenced, because its snapshot and
     /// applied records are the only references to objects and segments the
     /// reaper would otherwise delete; the reopened group takes them over.
-    pub(super) async fn close_retaining(&self, scope: StreamId) {
-        if let Some(group) = self.groups.lock().await.get(&scope) {
-            self.closed_states.lock().insert(scope, group.state.clone());
-        }
-        self.close_copy(scope).await;
+    /// The close holds the stream's opening lock and waits for the group to
+    /// stop: the generation stays the same, so nothing else fences the old
+    /// group's snapshot files and WAL writes from a reopened one, and an
+    /// open that raced the close finds the mark once it has the lock.
+    pub(super) async fn close_retaining(&self, scope: StreamId, mark: impl FnOnce()) -> bool {
+        let Ok(opening) = self.opening(scope).await else {
+            return false;
+        };
+        let _guard = opening.lock().await;
+        let Some(group) = self.groups.lock().await.remove(&scope) else {
+            return false;
+        };
+        self.closed_states.lock().insert(scope, group.state.clone());
+        mark();
+        group.state.suspend();
+        group.stop.cancel();
+        let _ = group.raft.shutdown().await;
+        group.state.shutdown().await;
+        true
     }
 
+    /// Closes this keeper's copy of `scope` once its ownership moved to
+    /// another generation: the open group, or a parked copy's retained state
+    /// and mark. The new generation fences the old group's writes, so its
+    /// shutdown need not be awaited.
     pub(super) async fn close_copy(&self, scope: StreamId) {
+        self.parked.write().remove(&scope);
+        self.closed_states.lock().remove(&scope);
         if let Some(group) = self.groups.lock().await.remove(&scope) {
             group.state.suspend();
             group.stop.cancel();

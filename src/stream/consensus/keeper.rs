@@ -627,8 +627,8 @@ impl Engine {
 
     /// Closes the groups of deleted streams once the deletion is applied on
     /// this replica, replicated to every voter it can see, and older than
-    /// `DELETED_GROUP_GRACE`. A later request reopens the group and is
-    /// answered `Deleted`.
+    /// `DELETED_GROUP_GRACE`. Later requests are answered `Deleted` without
+    /// reopening the group.
     async fn close_settled_deletions(&self) {
         let groups = self
             .groups
@@ -659,8 +659,11 @@ impl Engine {
             }
         }
         for stream in closing {
+            // Marked first: a request that races the close is refused
+            // rather than reopening the group.
             self.deleted.write().insert(stream);
-            self.close_retaining(stream).await;
+            self.close_retaining(stream, || ()).await;
+            self.preferred.lock().remove(&stream);
         }
     }
 
@@ -781,8 +784,10 @@ impl Engine {
             .lock()
             .await
             .insert(group.genesis.stream, group.clone());
-        // The reopened group references its snapshot and records itself.
+        // The reopened group references its snapshot and records itself,
+        // and is no longer parked.
         self.closed_states.lock().remove(&group.genesis.stream);
+        self.parked.write().remove(&group.genesis.stream);
         let resume = group.clone();
         let stop = group.stop.clone();
         let id = self.id.as_u128();

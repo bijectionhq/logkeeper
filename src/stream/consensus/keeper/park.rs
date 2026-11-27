@@ -112,10 +112,15 @@ impl Engine {
     }
 
     pub(super) async fn park(&self, stream: StreamId) {
-        super::super::metrics::count(&super::super::metrics::COUNTERS.parked);
-        self.parked.write().insert(stream);
+        let parked = self
+            .close_retaining(stream, || {
+                self.parked.write().insert(stream);
+            })
+            .await;
+        if parked {
+            super::super::metrics::count(&super::super::metrics::COUNTERS.parked);
+        }
         self.activity.lock().remove(&stream);
-        self.close_retaining(stream).await;
     }
 
     /// A follower parks when it is idle itself and holds exactly the

@@ -134,3 +134,82 @@ async fn a_client_request_opens_a_stream_past_the_limit_at_startup() {
     );
     cluster.stop_all().await;
 }
+
+/// Retiring a parked copy drops the state machine that pinned its objects
+/// and segments, and its park mark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retiring_a_parked_copy_drops_its_closed_state_and_park_mark() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, d] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(211);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let generation = journal.replica_generation(stream, c).await.unwrap();
+
+    cluster.running.remove(&c).unwrap().stop().await;
+    let current = journal.configuration(stream).await.unwrap();
+    let moved = journal
+        .replace(stream, current.revision, [a, b, d])
+        .await
+        .unwrap();
+    assert_eq!(moved.voters, [a, b, d]);
+
+    cluster.restart(c).await;
+    let engine_c = cluster.running[&c].engine.clone();
+    let _ = cluster.group(c, stream).await;
+    engine_c.park(stream).await;
+    assert!(engine_c.parked.read().contains(&stream));
+    assert!(engine_c.closed_states.lock().contains_key(&stream));
+    let pin = engine_c.closed_states.lock()[&stream].lifetime();
+
+    let leader = cluster.leader(stream).await;
+    journal
+        .retire_copy(stream, c, leader, moved.revision, generation)
+        .await
+        .unwrap();
+
+    assert!(!engine_c.parked.read().contains(&stream));
+    assert!(!engine_c.closed_states.lock().contains_key(&stream));
+    assert_eq!(
+        pin.strong_count(),
+        0,
+        "the retired copy's objects and segments are no longer pinned"
+    );
+    cluster.stop_all().await;
+}
+
+/// Closing a deleted stream forgets its writer's leader preference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_a_stream_forgets_its_preferred_leader() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(212);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal.prefer_leader(stream, b).await.unwrap();
+    assert!(wait_for_leader(&cluster, stream, b).await);
+    assert!(
+        cluster.running[&b]
+            .engine
+            .preferred
+            .lock()
+            .contains_key(&stream)
+    );
+
+    journal.delete(stream).await.unwrap();
+    timeout(WAIT, async {
+        while !cluster.running[&b].engine.deleted.read().contains(&stream) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("deleted stream closed on b");
+    assert!(
+        !cluster.running[&b]
+            .engine
+            .preferred
+            .lock()
+            .contains_key(&stream)
+    );
+    cluster.stop_all().await;
+}
