@@ -1,7 +1,7 @@
 # Consensus keeper image. Build from the repository root:
 #   docker build -f deploy/consensus/Dockerfile -t logkeeper-consensus:dev .
-# The healthcheck needs the keeper's admin listener on 127.0.0.1:5741:
-# `"admin": {"listen": "127.0.0.1:5741"}` in the keeper config.
+# The healthcheck uses the keeper's admin listener on 127.0.0.1:5741, as in
+# deploy/consensus/keeper.example.json.
 
 FROM rust:1.94.1-slim-bookworm AS build
 WORKDIR /src

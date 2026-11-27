@@ -28,7 +28,7 @@ the consumer: RTDB moves streams off keepers listed in `draining` in its
    match its trusted placement authority".
 
 3. **Restart the existing keepers** one at a time with the [rolling-upgrade
-   procedure](rolling-upgrade.md), steps 5 to 8, keeping the same binary. The
+   procedure](rolling-upgrade.md), steps 6 to 9, keeping the same binary. The
    new keeper is not running yet, so liveness reports it as dead and
    placement and repair never choose it. Its UUID is not a voter of any
    stream, so `/safe-to-stop` is not blocked by it.
@@ -67,7 +67,7 @@ stream only while it writes that database, at most one voter per stream every
 
 1. Make sure the remaining eligible keepers have room: three domains, each
    with an accepting keeper other than the drained one
-   (`logkeeper_consensus_accepting 1` **[ops]**).
+   (`logkeeper_consensus_accepting 1`).
 
 2. Add the UUID to `draining` in every RTDB `JournalConfig` file, keeping it
    in `placement`. Rewrite each file in place, atomically:
@@ -81,8 +81,7 @@ stream only while it writes that database, at most one voter per stream every
    each move. `Multi journal placement deferred: ...` is retried on the next
    tick.
 
-3. **Wait until no stream names the keeper.** On the drained keeper
-   **[ops]**:
+3. **Wait until no stream names the keeper.** On the drained keeper:
 
    ```sh
    curl -sS $ADMIN/metrics | grep 'logkeeper_consensus_streams{state="hosted"}'
@@ -90,8 +89,8 @@ stream only while it writes that database, at most one voter per stream every
    ```
 
    Removed copies retire themselves, so `hosted` reaches 0 once every move
-   has committed and retirement has run. Without **[ops]**, check each
-   stream with `lk admin status --config operator.json --stream UUID`.
+   has committed and retirement has run. To check one stream, run
+   `lk admin status --config operator.json --stream UUID`.
 
    Streams that RTDB does not write (databases with no running writer) do
    not move. Wake their writers or accept that they stay. If the keeper is a

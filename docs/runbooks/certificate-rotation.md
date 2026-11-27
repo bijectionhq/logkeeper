@@ -13,7 +13,7 @@ For each keeper, one at a time:
 1. Issue a new leaf from the same CA, with the same URI SAN
    `urn:logkeeper:keeper:<uuid>` and both serverAuth and clientAuth.
 2. Wait until it is safe to stop (`probe safe-to-stop`, as in [rolling
-   upgrade](rolling-upgrade.md) step 5), then stop the keeper.
+   upgrade](rolling-upgrade.md) step 6), then stop the keeper.
 3. Replace the files at the configured `tls.certificate` and
    `tls.private_key` paths, and rewrite the digest:
 

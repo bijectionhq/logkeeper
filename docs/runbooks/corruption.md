@@ -4,7 +4,7 @@ The keeper detects damage at three levels:
 
 | Damage | What the keeper does | Where you see it |
 | --- | --- | --- |
-| One stream's snapshot, index pages or extents | Quarantines that replica: it keeps protecting the stream's objects and stops serving it | Log line `logkeeper quarantined stream ...`; `/ready` `quarantined_streams`; `/problems` `quarantined`; `logkeeper_consensus_streams{state="quarantined"}` **[ops]** |
+| One stream's snapshot, index pages or extents | Quarantines that replica: it keeps protecting the stream's objects and stops serving it | Log line `logkeeper quarantined stream ...`; `/ready` `quarantined_streams`; `/problems` `quarantined`; `logkeeper_consensus_streams{state="quarantined"}` |
 | WAL frames, segments, the boundary or the keeper identity | Refuses to start ("missing or foreign installed keeper media", a boundary or chain mismatch), or the WAL thread fails and `/live` turns 503 | `journalctl -u $UNIT`; `/live` |
 | A stalled disk (WAL round over 20 s) | The watchdog ends the process | Exit in `journalctl`; systemd stops restarting after 5 failures in 10 minutes |
 
@@ -18,7 +18,7 @@ voters are healthy. Check that before doing anything else. If they are not
 healthy, protect the survivor's copy and go to [lose two
 voters](lose-two-voters.md) only as a last resort.
 
-## 1. Stop and verify (offline) [ops]
+## 1. Stop and verify (offline)
 
 ```sh
 sudo systemctl stop $UNIT

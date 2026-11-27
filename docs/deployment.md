@@ -5,21 +5,19 @@ mainly as the journal of RTDB Multi. The [README](../README.md) documents the
 APIs. This guide covers hosts, disks, identities, bring-up and day-two
 operations. The [runbooks](runbooks/) hold the step-by-step procedures.
 
-Every command, flag and config field here exists in the code. Some
-operational features are still landing, and they are marked inline:
+Every command, flag and config field here exists in the code on `main`. The
+admin endpoints (`/live`, `/ready`, `/safe-to-stop`, `/problems`, `/status`,
+`/metrics`), the offline `keeper inspect`, `verify`, `dump-segment` and
+`debug-bundle` tools and structured logs are on `main`; the procedures assume
+a keeper built with them. One group of features is still landing and marked
+inline:
 
-- **[ops]**: now on `main`. The mark means a step needs the admin endpoints
-  (`/live`, `/ready`, `/safe-to-stop`, `/problems`, `/status`, `/metrics`),
-  the `admin` and `log_format` config fields, the offline `keeper inspect`,
-  `keeper verify` and `keeper dump-segment` tools, or `keeper debug-bundle`.
-  A keeper built before them has none of these; its "Without [ops]"
-  alternatives still apply.
 - **[upgrades]**: N-1 wire negotiation, the cluster write-version gate,
   `keeper salvage`, durable quarantine with `keeper clear-quarantine`, and
   `retired` keepers.
 
-Until a marked feature reaches `main`, its procedure step does not work. Each
-marked step says what to do instead. [Missing features](#missing-features)
+Until it reaches `main`, a marked step does not work, and each says what to
+do instead. [Missing features](#missing-features)
 lists what does not exist at all.
 
 Packaging lives in [`deploy/consensus/`](../deploy/consensus/):
@@ -49,7 +47,7 @@ shared segmented WAL. It listens on three TCP ports, each with mutual TLS 1.3:
 | Application | `keepers` (and `listen`) | Clients such as RTDB, and other keepers | `logkeeper-consensus/1` |
 | Control | `peers` | Keepers only: votes, heartbeats, pings, parking, leader transfer | `logkeeper-consensus-control/8` |
 | Bulk and replication | `bulk` | Keepers only: AppendEntries batches and snapshot files | `logkeeper-consensus-bulk/2`, `logkeeper-consensus-replication/3` |
-| Admin **[ops]** | `admin.listen` | Probes, metrics scrapers, operators | Plain HTTP on loopback, or mTLS |
+| Admin | `admin.listen` | Probes, metrics scrapers, operators | Plain HTTP on loopback, or mTLS |
 
 A keeper binds the `peers` and `bulk` addresses that its own inventory lists
 for itself. Every address in the inventory is an `IP:port` (`SocketAddr`), and
@@ -103,7 +101,11 @@ staged repair need it.
   which streams exist is lost too. Use it only for development.
 - **Replicated catalog (`catalog_voters`)**: the catalog is a consensus stream
   of its own on three keepers in distinct domains. It is never parked, and the
-  normal leader-driven repair repairs it. It survives losing one voter. Losing
+  normal leader-driven repair repairs it. Since placement certification
+  (commit `59038f5`), a copy that restarts without hearing from its leader
+  asks the catalog before it campaigns or serves reads. After a whole-cluster
+  restart, streams therefore elect only once the catalog answers. Start the
+  catalog voters first, or together with the rest. It survives losing one voter. Losing
   two stops creation and staging: existing streams keep serving, and recovery
   of the catalog itself does not exist yet ([missing features](#missing-features)).
   **Use `catalog_voters` in production.** List the same three sorted UUIDs on
@@ -188,15 +190,16 @@ The figures below were measured with the `consensus-streams` example:
 
 ```sh
 cargo build --release --features consensus-testing --example consensus-streams
-target/release/examples/consensus-streams --streams 128 --active 0 --seconds 10 [--park-after 5]
-target/release/examples/consensus-streams --streams 16 --active 16 --seconds 20
+target/release/examples/consensus-streams --sync-mode fsync --streams 128 --active 0 --seconds 10 [--park-after 5]
+target/release/examples/consensus-streams --sync-mode fsync --streams 16 --active 16 --seconds 20
 ```
 
 **Conditions:**
 
 - One Apple M6 laptop (12 cores, 24 GiB), with all four keepers (three voters
   and the catalog keeper) and the client in one process, on one APFS SSD.
-- No network latency. The local cluster uses plain `fsync`, which on macOS
+- No network latency. The runs used plain `fsync` (`--sync-mode fsync`; the
+  example now defaults to `full`), which on macOS
   does not drain the drive's cache (`sync_mode: full` costs about 2.3 ms per
   flush there). On Linux, both modes flush the device, so expect lower
   throughput than this table on Linux disks with real flush latency.
@@ -280,7 +283,7 @@ reconciliation, and writes it. Its principal must therefore be in both
 any writer may write any stream. Do not share keepers between tenants that
 must not write each other's journals.
 
-With `admin.mtls: true` **[ops]**, the admin listener also requires a client
+With `admin.mtls: true`, the admin listener also requires a client
 certificate listed in `administrators`. There is no read-only metrics role, so
 an mTLS scraper holds administrator rights. Prefer the loopback listener and a
 node-local scraper.
@@ -336,7 +339,7 @@ For each keeper, in any order:
 
 1. **Choose identities.** Draw one UUID per keeper (`uuidgen | tr A-Z a-z`).
    Pick its domain, its IP address and three ports (application, control,
-   bulk), plus a loopback admin port **[ops]**.
+   bulk), plus a loopback admin port.
 2. **Issue the certificate** with URI SAN `urn:logkeeper:keeper:<uuid>` and
    both serverAuth and clientAuth. Issue client certificates for RTDB
    (`urn:logkeeper:client:rtdb`) and the operator.
@@ -354,8 +357,8 @@ For each keeper, in any order:
    | `snapshot_send_bytes_per_second` | 67108864 | Keeper-wide snapshot send rate; 0 means unpaced |
    | `sync_mode` | `full` | `full` (`F_FULLFSYNC` on Apple platforms) or `fsync`; on Linux both flush the device cache. Never use `fsync` on macOS in production |
    | `async_append` | `true` | A leader replicates its own appends while its WAL write of them is in flight; it counts toward commit only once that write is durable. `false` syncs first, as before |
-   | `admin` **[ops]** | none | `{"listen": "127.0.0.1:5741", "mtls": false}` |
-   | `log_format` **[ops]** | `human` | `human` or `json` |
+   | `admin` | none | `{"listen": "127.0.0.1:5741", "mtls": false, "cluster": {...}}`. `cluster` lists the other keepers' admin addresses for `keeper debug-bundle` |
+   | `log_format` | `human` | `human` or `json` |
 
    On `main`, unknown fields are refused at startup. With **[upgrades]** they
    only produce a warning.
@@ -379,7 +382,7 @@ For each keeper, in any order:
 7. **Start the keeper** with `systemctl enable --now logkeeper-consensus`, or
    apply the StatefulSet.
 
-Then, from each keeper host **[ops]**:
+Then, from each keeper host:
 
 ```sh
 curl -fsS http://127.0.0.1:5741/live    # {"live":true,"wal_healthy":true,"stopping":false,...}
@@ -404,9 +407,9 @@ logkeeper admin status --config operator.json --stream $UUID   # configuration, 
 logkeeper admin problems --config operator.json                # every keeper's /problems, merged
 ```
 
-Seal, append and read need a writer, which `logkeeper admin` is not. Without **[ops]**, check liveness
-with the keeper's stderr. Every 5 s it prints refusal counters, and
-`peer.unreachable` at startup is expected until all keepers are up.
+Seal, append and read need a writer, which `logkeeper admin` is not.
+`peer.unreachable` refusals in the log at startup are expected until all
+keepers are up.
 
 ### Kubernetes
 
@@ -429,13 +432,13 @@ keeper's rules:
 - **Zones:** required anti-affinity on `topology.kubernetes.io/zone` and on
   `kubernetes.io/hostname`.
 - **Probes:** a startup and liveness probe on `/live`, and readiness on
-  `/ready` **[ops]**. Both use `curl` on loopback inside the pod, because a
+  `/ready`. Both use `curl` on loopback inside the pod, because a
   plain admin listener only binds loopback.
 - **Rolling updates:** `podManagementPolicy: Parallel`, so the three pods can
   find each other at first start. `RollingUpdate` with `maxUnavailable: 1`
   and `minReadySeconds: 30` replaces one pod at a time and waits for `/ready`.
 - **PodDisruptionBudget:** `maxUnavailable: 1`.
-- **preStop:** waits up to 240 s for `/safe-to-stop` **[ops]**. SIGTERM then
+- **preStop:** waits up to 240 s for `/safe-to-stop`. SIGTERM then
   hands off leadership. `terminationGracePeriodSeconds: 300` covers both.
 - **Certificates:** one Secret, `logkeeper-tls`, holds every keeper's
   `keeper-N.pem` and `keeper-N.key`, plus `ca.pem`. A plain StatefulSet cannot
@@ -527,7 +530,7 @@ acknowledges with `logkeeper admin acknowledge-recovery --stream UUID`
 (or `ConsensusJournal::acknowledge_recovery`; writer or administrator). The
 [two-voter-loss runbook](runbooks/lose-two-voters.md) has the steps.
 
-## Monitoring **[ops]**
+## Monitoring
 
 Scrape `/metrics` with a node-local agent on loopback, or remotely over mTLS,
 as `job="logkeeper"`, and load the alert rules in
@@ -549,11 +552,14 @@ The rules cover at least:
 | Quarantine | `logkeeper_consensus_streams{state="quarantined"}` | Above 0 |
 | Certificate expiry | your PKI | Under 30 days |
 
-Logs go to stderr. With **[ops]** they are structured (`log_format`,
-`LOGKEEPER_LOG`), administrative actions are logged under `logkeeper::audit`,
-and critical invariant violations under `logkeeper::critical`
-(`logkeeper_consensus_critical_total`). Before it, they are free text, and
-every 5 s the keeper prints refusal counters.
+Logs go to stderr, structured (`log_format`, `LOGKEEPER_LOG`).
+Administrative actions are logged under `logkeeper::audit`, and critical
+invariant violations under `logkeeper::critical`
+(`logkeeper_consensus_critical_total`). For an incident, collect
+`logkeeper keeper debug-bundle --config FILE [--admin ADDR]... [--data DIR]
+[--out FILE]`: a tar of the redacted config and the admin pages. It reaches
+the keepers in `admin.cluster` (or `--admin`) only over mTLS admin
+listeners. With loopback listeners, run it on every host.
 
 ## Supported-version policy: N-1
 
@@ -576,8 +582,8 @@ How this is enforced:
 - **On `main` today:** none of that exists. Two builds interoperate only if
   every ALPN in `src/stream/consensus/mod.rs` is identical. Any ALPN bump
   between your running build and the new one means a full-cluster stop and
-  start, not a rolling upgrade. Compare the `logkeeper_build_info` labels
-  **[ops]**, or the constants in the source, before you upgrade.
+  start, not a rolling upgrade. Compare the `logkeeper_build_info` labels,
+  or the constants in the source, before you upgrade.
 - **Media formats** migrate forward on first start. For example,
   `logkeeper-raft-2` becomes `logkeeper-raft-3` (segments). Older binaries
   cannot reopen migrated media, so on `main` a rollback after a format
@@ -645,4 +651,4 @@ Most are items in the consensus design's review tables.
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |
 | Read-only metrics principal | mTLS scrapers are administrators or keepers | Loopback admin listener and a local agent |
 | Online backup and export | See [backup](#backup-and-restore) | RTDB checkpoints |
-| Durable fencing of keepers lost in a recovery (review item 13) | Two lost voters returning together can briefly serve old history | Start lost keepers one at a time, or wipe them |
+| Catalog-bounded leases | A lost keeper that never stopped stays certified and, with the other lost keeper, can keep leading the old configuration. Restarting lost keepers are fenced by placement certification | Fence both lost keepers before `recover-stream` (`--lost` states it) |

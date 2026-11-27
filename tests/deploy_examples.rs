@@ -51,6 +51,15 @@ fn check_keeper(config: &Config) {
     {
         assert!(uri.starts_with("urn:logkeeper:client:"), "{uri}");
     }
+    // The Dockerfile healthcheck and the Kubernetes probes and preStop hook
+    // call this plain loopback admin listener.
+    let admin = config
+        .admin
+        .as_ref()
+        .expect("examples serve the admin listener");
+    assert_eq!(admin.listen, "127.0.0.1:5741".parse().unwrap());
+    assert!(!admin.mtls);
+    assert!(config.async_append);
     assert!(!config.data.starts_with(&config.enrollment));
     assert!(!config.enrollment.starts_with(&config.data));
 }

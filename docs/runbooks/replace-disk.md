@@ -11,7 +11,7 @@ with a new UUID**. Never run `keeper initialize` again under the old UUID:
 
 ## 1. Confirm the loss and the survivors
 
-On each other keeper **[ops]**:
+On each other keeper:
 
 ```sh
 probe problems | jq '.problems[] | {stream, reasons, dead_voters}'

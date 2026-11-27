@@ -15,16 +15,16 @@ keeper to return.
 
 ## 1. Identify the streams and the survivor
 
-On the surviving keeper **[ops]**:
+On the surviving keeper:
 
 ```sh
 probe problems | jq -r '.problems[] | select(.reasons | index("leaderless")) | .stream'
 ```
 
 Then, for each such stream, `lk admin status --config operator.json --stream
-UUID` shows its configuration and which voters answer. Without **[ops]**, use
-`lk admin status` for each stream RTDB reports as unavailable (RTDB returns `Unavailable` on
-seal and append).
+UUID` shows its configuration and which voters answer. Run it also for each
+stream RTDB reports as unavailable (RTDB returns `Unavailable` on seal and
+append).
 
 **Confirm both lost keepers are really gone**, by checking each host
 directly: the process is not running (`systemctl is-active $UNIT` prints
@@ -117,11 +117,14 @@ incident.
 
 ## 6. The lost keepers
 
-If a lost keeper returns with its data, its copies retire on the first
-contact with a recovered voter. **Start lost keepers one at a time**, or wipe
-them and replace them as new keepers. If both return together, each asks
-every other keeper for its finalized configuration before it first votes,
-refuses to vote once the survivor or a replacement reports the recovered
-one, and retires. Only if the survivor and both replacements are all
-unreachable from them could they still form a quorum of the old
-configuration, and a client holding a cached route read the lost history.
+A lost keeper that restarts with its data cannot campaign or serve reads
+for the stream until its copy is certified (commit `59038f5`). It asks the
+catalog for the stream's latest staged move, finds the recovery, is fenced,
+and retires its copy. That holds even if both lost keepers return together
+and neither can reach a current voter. Before it first votes, it also asks
+every other keeper for its finalized configuration.
+
+What remains open is a lost keeper that **never stopped**. It stays certified,
+and with the other lost keeper it can keep leading the old configuration
+until it reaches a recovered voter. Hence the fencing rule in step 1. Wiping
+lost keepers and replacing them as new keepers stays the simplest choice.

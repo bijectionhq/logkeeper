@@ -1,7 +1,7 @@
 # Consensus keeper runbooks
 
 Each runbook gives the exact commands, the output to expect, and when to stop.
-Read [the deployment guide](../deployment.md) first. Steps marked **[ops]** or
+Read [the deployment guide](../deployment.md) first. Steps marked
 **[upgrades]** depend on features that are still landing (see the guide's
 introduction), and each says what to do without them.
 
@@ -22,7 +22,7 @@ The commands assume the systemd layout from `deploy/consensus/`:
 
 ```sh
 CONFIG=/etc/logkeeper/keeper.json     # this host's keeper config
-ADMIN=http://127.0.0.1:5741           # this host's admin listener [ops]
+ADMIN=http://127.0.0.1:5741           # this host's admin listener
 UNIT=logkeeper-consensus              # systemd unit
 lk() { sudo -u logkeeper /usr/local/bin/logkeeper "$@"; }
 probe() { curl -sS -o /dev/stderr -w '%{http_code}\n' "$ADMIN/$1"; }
@@ -47,7 +47,16 @@ of these appears on a keeper:
 
 Then work out why before you continue.
 
-Without **[ops]**, use the keeper's stderr (`journalctl -u $UNIT`): it prints
-refusal counters every 5 s. For per-stream health, use `lk admin status
---stream UUID`, which reads the configuration, leader, head and each voter's
-replica over the application lane.
+For per-stream health, use `lk admin status --config operator.json --stream
+UUID`, which reads the configuration, leader, head and each voter's replica
+over the application lane. `lk admin problems --config operator.json` merges
+every keeper's `/problems`.
+
+For an incident, collect a debug bundle before changing anything:
+`lk keeper debug-bundle --config $CONFIG --out /tmp/bundle.tar` writes a tar
+with this keeper's redacted config and the admin pages of every keeper it
+reaches. With `admin.mtls: true` it also fetches the keepers listed in
+`admin.cluster`, using the keeper's own certificate. With loopback-only
+listeners, run it on each host. Add `--data` on a stopped keeper to include
+offline `inspect` and `verify`. `probe status` gives one keeper's summary
+page.

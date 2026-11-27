@@ -9,25 +9,26 @@ test](../../tests/rolling_upgrade.rs) runs this sequence in process under
 write load.
 
 **What to expect.** The test was run ten times (40 restarts) on one loaded
-Mac. It uses four keepers with a replicated catalog, and four streams that
-each append a record every few milliseconds. Results:
-- No acknowledged record was lost (32,481 checked).
-- The worst append stall during a restart was 2.4 s, and the mean 0.8 s.
-- A keeper was ready again at most 1.8 s after it started.
+Mac, at Logkeeper `55e94a5` with asynchronous leader append. It uses four
+keepers with a replicated catalog, and four streams that each append a record
+every few milliseconds. Results:
+- No acknowledged record was lost (79,079 checked).
+- The worst append stall during a restart was 2.35 s, and the mean 0.66 s.
+- A keeper was ready again at most 2.3 s after it started.
 
 In 24 of the 40 restarts, the stopping keeper handed its leaders off and
-writes paused for under 0.3 s. In the other 16, a leader was not handed off:
-the hand-off only targets a follower that has matched the leader's last
-entry, and under constant writes there often is none. Its streams then waited
-out the 1.8 s lease plus an election. Budget about 2.5 s of write
-unavailability per keeper restart, on the streams that keeper leads.
+writes paused for well under a second. In the other 16, a leader was not
+handed off: the hand-off only targets a follower that has matched the
+leader's last entry, and under constant writes there often is none. Its
+streams then waited out the 1.8 s lease plus an election. Budget about 2.5 s
+of write unavailability per keeper restart, on the streams that keeper leads.
 
 ## Before you start
 
 1. **Check compatibility.** With **[upgrades]**, the new release must be
    exactly one release ahead of every running keeper (N-1). On `main`
    without it, the two builds must have identical ALPNs. Compare
-   `logkeeper_build_info` on a running keeper **[ops]**:
+   `logkeeper_build_info` on a running keeper:
 
    ```sh
    curl -sS $ADMIN/metrics | grep '^logkeeper_build_info'
@@ -44,14 +45,21 @@ unavailability per keeper restart, on the streams that keeper leads.
    If any ALPN differs on `main` without **[upgrades]**, this is not a rolling
    upgrade. Stop every keeper, upgrade them all, and start them all.
 
-2. **Check media format changes.** Read the release notes or the README's
+2. **Upgrade catalog keepers first when the protocol grows.** A new
+   application request, such as `Request::Staging` from commit `59038f5`, is
+   refused by older catalog keepers. A restarted copy that cannot certify
+   its placement does not campaign. So upgrade the `catalog` keeper and the
+   `catalog_voters` before the other keepers. The release notes or the README
+   say when a release adds a request.
+
+3. **Check media format changes.** Read the release notes or the README's
    "Keeper storage and upgrade" section for a media format change, such as a
    new `FORMAT` in `storage/media.rs`. A keeper migrates its media on first
    start, and the old binary cannot reopen migrated media. With
    **[upgrades]**, new formats wait for finalization, so rollback stays
-   possible until step 7.
+   possible until step 11.
 
-3. **Check that the cluster is healthy.** On every keeper:
+4. **Check that the cluster is healthy.** On every keeper:
 
    ```sh
    probe ready         # 200, "ready":true
@@ -61,7 +69,7 @@ unavailability per keeper restart, on the streams that keeper leads.
    Abort if any keeper is not ready, or if any stream is `leaderless` or
    `under_replicated`.
 
-4. **Stage the binary** on every host without replacing the running one:
+5. **Stage the binary** on every host without replacing the running one:
 
    ```sh
    install -m 0555 logkeeper-NEW /usr/local/bin/logkeeper.next
@@ -70,7 +78,7 @@ unavailability per keeper restart, on the streams that keeper leads.
 
 ## For each keeper, one at a time
 
-5. **Wait until it is safe to stop:**
+6. **Wait until it is safe to stop:**
 
    ```sh
    until probe safe-to-stop | grep -qx 200; do sleep 5; done
@@ -81,18 +89,14 @@ unavailability per keeper restart, on the streams that keeper leads.
    of a stream hosted here is unreachable or silent. **Abort** if it stays
    `503` for more than 5 minutes. Fix the other keeper first.
 
-   Without **[ops]**: confirm from the other keepers' logs that no keeper
-   reports `peer.unreachable` for the others, and wait 60 s after the
-   previous keeper became ready.
-
-6. **Drain leaders, stop, upgrade, start:**
+7. **Drain leaders, stop, upgrade, start:**
 
    ```sh
    sudo systemctl stop $UNIT              # SIGTERM: leaders hand off within 3 s, WAL flushed
    systemctl show -p Result,ExecMainStatus $UNIT   # Result=success
    sudo install -m 0555 /usr/local/bin/logkeeper /usr/local/bin/logkeeper.prev
    sudo mv /usr/local/bin/logkeeper.next /usr/local/bin/logkeeper
-   lk keeper verify --config $CONFIG      # [ops] optional, offline: exit 0, "ok"
+   lk keeper verify --config $CONFIG      # optional, offline: exit 0, "ok"
    sudo systemctl start $UNIT
    ```
 
@@ -103,7 +107,7 @@ unavailability per keeper restart, on the streams that keeper leads.
    investigate the disk if the stop takes longer than 30 s (`Result=timeout`)
    or the unit exits with failure.
 
-7. **Wait until it is ready:**
+8. **Wait until it is ready:**
 
    ```sh
    until probe ready | grep -qx 200; do sleep 5; done
@@ -121,18 +125,18 @@ unavailability per keeper restart, on the streams that keeper leads.
 
    To roll this keeper back: stop it, restore `logkeeper.prev`, and start it
    again. That works only if the new binary did not migrate the media (see
-   step 2).
+   step 3).
 
-8. **Soak** for at least `minReadySeconds` (30 s), check `probe problems` on
-   all keepers, then continue with the next keeper at step 5.
+9. **Soak** for at least `minReadySeconds` (30 s), check `probe problems` on
+   all keepers, then continue with the next keeper at step 6.
 
 ## After every keeper is upgraded
 
-9. **Soak the whole cluster** for an agreed period, for example 24 h, at
+10. **Soak the whole cluster** for an agreed period, for example 24 h, at
    normal load. Until you finalize, rollback is the same procedure with the
    previous binary.
 
-10. **Finalize [upgrades]:** this allows the new durable formats. It is
+11. **Finalize [upgrades]:** this allows the new durable formats. It is
     refused unless every active keeper advertises the write-version gate.
     `lk admin finalize-version` is reserved for it but refuses until the
     cluster feature level from the upgrades work is on `main`. Until then,
@@ -148,7 +152,7 @@ unavailability per keeper restart, on the streams that keeper leads.
 
 ## Kubernetes
 
-The StatefulSet carries out steps 5 to 8 by itself:
+The StatefulSet carries out steps 6 to 9 by itself:
 - The `preStop` hook waits for `/safe-to-stop`, for at most 240 s.
 - SIGTERM hands off leadership.
 - The next pod is replaced only after `/ready` has held for

@@ -7,7 +7,7 @@ so growing the media filesystem online takes effect without a restart:
 
 ```sh
 sudo xfs_growfs /var/lib/logkeeper/media      # or resize2fs for ext4
-curl -sS $ADMIN/metrics | grep '^logkeeper_consensus_accepting'   # 1 [ops]
+curl -sS $ADMIN/metrics | grep '^logkeeper_consensus_accepting'   # 1
 ```
 
 The allocation unit must stay at or below 16 KiB. A keeper that was full
@@ -22,7 +22,7 @@ do not count, so most RTDB deployments run far more databases than 128 per
 keeper, as long as fewer than 128 are active at once. A keeper at the limit
 refuses to open more groups ("keeper stream limit reached"). To raise it,
 set `max_streams` in each keeper config, then restart the keepers one at a
-time (see [rolling upgrade](rolling-upgrade.md), steps 5 to 8). Size memory
+time (see [rolling upgrade](rolling-upgrade.md), steps 6 to 9). Size memory
 first: about 1 MiB per open group plus 300 bytes per retained record per
 voter (see the [sizing section](../deployment.md#sizing)).
 

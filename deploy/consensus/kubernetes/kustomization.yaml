@@ -2,9 +2,8 @@
 # Before applying: set the node IPs in keepers/*.json, the node names and
 # disk paths in volumes.yaml, the certificate digests in
 # keepers/*.provision.json, and create the `logkeeper-tls` Secret. See
-# docs/deployment.md. The probes and preStop hook use the admin listener on
-# 127.0.0.1:5741: add `"admin": {"listen": "127.0.0.1:5741"}` to each
-# keepers/*.json once the keeper release has it.
+# docs/deployment.md. The probes and preStop hook use each keeper's plain
+# admin listener on 127.0.0.1:5741 (`admin` in keepers/*.json).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: logkeeper

@@ -45,5 +45,12 @@
   "max_streams": 128,
   "repair_after_secs": 600,
   "park_after_secs": 600,
-  "snapshot_send_bytes_per_second": 67108864
+  "snapshot_send_bytes_per_second": 67108864,
+  "async_append": true,
+  "sync_mode": "full",
+  "log_format": "json",
+  "admin": {
+    "listen": "127.0.0.1:5741",
+    "mtls": false
+  }
 }
