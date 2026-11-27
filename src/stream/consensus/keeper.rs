@@ -840,8 +840,10 @@ impl Engine {
                     | Request::StageOriginal { .. }
                     | Request::AppendOriginal { .. }
                     | Request::PreferLeader { .. }
-                    | Request::AcknowledgeRecovery(_)
-                    | Request::Trim { .. } => writer || admin,
+                    | Request::Trim { .. } => writer,
+                    // An administrator may acknowledge a recovery, but only a
+                    // writer may write to the stream.
+                    Request::AcknowledgeRecovery(_) => writer || admin,
                     Request::ProveOriginal { .. } => admin || writer || reader,
                     Request::Stage(_)
                     | Request::StageReplica { .. }

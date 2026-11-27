@@ -352,3 +352,42 @@ async fn the_recovery_write_is_all_or_nothing_across_a_crash() {
     assert_eq!(journal.head(stream).await, Ok(Lsn(4)));
     cluster.stop_all().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_administrator_that_is_not_a_writer_cannot_write() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    cluster.stop_all().await;
+    for config in cluster.configs.values_mut() {
+        config.writers = vec![OWNER.into()];
+        config.administrators = vec![OWNER.into(), OTHER.into()];
+        config.readers = vec![OWNER.into(), OTHER.into()];
+    }
+    for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
+        cluster.restart(id).await;
+    }
+    let owner = cluster.client(&cluster.credentials);
+    let stream = StreamId(84);
+    owner.create(stream, [a, b, c], 4096).await.unwrap();
+    let sealed = owner
+        .seal(stream, Epoch(0), Uuid::from_u128(5))
+        .await
+        .unwrap();
+
+    let admin = cluster.client_within(&cluster.other, Duration::from_secs(3));
+    assert!(
+        admin
+            .seal(stream, Epoch(1), Uuid::from_u128(77))
+            .await
+            .is_err()
+    );
+    assert!(
+        admin
+            .append(stream, sealed.fence, Lsn(1), Bytes::from_static(b"no"))
+            .await
+            .is_err()
+    );
+    assert!(admin.trim(stream, sealed.fence, Lsn(1)).await.is_err());
+    assert_eq!(owner.head(stream).await, Ok(Lsn(0)));
+    cluster.stop_all().await;
+}
