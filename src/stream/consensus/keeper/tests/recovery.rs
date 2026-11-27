@@ -492,3 +492,128 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
     .expect("the retried recovery serves on its voters");
     cluster.stop_all().await;
 }
+
+/// An excluded lost voter retires on the highest placement it can find, not
+/// on the first stale proof that still names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, d] = cluster.ids;
+    let f = Uuid::from_u128(7);
+    let journal = cluster.client(&cluster.credentials);
+    let stream = StreamId(206);
+    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    let fence = journal
+        .seal(stream, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap()
+        .fence;
+    for at in 1..=3 {
+        journal
+            .append(stream, fence, Lsn(at), Bytes::from(format!("rec-{at}")))
+            .await
+            .unwrap();
+    }
+    let group_a = cluster.group(a, stream).await;
+    timeout(WAIT, async {
+        while group_a.state.head() != Ok(Lsn(3)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(group_a);
+
+    for stopped in [b, c, a] {
+        cluster.running.remove(&stopped).unwrap().stop().await;
+    }
+    let report = cluster.configs[&a]
+        .recover_stream(
+            stream,
+            Recovery {
+                acknowledge_data_loss: true,
+                with: Some([d, f]),
+                interrupt: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.voters, [a, d, f]);
+
+    cluster.restart(a).await;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(cfg) = journal.configuration(stream).await
+                && cfg.voters == [a, d, f]
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Move leadership of the recovered quorum to replacement `f` (UUID 7,
+    // which sorts after lost voters `b` (2) and `c` (3)), so excluder `a` is a
+    // follower that replies Leader(Some(f)) to PlacementProof.
+    journal.prefer_leader(stream, f).await.unwrap();
+    assert!(wait_for_leader(&cluster, stream, f).await);
+
+    // Pause `a` while `b` and `c` restart and elect an old rev-0 quorum leader,
+    // then bring `a` back as a follower of `[a, d, f]`.
+    cluster.running.remove(&a).unwrap().stop().await;
+    cluster.restart(b).await;
+    cluster.restart(c).await;
+    let old_leader = timeout(WAIT, async {
+        loop {
+            for id in [b, c] {
+                if let Some(group) = cluster.running[&id].engine.groups.lock().await.get(&stream)
+                    && group.raft.metrics().borrow_watched().state == openraft::ServerState::Leader
+                {
+                    return id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the two returning lost voters formed an old quorum");
+    let old_follower = if old_leader == b { c } else { b };
+    let leader_engine = cluster.running[&old_leader].engine.clone();
+    let follower_engine = cluster.running[&old_follower].engine.clone();
+    let follower_group = cluster.group(old_follower, stream).await;
+    // Hold old_leader's opening lock so old_leader stays alive serving its
+    // stale rev-0 PlacementProof while `a` rejoins `[a, d, f]` as follower.
+    let leader_opening = leader_engine.opening(stream).await.unwrap();
+    let _hold_old_leader = leader_opening.lock().await;
+    cluster.restart(a).await;
+    let _ = cluster.group(a, stream).await;
+    // Mark `a` (the recovered follower) as the peer that excluded `old_follower`
+    // and wake old_follower's repair loop to run retire_removed.
+    *follower_group.excluded.lock() = Some(a);
+    follower_engine.retire_now.notify_one();
+    // Wait for retire_removed to process `excluded` (either retiring or
+    // erroneously clearing `excluded` on old_leader's stale rev-0 proof).
+    timeout(WAIT, async {
+        while follower_group.excluded.lock().is_some()
+            && follower_engine
+                .disk
+                .ownership(stream)
+                .and_then(|book| book.generation())
+                .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("retire_removed processed the excluded mark");
+    assert!(
+        follower_engine
+            .disk
+            .ownership(stream)
+            .and_then(|book| book.generation())
+            .is_none(),
+        "excluded lost voter must follow past follower excluder `a` and ignore stale rev-0 proof from {old_leader} to retire"
+    );
+    cluster.stop_all().await;
+}

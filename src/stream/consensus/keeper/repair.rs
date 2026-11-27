@@ -35,7 +35,7 @@ use crate::stream::consensus::{
     KeeperStatus,
     assignment::{self, Health, View},
     decisions,
-    network::Frame,
+    network::{Frame, Proof},
 };
 
 #[cfg(not(test))]
@@ -565,9 +565,12 @@ impl Engine {
     /// for the repair delay, or that a peer refused as outside its placement,
     /// and whose current placement, certified by another keeper, no longer
     /// names this keeper. That copy belongs to a voter replaced while it was
-    /// down, moved off by a drain, or lost to an operator recovery. A peer
-    /// that refused the copy is asked first: a lost voter's old peers may
-    /// still certify the placement it lost.
+    /// down, moved off by a drain, or lost to an operator recovery.
+    ///
+    /// Every other keeper is asked at once and the proof at the highest
+    /// revision decides, preferring the peer that refused the copy on a tie.
+    /// A lost voter's old peers may still certify the placement it lost,
+    /// and the peer that refused it may only follow the recovered leader.
     async fn retire_removed(&self) {
         let groups = self
             .groups
@@ -595,35 +598,47 @@ impl Engine {
                 continue;
             };
             let excluder = *group.excluded.lock();
-            let authorities = excluder
-                .into_iter()
-                .chain(self.placement.domains().keys().copied())
-                .collect::<Vec<_>>();
-            for authority in authorities {
-                if authority == self.id {
-                    continue;
+            let mut authorities = excluder.into_iter().collect::<Vec<_>>();
+            for keeper in self.placement.domains().keys() {
+                if *keeper != self.id && !authorities.contains(keeper) {
+                    authorities.push(*keeper);
                 }
-                let Ok(proof) = self.verified_proof(authority, &group.genesis).await else {
+            }
+            let proofs = futures::future::join_all(authorities.into_iter().map(|authority| {
+                let genesis = &group.genesis;
+                async move { (authority, self.verified_proof(authority, genesis).await) }
+            }))
+            .await;
+            let mut highest = None;
+            for (authority, proof) in proofs {
+                let Ok(proof) = proof else {
                     continue;
                 };
-                let named = proof.configuration.voters.contains(&self.id)
-                    || proof.joint.is_some_and(|roster| roster.contains(&self.id));
-                if named {
-                    // The refusal came from a stale or lagging peer.
-                    *group.excluded.lock() = None;
-                } else {
-                    let result = self
-                        .retire_copy(stream, authority, proof.configuration.revision, generation)
-                        .await;
-                    eprintln!(
-                        "logkeeper retired its removed copy of stream {stream:?}: {}",
-                        match result {
-                            Ok(_) => "retired".to_owned(),
-                            Err(error) => error.to_string(),
-                        }
-                    );
+                if highest.as_ref().is_none_or(|(_, best): &(_, Proof)| {
+                    proof.configuration.revision > best.configuration.revision
+                }) {
+                    highest = Some((authority, proof));
                 }
-                break;
+            }
+            let Some((authority, proof)) = highest else {
+                continue;
+            };
+            let named = proof.configuration.voters.contains(&self.id)
+                || proof.joint.is_some_and(|roster| roster.contains(&self.id));
+            if named {
+                // The refusal came from a stale or lagging peer.
+                *group.excluded.lock() = None;
+            } else {
+                let result = self
+                    .retire_copy(stream, authority, proof.configuration.revision, generation)
+                    .await;
+                eprintln!(
+                    "logkeeper retired its removed copy of stream {stream:?}: {}",
+                    match result {
+                        Ok(_) => "retired".to_owned(),
+                        Err(error) => error.to_string(),
+                    }
+                );
             }
         }
     }
