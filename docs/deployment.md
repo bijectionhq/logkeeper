@@ -8,9 +8,12 @@ operations. The [runbooks](runbooks/) hold the step-by-step procedures.
 Every command, flag and config field here exists in the code. Some
 operational features are still landing, and they are marked inline:
 
-- **[ops]**: admin endpoints (`/live`, `/ready`, `/safe-to-stop`, `/problems`,
-  `/metrics`), the `admin` and `log_format` config fields, and the offline
-  `keeper inspect`, `keeper verify` and `keeper dump-segment` tools.
+- **[ops]**: now on `main`. The mark means a step needs the admin endpoints
+  (`/live`, `/ready`, `/safe-to-stop`, `/problems`, `/status`, `/metrics`),
+  the `admin` and `log_format` config fields, the offline `keeper inspect`,
+  `keeper verify` and `keeper dump-segment` tools, or `keeper debug-bundle`.
+  A keeper built before them has none of these; its "Without [ops]"
+  alternatives still apply.
 - **[upgrades]**: N-1 wire negotiation, the cluster write-version gate,
   `keeper salvage`, durable quarantine with `keeper clear-quarantine`, and
   `retired` keepers.
@@ -518,13 +521,18 @@ administrator). The
 
 ## Monitoring **[ops]**
 
-Scrape `/metrics` with a node-local agent on loopback. Alert on:
+Scrape `/metrics` with a node-local agent on loopback, or remotely over mTLS,
+as `job="logkeeper"`, and load the alert rules in
+[`deploy/prometheus/logkeeper-alerts.yml`](../deploy/prometheus/logkeeper-alerts.yml)
+and the dashboard in [`deploy/grafana/logkeeper.json`](../deploy/grafana/logkeeper.json).
+The README's operations section lists every alert with its first response.
+The rules cover at least:
 
 | Signal | Metric or endpoint | Alert when |
 | --- | --- | --- |
 | Keeper down | `/live` | 503 or no answer for 30 s |
 | Not caught up | `/ready` | 503 for more than 5 minutes after a start |
-| WAL stall | `logkeeper_consensus_wal_round_duration_seconds` | p99 above 1 s; the watchdog ends the keeper at 20 s |
+| WAL stall | `logkeeper_consensus_wal_round_duration_seconds`, `logkeeper_consensus_media_responsive` | p99 above half the 2.5 s slow-round gate, where the keeper hands off leadership; the watchdog ends the keeper at 20 s |
 | Under-replication | `/problems` `under_replicated`, `logkeeper_consensus_keeper_liveness{state="dead"}` | Any for longer than `repair_after_secs` |
 | Quorum risk | `/problems` `leaderless`, `parked_with_dead_voter` | Any |
 | Ceilings | `/problems` `near_record_ceiling`, `near_quota_ceiling`, `near_suffix_ceiling` | Any. The writer is not trimming |
@@ -533,10 +541,11 @@ Scrape `/metrics` with a node-local agent on loopback. Alert on:
 | Quarantine | `logkeeper_consensus_streams{state="quarantined"}` | Above 0 |
 | Certificate expiry | your PKI | Under 30 days |
 
-Logs go to stderr. On `main`, they are free text, and every 5 s the keeper
-prints refusal counters. With **[ops]** they are structured (`log_format`,
-`LOGKEEPER_LOG`), and administrative actions are logged under
-`logkeeper::audit`.
+Logs go to stderr. With **[ops]** they are structured (`log_format`,
+`LOGKEEPER_LOG`), administrative actions are logged under `logkeeper::audit`,
+and critical invariant violations under `logkeeper::critical`
+(`logkeeper_consensus_critical_total`). Before it, they are free text, and
+every 5 s the keeper prints refusal counters.
 
 ## Supported-version policy: N-1
 
@@ -627,7 +636,6 @@ Most are items in the consensus design's review tables.
 | Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
 | TLS reload without restart (T12) | Certificate rotation restarts each keeper | Rolling restart |
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |
-| Read-only metrics principal | mTLS scrapers are administrators | Loopback admin listener and a local agent |
-| Cluster debug bundle (T9) | No one-shot collector | `inspect`, `verify`, `/problems` and `/metrics` per keeper **[ops]** |
+| Read-only metrics principal | mTLS scrapers are administrators or keepers | Loopback admin listener and a local agent |
 | Online backup and export | See [backup](#backup-and-restore) | RTDB checkpoints |
 | Durable fencing of keepers lost in a recovery (review item 13) | Two lost voters returning together can briefly serve old history | Start lost keepers one at a time, or wipe them |
