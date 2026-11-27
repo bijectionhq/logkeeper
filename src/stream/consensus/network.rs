@@ -1896,16 +1896,32 @@ impl Peer {
 /// sent it, which steps the leader down and lets it campaign above that
 /// term. That follower voted for this node in that term, so it cannot be a
 /// candidate there, and no vote is granted on the strength of it.
+///
+/// Every reply that hands OpenRaft the receiver's vote gets the same
+/// treatment: AppendEntries (heartbeats included), snapshot chunks, and
+/// vote and pre-vote replies, since a candidate that wins under a lower vote
+/// than one a peer echoed back would lead the same way. A TransferLeader
+/// reply carries no vote, and OpenRaft only logs it.
 fn disown_regressed_vote(
     reply: AppendEntriesResponse<RaftTypes>,
     sender: NodeId,
     target: NodeId,
 ) -> AppendEntriesResponse<RaftTypes> {
     match reply {
-        AppendEntriesResponse::HigherVote(vote) if vote.leader_id().voted_for == sender => {
-            AppendEntriesResponse::HigherVote(Vote::new(vote.leader_id().term, target))
+        AppendEntriesResponse::HigherVote(vote) => {
+            AppendEntriesResponse::HigherVote(disown_vote(vote, sender, target))
         }
         other => other,
+    }
+}
+
+/// `vote`, a receiver's answer to `sender`, as the same term voting for the
+/// receiver `target` when it names `sender` itself.
+fn disown_vote(vote: Vote, sender: NodeId, target: NodeId) -> Vote {
+    if vote.leader_id().voted_for == sender {
+        Vote::new(vote.leader_id().term, target)
+    } else {
+        vote
     }
 }
 
@@ -2004,7 +2020,10 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         let last_log = request.last_log_id;
         let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
             self.request(PeerRequest::Vote(request), &option).await?;
-        let response = response.map_err(|error| unreachable(&error))?;
+        let mut response = response.map_err(|error| unreachable(&error))?;
+        if response.vote > proposed {
+            response.vote = disown_vote(response.vote, proposed.leader_id().voted_for, self.target);
+        }
         if !response.vote_granted
             && !response.vote.is_committed()
             && response.vote.leader_id().term == proposed.leader_id().term
@@ -2034,9 +2053,13 @@ impl RaftNetworkV2<RaftTypes> for Peer {
         if !(self.network.authority)() {
             return Err(unreachable(&invalid(UNAUTHORIZED)).into());
         }
+        let proposed = request.vote;
         let response: Result<VoteResponse<RaftTypes>, RaftError<RaftTypes>> =
             self.request(PeerRequest::PreVote(request), &option).await?;
-        let response = response.map_err(|error| unreachable(&error))?;
+        let mut response = response.map_err(|error| unreachable(&error))?;
+        if response.vote > proposed {
+            response.vote = disown_vote(response.vote, proposed.leader_id().voted_for, self.target);
+        }
         self.network.check_grant(self.target, response)
     }
 
@@ -2161,10 +2184,13 @@ impl RaftNetworkV2<RaftTypes> for Peer {
                     continue;
                 }
             };
-            if reply.vote > vote || done {
-                if done {
-                    super::metrics::count(&self.network.state.metrics().snapshots_sent_ok);
-                }
+            if reply.vote > vote {
+                return Ok(SnapshotResponse {
+                    vote: disown_vote(reply.vote, vote.leader_id().voted_for, self.target),
+                });
+            }
+            if done {
+                super::metrics::count(&self.network.state.metrics().snapshots_sent_ok);
                 return Ok(reply);
             }
             offset += read;
@@ -2247,6 +2273,37 @@ mod tests {
                 .encode_for(WireVersion::Previous)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_receivers_vote_naming_the_sender_is_passed_on_as_a_vote_for_the_receiver() {
+        let (leader, peer, other) = (1, 2, 3);
+        assert_eq!(
+            disown_vote(Vote::new(53, leader), leader, peer),
+            Vote::new(53, peer)
+        );
+        assert_eq!(
+            disown_vote(Vote::new_committed(53, leader), leader, peer),
+            Vote::new(53, peer)
+        );
+        // A newer vote for anyone else passes unchanged, so the leader
+        // follows it as before.
+        assert_eq!(
+            disown_vote(Vote::new(53, other), leader, peer),
+            Vote::new(53, other)
+        );
+        assert!(matches!(
+            disown_regressed_vote(
+                AppendEntriesResponse::HigherVote(Vote::new(53, leader)),
+                leader,
+                peer
+            ),
+            AppendEntriesResponse::HigherVote(vote) if vote == Vote::new(53, peer)
+        ));
+        assert!(matches!(
+            disown_regressed_vote(AppendEntriesResponse::Success, leader, peer),
+            AppendEntriesResponse::Success
+        ));
     }
 
     #[tokio::test(start_paused = true)]
