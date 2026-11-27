@@ -131,6 +131,7 @@ impl Cluster {
                 local.into()
             }
         };
+        crate::stream::consensus::logging::test_warnings::install();
         let dir = tempfile::tempdir().unwrap();
         let roots = dir.path().join("ca.pem");
         let ca = ca(&roots);
@@ -382,6 +383,7 @@ impl Cluster {
         for (_, server) in std::mem::take(&mut self.running) {
             server.stop().await;
         }
+        crate::stream::consensus::logging::test_warnings::check();
     }
 }
 

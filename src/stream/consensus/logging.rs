@@ -47,6 +47,9 @@ macro_rules! critical {
 }
 pub(crate) use critical;
 
+#[cfg(test)]
+pub(super) mod test_warnings;
+
 /// Default window for suppressing repeated noisy warnings on the same key.
 pub(super) const REPEAT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RATE_KEYS: usize = 1024;
