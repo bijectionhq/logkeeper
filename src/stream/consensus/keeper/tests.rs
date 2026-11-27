@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod catalog;
 mod incarnation;
 mod lifecycle;
+mod model_counterexamples;
 mod park;
 mod recovery;
 mod repair;
