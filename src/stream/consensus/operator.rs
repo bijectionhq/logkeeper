@@ -56,9 +56,9 @@ pub struct OperatorConfig {
     pub keepers: Keepers,
     /// The keeper that assigns stream genesis.
     pub catalog: Uuid,
-    /// The replicated catalog's voters, when the keepers run one.
+    /// The replicated catalog's initial voters, when the keepers run one.
     #[serde(default)]
-    pub catalog_voters: Option<[Uuid; 3]>,
+    pub catalog_voters: Option<Voters>,
     /// Every keeper's admin listener. Status, problems, drain and
     /// decommission read them.
     #[serde(default)]

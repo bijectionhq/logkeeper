@@ -163,7 +163,7 @@ pub(super) struct SimCluster {
     /// spares 8 and 9 for five-voter streams.
     pub all_ids: Vec<Uuid>,
     pub catalog: Uuid,
-    pub catalog_voters: Option<[Uuid; 3]>,
+    pub catalog_voters: Option<Voters>,
     /// Keepers wiped and initialized again under their old IDs.
     pub wiped: BTreeSet<Uuid>,
     pub faults: FaultNetwork,
@@ -238,7 +238,7 @@ impl SimCluster {
         let all_ids = (1..=keeper_count).map(Uuid::from_u128).collect::<Vec<_>>();
         let catalog_voters = options
             .replicated_catalog
-            .then_some([5, 6, 7].map(Uuid::from_u128));
+            .then_some(Voters::from([5, 6, 7].map(Uuid::from_u128)));
         let domains: Domains = all_ids
             .iter()
             .copied()

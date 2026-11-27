@@ -212,13 +212,15 @@ authenticated inventory contacts to elect and serve. Creation and unpublished
 staging require the catalog.
 
 Production keepers replicate the catalog: give every keeper the same
-`catalog_voters`, three sorted keeper UUIDs in distinct failure domains, one
-of them the `catalog` keeper. The catalog is the configuration authority
+`catalog_voters`, three or five sorted keeper UUIDs, one of them the `catalog`
+keeper. Use five for a new production cluster. Spread the voters so loss of
+one failure domain leaves a majority. Three voters need three domains. Five
+can use three or more domains with at most two voters per domain. Use five
+distinct domains to survive the loss of any two domains. The catalog is the configuration authority
 whose leases every keeper needs to lead (see "Lost voters that never
 stopped" below), so a keeper refuses to start with the `catalog` keeper
 alone unless its configuration sets `allow_single_catalog: true`, for
-development clusters. The design calls for five catalog voters across
-failure domains; the catalog takes three until streams take five voters.
+development clusters.
 
 `lease_millis` (30000) is how long a keeper's liveness lease lasts and
 `lease_drift_margin_millis` (3000) how much shorter its holder counts it;
@@ -248,10 +250,11 @@ read the stream but not write, seal, trim or delete it.
   answers that a stream does not exist.
 - **Claims and stages:** a follower answers with its leader. The leader takes
   a read barrier, catches up, and appends.
-- **Outages:** with one catalog voter down, creation, staging and repair
-  continue. With two down, creation and unpublished staging fail with
-  `Unavailable`, and a cold client still finds a stream that the remaining
-  voter has applied. Once leases are finalized, existing streams keep
+- **Outages:** creation, staging and repair continue while a majority of
+  catalog voters remains. A three-voter catalog tolerates one voter loss
+  and a five-voter catalog tolerates two. Without a majority, creation and
+  unpublished staging fail with `Unavailable`. A cold client can still find
+  entries that a reachable catalog voter has applied. Once leases are finalized, existing streams keep
   serving only for the lease: after it every keeper stops leading until the
   catalog regains its majority.
 - **Compaction:** when more than 1024 records follow the last checkpoint,
@@ -264,7 +267,12 @@ read the stream but not write, seal, trim or delete it.
   the rest.
 
 **Migration:** stop every keeper, add `catalog_voters` to every keeper and
-consumer configuration, and restart. The first record of the replicated
+consumer configuration, and restart. To bootstrap a five-voter catalog,
+use a release that supports five on every keeper and consumer before this
+first start. The catalog's genesis roster is fixed after bootstrap. Changing
+the list on an established replicated catalog cannot resize it. Use normal
+Raft membership replacement to move catalog replicas at the same width.
+The first record of the replicated
 catalog is a seed that the `catalog` keeper appends as its leader: a
 checkpoint of its single-keeper entries, which may be empty, and a seed
 marker. Another leader hands leadership to the `catalog` keeper for this.

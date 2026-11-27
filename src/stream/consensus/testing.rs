@@ -65,7 +65,7 @@ pub struct LocalCluster {
     voters: Voters,
     spares: Vec<Uuid>,
     catalog: Uuid,
-    catalog_voters: Option<[Uuid; 3]>,
+    catalog_voters: Option<Voters>,
     issued: Mutex<BTreeMap<String, Credentials>>,
 }
 
@@ -148,7 +148,7 @@ impl LocalCluster {
         let issuer = authority(&roots)?;
         let voters = [1, 2, 3].map(Uuid::from_u128);
         let catalog = Uuid::from_u128(4);
-        let catalog_voters = replicated.then_some([voters[0], voters[1], catalog]);
+        let catalog_voters = replicated.then_some(Voters::from([voters[0], voters[1], catalog]));
         let spares = if spared {
             vec![Uuid::from_u128(5), Uuid::from_u128(6)]
         } else {
@@ -324,7 +324,7 @@ impl LocalCluster {
     }
 
     /// The replicated catalog's voters, when the cluster runs one.
-    pub fn catalog_voters(&self) -> Option<[Uuid; 3]> {
+    pub fn catalog_voters(&self) -> Option<Voters> {
         self.catalog_voters
     }
 

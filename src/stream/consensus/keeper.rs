@@ -201,12 +201,12 @@ pub struct Config {
     pub retired: BTreeSet<uuid::Uuid>,
     pub enrollment: PathBuf,
     pub catalog: uuid::Uuid,
-    /// Three keepers in distinct failure domains that host the catalog as a
-    /// consensus stream of its own. Without them `catalog` alone holds it.
+    /// The three or five initial voters hosting the replicated catalog.
+    /// Spread them across failure domains so one domain cannot lose quorum.
     /// `catalog` must be one of them: it seeds the replicated catalog with
     /// its single-keeper entries once.
     #[serde(default)]
-    pub catalog_voters: Option<[uuid::Uuid; 3]>,
+    pub catalog_voters: Option<Voters>,
     /// Lets `catalog` alone hold the catalog, without `catalog_voters`. For
     /// development only: production replicates the catalog, which is the
     /// configuration authority every keeper's lease depends on.
@@ -457,11 +457,10 @@ impl Config {
             ));
         }
         if let Some(voters) = &self.catalog_voters
-            && (!placement.structural_roster(&Voters::from(*voters))
-                || !voters.contains(&self.catalog))
+            && (!placement.structural_roster(voters) || !voters.contains(&self.catalog))
         {
             return Err(invalid(
-                "catalog voters must be three sorted keepers in distinct domains, one the catalog",
+                "catalog voters must be sorted known keepers, one the catalog",
             ));
         }
         if let Some(admin) = &self.admin {
@@ -548,6 +547,9 @@ impl Config {
         let id = self.keeper;
         let registry = self.enrollment.clone();
         let data = self.data.clone();
+        let catalog_stream = self
+            .catalog_voters
+            .map(|voters| catalog_stream::CatalogStream::new(voters, self.catalog));
         let (disk, recognition, mode) = tokio::task::spawn_blocking(move || {
             let disk = Disk::open(enrollment)?;
             let recognition = incarnation::Recognition::open(&registry, id, disk.incarnation)?;
@@ -555,6 +557,24 @@ impl Config {
             Ok::<_, io::Error>((disk, recognition, mode))
         })
         .await??;
+        if let Some(genesis) = disk.genesis(catalog_stream::STREAM) {
+            if !catalog_stream
+                .as_ref()
+                .is_some_and(|catalog| catalog.matches(&genesis))
+            {
+                return Err(invalid(
+                    "catalog configuration differs from durable genesis",
+                ));
+            }
+        } else if let Some(voters) = self.catalog_voters
+            && voters.contains(&id)
+            && voters.len() == 5
+            && !placement.roster(&voters)
+        {
+            return Err(invalid(
+                "five catalog voters must be spread across failure domains",
+            ));
+        }
         let lease = Arc::new(lease::Lease::open(
             &self.data,
             Duration::from_millis(self.lease_millis),
@@ -619,9 +639,7 @@ impl Config {
             catalog_id: self.catalog,
             catalog,
             lease,
-            catalog_stream: self.catalog_voters.map(|voters| {
-                catalog_stream::CatalogStream::new(Voters::from(voters), self.catalog)
-            }),
+            catalog_stream,
             disk,
             recognition,
             mode,
@@ -1437,6 +1455,14 @@ impl Engine {
 
     async fn group(&self, genesis: Genesis) -> io::Result<Arc<Group>> {
         self.require_media()?;
+        if genesis.stream == catalog_stream::STREAM
+            && !self
+                .catalog_stream
+                .as_ref()
+                .is_some_and(|catalog| catalog.matches(&genesis))
+        {
+            return Err(invalid("catalog genesis does not match configuration"));
+        }
         if self.is_quarantined(genesis.stream) {
             return Err(invalid("stream replica is quarantined"));
         }

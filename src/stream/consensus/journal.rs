@@ -39,10 +39,10 @@ pub struct JournalConfig {
     pub keepers: Keepers,
     /// The keeper that assigns stream genesis.
     pub catalog: uuid::Uuid,
-    /// The replicated catalog's three voters, when the keepers run one.
+    /// The replicated catalog's initial voters, when the keepers run one.
     /// Claims and lookups then go to them instead of `catalog`.
     #[serde(default)]
-    pub catalog_voters: Option<[uuid::Uuid; 3]>,
+    pub catalog_voters: Option<Voters>,
     /// The voters of every stream this consumer creates, three or five.
     /// Give either this fixed roster or `placement`.
     #[serde(default)]

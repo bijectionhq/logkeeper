@@ -201,6 +201,10 @@ pub(super) struct CatalogStream {
 }
 
 impl CatalogStream {
+    pub fn matches(&self, genesis: &Genesis) -> bool {
+        self.genesis == *genesis
+    }
+
     pub fn new(voters: Voters, seeder: Uuid) -> Self {
         let genesis = Genesis {
             stream: STREAM,

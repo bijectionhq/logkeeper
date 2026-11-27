@@ -38,7 +38,7 @@ pub struct Client {
     rpc: Rpc,
     catalog: uuid::Uuid,
     /// The replicated catalog's voters, which replace `catalog` when set.
-    catalog_voters: Option<[uuid::Uuid; 3]>,
+    catalog_voters: Option<Voters>,
     /// The replicated catalog voter that last answered a claim.
     catalog_leader: Arc<Mutex<Option<uuid::Uuid>>>,
     deadline: Duration,
@@ -83,8 +83,8 @@ impl Client {
 
     /// Uses the replicated catalog on `voters` instead of the single catalog
     /// keeper. Claims and lookups try them in order and follow leader hints.
-    pub fn with_catalog_voters(mut self, voters: [uuid::Uuid; 3]) -> Self {
-        self.catalog_voters = Some(voters);
+    pub fn with_catalog_voters(mut self, voters: impl Into<Voters>) -> Self {
+        self.catalog_voters = Some(voters.into());
         self
     }
 

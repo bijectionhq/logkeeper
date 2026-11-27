@@ -126,31 +126,37 @@ up front.
 ### The catalog
 
 The catalog assigns each stream's genesis (ID, first voters, quota), records
-staged membership changes and answers location lookups. Existing streams keep
-reading and writing while it is down. Creation (a new RTDB database) and
-staged repair need it.
+staged membership changes, answers location lookups and grants keepers
+leases. When leases are enabled, existing streams can read and write during
+a catalog outage until their keepers' leases expire. Creation (a new RTDB
+database) and staged repair need a catalog quorum.
 
 - **Catalog keeper (`catalog`)**: one keeper holds the catalog alone. If it is
   down, nothing can be created or repaired. If its disk is lost, the record of
   which streams exist is lost too. Use it only for development.
 - **Replicated catalog (`catalog_voters`)**: the catalog is a consensus stream
-  of its own on three keepers in distinct domains. It is never parked, and the
+  of its own on three or five keepers. It is never parked, and the
   normal leader-driven repair repairs it. Since placement certification
   (commit `59038f5`), a copy that restarts without hearing from its leader
   asks the catalog before it campaigns or serves reads. After a whole-cluster
   restart, streams therefore elect only once the catalog answers. Start the
-  catalog voters first, or together with the rest. It survives losing one voter. Losing
-  two stops creation and staging: existing streams keep serving, and recovery
-  of the catalog itself does not exist yet ([missing features](#missing-features)).
-  **Use `catalog_voters` in production.** List the same three sorted UUIDs on
-  every keeper and in every client config. One of them must be the `catalog`
-  keeper. That keeper seeds the replicated catalog once, at its first start
-  with `catalog_voters`.
+  catalog voters first, or together with the rest. Three voters tolerate one
+  loss and five voters tolerate two. Recovery of the catalog itself requires
+  returning enough voters to regain quorum.
+  **Use five `catalog_voters` for new production clusters.** List the same
+  sorted UUIDs on every keeper and in every client config. Put at most two
+  of five voters in any one failure domain. With three voters, use three
+  distinct domains. One voter must be the `catalog` keeper, which seeds the
+  replicated catalog at first start.
 
 Migrating from a single catalog keeper is a full stop: stop every keeper, add
 `catalog_voters` to every keeper and consumer config, then start them all. The
-`catalog` keeper must be up for the first start. See the README section
-"Keeper-hosted consensus streams".
+`catalog` keeper must be up for the first start. Before bootstrapping five
+voters, upgrade all keepers and consumers to a release that supports five.
+The existing replicated catalog keeps its genesis roster and width. Assign
+new members through Raft replacement. The config remains the genesis roster
+and a list of discovery contacts. See the README section "Keeper-hosted
+consensus streams".
 
 ### Co-locating with RTDB
 
@@ -627,7 +633,7 @@ has these fields. Unknown fields are refused.
 | --- | --- | --- |
 | `keepers` | yes | Application addresses of every keeper (the keepers' `keepers` map) |
 | `catalog` | yes | The catalog keeper's UUID |
-| `catalog_voters` | with a replicated catalog | The same three UUIDs as the keepers |
+| `catalog_voters` | with a replicated catalog | The same three or five initial voter UUIDs as the keepers |
 | `placement` | one of `placement` and `voters` | Keepers eligible to vote, with their domains. Each new stream gets three in distinct domains. Use this in production |
 | `voters` | | A fixed roster for every stream, which never moves. Only for tests |
 | `draining` | no | Placement keepers to move streams off |
@@ -815,6 +821,6 @@ Most are items in the consensus design's review tables.
 | Missing | Effect | Workaround |
 | --- | --- | --- |
 | Runtime inventory change (T19) | Adding a keeper restarts every keeper | Plan the count; restart one at a time |
-| Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
+| Catalog recovery after a majority is lost | Creation and staging stop until enough voters return | Bootstrap five voters in at least three zones and replace failed ones promptly |
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |
 | Disaster restore without original enrollment | An inaccessible old pair cannot produce retirement proofs. One survivor cannot safely repair the old quorum | Restore enough original participants, or rebuild a fresh isolated cell from a qualified application backup |

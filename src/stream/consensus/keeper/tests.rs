@@ -79,7 +79,7 @@ struct Cluster {
     keepers: Keepers,
     ids: [Uuid; 4],
     catalog: Uuid,
-    catalog_voters: Option<[Uuid; 3]>,
+    catalog_voters: Option<Voters>,
     credentials: Credentials,
     other: Credentials,
     #[cfg(unix)]
@@ -99,11 +99,11 @@ impl Cluster {
     /// Hosts the catalog as a consensus stream on keepers 5, 6 and 7. The
     /// catalog keeper 5 seeds it.
     async fn start_replicated() -> Self {
-        let voters = [5, 6, 7].map(Uuid::from_u128);
+        let voters = Voters::from([5, 6, 7].map(Uuid::from_u128));
         Self::start_with(["a", "b", "c", "d"], Some(voters)).await
     }
 
-    async fn start_with(domains: [&str; 4], catalog_voters: Option<[Uuid; 3]>) -> Self {
+    async fn start_with(domains: [&str; 4], catalog_voters: Option<Voters>) -> Self {
         Self::start_addressed(domains, catalog_voters, false, 0).await
     }
 
@@ -121,7 +121,7 @@ impl Cluster {
 
     async fn start_addressed(
         domains: [&str; 4],
-        catalog_voters: Option<[Uuid; 3]>,
+        catalog_voters: Option<Voters>,
         named: bool,
         extra: u128,
     ) -> Self {
@@ -132,7 +132,7 @@ impl Cluster {
     /// it on later needs.
     async fn start_configured(
         domains: [&str; 4],
-        catalog_voters: Option<[Uuid; 3]>,
+        catalog_voters: Option<Voters>,
         named: bool,
         offload: Option<crate::stream::consensus::OffloadConfig>,
         extra: u128,

@@ -77,7 +77,8 @@ async fn check(cluster: &Cluster, claimed: &[Genesis]) {
 async fn without_a_catalog_quorum_creates_fail_and_existing_streams_serve() {
     let mut cluster = Cluster::start_replicated().await;
     let [a, b, c, d] = cluster.ids;
-    let [_, second, third] = cluster.catalog_voters.unwrap();
+    let voters = cluster.catalog_voters.unwrap();
+    let (second, third) = (voters[1], voters[2]);
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(81);
     journal
@@ -127,10 +128,99 @@ async fn without_a_catalog_quorum_creates_fail_and_existing_streams_serve() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn five_voter_catalog_grants_leases_and_creates_after_two_voters_stop() {
+    let voters = Voters::from([5, 6, 7, 8, 9].map(Uuid::from_u128));
+    let mut cluster = Cluster::start_addressed(["a", "b", "c", "d"], Some(voters), false, 2).await;
+    let data = Voters::from([cluster.ids[0], cluster.ids[1], cluster.ids[2]]);
+    let existing = StreamId(120);
+    let client = cluster.client(&cluster.credentials);
+    client.create(existing, data, 4096).await.unwrap();
+    cluster.finalize().await;
+    for voter in voters {
+        assert_eq!(located(&cluster, voter, existing).await.0.voters, data);
+        let group = cluster.group(voter, STREAM).await;
+        assert_eq!(group.genesis.voters, voters);
+        assert_eq!(
+            group
+                .raft
+                .metrics()
+                .borrow_watched()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .collect::<BTreeSet<_>>(),
+            voters.into_iter().map(|id| id.as_u128()).collect(),
+        );
+    }
+
+    // The original seeder need not be present after bootstrap.
+    for voter in [cluster.catalog, voters[1]] {
+        cluster.running.remove(&voter).unwrap().stop().await;
+    }
+    let fresh = StreamId(121);
+    let cold = cluster.client(&cluster.credentials);
+    cold.create(fresh, data, 4096).await.unwrap();
+    assert_eq!(cold.claimed_voters(fresh).await, Ok(Some(data)));
+
+    // The prior leases have now expired. The catalog must grant new ones
+    // before these data voters can serve or accept writes again.
+    let lease = Duration::from_millis(cluster.configs[&data[0]].lease_millis);
+    tokio::time::sleep(lease).await;
+    let sealed = cold
+        .seal(fresh, Epoch(0), Uuid::from_u128(99))
+        .await
+        .unwrap();
+    assert_eq!(
+        cold.append(fresh, sealed.fence, Lsn(1), Bytes::from_static(b"record"))
+            .await,
+        Ok(Lsn(1))
+    );
+    assert_eq!(cold.head(fresh).await, Ok(Lsn(1)));
+    cluster.stop_all().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn five_voter_catalog_cannot_reseed_an_existing_replicated_catalog() {
+    let mut cluster = Cluster::start_replicated().await;
+    let [a, b, c, _] = cluster.ids;
+    let client = cluster.client(&cluster.credentials);
+    client
+        .create(StreamId(122), Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
+    let changed = Voters::from([1, 2, 5, 6, 7].map(Uuid::from_u128));
+    let genesis = Genesis {
+        voters: changed,
+        ..cluster.group(cluster.catalog, STREAM).await.genesis.clone()
+    };
+    let replica = &cluster.running[&a].engine;
+    assert!(replica.disk.genesis(STREAM).is_none());
+    let error = replica.group(genesis).await.err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        "catalog genesis does not match configuration"
+    );
+    assert!(replica.disk.genesis(STREAM).is_none());
+
+    cluster.stop_all().await;
+    let mut config = cluster.configs[&cluster.catalog].clone();
+    config.catalog_voters = Some(changed);
+    let error = config
+        .prepare(CancellationToken::new())
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "catalog configuration differs from durable genesis"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_lost_catalog_voter_leaves_creates_and_repair_and_is_replaced() {
     let mut cluster = Cluster::start_replicated().await;
     let [a, b, c, d] = cluster.ids;
-    let [_, second, _] = cluster.catalog_voters.unwrap();
+    let second = cluster.catalog_voters.unwrap()[1];
     let journal = cluster.client(&cluster.credentials);
     journal
         .create(StreamId(83), Voters::from([a, b, c]), 4096)
@@ -279,7 +369,7 @@ async fn a_populated_single_catalog_migrates_into_the_replicated_catalog() {
         .unwrap();
     cluster.stop_all().await;
 
-    let voters = [5, 6, 7].map(Uuid::from_u128);
+    let voters = Voters::from([5, 6, 7].map(Uuid::from_u128));
     for config in cluster.configs.values_mut() {
         config.catalog_voters = Some(voters);
     }
@@ -326,7 +416,8 @@ async fn a_populated_single_catalog_migrates_into_the_replicated_catalog() {
 async fn the_replicated_catalog_stays_reachable_after_its_voters_are_replaced() {
     let mut cluster = Cluster::start_replicated().await;
     let [a, b, c, d] = cluster.ids;
-    let [c1, c2, c3] = cluster.catalog_voters.unwrap();
+    let voters = cluster.catalog_voters.unwrap();
+    let (c1, c2, c3) = (voters[0], voters[1], voters[2]);
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(210);
     journal
