@@ -15,6 +15,7 @@ from study_tools import check_lean_mutation, check_lean_theorems
 MODULES = {
     "RecoveryFence": 10, "Parking": 7, "RetireOnProof": 4, "CatalogClaim": 6,
     "EpochLease": 10, "OffloadPrefix": 11, "SegmentedWAL": 13, "JournalContract": 13,
+    "RTDBRecovery": 9,
 }
 
 CONTROLS = [
@@ -155,6 +156,30 @@ CONTROLS = [
         "(max held.1 record.fence.epoch, min held.2 record.lossPoint)",
         "(max held.1 record.fence.epoch, record.lossPoint)",
         "    · exact Or.inl ⟨_, _, rfl, by omega, by omega⟩",
+    ),
+    (
+        "RTDBRecovery", "recheck-the-wrong-record",
+        "  ⟨now.head, now.floor, decide (now.entries[cursor.head - 1]? = before.entries[cursor.head - 1]?),",
+        "  ⟨now.head, now.floor, decide (now.entries[cursor.head - 1]? = before.entries[cursor.head]?),",
+        "  have prefixKept := recheck_keeps_the_applied_prefix inv commands cursor.head within recheck",
+    ),
+    (
+        "RTDBRecovery", "skip-the-record-after-the-cursor",
+        "    (now.entries.drop cursor.head).map .record⟩",
+        "    (now.entries.drop (cursor.head + 1)).map .record⟩",
+        "        exact ⟨record.fence.head - cursor.head, by rw [List.getElem?_drop, Nat.add_sub_cancel' (by omega), entry]⟩",
+    ),
+    (
+        "RTDBRecovery", "trust-a-checkpoint-at-the-seen-epoch",
+        "  | .checkpoint checkpoint => seen < checkpoint.recoveryEpoch",
+        "  | .checkpoint checkpoint => seen + 1 < checkpoint.recoveryEpoch",
+        "      decide_eq_true (Nat.lt_of_lt_of_le unseen includes)",
+    ),
+    (
+        "RTDBRecovery", "stamp-an-earlier-cut",
+        "  ⟨base.through + count, learn base.recoveryEpoch (suffix.take count)⟩",
+        "  ⟨base.through + count, learn base.recoveryEpoch (suffix.take (count - 1))⟩",
+        "      ⟨base.through + before.length, learn base.recoveryEpoch before⟩ := by\n  simp [capture]",
     ),
 ]
 

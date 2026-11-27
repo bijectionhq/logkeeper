@@ -6,3 +6,4 @@ import Logkeeper.ConsensusAdditions.EpochLease
 import Logkeeper.ConsensusAdditions.OffloadPrefix
 import Logkeeper.ConsensusAdditions.SegmentedWAL
 import Logkeeper.ConsensusAdditions.JournalContract
+import Logkeeper.ConsensusAdditions.RTDBRecovery
