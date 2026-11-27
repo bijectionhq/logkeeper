@@ -301,11 +301,12 @@ counts are from TLC 2.19 on 10 workers of the development Mac.
 | `AuthorityOutageNoLease` | control: leases not modeled | `LeadershipLapses` | violated |
 | `AuthorityReusedId` | keeper `k3` reincarnates on new media under a bumped epoch while the first incarnation runs or stops; 6d75fec kept | `CommittedEntriesPreserved`, `ElectionSafety` | pass, 1,011,168 states, 1 min 37 s |
 | `AuthorityReusedIdEpochOnly` | control: the epoch bump without 6d75fec | same | `CommittedEntriesPreserved` violated (finding 3) |
-| `AuthorityRF5` | RF 5 as the code recovers: survivors `s`, `t`, only the writer gets the recovery round and `t` keeps running with its lease; lost `a`, `b` running, `c` down (`StoppedAtStart`, a smaller cut than the earlier 8-keeper one); three replacements; `ExcludeLostIds`, `SurvivorFence`; `MaxNewTerms = 1` | as `AuthorityRecovery`, plus `FinalizedStaysRecovered` | not run to the end: no violation in 6,887,801 distinct states (stopped for memory). Its safety follows from `AuthorityRF5Exclusion`, whose unmodeled lease for `t` only adds behaviors |
+| `AuthorityRF5` | RF 5 as the code recovers: survivors `s`, `t`, only the writer gets the recovery round and `t` keeps running with its lease; lost `a`, `b` running, `c` down (`StoppedAtStart`, a smaller cut than the earlier 8-keeper one); three replacements; `ExcludeLostIds`, `SurvivorFence`; `MaxNewTerms = 1` | as `AuthorityRecovery`, plus `FinalizedStaysRecovered` | pass, 26,598,708 distinct states, depth 34, 40 min 50 s on 8 workers of the M1 host (10 GB heap) |
 | `AuthorityRF5Exclusion` | as `AuthorityRF5`, but `t`'s lease is not modeled (always valid and unfenced), so only the identity exclusion protects it | same | pass, 20,548,926 distinct states, depth 33, 36 min 44 s on 6 workers |
 | `AuthorityRF5ExclusionControl` | control: as `AuthorityRF5Exclusion` without the exclusion | same | `NoMixedHistory` violated: 8,286,893 distinct states, 8 min 11 s on 6 workers, a 20-state trace (finding 4) |
 
-`check.sh` runs all but the RF 5 configurations, which take too long for it: the controls and the liveness and
+`check.sh` runs all but the RF 5 configurations (about 40 min each; run them alone on a large
+host, with `-Xmx10g` or more): the controls and the liveness and
 reuse configurations in `fast` mode, and `AuthorityRecovery` and
 `AuthorityOutageSafety` with the deep configurations.
 
