@@ -25,6 +25,14 @@ residual risks are witnesses: `two_returning_voters_serve_the_lost_suffix`
 `unconfirmed_local_read_serves_the_lost_suffix` (a single returning voter
 answers a read from its own applied state without a barrier, which the TLA+
 model found as CE-3).
+
+The `contact` step refuses every message a lost voter sends the survivor.
+The shipped keeper refuses votes, pre-votes and appends, but answers a
+snapshot chunk with its own vote, at the recovery term (the ignored test
+`the_survivor_refuses_a_lost_voters_snapshot_without_its_term`). Only a
+leader sends snapshots, and a lost voter leads only with the other lost
+voter's vote, so the theorems for one returning voter still describe the
+keeper; with both returning, that answer teaches them the recovery term.
 -/
 
 namespace Logkeeper.ConsensusAdditions.RecoveryFence

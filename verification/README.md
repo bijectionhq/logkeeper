@@ -216,3 +216,9 @@ voters form a quorum of the old configuration and serve the lost suffix
 until one of them contacts a recovered voter. A single returning voter
 cannot commit or pass a barrier, but a read it answers from its own applied
 state, without a barrier, can serve the lost suffix (TLA+ CE-3).
+The Lean model refuses every message a lost voter sends the survivor; the
+keeper refuses votes, pre-votes and appends but answers a snapshot chunk
+with its vote at the recovery term, which the ignored test
+`the_survivor_refuses_a_lost_voters_snapshot_without_its_term` in
+`src/stream/consensus/keeper/tests/recovery.rs` reproduces. Only a leader of
+the old configuration sends snapshots, which takes both lost voters.

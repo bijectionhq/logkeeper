@@ -617,3 +617,73 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
     );
     cluster.stop_all().await;
 }
+
+/// After a recovery, a lost voter must never learn the recovered term from
+/// the survivor: that is what keeps it from campaigning above the recovery
+/// entries. Votes, pre-votes and appends from a sender outside the
+/// survivor's membership and below its term are refused without an answer
+/// (`decisions::excludes_sender`), but a snapshot chunk is not: the
+/// survivor answers it with its own vote, at the recovery term. A lost
+/// voter that leads the old configuration, as when both lost voters return
+/// together, and sends the survivor a snapshot therefore learns the
+/// recovery term instead of being told it was excluded. Found while proving
+/// `RecoveryFence.lost_replicas_stay_below_the_recovery_term`, which assumes
+/// every contact from a lost voter is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a snapshot chunk from an excluded lost voter is answered with the recovery term"]
+async fn the_survivor_refuses_a_lost_voters_snapshot_without_its_term() {
+    use crate::stream::consensus::{
+        SnapshotMeta,
+        network::{ChunkReply, Frame, SnapshotChunk},
+    };
+
+    let mut cluster = Cluster::start().await;
+    let [a, b, c, _] = cluster.ids;
+    let stream = StreamId(82);
+    written_stream(&cluster, stream, [a, b, c], a, 2).await;
+    let journal = cluster.client(&cluster.credentials);
+    for keeper in [b, c, a] {
+        cluster.running.remove(&keeper).unwrap().stop().await;
+    }
+    let report = cluster.configs[&a]
+        .recover_stream(stream, acknowledged())
+        .await
+        .unwrap();
+    assert!(report.written);
+    cluster.restart(a).await;
+    configured(&journal, stream, report.voters).await;
+    let survivor = cluster.group(a, stream).await;
+    let recovered = survivor.raft.metrics().borrow_watched().current_term;
+
+    // `b` leads the old configuration in a term below the recovery term.
+    let chunk = SnapshotChunk {
+        vote: Vote::new_committed(2, b.as_u128()),
+        meta: SnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "lost".into(),
+        },
+        offset: 0,
+        data: Vec::new(),
+        done: false,
+    };
+    let reply = cluster
+        .peer_rpc(b, Lane::Bulk)
+        .call::<ChunkReply>(
+            a,
+            Frame::Peer(
+                survivor.genesis.clone(),
+                PeerRequest::Snapshot(chunk, [0; 32]),
+            ),
+            Duration::from_secs(3),
+        )
+        .await;
+    // A refusal carries no Raft answer, so no vote of the recovered history.
+    if let Ok(answer) = reply {
+        panic!(
+            "the survivor answered a lost voter's snapshot with {answer:?}, \
+             teaching it a term of the recovered history (recovery term {recovered})"
+        );
+    }
+    cluster.stop_all().await;
+}
