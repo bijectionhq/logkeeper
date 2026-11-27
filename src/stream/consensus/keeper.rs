@@ -1976,7 +1976,9 @@ impl Group {
 
     async fn write(&self, command: Command) -> Reply {
         use super::metrics::count;
-        let metrics = self.state.metrics().clone();
+        // Borrowed, not cloned: one shared refcount bumped by every write
+        // on every stream would be a contended cache line.
+        let metrics = self.state.metrics();
         let started = std::time::Instant::now();
         if self.require_healthy().is_err() {
             count(&metrics.write_unhealthy);
@@ -2003,12 +2005,12 @@ impl Group {
             }
         };
         let raft = self.raft.clone();
-        let proposal_metrics = metrics.clone();
         let in_flight = InFlight::start(&self.proposals, ticket, started, metrics.clone());
         // The proposal owns its reservation even when the caller drops the
         // request or times out. The WAL settles it as it publishes the slot.
         let proposal = tokio::spawn(async move {
-            let (_permit, _space, _in_flight) = (permit, space, in_flight);
+            let (_permit, _space) = (permit, space);
+            let proposal_metrics = &in_flight.metrics;
             let (responder, response) = ProgressResponder::complete_only();
             if let Err(error) = raft
                 .client_write_ff(
