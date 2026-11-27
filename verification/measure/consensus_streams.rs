@@ -27,6 +27,9 @@
 //! batching, and reports the largest offload lag seen during the run and how
 //! long the leaders took to upload everything once the writers stopped.
 //!
+//! `--finalize 1` finalizes the cluster at this build's level first, so
+//! liveness leases are enforced, and waits until every keeper holds one.
+//!
 //! `--fill N` first writes N 64-byte records to stream 1 in 256-record
 //! batches and reports the process's resident memory with that stream open
 //! and, with `--park-after`, once it parked.
@@ -51,6 +54,7 @@ struct Args {
     cold: u64,
     offload: Option<String>,
     offload_interval_ms: u64,
+    finalize: bool,
 }
 
 fn args() -> Args {
@@ -66,6 +70,7 @@ fn args() -> Args {
         cold: 0,
         offload: None,
         offload_interval_ms: 1000,
+        finalize: false,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -86,6 +91,7 @@ fn args() -> Args {
             "--cold" => args.cold = value.parse().unwrap(),
             "--offload" => args.offload = Some(value),
             "--offload-interval-ms" => args.offload_interval_ms = value.parse().unwrap(),
+            "--finalize" => args.finalize = value != "0",
             other => panic!("unknown flag {other}"),
         }
     }
@@ -192,6 +198,15 @@ async fn main() {
     }
     let config = cluster.journal_config(1 << 30, args.record.max(4096));
     let journal = cluster.journal(PRINCIPAL, &config).unwrap();
+    if args.finalize {
+        let version = logkeeper::stream::consensus::CLUSTER_VERSION_CURRENT;
+        while journal.finalize_version(version).await != Ok(version) {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        // Keepers learn the level within 10 s and enforce leases at their
+        // next renewal, within 9 s.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+    }
     for id in 1..=args.streams {
         journal.create(StreamId(u128::from(id))).await.unwrap();
         journal

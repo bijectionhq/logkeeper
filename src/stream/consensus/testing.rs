@@ -218,8 +218,9 @@ impl LocalCluster {
                 catalog,
                 catalog_voters,
                 allow_single_catalog: true,
-                lease_millis: 30_000,
-                lease_drift_margin_millis: 3_000,
+                // Short, so a recovery's wait for lost leases stays short.
+                lease_millis: 4_000,
+                lease_drift_margin_millis: 400,
                 readers: principals.clone(),
                 writers: principals.clone(),
                 administrators: principals.clone(),

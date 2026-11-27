@@ -39,6 +39,14 @@ async fn a_spared_cluster_recovers_a_stream_that_lost_two_voters() {
     assert_eq!(cluster.spares().len(), 2);
     let config = cluster.journal_config(1 << 20, 1024);
     let journal = cluster.journal(PRINCIPAL, &config).unwrap();
+    // With liveness leases finalized, the catalog fences the lost voters
+    // and the recovery waits out their leases, so it needs no retirement
+    // proofs from their hosts.
+    let version = logkeeper::stream::consensus::CLUSTER_VERSION_CURRENT;
+    assert_eq!(
+        retry(|| journal.finalize_version(version)).await,
+        Ok(version)
+    );
     let stream = StreamId(0x5eed);
     retry(|| journal.create(stream)).await.unwrap();
     assert_eq!(retry(|| journal.seal(stream, Epoch(1))).await, Ok(Lsn(0)));

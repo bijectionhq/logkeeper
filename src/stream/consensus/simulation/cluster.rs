@@ -322,6 +322,22 @@ impl SimCluster {
         journal
     }
 
+    /// Waits until every running keeper holds an enforced lease.
+    pub async fn await_leases(&self) {
+        let end = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !self
+            .running
+            .values()
+            .all(|running| running.engine.lease.enforced() && running.engine.lease.valid())
+        {
+            assert!(
+                tokio::time::Instant::now() < end,
+                "keepers hold no enforced lease"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     /// Finalizes the cluster version through the catalog and sets it on every
     /// running keeper, as each keeper's 10 s version loop would.
     pub async fn finalize_version(&self) {

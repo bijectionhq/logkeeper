@@ -881,6 +881,14 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
 /// cross-voter convergence and all safety/linearizability/durability invariants.
 async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
     let mut cluster = SimCluster::start(plan.seed, plan.options.clone()).await;
+    // `LOGKEEPER_CONSENSUS_LEASES=1` finalizes the cluster first, so every
+    // fault runs under enforced liveness leases from the catalog.
+    if env::var("LOGKEEPER_CONSENSUS_LEASES")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        cluster.finalize_version().await;
+        cluster.await_leases().await;
+    }
     let limits = Limits {
         max_record_bytes: plan.options.max_record_bytes,
         stream_quota_bytes: plan.options.quota_bytes,
