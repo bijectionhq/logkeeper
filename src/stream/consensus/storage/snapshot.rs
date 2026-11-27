@@ -302,8 +302,14 @@ impl Pin {
     }
 
     /// Makes the pin durable in the replica's directory, so a restart keeps
-    /// the copy parked without loading its image.
+    /// the copy parked without loading its image. The mark is an N format:
+    /// before the cluster version is finalized none is written, so an N-1
+    /// keeper never meets one and a later N never trusts one an N-1 outran.
+    /// The copy then reopens at restart, as N-1 does.
     pub fn persist(&self, disk: &Disk, stream: StreamId) -> io::Result<()> {
+        if !disk.write_version_allows(crate::stream::consensus::CLUSTER_VERSION_CURRENT) {
+            return Ok(());
+        }
         // Segments that slices of the selected snapshot left stay named
         // until a rebuilt snapshot is selected.
         let mut segments = self.segments().collect::<Vec<_>>();

@@ -1131,7 +1131,7 @@ fn replay(
                     let record: Record = options()
                         .with_limit(MAX_FRAME)
                         .deserialize(&body)
-                        .map_err(io::Error::other)?;
+                        .map_err(newer_record)?;
                     let slices = slices(&record, &body, id, offset + FRAME_HEADER, objects)?;
                     state.apply(record)?;
                     if let Some((stream, slices)) = slices {
@@ -1298,6 +1298,20 @@ pub(in crate::stream::consensus::storage) fn open_readonly(
     Ok((state, slot))
 }
 
+/// A frame that passed its checksum yet does not decode. An unknown record
+/// variant is a record a newer release wrote after finalization.
+fn newer_record(error: bincode::Error) -> io::Error {
+    if error.to_string().contains("expected variant index") {
+        invalid(format!(
+            "WAL holds a record of a newer format: this media was written by a newer \
+             Logkeeper release after the cluster version was finalized, and cannot be \
+             opened by this one ({error})"
+        ))
+    } else {
+        io::Error::other(error)
+    }
+}
+
 pub(in crate::stream::consensus::storage) fn read_checkpoint(
     directory: &Path,
     reference: CheckpointRef,
@@ -1328,9 +1342,14 @@ pub(in crate::stream::consensus::storage) fn read_checkpoint(
         return Ok((v5.checkpoint, v5.cluster_version));
     }
     if !bytes.starts_with(CHECKPOINT_MAGIC) {
-        return Err(invalid(
-            "WAL checkpoint does not match its trusted boundary",
-        ));
+        // The digest matched, so the bytes are what was written: a format
+        // this binary does not know, from a release finalized past it.
+        return Err(invalid(if bytes.starts_with(b"LKRWAL") {
+            "WAL checkpoint is in a newer format: this media was written by a newer Logkeeper \
+             release after the cluster version was finalized, and cannot be opened by this one"
+        } else {
+            "WAL checkpoint does not match its trusted boundary"
+        }));
     }
     let checkpoint: Checkpoint = options()
         .with_limit(MAX_CHECKPOINT)
@@ -1499,5 +1518,26 @@ impl Leaf {
             state.catalog.insert(scope, catalog);
         }
         Ok((failed, bad))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_record_of_a_newer_release_is_named_as_such() {
+        let unknown = 1000u32.to_le_bytes();
+        let error = options()
+            .with_limit(MAX_FRAME)
+            .deserialize::<Record>(&unknown)
+            .map_err(newer_record)
+            .err()
+            .expect("an unknown record variant does not decode");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error.to_string().contains("newer Logkeeper release"),
+            "{error}"
+        );
     }
 }

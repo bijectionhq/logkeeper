@@ -376,6 +376,43 @@ impl ProcessCluster {
         .expect("keeper started listening");
     }
 
+    fn data_dir(&self, id: Uuid) -> PathBuf {
+        self._dir.path().join(format!("data-{id}"))
+    }
+
+    /// Starts `id` on `binary` and expects it to refuse its media: it must
+    /// exit unsuccessfully within the deadline. Returns its standard error.
+    fn refused_start(&self, id: Uuid, binary: Binary) -> String {
+        let mut child = Command::new(binary.path())
+            .args(["keeper", "--config"])
+            .arg(&self.config_paths[&id])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn keeper process");
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait keeper") {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("keeper {id} ({binary:?}) started on media it should refuse");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(!status.success(), "keeper {id} ({binary:?}) exited cleanly");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("piped stderr")
+            .read_to_string(&mut stderr)
+            .expect("read keeper stderr");
+        stderr
+    }
+
     async fn stop_keeper(&mut self, id: Uuid) {
         let mut child = self.children.remove(&id).expect("keeper not running");
         let pid = child.id().to_string();
@@ -572,7 +609,7 @@ async fn rolling_restart_one_at_a_time_under_load() {
         .fence;
 
     // Run continuous writes in the background while upgrading every keeper one
-    // at a time from N-1 (`e0e27d7`) to N.
+    // at a time from N-1 to N.
     let stop_writer = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let acked = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let writer_handle = {
@@ -684,6 +721,40 @@ async fn rolling_restart_one_at_a_time_under_load() {
         Ok(CLUSTER_VERSION_CURRENT)
     );
     assert_eq!(client.cluster_version().await, Ok(CLUSTER_VERSION_CURRENT));
+
+    // Once finalized, keepers write N formats, here an LKRWAL05 checkpoint,
+    // and an N-1 binary refuses the media rather than misreading it.
+    let victim = cluster.voters[0];
+    let checkpoints = cluster.data_dir(victim).join("raft-checkpoints");
+    let n_checkpoint = || {
+        fs::read_dir(&checkpoints)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| fs::read(entry.path()).is_ok_and(|bytes| bytes.starts_with(b"LKRWAL05")))
+    };
+    let mut next = client.head(stream).await.unwrap().0 + 1;
+    timeout(Duration::from_secs(150), async {
+        while !n_checkpoint() {
+            match client
+                .append(stream, fence, Lsn(next), Bytes::from_static(b"finalized"))
+                .await
+            {
+                Ok(_) => next += 1,
+                Err(JournalError::Unavailable) => {
+                    next = client.head(stream).await.map_or(next, |head| head.0 + 1);
+                }
+                Err(error) => panic!("append after finalization failed: {error:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("a finalized keeper wrote an N checkpoint");
+    cluster.stop_keeper(victim).await;
+    let stderr = cluster.refused_start(victim, Binary::Old);
+    assert!(!stderr.trim().is_empty(), "N-1 refused without a message");
+    eprintln!("N-1 refused finalized media: {}", stderr.trim());
 
     cluster.stop_all().await;
 }

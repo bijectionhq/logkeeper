@@ -241,6 +241,8 @@ async fn a_parked_stream_stays_parked_across_a_restart_and_opens_lazily() {
     for id in cluster.configs.keys().copied().collect::<Vec<_>>() {
         cluster.restart(id).await;
     }
+    // Park marks are a format N-1 cannot read.
+    cluster.finalize().await;
     let journal = cluster.client(&cluster.credentials);
     let record = |at: u64| Bytes::from(vec![(at % 251) as u8; 2048]);
     let (parked, busy) = (StreamId(220), StreamId(221));

@@ -41,6 +41,23 @@ async fn a_cold_record_no_longer_pins_its_segment() {
     drop(group);
     let engines = [a, b, c].map(|id| cluster.running[&id].engine.clone());
     let mut at = 0;
+    // Relocated slices are a format N-1 cannot read: before the cluster
+    // version is finalized, passes copy nothing and the segment stays.
+    for _ in 0..12 {
+        for _ in 0..8 {
+            at += 1;
+            journal
+                .append(filler, fences[1], Lsn(at), Bytes::from(vec![7; 64 * 1024]))
+                .await
+                .unwrap();
+            journal.trim(filler, fences[1], Lsn(at)).await.unwrap();
+        }
+        for engine in &engines {
+            engine.compact_pass(Duration::ZERO).await;
+        }
+    }
+    assert!(segment.exists(), "nothing relocates before finalization");
+    cluster.finalize().await;
     timeout(Duration::from_secs(60), async {
         while segment.exists() {
             for _ in 0..8 {

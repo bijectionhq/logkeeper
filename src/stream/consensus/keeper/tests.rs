@@ -312,6 +312,28 @@ impl Cluster {
         );
     }
 
+    /// Finalizes the cluster version through the catalog, as an
+    /// administrator would once every keeper runs this build, and waits
+    /// until every running keeper allows the formats it gates.
+    async fn finalize(&self) {
+        let client = self.client(&self.credentials);
+        let version = crate::stream::consensus::CLUSTER_VERSION_CURRENT;
+        timeout(WAIT, async {
+            while client.finalize_version(version).await != Ok(version) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            while !self
+                .running
+                .values()
+                .all(|running| running.engine.disk.write_version_allows(version))
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the cluster version finalized");
+    }
+
     async fn stop_all(&mut self) {
         for (_, server) in std::mem::take(&mut self.running) {
             server.stop().await;

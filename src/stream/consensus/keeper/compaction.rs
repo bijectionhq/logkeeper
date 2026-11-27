@@ -17,6 +17,10 @@
 //!    snapshot again; its rebuilt snapshot names only the copies, which
 //!    releases the segment.
 //!
+//! Copying writes `Record::Relocate` frames, which N-1 keepers cannot read,
+//! so it waits for the finalized cluster version; until then a pass only
+//! asks owners to snapshot and purge.
+//!
 //! Passes run every `PASS_INTERVAL` with up to a fifth of jitter. The model
 //! is BookKeeper's `GarbageCollectorThread` with its `EntryLogCompactor`,
 //! and raft-engine's purge, which asks owners to compact before it
@@ -103,6 +107,14 @@ impl Engine {
                     }
                 }
                 continue;
+            }
+            if !self
+                .disk
+                .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_CURRENT)
+            {
+                // Relocate frames are an N format: copy nothing before
+                // finalization, so N-1 can still open this WAL.
+                break;
             }
             match self.disk.relocate_segment(id, budget).await {
                 Ok(0) => break,
