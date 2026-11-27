@@ -30,6 +30,7 @@ use super::{
     Disk, Record,
     media::{hex, sha256},
 };
+use crate::stream::consensus::Voters;
 use crate::stream::timed::EVIDENCE_BYTES;
 use crate::stream::{
     consensus::{
@@ -959,8 +960,8 @@ impl StateMachine {
             .get_joint_config()
             .get(1)
             .map(|target| {
-                let mut target = target.iter().copied().map(uuid::Uuid::from_u128);
-                std::array::from_fn(|_| target.next().expect("checked joint roster"))
+                let target = target.iter().copied().map(uuid::Uuid::from_u128);
+                Voters::new(&target.collect::<Vec<_>>()).expect("checked joint roster")
             });
         Ok(crate::stream::consensus::network::Proof {
             genesis: self.inner.genesis.clone(),
@@ -1375,8 +1376,9 @@ impl Inner {
                             .copied()
                             .map(uuid::Uuid::from_u128)
                             .collect::<Vec<_>>();
-                        let voters = <[_; 3]>::try_from(voters)
-                            .map_err(|_| invalid("invalid finalized voter configuration"))?;
+                        let voters = Voters::new(&voters)
+                            .filter(|voters| voters.len() == self.genesis.voters.len())
+                            .ok_or_else(|| invalid("invalid finalized voter configuration"))?;
                         if image
                             .configuration
                             .is_none_or(|current| current.voters != voters)
@@ -1661,8 +1663,9 @@ pub(super) fn inspect_stream_readonly(
                         .copied()
                         .map(uuid::Uuid::from_u128)
                         .collect::<Vec<_>>();
-                    let voters = <[_; 3]>::try_from(voters)
-                        .map_err(|_| invalid("invalid finalized voter configuration"))?;
+                    let voters = Voters::new(&voters)
+                        .filter(|voters| voters.len() == genesis.voters.len())
+                        .ok_or_else(|| invalid("invalid finalized voter configuration"))?;
                     if image
                         .configuration
                         .is_none_or(|current| current.voters != voters)

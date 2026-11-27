@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use super::*;
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{Fence, placement::Placement, state::Command};
 
 const KEEPER: u128 = 1;
@@ -16,7 +17,7 @@ const KEEPER: u128 = 1;
 fn genesis(stream: u128) -> Genesis {
     Genesis {
         stream: StreamId(stream),
-        voters: [1, 2, 3].map(Uuid::from_u128),
+        voters: Voters::from([1, 2, 3].map(Uuid::from_u128)),
         quota_bytes: 64 * 1024 * 1024,
         immutable: false,
     }

@@ -2,6 +2,7 @@
 
 use super::ops::start_admin_cluster;
 use super::*;
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{Configuration, Operator, OperatorConfig, admin_command};
 
 pub(super) fn operator_config(
@@ -182,7 +183,10 @@ async fn decommission_retires_replicas_without_losing_records() {
     let leaving = voters[0];
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(Uuid::new_v4().as_u128());
-    client.create(stream, voters, 1 << 26).await.unwrap();
+    client
+        .create(stream, Voters::from(voters), 1 << 26)
+        .await
+        .unwrap();
     let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
     client
         .append(stream, sealed.fence, Lsn(1), Bytes::from_static(b"keep me"))
@@ -220,7 +224,10 @@ async fn drain_moves_leadership_off_a_keeper_and_survives_restart() {
     let mut streams = Vec::new();
     for _ in 0..3 {
         let stream = StreamId(Uuid::new_v4().as_u128());
-        client.create(stream, voters, 1 << 26).await.unwrap();
+        client
+            .create(stream, Voters::from(voters), 1 << 26)
+            .await
+            .unwrap();
         streams.push(stream);
     }
     let drained = cluster.leader_after_head(&client, streams[0]).await;
@@ -304,7 +311,10 @@ async fn a_draining_voter_campaigns_when_no_other_voter_can_win() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(232);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     journal.prefer_leader(stream, c).await.unwrap();
     assert!(wait_for_leader(&cluster, stream, c).await);
     let fence = journal

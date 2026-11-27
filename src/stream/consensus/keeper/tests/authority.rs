@@ -105,7 +105,7 @@ async fn leads(cluster: &Cluster, keeper: Uuid, stream: StreamId) -> bool {
         })
 }
 
-async fn configured(journal: &Client, stream: StreamId, voters: [Uuid; 3]) -> Configuration {
+async fn configured(journal: &Client, stream: StreamId, voters: Voters) -> Configuration {
     timeout(Duration::from_secs(30), async {
         loop {
             if let Ok(configuration) = journal.configuration(stream).await
@@ -135,7 +135,10 @@ async fn running_lost_voters_stop_serving_before_the_recovered_configuration_doe
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(0xA1);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 1 << 20).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 20)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -332,7 +335,10 @@ async fn leadership_lapses_in_a_catalog_outage_and_returns_with_the_catalog() {
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(0xA2);
     let journal = cluster.client_within(&cluster.credentials, Duration::from_millis(800));
-    journal.create(stream, [a, b, c], 1 << 20).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 20)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -406,7 +412,10 @@ async fn an_unfinalized_cluster_keeps_serving_through_a_catalog_outage() {
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(0xA3);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 1 << 20).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 20)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -446,7 +455,10 @@ async fn a_lease_lapse_mid_write_acknowledges_nothing() {
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(0xA4);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 1 << 20).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 20)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -535,8 +547,8 @@ fn authority_requests_and_replies_stay_off_n_minus_1() {
     let stage = Stage {
         stream: StreamId(9),
         source: 1,
-        old: [1, 2, 3].map(Uuid::from_u128),
-        target: [1, 4, 5].map(Uuid::from_u128),
+        old: Voters::from([1, 2, 3].map(Uuid::from_u128)),
+        target: Voters::from([1, 4, 5].map(Uuid::from_u128)),
     };
     for request in [
         Request::RenewLease {

@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::stream::consensus::Configuration;
+use crate::stream::consensus::Voters;
 
 /// A cluster whose streams park after 2 s idle.
 async fn parking_cluster() -> Cluster {
@@ -63,8 +64,14 @@ async fn a_parked_stream_that_names_a_dead_keeper_wakes_and_is_repaired() {
     let [a, b, c, d] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let (lost, healthy) = (StreamId(120), StreamId(121));
-    journal.create(lost, [a, b, c], 4096).await.unwrap();
-    journal.create(healthy, [a, b, d], 4096).await.unwrap();
+    journal
+        .create(lost, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
+    journal
+        .create(healthy, Voters::from([a, b, d]), 4096)
+        .await
+        .unwrap();
     let initial = journal.configuration(lost).await.unwrap();
     assert_eq!(
         journal.configuration(healthy).await.unwrap().voters,
@@ -103,7 +110,10 @@ async fn one_pass_repairs_many_streams_and_a_failing_repair_blocks_none() {
     let journal = cluster.client(&cluster.credentials);
     let streams = (130..136).map(StreamId).collect::<Vec<_>>();
     for stream in &streams {
-        journal.create(*stream, [a, b, c], 4096).await.unwrap();
+        journal
+            .create(*stream, Voters::from([a, b, c]), 4096)
+            .await
+            .unwrap();
         assert_eq!(journal.head(*stream).await, Ok(Lsn(0)));
     }
     let initial = journal.configuration(streams[0]).await.unwrap().revision;
@@ -178,7 +188,10 @@ async fn leadership_returns_to_the_preferred_voter_after_it_restarts() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(140);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let leader = cluster.leader_after_head(&journal, stream).await;
     let target = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
     journal.prefer_leader(stream, target).await.unwrap();
@@ -229,7 +242,10 @@ async fn a_parked_stream_answers_within_an_election_timeout_and_parks_past_a_dea
     let [a, b, c, d] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(150);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::from_u128(9))
         .await
@@ -280,7 +296,10 @@ async fn a_parked_stream_answers_within_an_election_timeout_and_parks_past_a_dea
     // A stream whose follower's keeper is dead still parks. Its repair is
     // made to fail so it stays on the dead keeper.
     let lonely = StreamId(151);
-    journal.create(lonely, [a, b, d], 4096).await.unwrap();
+    journal
+        .create(lonely, Voters::from([a, b, d]), 4096)
+        .await
+        .unwrap();
     journal.prefer_leader(lonely, a).await.unwrap();
     assert!(wait_for_leader(&cluster, lonely, a).await);
     for id in [a, b] {

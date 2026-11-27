@@ -401,6 +401,7 @@ impl Seen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::consensus::Voters;
 
     #[test]
     fn reads_try_a_voter_in_the_clients_domain_first() {
@@ -410,7 +411,7 @@ mod tests {
             preferred: Some((
                 Configuration {
                     revision: 1,
-                    voters: [a, b, c],
+                    voters: Voters::from([a, b, c]),
                 },
                 b,
             )),
@@ -427,7 +428,7 @@ mod tests {
     fn pages_are_bound_to_scope_minimum_and_request_bounds() {
         let genesis = Genesis {
             stream: StreamId(4),
-            voters: [1, 2, 3].map(Uuid::from_u128),
+            voters: Voters::from([1, 2, 3].map(Uuid::from_u128)),
             quota_bytes: 128,
             immutable: false,
         };

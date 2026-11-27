@@ -144,7 +144,7 @@ impl Ownership {
                             staged.stream == stage.stream
                                 && staged.source == stage.source
                                 && staged.old == stage.old
-                                && staged.survivor() == stage.survivor(),
+                                && staged.survivors() == stage.survivors(),
                         ) =>
                     {
                         let revision = stage.source.checked_add(1).ok_or_else(stale)?;
@@ -286,13 +286,14 @@ pub(super) fn directory(data: &Path, stream: StreamId, generation: u64) -> PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::consensus::Voters;
 
     fn stage(old: [u128; 3], target: [u128; 3]) -> Stage {
         Stage {
             stream: StreamId(1),
             source: 0,
-            old: old.map(uuid::Uuid::from_u128),
-            target: target.map(uuid::Uuid::from_u128),
+            old: Voters::from(old.map(uuid::Uuid::from_u128)),
+            target: Voters::from(target.map(uuid::Uuid::from_u128)),
         }
     }
 
@@ -344,7 +345,7 @@ mod tests {
         let mut other = stage([1, 2, 5], [1, 2, 4]);
         assert!(book.apply(Change::Stage(other.clone()), |_| false).is_err());
         // So does any stage below the high-water mark.
-        other.old = [1, 2, 3].map(uuid::Uuid::from_u128);
+        other.old = Voters::from([1, 2, 3].map(uuid::Uuid::from_u128));
         book.high = 2;
         assert!(book.apply(Change::Stage(other), |_| false).is_err());
     }

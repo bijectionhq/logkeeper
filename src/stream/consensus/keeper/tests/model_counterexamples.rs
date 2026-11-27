@@ -9,11 +9,12 @@
 //! ```
 
 use super::*;
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{Configuration, keeper::Recovery};
 
 const RECOVERY_WAIT: Duration = Duration::from_secs(30);
 
-async fn wait_configured(journal: &Client, stream: StreamId, voters: [Uuid; 3]) -> Configuration {
+async fn wait_configured(journal: &Client, stream: StreamId, voters: Voters) -> Configuration {
     timeout(RECOVERY_WAIT, async {
         loop {
             if let Ok(configuration) = journal.configuration(stream).await
@@ -56,7 +57,10 @@ async fn an_aborted_replacement_does_not_wedge_subsequent_repair_on_the_same_kee
     let [a, b, c, d] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(201);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let initial = journal.configuration(stream).await.unwrap();
     assert_eq!(initial.voters, [a, b, c]);
 
@@ -71,8 +75,11 @@ async fn an_aborted_replacement_does_not_wedge_subsequent_repair_on_the_same_kee
         Some(Box::new(move |group, _, _| group == stream));
 
     let short = cluster.client_within(&cluster.credentials, Duration::from_secs(3));
-    let aborted =
-        tokio::spawn(async move { short.replace(stream, initial.revision, [a, b, d]).await });
+    let aborted = tokio::spawn(async move {
+        short
+            .replace(stream, initial.revision, Voters::from([a, b, d]))
+            .await
+    });
 
     // Wait until `d` has durably recorded the staged (uninstalled) copy.
     timeout(WAIT, async {
@@ -115,10 +122,12 @@ async fn an_aborted_replacement_does_not_wedge_subsequent_repair_on_the_same_kee
     // for `source = initial.revision` (`revision = r + 1 <= high_water`).
     let mut target = [b, c, d];
     target.sort_unstable();
-    let replaced = journal.replace(stream, current.revision, target).await;
+    let replaced = journal
+        .replace(stream, current.revision, Voters::from(target))
+        .await;
     assert_eq!(
         replaced.map(|cfg| cfg.voters),
-        Ok(target),
+        Ok(Voters::from(target)),
         "repairing dead voter `a` onto `d` after an aborted replacement of `c` must succeed"
     );
     cluster.stop_all().await;
@@ -148,7 +157,10 @@ async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suf
     let stream = StreamId(202);
     let journal = cluster.client(&cluster.credentials);
 
-    journal.create(stream, [b, c, a], 1 << 20).await.unwrap();
+    journal
+        .create(stream, Voters::from([b, c, a]), 1 << 20)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -237,8 +249,8 @@ async fn a_single_returning_lost_voter_with_a_snapshot_cannot_serve_the_lost_suf
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some(vec![b, c]),
-                with: Some([d, f]),
+                lost: Some([b, c].to_vec()),
+                with: Some([d, f].to_vec()),
                 legacy_unfenced: true,
                 ..Recovery::default()
             },
@@ -339,7 +351,10 @@ async fn returning_lost_voters_retire_and_cannot_form_a_permanent_split_brain_wh
     let stream = StreamId(203);
     let journal = cluster.client(&cluster.credentials);
 
-    journal.create(stream, [a, b, c], 1 << 20).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 20)
+        .await
+        .unwrap();
     let old_seal = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -391,8 +406,8 @@ async fn returning_lost_voters_retire_and_cannot_form_a_permanent_split_brain_wh
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some(vec![b, c]),
-                with: Some([d, f]),
+                lost: Some([b, c].to_vec()),
+                with: Some([d, f].to_vec()),
                 legacy_unfenced: true,
                 ..Recovery::default()
             },
@@ -423,7 +438,7 @@ async fn returning_lost_voters_retire_and_cannot_form_a_permanent_split_brain_wh
     let mut final_roster = [d, f, g];
     final_roster.sort_unstable();
     let moved = journal
-        .replace(stream, recovered_cfg.revision, final_roster)
+        .replace(stream, recovered_cfg.revision, Voters::from(final_roster))
         .await
         .unwrap();
     assert_eq!(moved.voters, final_roster);

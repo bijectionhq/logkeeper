@@ -22,7 +22,8 @@ impl Cluster {
     /// the cluster version, which offload needs.
     pub(super) async fn start_offloaded(offload: &OffloadConfig) -> Self {
         let cluster =
-            Self::start_configured(["a", "b", "c", "d"], None, false, Some(offload.clone())).await;
+            Self::start_configured(["a", "b", "c", "d"], None, false, Some(offload.clone()), 0)
+                .await;
         cluster.finalize().await;
         cluster
     }
@@ -118,7 +119,7 @@ async fn offload_survives_leader_changes_and_serves_reads_below_the_local_floor(
     let ids = cluster.ids;
     let stream = StreamId(41);
     journal
-        .create(stream, [ids[0], ids[1], ids[2]], 1 << 24)
+        .create(stream, Voters::from([ids[0], ids[1], ids[2]]), 1 << 24)
         .await
         .unwrap();
     let fence = journal
@@ -196,7 +197,7 @@ async fn an_object_store_outage_backpressures_writers_until_offload_catches_up()
     let ids = cluster.ids;
     let stream = StreamId(42);
     journal
-        .create(stream, [ids[0], ids[1], ids[2]], 1 << 24)
+        .create(stream, Voters::from([ids[0], ids[1], ids[2]]), 1 << 24)
         .await
         .unwrap();
     let fence = journal
@@ -259,7 +260,7 @@ async fn uploads_after_a_crash_mid_upload_are_idempotent_and_corruption_is_detec
     let ids = cluster.ids;
     let stream = StreamId(43);
     journal
-        .create(stream, [ids[0], ids[1], ids[2]], 1 << 24)
+        .create(stream, Voters::from([ids[0], ids[1], ids[2]]), 1 << 24)
         .await
         .unwrap();
     let fence = journal
@@ -357,7 +358,10 @@ async fn recovery_from_one_survivor_restores_the_longer_object_store_history() {
     let journal = cluster.client(&cluster.credentials);
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(44);
-    journal.create(stream, [a, b, c], 1 << 24).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 24)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -391,7 +395,7 @@ async fn recovery_from_one_survivor_restores_the_longer_object_store_history() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some(vec![b, c]),
+                lost: Some([b, c].to_vec()),
                 fence_proofs,
                 ..Recovery::default()
             },
@@ -474,7 +478,10 @@ async fn export_import_round_trips_and_a_stream_restores_with_no_survivor() {
     let journal = cluster.client(&cluster.credentials);
     let [a, b, c, d] = cluster.ids;
     let source = StreamId(45);
-    journal.create(source, [a, b, c], 1 << 24).await.unwrap();
+    journal
+        .create(source, Voters::from([a, b, c]), 1 << 24)
+        .await
+        .unwrap();
     let fence = journal
         .seal(source, Epoch(0), Uuid::from_u128(99))
         .await
@@ -708,7 +715,10 @@ async fn offload_to_minio_is_idempotent_and_serves_reads_below_the_local_floor()
     let mut cluster = Cluster::start_offloaded(&config).await;
     let journal = cluster.client(&cluster.credentials);
     let [a, b, c, _] = cluster.ids;
-    journal.create(stream, [a, b, c], 1 << 24).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 1 << 24)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -745,7 +755,7 @@ async fn an_immutable_stream_offloads_and_reads_below_its_local_floor_but_refuse
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(49);
     journal
-        .create_immutable(stream, [a, b, c], 1 << 24)
+        .create_immutable(stream, Voters::from([a, b, c]), 1 << 24)
         .await
         .unwrap();
     let session = journal_contract::WriterSessionId(77);
@@ -798,7 +808,7 @@ async fn an_immutable_stream_restores_and_imports_as_immutable() {
     let [a, b, c, d] = cluster.ids;
     let source = StreamId(52);
     journal
-        .create_immutable(source, [a, b, c], 1 << 24)
+        .create_immutable(source, Voters::from([a, b, c]), 1 << 24)
         .await
         .unwrap();
     let session = journal_contract::WriterSessionId(78);

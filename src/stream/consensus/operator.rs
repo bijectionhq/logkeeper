@@ -21,7 +21,10 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 use uuid::Uuid;
 
-use super::{Address, Client, Configuration, Credentials, Domains, Keepers, assignment, invalid};
+use super::{
+    Address, Client, Configuration, Credentials, Domains, Keepers, assignment, decisions, invalid,
+};
+use crate::stream::consensus::Voters;
 use crate::stream::transport;
 
 /// One admin HTTP request, connect to last byte.
@@ -171,29 +174,40 @@ impl Operator {
         &self.client
     }
 
-    /// Creates `stream` on `voters`, or on three keepers of `placement` in
-    /// distinct domains. Retrying with the same arguments is safe.
+    /// Creates `stream` on `voters`, or on `factor` keepers of `placement`
+    /// (three or five) spread over failure domains. Retrying with the same
+    /// arguments is safe.
     pub async fn create(
         &self,
         stream: StreamId,
-        voters: Option<[Uuid; 3]>,
+        voters: Option<Voters>,
+        factor: usize,
         quota_bytes: u64,
     ) -> io::Result<Configuration> {
-        self.create_kind(stream, voters, quota_bytes, false).await
+        self.create_kind(stream, voters, factor, quota_bytes, false)
+            .await
     }
 
     async fn create_kind(
         &self,
         stream: StreamId,
-        voters: Option<[Uuid; 3]>,
+        voters: Option<Voters>,
+        factor: usize,
         quota_bytes: u64,
         immutable: bool,
     ) -> io::Result<Configuration> {
         let voters = match (voters, &self.config.placement) {
-            (Some(voters), _) => voters,
-            (None, Some(placement)) => assignment::choose(stream, placement).ok_or_else(|| {
-                invalid("placement does not hold three keepers in distinct domains")
-            })?,
+            (Some(voters), _) if voters.len() == factor => voters,
+            (Some(_), _) => {
+                return Err(invalid("--voters must name --replication-factor keepers"));
+            }
+            (None, Some(placement)) => {
+                assignment::choose(stream, placement, factor).ok_or_else(|| {
+                    invalid(format!(
+                        "placement cannot spread {factor} voters over its failure domains"
+                    ))
+                })?
+            }
             (None, None) => {
                 return Err(invalid(
                     "give --voters, or a placement in the operator configuration",
@@ -321,9 +335,7 @@ impl Operator {
         if current.voters.contains(&new) {
             return Err(invalid(format!("{new} is already a voter of the stream")));
         }
-        let voters = current
-            .voters
-            .map(|voter| if voter == old { new } else { voter });
+        let voters = current.voters.replacing(old, new);
         self.replace(stream, current.revision, voters).await
     }
 
@@ -332,7 +344,7 @@ impl Operator {
         &self,
         stream: StreamId,
         expected: u64,
-        voters: [Uuid; 3],
+        voters: Voters,
     ) -> io::Result<Configuration> {
         self.client
             .replace(stream, expected, voters)
@@ -602,7 +614,7 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 
 pub const ADMIN_USAGE: &str = "Usage: logkeeper admin COMMAND --config FILE [--json]
 Commands:
-  create --stream UUID --quota-bytes N [--voters A,B,C]
+  create --stream UUID --quota-bytes N [--replication-factor 3|5] [--voters A,B,C[,D,E]]
   status --stream UUID | status --keeper UUID
   replace --stream UUID (--old KEEPER --new KEEPER | --expected REVISION --voters A,B,C)
   prefer-leader --stream UUID --keeper KEEPER
@@ -687,12 +699,12 @@ fn parse_uuid(raw: &str) -> io::Result<Uuid> {
     Uuid::parse_str(raw).map_err(|error| invalid(format!("{raw}: {error}")))
 }
 
-fn parse_voters(raw: &str) -> io::Result<[Uuid; 3]> {
+fn parse_voters(raw: &str) -> io::Result<Voters> {
     let voters = raw
         .split(',')
         .map(parse_uuid)
         .collect::<io::Result<Vec<_>>>()?;
-    <[Uuid; 3]>::try_from(voters).map_err(|_| invalid("--voters takes three keeper UUIDs"))
+    Voters::new(&voters).ok_or_else(|| invalid("--voters takes three or five keeper UUIDs"))
 }
 
 impl Operator {
@@ -783,8 +795,9 @@ impl Operator {
                 super::offload::transfer::stage(&store, target, &loaded).await?;
                 // A restore or import keeps the source's kind: an immutable
                 // history stays immutable, under writer-session fencing.
+                let factor = voters.map_or(3, |voters| voters.len());
                 let configuration = self
-                    .create_kind(target, voters, quota, loaded.immutable)
+                    .create_kind(target, voters, factor, quota, loaded.immutable)
                     .await?;
                 let head = self
                     .client
@@ -810,9 +823,17 @@ impl Operator {
                     .parse::<u64>()
                     .map_err(|error| invalid(format!("--quota-bytes: {error}")))?;
                 let voters = flags.remove("voters").map(parse_voters).transpose()?;
+                let factor = match flags.remove("replication-factor") {
+                    Some(raw) => raw
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|factor| decisions::replication_factor(*factor))
+                        .ok_or_else(|| invalid("--replication-factor is 3 or 5"))?,
+                    None => voters.map_or(3, |voters| voters.len()),
+                };
                 done(json!({
                     "stream": Uuid::from_u128(stream.0),
-                    "configuration": self.create(stream, voters, quota).await?,
+                    "configuration": self.create(stream, voters, factor, quota).await?,
                 }))
             }
             "status" => match (flags.contains_key("stream"), flags.contains_key("keeper")) {

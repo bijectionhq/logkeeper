@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 151,
+  "min_verified_functions": 158,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -339,12 +339,12 @@
       "min_verified_functions": 150
     },
     "recover-beside-a-live-voter": {
-      "defect": "allow a recovery while another voter answers healthy",
+      "defect": "allow a recovery while survivors form a quorum",
       "mutate": [
         {
           "file": "src/stream/consensus/decisions.rs",
-          "find": "    acknowledged && survivor_votes && healthy_others == 0\n}",
-          "replace": "    acknowledged && survivor_votes && healthy_others <= 1\n}"
+          "find": "        && healthy_others < quorum(voters) as u64 - 1\n",
+          "replace": "        && healthy_others < quorum(voters) as u64\n"
         }
       ],
       "expect": [
@@ -354,15 +354,15 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 150
+      "min_verified_functions": 157
     },
     "recover-unacknowledged": {
       "defect": "allow a recovery without the operator's acknowledgement",
       "mutate": [
         {
           "file": "src/stream/consensus/decisions.rs",
-          "find": "    acknowledged && survivor_votes && healthy_others == 0\n}",
-          "replace": "    survivor_votes && healthy_others == 0\n}"
+          "find": "    acknowledged\n        && survivor_votes\n        && replication_factor(voters)",
+          "replace": "    survivor_votes\n        && replication_factor(voters)"
         }
       ],
       "expect": [
@@ -372,7 +372,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 150
+      "min_verified_functions": 157
     },
     "reuse-recovery-term": {
       "defect": "step the recovery term by one instead of past any term the lost voters reached",
@@ -781,12 +781,12 @@
       "min_verified_functions": 150
     },
     "repair-with-one-live-voter": {
-      "defect": "move a roster with one live voter",
+      "defect": "move a roster without a live quorum",
       "mutate": [
         {
           "file": "src/stream/consensus/decisions.rs",
-          "find": "    live >= 2\n",
-          "replace": "    live >= 1\n"
+          "find": "    live >= voters / 2 + 1\n",
+          "replace": "    live >= voters / 2\n"
         }
       ],
       "expect": [
@@ -796,7 +796,7 @@
           "category": "postcondition not satisfied"
         }
       ],
-      "min_verified_functions": 150
+      "min_verified_functions": 157
     },
     "ceiling-at-the-average": {
       "defect": "drop the load ceiling's headroom above the average",
@@ -1460,6 +1460,83 @@
         }
       ],
       "min_verified_functions": 150
+    },
+    "four-voters": {
+      "defect": "admit an even roster",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    voters == 3 || voters == 5\n}",
+          "replace": "    voters >= 3 && voters <= 5\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "replication_factor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 157
+    },
+    "minority-quorum": {
+      "defect": "count half the roster as a quorum",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    voters / 2 + 1\n}",
+          "replace": "    (voters + 1) / 2\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "quorum",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "quorum",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 157
+    },
+    "five-in-two-domains": {
+      "defect": "let one domain hold a quorum of five",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    replication_factor(voters) && most_in_domain >= 1 && most_in_domain <= voters - quorum(voters)\n",
+          "replace": "    replication_factor(voters) && most_in_domain >= 1 && most_in_domain <= voters - quorum(voters) + 1\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "spread_allows",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 157
+    },
+    "five-before-finalize": {
+      "defect": "create a five-voter stream before the cluster finalized",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    voters == 3 || (voters == 5 && write_version_allows(finalized, required))\n",
+          "replace": "    voters == 3 || voters == 5\n"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "creates_replication",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 157
     }
   }
 }

@@ -7,7 +7,7 @@ use std::{
 use openraft::BasicNode;
 use uuid::Uuid;
 
-use super::{Genesis, Keepers, NodeId, Stage, invalid};
+use super::{Genesis, Keepers, NodeId, Stage, Voters, decisions, invalid};
 
 /// Operator-certified failure domains, keyed by keeper incarnation.
 pub type Domains = BTreeMap<Uuid, String>;
@@ -85,27 +85,28 @@ impl Placement {
         genesis.stream.0 != 0 && genesis.quota_bytes > 0 && self.structural_roster(&genesis.voters)
     }
 
-    /// Strict placement check: three sorted active (non-retired) keepers in
-    /// distinct failure domains.
-    pub fn roster(&self, voters: &[Uuid; 3]) -> bool {
-        let [a, b, c] = *voters;
-        if !(a < b && b < c) {
+    /// Strict placement check: three or five sorted active (non-retired)
+    /// keepers spread so that losing any one failure domain leaves a
+    /// quorum (`decisions::spread_allows`). Three voters take three
+    /// distinct domains; five take at least three, at most two per domain.
+    pub fn roster(&self, voters: &Voters) -> bool {
+        if !voters.ascending() {
             return false;
         }
-        match (
-            self.eligible.get(&a),
-            self.eligible.get(&b),
-            self.eligible.get(&c),
-        ) {
-            (Some(a), Some(b), Some(c)) => a != b && b != c && a != c,
-            _ => false,
+        let mut counts = BTreeMap::<&String, usize>::new();
+        for voter in voters {
+            match self.eligible.get(voter) {
+                Some(domain) => *counts.entry(domain).or_default() += 1,
+                None => return false,
+            }
         }
+        decisions::spread_allows(voters.len(), counts.into_values().max().unwrap_or(0))
     }
 
-    /// Structural check: three sorted known keepers (active or retired).
-    pub fn structural_roster(&self, voters: &[Uuid; 3]) -> bool {
-        let [a, b, c] = *voters;
-        a < b && b < c && self.known(a) && self.known(b) && self.known(c)
+    /// Structural check: three or five sorted known keepers (active or
+    /// retired).
+    pub fn structural_roster(&self, voters: &Voters) -> bool {
+        voters.ascending() && voters.iter().all(|voter| self.known(*voter))
     }
 
     /// Strict check for a new stage: the old roster only needs to be
@@ -113,6 +114,7 @@ impl Placement {
     /// move), while the target roster must satisfy current strict placement.
     pub fn stage(&self, stage: &Stage) -> bool {
         stage.old != stage.target
+            && stage.old.len() == stage.target.len()
             && self.structural_roster(&stage.old)
             && self.roster(&stage.target)
     }
@@ -120,6 +122,7 @@ impl Placement {
     /// Structural check for historical/replayed stage records.
     pub fn structural_stage(&self, stage: &Stage) -> bool {
         stage.old != stage.target
+            && stage.old.len() == stage.target.len()
             && self.structural_roster(&stage.old)
             && self.structural_roster(&stage.target)
     }
@@ -132,11 +135,8 @@ impl Placement {
                 .nodes()
                 .all(|(id, _)| self.eligible.contains_key(&Uuid::from_u128(*id)))
             && configs.iter().all(|voters| {
-                if voters.len() != 3 {
-                    return false;
-                }
-                let mut voters = voters.iter().map(|id| Uuid::from_u128(*id));
-                self.roster(&std::array::from_fn(|_| voters.next().unwrap()))
+                roster_of(voters)
+                    .is_some_and(|voters| voters.len() == configs[0].len() && self.roster(&voters))
             })
     }
 
@@ -153,13 +153,22 @@ impl Placement {
                 .nodes()
                 .all(|(id, _)| self.known(Uuid::from_u128(*id)))
             && configs.iter().all(|voters| {
-                if voters.len() != 3 {
-                    return false;
-                }
-                let mut voters = voters.iter().map(|id| Uuid::from_u128(*id));
-                self.structural_roster(&std::array::from_fn(|_| voters.next().unwrap()))
+                roster_of(voters).is_some_and(|voters| {
+                    voters.len() == configs[0].len() && self.structural_roster(&voters)
+                })
             })
     }
+}
+
+/// The roster of one side of a Raft membership, in ascending order, or
+/// `None` unless it holds three or five voters.
+fn roster_of(voters: &BTreeSet<NodeId>) -> Option<Voters> {
+    Voters::new(
+        &voters
+            .iter()
+            .map(|id| Uuid::from_u128(*id))
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[cfg(test)]
@@ -206,5 +215,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn five_voters_may_share_a_domain_but_never_hand_one_a_quorum() {
+        let ids = [1, 2, 3, 4, 5, 6, 7].map(Uuid::from_u128);
+        let keepers = ids
+            .into_iter()
+            .enumerate()
+            .map(|(i, id)| {
+                (
+                    id,
+                    std::net::SocketAddr::from(([127, 0, 0, 1], 6000 + i as u16)).into(),
+                )
+            })
+            .collect();
+        let domains = ids
+            .into_iter()
+            .zip(["a", "a", "b", "b", "c", "a", "d"].map(String::from))
+            .collect();
+        let placement = Placement::new(&keepers, domains, BTreeSet::new()).unwrap();
+        let roster = |ids: &[u128]| {
+            Voters::sorted(&ids.iter().copied().map(Uuid::from_u128).collect::<Vec<_>>()).unwrap()
+        };
+        assert!(placement.roster(&roster(&[1, 2, 3, 4, 5])), "2+2+1");
+        assert!(placement.roster(&roster(&[1, 3, 4, 5, 7])), "1+2+1+1");
+        assert!(
+            !placement.roster(&roster(&[1, 2, 6, 3, 5])),
+            "a holds three"
+        );
+        assert!(
+            !placement.roster(&roster(&[1, 2, 3])),
+            "three voters need three domains"
+        );
+        assert!(placement.roster(&roster(&[1, 3, 5])));
+        // A move keeps the replication factor.
+        let stage = Stage {
+            stream: journal_contract::StreamId(1),
+            source: 1,
+            old: roster(&[1, 3, 5]),
+            target: roster(&[1, 2, 3, 4, 5]),
+        };
+        assert!(!placement.stage(&stage));
+        // Both sides of a five-voter joint configuration have five voters.
+        let nodes = ids
+            .into_iter()
+            .map(|id| (id.as_u128(), BasicNode::default()))
+            .collect::<BTreeMap<_, _>>();
+        let joint = vec![
+            BTreeSet::from([1, 2, 3, 4, 5]),
+            BTreeSet::from([2, 3, 4, 5, 7]),
+        ];
+        assert!(placement.membership(&openraft::Membership::new(joint, nodes.clone()).unwrap()));
+        let mixed = vec![BTreeSet::from([1, 3, 5]), BTreeSet::from([2, 3, 4, 5, 7])];
+        assert!(!placement.membership(&openraft::Membership::new(mixed, nodes).unwrap()));
     }
 }

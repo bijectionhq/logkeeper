@@ -2,6 +2,7 @@
 //! the same generation, and a park that only some followers accepted.
 
 use super::*;
+use crate::stream::consensus::Voters;
 
 async fn parking_cluster(repair_after_secs: Option<u64>) -> Cluster {
     let mut cluster = Cluster::start().await;
@@ -25,7 +26,10 @@ async fn park_idle_leaves_a_stream_under_repair_open() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(207);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     journal.prefer_leader(stream, a).await.unwrap();
     assert!(wait_for_leader(&cluster, stream, a).await);
 
@@ -61,7 +65,10 @@ async fn a_wake_during_park_never_orphans_the_stream() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(208);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let _ = cluster.group(a, stream).await;
 
     let engine = cluster.running[&a].engine.clone();
@@ -99,7 +106,10 @@ async fn parking_stops_the_closed_group_before_it_returns() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(213);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let engine = cluster.running[&a].engine.clone();
     let group = cluster.group(a, stream).await;
     engine.park(stream).await;
@@ -124,7 +134,10 @@ async fn a_follower_parked_by_a_declined_park_reopens() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(209);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     journal.prefer_leader(stream, a).await.unwrap();
     assert!(wait_for_leader(&cluster, stream, a).await);
 

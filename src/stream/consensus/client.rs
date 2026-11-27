@@ -24,6 +24,7 @@ use super::{
     network::{Lane, Reply, Request, Rpc},
     state::Outcome,
 };
+use crate::stream::consensus::Voters;
 
 const ATTEMPT: Duration = Duration::from_millis(1200);
 const ROUTE_FANOUT: usize = 16;
@@ -113,12 +114,7 @@ impl Client {
 
     /// Assigns and initializes a stream's unique genesis. Use the same ID, voter
     /// set, and quota when retrying an uncertain create.
-    pub async fn create(
-        &self,
-        stream: StreamId,
-        voters: [uuid::Uuid; 3],
-        quota_bytes: u64,
-    ) -> Result<()> {
+    pub async fn create(&self, stream: StreamId, voters: Voters, quota_bytes: u64) -> Result<()> {
         self.create_stream(stream, voters, quota_bytes, false).await
     }
 
@@ -126,7 +122,7 @@ impl Client {
     pub async fn create_immutable(
         &self,
         stream: StreamId,
-        voters: [uuid::Uuid; 3],
+        voters: Voters,
         quota_bytes: u64,
     ) -> Result<()> {
         self.create_stream(stream, voters, quota_bytes, true).await
@@ -135,7 +131,7 @@ impl Client {
     pub(super) async fn create_stream(
         &self,
         stream: StreamId,
-        mut voters: [uuid::Uuid; 3],
+        mut voters: Voters,
         quota_bytes: u64,
         immutable: bool,
     ) -> Result<()> {
@@ -691,7 +687,7 @@ impl Client {
 
     /// The voters the catalog assigned to `stream`, or `None` when the
     /// catalog has none.
-    pub(super) async fn claimed_voters(&self, stream: StreamId) -> Result<Option<[uuid::Uuid; 3]>> {
+    pub(super) async fn claimed_voters(&self, stream: StreamId) -> Result<Option<Voters>> {
         let end = Instant::now() + self.deadline;
         match self.refresh(stream, end).await {
             Ok(route) => Ok(route.genesis.map(|genesis| genesis.voters)),
@@ -736,7 +732,7 @@ impl Client {
         &self,
         stream: StreamId,
         expected: u64,
-        mut voters: [uuid::Uuid; 3],
+        mut voters: Voters,
     ) -> Result<Configuration> {
         voters.sort_unstable();
         configuration(

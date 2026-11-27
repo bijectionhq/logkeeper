@@ -20,6 +20,7 @@ use bytes::Bytes;
 use journal_contract::StreamId;
 use parking_lot::Mutex;
 
+use crate::stream::consensus::Voters;
 use crate::stream::{
     keeper::durability::{sync_directory, sync_file},
     timed::{
@@ -46,19 +47,22 @@ impl fmt::Debug for TimedAuthority {
 }
 
 /// The roster binding of a staged original: its sorted voters and a
-/// nonzero proposal derived from the configuration revision.
+/// nonzero proposal derived from the configuration revision. Timed
+/// originals bind a three-voter ensemble, so a five-voter stream has none.
 pub(super) fn origin(
     original: TimedOriginal,
-    voters: [uuid::Uuid; 3],
+    voters: Voters,
     revision: u64,
-) -> TimedOrigin {
-    let mut voters = voters;
-    voters.sort_unstable();
-    TimedOrigin {
+) -> Option<TimedOrigin> {
+    let voters = voters.into_sorted();
+    Some(TimedOrigin {
         original,
-        ensemble: voters.map(|voter| KeeperId(voter.as_u128())),
+        ensemble: voters
+            .map(|voter| KeeperId(voter.as_u128()))
+            .try_into()
+            .ok()?,
         proposal: u128::from(revision) + 1,
-    }
+    })
 }
 
 /// Durable shadow stages, one per stream, under the keeper's data directory.

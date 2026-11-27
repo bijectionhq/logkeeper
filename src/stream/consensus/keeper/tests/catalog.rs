@@ -1,6 +1,7 @@
 //! The replicated catalog: outages, races, compaction and migration.
 
 use super::*;
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::keeper::catalog_stream::{COMPACT_AFTER, STREAM};
 
 /// What `keeper`'s catalog replica answers for `stream` once it has applied
@@ -79,7 +80,10 @@ async fn without_a_catalog_quorum_creates_fail_and_existing_streams_serve() {
     let [_, second, third] = cluster.catalog_voters.unwrap();
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(81);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -95,7 +99,9 @@ async fn without_a_catalog_quorum_creates_fail_and_existing_streams_serve() {
     cluster.running.remove(&third).unwrap().stop().await;
     let quick = cluster.client_within(&cluster.credentials, Duration::from_secs(2));
     assert_eq!(
-        quick.create(StreamId(82), [a, b, d], 4096).await,
+        quick
+            .create(StreamId(82), Voters::from([a, b, d]), 4096)
+            .await,
         Err(JournalError::Unavailable)
     );
     assert_eq!(
@@ -106,11 +112,17 @@ async fn without_a_catalog_quorum_creates_fail_and_existing_streams_serve() {
     );
     // A cold client finds the stream in the remaining voter's fold.
     let cold = cluster.client(&cluster.credentials);
-    assert_eq!(cold.claimed_voters(stream).await, Ok(Some([a, b, c])));
+    assert_eq!(
+        cold.claimed_voters(stream).await,
+        Ok(Some(Voters::from([a, b, c])))
+    );
     assert_eq!(cold.head(stream).await, Ok(Lsn(2)));
     cluster.restart(second).await;
     cluster.restart(third).await;
-    journal.create(StreamId(82), [a, b, d], 4096).await.unwrap();
+    journal
+        .create(StreamId(82), Voters::from([a, b, d]), 4096)
+        .await
+        .unwrap();
     cluster.stop_all().await;
 }
 
@@ -120,13 +132,19 @@ async fn one_lost_catalog_voter_leaves_creates_and_repair_and_is_replaced() {
     let [a, b, c, d] = cluster.ids;
     let [_, second, _] = cluster.catalog_voters.unwrap();
     let journal = cluster.client(&cluster.credentials);
-    journal.create(StreamId(83), [a, b, c], 4096).await.unwrap();
+    journal
+        .create(StreamId(83), Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     cluster.running.remove(&second).unwrap().stop().await;
     let stream = StreamId(84);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let current = journal.configuration(stream).await.unwrap();
     let placed = journal
-        .replace(stream, current.revision, [a, b, d])
+        .replace(stream, current.revision, Voters::from([a, b, d]))
         .await
         .unwrap();
     assert_eq!(placed.voters, [a, b, d]);
@@ -148,9 +166,15 @@ async fn one_lost_catalog_voter_leaves_creates_and_repair_and_is_replaced() {
     .await
     .expect("the catalog leader replaced its silent voter");
     assert!(moved.revision > 0);
-    journal.create(StreamId(85), [b, c, d], 4096).await.unwrap();
+    journal
+        .create(StreamId(85), Voters::from([b, c, d]), 4096)
+        .await
+        .unwrap();
     let cold = cluster.client(&cluster.credentials);
-    assert_eq!(cold.claimed_voters(StreamId(85)).await, Ok(Some([b, c, d])));
+    assert_eq!(
+        cold.claimed_voters(StreamId(85)).await,
+        Ok(Some(Voters::from([b, c, d])))
+    );
     cluster.stop_all().await;
 }
 
@@ -160,11 +184,14 @@ async fn concurrent_claims_of_one_stream_resolve_to_one_genesis() {
     let [a, b, c, d] = cluster.ids;
     let first = cluster.client(&cluster.credentials);
     let second = cluster.client(&cluster.credentials);
-    first.create(StreamId(86), [a, b, c], 4096).await.unwrap();
+    first
+        .create(StreamId(86), Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let stream = StreamId(87);
     let (left, right) = tokio::join!(
-        first.create(stream, [a, b, c], 4096),
-        second.create(stream, [a, b, d], 4096)
+        first.create(stream, Voters::from([a, b, c]), 4096),
+        second.create(stream, Voters::from([a, b, d]), 4096)
     );
     let winner = match (left, right) {
         (Ok(()), Err(JournalError::Conflict { .. })) => [a, b, c],
@@ -174,8 +201,14 @@ async fn concurrent_claims_of_one_stream_resolve_to_one_genesis() {
     for voter in cluster.catalog_voters.unwrap() {
         assert_eq!(located(&cluster, voter, stream).await.0.voters, winner);
     }
-    assert_eq!(first.claimed_voters(stream).await, Ok(Some(winner)));
-    assert_eq!(second.claimed_voters(stream).await, Ok(Some(winner)));
+    assert_eq!(
+        first.claimed_voters(stream).await,
+        Ok(Some(winner)).map(|voters| voters.map(Voters::from))
+    );
+    assert_eq!(
+        second.claimed_voters(stream).await,
+        Ok(Some(winner)).map(|voters| voters.map(Voters::from))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -183,12 +216,15 @@ async fn compaction_keeps_lookups_across_a_checkpoint_trim_and_restart() {
     let mut cluster = Cluster::start_replicated().await;
     let [a, b, c, d] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
-    journal.create(StreamId(88), [a, b, c], 4096).await.unwrap();
+    journal
+        .create(StreamId(88), Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let rosters = [[a, b, c], [a, b, d], [a, c, d], [b, c, d]];
     let claimed = (0..3 * COMPACT_AFTER as u128)
         .map(|index| Genesis {
             stream: StreamId(1000 + index),
-            voters: rosters[index as usize % 4],
+            voters: Voters::from(rosters[index as usize % 4]),
             quota_bytes: 4096,
             immutable: false,
         })
@@ -212,7 +248,8 @@ async fn compaction_keeps_lookups_across_a_checkpoint_trim_and_restart() {
     let cold = cluster.client(&cluster.credentials);
     assert_eq!(cold.claimed_voters(unknown).await, Ok(None));
     assert!(matches!(
-        cold.create(claimed[0].stream, [b, c, d], 4096).await,
+        cold.create(claimed[0].stream, Voters::from([b, c, d]), 4096)
+            .await,
         Err(JournalError::Conflict { .. })
     ));
     cold.create(claimed[0].stream, claimed[0].voters, 4096)
@@ -227,11 +264,17 @@ async fn a_populated_single_catalog_migrates_into_the_replicated_catalog() {
     let [a, b, c, d] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let (kept, moved, created) = (StreamId(90), StreamId(91), StreamId(92));
-    journal.create(kept, [a, b, c], 4096).await.unwrap();
-    journal.create(moved, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(kept, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
+    journal
+        .create(moved, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let current = journal.configuration(moved).await.unwrap();
     journal
-        .replace(moved, current.revision, [a, b, d])
+        .replace(moved, current.revision, Voters::from([a, b, d]))
         .await
         .unwrap();
     cluster.stop_all().await;
@@ -245,15 +288,25 @@ async fn a_populated_single_catalog_migrates_into_the_replicated_catalog() {
         cluster.restart(id).await;
     }
     let cold = cluster.client(&cluster.credentials);
-    assert_eq!(cold.claimed_voters(kept).await, Ok(Some([a, b, c])));
-    assert_eq!(cold.claimed_voters(moved).await, Ok(Some([a, b, c])));
+    assert_eq!(
+        cold.claimed_voters(kept).await,
+        Ok(Some(Voters::from([a, b, c])))
+    );
+    assert_eq!(
+        cold.claimed_voters(moved).await,
+        Ok(Some(Voters::from([a, b, c])))
+    );
     assert_eq!(cold.head(moved).await, Ok(Lsn(0)));
     assert!(matches!(
-        cold.create(kept, [a, b, d], 4096).await,
+        cold.create(kept, Voters::from([a, b, d]), 4096).await,
         Err(JournalError::Conflict { .. })
     ));
-    cold.create(kept, [a, b, c], 4096).await.unwrap();
-    cold.create(created, [b, c, d], 4096).await.unwrap();
+    cold.create(kept, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
+    cold.create(created, Voters::from([b, c, d]), 4096)
+        .await
+        .unwrap();
     for voter in voters {
         assert_eq!(located(&cluster, voter, kept).await.0.voters, [a, b, c]);
         // The imported stage still orders the moved stream's contacts.
@@ -276,21 +329,26 @@ async fn the_replicated_catalog_stays_reachable_after_its_voters_are_replaced() 
     let [c1, c2, c3] = cluster.catalog_voters.unwrap();
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(210);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
 
     // Replace all three original catalog voters one by one:
     // [5, 6, 7] -> [1, 6, 7] -> [1, 2, 7] -> [1, 2, 3].
     let mut current = journal.configuration(STREAM).await.unwrap();
     for next in [[a, c2, c3], [a, b, c3], [a, b, c]] {
         current = journal
-            .replace(STREAM, current.revision, next)
+            .replace(STREAM, current.revision, Voters::from(next))
             .await
             .unwrap();
     }
     assert_eq!(current.voters, [a, b, c]);
 
     // Retire the removed catalog copies on the three original catalog_voters.
-    let authority = cluster.authority(STREAM, [a, b, c], current.revision).await;
+    let authority = cluster
+        .authority(STREAM, Voters::from([a, b, c]), current.revision)
+        .await;
     for old in [c1, c2, c3] {
         if let Ok(generation) = journal.replica_generation(STREAM, old).await {
             journal
@@ -305,7 +363,7 @@ async fn the_replicated_catalog_stays_reachable_after_its_voters_are_replaced() 
     let cold = cluster.client_within(&cluster.credentials, Duration::from_secs(3));
     assert_eq!(
         cold.claimed_voters(stream).await,
-        Ok(Some([a, b, c])),
+        Ok(Some(Voters::from([a, b, c]))),
         "a cold client must still reach the replicated catalog after its original voters were replaced"
     );
     let reply = cluster.running[&d]

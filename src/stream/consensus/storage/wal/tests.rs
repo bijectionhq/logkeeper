@@ -9,6 +9,7 @@ use std::{
 use uuid::Uuid;
 
 use super::*;
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{
     Fence, MAX_RECORD,
     state::Command,
@@ -20,7 +21,7 @@ use std::time::Duration;
 fn genesis() -> Genesis {
     Genesis {
         stream: StreamId(1),
-        voters: [1, 2, 3].map(Uuid::from_u128),
+        voters: Voters::from([1, 2, 3].map(Uuid::from_u128)),
         quota_bytes: 64 * 1024 * 1024,
         immutable: false,
     }
@@ -344,7 +345,7 @@ async fn staged_install_requires_the_exact_cut_and_generation_and_keeps_the_vote
         stream,
         source: 12,
         old: genesis.voters,
-        target: [2, 3, 4].map(Uuid::from_u128),
+        target: Voters::from([2, 3, 4].map(Uuid::from_u128)),
     };
     let enrollment = install(dir.path(), genesis.voters[0]);
     let disk = Disk::open(enrollment()).unwrap();

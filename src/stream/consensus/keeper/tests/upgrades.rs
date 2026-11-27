@@ -2,6 +2,7 @@
 //! typed `Unsupported`, and version-mismatch liveness without mass repair.
 
 use super::*;
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{
     BUILD_VERSION, CLUSTER_VERSION_CURRENT, CLUSTER_VERSION_V1, KeeperStatus, MAX_MESSAGE,
     PREV_ALPN, PREV_CONTROL_ALPN, decode, encode, features,
@@ -217,7 +218,10 @@ async fn version_mismatch_counts_as_alive_and_does_not_trigger_repair() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(201);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let initial = journal.configuration(stream).await.unwrap();
 
     // Stop keeper `c` and bind its control/app/bulk ports with a TLS server
@@ -304,7 +308,10 @@ async fn write_version_gate_keeps_v1_checkpoints_until_finalized_in_replicated_a
         let [a, b, c, _] = cluster.ids;
         let client = cluster.client(&cluster.credentials);
         let stream = StreamId(210 + u128::from(replicated));
-        client.create(stream, [a, b, c], 4096).await.unwrap();
+        client
+            .create(stream, Voters::from([a, b, c]), 4096)
+            .await
+            .unwrap();
         let fence = client
             .seal(stream, Epoch(0), Uuid::from_u128(50))
             .await
@@ -498,8 +505,14 @@ async fn scrub_quarantines_a_parked_snapshot_without_serving_a_read() {
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(221);
     let sibling = StreamId(222);
-    client.create(stream, [a, b, c], 4096).await.unwrap();
-    client.create(sibling, [a, b, c], 4096).await.unwrap();
+    client
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
+    client
+        .create(sibling, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = client
         .seal(stream, Epoch(0), Uuid::new_v4())
         .await
@@ -578,7 +591,10 @@ async fn checksum_failure_quarantines_durably_survives_restart_triggers_repair_a
     let [a, b, c, _] = cluster.ids;
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(220);
-    client.create(stream, [a, b, c], 4096).await.unwrap();
+    client
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = client
         .seal(stream, Epoch(0), Uuid::from_u128(61))
         .await
@@ -753,7 +769,7 @@ async fn salvage_of_a_checkpointed_segment_quarantines_only_the_streams_it_holds
     let mut victim = None;
     for (stream, writer) in [(lost, 81), (kept, 82)] {
         client
-            .create(stream, [a, b, c], 4 * 1024 * 1024)
+            .create(stream, Voters::from([a, b, c]), 4 * 1024 * 1024)
             .await
             .unwrap();
         if victim.is_none() {
@@ -863,11 +879,11 @@ async fn offline_salvage_boots_past_damaged_wal_quarantines_affected_streams_and
     let healthy = StreamId(231);
     let damaged = StreamId(232);
     client
-        .create(healthy, [a, b, c], 4 * 1024 * 1024)
+        .create(healthy, Voters::from([a, b, c]), 4 * 1024 * 1024)
         .await
         .unwrap();
     client
-        .create(damaged, [a, b, c], 4 * 1024 * 1024)
+        .create(damaged, Voters::from([a, b, c]), 4 * 1024 * 1024)
         .await
         .unwrap();
 
@@ -1065,7 +1081,10 @@ async fn placement_change_does_not_quarantine_and_repair_rebalances_violation() 
     let [a, b, c, d] = cluster.ids;
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(240);
-    client.create(stream, [a, b, c], 4096).await.unwrap();
+    client
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = client
         .seal(stream, Epoch(0), Uuid::from_u128(81))
         .await
@@ -1132,7 +1151,10 @@ async fn placement_change_does_not_quarantine_and_repair_rebalances_violation() 
     // Strict placement is STILL enforced on new geneses and stage targets.
     let bad_stream = StreamId(241);
     assert!(
-        client.create(bad_stream, [a, b, c], 4096).await.is_err(),
+        client
+            .create(bad_stream, Voters::from([a, b, c]), 4096)
+            .await
+            .is_err(),
         "new genesis violating updated placement must be rejected"
     );
 
@@ -1196,7 +1218,9 @@ async fn placement_change_does_not_quarantine_and_repair_rebalances_violation() 
 
     // Stage targeting a colliding roster must still be rejected.
     assert!(matches!(
-        client.replace(stream, rebalanced.revision, [a, b, c]).await,
+        client
+            .replace(stream, rebalanced.revision, Voters::from([a, b, c]))
+            .await,
         Err(JournalError::Conflict { .. })
     ));
 
@@ -1220,7 +1244,10 @@ async fn retired_keepers_do_not_quarantine_and_repair_moves_streams_off_them() {
     let [a, b, c, _d] = cluster.ids;
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(242);
-    client.create(stream, [a, b, c], 4096).await.unwrap();
+    client
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = client
         .seal(stream, Epoch(0), Uuid::from_u128(82))
         .await
@@ -1258,7 +1285,10 @@ async fn retired_keepers_do_not_quarantine_and_repair_moves_streams_off_them() {
         assert!(!cluster.running[&voter].engine.is_quarantined(stream));
     }
     assert!(
-        client.create(StreamId(243), [a, b, c], 4096).await.is_err(),
+        client
+            .create(StreamId(243), Voters::from([a, b, c]), 4096)
+            .await
+            .is_err(),
         "new genesis naming a retired keeper must be rejected"
     );
 
@@ -1351,7 +1381,10 @@ async fn the_scrubber_quarantines_a_corrupt_slice_nobody_reads() {
     let [a, b, c, _] = cluster.ids;
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(236);
-    client.create(stream, [a, b, c], 4096).await.unwrap();
+    client
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = client
         .seal(stream, Epoch(0), Uuid::from_u128(91))
         .await
@@ -1540,7 +1573,10 @@ async fn epochs_after_a_snapshot_install(
     use tokio::io::AsyncSeekExt;
 
     let client = cluster.client(&cluster.credentials);
-    client.create(stream, voters, 64 * 1024).await.unwrap();
+    client
+        .create(stream, Voters::from(voters), 64 * 1024)
+        .await
+        .unwrap();
     let first = client
         .seal(stream, Epoch(0), Uuid::from_u128(60))
         .await
@@ -1586,7 +1622,7 @@ async fn epochs_after_a_snapshot_install(
     let follower = voters.into_iter().find(|id| *id != leader).unwrap();
     let next = voters.map(|id| if id == follower { fresh } else { id });
     client
-        .replace(stream, starting.revision, next)
+        .replace(stream, starting.revision, Voters::from(next))
         .await
         .unwrap();
     let copy = cluster.group(fresh, stream).await;

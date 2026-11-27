@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::stream::consensus::AdminConfig;
+use crate::stream::consensus::Voters;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(super) fn free_loopback() -> SocketAddr {
@@ -173,7 +174,10 @@ async fn rotating_tls_keeps_existing_connections_and_publishes_only_authorized_c
     let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(Uuid::new_v4().as_u128());
-    client.create(stream, voters, 1 << 26).await.unwrap();
+    client
+        .create(stream, Voters::from(voters), 1 << 26)
+        .await
+        .unwrap();
     let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
     let keeper = cluster.leader_after_head(&client, stream).await;
     let addr = addresses[&keeper];
@@ -244,7 +248,7 @@ async fn admin_plain_http_metrics_health_and_validation() {
     assert!(bad.validate().is_err());
 
     client
-        .create(stream, voters, 64 * 1024 * 1024)
+        .create(stream, Voters::from(voters), 64 * 1024 * 1024)
         .await
         .unwrap();
     let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
@@ -438,7 +442,7 @@ async fn problem_streams_report_detects_live_cluster_anomalies() {
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(Uuid::new_v4().as_u128());
     client
-        .create(stream, voters, 64 * 1024 * 1024)
+        .create(stream, Voters::from(voters), 64 * 1024 * 1024)
         .await
         .unwrap();
     let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
@@ -532,7 +536,7 @@ async fn ready_accepts_parked_streams_and_problems_detects_parked_with_dead_vote
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(Uuid::new_v4().as_u128());
     client
-        .create(stream, voters, 64 * 1024 * 1024)
+        .create(stream, Voters::from(voters), 64 * 1024 * 1024)
         .await
         .unwrap();
     let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
@@ -609,7 +613,7 @@ async fn offline_inspect_verify_and_dump_segment() {
     let writer_id = Uuid::new_v4();
 
     client
-        .create(stream, voters, 64 * 1024 * 1024)
+        .create(stream, Voters::from(voters), 64 * 1024 * 1024)
         .await
         .unwrap();
     let sealed = client.seal(stream, Epoch(0), writer_id).await.unwrap();
@@ -773,7 +777,7 @@ async fn offline_inspect_reports_quarantined_replica_on_missing_snapshot() {
     let stream = StreamId(Uuid::new_v4().as_u128());
 
     client
-        .create(stream, voters, 64 * 1024 * 1024)
+        .create(stream, Voters::from(voters), 64 * 1024 * 1024)
         .await
         .unwrap();
     let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
@@ -819,7 +823,7 @@ async fn offline_verify_checks_checkpoint_and_multi_segment_chain() {
     let stream = StreamId(Uuid::new_v4().as_u128());
 
     client
-        .create(stream, voters, 64 * 1024 * 1024)
+        .create(stream, Voters::from(voters), 64 * 1024 * 1024)
         .await
         .unwrap();
     let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
@@ -909,7 +913,10 @@ async fn debug_bundle_collects_every_keeper_over_mtls_and_inspects_offline() {
     let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(Uuid::new_v4().as_u128());
-    client.create(stream, voters, 1 << 20).await.unwrap();
+    client
+        .create(stream, Voters::from(voters), 1 << 20)
+        .await
+        .unwrap();
 
     let local = voters[0];
     let mut config = cluster.configs[&local].clone();
@@ -990,7 +997,10 @@ async fn inventory_dns_names_resolve_at_connect_and_identity_comes_from_certific
     let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
     let client = cluster.client(&cluster.credentials);
     let stream = StreamId(Uuid::new_v4().as_u128());
-    client.create(stream, voters, 1 << 26).await.unwrap();
+    client
+        .create(stream, Voters::from(voters), 1 << 26)
+        .await
+        .unwrap();
     let sealed = client.seal(stream, Epoch(0), Uuid::new_v4()).await.unwrap();
     client
         .append(stream, sealed.fence, Lsn(1), Bytes::from_static(b"named"))

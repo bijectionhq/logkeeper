@@ -76,7 +76,8 @@ impl Request {
             | Self::Restore { .. }
             | Self::RenewLease { .. }
             | Self::FenceKeeper(_)
-            | Self::RecoverStream { .. } => WireVersion::Current,
+            | Self::RecoverStream { .. }
+            | Self::LocalTip(_) => WireVersion::Current,
         }
     }
 }
@@ -131,7 +132,8 @@ impl Reply {
             | Self::Unsupported(_)
             | Self::ClusterVersion(_)
             | Self::Lease(_)
-            | Self::Recovered(_) => WireVersion::Current,
+            | Self::Recovered(_)
+            | Self::Tip(_) => WireVersion::Current,
         }
     }
 }

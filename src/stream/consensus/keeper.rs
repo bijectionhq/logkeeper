@@ -57,6 +57,7 @@ use super::{
     storage::{self, Authority, Disk, Enrollment, FollowerAppend, LogStore, Record, StateMachine},
 };
 use crate::server::durability::SyncMode;
+use crate::stream::consensus::Voters;
 use crate::stream::{transport, wire::KeeperId};
 use admission::ReplicationIngress;
 pub use offload::OffloadStatus;
@@ -421,7 +422,8 @@ impl Config {
             ));
         }
         if let Some(voters) = &self.catalog_voters
-            && (!placement.structural_roster(voters) || !voters.contains(&self.catalog))
+            && (!placement.structural_roster(&Voters::from(*voters))
+                || !voters.contains(&self.catalog))
         {
             return Err(invalid(
                 "catalog voters must be three sorted keepers in distinct domains, one the catalog",
@@ -578,9 +580,9 @@ impl Config {
             catalog_id: self.catalog,
             catalog,
             lease,
-            catalog_stream: self
-                .catalog_voters
-                .map(|voters| catalog_stream::CatalogStream::new(voters, self.catalog)),
+            catalog_stream: self.catalog_voters.map(|voters| {
+                catalog_stream::CatalogStream::new(Voters::from(voters), self.catalog)
+            }),
             disk,
             recognition,
             mode,
@@ -1568,6 +1570,7 @@ impl Engine {
                         | Request::KeeperStatus(_)
                         | Request::PlacementProof(_)
                         | Request::LocalConfiguration(_)
+                        | Request::LocalTip(_)
                         | Request::StageReplica { .. }
                         | Request::InstallReplica { .. }
                         | Request::StageRecovered { .. }
@@ -1591,7 +1594,7 @@ impl Engine {
                     || matches!(request, Request::FenceKeeper(keeper)
                     if keeper.as_u128() == *id)
                     || matches!(request, Request::RecoverStream { stage, .. }
-                    if stage.survivor().map(|survivor| survivor.as_u128()) == Some(*id)) =>
+                    if stage.survivors().iter().any(|survivor| survivor.as_u128() == *id)) =>
             {
                 Ok(None)
             }
@@ -1691,6 +1694,13 @@ impl Engine {
                 Ok(Reply::Configured(configuration))
             }
             Request::ClearQuarantine(stream) => self.clear_quarantine(stream).await,
+            Request::LocalTip(stream) => Ok(Reply::Tip(
+                self.disk
+                    .genesis(stream)
+                    .is_some()
+                    .then(|| self.disk.recovery_point(stream).tip)
+                    .flatten(),
+            )),
             Request::LocalCopy(_) => Ok(self
                 .disk
                 .ownership(stream)
@@ -2253,7 +2263,9 @@ impl Engine {
         if !view.fits {
             return refused(JournalError::Full { floor: view.floor });
         }
-        let origin = super::timed::origin(original, voters, revision);
+        let Some(origin) = super::timed::origin(original, voters, revision) else {
+            return refused(JournalError::Unsupported);
+        };
         let keeper = crate::stream::wire::KeeperId(self.id.as_u128());
         let (head, epoch) = (view.head.0, original.epoch.0);
         let sample = tokio::task::spawn_blocking(move || {
@@ -2311,7 +2323,7 @@ impl Engine {
                     original,
                     view.configuration.voters,
                     view.configuration.revision,
-                ) != evidence.origin)
+                ) != Some(evidence.origin))
         {
             return refused(JournalError::Unavailable);
         }
@@ -2415,7 +2427,7 @@ impl Engine {
         }
     }
 
-    fn nodes(&self, voters: [uuid::Uuid; 3]) -> BTreeMap<NodeId, BasicNode> {
+    fn nodes(&self, voters: Voters) -> BTreeMap<NodeId, BasicNode> {
         voters
             .into_iter()
             .map(|id| {

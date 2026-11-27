@@ -19,9 +19,10 @@ use crate::stream::timed::{
 use serde::Deserialize;
 
 use super::{
-    Client, Configuration, Credentials, Domains, Fence, Keepers, MAX_RECORD, assignment,
+    Client, Configuration, Credentials, Domains, Fence, Keepers, MAX_RECORD, assignment, decisions,
     state::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS},
 };
+use crate::stream::consensus::Voters;
 
 /// The writer UUID every contract seal uses. The contract identifies a
 /// writer by its authenticated principal, and the keeper checks that
@@ -42,14 +43,21 @@ pub struct JournalConfig {
     /// Claims and lookups then go to them instead of `catalog`.
     #[serde(default)]
     pub catalog_voters: Option<[uuid::Uuid; 3]>,
-    /// The three voters of every stream this consumer creates. Give either
-    /// this fixed roster or `placement`.
+    /// The voters of every stream this consumer creates, three or five.
+    /// Give either this fixed roster or `placement`.
     #[serde(default)]
-    pub voters: Option<[uuid::Uuid; 3]>,
+    pub voters: Option<Voters>,
     /// Keepers eligible to vote, with their failure domains. Each created
-    /// stream gets three of them in distinct domains.
+    /// stream gets `replication_factor` of them in distinct domains, or
+    /// spread so that no domain holds a quorum when there are fewer.
     #[serde(default)]
     pub placement: Option<Domains>,
+    /// Voters of every stream this consumer creates: 3 (the default) or 5.
+    /// Five voters keep a stream writable through the loss of any two, and
+    /// need a cluster finalized at the replication-factor version. A fixed
+    /// `voters` roster must have this many.
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: usize,
     /// Placement keepers that streams move off. They keep serving until
     /// every stream has moved.
     #[serde(default)]
@@ -70,6 +78,10 @@ pub struct JournalConfig {
     /// to a voter in this domain, which avoids a cross-zone round trip.
     #[serde(default)]
     pub domain: Option<String>,
+}
+
+fn default_replication_factor() -> usize {
+    3
 }
 
 fn default_max_record_bytes() -> usize {
@@ -100,6 +112,15 @@ impl JournalConfig {
         {
             return Err(invalid("catalog voters must be known keepers"));
         }
+        if !decisions::replication_factor(self.replication_factor)
+            || self
+                .voters
+                .is_some_and(|voters| voters.len() != self.replication_factor)
+        {
+            return Err(invalid(
+                "a journal's replication factor is 3 or 5, and fixed voters must match it",
+            ));
+        }
         match (&self.voters, &self.placement) {
             (Some(voters), None) if voters.iter().all(|voter| self.keepers.contains_key(voter)) => {
                 ()
@@ -125,8 +146,8 @@ impl JournalConfig {
 /// Where streams are placed. Fixed rosters never move.
 #[derive(Clone, Debug)]
 enum Placement {
-    Fixed([uuid::Uuid; 3]),
-    Ranked { eligible: Domains },
+    Fixed(Voters),
+    Ranked { eligible: Domains, factor: usize },
 }
 
 impl Placement {
@@ -141,16 +162,17 @@ impl Placement {
                     })
                     .map(|(keeper, domain)| (*keeper, domain.clone()))
                     .collect(),
+                factor: config.replication_factor,
             },
             (None, None) => unreachable!("validated journal configuration"),
         }
     }
 
-    fn voters(&self, stream: StreamId) -> Result<[uuid::Uuid; 3]> {
+    fn voters(&self, stream: StreamId) -> Result<Voters> {
         match self {
             Self::Fixed(voters) => Ok(*voters),
-            Self::Ranked { eligible } => {
-                assignment::choose(stream, eligible).ok_or(JournalError::Unavailable)
+            Self::Ranked { eligible, factor } => {
+                assignment::choose(stream, eligible, *factor).ok_or(JournalError::Unavailable)
             }
         }
     }
@@ -308,8 +330,10 @@ impl ConsensusJournal {
             Some(retained) => retained,
             None => {
                 let configuration = self.client.configuration(original.stream).await?;
-                let mut voters = configuration.voters;
-                voters.sort_unstable();
+                let voters = configuration.voters.into_sorted();
+                if !voters.legacy() {
+                    return Err(JournalError::Unsupported);
+                }
                 let stage = |keeper| {
                     self.client.stage_original(
                         keeper,
@@ -321,7 +345,8 @@ impl ConsensusJournal {
                 };
                 let (first, second) = futures::try_join!(stage(voters[0]), stage(voters[1]))?;
                 let evidence = TimedEvidence {
-                    origin: super::timed::origin(original, voters, configuration.revision),
+                    origin: super::timed::origin(original, voters, configuration.revision)
+                        .ok_or(JournalError::Unsupported)?,
                     samples: [first, second],
                 };
                 let proof = evidence
@@ -380,7 +405,7 @@ impl ConsensusJournal {
     /// fits or no eligible keeper can take the voter. Call it again until it
     /// returns `None`. Fixed rosters never move.
     pub async fn reconcile_placement(&self, stream: StreamId) -> Result<Option<Configuration>> {
-        let Placement::Ranked { eligible } = self.placement.read().clone() else {
+        let Placement::Ranked { eligible, .. } = self.placement.read().clone() else {
             return Ok(None);
         };
         let current = self.client.configuration(stream).await?;
@@ -543,7 +568,7 @@ impl ConsensusJournal {
 
     async fn create_stream(&self, stream: StreamId, immutable: bool) -> Result<()> {
         let placement = self.placement.read().clone();
-        let Placement::Ranked { eligible } = placement else {
+        let Placement::Ranked { eligible, factor } = placement else {
             let voters = placement.voters(stream)?;
             return self
                 .client
@@ -562,6 +587,7 @@ impl ConsensusJournal {
                         eligible: &eligible,
                         health: &health,
                     },
+                    factor,
                 )
                 .ok_or(JournalError::Unavailable)?
             }

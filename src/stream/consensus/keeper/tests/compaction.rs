@@ -1,6 +1,7 @@
 //! Segment compaction on running keepers.
 
 use super::*;
+use crate::stream::consensus::Voters;
 
 /// One retained record of an otherwise idle stream no longer keeps its
 /// whole WAL segment once the rest of the segment is dead: its owner
@@ -15,7 +16,10 @@ async fn a_cold_record_no_longer_pins_its_segment() {
     let (cold, filler) = (StreamId(230), StreamId(231));
     let mut fences = Vec::new();
     for stream in [cold, filler] {
-        journal.create(stream, [a, b, c], 64 << 20).await.unwrap();
+        journal
+            .create(stream, Voters::from([a, b, c]), 64 << 20)
+            .await
+            .unwrap();
         let sealed = journal
             .seal(stream, Epoch(0), Uuid::from_u128(9))
             .await

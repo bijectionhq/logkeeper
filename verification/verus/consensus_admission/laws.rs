@@ -197,21 +197,31 @@ fn restart_never_restores_leadership(committed: bool, voted_for_self: bool) {
 
 // Recovery admission: a recovery runs only with the operator's
 // acknowledgement and a survivor that votes in the latest configuration,
-// and only when no other voter answers with a healthy replica. The
-// survivor alone is then fewer than the two voters a quorum of three needs,
-// so no live quorum can commit beside the recovered log.
+// and only when the voters that answer with a healthy replica, the
+// survivor among them, are fewer than a quorum: none of three answers
+// beside the survivor, at most one of five. No live quorum can then commit
+// beside the recovered log.
 fn recovery_needs_acknowledgement_and_no_live_quorum(
-    acknowledged: bool, survivor_votes: bool, healthy_others: u64,
+    acknowledged: bool, survivor_votes: bool, healthy_others: u64, voters: usize,
 ) {
-    if allows_recovery(acknowledged, survivor_votes, healthy_others) {
+    if allows_recovery(acknowledged, survivor_votes, healthy_others, voters) {
         assert(acknowledged && survivor_votes);
-        assert(1 + healthy_others < 2);
+        assert(voters == 3 || voters == 5);
+        assert(2 * (1 + healthy_others) <= voters as u64);
     }
-    let unacknowledged = allows_recovery(false, survivor_votes, healthy_others);
+    let unacknowledged = allows_recovery(false, survivor_votes, healthy_others, voters);
     assert(!unacknowledged);
-    if healthy_others >= 1 {
-        let alive = allows_recovery(acknowledged, survivor_votes, healthy_others);
+    if voters == 3 && healthy_others >= 1 {
+        let alive = allows_recovery(acknowledged, survivor_votes, healthy_others, voters);
         assert(!alive);
+    }
+    if voters == 5 && healthy_others >= 2 {
+        let alive = allows_recovery(acknowledged, survivor_votes, healthy_others, voters);
+        assert(!alive);
+    }
+    if voters == 5 && healthy_others == 1 && acknowledged && survivor_votes {
+        let two_survivors = allows_recovery(acknowledged, survivor_votes, healthy_others, voters);
+        assert(two_survivors);
     }
 }
 
@@ -562,12 +572,66 @@ fn a_repair_pass_respects_its_slots(
     started
 }
 
-// Nothing moves unless two of three voters are live: a membership change
-// needs a quorum.
-fn a_roster_moves_only_with_two_live_voters(live: usize) {
-    let moves = repair_allowed(live);
-    assert(live < 2 ==> !moves);
-    assert(live >= 2 ==> moves);
+// Nothing moves unless a quorum of the roster is live: two of three, three
+// of five. A membership change needs a quorum.
+fn a_roster_moves_only_with_a_live_quorum(live: usize) {
+    let three = repair_allowed(live, 3);
+    assert(live < 2 ==> !three);
+    assert(live >= 2 ==> three);
+    let five = repair_allowed(live, 5);
+    assert(live < 3 ==> !five);
+    assert(live >= 3 ==> five);
+}
+
+// ReplicationFactor: a stream has three or five voters, and any two quorums
+// of one roster share a voter, so two leaders of one term cannot both
+// commit.
+fn quorums_of_a_roster_intersect(voters: usize)
+    requires voters == 3 || voters == 5,
+{
+    let allowed = replication_factor(voters);
+    assert(allowed);
+    let q = quorum(voters);
+    assert(q + q > voters);
+    assert(voters == 3 ==> q == 2);
+    assert(voters == 5 ==> q == 3);
+    let even = replication_factor(4);
+    assert(!even);
+    let single = replication_factor(1);
+    assert(!single);
+}
+
+// ReplicationFactor.Placement: an admitted roster survives the loss of any
+// one failure domain with a quorum. Three voters take three domains; five
+// voters at most two per domain, so at least three domains, and a domain
+// holding a quorum of five is refused.
+fn a_spread_roster_survives_any_domain(voters: usize, most_in_domain: usize) {
+    let spread = spread_allows(voters, most_in_domain);
+    if spread {
+        assert(voters == 3 || voters == 5);
+        assert(voters - most_in_domain >= voters / 2 + 1);
+        // At most two per domain means five voters span at least three.
+        assert(most_in_domain * 2 < voters);
+    }
+    let three_in_two = spread_allows(3, 2);
+    assert(!three_in_two);
+    let five_majority = spread_allows(5, 3);
+    assert(!five_majority);
+    let two_two_one = spread_allows(5, 2);
+    assert(two_two_one);
+    let distinct = spread_allows(3, 1);
+    assert(distinct);
+}
+
+// ReplicationFactor.Upgrade: three-voter streams are created at any cluster
+// version, five-voter streams only once every keeper reads their roster.
+fn five_voters_wait_for_the_finalized_version(finalized: u32, required: u32) {
+    let three = creates_replication(3, finalized, required);
+    assert(three);
+    let five = creates_replication(5, finalized, required);
+    assert(five == (finalized >= required));
+    let four = creates_replication(4, finalized, required);
+    assert(!four);
 }
 
 // Placement never refuses an eligible keeper at or below the average load,

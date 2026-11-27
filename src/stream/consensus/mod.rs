@@ -23,6 +23,7 @@ mod storage;
 #[cfg(feature = "consensus-testing")]
 pub mod testing;
 mod timed;
+mod voters;
 
 use std::{collections::BTreeMap, io, net::SocketAddr};
 
@@ -50,6 +51,7 @@ pub use operator::{
 pub use placement::Domains;
 pub use storage::{InspectReport, SalvageReport, SegmentDump, VerifyReport, dump_segment_file};
 pub use timed::TimedAuthority;
+pub use voters::{MAX_VOTERS, Voters};
 
 pub(super) const ALPN: &[u8] = b"logkeeper-consensus/2";
 pub(super) const PREV_ALPN: &[u8] = b"logkeeper-consensus/1";
@@ -82,8 +84,13 @@ pub const CLUSTER_VERSION_OFFLOAD: u32 = CLUSTER_VERSION_V5;
 pub const CLUSTER_VERSION_V6: u32 = 6;
 /// The level liveness leases wait for.
 pub const CLUSTER_VERSION_LEASES: u32 = CLUSTER_VERSION_V6;
+/// Cluster feature level at which a stream may be created with five voters,
+/// whose rosters older keepers cannot read (`voters.rs`).
+pub const CLUSTER_VERSION_V7: u32 = 7;
+/// The level five-voter streams wait for.
+pub const CLUSTER_VERSION_REPLICATION: u32 = CLUSTER_VERSION_V7;
 /// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V6;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V7;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -109,6 +116,8 @@ pub mod features {
     /// Renews liveness leases with the catalog and honours them once the
     /// cluster finalizes `CLUSTER_VERSION_LEASES`.
     pub const LEASES: u64 = 1 << 8;
+    /// Reads and serves five-voter rosters (`voters.rs`).
+    pub const REPLICATION_FACTOR: u64 = 1 << 9;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 = VERSION_NEGOTIATION
@@ -118,7 +127,8 @@ pub mod features {
         | RECOVERY_MARKER
         | IMMUTABLE_STREAMS
         | OFFLOAD
-        | LEASES;
+        | LEASES
+        | REPLICATION_FACTOR;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
@@ -247,7 +257,7 @@ impl From<KeeperStatusV1> for KeeperStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Configuration {
     pub revision: u64,
-    pub voters: [uuid::Uuid; 3],
+    pub voters: Voters,
 }
 
 const IMMUTABLE_GENESIS_PREFIX: StreamId = StreamId(0);
@@ -257,7 +267,7 @@ const IMMUTABLE_GENESIS_PREFIX_BYTES: usize = size_of::<u128>() + size_of::<u64>
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Genesis {
     stream: StreamId,
-    voters: [uuid::Uuid; 3],
+    voters: Voters,
     quota_bytes: u64,
     immutable: bool,
 }
@@ -332,31 +342,44 @@ impl<'de> Deserialize<'de> for Genesis {
 struct Stage {
     stream: StreamId,
     source: u64,
-    old: [uuid::Uuid; 3],
-    target: [uuid::Uuid; 3],
+    old: Voters,
+    target: Voters,
 }
 
 impl Stage {
-    /// Whether the stage is an operator recovery's: it keeps exactly one
-    /// voter, the survivor, and replaces the two lost ones.
-    fn recovery(&self) -> bool {
-        self.old != self.target
-            && self
-                .target
-                .iter()
-                .filter(|voter| self.old.contains(voter))
-                .count()
-                == 1
+    /// The voters the stage keeps from its old configuration.
+    fn kept(&self) -> usize {
+        self.target
+            .iter()
+            .filter(|voter| self.old.contains(voter))
+            .count()
     }
 
-    /// The voter a stage keeps from its old configuration when it keeps
-    /// exactly one, as a recovery does.
-    fn survivor(&self) -> Option<uuid::Uuid> {
-        let mut kept = self.old.iter().filter(|voter| self.target.contains(voter));
-        match (kept.next(), kept.next()) {
-            (Some(survivor), None) => Some(*survivor),
-            _ => None,
+    /// Whether the stage is an operator recovery's: it keeps at least one
+    /// voter but fewer than a quorum of the old configuration, its
+    /// survivors (one of three; one or two of five), and replaces the lost
+    /// ones. An ordinary move keeps a quorum, or moves a three-voter stream
+    /// to a disjoint roster; `replace` refuses a five-voter move that would
+    /// look like a recovery.
+    fn recovery(&self) -> bool {
+        let kept = self.kept();
+        self.old != self.target && kept >= 1 && kept < self.old.quorum()
+    }
+
+    /// A recovery stage's survivors, the voters it keeps from its old
+    /// configuration; none for an ordinary move. With two survivors of
+    /// five, only the more advanced one may write the recovery
+    /// (`keeper/recovery.rs`), so equal survivors mean the same recovering
+    /// keeper.
+    fn survivors(&self) -> Vec<uuid::Uuid> {
+        if !self.recovery() {
+            return Vec::new();
         }
+        self.old
+            .iter()
+            .copied()
+            .filter(|voter| self.target.contains(voter))
+            .collect()
     }
 }
 
@@ -365,7 +388,7 @@ impl Genesis {
         self.stream.0 != 0
             && self.quota_bytes > 0
             && self.voters.iter().all(|id| keepers.contains_key(id))
-            && self.voters.windows(2).all(|pair| pair[0] < pair[1])
+            && self.voters.ascending()
     }
 
     fn valid_with_retired(
@@ -379,7 +402,7 @@ impl Genesis {
                 .voters
                 .iter()
                 .all(|id| keepers.contains_key(id) || retired.contains(id))
-            && self.voters.windows(2).all(|pair| pair[0] < pair[1])
+            && self.voters.ascending()
     }
 }
 
@@ -428,7 +451,7 @@ mod tests {
         };
         let mut genesis = Genesis {
             stream: previous.stream,
-            voters: previous.voters,
+            voters: Voters::from(previous.voters),
             quota_bytes: previous.quota_bytes,
             immutable: false,
         };

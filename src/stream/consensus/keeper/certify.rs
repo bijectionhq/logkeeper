@@ -28,9 +28,9 @@ use std::{sync::Arc, time::Duration};
 
 use journal_contract::StreamId;
 use openraft::async_runtime::WatchReceiver;
-use uuid::Uuid;
 
 use super::{Engine, Group, Outcome, Reply, Request, catalog_stream};
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{Stage, decisions};
 
 /// How often the certifier looks for copies that still need certification,
@@ -186,7 +186,7 @@ impl Engine {
 /// Whether `stage`, the catalog's latest move, fences a copy whose effective
 /// membership has the voter sets `configs`.
 fn fences(configs: &[std::collections::BTreeSet<u128>], stage: &Stage) -> bool {
-    let set = |voters: [Uuid; 3]| voters.map(|id| id.as_u128()).into_iter().collect();
+    let set = |voters: Voters| voters.map(|id| id.as_u128()).into_iter().collect();
     let (old, target): (std::collections::BTreeSet<u128>, _) = (set(stage.old), set(stage.target));
     let uniform =
         |voters: &std::collections::BTreeSet<u128>| matches!(configs, [only] if only == voters);

@@ -31,6 +31,7 @@ use parking_lot::Mutex;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+use crate::stream::consensus::Voters;
 use cluster::{ClusterOptions, READER, SimCluster, WAIT, WRITER_A, WRITER_B, WalCrashKind};
 use faults::{Coverage, LaneFaults, LaneKey, Rng};
 use history::{History, Violation};
@@ -82,6 +83,8 @@ struct RunConfig {
     profile: Option<Profile>,
     /// Number of randomized steps to generate.
     steps: usize,
+    /// Voters of every stream, 3 or 5.
+    replication: usize,
 }
 
 impl RunConfig {
@@ -91,6 +94,7 @@ impl RunConfig {
             ignore_reused_ids: false,
             profile: None,
             steps: 18,
+            replication: 3,
         }
     }
 
@@ -100,6 +104,7 @@ impl RunConfig {
             ignore_reused_ids: false,
             profile: None,
             steps: 14,
+            replication: 3,
         }
     }
 }
@@ -107,7 +112,7 @@ impl RunConfig {
 #[derive(Clone, Debug)]
 struct StreamSpec {
     stream: StreamId,
-    initial_voters: [Uuid; 3],
+    initial_voters: Voters,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,9 +214,14 @@ enum Step {
     WipeAndReinit { keeper_slot: usize },
     /// Stop 1 or 2 replicated catalog voters, issue create/append, then restart.
     CatalogOutage { down_count: usize },
-    /// Lose 2 of 3 voters of `stream_idx`, run offline `recover_stream` on the
-    /// survivor, acknowledge recovery, restart lost voters, and resume writing.
+    /// Lose a quorum of `stream_idx`'s voters (2 of 3; 3 or 4 of 5), run
+    /// offline `recover_stream` on the more advanced survivor, acknowledge
+    /// recovery, restart lost voters, and resume writing.
     OperatorRecovery { stream_idx: usize },
+    /// Crash two voters of a five-voter `stream_idx`, the leader among them
+    /// when `leader`, write and read through the three that remain, then
+    /// restart them.
+    LoseTwoOfFive { stream_idx: usize, leader: bool },
     /// Brief sleep to allow elections, heartbeats, or repairs to advance.
     PauseMs(u64),
 }
@@ -229,7 +239,7 @@ struct Plan {
 /// sensible next LSNs, sequential epochs, and payload tags.
 struct StreamTracker {
     stream: StreamId,
-    voters: [Uuid; 3],
+    voters: Voters,
     current_epoch: Epoch,
     current_owner: Option<WriterKind>,
     next_lsn: Lsn,
@@ -299,6 +309,7 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
         max_record_bytes: 4096,
         client_deadline_ms: if config.allow_wipe { 2_500 } else { 4_000 },
         ignore_reused_ids: config.ignore_reused_ids,
+        replication: config.replication,
     };
 
     let data_ids = [1, 2, 3, 4].map(Uuid::from_u128);
@@ -309,15 +320,27 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
     };
     let mut streams = Vec::with_capacity(stream_count);
     for idx in 0..stream_count {
-        let mut voters = if idx == 0 {
-            [data_ids[0], data_ids[1], data_ids[2]]
-        } else {
-            [data_ids[0], data_ids[1], data_ids[3]]
+        let voters = match (config.replication, idx) {
+            (5, 0) => vec![
+                data_ids[0],
+                data_ids[1],
+                data_ids[2],
+                data_ids[3],
+                Uuid::from_u128(8),
+            ],
+            (5, _) => vec![
+                data_ids[0],
+                data_ids[1],
+                data_ids[2],
+                data_ids[3],
+                Uuid::from_u128(9),
+            ],
+            (_, 0) => vec![data_ids[0], data_ids[1], data_ids[2]],
+            _ => vec![data_ids[0], data_ids[1], data_ids[3]],
         };
-        voters.sort_unstable();
         streams.push(StreamSpec {
             stream: StreamId((seed as u128) * 100 + (idx as u128) + 1),
-            initial_voters: voters,
+            initial_voters: Voters::sorted(&voters).expect("three or five voters"),
         });
     }
 
@@ -868,6 +891,19 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
         }
     }
 
+    // Five voters ride out two crashed voters, the leader among them on
+    // alternate seeds, without an outage.
+    if config.replication == 5 && !config.allow_wipe {
+        let at = rng.range(steps.len() + 1);
+        steps.insert(
+            at,
+            Step::LoseTwoOfFive {
+                stream_idx: 0,
+                leader: seed % 2 == 0,
+            },
+        );
+    }
+
     Plan {
         seed,
         profile,
@@ -882,9 +918,11 @@ fn generate_plan(seed: u64, config: &RunConfig) -> Plan {
 async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
     let mut cluster = SimCluster::start(plan.seed, plan.options.clone()).await;
     // `LOGKEEPER_CONSENSUS_LEASES=1` finalizes the cluster first, so every
-    // fault runs under enforced liveness leases from the catalog.
-    if env::var("LOGKEEPER_CONSENSUS_LEASES")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    // fault runs under enforced liveness leases from the catalog. Five-voter
+    // streams need the finalized version, which also enforces leases.
+    if plan.options.replication == 5
+        || env::var("LOGKEEPER_CONSENSUS_LEASES")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     {
         cluster.finalize_version().await;
         cluster.await_leases().await;
@@ -960,7 +998,7 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
             slot_map.push(id);
         }
     }
-    for id in cluster.all_ids {
+    for id in cluster.all_ids.clone() {
         if !slot_map.contains(&id) {
             slot_map.push(id);
         }
@@ -1039,10 +1077,8 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                         .copied()
                         .find(|id| !current.contains(id) && cluster.is_running(*id));
                     if let Some(spare) = spare {
-                        let drop_idx = rng.range(3);
-                        let mut next = current;
-                        next[drop_idx] = spare;
-                        next.sort_unstable();
+                        let drop_idx = rng.range(current.len());
+                        let next = current.replacing(current[drop_idx], spare);
                         if let Ok(updated) = journal_a
                             .client()
                             .replace(stream, config.revision, next)
@@ -1241,18 +1277,36 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                 cluster.clear_disk_faults();
                 cluster.restart_all_stopped().await;
 
-                // Stop 2 of the 3 voters; keep voters[0] as survivor.
-                let survivor = voters[0];
-                let lost = [voters[1], voters[2]];
+                // Lose a quorum: 2 of 3 voters, keeping voters[0]; 3 of 5,
+                // keeping voters[0] and voters[1], or 4 of 5 on alternate
+                // seeds.
+                let survivors = match voters.len() {
+                    5 if plan.seed % 2 == 0 => 2,
+                    _ => 1,
+                };
+                let lost = voters[survivors..].to_vec();
                 let probe_before = cluster.probe_client();
-                let mut lost_gens = Vec::with_capacity(2);
-                for id in lost {
-                    lost_gens.push((id, probe_before.replica_generation(stream, id).await.ok()));
+                let mut lost_gens = Vec::with_capacity(lost.len());
+                for id in &lost {
+                    lost_gens.push((*id, probe_before.replica_generation(stream, *id).await.ok()));
                 }
-                for id in lost {
-                    cluster.crash(id).await;
+                for id in &lost {
+                    cluster.crash(*id).await;
                 }
-                let report = cluster.recover_stream_offline(survivor, lost, stream).await;
+                // With two survivors only the more advanced one recovers; the
+                // other refuses and names it.
+                let mut report = cluster
+                    .recover_stream_offline(voters[0], &lost, stream)
+                    .await;
+                if survivors == 2
+                    && report
+                        .as_ref()
+                        .is_err_and(|error| error.to_string().contains("more advanced log"))
+                {
+                    report = cluster
+                        .recover_stream_offline(voters[1], &lost, stream)
+                        .await;
+                }
                 if let Ok(report) = report {
                     history.record_operator_recovery(stream, report.head, report.epoch);
                     trackers.lock()[*stream_idx].voters = report.voters;
@@ -1340,6 +1394,83 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
                     cluster.restart_all_stopped().await;
                 }
             }
+            Step::LoseTwoOfFive { stream_idx, leader } => {
+                let (stream, voters, deleted) = {
+                    let lock = trackers.lock();
+                    (
+                        lock[*stream_idx].stream,
+                        lock[*stream_idx].voters,
+                        lock[*stream_idx].deleted,
+                    )
+                };
+                if deleted || voters.len() != 5 {
+                    continue;
+                }
+                cluster.faults.heal_all();
+                cluster.clear_disk_faults();
+                cluster.restart_all_stopped().await;
+                let current = cluster.leader(stream).await;
+                let mut lost = Vec::with_capacity(2);
+                if *leader && let Some(current) = current.filter(|id| voters.contains(id)) {
+                    lost.push(current);
+                }
+                for id in voters.iter().rev() {
+                    if lost.len() < 2 && !lost.contains(id) && Some(*id) != current {
+                        lost.push(*id);
+                    }
+                }
+                for id in &lost {
+                    cluster.crash(*id).await;
+                }
+                // Three voters remain, a quorum: writes and reads go on.
+                let ops = [
+                    ClientOp::Append {
+                        stream_idx: *stream_idx,
+                        writer: WriterKind::A,
+                        stale_epoch: false,
+                        retry_previous: false,
+                    },
+                    ClientOp::AppendBatch {
+                        stream_idx: *stream_idx,
+                        writer: WriterKind::A,
+                        count: 2,
+                    },
+                    ClientOp::Read {
+                        stream_idx: *stream_idx,
+                        wait_ms: 0,
+                    },
+                ];
+                let served = |faults: &faults::FaultNetwork| {
+                    let coverage = faults.coverage();
+                    ["op:append_ok", "op:append_batch_ok", "op:read_ok"]
+                        .iter()
+                        .map(|event| coverage.get(event).copied().unwrap_or(0))
+                        .sum::<usize>()
+                };
+                let before = served(&cluster.faults);
+                total_ops += run_concurrent_ops(
+                    &ops,
+                    plan.seed,
+                    &journal_a,
+                    &journal_b,
+                    &journal_r,
+                    &trackers,
+                    &history,
+                    &cluster.faults,
+                    &mut rng,
+                )
+                .await;
+                if served(&cluster.faults) > before {
+                    cluster.faults.hit("op:served_without_two_of_five");
+                }
+                if let Err(violation) = history.check_all(&BTreeMap::new()) {
+                    cluster.stop_all().await;
+                    return Err(violation);
+                }
+                for id in lost {
+                    cluster.restart(id).await;
+                }
+            }
             Step::PauseMs(ms) => {
                 tokio::time::sleep(Duration::from_millis(*ms)).await;
             }
@@ -1355,7 +1486,7 @@ async fn execute_plan(plan: &Plan) -> Result<RunSummary, Violation> {
     // durability regression that happened during the fault phase is observed in history.
     let probe = cluster.probe_client();
     let mut converged = BTreeMap::new();
-    let snapshot_specs: Vec<(StreamId, [Uuid; 3], bool)> = trackers
+    let snapshot_specs: Vec<(StreamId, Voters, bool)> = trackers
         .lock()
         .iter()
         .map(|t| (t.stream, t.voters, t.deleted))
@@ -1938,6 +2069,64 @@ async fn consensus_fault_harness_ci() {
     );
 }
 
+/// `LOGKEEPER_CONSENSUS_REPLICATION=5` runs the soak and replay tests on
+/// five-voter streams.
+fn replication_from_env() -> usize {
+    env::var("LOGKEEPER_CONSENSUS_REPLICATION").map_or(3, |v| v.parse::<usize>().unwrap())
+}
+
+/// CI-sized fault harness on five-voter streams: a nine-keeper cluster
+/// finalized at the replication-factor version, the same randomized faults
+/// and checks, two crashed voters with writes going on, and operator
+/// recovery from one or two survivors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consensus_fault_harness_five_voters() {
+    let first = env::var("LOGKEEPER_CONSENSUS_FIRST_SEED").map_or(0, |v| v.parse::<u64>().unwrap());
+    let count = env::var("LOGKEEPER_CONSENSUS_SEEDS").map_or(6, |v| v.parse::<u64>().unwrap());
+    let config = RunConfig {
+        replication: 5,
+        ..RunConfig::standard()
+    };
+    let mut coverage = Coverage::new();
+    for seed in first..first + count {
+        let summary = timeout(Duration::from_secs(120), run_seed(seed, &config))
+            .await
+            .unwrap_or_else(|_| panic!("five-voter fault harness timed out on seed {seed}"))
+            .unwrap_or_else(|(plan, violation)| {
+                panic!(
+                    "five-voter fault harness FAILED on seed {seed} (profile {:?}):\n\
+                     {violation}\n\
+                     replay with: LOGKEEPER_CONSENSUS_REPLICATION=5 LOGKEEPER_CONSENSUS_SEED={seed} cargo test --locked --features stream --lib consensus_fault_harness_replay_seed -- --ignored --nocapture\n\
+                     plan steps ({}): {:#?}",
+                    plan.profile,
+                    plan.steps.len(),
+                    plan.steps,
+                )
+            });
+        for (event, n) in summary.coverage {
+            *coverage.entry(event).or_default() += n;
+        }
+    }
+    if first == 0 && count >= 6 {
+        for required in [
+            "op:append_ok",
+            "op:read_ok",
+            "op:served_without_two_of_five",
+            "op:recover_stream",
+            "op:acknowledge_recovery",
+        ] {
+            assert!(
+                coverage.contains_key(required),
+                "five-voter fault harness missed coverage for `{required}`; observed: {coverage:?}"
+            );
+        }
+    }
+    eprintln!(
+        "five-voter fault harness seeds {first}..{}: {coverage:?}",
+        first + count
+    );
+}
+
 /// Randomized large-batch fault test: mixes 256-record batches (and >256-record
 /// multi-chunk batches) crossing snapshot intervals under partitions, slow disk,
 /// and keeper restarts. Guards against snapshot page-budget and extent-reaping bugs.
@@ -1954,6 +2143,7 @@ async fn consensus_fault_harness_large_batches() {
         max_record_bytes: 4096,
         client_deadline_ms: 8_000,
         ignore_reused_ids: false,
+        replication: 3,
     };
     let mut cluster = SimCluster::start(seed, options.clone()).await;
     let limits = Limits {
@@ -1966,8 +2156,8 @@ async fn consensus_fault_harness_large_batches() {
         cluster.data_ids[1],
         cluster.data_ids[2],
     ];
-    let journal = cluster.journal(WRITER_A, voters);
-    let reader = cluster.journal(READER, voters);
+    let journal = cluster.journal(WRITER_A, Voters::from(voters));
+    let reader = cluster.journal(READER, Voters::from(voters));
     let stream = StreamId(80_000 + seed as u128);
     let caller = WriterKind::A.identity();
 
@@ -2063,7 +2253,7 @@ async fn consensus_fault_harness_large_batches() {
     // Repair may have replaced the crashed voter while it was down.
     let voters = match cluster.probe_client().configuration(stream).await {
         Ok(configuration) => configuration.voters,
-        Err(_) => voters,
+        Err(_) => Voters::from(voters),
     };
     let conv = cluster
         .wait_converged(stream, &voters, Duration::from_secs(60))
@@ -2106,7 +2296,7 @@ fn amnesia_plan(ignore_reused_ids: bool) -> Plan {
         },
         streams: vec![StreamSpec {
             stream: StreamId(3_000_003),
-            initial_voters: voters,
+            initial_voters: Voters::from(voters),
         }],
         steps: vec![
             Step::Ops(vec![ClientOp::Append {
@@ -2245,6 +2435,7 @@ async fn consensus_fault_harness_replay_seed() {
     };
     config.ignore_reused_ids = env::var("LOGKEEPER_CONSENSUS_IGNORE_REUSE")
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    config.replication = replication_from_env();
     match run_seed(seed, &config).await {
         Ok(summary) => {
             eprintln!(
@@ -2295,6 +2486,7 @@ async fn consensus_fault_harness_soak() {
     };
     config.ignore_reused_ids = env::var("LOGKEEPER_CONSENSUS_IGNORE_REUSE")
         .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    config.replication = replication_from_env();
     let mut coverage = Coverage::new();
     let mut total_ops = 0usize;
     let mut failures = Vec::new();

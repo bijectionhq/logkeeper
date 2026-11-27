@@ -6,7 +6,8 @@
 //! voters. A voter is dead when it has been silent for the repair delay and
 //! its keeper does not answer liveness pings, or answers without a healthy
 //! replica. It is replaced by the best-ranked live keeper with room in a
-//! free failure domain; nothing moves without two live voters.
+//! free failure domain; nothing moves without a live quorum of the voters
+//! (two of three, three of five).
 //!
 //! At most `MAX_REPAIRS` repairs run at once, in their own tasks, so a slow
 //! replacement never holds up the pass; their snapshot sends share the

@@ -31,6 +31,7 @@ use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 use super::{Engine, Group};
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{
     BUILD_VERSION, CLUSTER_VERSION_CURRENT, CLUSTER_VERSION_V1, KeeperStatus, decisions, features,
     metrics, network,
@@ -347,8 +348,10 @@ impl Engine {
         if target > CLUSTER_VERSION_CURRENT {
             return Err(JournalError::Unsupported);
         }
-        // Leases also need every keeper to renew and honour them.
-        let required_feature = if target >= super::super::CLUSTER_VERSION_LEASES {
+        let required_feature = if target >= super::super::CLUSTER_VERSION_V7 {
+            features::REPLICATION_FACTOR | features::LEASES | features::OFFLOAD
+        } else if target >= super::super::CLUSTER_VERSION_LEASES {
+            // Leases also need every keeper to renew and honour them.
             features::LEASES | features::OFFLOAD
         } else if target >= super::super::CLUSTER_VERSION_V5 {
             features::OFFLOAD
@@ -573,14 +576,16 @@ impl Engine {
                 .map(|genesis| (genesis.stream, genesis.voters));
             parked_copies.chain(unopened).collect::<Vec<_>>()
         };
-        let needs_wake = |voters: &[Uuid; 3]| {
+        let needs_wake = |voters: &Voters| {
             let lost = voters
                 .iter()
                 .filter(|voter| {
                     dead.contains(voter) || !self.placement.all_domains().contains_key(voter)
                 })
                 .count();
-            lost == 1
+            // Repair can replace a lost voter only while a quorum is left:
+            // one lost of three, one or two of five.
+            (lost >= 1 && decisions::repair_allowed(voters.len() - lost, voters.len()))
                 || (lost == 0
                     && (!self.placement.roster(voters)
                         || voters.iter().any(|voter| leaving.contains(voter))))

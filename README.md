@@ -137,8 +137,8 @@ volumes with an allocation unit up to 16 KiB.
 
 Pass the application certificate paths, the inventory, the catalog UUID, and
 an operation deadline to `Client::new`. With a replicated catalog, also pass
-its voters to `Client::with_catalog_voters`. With an authorized client and three
-voter UUIDs, a first write looks like this.
+its voters to `Client::with_catalog_voters`. With an authorized client and
+three or five voter UUIDs (a `Voters` roster), a first write looks like this.
 
 ```rust,ignore
 use bytes::Bytes;
@@ -169,8 +169,28 @@ never created. Unreachable or obsolete peers leave that question open.
 Records can be up to 4 MiB. Trim advances the logical read floor. Delete is
 terminal for a stream ID.
 
+**Replication factor.** A stream has three or five voters, fixed at create.
+Three voters commit with two and survive the loss of any one; five commit
+with three and survive the loss of any two, at the cost of one more
+replication round trip in the commit quorum and two more copies. A
+`JournalConfig` sets `replication_factor` (3 by default, or 5); fixed
+`voters` must have that many, and a placement chooses that many. Placement
+puts each voter in its own failure domain when there are enough domains.
+With fewer, five voters share domains so that none holds more than two
+(2+2+1 over three domains, 2+1+1+1 over four), so losing any one domain
+leaves a quorum; two domains cannot hold five voters, and three voters
+always need three domains. The catalog refuses a five-voter genesis until
+the cluster has finalized the replication-factor version
+(`CLUSTER_VERSION_REPLICATION`), since an older keeper cannot read a
+five-voter roster. Repair, replacement, parking, leader preference and
+operator recovery handle both sizes: repair needs a live quorum (two of
+three, three of five) and replaces one voter at a time, and recovery applies
+once a quorum is lost. Timed originals bind a three-voter ensemble, so a
+five-voter stream refuses them with `Unsupported`.
+
 Use `configuration` to fetch a revision, then call `replace` with that revision
-and the three desired voters. Retry the same revision and target if the
+and the desired voters: as many as the stream has, keeping a quorum of the
+current ones (an ordinary move replaces one voter at a time). Retry the same revision and target if the
 outcome is uncertain. The keeper commits the exact catalog staging receipt
 before entering joint consensus. Once retained, that receipt supports the
 matching change during catalog outage. A later leader can finish committed
@@ -311,30 +331,39 @@ writes a clean checkpoint and boundary, the keeper starts strictly, and
 repair replaces the quarantined replicas. Strict startup is unchanged.
 An unverifiable basis requires a fresh keeper incarnation.
 
-### Recovering a stream that lost two of its three voters
+### Recovering a stream that lost a quorum of its voters
 
-A stream commits and changes membership with two of its three voters, so it
-stops when two are lost and leader-driven repair cannot help. An operator can
-make the survivor's replica the stream's only history. This can lose
-acknowledged records: a committed record reached two voters, which may have
-been the two lost ones. Follow the [two-voter-loss runbook](docs/runbooks/lose-two-voters.md)
-to retire both lost keeper identities, obtain their signed proofs, and stop
+A stream commits and changes membership with a quorum of its voters (two of
+three, three of five), so it stops when it loses two of three, or three of
+five, and leader-driven repair cannot help. An operator can make a
+survivor's replica the stream's only history. This can lose acknowledged
+records: a committed record reached a quorum, which may have been the lost
+voters. Follow the [two-voter-loss runbook](docs/runbooks/lose-two-voters.md)
+to retire every lost keeper identity, obtain their signed proofs, and stop
 the surviving keeper. Then run on the survivor's host:
 
 ```sh
 cargo run --locked --features stream -- keeper recover-stream --config keeper.json \
-  --stream STREAM_UUID --acknowledge-data-loss [--lost LOST1_UUID[,LOST2_UUID]] \
-  [--fence-proof LOST1_UUID.fence.json --fence-proof LOST2_UUID.fence.json] \
-  [--with KEEPER_UUID,KEEPER_UUID]
+  --stream STREAM_UUID --acknowledge-data-loss [--lost LOST1_UUID[,...]] \
+  [--fence-proof LOST1_UUID.fence.json ...] [--with KEEPER_UUID[,...]]
 ```
+
+With two survivors of five, the recovery runs on the more advanced one: the
+survivor whose last log entry is later, or the lower keeper ID on a tie. The
+command asks the other survivor, which keeps running, for its last entry
+(`Request::LocalTip`, keeper-only) and refuses on the less advanced one,
+naming the other. The other survivor keeps its seat in the recovered
+configuration and catches up from the recovering one like any follower; an
+uncommitted suffix of its own is replaced.
 
 The command takes the keeper's media lock, so it refuses while the keeper
 runs. It replays the whole local log, including entries the survivor never
 saw committed, and asks every other keeper for its status.
 
 - **Refusals.** It refuses when the survivor is not a voter of the stream's
-  latest configuration, when that configuration is joint, and when any other
-  voter of it answers with a healthy replica, open or parked: the stream
+  latest configuration, when that configuration is joint, and when the other
+  voters that answer with a healthy replica, open or parked, would form a
+  quorum with the survivor (any of three; two or more of five): the stream
   still has a quorum, so restart the survivor instead. It also refuses the
   replicated catalog stream. Without `--acknowledge-data-loss` it prints what
   it would do and refuses.
@@ -344,15 +373,17 @@ saw committed, and asks every other keeper for its status.
   `--lost` declares the named lost voters dead, which bumps their epochs in
   the catalog and ends their leases for every stream, and a `--fence-proof`
   given is still checked. `--lost` is required only for a lost voter that
-  never held a lease, which time cannot depose. Before finalization `--lost`
-  names the configuration's two other voters and each `--fence-proof` comes
+  never held a lease, which time cannot depose. `--lost` never names a voter
+  that answers with a healthy replica. Before finalization `--lost`
+  names every other voter of the configuration and each `--fence-proof` comes
   from running `keeper fence-recovery` while the voter is stopped; recovery
-  validates both signatures and verifies the proofs correspond to the
-  original enrolled media.
-- **Replacements.** `--with` names two keepers. Without it the command takes
-  the two best-ranked live, accepting keepers outside the lost configuration,
-  in failure domains distinct from each other and from the survivor's. They
-  must answer.
+  validates every signature and verifies the proofs correspond to the
+  original enrolled media. Five-voter streams exist only after finalizing
+  level 7, which includes leases.
+- **Replacements.** `--with` names one keeper per lost voter. Without it
+  the command takes the best-ranked live, accepting keepers outside the lost
+  configuration, in free failure domains first and spread with the
+  survivors as placement requires. They must answer.
 - **The catalog transaction.** Each replacement stages an installed, empty
   copy of the stream. A replacement refuses when its own open replica votes
   in its configuration, which means the survivor's view is stale. The
@@ -818,6 +849,15 @@ Each gate names the level its format needs (`CLUSTER_VERSION_V2` for all of
 these), never `CLUSTER_VERSION_CURRENT`. A format a later release adds follows
 the same rule: it is written only once `write_version_allows` it.
 
+**Five-voter rosters.** Finalizing level 7 (`CLUSTER_VERSION_REPLICATION`)
+also needs every keeper to advertise the `REPLICATION_FACTOR` feature bit;
+only then does the catalog accept five-voter geneses. A five-voter roster
+keeps the three-element tuple of a three-voter one on the wire, in the WAL
+and in snapshots, packed as byte strings of 32, 32 and 16 bytes, so an N-1
+keeper refuses it as an invalid UUID instead of misreading it, and a
+three-voter roster encodes exactly as before. Nothing carrying a five-voter
+roster is encoded for an N-1 connection.
+
 **Wire variants.** Variants of `Frame`, `Request`, `PeerRequest`, `Reply`,
 `Outcome` and `JournalError` are only ever appended, and each is classified
 by the wire version that introduced it in `network/versions.rs`, an
@@ -848,10 +888,11 @@ Cluster version 3 enables the atomic recovery marker.
 Finalization probes each active keeper for explicit support for that command.
 The version 2 parking, relocation and checkpoint formats remain available during this upgrade.
 
-**Placement changes and retired keepers.** The rule of three active keepers
-in distinct failure domains applies only where a roster is chosen: a new
+**Placement changes and retired keepers.** The rule of active keepers
+spread over failure domains (three in distinct domains, or five with at
+most two per domain) applies only where a roster is chosen: a new
 genesis, a stage's target and a recovery's replacements. Replay, snapshots,
-ingress and proofs only check that the voters are three sorted keepers the
+ingress and proofs only check that the voters are three or five sorted keepers the
 inventory knows, so a domain reassignment or a retirement never quarantines
 a replica. Leaders count a configuration that breaks placement
 (`placement.violation`), and repair moves it, waking it if it is parked.
@@ -962,7 +1003,8 @@ served. A live leader's lease can still refuse the ballot.
 `ConsensusJournal` implements `journal_contract::Journal` over consensus
 streams. Construct it from client credentials and a `JournalConfig` with the
 keeper inventory, the catalog keeper and, with a replicated catalog, its
-`catalog_voters`, the three voters and the quota for each stream it creates, the record limit and the operation deadline. Every
+`catalog_voters`, the three or five voters (or a placement and
+`replication_factor`) and the quota for each stream it creates, the record limit and the operation deadline. Every
 principal authorised as a writer can seal, append and trim.
 
 The contract identifies a writer by its authenticated principal. The journal
@@ -983,9 +1025,11 @@ exposes one batch directly.
 
 A `JournalConfig` names either fixed `voters` for every stream or a
 `placement`: the eligible keepers with their failure domains, plus an
-optional `draining` list. With a placement, `create` chooses three eligible,
-non-draining keepers in distinct domains by rendezvous ranking of the stream
-and keeper identities, so every consumer derives the same voters.
+optional `draining` list. With a placement, `create` chooses
+`replication_factor` (3 or 5) eligible, non-draining keepers by rendezvous
+ranking of the stream and keeper identities, in distinct domains when there
+are enough and otherwise at most two per domain, so every consumer derives
+the same voters.
 `update_placement` applies a changed eligible set or draining list.
 `reconcile_placement` keeps every voter that is still eligible in a distinct
 domain, replaces one other voter through `replace`, and returns the new

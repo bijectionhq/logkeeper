@@ -43,6 +43,7 @@ use super::{
     state::{Command, Outcome},
     storage::{SnapshotFile, StateMachine},
 };
+use crate::stream::consensus::Voters;
 use crate::stream::transport::{Channel, connect_protocols, is_alpn_mismatch};
 
 mod versions;
@@ -177,7 +178,7 @@ pub(super) enum Request {
     Replace {
         stream: StreamId,
         expected: u64,
-        voters: [uuid::Uuid; 3],
+        voters: Voters,
     },
     PlacementProof(StreamId),
     StageReplica {
@@ -323,6 +324,11 @@ pub(super) enum Request {
         dead: Vec<uuid::Uuid>,
         record: super::authority::RecoveryRecord,
     },
+    /// An operator recovery asks another surviving voter for the last log
+    /// entry of its copy of `stream`, answered with `Reply::Tip`. With two
+    /// survivors of five only the more advanced one recovers. Keepers only;
+    /// added last.
+    LocalTip(StreamId),
 }
 
 impl Request {
@@ -347,6 +353,7 @@ impl Request {
             | Self::LocalConfiguration(stream)
             | Self::Staging(stream)
             | Self::ClearQuarantine(stream)
+            | Self::LocalTip(stream)
             | Self::Configuration(stream) => stream,
             Self::Stage(ref stage) | Self::RecoverStream { ref stage, .. } => stage.stream,
             Self::ClusterVersion
@@ -438,9 +445,18 @@ pub(super) fn encode_pong(pong: &Pong, version: WireVersion) -> io::Result<Vec<u
     }
 }
 
-// Genesis encodes a u128 stream ID, three length-prefixed UUID byte strings
-// (u64 length and 16 bytes each), and a u64 quota.
-const GENESIS_WIRE_BYTES: usize = 16 + 3 * (8 + 16) + 8;
+/// The encoded length of the genesis that starts `bytes`: a u128 stream ID,
+/// a voter roster of three length-prefixed byte strings (16 bytes each for
+/// three voters, 32, 32 and 16 for five; see `voters.rs`), and a u64 quota.
+fn genesis_wire_bytes(bytes: &[u8]) -> Option<usize> {
+    let first = u64::from_le_bytes(bytes.get(16..24)?.try_into().ok()?);
+    let roster = match first {
+        16 => 3 * (8 + 16),
+        32 => 3 * 8 + 5 * 16,
+        _ => return None,
+    };
+    Some(16 + roster + 8)
+}
 
 pub(super) enum DecodedFrame {
     Frame(Frame),
@@ -485,8 +501,12 @@ pub(super) fn decode_frame(bytes: &[u8], version: WireVersion) -> io::Result<Dec
     } else {
         0
     };
-    let peer_start = 4 + GENESIS_WIRE_BYTES + prefix;
+    let peer_start = bytes
+        .get(4 + prefix..)
+        .and_then(genesis_wire_bytes)
+        .map(|genesis| 4 + prefix + genesis);
     if frame_tag == 1
+        && let Some(peer_start) = peer_start
         && let Some(tag) = bytes.get(peer_start..peer_start + 4)
     {
         let peer_tag = u32::from_le_bytes(tag.try_into().unwrap());
@@ -506,6 +526,24 @@ impl Request {
     /// since N-1 is refused locally on an N-1 connection.
     pub(super) fn supported_on(&self, version: WireVersion) -> bool {
         self.introduced() <= version
+    }
+}
+
+impl Request {
+    /// Whether every roster the request carries has three voters, the only
+    /// size an N-1 peer reads.
+    fn legacy_roster(&self) -> bool {
+        match self {
+            Self::Claim(genesis) | Self::ReadAt { genesis, .. } => genesis.voters.legacy(),
+            Self::Stage(stage) => stage.old.legacy() && stage.target.legacy(),
+            Self::Replace { voters, .. } => voters.legacy(),
+            Self::StageReplica { genesis, stage }
+            | Self::InstallReplica { genesis, stage, .. }
+            | Self::StageRecovered { genesis, stage } => {
+                genesis.voters.legacy() && stage.old.legacy() && stage.target.legacy()
+            }
+            _ => true,
+        }
     }
 }
 
@@ -534,6 +572,12 @@ impl Frame {
                 frame if frame.introduced() > WireVersion::Previous => {
                     Err(unsupported("frame requires a newer keeper protocol"))
                 }
+                Self::Peer(genesis, _) if !genesis.voters.legacy() => Err(unsupported(
+                    "five-voter streams require a newer keeper protocol",
+                )),
+                Self::Client(request) if !request.legacy_roster() => Err(unsupported(
+                    "five-voter streams require a newer keeper protocol",
+                )),
                 frame => encode(frame),
             },
         }
@@ -729,6 +773,9 @@ pub(super) enum Reply {
     Lease(super::authority::Grant),
     /// The catalog's answer to a recovery transaction. Added last.
     Recovered(super::authority::Recovered),
+    /// The last log entry of the answering keeper's copy, if it holds one.
+    /// Added last.
+    Tip(Option<super::LogId>),
 }
 
 /// The N-1 wire codec for [`Reply`], the bincode layout of
@@ -767,6 +814,11 @@ impl ReplyV1 {
         if reply.introduced() > WireVersion::Previous {
             return Err(unsupported("reply requires a newer keeper protocol"));
         }
+        if !reply.legacy_roster() {
+            return Err(unsupported(
+                "five-voter streams require a newer keeper protocol",
+            ));
+        }
         Ok(match reply {
             Reply::Decision(outcome) => Self::Decision(outcome_v1(outcome)),
             Reply::Leader(leader) => Self::Leader(leader),
@@ -801,6 +853,9 @@ impl ReplyV1 {
                     "the configuration authority requires a newer protocol",
                 ));
             }
+            Reply::Tip(_) => {
+                return Err(unsupported("N-1 knows no local tip request"));
+            }
         })
     }
 
@@ -826,6 +881,30 @@ impl ReplyV1 {
     }
 }
 
+impl Reply {
+    /// Whether every roster the reply carries has three voters.
+    fn legacy_roster(&self) -> bool {
+        let configuration = |configuration: &Option<super::Configuration>| {
+            configuration.is_none_or(|configuration| configuration.voters.legacy())
+        };
+        match self {
+            Self::Catalog(genesis, _) => genesis.voters.legacy(),
+            Self::Staged(stage) => stage.old.legacy() && stage.target.legacy(),
+            Self::Placement(proof) => {
+                proof.genesis.voters.legacy() && proof.configuration.voters.legacy()
+            }
+            Self::ScopedPage {
+                genesis,
+                configuration: scoped,
+                ..
+            } => genesis.voters.legacy() && configuration(scoped),
+            Self::Configured(configured) => configuration(configured),
+            Self::Decision(Outcome::Configuration(configured)) => configured.voters.legacy(),
+            _ => true,
+        }
+    }
+}
+
 pub(super) fn encode_reply(reply: Reply, version: WireVersion) -> io::Result<Vec<u8>> {
     match version {
         WireVersion::Current => encode(&reply),
@@ -844,7 +923,7 @@ pub(super) fn decode_reply(bytes: &[u8], version: WireVersion) -> io::Result<Rep
 pub(super) struct Proof {
     pub genesis: Genesis,
     pub configuration: super::Configuration,
-    pub joint: Option<[uuid::Uuid; 3]>,
+    pub joint: Option<Voters>,
     pub stage: Option<Stage>,
 }
 
@@ -2096,6 +2175,79 @@ impl RaftNetworkV2<RaftTypes> for Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn genesis(voters: super::super::Voters) -> Genesis {
+        Genesis {
+            stream: StreamId(7),
+            voters,
+            quota_bytes: 1 << 20,
+            immutable: false,
+        }
+    }
+
+    #[test]
+    fn five_voter_frames_peek_their_peer_tag_and_never_reach_an_older_peer() {
+        let three = super::super::Voters::from([1, 2, 3].map(uuid::Uuid::from_u128));
+        let five = super::super::Voters::from([1, 2, 3, 4, 5].map(uuid::Uuid::from_u128));
+        let park = |voters| {
+            Frame::Peer(
+                genesis(voters),
+                PeerRequest::Park {
+                    vote: Vote::new(1, 1),
+                    last: None,
+                },
+            )
+        };
+        // A three-voter frame keeps the N-1 layout and is sent as before.
+        let legacy = park(three).encode_for(WireVersion::Previous).unwrap();
+        assert_eq!(legacy, encode(&park(three)).unwrap());
+        assert_eq!(genesis_wire_bytes(&legacy[4..]), Some(16 + 3 * 24 + 8));
+        // A five-voter frame decodes on N, and its peer tag is found past
+        // the longer roster, so an unknown tag is still a typed refusal.
+        let current = park(five).encode_for(WireVersion::Current).unwrap();
+        assert_eq!(
+            genesis_wire_bytes(&current[4..]),
+            Some(16 + 3 * 8 + 5 * 16 + 8)
+        );
+        assert!(matches!(
+            decode_frame(&current, WireVersion::Current).unwrap(),
+            DecodedFrame::Frame(Frame::Peer(decoded, _)) if decoded.voters == five
+        ));
+        let mut unknown = current.clone();
+        let tag = 4 + genesis_wire_bytes(&current[4..]).unwrap();
+        unknown[tag..tag + 4].copy_from_slice(&99u32.to_le_bytes());
+        assert!(matches!(
+            decode_frame(&unknown, WireVersion::Current).unwrap(),
+            DecodedFrame::Unsupported(_)
+        ));
+        // Nothing carrying a five-voter roster is encoded for an N-1 peer.
+        assert!(park(five).encode_for(WireVersion::Previous).is_err());
+        assert!(
+            Frame::Client(Request::Claim(genesis(five)))
+                .encode_for(WireVersion::Previous)
+                .is_err()
+        );
+        assert!(
+            Frame::Client(Request::Claim(genesis(three)))
+                .encode_for(WireVersion::Previous)
+                .is_ok()
+        );
+        assert!(
+            encode_reply(Reply::Catalog(genesis(five), vec![]), WireVersion::Previous).is_err()
+        );
+        assert!(
+            encode_reply(
+                Reply::Catalog(genesis(three), vec![]),
+                WireVersion::Previous
+            )
+            .is_ok()
+        );
+        assert!(
+            Frame::Client(Request::LocalTip(StreamId(7)))
+                .encode_for(WireVersion::Previous)
+                .is_err()
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn snapshot_sends_are_paced_across_streams() {

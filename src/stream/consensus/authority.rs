@@ -305,8 +305,8 @@ mod tests {
         Stage {
             stream: StreamId(9),
             source: 4,
-            old: [ids[0], ids[1], ids[2]],
-            target: [ids[0], ids[3], ids[4]],
+            old: crate::stream::consensus::Voters::from([ids[0], ids[1], ids[2]]),
+            target: crate::stream::consensus::Voters::from([ids[0], ids[3], ids[4]]),
         }
     }
 

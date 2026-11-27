@@ -44,6 +44,7 @@ use tokio::{
 use uuid::Uuid;
 
 use super::{Engine, Group, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{
     Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, authority, catalog, decisions, decode,
     encode,
@@ -200,7 +201,7 @@ pub(super) struct CatalogStream {
 }
 
 impl CatalogStream {
-    pub fn new(voters: [Uuid; 3], seeder: Uuid) -> Self {
+    pub fn new(voters: Voters, seeder: Uuid) -> Self {
         let genesis = Genesis {
             stream: STREAM,
             voters,
@@ -220,7 +221,7 @@ impl CatalogStream {
 
 impl CatalogStream {
     /// The configured voters of the catalog stream.
-    pub fn voters(&self) -> [Uuid; 3] {
+    pub fn voters(&self) -> Voters {
         self.genesis.voters
     }
 }
@@ -490,6 +491,14 @@ impl Engine {
             };
             if !fold.seeded {
                 return Ok(failure(JournalError::Unavailable));
+            }
+            // Five voters need every keeper to read their roster.
+            if !crate::stream::consensus::decisions::creates_replication(
+                genesis.voters.len(),
+                fold.cluster_version,
+                crate::stream::consensus::CLUSTER_VERSION_REPLICATION,
+            ) {
+                return Ok(failure(JournalError::Unsupported));
             }
             if let Some(existing) = fold.entries.get(&genesis.stream) {
                 return Ok(if existing.genesis == genesis {
@@ -1110,7 +1119,7 @@ mod tests {
         let ids = [1, 2, 3, 4].map(Uuid::from_u128);
         let own = Genesis {
             stream: STREAM,
-            voters: [ids[0], ids[1], ids[2]],
+            voters: Voters::from([ids[0], ids[1], ids[2]]),
             quota_bytes: QUOTA_BYTES,
             immutable: false,
         };
@@ -1120,19 +1129,19 @@ mod tests {
             quota_bytes: 4096,
             immutable: false,
         };
-        let first = genesis([ids[0], ids[1], ids[2]]);
+        let first = genesis(Voters::from([ids[0], ids[1], ids[2]]));
         let stage = Stage {
             stream: StreamId(7),
             source: 1,
             old: first.voters,
-            target: [ids[0], ids[1], ids[3]],
+            target: Voters::from([ids[0], ids[1], ids[3]]),
         };
         let mut fold = Fold::new(&own, Lsn(1));
         for record in [
             CatalogRecord::Checkpoint(Vec::new()),
             CatalogRecord::Seeded,
             CatalogRecord::Claim(first.clone()),
-            CatalogRecord::Claim(genesis([ids[0], ids[1], ids[3]])),
+            CatalogRecord::Claim(genesis(Voters::from([ids[0], ids[1], ids[3]]))),
             CatalogRecord::Stage(stage.clone()),
             CatalogRecord::Contacts(StreamId(8), vec![ids[3]]),
         ] {

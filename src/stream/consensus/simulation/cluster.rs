@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::faults::FaultNetwork;
+use crate::stream::consensus::Voters;
 use crate::stream::{
     consensus::{
         Client, Config, Configuration, ConsensusJournal, Credentials, Domains, JournalConfig,
@@ -50,6 +51,10 @@ pub(super) struct ClusterOptions {
     /// Keepers accept a keeper ID reused on new media, as before media
     /// incarnations, which reopens the Raft amnesia bug.
     pub ignore_reused_ids: bool,
+    /// Voters of every stream: 3, or 5 on a cluster that adds keepers 8
+    /// and 9 (domains g and h) and finalizes the replication-factor
+    /// version before the first create.
+    pub replication: usize,
 }
 
 impl Default for ClusterOptions {
@@ -62,6 +67,7 @@ impl Default for ClusterOptions {
             quota_bytes: 512 * 1024,
             max_record_bytes: 4096,
             client_deadline_ms: 4_000,
+            replication: 3,
             ignore_reused_ids: false,
         }
     }
@@ -140,16 +146,18 @@ impl Running {
     }
 }
 
-/// Seven in-process consensus keepers in distinct failure domains with fault
-/// injection wired into every RPC lane and WAL disk.
+/// Seven in-process consensus keepers in distinct failure domains, nine for
+/// five-voter streams, with fault injection wired into every RPC lane and
+/// WAL disk.
 pub(super) struct SimCluster {
     running: BTreeMap<Uuid, Running>,
     configs: BTreeMap<Uuid, Config>,
     pub keepers: Keepers,
     /// Four primary data keepers (indices 0..4).
     pub data_ids: [Uuid; 4],
-    /// All seven keeper IDs (data keepers + catalog/spare keepers 5, 6, 7).
-    pub all_ids: [Uuid; 7],
+    /// All keeper IDs: data keepers, catalog/spare keepers 5, 6, 7, and
+    /// spares 8 and 9 for five-voter streams.
+    pub all_ids: Vec<Uuid>,
     pub catalog: Uuid,
     pub catalog_voters: Option<[Uuid; 3]>,
     /// Keepers wiped and initialized again under their old IDs.
@@ -170,13 +178,15 @@ impl SimCluster {
         let ca = ca(&roots);
         let data_ids = [1, 2, 3, 4].map(Uuid::from_u128);
         let catalog = Uuid::from_u128(5);
-        let all_ids = [1, 2, 3, 4, 5, 6, 7].map(Uuid::from_u128);
+        let keeper_count = if options.replication == 5 { 9 } else { 7 };
+        let all_ids = (1..=keeper_count).map(Uuid::from_u128).collect::<Vec<_>>();
         let catalog_voters = options
             .replicated_catalog
             .then_some([5, 6, 7].map(Uuid::from_u128));
         let domains: Domains = all_ids
-            .into_iter()
-            .zip(["a", "b", "c", "d", "directory", "e", "f"])
+            .iter()
+            .copied()
+            .zip(["a", "b", "c", "d", "directory", "e", "f", "g", "h"])
             .map(|(id, domain)| (id, domain.into()))
             .collect();
         let enrollment = dir.path().join("registry");
@@ -196,7 +206,7 @@ impl SimCluster {
         let mut peers = Keepers::new();
         let mut bulk = Keepers::new();
         let mut listeners = BTreeMap::new();
-        for id in all_ids {
+        for id in all_ids.iter().copied() {
             let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let control = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let snapshot = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -296,12 +306,13 @@ impl SimCluster {
         }
     }
 
-    pub fn journal_config(&self, voters: [Uuid; 3], domain: Option<&str>) -> JournalConfig {
+    pub fn journal_config(&self, voters: Voters, domain: Option<&str>) -> JournalConfig {
         JournalConfig {
             keepers: self.keepers.clone(),
             catalog: self.catalog,
             catalog_voters: self.catalog_voters,
             voters: Some(voters),
+            replication_factor: voters.len(),
             placement: None,
             draining: BTreeSet::new(),
             retired: BTreeSet::new(),
@@ -312,7 +323,7 @@ impl SimCluster {
         }
     }
 
-    pub fn journal(&self, principal: &str, voters: [Uuid; 3]) -> ConsensusJournal {
+    pub fn journal(&self, principal: &str, voters: Voters) -> ConsensusJournal {
         let (creds, source) = self.creds_for(principal);
         let config = self.journal_config(voters, None);
         let journal = ConsensusJournal::new(creds, &config).unwrap();
@@ -444,7 +455,7 @@ impl SimCluster {
 
     pub async fn restart_all_stopped(&mut self) {
         self.reap_crashed().await;
-        for id in self.all_ids {
+        for id in self.all_ids.clone() {
             if !self.running.contains_key(&id) {
                 self.restart(id).await;
             }
@@ -549,7 +560,7 @@ impl SimCluster {
     pub async fn recover_stream_offline(
         &mut self,
         survivor: Uuid,
-        lost: [Uuid; 2],
+        lost: &[Uuid],
         stream: StreamId,
     ) -> io::Result<RecoveryReport> {
         self.stop_graceful(survivor).await;
@@ -693,7 +704,7 @@ impl SimCluster {
     pub async fn wait_converged(
         &self,
         stream: StreamId,
-        voters: &[Uuid; 3],
+        voters: &Voters,
         limit: Duration,
     ) -> Result<Vec<VoterSnapshot>, Vec<Option<VoterSnapshot>>> {
         let probe = self.probe_client();
@@ -728,27 +739,27 @@ impl SimCluster {
                 // Issue a fresh head so parked streams reopen and followers
                 // receive the latest commit index from the leader.
                 let expected_head = probe.head(stream).await;
-                let mut snaps = Vec::with_capacity(3);
+                let mut snaps = Vec::with_capacity(voters.len());
                 for &v in voters {
                     snaps.push(self.inspect_voter(v, stream).await);
                 }
-                if let [Some(a), Some(b), Some(c)] = &snaps[..] {
+                if let Some(all) = snaps.iter().cloned().collect::<Option<Vec<_>>>()
+                    && let [a, rest @ ..] = &all[..]
+                {
                     let head_matches = match expected_head {
                         Ok(h) => !a.deleted && a.head == h,
                         Err(JournalError::Deleted) => a.deleted,
                         _ => false,
                     };
                     if head_matches
-                        && a.deleted == b.deleted
-                        && b.deleted == c.deleted
-                        && a.floor == b.floor
-                        && b.floor == c.floor
-                        && a.head == b.head
-                        && b.head == c.head
-                        && a.records == b.records
-                        && b.records == c.records
+                        && rest.iter().all(|b| {
+                            a.deleted == b.deleted
+                                && a.floor == b.floor
+                                && a.head == b.head
+                                && a.records == b.records
+                        })
                     {
-                        return Some(snaps.into_iter().map(Option::unwrap).collect::<Vec<_>>());
+                        return Some(all);
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(40)).await;
@@ -758,7 +769,7 @@ impl SimCluster {
         match outcome {
             Ok(Some(snaps)) => Ok(snaps),
             Ok(None) | Err(_) => {
-                let mut snaps = Vec::with_capacity(3);
+                let mut snaps = Vec::with_capacity(voters.len());
                 for &v in voters {
                     snaps.push(self.inspect_voter(v, stream).await);
                 }

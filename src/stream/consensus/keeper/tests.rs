@@ -5,6 +5,7 @@ use openraft::{EntryPayload, async_runtime::WatchReceiver, raft::AppendEntriesRe
 use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
 use uuid::Uuid;
 
+use crate::stream::consensus::Voters;
 use crate::stream::{
     consensus::{
         Client, Entry, Fence, LogId, RaftTypes,
@@ -27,6 +28,7 @@ mod ops;
 mod park;
 mod recovery;
 mod repair;
+mod replication;
 mod upgrades;
 
 pub(super) type RejectAppend =
@@ -99,21 +101,28 @@ impl Cluster {
     }
 
     async fn start_with(domains: [&str; 4], catalog_voters: Option<[Uuid; 3]>) -> Self {
-        Self::start_addressed(domains, catalog_voters, false).await
+        Self::start_addressed(domains, catalog_voters, false, 0).await
+    }
+
+    /// Adds `extra` keepers 8, 9, ... in their own domains g, h, ..., so
+    /// five-voter streams have spare keepers to move to.
+    async fn start_wide(extra: u128) -> Self {
+        Self::start_addressed(["a", "b", "c", "d"], None, false, extra).await
     }
 
     /// Lists every keeper in the inventory as `localhost:port`, a DNS name
     /// resolved at each connect, instead of an IP address.
     async fn start_named() -> Self {
-        Self::start_addressed(["a", "b", "c", "d"], None, true).await
+        Self::start_addressed(["a", "b", "c", "d"], None, true, 0).await
     }
 
     async fn start_addressed(
         domains: [&str; 4],
         catalog_voters: Option<[Uuid; 3]>,
         named: bool,
+        extra: u128,
     ) -> Self {
-        Self::start_configured(domains, catalog_voters, named, None).await
+        Self::start_configured(domains, catalog_voters, named, None, extra).await
     }
 
     /// Starts every keeper with `offload`, without the restart that turning
@@ -123,6 +132,7 @@ impl Cluster {
         catalog_voters: Option<[Uuid; 3]>,
         named: bool,
         offload: Option<crate::stream::consensus::OffloadConfig>,
+        extra: u128,
     ) -> Self {
         let address = |listener: &TcpListener| -> crate::stream::consensus::Address {
             let local = listener.local_addr().unwrap();
@@ -140,11 +150,19 @@ impl Cluster {
         let catalog = Uuid::from_u128(5);
         let roster = ids
             .into_iter()
-            .chain([catalog, Uuid::from_u128(6), Uuid::from_u128(7)]);
+            .chain([catalog, Uuid::from_u128(6), Uuid::from_u128(7)])
+            .chain((8..8 + extra).map(Uuid::from_u128));
+        let extra_domains = (0..extra).map(|index| ((b'g' + index as u8) as char).to_string());
         let domains: Domains = roster
             .clone()
-            .zip(domains.into_iter().chain(["directory", "e", "f"]))
-            .map(|(id, domain)| (id, domain.into()))
+            .zip(
+                domains
+                    .into_iter()
+                    .chain(["directory", "e", "f"])
+                    .map(str::to_owned)
+                    .chain(extra_domains),
+            )
+            .map(|(id, domain)| (id, domain))
             .collect();
         let enrollment = dir.path().join("registry");
         std::fs::create_dir(&enrollment).unwrap();
@@ -322,7 +340,7 @@ impl Cluster {
         panic!("no leader for {stream:?}")
     }
 
-    async fn authority(&self, stream: StreamId, roster: [Uuid; 3], revision: u64) -> Uuid {
+    async fn authority(&self, stream: StreamId, roster: Voters, revision: u64) -> Uuid {
         timeout(WAIT, async {
             loop {
                 for id in roster {
@@ -431,11 +449,16 @@ async fn failover_snapshot_replacement_and_restart_preserve_the_stream() {
     let stream = StreamId(7);
     let initial = [ids[0], ids[1], ids[2]];
     assert_eq!(journal.head(stream).await, Err(JournalError::NotFound));
-    journal.create(stream, initial, 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from(initial), 4096)
+        .await
+        .unwrap();
     let starting = journal.configuration(stream).await.unwrap();
     assert_eq!(starting.voters, initial);
     assert_eq!(
-        journal.create(stream, [ids[1], ids[2], ids[3]], 4096).await,
+        journal
+            .create(stream, Voters::from([ids[1], ids[2], ids[3]]), 4096)
+            .await,
         Err(JournalError::Conflict { head: Lsn(0) })
     );
     let writer = Uuid::from_u128(99);
@@ -590,13 +613,15 @@ async fn failover_snapshot_replacement_and_restart_preserve_the_stream() {
         catalog,
     ];
     let replaced = journal
-        .replace(stream, starting.revision, next)
+        .replace(stream, starting.revision, Voters::from(next))
         .await
         .unwrap();
     assert_eq!(replaced.voters, next);
     assert!(replaced.revision > starting.revision);
     assert_eq!(
-        journal.replace(stream, starting.revision, next).await,
+        journal
+            .replace(stream, starting.revision, Voters::from(next))
+            .await,
         Ok(replaced)
     );
     let learner = cluster
@@ -645,13 +670,15 @@ async fn failover_snapshot_replacement_and_restart_preserve_the_stream() {
 
     cluster.restart(leader).await;
     let restored = journal
-        .replace(stream, replaced.revision, initial)
+        .replace(stream, replaced.revision, Voters::from(initial))
         .await
         .unwrap();
     assert_eq!(restored.voters, initial);
     assert!(restored.revision > replaced.revision);
     assert_eq!(
-        journal.replace(stream, starting.revision, next).await,
+        journal
+            .replace(stream, starting.revision, Voters::from(next))
+            .await,
         Err(JournalError::Conflict { head: Lsn(161) })
     );
     cluster.running.remove(&catalog).unwrap().stop().await;
@@ -668,7 +695,10 @@ async fn new_leader_finalizes_joint_membership_without_the_caller() {
     let [a, b, c, d] = cluster.ids;
     let stream = StreamId(8);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let initial = journal.configuration(stream).await.unwrap();
     let leader = cluster.leader(stream).await;
     let removed = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
@@ -701,7 +731,11 @@ async fn new_leader_finalizes_joint_membership_without_the_caller() {
     }
     let replacement = tokio::spawn({
         let journal = journal.clone();
-        async move { journal.replace(stream, initial.revision, next).await }
+        async move {
+            journal
+                .replace(stream, initial.revision, Voters::from(next))
+                .await
+        }
     });
     source
         .raft
@@ -820,7 +854,9 @@ async fn new_leader_finalizes_joint_membership_without_the_caller() {
     let final_configuration = final_configuration.unwrap();
     assert_eq!(journal.head(stream).await, Ok(Lsn(1)));
     assert_eq!(
-        journal.replace(stream, initial.revision, next).await,
+        journal
+            .replace(stream, initial.revision, Voters::from(next))
+            .await,
         Ok(final_configuration)
     );
     cluster.stop_all().await;
@@ -832,15 +868,28 @@ async fn rejects_untrusted_media_and_duplicate_failure_domains() {
     let [a, b, c, d] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let bad = StreamId(20);
-    assert!(journal.create(bad, [a, a, b], 4096).await.is_err());
-    assert!(journal.create(bad, [a, b, d], 4096).await.is_err());
+    assert!(
+        journal
+            .create(bad, Voters::from([a, a, b]), 4096)
+            .await
+            .is_err()
+    );
+    assert!(
+        journal
+            .create(bad, Voters::from([a, b, d]), 4096)
+            .await
+            .is_err()
+    );
     assert_eq!(journal.head(bad).await, Err(JournalError::NotFound));
     let good = StreamId(21);
-    journal.create(good, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(good, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let configuration = journal.configuration(good).await.unwrap();
     assert_eq!(
         journal
-            .replace(good, configuration.revision, [a, b, d])
+            .replace(good, configuration.revision, Voters::from([a, b, d]))
             .await,
         Err(JournalError::Conflict { head: Lsn(0) })
     );
@@ -901,7 +950,9 @@ async fn catalog_outage_requires_a_retained_exact_stage_and_cold_clients_use_inv
         .unwrap()
     };
     assert_eq!(
-        quick(&cluster).create(stream, [a, b, c], 4096).await,
+        quick(&cluster)
+            .create(stream, Voters::from([a, b, c]), 4096)
+            .await,
         Err(JournalError::Unavailable)
     );
     assert_eq!(
@@ -909,7 +960,10 @@ async fn catalog_outage_requires_a_retained_exact_stage_and_cold_clients_use_inv
         Err(JournalError::Unavailable)
     );
     cluster.restart(catalog).await;
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let current = journal.configuration(stream).await.unwrap();
     let leader = cluster.leader(stream).await;
     let next: [_; 3] = [a, b, c, d]
@@ -922,7 +976,7 @@ async fn catalog_outage_requires_a_retained_exact_stage_and_cold_clients_use_inv
         stream,
         source: current.revision,
         old: current.voters,
-        target: next,
+        target: Voters::from(next),
     };
     let directory = &cluster.running[&catalog].engine;
     // The durable publication survives loss of its response. Until a leader
@@ -937,7 +991,7 @@ async fn catalog_outage_requires_a_retained_exact_stage_and_cold_clients_use_inv
     assert_eq!(quick(&cluster).head(stream).await, Ok(Lsn(0)));
     assert_eq!(
         quick(&cluster)
-            .replace(stream, current.revision, next)
+            .replace(stream, current.revision, Voters::from(next))
             .await,
         Err(JournalError::Unavailable)
     );
@@ -950,7 +1004,11 @@ async fn catalog_outage_requires_a_retained_exact_stage_and_cold_clients_use_inv
     }));
     let moving = tokio::spawn({
         let journal = journal.clone();
-        async move { journal.replace(stream, current.revision, next).await }
+        async move {
+            journal
+                .replace(stream, current.revision, Voters::from(next))
+                .await
+        }
     });
     source
         .raft
@@ -975,10 +1033,14 @@ async fn catalog_outage_requires_a_retained_exact_stage_and_cold_clients_use_inv
     *cluster.running[&d].engine.reject_append.write() = None;
     let cold = cluster.client(&cluster.credentials);
     assert_eq!(cold.head(stream).await, Ok(Lsn(0)));
-    let placed = cold.replace(stream, current.revision, next).await.unwrap();
+    let placed = cold
+        .replace(stream, current.revision, Voters::from(next))
+        .await
+        .unwrap();
     assert_eq!(placed.voters, next);
     assert_eq!(
-        cold.replace(stream, current.revision, next).await,
+        cold.replace(stream, current.revision, Voters::from(next))
+            .await,
         Ok(placed)
     );
     let directory = &cluster.configs[&catalog];
@@ -1021,7 +1083,10 @@ async fn damaged_snapshot_is_scoped_and_only_the_selected_bytes_repair_it() {
     let damaged = StreamId(23);
     let other = StreamId(24);
     for stream in [damaged, other] {
-        journal.create(stream, [a, b, c], 4096).await.unwrap();
+        journal
+            .create(stream, Voters::from([a, b, c]), 4096)
+            .await
+            .unwrap();
     }
     let sealed = journal
         .seal(damaged, Epoch(0), Uuid::new_v4())
@@ -1151,7 +1216,10 @@ async fn saturated_application_and_bulk_sockets_leave_a_durable_peer_path() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(25);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::new_v4())
         .await
@@ -1248,7 +1316,10 @@ async fn a_vote_survives_a_lost_reply_and_rejects_another_candidate_in_its_term(
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(26);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let voter = cluster.group(c, stream).await;
     voter
         .raft
@@ -1351,10 +1422,13 @@ async fn saturated_follower_body_and_disk_leave_quorum_control_and_covered_purge
     let stream = StreamId(49);
     let auxiliary = StreamId(50);
     journal
-        .create(stream, [a, b, c], 4 * 1024 * 1024)
+        .create(stream, Voters::from([a, b, c]), 4 * 1024 * 1024)
         .await
         .unwrap();
-    journal.create(auxiliary, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(auxiliary, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::new_v4())
         .await
@@ -1542,7 +1616,7 @@ async fn cancelled_follower_exchange_retains_charges_until_the_exact_durable_set
     let stream = StreamId(51);
     let journal = cluster.client(&cluster.credentials);
     journal
-        .create(stream, [source, receiver, third], 4096)
+        .create(stream, Voters::from([source, receiver, third]), 4096)
         .await
         .unwrap();
     let fence = journal
@@ -1664,7 +1738,10 @@ async fn joint_replication_survives_each_declared_domain_loss() {
     let target = [b, c, d];
     for (iteration, lost) in [vec![a, d], vec![b], vec![c]].into_iter().enumerate() {
         let stream = StreamId(30 + iteration as u128);
-        journal.create(stream, [a, b, c], 4096).await.unwrap();
+        journal
+            .create(stream, Voters::from([a, b, c]), 4096)
+            .await
+            .unwrap();
         let prior = journal.configuration(stream).await.unwrap();
         let leader = cluster.leader(stream).await;
         let hold = Arc::new(AtomicBool::new(true));
@@ -1684,7 +1761,11 @@ async fn joint_replication_survives_each_declared_domain_loss() {
         }
         let change = tokio::spawn({
             let journal = journal.clone();
-            async move { journal.replace(stream, prior.revision, target).await }
+            async move {
+                journal
+                    .replace(stream, prior.revision, Voters::from(target))
+                    .await
+            }
         });
         let source = cluster.group(leader, stream).await;
         source
@@ -1709,7 +1790,7 @@ async fn joint_replication_survives_each_declared_domain_loss() {
         }
         hold.store(false, Ordering::Relaxed);
         let settled = journal
-            .replace(stream, prior.revision, target)
+            .replace(stream, prior.revision, Voters::from(target))
             .await
             .unwrap();
         assert_eq!(settled.voters, target);
@@ -1728,7 +1809,10 @@ async fn covered_maintenance_reopens_full_suffix_with_all_bulk_sessions_held() {
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(40);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 16 * 1024).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 16 * 1024)
+        .await
+        .unwrap();
     for id in [a, b, c] {
         cluster.group(id, stream).await.state.pause_snapshots(true);
     }
@@ -1825,7 +1909,10 @@ async fn seekable_transfer_pins_its_exact_old_extents_until_close() {
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(41);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 32 * 1024).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 32 * 1024)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::new_v4())
         .await
@@ -1894,7 +1981,10 @@ async fn seekable_transfer_pins_its_exact_old_extents_until_close() {
     // The extent shares a WAL segment with other frames. Other traffic rolls
     // the segment and checkpoints past it, so only a pin could keep it.
     let filler = StreamId(141);
-    journal.create(filler, [a, b, c], 64 << 20).await.unwrap();
+    journal
+        .create(filler, Voters::from([a, b, c]), 64 << 20)
+        .await
+        .unwrap();
     let filling = journal
         .seal(filler, Epoch(0), Uuid::new_v4())
         .await
@@ -1923,19 +2013,22 @@ async fn retire_then_restart_then_stage_only_reclaims_the_detached_generation() 
     let [a, b, c, d] = cluster.ids;
     let stream = StreamId(42);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let initial = journal.configuration(stream).await.unwrap();
     let pinned = cluster.group(a, stream).await;
     let first = journal.replica_generation(stream, a).await.unwrap();
     let path = super::super::ownership::directory(&cluster.configs[&a].data, stream, first);
     let excluded = journal
-        .replace(stream, initial.revision, [b, c, d])
+        .replace(stream, initial.revision, Voters::from([b, c, d]))
         .await
         .unwrap();
     assert_eq!(excluded.revision, initial.revision + 1);
     assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
     let authority = cluster
-        .authority(stream, [b, c, d], excluded.revision)
+        .authority(stream, Voters::from([b, c, d]), excluded.revision)
         .await;
     assert!(
         journal
@@ -1959,7 +2052,7 @@ async fn retire_then_restart_then_stage_only_reclaims_the_detached_generation() 
     cluster.restart(a).await;
 
     let joined = journal
-        .replace(stream, excluded.revision, [a, b, c])
+        .replace(stream, excluded.revision, Voters::from([a, b, c]))
         .await
         .unwrap();
     let now = journal.replica_generation(stream, a).await.unwrap();
@@ -1981,15 +2074,15 @@ async fn retire_then_restart_then_stage_only_reclaims_the_detached_generation() 
     assert!(current.exists());
 
     let excluded = journal
-        .replace(stream, joined.revision, [b, c, d])
+        .replace(stream, joined.revision, Voters::from([b, c, d]))
         .await
         .unwrap();
     assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
     let authority = cluster
-        .authority(stream, [b, c, d], excluded.revision)
+        .authority(stream, Voters::from([b, c, d]), excluded.revision)
         .await;
     journal
-        .replace(stream, excluded.revision, [a, b, c])
+        .replace(stream, excluded.revision, Voters::from([a, b, c]))
         .await
         .unwrap();
     let newer = journal.replica_generation(stream, a).await.unwrap();
@@ -2012,7 +2105,10 @@ async fn preferred_read_hedges_once_and_discovers_a_disjoint_roster() {
     let stream = StreamId(43);
     let journal = cluster.client(&cluster.credentials);
     let reader = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::new_v4())
         .await
@@ -2065,7 +2161,7 @@ async fn preferred_read_hedges_once_and_discovers_a_disjoint_roster() {
 
     let initial = journal.configuration(stream).await.unwrap();
     journal
-        .replace(stream, initial.revision, target)
+        .replace(stream, initial.revision, Voters::from(target))
         .await
         .unwrap();
     journal
@@ -2101,7 +2197,10 @@ async fn a_long_poll_waits_on_one_voter_without_hedging() {
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(44);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::new_v4())
         .await
@@ -2163,7 +2262,10 @@ async fn a_quarantined_replica_supplies_no_quorum_evidence() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(62);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::new_v4())
         .await
@@ -2236,7 +2338,10 @@ async fn continuous_control_and_a_busy_stream_leave_unrelated_progress_and_targe
     let (hot, quiet) = (StreamId(63), StreamId(64));
     let mut fences = Vec::new();
     for stream in [hot, quiet] {
-        journal.create(stream, [a, b, c], 64 * MIB).await.unwrap();
+        journal
+            .create(stream, Voters::from([a, b, c]), 64 * MIB)
+            .await
+            .unwrap();
         fences.push(
             journal
                 .seal(stream, Epoch(0), Uuid::new_v4())
@@ -2363,7 +2468,7 @@ async fn a_restarted_leader_reads_only_after_committing_in_a_new_term() {
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(65);
     journal
-        .create(stream, [a, b, c], 1024 * 1024)
+        .create(stream, Voters::from([a, b, c]), 1024 * 1024)
         .await
         .unwrap();
     let fence = journal
@@ -2426,7 +2531,10 @@ async fn a_newcomer_confirms_persisted_progress_without_completing_a_quorum() {
     let [a, b, c, d] = cluster.ids;
     let stream = StreamId(66);
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let initial = journal.configuration(stream).await.unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::new_v4())
@@ -2457,7 +2565,11 @@ async fn a_newcomer_confirms_persisted_progress_without_completing_a_quorum() {
     }
     let replacement = tokio::spawn({
         let journal = journal.clone();
-        async move { journal.replace(stream, initial.revision, next).await }
+        async move {
+            journal
+                .replace(stream, initial.revision, Voters::from(next))
+                .await
+        }
     });
     let source = cluster.group(leader, stream).await;
     source
@@ -2547,8 +2659,16 @@ async fn a_newcomer_confirms_persisted_progress_without_completing_a_quorum() {
 #[ignore = "measurement, run explicitly"]
 async fn measure_consensus_append_throughput() {
     let mut cluster = Cluster::start().await;
-    let [a, b, c, _] = cluster.ids;
+    let [a, b, c, d] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
+    // `LK_MEASURE_VOTERS=5` measures five-voter streams on 1, 2, 3, 4 and 6.
+    let voters = match std::env::var("LK_MEASURE_VOTERS").as_deref() {
+        Ok("5") => {
+            cluster.finalize().await;
+            Voters::from([a, b, c, d, Uuid::from_u128(6)])
+        }
+        _ => Voters::from([a, b, c]),
+    };
     let seconds = std::env::var("LK_MEASURE_SECONDS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -2575,7 +2695,7 @@ async fn measure_consensus_append_throughput() {
         for index in 0..streams {
             let stream = StreamId(10_000 + case as u128 * 1_000 + index as u128);
             journal
-                .create(stream, [a, b, c], 256 * 1024 * 1024)
+                .create(stream, voters, 256 * 1024 * 1024)
                 .await
                 .unwrap();
             let fence = journal
@@ -2626,7 +2746,8 @@ async fn measure_consensus_append_throughput() {
             .sum::<u64>()
             - busy_before;
         eprintln!(
-            "LKMEASURE streams={streams} in_flight={in_flight} size={size} records={} records/s={:.0} MiB/s={:.2} p50={:?} p99={:?} busy_replies={busy} control_refused={}",
+            "LKMEASURE voters={} streams={streams} in_flight={in_flight} size={size} records={} records/s={:.0} MiB/s={:.2} p50={:?} p99={:?} busy_replies={busy} control_refused={}",
+            voters.len(),
             latencies.len(),
             latencies.len() as f64 / wall,
             latencies.len() as f64 * size as f64 / wall / (1024.0 * 1024.0),
@@ -2654,7 +2775,7 @@ async fn deleted_streams_release_their_keeper_slots() {
     for stream in (1..=8).map(StreamId) {
         timeout(WAIT, async {
             loop {
-                match journal.create(stream, [a, b, c], 4096).await {
+                match journal.create(stream, Voters::from([a, b, c]), 4096).await {
                     Ok(()) => return,
                     Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
                 }
@@ -2693,7 +2814,10 @@ async fn a_gracefully_stopped_leader_hands_its_streams_to_a_voter() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(51);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
     let leader = cluster.leader(stream).await;
     let metrics = cluster.running[&leader].engine.disk.metrics.clone();
@@ -2732,7 +2856,10 @@ async fn the_leader_replaces_a_voter_whose_keeper_stays_down() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(52);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let initial = journal.configuration(stream).await.unwrap();
     let leader = cluster.leader_after_head(&journal, stream).await;
     let down = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
@@ -2776,7 +2903,10 @@ async fn idle_streams_park_on_every_voter_and_reopen_on_request() {
     }
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(53);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), uuid::Uuid::from_u128(9))
         .await
@@ -2827,7 +2957,10 @@ async fn a_replaced_voter_retires_its_copy_when_it_returns() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(54);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let initial = journal.configuration(stream).await.unwrap();
     let leader = cluster.leader_after_head(&journal, stream).await;
     let down = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
@@ -2886,7 +3019,10 @@ async fn a_writer_moves_leadership_to_its_domain_once_a_minute() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(55);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let leader = cluster.leader_after_head(&journal, stream).await;
     let target = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
     journal.prefer_leader(stream, target).await.unwrap();
@@ -2906,7 +3042,10 @@ async fn a_leader_without_space_hands_its_streams_to_a_follower() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(56);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let leader = cluster.leader_after_head(&journal, stream).await;
     cluster.running[&leader].engine.disk.space.set_available(0);
     let others = [a, b, c]
@@ -2939,7 +3078,10 @@ async fn a_leader_that_crashes_before_its_own_sync_keeps_the_replicated_commit()
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(58);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::new_v4())
         .await
@@ -3028,7 +3170,10 @@ async fn a_leader_with_slow_media_hands_off_refuses_hand_offs_and_accepts_nothin
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(57);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let leader = cluster.leader_after_head(&journal, stream).await;
     let slow = cluster.running[&leader].engine.clone();
     assert!(slow.keeper_status().await.accepting);
@@ -3083,7 +3228,10 @@ async fn a_leader_steps_down_when_a_peer_holds_its_own_newer_vote() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(59);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let leader = cluster.leader_after_head(&journal, stream).await;
     let follower = [a, b, c].into_iter().find(|id| *id != leader).unwrap();
     let led = cluster.group(leader, stream).await;
@@ -3153,7 +3301,10 @@ async fn voters_with_slow_media_still_elect_a_leader() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(58);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     journal.prefer_leader(stream, c).await.unwrap();
     assert!(wait_for_leader(&cluster, stream, c).await);
     for id in [a, b] {
@@ -3185,7 +3336,10 @@ async fn the_leader_removes_a_learner_left_by_an_aborted_replacement() {
     let [a, b, c, d] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(57);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let leader = cluster.leader_after_head(&journal, stream).await;
     let group = cluster.group(leader, stream).await;
     let node = group
@@ -3240,7 +3394,10 @@ async fn a_parked_stream_keeps_its_snapshot_and_retained_extents() {
     let (parked, busy) = (StreamId(58), StreamId(59));
     let mut fences = Vec::new();
     for stream in [parked, busy] {
-        journal.create(stream, [a, b, c], 1 << 30).await.unwrap();
+        journal
+            .create(stream, Voters::from([a, b, c]), 1 << 30)
+            .await
+            .unwrap();
         let sealed = journal
             .seal(stream, Epoch(0), uuid::Uuid::from_u128(9))
             .await
@@ -3324,7 +3481,10 @@ async fn heartbeats_for_many_streams_share_one_frame_and_keep_the_parked_and_del
     let streams = (90..106).map(StreamId).collect::<Vec<_>>();
     let mut genesis = Vec::new();
     for stream in &streams {
-        journal.create(*stream, [a, b, c], 4096).await.unwrap();
+        journal
+            .create(*stream, Voters::from([a, b, c]), 4096)
+            .await
+            .unwrap();
         genesis.push(cluster.group(a, *stream).await.genesis.clone());
     }
     let engine = cluster.running[&a].engine.clone();

@@ -229,20 +229,26 @@ pub(super) fn demotes_vote(committed: bool, voted_for_self: bool) -> bool {
     committed && voted_for_self
 }
 
-/// Whether an operator may recover a stream from its surviving voter. The
-/// survivor must still vote in its stream's latest configuration, the
-/// operator must acknowledge the data loss, and no other voter of that
-/// configuration may answer with a healthy replica: together with the
-/// survivor it would form a quorum that can still commit.
+/// Whether an operator may recover a stream of `voters` voters from a
+/// surviving voter. The survivor must still vote in its stream's latest
+/// configuration, the operator must acknowledge the data loss, and the
+/// other voters of that configuration that answer with a healthy replica
+/// must not form a quorum with the survivor, which could still commit:
+/// none of three, at most one other of five.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (acknowledged && survivor_votes && healthy_others == 0)
+    ensures out == (acknowledged && survivor_votes && (voters == 3 || voters == 5)
+        && healthy_others + 1 < (voters / 2 + 1) as u64)
 ))]
 pub(super) fn allows_recovery(
     acknowledged: bool,
     survivor_votes: bool,
     healthy_others: u64,
+    voters: usize,
 ) -> bool {
-    acknowledged && survivor_votes && healthy_others == 0
+    acknowledged
+        && survivor_votes
+        && replication_factor(voters)
+        && healthy_others < quorum(voters) as u64 - 1
 }
 
 /// How far a recovery term jumps past the survivor's highest term. The lost
@@ -989,12 +995,55 @@ pub(super) fn starts_repair(
 }
 
 /// Whether a voter roster may move: a membership change needs a quorum,
-/// so at least two of the three current voters must be live.
+/// so a majority of the current voters must be live: two of three, or
+/// three of five.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
-    ensures out == (live >= 2)
+    ensures out == (live >= voters / 2 + 1)
 ))]
-pub(super) fn repair_allowed(live: usize) -> bool {
-    live >= 2
+pub(super) fn repair_allowed(live: usize, voters: usize) -> bool {
+    live >= voters / 2 + 1
+}
+
+/// Whether a stream may have `voters` voters: three or five.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (voters == 3 || voters == 5)
+))]
+pub(super) fn replication_factor(voters: usize) -> bool {
+    voters == 3 || voters == 5
+}
+
+/// The votes that commit an entry, elect a leader or change the
+/// membership of a roster of `voters`: a majority.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    requires voters < usize::MAX,
+    ensures out == voters / 2 + 1, out * 2 > voters,
+))]
+pub(super) fn quorum(voters: usize) -> usize {
+    voters / 2 + 1
+}
+
+/// Whether a roster of `voters` voters, of which at most `most_in_domain`
+/// share a failure domain, is spread enough for a new stream or a move's
+/// target: losing any one domain leaves a quorum. Three voters therefore
+/// take three domains, and five voters at least three, at most two in any
+/// one (2+2+1 over three domains, 2+1+1+1 over four, one each over five).
+/// Placement prefers distinct domains whenever there are enough.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == ((voters == 3 || voters == 5) && most_in_domain >= 1
+        && most_in_domain <= voters - (voters / 2 + 1))
+))]
+pub(super) fn spread_allows(voters: usize, most_in_domain: usize) -> bool {
+    replication_factor(voters) && most_in_domain >= 1 && most_in_domain <= voters - quorum(voters)
+}
+
+/// Whether a create may give a stream `voters` voters. Three always works.
+/// Five-voter rosters use a record layout older keepers cannot read, so
+/// they need the finalized cluster version that every keeper reads.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (voters == 3 || (voters == 5 && finalized >= required))
+))]
+pub(super) fn creates_replication(voters: usize, finalized: u32, required: u32) -> bool {
+    voters == 3 || (voters == 5 && write_version_allows(finalized, required))
 }
 
 /// The stream count above which an eligible keeper takes no new voter:

@@ -14,9 +14,9 @@ use journal_contract::{
     reference::Limits,
 };
 use parking_lot::Mutex;
-use uuid::Uuid;
 
 use super::cluster::VoterSnapshot;
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::state::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS};
 
 /// A detected safety, durability, fencing, linearizability, or convergence bug.
@@ -62,7 +62,7 @@ pub(super) enum Violation {
     },
     CrossVoterDivergence {
         stream: StreamId,
-        voters: [Uuid; 3],
+        voters: Voters,
         detail: String,
     },
 }
@@ -691,7 +691,7 @@ impl History {
         converged: &BTreeMap<
             StreamId,
             (
-                [Uuid; 3],
+                Voters,
                 Result<Vec<VoterSnapshot>, Vec<Option<VoterSnapshot>>>,
             ),
         >,
@@ -835,7 +835,7 @@ impl History {
                         });
                     }
                 };
-                if snaps.len() != 3
+                if snaps.len() != voters.len()
                     || snaps.windows(2).any(|w| {
                         w[0].deleted != w[1].deleted
                             || w[0].floor != w[1].floor

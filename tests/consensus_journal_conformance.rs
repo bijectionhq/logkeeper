@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use journal_contract::{Journal, conformance};
-use logkeeper::stream::consensus::testing::LocalCluster;
+use logkeeper::stream::consensus::{Voters, testing::LocalCluster};
 
 const PRINCIPALS: [&str; 3] = [
     "urn:logkeeper:client:1",
@@ -351,8 +351,8 @@ async fn batches_commit_atomically_and_survive_restart_and_replacement() {
 
     // A replacement voter catches up on batch entries and serves them.
     let configuration = other.client().configuration(stream).await.unwrap();
-    let [first, second, third] = cluster.voters();
-    let next = [first, third, cluster.catalog()];
+    let [first, second, third] = <[_; 3]>::try_from(&cluster.voters()[..]).unwrap();
+    let next = Voters::from([first, third, cluster.catalog()]);
     let replaced = other
         .client()
         .replace(stream, configuration.revision, next)
@@ -601,13 +601,13 @@ async fn timed_originals_prove_quorum_sync_before_their_cutoff() {
     );
     // A replacement voter installs the timed records and keeps their proofs.
     let configuration = other.client().configuration(stream).await.unwrap();
-    let [first, second, third] = cluster.voters();
+    let [first, second, third] = <[_; 3]>::try_from(&cluster.voters()[..]).unwrap();
     other
         .client()
         .replace(
             stream,
             configuration.revision,
-            [first, third, cluster.catalog()],
+            Voters::from([first, third, cluster.catalog()]),
         )
         .await
         .unwrap();
@@ -676,7 +676,9 @@ async fn timed_staging_and_retries_require_the_immutable_writer_session() {
     let finalized = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match journal.finalize_version(CLUSTER_VERSION_V4).await {
-                Err(JournalError::Unavailable) => tokio::time::sleep(Duration::from_millis(20)).await,
+                Err(JournalError::Unavailable) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await
+                }
                 result => break result,
             }
         }

@@ -20,6 +20,7 @@ use std::{
     net::{SocketAddr, TcpListener as StdListener},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use rcgen::{
@@ -43,6 +44,7 @@ use super::{
     RecoveryReport, SyncMode, TimedAuthority,
     storage::{Authority, Provision, hex, sha256},
 };
+use crate::stream::consensus::Voters;
 
 struct Running {
     stop: CancellationToken,
@@ -60,7 +62,7 @@ pub struct LocalCluster {
     configs: BTreeMap<Uuid, Config>,
     running: BTreeMap<Uuid, Running>,
     keepers: Keepers,
-    voters: [Uuid; 3],
+    voters: Voters,
     spares: Vec<Uuid>,
     catalog: Uuid,
     catalog_voters: Option<[Uuid; 3]>,
@@ -99,6 +101,39 @@ impl LocalCluster {
     /// voter 1 and the spares.
     pub async fn start_spared(principals: &[&str]) -> io::Result<Self> {
         Self::start_with(principals, false, 600, false, true).await
+    }
+
+    /// Starts the keepers of [`LocalCluster::start_spared`] with streams on
+    /// five voters: keepers 1, 2, 3, 5 and 6, two each in zones b and c and
+    /// one in zone a, the spread placement allows over three domains. The
+    /// cluster version is finalized, which five-voter streams need.
+    pub async fn start_five_voters(principals: &[&str]) -> io::Result<Self> {
+        let mut cluster = Self::start_with(principals, false, 600, false, true).await?;
+        let mut five = cluster.voters.to_vec();
+        five.append(&mut cluster.spares);
+        cluster.voters = Voters::sorted(&five).expect("five voters");
+        cluster.finalize(principals[0]).await?;
+        Ok(cluster)
+    }
+
+    /// Finalizes the cluster version as `principal`, an administrator, once
+    /// every keeper answers.
+    async fn finalize(&self, principal: &str) -> io::Result<()> {
+        let client = super::Client::new(
+            &self.credentials(principal)?,
+            self.keepers.clone(),
+            self.catalog,
+            Duration::from_secs(10),
+        )?;
+        let version = super::CLUSTER_VERSION_CURRENT;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while client.finalize_version(version).await != Ok(version) {
+            if tokio::time::Instant::now() > deadline {
+                return Err(io::Error::other("the cluster version did not finalize"));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(())
     }
 
     async fn start_with(
@@ -188,7 +223,7 @@ impl LocalCluster {
             configs: BTreeMap::new(),
             running: BTreeMap::new(),
             keepers: keepers.clone(),
-            voters,
+            voters: Voters::from(voters),
             spares,
             catalog,
             catalog_voters,
@@ -274,7 +309,7 @@ impl LocalCluster {
         self.offset.store(micros, Ordering::SeqCst);
     }
 
-    pub fn voters(&self) -> [Uuid; 3] {
+    pub fn voters(&self) -> Voters {
         self.voters
     }
 
@@ -318,6 +353,7 @@ impl LocalCluster {
             catalog: self.catalog,
             catalog_voters: self.catalog_voters,
             voters: Some(self.voters),
+            replication_factor: self.voters.len(),
             placement: None,
             draining: Default::default(),
             retired: Default::default(),

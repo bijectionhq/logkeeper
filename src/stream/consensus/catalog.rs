@@ -189,6 +189,14 @@ impl Catalog {
                 head: Lsn(0),
             })));
         }
+        // Five voters need every keeper to read their roster.
+        if !super::decisions::creates_replication(
+            genesis.voters.len(),
+            self.disk.cluster_version(),
+            super::CLUSTER_VERSION_REPLICATION,
+        ) {
+            return Ok(Reply::Decision(Outcome::Refused(JournalError::Unsupported)));
+        }
         // A disconnected caller must not release the claim lock between enqueue
         // and sync, when a competing claim could still see an empty catalog.
         let catalog = Self {
@@ -324,7 +332,7 @@ pub(super) fn admits_stage(entry: &CatalogEntry, stage: &Stage) -> bool {
         std::cmp::Ordering::Equal => {
             stage.old == current.old
                 && stage.recovery() == current.recovery()
-                && stage.survivor() == current.survivor()
+                && stage.survivors() == current.survivors()
         }
         std::cmp::Ordering::Greater => {
             !stage.recovery()

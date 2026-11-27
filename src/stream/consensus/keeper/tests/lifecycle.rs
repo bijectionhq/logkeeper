@@ -2,6 +2,7 @@
 //! retired while parked, and deleted.
 
 use super::*;
+use crate::stream::consensus::Voters;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_voter_learns_deletion_from_closed_tombstones() {
@@ -9,7 +10,10 @@ async fn a_restarted_voter_learns_deletion_from_closed_tombstones() {
     let voters = [cluster.ids[0], cluster.ids[1], cluster.ids[2]];
     let stream = StreamId(223);
     let client = cluster.client(&cluster.credentials);
-    client.create(stream, voters, 4096).await.unwrap();
+    client
+        .create(stream, Voters::from(voters), 4096)
+        .await
+        .unwrap();
     let leader = cluster.leader_after_head(&client, stream).await;
     let victim = voters.into_iter().find(|id| *id != leader).unwrap();
     let follower = cluster.group(victim, stream).await;
@@ -68,7 +72,10 @@ async fn a_stream_past_the_limit_at_startup_keeps_its_snapshot_objects() {
     let (first, second) = (StreamId(200), StreamId(201));
     let mut fences = Vec::new();
     for stream in [first, second] {
-        journal.create(stream, [a, b, c], 1 << 30).await.unwrap();
+        journal
+            .create(stream, Voters::from([a, b, c]), 1 << 30)
+            .await
+            .unwrap();
         let sealed = journal
             .seal(stream, Epoch(0), Uuid::from_u128(9))
             .await
@@ -146,7 +153,10 @@ async fn a_client_request_opens_a_stream_past_the_limit_at_startup() {
     let journal = cluster.client(&cluster.credentials);
     let (first, second) = (StreamId(202), StreamId(203));
     for stream in [first, second] {
-        journal.create(stream, [a, b, c], 4096).await.unwrap();
+        journal
+            .create(stream, Voters::from([a, b, c]), 4096)
+            .await
+            .unwrap();
         assert_eq!(journal.head(stream).await, Ok(Lsn(0)));
     }
     cluster.stop_all().await;
@@ -196,13 +206,16 @@ async fn retiring_a_parked_copy_drops_its_closed_state_and_park_mark() {
     let [a, b, c, d] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(211);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let generation = journal.replica_generation(stream, c).await.unwrap();
 
     cluster.running.remove(&c).unwrap().stop().await;
     let current = journal.configuration(stream).await.unwrap();
     let moved = journal
-        .replace(stream, current.revision, [a, b, d])
+        .replace(stream, current.revision, Voters::from([a, b, d]))
         .await
         .unwrap();
     assert_eq!(moved.voters, [a, b, d]);
@@ -238,7 +251,10 @@ async fn deleting_a_stream_forgets_its_preferred_leader() {
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(212);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     journal.prefer_leader(stream, b).await.unwrap();
     assert!(wait_for_leader(&cluster, stream, b).await);
     assert!(
@@ -296,7 +312,10 @@ async fn a_parked_stream_stays_parked_across_a_restart_and_opens_lazily() {
     let (parked, busy) = (StreamId(220), StreamId(221));
     let mut fences = Vec::new();
     for stream in [parked, busy] {
-        journal.create(stream, [a, b, c], 1 << 30).await.unwrap();
+        journal
+            .create(stream, Voters::from([a, b, c]), 1 << 30)
+            .await
+            .unwrap();
         let sealed = journal
             .seal(stream, Epoch(0), Uuid::from_u128(9))
             .await
@@ -425,7 +444,10 @@ async fn a_keeper_at_its_limit_evicts_its_least_recently_used_idle_copy() {
     let journal = cluster.client(&cluster.credentials);
     let streams = [StreamId(222), StreamId(223), StreamId(224)];
     for stream in &streams[..2] {
-        journal.create(*stream, [a, b, c], 4096).await.unwrap();
+        journal
+            .create(*stream, Voters::from([a, b, c]), 4096)
+            .await
+            .unwrap();
         assert_eq!(journal.head(*stream).await, Ok(Lsn(0)));
     }
     // `a` follows the first and leads the second, which looks idle longer:
@@ -449,7 +471,10 @@ async fn a_keeper_at_its_limit_evicts_its_least_recently_used_idle_copy() {
     }
     let expected = streams[0];
     drop((first, second));
-    journal.create(streams[2], [a, b, c], 4096).await.unwrap();
+    journal
+        .create(streams[2], Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     assert_eq!(journal.head(streams[2]).await, Ok(Lsn(0)));
     let open = engine
         .groups

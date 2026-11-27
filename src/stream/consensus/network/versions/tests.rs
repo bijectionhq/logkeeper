@@ -14,6 +14,7 @@ use super::super::{
     decode_frame, encode_reply,
 };
 use super::{error_introduced, outcome_introduced, variants};
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{
     Configuration, Fence, Genesis, KeeperStatus, Sealed, SnapshotMeta, Stage, Vote, encode,
     state::Outcome,
@@ -97,7 +98,7 @@ const STREAM: StreamId = StreamId(9);
 fn genesis() -> Genesis {
     Genesis {
         stream: STREAM,
-        voters: [1, 2, 3].map(uuid::Uuid::from_u128),
+        voters: Voters::from([1, 2, 3].map(uuid::Uuid::from_u128)),
         quota_bytes: 4096,
         immutable: false,
     }
@@ -107,8 +108,8 @@ fn stage() -> Stage {
     Stage {
         stream: STREAM,
         source: 1,
-        old: [1, 2, 3].map(uuid::Uuid::from_u128),
-        target: [1, 2, 4].map(uuid::Uuid::from_u128),
+        old: Voters::from([1, 2, 3].map(uuid::Uuid::from_u128)),
+        target: Voters::from([1, 2, 4].map(uuid::Uuid::from_u128)),
     }
 }
 
@@ -122,7 +123,7 @@ fn fence() -> Fence {
 fn configuration() -> Configuration {
     Configuration {
         revision: 1,
-        voters: [1, 2, 3].map(uuid::Uuid::from_u128),
+        voters: Voters::from([1, 2, 3].map(uuid::Uuid::from_u128)),
     }
 }
 
@@ -180,7 +181,7 @@ fn request(tag: usize) -> Option<Request> {
         12 => Request::Replace {
             stream: STREAM,
             expected: 1,
-            voters: [1, 2, 4].map(uuid::Uuid::from_u128),
+            voters: Voters::from([1, 2, 4].map(uuid::Uuid::from_u128)),
         },
         13 => Request::PlacementProof(STREAM),
         14 => Request::StageReplica {
@@ -308,6 +309,7 @@ fn request(tag: usize) -> Option<Request> {
                 time_unix_ms: 0,
             },
         },
+        42 => Request::LocalTip(STREAM),
         _ => return None,
     })
 }
@@ -403,6 +405,7 @@ fn reply(tag: usize) -> Option<Reply> {
             wait_ms: 33_000,
             written: true,
         }),
+        13 => Reply::Tip(None),
         _ => return None,
     })
 }

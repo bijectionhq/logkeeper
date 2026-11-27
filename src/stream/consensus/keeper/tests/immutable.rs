@@ -13,7 +13,8 @@ async fn immutable_streams_keep_exact_seal_receipts_across_snapshots_and_restart
         keepers: cluster.keepers.clone(),
         catalog: cluster.catalog,
         catalog_voters: cluster.catalog_voters,
-        voters: Some(voters),
+        voters: Some(Voters::from(voters)),
+        replication_factor: 3,
         placement: None,
         draining: Default::default(),
         retired: Default::default(),
@@ -136,7 +137,7 @@ async fn immutable_streams_keep_exact_seal_receipts_across_snapshots_and_restart
     assert_eq!(journal.head(stream).await, Ok(Lsn(2)));
     let changed = cluster
         .client(&cluster.credentials)
-        .replace(stream, 0, [a, b, d])
+        .replace(stream, 0, Voters::from([a, b, d]))
         .await
         .unwrap();
     assert_eq!(changed.voters, [a, b, d]);

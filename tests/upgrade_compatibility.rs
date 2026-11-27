@@ -562,7 +562,11 @@ async fn old_keeper_writes_new_keeper_opens_the_data() {
     let client = cluster.client();
     let stream = StreamId(1001);
     client
-        .create(stream, cluster.voters, 4 * 1024 * 1024)
+        .create(
+            stream,
+            logkeeper::stream::consensus::Voters::from(cluster.voters),
+            4 * 1024 * 1024,
+        )
         .await
         .unwrap();
     let fence = client
@@ -630,7 +634,11 @@ async fn mixed_two_old_one_new_cluster_keeps_serving() {
     let client = cluster.client();
     let stream = StreamId(1002);
     client
-        .create(stream, cluster.voters, 4 * 1024 * 1024)
+        .create(
+            stream,
+            logkeeper::stream::consensus::Voters::from(cluster.voters),
+            4 * 1024 * 1024,
+        )
         .await
         .unwrap();
     let fence = client
@@ -706,7 +714,11 @@ async fn rolling_restart_one_at_a_time_under_load() {
     let client = cluster.client();
     let stream = StreamId(1003);
     client
-        .create(stream, cluster.voters, 8 * 1024 * 1024)
+        .create(
+            stream,
+            logkeeper::stream::consensus::Voters::from(cluster.voters),
+            8 * 1024 * 1024,
+        )
         .await
         .unwrap();
     let fence = client
@@ -916,7 +928,11 @@ async fn copies_under_an_n1_catalog_wait_for_a_leader_to_certify_them() {
     let client = cluster.client();
     let stream = StreamId(1005);
     client
-        .create(stream, cluster.voters, 4 * 1024 * 1024)
+        .create(
+            stream,
+            logkeeper::stream::consensus::Voters::from(cluster.voters),
+            4 * 1024 * 1024,
+        )
         .await
         .unwrap();
     let fence = client
@@ -997,7 +1013,11 @@ async fn downgrade_before_finalize_works() {
     let client = cluster.client();
     let s1 = StreamId(1004);
     client
-        .create(s1, cluster.voters, 4 * 1024 * 1024)
+        .create(
+            s1,
+            logkeeper::stream::consensus::Voters::from(cluster.voters),
+            4 * 1024 * 1024,
+        )
         .await
         .unwrap();
     let fence1 = client
@@ -1034,7 +1054,11 @@ async fn downgrade_before_finalize_works() {
     }
     let s2 = StreamId(1005);
     client
-        .create(s2, cluster.voters, 4 * 1024 * 1024)
+        .create(
+            s2,
+            logkeeper::stream::consensus::Voters::from(cluster.voters),
+            4 * 1024 * 1024,
+        )
         .await
         .unwrap();
     let fence2 = client

@@ -273,15 +273,15 @@ const FENCE_USAGE: &str =
 
 #[cfg(feature = "stream")]
 const RECOVER_USAGE: &str = "Usage: logkeeper keeper recover-stream --config FILE --stream UUID \
-     [--acknowledge-data-loss [--lost KEEPER[,KEEPER]] [--fence-proof FILE --fence-proof FILE]] \
-     [--with KEEPER,KEEPER]";
+     [--acknowledge-data-loss [--lost KEEPER[,...]] [--fence-proof FILE ...]] \
+     [--with KEEPER[,...]]";
 
-/// Recovers a stream that lost two of its three voters from this stopped
-/// keeper's replica. Without `--acknowledge-data-loss` it prints what it
+/// Recovers a stream that lost a quorum of its voters (two of three, three
+/// or four of five) from this stopped keeper's replica. Without `--acknowledge-data-loss` it prints what it
 /// would do and refuses. Once liveness leases are finalized, `--lost`
 /// declares lost voters dead, which bumps their epochs, and is needed only
 /// for a lost voter that never held a lease; retirement proofs are optional.
-/// Before that, an acknowledged run names both lost voters with `--lost`
+/// Before that, an acknowledged run names every lost voter with `--lost`
 /// and gives signed retirement evidence for each.
 #[cfg(feature = "stream")]
 async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -308,7 +308,10 @@ async fn recover_stream(args: &[String]) -> Result<(), Box<dyn std::error::Error
                     .map(uuid::Uuid::parse_str)
                     .collect::<Result<Vec<_>, _>>()?;
                 if flag == "--with" {
-                    recovery.with = Some(<[_; 2]>::try_from(keepers).map_err(|_| RECOVER_USAGE)?);
+                    if keepers.is_empty() || keepers.len() > 4 {
+                        return Err(RECOVER_USAGE.into());
+                    }
+                    recovery.with = Some(keepers);
                 } else {
                     recovery.lost = Some(keepers);
                 }

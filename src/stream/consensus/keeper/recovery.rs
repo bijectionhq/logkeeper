@@ -1,12 +1,20 @@
-//! Operator recovery of a stream that lost two of its three voters.
+//! Operator recovery of a stream that lost a quorum of its voters: two of
+//! three, or three or more of five.
 //!
 //! `logkeeper keeper recover-stream` runs on the stopped survivor's data
 //! directory under its media lock. It replays the survivor's whole log,
 //! asks every other keeper for its status, and refuses unless the operator
-//! acknowledges the data loss and no other voter answers with a healthy
-//! replica. A voter that does not answer is asked again for longer before
-//! it counts as lost: a slow keeper is not a lost one. It then stages an
-//! installed empty copy on each of two replacements and commits the
+//! acknowledges the data loss and the other voters that answer with a
+//! healthy replica do not form a quorum with the survivor (none of three,
+//! at most one of five). A voter that does not answer is asked again for
+//! longer before it counts as lost: a slow keeper is not a lost one. With
+//! two survivors of five, the recovery runs on the more advanced one (the
+//! later last log entry, then the lower keeper ID): it asks the other for
+//! its last entry (`Request::LocalTip`) and refuses on the other's keeper.
+//! The other survivor keeps its seat in the recovered configuration and
+//! catches up from the survivor like any follower, its divergent
+//! uncommitted suffix replaced. It then stages an installed empty copy on
+//! each replacement and commits the
 //! recovery as one catalog transaction: it bumps the stream's configuration
 //! epoch (its revision) and installs the new membership, fences the stream
 //! for every voter it leaves, and bumps the epochs of the keepers the
@@ -38,6 +46,7 @@ use tokio::time::{Instant, timeout};
 use uuid::Uuid;
 
 use super::{Config, FenceProof, Reply, Request, catalog_stream, failure};
+use crate::stream::consensus::Voters;
 use crate::stream::{
     consensus::{
         Entry, LogId, Stage, Vote, assignment,
@@ -69,11 +78,12 @@ pub struct Recovery {
     /// Voters of the lost configuration the operator declares dead: their
     /// epochs are bumped, which ends every lease they hold for every
     /// stream. Optional once leases are finalized, except for a lost voter
-    /// that never held a lease. Before that it must name both.
+    /// that never held a lease. Before that it must name every lost voter.
     pub lost: Option<Vec<Uuid>>,
-    /// The two replacement keepers. Without them the best-ranked live,
-    /// accepting keepers in free failure domains are chosen.
-    pub with: Option<[Uuid; 2]>,
+    /// The replacement keepers, one per lost voter. Without them the
+    /// best-ranked live, accepting keepers in free failure domains are
+    /// chosen.
+    pub with: Option<Vec<Uuid>>,
     /// One retirement proof per lost voter. Required until leases are
     /// finalized; optional after, and checked when given.
     pub fence_proofs: Vec<FenceProof>,
@@ -93,8 +103,8 @@ pub struct Recovery {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveryReport {
     pub stream: StreamId,
-    pub lost: [Uuid; 2],
-    pub voters: [Uuid; 3],
+    pub lost: Vec<Uuid>,
+    pub voters: Voters,
     pub revision: u64,
     pub head: Lsn,
     pub epoch: Epoch,
@@ -116,8 +126,8 @@ impl std::fmt::Display for RecoveryReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "stream {:032x} {} from this keeper at head {}: voters {} {} {}, revision {}, \
-             term {}, recovery fence at epoch {}. Lost voters {} and {} must retire their \
+            "stream {:032x} {} from this keeper at head {}: voters {}, revision {}, \
+             term {}, recovery fence at epoch {}. Lost voters {} must retire their \
              copies or stay retired; the catalog fences the stream for {} keeper(s), and \
              this command waited {} ms for their leases to end. Start this keeper, then \
              acknowledge the recovery so writers can seal again.",
@@ -128,14 +138,11 @@ impl std::fmt::Display for RecoveryReport {
                 "was already recovered"
             },
             self.head.0,
-            self.voters[0],
-            self.voters[1],
-            self.voters[2],
+            listed(&self.voters, " "),
             self.revision,
             self.term,
             self.epoch.0,
-            self.lost[0],
-            self.lost[1],
+            listed(&self.lost, " and "),
             self.fenced.len(),
             self.waited.as_millis(),
         )?;
@@ -219,7 +226,7 @@ impl Config {
         if let Some(done) = point.written {
             let report = RecoveryReport {
                 stream,
-                lost: lost(&done.old, self.keeper),
+                lost: lost(&done.old, &done.target),
                 voters: done.target,
                 revision: configuration.revision,
                 head,
@@ -251,14 +258,18 @@ impl Config {
             ));
         }
         let old = configuration.voters;
-        let others = lost(&old, self.keeper);
+        let others = old
+            .iter()
+            .copied()
+            .filter(|voter| *voter != self.keeper)
+            .collect::<Vec<_>>();
         let mut dead = recovery.lost.clone().unwrap_or_default();
         dead.sort_unstable();
         dead.dedup();
         if dead.iter().any(|keeper| !others.contains(keeper)) {
             return Err(invalid(format!(
-                "refused: --lost may name only the lost voters {} and {}",
-                others[0], others[1],
+                "refused: --lost may name only other voters: {}",
+                listed(&others, ", "),
             )));
         }
         let named = dead == others;
@@ -271,9 +282,9 @@ impl Config {
         if recovery.acknowledge_data_loss && !leases && !named {
             return Err(invalid(format!(
                 "refused: the cluster has not finalized liveness leases, so nothing deposes \
-                 a lost voter that still runs. Retire both lost keepers, then name them with \
-                 --lost {},{} and a --fence-proof for each",
-                others[0], others[1],
+                 a lost voter that still runs. Retire every lost keeper, then name them with \
+                 --lost {} and a --fence-proof for each",
+                listed(&others, ","),
             )));
         }
         // Preserve regression coverage for installations whose old operator
@@ -286,7 +297,7 @@ impl Config {
             && !legacy_unfenced
             && (!leases || !recovery.fence_proofs.is_empty())
         {
-            self.verify_recovery_fences(others, &recovery.fence_proofs)?;
+            self.verify_recovery_fences(&dead, &recovery.fence_proofs)?;
         }
 
         #[cfg(test)]
@@ -325,7 +336,8 @@ impl Config {
             LOST_STATUS_ROUNDS
         } {
             let silent = others
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|voter| statuses.get(voter).cloned().flatten().is_none())
                 .collect::<Vec<_>>();
             if silent.is_empty() {
@@ -341,19 +353,57 @@ impl Config {
                 }
             }
         }
-        let healthy = others
+        let peers = others
             .iter()
+            .copied()
             .filter(|voter| {
                 statuses
                     .get(voter)
                     .and_then(|status| status.as_ref())
                     .is_some_and(|status| status.replica == Some(true))
             })
-            .count() as u64;
-        if healthy != 0 {
+            .collect::<Vec<_>>();
+        let healthy = peers.len() as u64;
+        if healthy + 1 >= old.quorum() as u64 {
             return Err(invalid(format!(
                 "refused: {healthy} other voter(s) of {old:?} answer with a healthy replica, \
                  so the stream still has a quorum; restart this keeper instead"
+            )));
+        }
+        // With two survivors of five, the more advanced one recovers, so two
+        // runs can never write rival recoveries.
+        for peer in &peers {
+            let tip = match rpc
+                .call_application(*peer, Request::LocalTip(stream), STATUS_TIMEOUT)
+                .await
+            {
+                Ok(Reply::Tip(tip)) => tip,
+                _ => {
+                    return Err(invalid(format!(
+                        "refused: surviving voter {peer} did not report its last log entry, \
+                         so this recovery cannot tell which survivor is more advanced; retry"
+                    )));
+                }
+            };
+            if (tip, std::cmp::Reverse(*peer)) > (point.tip, std::cmp::Reverse(self.keeper)) {
+                return Err(invalid(format!(
+                    "refused: surviving voter {peer} holds the more advanced log \
+                     ({tip:?} against this keeper's {:?}); stop it and recover from it instead",
+                    point.tip
+                )));
+            }
+        }
+        let mut survivors = peers.clone();
+        survivors.push(self.keeper);
+        survivors.sort_unstable();
+        let others = others
+            .into_iter()
+            .filter(|voter| !peers.contains(voter))
+            .collect::<Vec<_>>();
+        // A surviving voter cannot be declared dead.
+        if let Some(alive) = dead.iter().find(|keeper| peers.contains(keeper)) {
+            return Err(invalid(format!(
+                "refused: --lost names {alive}, which answers with a healthy replica"
             )));
         }
 
@@ -372,8 +422,14 @@ impl Config {
             .collect::<BTreeMap<_, _>>();
         let target = match recovery.with {
             Some(with) => {
-                let mut target = [self.keeper, with[0], with[1]];
-                target.sort_unstable();
+                let target = Voters::sorted(&[survivors.as_slice(), with.as_slice()].concat())
+                    .filter(|target| target.len() == old.len())
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "--with names one replacement for each of the {} lost voters",
+                            others.len()
+                        ))
+                    })?;
                 if with.iter().any(|keeper| {
                     old.contains(keeper)
                         || !statuses
@@ -383,16 +439,15 @@ impl Config {
                 }) || !placement.roster(&target)
                 {
                     return Err(invalid(
-                        "replacements must be two live, accepting keepers outside the lost \
-                         configuration, in failure domains distinct from each other and from \
-                         this keeper's",
+                        "replacements must be live, accepting keepers outside the lost \
+                         configuration, spread over failure domains with the survivors",
                     ));
                 }
                 target
             }
             None => assignment::recovery_roster(
                 stream,
-                self.keeper,
+                &survivors,
                 old,
                 &assignment::View {
                     eligible: placement.domains(),
@@ -400,7 +455,7 @@ impl Config {
                 },
             )
             .ok_or_else(|| {
-                invalid("no two live, accepting keepers in free failure domains can replace the lost voters")
+                invalid("no live, accepting keepers in free failure domains can replace the lost voters")
             })?,
         };
         let stage = Stage {
@@ -427,27 +482,29 @@ impl Config {
         let epoch = decisions::recovery_epoch(restored_epoch.0)
             .map(Epoch)
             .ok_or_else(|| invalid("the stream's epoch is exhausted"))?;
-        if !decisions::allows_recovery(recovery.acknowledge_data_loss, survivor_votes, healthy) {
+        if !decisions::allows_recovery(
+            recovery.acknowledge_data_loss,
+            survivor_votes,
+            healthy,
+            old.len(),
+        ) {
             return Err(invalid(format!(
                 "refused without --acknowledge-data-loss. This would make this keeper's copy of \
-                 stream {:032x} (head {}) the only history: records only {} and {} held are \
+                 stream {:032x} (head {}) the only history: records only {} held are \
                  lost. The voters would become {target:?} at revision {}, term {term}, with \
                  seals refused under a recovery fence at epoch {} until an administrator \
                  acknowledges the recovery. Once leases are finalized the catalog fences the \
-                 stream for {} and {}, and the recovered configuration serves only once their \
-                 leases have ended. To proceed, add --acknowledge-data-loss; add --lost {},{} \
-                 to declare either dead, which ends its leases for every stream. Before leases \
-                 are finalized, also retire both and add a --fence-proof for each",
+                 stream for {}, and the recovered configuration serves only once their \
+                 leases have ended. To proceed, add --acknowledge-data-loss; add --lost {} \
+                 to declare any of them dead, which ends its leases for every stream. Before \
+                 leases are finalized, also retire them all and add a --fence-proof for each",
                 stream.0,
                 head.0,
-                others[0],
-                others[1],
+                listed(&others, " and "),
                 stage.source + 1,
                 epoch.0,
-                others[0],
-                others[1],
-                others[0],
-                others[1],
+                listed(&others, " and "),
+                listed(&others, ","),
             )));
         }
 
@@ -534,9 +591,10 @@ impl Config {
             None => {
                 return Err(invalid(format!(
                     "refused: the cluster has not finalized liveness leases, so nothing deposes \
-                     a lost voter that still runs. Confirm that {} and {} are down or fenced, \
-                     then name them with --lost {},{}",
-                    others[0], others[1], others[0], others[1],
+                     a lost voter that still runs. Confirm that {} are down or fenced, \
+                     then name them with --lost {}",
+                    listed(&others, " and "),
+                    listed(&others, ","),
                 )));
             }
         };
@@ -802,11 +860,18 @@ impl Config {
     }
 }
 
-/// The two voters of `voters` other than `survivor`.
-fn lost(voters: &[Uuid; 3], survivor: Uuid) -> [Uuid; 2] {
-    let mut others = voters.iter().copied().filter(|voter| *voter != survivor);
-    [
-        others.next().unwrap_or_default(),
-        others.next().unwrap_or_default(),
-    ]
+/// The voters of `old` that `target` no longer names.
+fn lost(old: &Voters, target: &Voters) -> Vec<Uuid> {
+    old.iter()
+        .copied()
+        .filter(|voter| !target.contains(voter))
+        .collect()
+}
+
+fn listed(keepers: &[Uuid], separator: &str) -> String {
+    keepers
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(separator)
 }

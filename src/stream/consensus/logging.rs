@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::stream::consensus::Voters;
 use journal_contract::{Epoch, Lsn, StreamId};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -464,10 +465,10 @@ pub(super) fn audit_replace(
     stream: StreamId,
     actor: &str,
     expected: u64,
-    voters: &[Uuid; 3],
+    voters: &Voters,
     outcome: &str,
 ) {
-    let voters = format!("{},{},{}", voters[0], voters[1], voters[2]);
+    let voters = joined(voters);
     tracing::info!(
         target: "logkeeper::audit",
         audit = true,
@@ -561,13 +562,21 @@ pub(super) fn audit_retire(
     );
 }
 
+fn joined(keepers: &[Uuid]) -> String {
+    keepers
+        .iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Audit log for offline quorum-loss recovery (`recovery`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn audit_recovery(
     keeper: Uuid,
     stream: StreamId,
-    lost: &[Uuid; 2],
-    voters: &[Uuid; 3],
+    lost: &[Uuid],
+    voters: &Voters,
     revision: u64,
     head: Lsn,
     epoch: Epoch,
@@ -575,8 +584,8 @@ pub(super) fn audit_recovery(
     written: bool,
     outcome: &str,
 ) {
-    let lost = format!("{},{}", lost[0], lost[1]);
-    let voters = format!("{},{},{}", voters[0], voters[1], voters[2]);
+    let lost = joined(lost);
+    let voters = joined(voters);
     tracing::info!(
         target: "logkeeper::audit",
         audit = true,

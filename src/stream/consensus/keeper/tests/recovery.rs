@@ -12,7 +12,7 @@ const RECOVERY_WAIT: Duration = Duration::from_secs(30);
 async fn written_stream(
     cluster: &Cluster,
     stream: StreamId,
-    voters: [Uuid; 3],
+    voters: Voters,
     survivor: Uuid,
     records: u64,
 ) -> Fence {
@@ -82,7 +82,7 @@ pub(super) async fn remember_peers(cluster: &Cluster, keeper: Uuid, peers: [Uuid
 fn contract_journal(
     cluster: &Cluster,
     credentials: &Credentials,
-    voters: [Uuid; 3],
+    voters: Voters,
 ) -> ConsensusJournal {
     ConsensusJournal::new(
         credentials,
@@ -91,6 +91,7 @@ fn contract_journal(
             catalog: cluster.catalog,
             catalog_voters: None,
             voters: Some(voters),
+            replication_factor: voters.len(),
             placement: None,
             draining: Default::default(),
             retired: Default::default(),
@@ -104,7 +105,7 @@ fn contract_journal(
 }
 
 /// Waits until the stream's leader reports `voters` as its configuration.
-async fn configured(journal: &Client, stream: StreamId, voters: [Uuid; 3]) -> Configuration {
+async fn configured(journal: &Client, stream: StreamId, voters: Voters) -> Configuration {
     timeout(RECOVERY_WAIT, async {
         loop {
             if let Ok(configuration) = journal.configuration(stream).await
@@ -131,7 +132,7 @@ async fn a_survivor_recovers_only_after_retiring_the_partitioned_voters() {
         .await;
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(81);
-    let old_fence = written_stream(&cluster, stream, [a, b, c], a, 5).await;
+    let old_fence = written_stream(&cluster, stream, Voters::from([a, b, c]), a, 5).await;
     let journal = cluster.client(&cluster.credentials);
     remember_peers(&cluster, a, [b, c]).await;
     cluster.running.remove(&a).unwrap().stop().await;
@@ -376,7 +377,7 @@ async fn recovery_preserves_a_catalog_move_the_survivor_missed() {
         };
         let [a, b, c, d] = cluster.ids;
         let stream = StreamId(87);
-        written_stream(&cluster, stream, [a, b, c], a, 1).await;
+        written_stream(&cluster, stream, Voters::from([a, b, c]), a, 1).await;
         let original = cluster
             .client(&cluster.credentials)
             .configuration(stream)
@@ -390,7 +391,7 @@ async fn recovery_preserves_a_catalog_move_the_survivor_missed() {
             stream,
             source: original.revision,
             old: original.voters,
-            target: [a, b, d],
+            target: Voters::from([a, b, d]),
         };
         assert!(matches!(
             cluster.running[&b].engine.catalog_request(Request::Stage(pending.clone())).await.unwrap(),
@@ -441,7 +442,7 @@ async fn recovery_refuses_a_durable_joint_configuration() {
     let mut cluster = Cluster::start().await;
     let [a, b, c, d] = cluster.ids;
     let stream = StreamId(88);
-    written_stream(&cluster, stream, [a, b, c], a, 1).await;
+    written_stream(&cluster, stream, Voters::from([a, b, c]), a, 1).await;
     let journal = cluster.client(&cluster.credentials);
     let original = journal.configuration(stream).await.unwrap();
     let leader = cluster.leader(stream).await;
@@ -468,8 +469,11 @@ async fn recovery_refuses_a_durable_joint_configuration() {
             }));
         }
     }
-    let replace =
-        tokio::spawn(async move { journal.replace(stream, original.revision, next).await });
+    let replace = tokio::spawn(async move {
+        journal
+            .replace(stream, original.revision, Voters::from(next))
+            .await
+    });
     let group = cluster.group(survivor, stream).await;
     timeout(WAIT, async {
         while group
@@ -505,7 +509,7 @@ async fn recovery_is_refused_while_another_voter_holds_a_healthy_replica() {
     let mut cluster = Cluster::start().await;
     let [a, b, c, d] = cluster.ids;
     let stream = StreamId(82);
-    written_stream(&cluster, stream, [a, b, c], a, 2).await;
+    written_stream(&cluster, stream, Voters::from([a, b, c]), a, 2).await;
     cluster.running.remove(&a).unwrap().stop().await;
     // Both other voters are alive: the stream has a quorum.
     let refused = cluster.configs[&a]
@@ -532,7 +536,7 @@ async fn recovery_is_refused_while_another_voter_holds_a_healthy_replica() {
             .recover_stream(
                 stream,
                 Recovery {
-                    lost,
+                    lost: lost.map(|keepers| keepers.to_vec()),
                     ..acknowledged()
                 },
             )
@@ -542,7 +546,7 @@ async fn recovery_is_refused_while_another_voter_holds_a_healthy_replica() {
     }
     // Named replacements must be live keepers outside the lost roster.
     let mut named = acknowledged();
-    named.with = Some([b, d]);
+    named.with = Some([b, d].to_vec());
     assert!(
         cluster.configs[&a]
             .recover_stream(stream, named)
@@ -555,7 +559,9 @@ async fn recovery_is_refused_while_another_voter_holds_a_healthy_replica() {
     cluster.restart(c).await;
     let journal = cluster.client(&cluster.credentials);
     assert_eq!(
-        configured(&journal, stream, [a, b, c]).await.voters,
+        configured(&journal, stream, Voters::from([a, b, c]))
+            .await
+            .voters,
         [a, b, c]
     );
     assert_eq!(journal.head(stream).await, Ok(Lsn(2)));
@@ -567,7 +573,7 @@ async fn the_recovery_write_is_all_or_nothing_across_a_crash() {
     let mut cluster = Cluster::start().await;
     let [a, b, c, d] = cluster.ids;
     let stream = StreamId(83);
-    written_stream(&cluster, stream, [a, b, c], a, 3).await;
+    written_stream(&cluster, stream, Voters::from([a, b, c]), a, 3).await;
     let journal = cluster.client(&cluster.credentials);
     let mut generations = BTreeMap::new();
     for lost in [b, c] {
@@ -584,7 +590,7 @@ async fn the_recovery_write_is_all_or_nothing_across_a_crash() {
     expected.sort_unstable();
     // A crash before the round's boundary leaves no trace of it.
     let mut before = legacy_acknowledged();
-    before.with = with;
+    before.with = with.map(|keepers| keepers.to_vec());
     before.interrupt = Some(2);
     assert!(
         cluster.configs[&a]
@@ -594,7 +600,7 @@ async fn the_recovery_write_is_all_or_nothing_across_a_crash() {
     );
     // A crash after the boundary leaves the whole recovery durable.
     let mut after = legacy_acknowledged();
-    after.with = with;
+    after.with = with.map(|keepers| keepers.to_vec());
     after.interrupt = Some(3);
     assert!(
         cluster.configs[&a]
@@ -610,7 +616,7 @@ async fn the_recovery_write_is_all_or_nothing_across_a_crash() {
     assert_eq!(report.voters, expected);
     assert_eq!(report.head, Lsn(3));
     cluster.restart(a).await;
-    configured(&journal, stream, expected).await;
+    configured(&journal, stream, Voters::from(expected)).await;
     assert_eq!(journal.head(stream).await, Ok(Lsn(3)));
     assert_eq!(
         journal.seal(stream, Epoch(2), Uuid::from_u128(5)).await,
@@ -642,7 +648,7 @@ async fn the_recovery_write_is_all_or_nothing_across_a_crash() {
             .configuration(stream)
             .await
             .map(|current| current.voters),
-        Ok(expected)
+        Ok(expected).map(Voters::from)
     );
     assert_eq!(
         journal
@@ -669,7 +675,10 @@ async fn an_administrator_that_is_not_a_writer_cannot_write() {
     }
     let owner = cluster.client(&cluster.credentials);
     let stream = StreamId(84);
-    owner.create(stream, [a, b, c], 4096).await.unwrap();
+    owner
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let sealed = owner
         .seal(stream, Epoch(0), Uuid::from_u128(5))
         .await
@@ -702,7 +711,10 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
     let (e, f) = (Uuid::from_u128(6), Uuid::from_u128(7));
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(205);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -728,7 +740,10 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
     // live and accepting, while StageRecovered fails on `e` after succeeding
     // on `d` (which sorts before `e`).
     let filler = StreamId(299);
-    journal.create(filler, [b, c, e], 4096).await.unwrap();
+    journal
+        .create(filler, Voters::from([b, c, e]), 4096)
+        .await
+        .unwrap();
     cluster.running.remove(&e).unwrap().stop().await;
     cluster.configs.get_mut(&e).unwrap().max_streams = 1;
     cluster.restart(e).await;
@@ -757,8 +772,8 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some(vec![b, c]),
-                with: Some([d, e]),
+                lost: Some([b, c].to_vec()),
+                with: Some([d, e].to_vec()),
                 ..legacy_acknowledged()
             },
         )
@@ -771,8 +786,8 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some(vec![b, c]),
-                with: Some([d, f]),
+                lost: Some([b, c].to_vec()),
+                with: Some([d, f].to_vec()),
                 ..legacy_acknowledged()
             },
         )
@@ -785,7 +800,7 @@ async fn a_retried_recovery_restages_a_replacement_of_an_aborted_attempt() {
             .configuration(stream)
             .await
             .map(|current| current.voters)
-            != Ok([a, d, f])
+            != Ok(Voters::from([a, d, f]))
             || journal.head(stream).await != Ok(Lsn(3))
         {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -810,7 +825,10 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
     let f = Uuid::from_u128(7);
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(206);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -840,8 +858,8 @@ async fn an_excluded_lost_voter_retires_past_a_stale_proof_that_names_it() {
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some(vec![b, c]),
-                with: Some([d, f]),
+                lost: Some([b, c].to_vec()),
+                with: Some([d, f].to_vec()),
                 ..legacy_acknowledged()
             },
         )
@@ -953,7 +971,10 @@ async fn returning_lost_voters_never_lead_and_retire_past_a_follower_survivor() 
     let f = Uuid::from_u128(7);
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(207);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let fence = journal
         .seal(stream, Epoch(0), Uuid::from_u128(99))
         .await
@@ -983,8 +1004,8 @@ async fn returning_lost_voters_never_lead_and_retire_past_a_follower_survivor() 
             stream,
             Recovery {
                 acknowledge_data_loss: true,
-                lost: Some(vec![b, c]),
-                with: Some([d, f]),
+                lost: Some([b, c].to_vec()),
+                with: Some([d, f].to_vec()),
                 ..legacy_acknowledged()
             },
         )
@@ -1071,7 +1092,7 @@ async fn the_survivor_refuses_a_lost_voters_snapshot_without_its_term() {
     let mut cluster = Cluster::start().await;
     let [a, b, c, _] = cluster.ids;
     let stream = StreamId(82);
-    written_stream(&cluster, stream, [a, b, c], a, 2).await;
+    written_stream(&cluster, stream, Voters::from([a, b, c]), a, 2).await;
     let journal = cluster.client(&cluster.credentials);
     for keeper in [b, c, a] {
         cluster.running.remove(&keeper).unwrap().stop().await;

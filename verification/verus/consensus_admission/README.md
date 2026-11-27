@@ -19,7 +19,7 @@
 | `oversized_batches_shrink` | Sender resize in the admission contract | `fit_append` |
 | `restart_never_restores_leadership` | `RestartRead.present_never_restores_leadership` | `demotes_vote` |
 | `accepted_batches_are_consecutive` | Decoded-cut validation before dispatch | `indices_follow`, `terms_ordered`, `consecutive_cut` |
-| `recovery_needs_acknowledgement_and_no_live_quorum` | Operator recovery admission (design section R) | `allows_recovery` |
+| `recovery_needs_acknowledgement_and_no_live_quorum` | Operator recovery admission (design section R): the healthy survivors are fewer than a quorum of three or five | `allows_recovery` |
 | `recovery_outranks_the_lost_history` | Recovery term and fence epoch above the survivor's history | `recovery_term`, `recovery_epoch` |
 | `a_recovery_restages_only_its_own_aborted_copy` | A retried recovery reuses a replacement only when no other history could have written to its copy | `restages_recovery` |
 | `only_certified_members_serve_reads` | A copy serves applied pages only once its placement is certified (TLA+ CE-3, `RecoverySingleReturnSnap`) | `serves_reads` |
@@ -43,7 +43,10 @@
 | `learners_leave_only_after_the_stale_delay` | Stale learner removal | `learner_stale` |
 | `repair_order_prefers_priority_then_rotation` | Joint changes, then stale learners, then dead voters; round-robin within a priority | `repair_key` |
 | `a_repair_pass_respects_its_slots` | At most `MAX_REPAIRS` at once, never a running or backed-off stream | `starts_repair` |
-| `a_roster_moves_only_with_two_live_voters` | Nothing moves without a live quorum of the current roster | `repair_allowed` |
+| `a_roster_moves_only_with_a_live_quorum` | Nothing moves without a live quorum of the current roster: two of three, three of five | `repair_allowed` |
+| `quorums_of_a_roster_intersect` | A stream has three or five voters, and two quorums of one roster share a voter | `replication_factor`, `quorum` |
+| `a_spread_roster_survives_any_domain` | An admitted roster keeps a quorum after losing any one failure domain: 1+1+1 for three voters, at most two per domain for five | `spread_allows` |
+| `five_voters_wait_for_the_finalized_version` | A five-voter stream is created only once the cluster finalized the replication-factor version | `creates_replication` |
 | `average_keepers_stay_roomy` | The load ceiling never refuses a keeper at or below the average | `load_ceiling`, `roomy` |
 | `leadership_moves_only_to_a_matched_voter` | Writer-domain handoff only to a matched voter, outside the hold-down | `hands_off` |
 | `only_orphaned_copies_seek_retirement` | Only an excluded or leaderless copy asks for a retiring proof | `orphaned` |

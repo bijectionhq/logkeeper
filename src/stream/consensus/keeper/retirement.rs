@@ -162,18 +162,22 @@ impl Config {
 
     pub(super) fn verify_recovery_fences(
         &self,
-        others: [Uuid; 2],
+        lost: &[Uuid],
         proofs: &[FenceProof],
     ) -> io::Result<()> {
-        let [first, second] = proofs else {
-            return Err(invalid(
-                "refused: supply two independently signed keeper retirement proofs with --fence-proof",
-            ));
-        };
-        let mut proven = [first.keeper, second.keeper];
+        if proofs.len() != lost.len() {
+            return Err(invalid(format!(
+                "refused: supply {} independently signed keeper retirement proofs with \
+                 --fence-proof, one per lost voter",
+                lost.len()
+            )));
+        }
+        let mut proven = proofs.iter().map(|proof| proof.keeper).collect::<Vec<_>>();
         proven.sort_unstable();
-        if proven != others {
-            return Err(invalid("retirement proofs must name the two lost voters"));
+        let mut lost = lost.to_vec();
+        lost.sort_unstable();
+        if proven != lost {
+            return Err(invalid("retirement proofs must name the lost voters"));
         }
         let known = Incarnations::load(&Incarnations::path(&self.enrollment, self.keeper))?;
         if known.reused {

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::stream::consensus::Sealed;
+use crate::stream::consensus::Voters;
 
 /// Waits until every running keeper but `id` has recorded `id`'s current
 /// media incarnation.
@@ -72,7 +73,10 @@ async fn wiped_witness(stream: StreamId) -> Wiped {
     let mut cluster = Cluster::start().await;
     let [a, b, c, _] = cluster.ids;
     let journal = cluster.client(&cluster.credentials);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::from_u128(9))
         .await
@@ -194,7 +198,10 @@ async fn a_voter_down_at_create_registers_from_peer_traffic() {
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(62);
     cluster.running.remove(&c).unwrap().stop().await;
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::from_u128(9))
         .await
@@ -299,7 +306,10 @@ async fn a_reused_keeper_takes_and_serves_a_staged_replica() {
     reused(&cluster, d).await;
     let journal = cluster.client(&cluster.credentials);
     let stream = StreamId(63);
-    journal.create(stream, [a, b, c], 4096).await.unwrap();
+    journal
+        .create(stream, Voters::from([a, b, c]), 4096)
+        .await
+        .unwrap();
     let sealed = journal
         .seal(stream, Epoch(0), Uuid::from_u128(9))
         .await
@@ -310,7 +320,7 @@ async fn a_reused_keeper_takes_and_serves_a_staged_replica() {
         .unwrap();
     let current = journal.configuration(stream).await.unwrap();
     let placed = journal
-        .replace(stream, current.revision, [a, b, d])
+        .replace(stream, current.revision, Voters::from([a, b, d]))
         .await
         .unwrap();
     assert_eq!(placed.voters, [a, b, d]);

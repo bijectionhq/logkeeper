@@ -25,6 +25,7 @@ use super::{
     super::network::{Lane, RpcFault},
     cluster::{ClusterOptions, READER, SimCluster, WAIT, WRITER_A, WRITER_B},
 };
+use crate::stream::consensus::Voters;
 
 /// Retries a setup call while a loaded machine answers `Unavailable`, for at
 /// most 30 s. Only for idempotent calls outside the race under test.
@@ -69,8 +70,8 @@ async fn bug_repro_append_retry_after_dropped_reply_returns_fenced_after_committ
         cluster.data_ids[2],
     ];
     let stream = StreamId(240_001);
-    let writer_a = cluster.journal(WRITER_A, voters);
-    let writer_b = cluster.journal(WRITER_B, voters);
+    let writer_a = cluster.journal(WRITER_A, Voters::from(voters));
+    let writer_b = cluster.journal(WRITER_B, Voters::from(voters));
     let id_a = Identity::from_static(WRITER_A);
     let id_b = Identity::from_static(WRITER_B);
 
@@ -182,7 +183,7 @@ async fn bug_repro_zero_disk_space_leaves_voter_as_zombie_replica() {
         cluster.data_ids[2],
     ];
     let stream = StreamId(140_001);
-    let writer = cluster.journal(WRITER_A, voters);
+    let writer = cluster.journal(WRITER_A, Voters::from(voters));
 
     settle!(writer.create(stream)).unwrap();
     assert_eq!(settle!(writer.seal(stream, Epoch(1))), Ok(Lsn(0)));
@@ -219,7 +220,7 @@ async fn bug_repro_zero_disk_space_leaves_voter_as_zombie_replica() {
         .await
         .unwrap();
     let converged = cluster
-        .wait_converged(stream, &voters, Duration::from_secs(6))
+        .wait_converged(stream, &Voters::from(voters), Duration::from_secs(6))
         .await;
     cluster.stop_all().await;
 
@@ -258,9 +259,9 @@ async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_h
     ];
     let [a, b, c] = voters;
     let stream = StreamId(160_001);
-    let writer_a = cluster.journal(WRITER_A, voters);
-    let writer_b = cluster.journal(WRITER_B, voters);
-    let reader = cluster.journal(READER, voters);
+    let writer_a = cluster.journal(WRITER_A, Voters::from(voters));
+    let writer_b = cluster.journal(WRITER_B, Voters::from(voters));
+    let reader = cluster.journal(READER, Voters::from(voters));
 
     settle!(writer_a.create(stream)).unwrap();
     assert_eq!(settle!(writer_a.seal(stream, Epoch(1))), Ok(Lsn(0)));
@@ -277,7 +278,7 @@ async fn bug_repro_simultaneous_lost_voter_return_and_survivor_crash_regresses_h
     cluster.crash(b).await;
     cluster.crash(c).await;
     let report = cluster
-        .recover_stream_offline(a, [b, c], stream)
+        .recover_stream_offline(a, &[b, c], stream)
         .await
         .unwrap();
     let probe = cluster.probe_client();
@@ -349,8 +350,8 @@ async fn bug_repro_cross_epoch_identical_payload_retry_violates_contract() {
         cluster.data_ids[2],
     ];
     let stream = StreamId(250_001);
-    let writer_a = cluster.journal(WRITER_A, voters);
-    let writer_b = cluster.journal(WRITER_B, voters);
+    let writer_a = cluster.journal(WRITER_A, Voters::from(voters));
+    let writer_b = cluster.journal(WRITER_B, Voters::from(voters));
     let id_a = Identity::from_static(WRITER_A);
     let id_b = Identity::from_static(WRITER_B);
 
@@ -436,8 +437,8 @@ async fn record_epochs_survive_a_snapshot_and_a_full_restart() {
     ];
     let stream = StreamId(250_002);
     cluster.finalize_version().await;
-    let writer_a = cluster.journal(WRITER_A, voters);
-    let writer_b = cluster.journal(WRITER_B, voters);
+    let writer_a = cluster.journal(WRITER_A, Voters::from(voters));
+    let writer_b = cluster.journal(WRITER_B, Voters::from(voters));
     let record = |at: u64| Bytes::from(format!("record-{at}"));
 
     settle!(writer_a.create(stream)).unwrap();
@@ -490,8 +491,8 @@ async fn an_append_after_a_competing_seal_is_never_reported_committed() {
         cluster.data_ids[2],
     ];
     let stream = StreamId(240_002);
-    let writer_a = cluster.journal(WRITER_A, voters);
-    let writer_b = cluster.journal(WRITER_B, voters);
+    let writer_a = cluster.journal(WRITER_A, Voters::from(voters));
+    let writer_b = cluster.journal(WRITER_B, Voters::from(voters));
     let record = Bytes::from_static(b"one");
 
     settle!(writer_a.create(stream)).unwrap();

@@ -35,7 +35,7 @@ fn record(at: u64) -> Bytes {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_spared_cluster_recovers_a_stream_that_lost_two_voters() {
     let mut cluster = LocalCluster::start_spared(&[PRINCIPAL]).await.unwrap();
-    let [survivor, b, c] = cluster.voters();
+    let [survivor, b, c] = <[_; 3]>::try_from(&cluster.voters()[..]).unwrap();
     assert_eq!(cluster.spares().len(), 2);
     let config = cluster.journal_config(1 << 20, 1024);
     let journal = cluster.journal(PRINCIPAL, &config).unwrap();

@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{Engine, Group, NodeId, Outcome, Reply, Request, failure, invalid, leader_reply};
+use crate::stream::consensus::Voters;
 use crate::stream::consensus::{LogId, Stage, Vote, state::Command};
 
 pub(super) const MANAGEMENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -16,7 +17,7 @@ impl Engine {
         &self,
         group: &Group,
         expected: u64,
-        voters: [Uuid; 3],
+        voters: Voters,
     ) -> std::io::Result<Reply> {
         let Ok(_guard) = group.membership.try_lock() else {
             return Ok(failure(JournalError::Unavailable));
@@ -31,7 +32,17 @@ impl Engine {
         };
         let joint = membership.membership().get_joint_config();
         let conflict = || failure(JournalError::Conflict { head });
-        if !self.placement.roster(&voters) {
+        // A stream keeps its replication factor. A five-voter move that keeps
+        // one or two voters would read as an operator recovery's stage
+        // (`Stage::recovery`), so it is refused; move one voter at a time.
+        let kept = voters
+            .iter()
+            .filter(|voter| configuration.voters.contains(voter))
+            .count();
+        if !self.placement.roster(&voters)
+            || voters.len() != configuration.voters.len()
+            || (voters.len() == 5 && kept >= 1 && kept < configuration.voters.quorum())
+        {
             return Ok(conflict());
         }
         if previous_revision == Some(expected) && configuration.voters == voters {
