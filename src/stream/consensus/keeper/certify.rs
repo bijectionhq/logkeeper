@@ -155,10 +155,11 @@ impl Engine {
             )
         });
         if fenced {
-            eprintln!(
-                "logkeeper fenced its copy of stream {stream:?}: the catalog's latest move {:?} \
-                 leaves its configuration",
-                staged.map(|stage| (stage.source, stage.old, stage.target)),
+            tracing::warn!(
+                keeper = %self.id,
+                stream = %crate::stream::consensus::logging::stream_uuid(stream),
+                staged = ?staged.map(|stage| (stage.source, stage.old, stage.target)),
+                "fenced this copy: the catalog's latest move leaves its configuration"
             );
             self.certification.fenced.write().insert(stream, generation);
             self.retire_now.notify_one();
