@@ -178,9 +178,10 @@ impl State {
         }
         if pending.waiters.is_empty() {
             // Only a choice can resolve a conflict with an uncertain earlier append.
+            // This payload was never sent, so a fence is a definite refusal.
             return Admission::Refused(match self.impossible(at) {
                 Some(error @ JournalError::Fenced { .. }) => error,
-                _ => JournalError::Unavailable,
+                _ => self.fenced().unwrap_or(JournalError::Unavailable),
             });
         }
         Admission::Waiting
@@ -441,6 +442,22 @@ impl State {
         }
     }
 
+    /// The fence a quorum of lanes reported in any revision. A fence is
+    /// permanent, so a retry round that has not yet repeated it still holds.
+    fn fenced(&self) -> Option<JournalError> {
+        let fences: Vec<_> = self
+            .lanes
+            .iter()
+            .filter_map(|lane| match lane.failure.as_ref()?.error {
+                JournalError::Fenced { current } => Some(current),
+                _ => None,
+            })
+            .collect();
+        (fences.len() >= QUORUM).then(|| JournalError::Fenced {
+            current: fences.into_iter().max().unwrap(),
+        })
+    }
+
     fn impossible(&self, at: Lsn) -> Option<JournalError> {
         self.failed(|_, failure| failure.at <= at)
     }
@@ -641,6 +658,48 @@ mod tests {
         );
         state.revision += 1;
         assert_eq!(state.publication(Lsn(3)), None);
+    }
+
+    #[test]
+    fn a_new_payload_behind_a_fenced_uncertain_append_is_fenced_after_a_retry() {
+        let fenced = |current| Lane {
+            accepted: Some(Lsn(1)),
+            published: Some(Lsn(1)),
+            failure: Some(Failure {
+                revision: 1,
+                at: Lsn(2),
+                error: JournalError::Fenced { current },
+            }),
+            ..Lane::default()
+        };
+        let mut state = State::new(Lsn(1), Lsn(1));
+        state.lanes = [fenced(Epoch(2)), fenced(Epoch(2)), Lane::default()];
+        state.revision = 1;
+        // The fenced append keeps its slot without a waiter.
+        state.pending.insert(
+            Lsn(2),
+            Pending {
+                payload: Entry::Ordinary(bytes::Bytes::from_static(b"before")),
+                waiters: Vec::new(),
+            },
+        );
+        let stale = Entry::Ordinary(bytes::Bytes::from_static(b"stale"));
+        assert!(matches!(
+            state.append(Lsn(2), &stale),
+            Admission::Refused(JournalError::Fenced { current: Epoch(2) })
+        ));
+        // A reseal at the old epoch retries the lanes before they answer again.
+        state.retry_lanes();
+        assert!(matches!(
+            state.append(Lsn(2), &stale),
+            Admission::Refused(JournalError::Fenced { current: Epoch(2) })
+        ));
+        // One fence is no quorum: the outcome stays unknown.
+        state.lanes[1].failure.as_mut().unwrap().error = JournalError::Unavailable;
+        assert!(matches!(
+            state.append(Lsn(2), &stale),
+            Admission::Refused(JournalError::Unavailable)
+        ));
     }
 }
 

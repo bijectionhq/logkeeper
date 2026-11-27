@@ -2144,3 +2144,49 @@ fn rotation_reclaims_mixed_packs_with_excess_discarded_bytes() {
     );
     assert_eq!(test.send(read(A, 1)), page(1, 1, &[(1, b"retained")]));
 }
+
+struct Identified(Arc<HashMap<KeeperId, Keeper>>, Identity);
+impl Transport for Identified {
+    fn identity(&self) -> &Identity {
+        &self.1
+    }
+
+    fn call(&self, keeper: KeeperId, request: Request) -> BoxFuture<'_, CallResult> {
+        Box::pin(async move {
+            self.0
+                .get(&keeper)
+                .ok_or(TransportError::Unreachable)?
+                .call(&self.1, request)
+                .await
+        })
+    }
+}
+
+#[tokio::test]
+async fn writers_on_durable_keepers_conform_to_the_journal_contract() {
+    use journal_contract::conformance;
+
+    let directories: Vec<_> = (0..3).map(|_| tempdir().unwrap()).collect();
+    let limits = Limits {
+        max_record_bytes: conformance::LIMITS.max_record_bytes.try_into().unwrap(),
+        stream_quota_bytes: conformance::LIMITS.stream_quota_bytes,
+        ..Limits::default()
+    };
+    let keepers = Arc::new(
+        MEMBERS
+            .into_iter()
+            .zip(&directories)
+            .map(|(id, dir)| (id, Keeper::open(dir.path(), id, limits).unwrap()))
+            .collect::<HashMap<_, _>>(),
+    );
+    conformance::run(|identity| {
+        Arc::new(
+            crate::stream::writer::Writer::new(
+                Arc::new(Identified(keepers.clone(), identity)),
+                MEMBERS,
+            )
+            .unwrap(),
+        )
+    })
+    .await;
+}
