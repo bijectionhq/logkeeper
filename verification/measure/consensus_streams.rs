@@ -12,6 +12,10 @@
 //! cargo run --release --features consensus-testing --example consensus-streams -- \
 //!     --streams 100 --active 8 --seconds 10
 //! ```
+//!
+//! `--fill N` first writes N 64-byte records to stream 1 in 256-record
+//! batches and reports the process's resident memory with that stream open
+//! and, with `--park-after`, once it parked.
 
 use std::time::{Duration, Instant};
 
@@ -29,6 +33,7 @@ struct Args {
     seconds: f64,
     park: Option<u64>,
     sync_mode: SyncMode,
+    fill: u64,
 }
 
 fn args() -> Args {
@@ -40,6 +45,7 @@ fn args() -> Args {
         seconds: 10.0,
         park: None,
         sync_mode: SyncMode::Full,
+        fill: 0,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -56,6 +62,7 @@ fn args() -> Args {
             "--sync-mode" => {
                 args.sync_mode = serde_json::from_value(value.into()).unwrap();
             }
+            "--fill" => args.fill = value.parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -101,6 +108,44 @@ fn cpu_seconds() -> f64 {
     seconds(usage.ru_utime) + seconds(usage.ru_stime)
 }
 
+/// Counts live heap bytes, which the allocator may not return to the system.
+struct Counting;
+
+static HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// SAFETY: forwards every call to the system allocator unchanged.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        HEAP.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        HEAP.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+fn heap_mib() -> f64 {
+    HEAP.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
+}
+
+/// Resident memory of this process in MiB.
+fn resident_mib() -> f64 {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<f64>()
+        .unwrap()
+        / 1024.0
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args = args();
@@ -120,9 +165,43 @@ async fn main() {
             .await
             .unwrap();
     }
+    let mut memory = String::new();
+    if args.fill > 0 {
+        let record = Bytes::from(vec![5; 64]);
+        let mut next = 1u64;
+        while next <= args.fill {
+            let batch = (next..(next + 256).min(args.fill + 1))
+                .map(|at| (Lsn(at), record.clone()))
+                .collect::<Vec<_>>();
+            next += batch.len() as u64;
+            journal
+                .append_batch(StreamId(1), Epoch(1), batch)
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        memory = format!(
+            ", \"filled\": {}, \"heap_open_mib\": {:.1}, \"rss_open_mib\": {:.1}",
+            args.fill,
+            heap_mib(),
+            resident_mib()
+        );
+    }
     // Let idle streams settle, and park when asked, before measuring their
     // steady cost.
-    tokio::time::sleep(Duration::from_secs(args.park.map_or(2, |park| park + 35))).await;
+    // A filled stream changed its log after the first leader pass, so it
+    // parks one 30 s pass later than the others.
+    let settle = args
+        .park
+        .map_or(2, |park| park + 35 + if args.fill > 0 { 30 } else { 0 });
+    tokio::time::sleep(Duration::from_secs(settle)).await;
+    if args.fill > 0 {
+        memory += &format!(
+            ", \"heap_settled_mib\": {:.1}, \"rss_settled_mib\": {:.1}",
+            heap_mib(),
+            resident_mib()
+        );
+    }
     let cpu = cpu_seconds();
     let started = Instant::now();
     let deadline = started + Duration::from_secs_f64(args.seconds);
@@ -166,7 +245,7 @@ async fn main() {
          \"record\": {}, \"seconds\": {:.2}, \
          \"batches_per_second\": {:.1}, \"records_per_second\": {:.1}, \"p50_ms\": {:.2}, \
          \"p99_ms\": {:.2}, \"cpu_cores\": {:.2}, \"peak_rss_mib\": {:.1}, \
-         \"disk_mib\": {:.1}}}",
+         \"disk_mib\": {:.1}{memory}}}",
         serde_json::to_value(args.sync_mode)
             .unwrap()
             .as_str()

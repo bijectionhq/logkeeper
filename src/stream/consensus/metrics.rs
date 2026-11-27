@@ -81,7 +81,7 @@ pub(super) async fn report(
     gauges: impl Fn() -> String,
 ) {
     let mut previous = COUNTERS.snapshot();
-    let mut summary = String::new();
+    let mut summary = gauges();
     loop {
         tokio::select! {
             () = stop.cancelled() => return,

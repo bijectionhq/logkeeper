@@ -7,7 +7,7 @@ use openraft::async_runtime::WatchReceiver;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::{Engine, Group, Outcome, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
+use super::{Closed, Engine, Group, Outcome, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
 use crate::stream::consensus::{
     Genesis, LogId, Stage, decisions,
     network::{Frame, Proof},
@@ -267,12 +267,15 @@ impl Engine {
             .lock()
             .await
             .get(&scope)
-            .map(|group| group.state.clone());
-        let state = open.or_else(|| self.closed_states.lock().get(&scope).cloned());
-        if let Some(state) = state {
-            self.detached_pins
+            .map(|group| (group.state.generation(), group.state.lifetime()));
+        let copy = open.or_else(|| {
+            self.closed_states
                 .lock()
-                .insert((scope, state.generation()), state.lifetime());
+                .get(&scope)
+                .map(|closed| (closed.generation(), closed.lifetime()))
+        });
+        if let Some(copy) = copy {
+            self.detached_pins.lock().insert((scope, copy.0), copy.1);
         }
     }
 
@@ -280,9 +283,12 @@ impl Engine {
     /// and runs `mark` once the group is out of `groups`. False when the
     /// stream had no open group.
     ///
-    /// The closed state machine stays referenced, because its snapshot and
-    /// applied records are the only references to objects and segments the
-    /// reaper would otherwise delete; the reopened group takes them over.
+    /// Until the group stops, its state machine stays referenced, because
+    /// its snapshot and applied records are the only references to objects
+    /// and segments the reaper would otherwise delete. Once it stopped, a
+    /// pin of those segments and objects replaces it, so no late snapshot
+    /// or apply can depend on anything the pin misses, and the applied
+    /// image is dropped; the reopened group loads it again.
     /// The close holds the stream's opening lock and waits for the group to
     /// stop: the generation stays the same, so nothing else fences the old
     /// group's snapshot files and WAL writes from a reopened one, and an
@@ -295,12 +301,21 @@ impl Engine {
         let Some(group) = self.groups.lock().await.remove(&scope) else {
             return false;
         };
-        self.closed_states.lock().insert(scope, group.state.clone());
+        self.closed_states
+            .lock()
+            .insert(scope, Closed::Closing(group.state.clone()));
         mark();
         group.state.suspend();
         group.stop.cancel();
         let _ = group.raft.shutdown().await;
         group.state.shutdown().await;
+        let pin = group.state.pin();
+        let mut closed = self.closed_states.lock();
+        if let Some(entry) = closed.get_mut(&scope)
+            && matches!(entry, Closed::Closing(state) if state.same(&group.state))
+        {
+            *entry = Closed::Pinned(pin);
+        }
         true
     }
 

@@ -563,14 +563,17 @@ impl SimCluster {
                 configuration,
             });
         }
-        let state = {
-            let groups = server.engine.groups.lock().await;
-            if let Some(group) = groups.get(&stream) {
-                Some(group.state.clone())
-            } else {
-                server.engine.closed_states.lock().get(&stream).cloned()
-            }
-        }?;
+        let open = server
+            .engine
+            .groups
+            .lock()
+            .await
+            .get(&stream)
+            .map(|group| group.state.clone());
+        let state = match open {
+            Some(state) => state,
+            None => server.engine.closed_state(stream).await?,
+        };
         if !state.healthy() {
             return None;
         }

@@ -2941,6 +2941,10 @@ async fn a_parked_stream_keeps_its_snapshot_and_retained_extents() {
             .await
             .unwrap();
     }
+    let mut images = Vec::new();
+    for id in [a, b, c] {
+        images.push(cluster.group(id, parked).await.state.downgrade());
+    }
     // The busy stream keeps writing, rolling and checkpointing segments,
     // while the other one parks and the reaper runs.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -2962,7 +2966,28 @@ async fn a_parked_stream_keeps_its_snapshot_and_retained_extents() {
                 .contains_key(&parked),
             "the idle stream parked"
         );
+        let engine = &cluster.running[&id].engine;
+        let pinned = engine
+            .closed_states
+            .lock()
+            .get(&parked)
+            .map(|closed| match closed {
+                super::Closed::Pinned(pin) => pin.segments().count(),
+                super::Closed::Closing(_) => 0,
+            });
+        assert!(
+            pinned.is_some_and(|segments| segments > 0),
+            "the parked copy keeps only pins of its segments"
+        );
     }
+    // No voter keeps the parked stream's applied image or snapshot copy.
+    timeout(WAIT, async {
+        while images.iter().any(|image| image.strong_count() != 0) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("parking dropped every voter's state machine");
     let page = timeout(WAIT, async {
         loop {
             match journal.read(parked, Lsn(1), 1, Duration::ZERO).await {

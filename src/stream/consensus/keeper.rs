@@ -417,9 +417,9 @@ pub(super) struct Engine {
     /// Idle streams whose groups this keeper closed until the next request,
     /// and when each parked.
     pub(super) parked: parking_lot::RwLock<HashMap<StreamId, Instant>>,
-    /// State machines of parked and deleted groups, kept so the reaper
-    /// cannot delete what only they reference.
-    pub(super) closed_states: parking_lot::Mutex<HashMap<StreamId, StateMachine>>,
+    /// Pins of parked and deleted groups, kept so the reaper cannot delete
+    /// what only they reference.
+    pub(super) closed_states: parking_lot::Mutex<HashMap<StreamId, Closed>>,
     /// The last log index of each led stream and when it last changed.
     activity: parking_lot::Mutex<HashMap<StreamId, (Option<u64>, Instant)>>,
     /// When each other keeper last answered a ping, and what it reported.
@@ -451,6 +451,37 @@ pub(super) struct Engine {
     repair_attempts: parking_lot::Mutex<HashMap<StreamId, u32>>,
     #[cfg(test)]
     pub(super) crash: std::sync::atomic::AtomicBool,
+}
+
+/// What a closed replica keeps so the reaper spares what reopening needs.
+pub(super) enum Closed {
+    /// The group is shutting down; its state machine still holds everything.
+    Closing(StateMachine),
+    /// The group shut down; only pins remain, and the image is dropped.
+    Pinned(storage::Pin),
+}
+
+impl Closed {
+    pub(super) fn finalized(&self) -> Option<super::Configuration> {
+        match self {
+            Self::Closing(state) => state.finalized(),
+            Self::Pinned(pin) => pin.finalized,
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        match self {
+            Self::Closing(state) => state.generation(),
+            Self::Pinned(pin) => pin.generation,
+        }
+    }
+
+    fn lifetime(&self) -> Weak<()> {
+        match self {
+            Self::Closing(state) => state.lifetime(),
+            Self::Pinned(pin) => pin.lifetime(),
+        }
+    }
 }
 
 enum Identity {
@@ -648,6 +679,26 @@ impl Engine {
         } else {
             Err(invalid("keeper media is unavailable"))
         }
+    }
+
+    /// The state machine of a closed copy of `stream`, for inspection. A
+    /// pinned copy is loaded from its snapshot and WAL suffix under the
+    /// opening lock, so no group opens beside it.
+    #[cfg(test)]
+    pub(super) async fn closed_state(&self, stream: StreamId) -> Option<StateMachine> {
+        if let Closed::Closing(state) = self.closed_states.lock().get(&stream)? {
+            return Some(state.clone());
+        }
+        let opening = self.opening(stream).await.ok()?;
+        let _guard = opening.lock().await;
+        if self.groups.lock().await.contains_key(&stream) {
+            return None;
+        }
+        let genesis = self.disk.genesis(stream)?;
+        let state = StateMachine::open(&self.disk, genesis, self.placement.clone())
+            .await
+            .ok()?;
+        Some(state)
     }
 
     /// The opening lock of `stream`, which takes one of the keeper's
@@ -957,8 +1008,7 @@ impl Engine {
             Request::KeeperStatus(stream) => {
                 #[cfg(test)]
                 tokio::time::sleep(Duration::from_millis(
-                    self.status_delay
-                        .load(std::sync::atomic::Ordering::Relaxed),
+                    self.status_delay.load(std::sync::atomic::Ordering::Relaxed),
                 ))
                 .await;
                 Ok(Reply::Status(self.status(stream).await))

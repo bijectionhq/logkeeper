@@ -73,6 +73,8 @@ struct State {
     live: BTreeMap<(StreamId, Uuid), Weak<Object>>,
     dead: VecDeque<(StreamId, Uuid)>,
     protected: BTreeSet<StreamId>,
+    // Scopes whose standalone objects a closed replica still needs.
+    held: BTreeMap<StreamId, usize>,
     ready: bool,
     scan: Option<ReadDir>,
     segments: Segments,
@@ -330,6 +332,15 @@ impl Objects {
         self.0.state.lock().protected.remove(&scope);
     }
 
+    /// Keeps every standalone object of `scope` until the hold drops.
+    pub fn hold(&self, scope: StreamId) -> Hold {
+        *self.0.state.lock().held.entry(scope).or_default() += 1;
+        Hold {
+            scope,
+            store: Arc::downgrade(&self.0),
+        }
+    }
+
     pub fn enable_reaping(&self) {
         self.0.state.lock().ready = true;
     }
@@ -370,6 +381,7 @@ impl Objects {
             // Hold the table while unlinking so a late pin cannot resurrect
             // a name already proven unreachable.
             if state.protected.contains(&scope)
+                || state.held.contains_key(&scope)
                 || state
                     .live
                     .get(&(scope, id))
@@ -436,6 +448,32 @@ impl Objects {
     }
 }
 
+/// A closed replica's hold on its scope's standalone objects.
+pub(in crate::stream::consensus) struct Hold {
+    scope: StreamId,
+    store: Weak<Inner>,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.upgrade() {
+            let mut state = store.state.lock();
+            if let Some(count) = state.held.get_mut(&self.scope) {
+                *count -= 1;
+                if *count == 0 {
+                    state.held.remove(&self.scope);
+                }
+            }
+        }
+    }
+}
+
+impl Segment {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 impl Drop for Segment {
     fn drop(&mut self) {
         if let Some(store) = self.store.upgrade() {
@@ -460,6 +498,14 @@ impl Object {
         match &self.0 {
             Body::File { key, .. } => Some(*key),
             Body::Slice { .. } => None,
+        }
+    }
+
+    /// The segment a slice lies in.
+    pub fn segment(&self) -> Option<Arc<Segment>> {
+        match &self.0 {
+            Body::File { .. } => None,
+            Body::Slice { segment, .. } => Some(segment.clone()),
         }
     }
 

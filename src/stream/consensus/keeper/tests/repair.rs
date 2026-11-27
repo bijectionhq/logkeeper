@@ -54,7 +54,7 @@ async fn local_configuration(
         .closed_states
         .lock()
         .get(&stream)
-        .and_then(|state| state.finalized())
+        .and_then(|closed| closed.finalized())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -259,6 +259,31 @@ struct ActiveSnapshot {
     dependencies: index::Dependencies,
 }
 
+/// What a closed replica keeps instead of its state machine: the segments
+/// its selected snapshot and applied records lie in, a hold on its
+/// standalone objects (index pages, entries from before segments), its
+/// lifetime and its finalized configuration. Reopening loads the image
+/// again from the selected snapshot and the WAL suffix, which pins itself.
+pub(in crate::stream::consensus) struct Pin {
+    pub finalized: Option<Configuration>,
+    pub generation: u64,
+    _segments: Vec<Arc<super::objects::Segment>>,
+    _files: super::objects::Hold,
+    _lifetime: Arc<()>,
+}
+
+impl Pin {
+    pub fn lifetime(&self) -> Weak<()> {
+        Arc::downgrade(&self._lifetime)
+    }
+
+    /// The segments the pin keeps.
+    #[cfg(test)]
+    pub fn segments(&self) -> impl Iterator<Item = u64> + '_ {
+        self._segments.iter().map(|segment| segment.id())
+    }
+}
+
 /// Captures an applied state before handing snapshot work to a background task.
 pub(in crate::stream::consensus) struct Builder {
     inner: Arc<Inner>,
@@ -403,6 +428,47 @@ impl StateMachine {
 
     pub fn generation(&self) -> u64 {
         self.inner.generation
+    }
+
+    pub fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Whether this state machine is still allocated, without keeping it.
+    #[cfg(test)]
+    pub fn downgrade(&self) -> Weak<impl Sized + use<>> {
+        Arc::downgrade(&self.inner)
+    }
+
+    /// The pins that keep what reopening needs once this state machine is
+    /// dropped. Taken after the group shut down, so no later snapshot or
+    /// apply can depend on anything else.
+    pub fn pin(&self) -> Pin {
+        let files = self.inner.disk.objects.hold(self.inner.genesis.stream);
+        let mut segments = BTreeMap::new();
+        let snapshot = self.inner.snapshot.lock();
+        let applied = self.inner.applied.read();
+        let images = snapshot
+            .as_ref()
+            .map(|active| &active.image)
+            .into_iter()
+            .chain([&*applied]);
+        for image in images {
+            for payload in image.state.records() {
+                if let Payload::Extent { object, .. } = payload
+                    && let Some(segment) = object.segment()
+                {
+                    segments.entry(segment.id()).or_insert(segment);
+                }
+            }
+        }
+        Pin {
+            finalized: applied.configuration,
+            generation: self.inner.generation,
+            _segments: segments.into_values().collect(),
+            _files: files,
+            _lifetime: self.inner.lifetime.clone(),
+        }
     }
 
     pub fn lifetime(&self) -> Weak<()> {
