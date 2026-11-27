@@ -658,6 +658,8 @@ async fn a_written_keeper_configuration_reads_back_for_a_keeper_process() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn timed_staging_and_retries_require_the_immutable_writer_session() {
+    use std::time::Duration;
+
     use bytes::Bytes;
     use journal_contract::{Epoch, JournalError, Lsn, StreamId, WriterFence, WriterSessionId};
     use logkeeper::stream::consensus::CLUSTER_VERSION_V4;
@@ -694,19 +696,35 @@ async fn timed_staging_and_retries_require_the_immutable_writer_session() {
         exclusive_journal_cutoff_micros: cutoff,
         original_receiver_certificate_sha256: [7; 32],
     };
-    let conflicting = Bytes::from_static(b"wrong session");
-    assert!(matches!(
-        journal
-            .append_session_timed_original(wrong, original(&conflicting), conflicting.clone())
-            .await,
-        Err(JournalError::Fenced { .. }),
-    ));
+    // A seal can commit before both selected signers have applied it.
+    let stage = |fence: WriterFence, payload: Bytes| {
+        let original = original(&payload);
+        let journal = &journal;
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let result = journal
+                    .append_session_timed_original(fence, original, payload.clone())
+                    .await;
+                let waiting_for_signer = match &result {
+                    Err(JournalError::Unavailable | JournalError::NotFound) => true,
+                    Err(JournalError::Fenced { current }) => *current < fence.writer_epoch,
+                    _ => false,
+                };
+                if !waiting_for_signer || tokio::time::Instant::now() >= deadline {
+                    return result;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    assert_eq!(
+        stage(wrong, Bytes::from_static(b"wrong session")).await,
+        Err(JournalError::Fenced { current: Epoch(1) }),
+    );
     let payload = Bytes::from_static(b"current session");
     let exact = original(&payload);
-    let proof = journal
-        .append_session_timed_original(fence, exact, payload.clone())
-        .await
-        .unwrap();
+    let proof = stage(fence, payload.clone()).await.unwrap();
     assert!(proof.original_quorum_sync_upper_micros < cutoff);
     assert_eq!(
         journal
