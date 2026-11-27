@@ -142,9 +142,15 @@ to this one, catalog keepers first, under writes, then
 
    To roll this keeper back: stop it, restore `logkeeper.prev`, and start it
    again. Rollback requires that the media still use a format the previous
-   binary supports (see step 3). A release without operator mode ignores
-   the drain mark. The keeper resumes draining when upgraded again,
-   until you clear the mark. When the outgoing binary predates `admin drain`,
+   binary supports (see step 3). The operator mode lives in
+   `operator-mode.json` in the data directory, which a release without
+   operator mode ignores: a rolled-back keeper that was draining or
+   decommissioning serves, campaigns and takes new placements again, and
+   nothing reports it. Repair does not move its replicas while it runs the
+   old binary. It resumes draining or decommissioning when upgraded again,
+   until you clear the mark with `lk admin undrain`. So before rolling back
+   a keeper in the middle of a decommission, expect the decommission to
+   pause, and check `lk admin drain-status` after the next upgrade. When the outgoing binary predates `admin drain`,
    use its graceful shutdown in step 7.
 
 9. **Soak** for at least `minReadySeconds` (30 s), check `probe problems` on

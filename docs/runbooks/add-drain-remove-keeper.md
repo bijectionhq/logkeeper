@@ -72,9 +72,19 @@ lk admin drain --config operator.json --keeper "$KEEPER"
 # drained: true
 ```
 
-The keeper hands off leadership and stops campaigning. Its replicas still
-vote. Run `lk admin undrain --config operator.json --keeper "$KEEPER"` when
-the maintenance is done.
+The keeper hands off leadership and stops campaigning, except as a last
+resort for a stream that has had no leader for three election timeouts
+because no other voter can win. Its replicas still vote. Run
+`lk admin undrain --config operator.json --keeper "$KEEPER"` when the
+maintenance is done.
+
+The mode is durable in `operator-mode.json` in the keeper's data directory,
+so it survives restarts. A release from before operator mode ignores that
+file: rolling a draining or decommissioning keeper back to such a release
+returns it to serving, silently, until it is upgraded again, when the mode
+resumes. Plain HTTP mode changes are accepted only from local tools, not
+from web pages (no `Origin` or `Sec-Fetch-*` header, and a loopback or
+single-label `Host`).
 
 ## Decommission and remove a keeper
 
