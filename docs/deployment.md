@@ -589,6 +589,9 @@ The rules cover at least:
 | Disk room | `logkeeper_consensus_accepting` | 0. The keeper refuses new streams |
 | Quarantine | `logkeeper_consensus_streams{state="quarantined"}` | Above 0 |
 | Certificate expiry | your PKI | Under 30 days |
+| Offload lag | `logkeeper_offload_lag_seconds`, `logkeeper_offload_upload_failures_total` | Over 5 minutes; failures for 10 minutes |
+| Offload backpressure | `logkeeper_offload_backpressured_appends_total` | Any increase: writers are refused |
+| Damaged object | `logkeeper_offload_corrupt_objects_total` | Any increase |
 
 Logs go to stderr, structured (`log_format`, `LOGKEEPER_LOG`).
 Administrative actions are logged under `logkeeper::audit`, and critical
@@ -634,9 +637,39 @@ Consumers such as RTDB can restore an application cut and authorize a successor 
 The application's archived cut sets the recovery point.
 Same-stream recovery is available for legacy mutable streams.
 
+## Offload to object storage
+
+Each stream's leader continuously uploads the committed prefix of its log to
+an S3-compatible store (or a directory) and records the durable, replicated
+`offloaded_through` through Raft. Configure the same `offload` section on
+every keeper (see the [offload runbook](runbooks/offload.md)); nothing is
+uploaded before `finalize-version` reaches level 5.
+
+| Setting | Default | What it costs |
+| --- | --- | --- |
+| `batch_bytes` | 16 MiB | Largest object, and the waiting bytes that trigger an upload |
+| `batch_interval_ms` | 10 000 | Most time a committed record waits for upload. One PUT per active stream every 10 s is about 260 000 PUTs a month, about $1.30 per continuously written stream at S3 Standard prices; idle streams upload nothing |
+| `max_lag_bytes` | 256 MiB | Waiting bytes per stream at which the leader refuses appends (`Unavailable`) |
+| `backpressure` | `true` | `false` keeps accepting writes through an outage, so a quorum loss then keeps only what a survivor holds |
+| `retain_local_bytes` | absent | Absent: keepers keep every record until the writer trims it, and the store is a backup. Set: keepers drop offloaded records older than the newest N bytes per stream; reads below that go to the store, and the dropped bytes no longer count against the stream's quota |
+| `cache_bytes` | 64 MiB | Segments each keeper caches for reads below its local floor |
+
+The leader uploads; uploads are idempotent across leader changes (objects are
+keyed by lineage and LSN range and written at most once). An operator
+recovery starts a new lineage, so a deposed configuration's later uploads are
+never used. The README's offload section has the measured throughput impact.
+
 ## Backup and restore
 
 What exists:
+
+- **Continuous offload** (above) keeps every committed record in object
+  storage within `batch_interval_ms`.
+- **`admin export-stream`** takes an online export of a stream into a
+  directory (the same segment objects plus a manifest); **`admin
+  import-stream`** loads an export into a new stream; **`admin
+  restore-stream`** rebuilds a stream whose voters are all lost from the
+  store alone, into a new stream ID, and reports the records it kept.
 
 - **Replication** is the durability mechanism. Every acknowledged record is
   on two of three voters in distinct domains, and leader-driven repair restores
@@ -646,13 +679,14 @@ What exists:
   stopped keeper whose WAL is intact. It is for a damaged snapshot file, not
   for disaster recovery.
 - **`keeper recover-stream`** rebuilds a legacy mutable stream from its last surviving voter
-  after two are lost, accepting possible loss of acknowledged records.
+  after two are lost, accepting possible loss of acknowledged records. With
+  offload it also takes the store's committed run when that is longer, and
+  reports the exact loss point.
 - **RTDB checkpoints** in object storage hold each database's state up to its
   last checkpoint. The journal holds only the suffix after it.
 
 What does not exist:
 
-- Online backup or export of a keeper's streams.
 - A cluster snapshot.
 - Restoring the replicated catalog after it loses two voters.
 - Point-in-time restore of a journal.
@@ -691,5 +725,4 @@ Most are items in the consensus design's review tables.
 | Runtime inventory change (T19) | Adding a keeper restarts every keeper | Plan the count; restart one at a time |
 | Catalog recovery after two voters are lost (review item 12) | Creation and staging stop until a voter returns | Keep catalog voters in three zones; replace failed ones promptly |
 | Per-stream authorization (T13) | Any writer may write any stream | One keeper cluster per trust domain |
-| Online backup and export | See [backup](#backup-and-restore) | RTDB checkpoints |
 | Disaster restore without original enrollment | An inaccessible old pair cannot produce retirement proofs. One survivor cannot safely repair the old quorum | Restore enough original participants, or rebuild a fresh isolated cell from a qualified application backup |

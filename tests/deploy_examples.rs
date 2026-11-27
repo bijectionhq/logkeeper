@@ -96,7 +96,10 @@ fn kubernetes_keepers_share_one_inventory() {
             assert!(admin.mtls);
             assert_eq!(admin.probe_listen, Some("127.0.0.1:5742".parse().unwrap()));
             for peer in &admin.cluster {
-                assert_eq!(peer.1.ip(), config.keepers[peer.0].ip());
+                assert_eq!(
+                    Some(peer.1.ip()),
+                    config.keepers[peer.0].socket_addr().map(|addr| addr.ip())
+                );
                 assert_eq!(peer.1.port(), 5741);
             }
             assert_eq!(admin.cluster.len(), 5);

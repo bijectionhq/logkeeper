@@ -11,6 +11,7 @@ mod keeper;
 pub mod logging;
 mod metrics;
 mod network;
+mod offload;
 mod operator;
 mod ownership;
 mod placement;
@@ -37,8 +38,9 @@ pub use crate::server::durability::SyncMode;
 pub use address::Address;
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
-pub use keeper::{AdminConfig, Config, FenceProof, Recovery, RecoveryReport};
+pub use keeper::{AdminConfig, Config, FenceProof, OffloadStatus, Recovery, RecoveryReport};
 pub use logging::LogFormat;
+pub use offload::OffloadConfig;
 pub use operator::{
     ADMIN_USAGE, AdminOutcome, ClusterProblems, Operator, OperatorConfig, StreamReport,
     admin_command, render as render_report,
@@ -67,8 +69,13 @@ pub const CLUSTER_VERSION_V2: u32 = 2;
 pub const CLUSTER_VERSION_V3: u32 = 3;
 /// Cluster feature level for immutable stream genesis and scoped writer sessions.
 pub const CLUSTER_VERSION_V4: u32 = 4;
+/// Cluster feature level of continuous offload: `Command::Offloaded`,
+/// `Command::Restore` and the snapshot formats that carry offload progress.
+pub const CLUSTER_VERSION_V5: u32 = 5;
+/// The level offload waits for.
+pub const CLUSTER_VERSION_OFFLOAD: u32 = CLUSTER_VERSION_V5;
 /// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V4;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_V5;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -87,6 +94,9 @@ pub mod features {
     pub const RECOVERY_MARKER: u64 = 1 << 5;
     /// Supports immutable stream genesis and scoped writer sessions.
     pub const IMMUTABLE_STREAMS: u64 = 1 << 6;
+    /// Applies `Command::Offloaded` and `Command::Restore` and reads the
+    /// snapshot formats that carry offload progress.
+    pub const OFFLOAD: u64 = 1 << 7;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 = VERSION_NEGOTIATION
@@ -94,7 +104,8 @@ pub mod features {
         | DURABLE_QUARANTINE
         | SOFT_PLACEMENT
         | RECOVERY_MARKER
-        | IMMUTABLE_STREAMS;
+        | IMMUTABLE_STREAMS
+        | OFFLOAD;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;

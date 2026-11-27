@@ -290,6 +290,18 @@ pub(super) enum Request {
         original: Vec<u8>,
         payload: bytes::Bytes,
     },
+    /// The leader's offload progress of `stream`, after uploading every
+    /// record committed when asked if `flush`. Administrators only.
+    OffloadStatus {
+        stream: StreamId,
+        flush: bool,
+    },
+    /// Points a fresh `stream` at records an operator put in the offload
+    /// store under its lineage 0. Administrators only.
+    Restore {
+        stream: StreamId,
+        restore: super::state::Restore,
+    },
 }
 
 impl Request {
@@ -330,6 +342,8 @@ impl Request {
             | Self::RetireCopy { stream, .. }
             | Self::PreferLeader { stream, .. }
             | Self::Written { stream, .. }
+            | Self::OffloadStatus { stream, .. }
+            | Self::Restore { stream, .. }
             | Self::Replace { stream, .. } => stream,
         }
     }
@@ -438,7 +452,9 @@ pub(super) fn decode_frame(bytes: &[u8], version: WireVersion) -> io::Result<Dec
     }
     let immutable = frame_tag == 1 && bytes.get(4..20) == Some(&[0; 16]);
     if immutable && version == WireVersion::Previous {
-        return Err(unsupported("immutable genesis requires a newer keeper protocol"));
+        return Err(unsupported(
+            "immutable genesis requires a newer keeper protocol",
+        ));
     }
     let prefix = if immutable {
         super::IMMUTABLE_GENESIS_PREFIX_BYTES

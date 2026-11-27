@@ -421,6 +421,72 @@ appended after the recovery, never from the lost suffix. Writers before the
 recovery are fenced by the recovery epoch, so none of their appends commits
 after it.
 
+### Continuous offload to object storage
+
+With `offload` in the keeper configuration (an `s3://bucket/prefix` URL, or
+`file:///directory`), each stream's leader uploads the committed prefix of
+its log, Neon-style, and records how far it got through Raft:
+
+- **Who and when.** The leader uploads, from its applied state only, so
+  every uploaded record is committed. It uploads once `batch_bytes` (16 MiB)
+  wait or the oldest waiting record is `batch_interval_ms` (10 s) old, one
+  object at a time per stream and `concurrency` (8) per keeper. A failed
+  upload backs off from 100 ms to 30 s.
+- **Objects.** `<prefix>/streams/<stream>/<lineage>/<first>-<last>.seg` holds
+  the records `first..=last` with their timed-record flag, per-record CRC-32,
+  the writer epochs the leader knew, and a SHA-256 trailer
+  (`offload/format.rs`). Keys are written with `PutMode::Create`, at most
+  once. A new leader, or a retry after a crash mid-upload, that finds the key
+  present moves on: within a lineage every object holds committed records, so
+  two objects that overlap agree.
+- **`offloaded_through`.** `Command::Offloaded { lineage, through,
+  retain_from }` advances the replicated `offloaded_through`, which never
+  moves back or past the applied head (`decisions::offloaded_through`). The
+  invariant the protocol model proves: the uploaded prefix is a prefix of the
+  committed log.
+- **Backpressure.** While more than `max_lag_bytes` (256 MiB) wait for
+  upload on a stream, its leader refuses appends with `Unavailable`
+  (`backpressure`, on by default).
+- **Retention.** With `retain_local_bytes`, the same command makes every
+  voter drop offloaded records older than the newest N bytes
+  (`decisions::local_floor`: only offloaded records, never past the head).
+  The writer's trim floor stays where it was: reads between it and the local
+  floor are served from the store by whichever keeper answers, through a
+  segment cache, so `ConsensusJournal`, `Client` and RTDB's replay read the
+  same pages as before. A read skips a damaged object when another object of
+  the lineage covers the record, and answers `Corrupted` otherwise. Snapshots
+  carry the offload progress beside the image (`LKRIDX03`, `LKRIMG04`), only
+  for streams that offloaded.
+- **Lineages.** An operator recovery or a restore starts a new lineage
+  (`Command::Restore`), recorded in a lineage object first. Each lineage is
+  authoritative only from its first LSN, so a deposed configuration that
+  keeps uploading under its old lineage can never extend or overwrite the
+  recovered history.
+- **Recovery.** `recover-stream` on a keeper with `offload` also reads the
+  store. It keeps every record at or below `max(survivor head, end of the
+  store's committed run)` (`decisions::recovered_head`) and reports that loss
+  point. When the store's run is longer, the recovery record replaces the
+  survivor's copy with it, and the recovered stream serves those records from
+  the store.
+- **Backup, export, restore.** `logkeeper admin offload-status`,
+  `export-stream --to DIR` (flush, then copy the objects and a manifest),
+  `import-stream --from DIR --stream NEW` and `restore-stream --from-stream
+  OLD --stream NEW --acknowledge-data-loss` (no surviving voter). An import or
+  restore uploads the records under the new stream, creates it, and points it
+  at them with the administrator's `Request::Restore`, which only a fresh,
+  never-sealed stream accepts. `docs/runbooks/offload.md` has the procedures.
+- **Upgrade.** `Command::Offloaded` and `Command::Restore` are appended to
+  the command enum, and nothing is uploaded or proposed until the cluster
+  finalizes level 5 (`CLUSTER_VERSION_OFFLOAD`), which requires every keeper
+  to advertise `features::OFFLOAD`. `Request::OffloadStatus` and
+  `Request::Restore` are appended requests, refused on N-1 connections and
+  answered `Unsupported` by keepers that lack them, so no ALPN changes.
+- **Metrics.** `logkeeper_offload_*`: uploaded bytes and objects, existing
+  objects, upload and record failures, remote reads and cache hits, corrupt
+  objects, backpressured appends, locally trimmed records, upload duration,
+  and the lag gauges `logkeeper_offload_lag_bytes` and
+  `logkeeper_offload_lag_seconds`.
+
 ### Keeper storage and upgrade
 
 Admission leaves 88 MiB free for durable protocol control (32 MiB), maintenance
@@ -650,9 +716,10 @@ releases mix: upgrade from N-1 to N, one keeper at a time
 binaries of the N-1 commit against this one.
 
 **Write-version gate.** The catalog holds a finalized cluster feature level,
-1 until an administrator finalizes. `Client::finalize_version(2)` probes
+1 until an administrator finalizes. `Client::finalize_version(5)` probes
 every keeper in the inventory and refuses with `Unsupported` while one lacks
-the gate, or `Unavailable`, worth retrying, while one does not answer. Until
+the feature bits that level needs (`features_for_version`: the gate, and
+`OFFLOAD` for level 5), or `Unavailable`, worth retrying, while one does not answer. Until
 then N writes only N-1 formats, so a keeper can go back to N-1: checkpoints
 stay `LKRWAL04`, no cluster-version record is written, segment compaction
 only asks owners to snapshot and purge instead of writing `Relocate` frames,
@@ -1131,6 +1198,10 @@ report is incomplete.
 | `drain-status --keeper K` | `K`'s mode, the streams it leads and hosts, and those it votes in |
 | `clear-quarantine --keeper K --stream UUID` | Clears the replica's quarantine marker after repair |
 | `finalize-version` | Enables the new write format after the rolling upgrade |
+| `offload-status --stream UUID` | `offloaded_through`, lineages, logical and local floors, head |
+| `export-stream --stream UUID --to DIR` | Flushes offload, then copies the stream's objects and a manifest into `DIR` |
+| `import-stream --from DIR --stream NEW --quota-bytes N [--voters A,B,C]` | Creates `NEW` holding an export's records |
+| `restore-stream --from-stream OLD --stream NEW --quota-bytes N [--floor LSN] --acknowledge-data-loss` | Rebuilds a stream with no surviving voter from the store into `NEW` and reports the records kept |
 
 Administrators may now also send `PreferLeader`, which used to be a writer's
 request; it moves leadership and writes nothing.
@@ -1296,6 +1367,10 @@ rules read the keeper's own gates rather than copying them:
 | `LogkeeperStreamNearRecordCeiling` / `NearSuffixCeiling` / `NearQuota` | warning | a stream passes 75% of a ceiling | the writer should trim; for the suffix, check snapshots |
 | `LogkeeperRepairQueueStuck` | warning | a repair waited over 15 m | `logkeeper_consensus_repair_backoff_streams` and the repair log lines |
 | `LogkeeperSlowProposals` | warning | proposals stay in flight over 1 s for 5 m | `logkeeper_consensus_commit_stage_seconds` names the stage |
+| `LogkeeperOffloadLagging` | warning | a led stream's oldest waiting record is over 5 m old, for 10 m | check upload failures and the store |
+| `LogkeeperOffloadUploadsFailing` | warning | uploads fail for 10 m | the store's reachability, credentials, bucket policy |
+| `LogkeeperOffloadBackpressure` | critical | appends are refused because offload fell behind | restore the store, or accept the risk with `backpressure: false` |
+| `LogkeeperOffloadCorruptObject` | critical | a fetched object failed its checksum | `docs/runbooks/offload.md` |
 
 `deploy/grafana/logkeeper.json` (data source and keeper variables) charts the
 same families in four rows: overview, writes and commit stages, WAL and disk,

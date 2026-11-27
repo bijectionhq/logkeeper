@@ -250,6 +250,7 @@ impl LocalCluster {
                     metrics_readers: Vec::new(),
                     probe_listen: None,
                 }),
+                offload: None,
             };
             provision(&config)?;
             config.initialize()?;
@@ -447,6 +448,38 @@ impl LocalCluster {
             .ok_or_else(|| io::Error::other("unknown keeper"))?
             .recover_stream(stream, recovery)
             .await
+    }
+
+    /// Restarts every keeper with continuous offload to `offload` and
+    /// finalizes the cluster version, which offload needs.
+    pub async fn enable_offload(
+        &mut self,
+        principal: &str,
+        offload: super::OffloadConfig,
+    ) -> io::Result<()> {
+        for keeper in self.configs.keys().copied().collect::<Vec<_>>() {
+            if self.running.contains_key(&keeper) {
+                self.stop(keeper).await?;
+            }
+            if let Some(config) = self.configs.get_mut(&keeper) {
+                config.offload = Some(offload.clone());
+            }
+            self.restart(keeper).await?;
+        }
+        let journal = self.journal(principal, &self.journal_config(1 << 20, 1024))?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match journal
+                .finalize_version(super::CLUSTER_VERSION_CURRENT)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(io::Error::other(format!("{error:?}"))),
+            }
+        }
     }
 
     /// Stops every keeper.

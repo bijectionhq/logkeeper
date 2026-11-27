@@ -20,6 +20,7 @@ mod immutable;
 mod incarnation;
 mod lifecycle;
 mod model_counterexamples;
+mod offload;
 mod operator;
 mod ops;
 mod park;
@@ -111,6 +112,17 @@ impl Cluster {
         catalog_voters: Option<[Uuid; 3]>,
         named: bool,
     ) -> Self {
+        Self::start_configured(domains, catalog_voters, named, None).await
+    }
+
+    /// Starts every keeper with `offload`, without the restart that turning
+    /// it on later needs.
+    async fn start_configured(
+        domains: [&str; 4],
+        catalog_voters: Option<[Uuid; 3]>,
+        named: bool,
+        offload: Option<crate::stream::consensus::OffloadConfig>,
+    ) -> Self {
         let address = |listener: &TcpListener| -> crate::stream::consensus::Address {
             let local = listener.local_addr().unwrap();
             if named {
@@ -196,6 +208,7 @@ impl Cluster {
                 timed_authority: None,
                 log_format: Default::default(),
                 admin: None,
+                offload: offload.clone(),
             };
             provision(&config);
             config.initialize().unwrap();

@@ -3,7 +3,9 @@
 //! variants of the release that is now N-1.
 
 use bytes::Bytes;
-use journal_contract::{Epoch, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId};
+use journal_contract::{
+    Epoch, JournalError, Lsn, Page, RecoveryFence, StreamId, WriterFence, WriterSessionId,
+};
 use openraft::raft::{AppendEntriesRequest, TransferLeaderRequest, VoteRequest};
 use serde::Serialize;
 
@@ -254,7 +256,10 @@ fn request(tag: usize) -> Option<Request> {
         33 => Request::RecoveryFence(STREAM),
         34 => Request::AcknowledgeRecoveryWithMarker {
             stream: STREAM,
-            fence: RecoveryFence { epoch: Epoch(1), head: Lsn(1) },
+            fence: RecoveryFence {
+                epoch: Epoch(1),
+                head: Lsn(1),
+            },
             payload: bytes,
         },
         35 => Request::SealSession {
@@ -271,6 +276,20 @@ fn request(tag: usize) -> Option<Request> {
             revision: 1,
             original: Vec::new(),
             payload: bytes,
+        },
+        37 => Request::OffloadStatus {
+            stream: STREAM,
+            flush: true,
+        },
+        38 => Request::Restore {
+            stream: STREAM,
+            restore: crate::stream::consensus::state::Restore {
+                lineage: 1,
+                floor: Lsn(1),
+                head: Lsn(0),
+                epoch: Epoch(0),
+                replace: true,
+            },
         },
         _ => return None,
     })
@@ -384,6 +403,16 @@ fn outcome(tag: usize) -> Option<Outcome> {
         6 => Outcome::OriginalSample(Vec::new()),
         7 => Outcome::OriginalEvidence(Vec::new()),
         8 => Outcome::RecoveryFence(None),
+        9 => Outcome::Offload(crate::stream::consensus::OffloadStatus {
+            stream: STREAM,
+            offloaded_through: Lsn(0),
+            lineage: 0,
+            lineages: vec![(0, Lsn(1))],
+            floor: Lsn(1),
+            local_floor: Lsn(1),
+            head: Lsn(0),
+            epoch: Epoch(0),
+        }),
         _ => return None,
     })
 }

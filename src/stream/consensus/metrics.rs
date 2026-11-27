@@ -111,7 +111,20 @@ pub(super) struct DurationHistogram {
     count: AtomicU64,
 }
 
+impl Default for DurationHistogram {
+    fn default() -> Self {
+        Self::new(LATENCY_BUCKETS_NS)
+    }
+}
+
 impl DurationHistogram {
+    /// Writes the histogram with its help and type lines.
+    pub(super) fn write_prometheus_named(&self, out: &mut String, name: &str, help: &str) {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} histogram");
+        self.write_prometheus(out, name, None);
+    }
+
     fn new(bounds_ns: &'static [u64]) -> Self {
         let buckets = (0..=bounds_ns.len())
             .map(|_| AtomicU64::new(0))
@@ -1411,7 +1424,8 @@ mod tests {
 
     #[test]
     fn alert_rules_and_dashboard_name_only_rendered_metrics() {
-        let text = Metrics::new().render_prometheus(&sample_scrape());
+        let mut text = Metrics::new().render_prometheus(&sample_scrape());
+        super::super::offload::OffloadMetrics::default().render_prometheus(&mut text);
         let rendered = text
             .lines()
             .filter(|line| !line.starts_with('#'))

@@ -725,6 +725,61 @@ impl StateMachine {
         })
     }
 
+    /// Where a read from `from` must go when this replica dropped the
+    /// record after offloading it.
+    pub fn remote(&self, from: Lsn) -> Option<crate::stream::consensus::state::Remote> {
+        self.inner.applied.read().state.remote(from)
+    }
+
+    pub fn offload_view(&self) -> Option<crate::stream::consensus::state::OffloadView> {
+        self.inner.applied.read().state.offload_view()
+    }
+
+    /// The applied records from `from`, about `max_bytes` of them, loaded
+    /// and checked, with the epoch runs that cover them.
+    pub async fn offload_records(
+        &self,
+        from: Lsn,
+        max_bytes: u64,
+    ) -> io::Result<(
+        Vec<crate::stream::consensus::offload::Record>,
+        Vec<(Lsn, Epoch)>,
+    )> {
+        let (payloads, epochs) = self
+            .inner
+            .applied
+            .read()
+            .state
+            .offload_records(from, max_bytes)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        let inner = self.inner.clone();
+        blocking(move || {
+            let records = payloads
+                .into_iter()
+                .map(|(lsn, payload)| {
+                    Ok(crate::stream::consensus::offload::Record {
+                        lsn,
+                        timed: payload.timed(),
+                        bytes: payload.load()?,
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>();
+            if let Err(error) = &records {
+                inner.fail(error);
+            }
+            Ok((records?, epochs))
+        })
+        .await
+    }
+
+    pub fn waiting_bytes(&self, from: Lsn) -> u64 {
+        self.inner.applied.read().state.waiting_bytes(from)
+    }
+
+    pub fn retention_floor(&self, bytes: u64) -> Lsn {
+        self.inner.applied.read().state.retention_floor(bytes)
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<()> {
         self.inner.changed.subscribe()
     }
@@ -1212,6 +1267,9 @@ impl Inner {
                     Some(epochs) => Ok(size + options().serialized_size(epochs)?),
                     None => Ok(size),
                 })
+                .and_then(|size| {
+                    Ok(size + options().serialized_size(&active.image.state.offload())?)
+                })
                 .map_err(io::Error::other)?;
             transfer.grow(
                 active
@@ -1492,6 +1550,8 @@ pub(in crate::stream::consensus) struct Replayed {
     pub uniform: bool,
     pub head: journal_contract::Result<Lsn>,
     pub epoch: Epoch,
+    /// Offload progress, and the logical floor.
+    pub offload: Option<crate::stream::consensus::state::OffloadView>,
 }
 
 /// Read-only inspection of one stream's snapshot and replayed suffix state.
@@ -1701,6 +1761,7 @@ pub(in crate::stream::consensus) async fn replay(
                 .state
                 .writer()
                 .map_or(Epoch(0), |(fence, _)| fence.epoch),
+            offload: image.state.offload_view(),
         })
     })
     .await
@@ -1778,6 +1839,10 @@ const MAGIC: &[u8; 8] = b"LKRIMG03";
 /// metadata and before the records. An N format, written only once the
 /// cluster version is finalized.
 const MAGIC_WITH_EPOCHS: &[u8; 8] = b"LKRIMG04";
+/// Images that also carry offload progress after the epoch runs. Written
+/// only for a stream that offloaded, which needs the finalized
+/// `CLUSTER_VERSION_OFFLOAD`, so N-1 receivers never meet it.
+const MAGIC_WITH_OFFLOAD: &[u8; 8] = b"LKRIMG05";
 const STAGED_IMAGE: &str = "lk-stage-";
 const HEADER_BYTES: u64 = 12;
 
@@ -1791,7 +1856,12 @@ fn write_image(
     with_epochs: bool,
     quarantine: impl Fn(&str),
 ) -> io::Result<()> {
-    file.write_all(if with_epochs {
+    let offload = image.state.offload();
+    let with_offload = offload != crate::stream::consensus::state::Offload::default();
+    let with_epochs = with_epochs || with_offload;
+    file.write_all(if with_offload {
+        MAGIC_WITH_OFFLOAD
+    } else if with_epochs {
         MAGIC_WITH_EPOCHS
     } else {
         MAGIC
@@ -1811,6 +1881,11 @@ fn write_image(
         if with_epochs {
             options()
                 .serialize_into(&mut writer, &image.state.epoch_runs())
+                .map_err(io::Error::other)?;
+        }
+        if with_offload {
+            options()
+                .serialize_into(&mut writer, &offload)
                 .map_err(io::Error::other)?;
         }
         for payload in image.state.records() {
@@ -1842,9 +1917,10 @@ fn read_image(
     let mut file = BufReader::new(file);
     let mut header = [0; 12];
     file.read_exact(&mut header)?;
-    let with_epochs = match &header[..8] {
-        magic if magic == MAGIC => false,
-        magic if magic == MAGIC_WITH_EPOCHS => true,
+    let (with_epochs, with_offload) = match &header[..8] {
+        magic if magic == MAGIC => (false, false),
+        magic if magic == MAGIC_WITH_EPOCHS => (true, false),
+        magic if magic == MAGIC_WITH_OFFLOAD => (true, true),
         _ => return Err(invalid("invalid snapshot format")),
     };
     let mut crc = crc32fast::Hasher::new();
@@ -1864,6 +1940,14 @@ fn read_image(
             .map_err(io::Error::other)?
     } else {
         EpochRuns::default()
+    };
+    let offload: crate::stream::consensus::state::Offload = if with_offload {
+        options()
+            .with_limit(MAX_MESSAGE)
+            .deserialize_from(&mut reader)
+            .map_err(io::Error::other)?
+    } else {
+        Default::default()
     };
     image.stage_intent = meta.snapshot_id.starts_with(STAGED_IMAGE);
     if &found != genesis
@@ -1916,6 +2000,7 @@ fn read_image(
     }
     image.state.restore_records(records, genesis.quota_bytes)?;
     image.state.restore_epochs(epochs)?;
+    image.state.restore_offload(offload)?;
     Ok((meta, image))
 }
 

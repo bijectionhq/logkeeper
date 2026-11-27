@@ -796,7 +796,11 @@ impl Engine {
 
     pub(super) async fn render_metrics(&self) -> String {
         let (_, scrape) = self.collect_streams_and_metrics().await;
-        self.disk.metrics.render_prometheus(&scrape)
+        let mut out = self.disk.metrics.render_prometheus(&scrape);
+        if let Some(offload) = &self.offload {
+            offload.store.metrics.render_prometheus(&mut out);
+        }
+        out
     }
 
     async fn collect_streams_and_metrics(&self) -> (ProblemReport, ScrapeSnapshot) {

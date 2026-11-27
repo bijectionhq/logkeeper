@@ -813,6 +813,8 @@ pub(super) fn internal(request: &Request) -> bool {
                 | Request::Delete(_)
                 | Request::AcknowledgeRecovery(_)
                 | Request::Written { .. }
+                | Request::OffloadStatus { .. }
+                | Request::Restore { .. }
         )
 }
 

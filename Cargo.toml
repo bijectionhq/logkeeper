@@ -14,7 +14,7 @@ description = "Epoch-fenced durable journals and a Rust quorum client"
 [features]
 simulation = []
 ordered-daemon = ["dep:ring", "dep:serde", "dep:serde_json", "dep:tokio-rustls", "uuid/serde"]
-stream = ["dep:ring", "dep:serde", "dep:serde_json", "dep:tokio-rustls", "dep:tracing", "dep:x509-parser", "uuid/serde", "journal-contract/serde", "dep:bincode", "dep:openraft", "tokio/fs"]
+stream = ["dep:ring", "dep:serde", "dep:serde_json", "dep:tokio-rustls", "dep:tracing", "dep:x509-parser", "uuid/serde", "journal-contract/serde", "dep:bincode", "dep:openraft", "tokio/fs", "dep:object_store"]
 consensus-testing = ["stream", "dep:rcgen", "dep:tempfile"]
 
 [dependencies]
@@ -25,6 +25,7 @@ crc32fast = "1.5"
 fs2 = "0.4"
 futures = "0.3"
 parking_lot = "0.12"
+object_store = { version = "=0.13.2", default-features = false, features = ["aws", "fs"], optional = true }
 openraft = { version = "=0.10.1", default-features = false, features = ["serde", "tokio-rt"], optional = true }
 prost = "0.14.3"
 rcgen = { version = "0.14", optional = true }

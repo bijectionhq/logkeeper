@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::{Genesis, Image, Payload, Selected, SnapshotMeta, invalid, sha256};
 use crate::stream::consensus::{
     decode, encode,
-    state::{EpochRuns, MAX_RETAINED_RECORDS, TIMED_RECORD},
+    state::{EpochRuns, MAX_RETAINED_RECORDS, Offload, TIMED_RECORD},
     storage::objects::{Key, Location, Object, Objects, Reference},
 };
 
@@ -26,10 +26,13 @@ pub(super) const MAGIC: &[u8; 8] = b"LKRIDX02";
 /// Roots without epochs, which reopen with unknown record epochs. Written
 /// until the cluster version is finalized, so a keeper can roll back.
 pub(super) const MAGIC_WITHOUT_EPOCHS: &[u8; 8] = b"LKRIDX01";
+/// Roots that also store offload progress. Written only once a stream has
+/// offloaded, which needs the finalized `CLUSTER_VERSION_OFFLOAD`.
+const MAGIC_WITH_OFFLOAD: &[u8; 8] = b"LKRIDX03";
 
 /// Whether a selected snapshot starts with an index root.
 pub(in crate::stream::consensus::storage) fn indexed(magic: &[u8; 8]) -> bool {
-    magic == MAGIC || magic == MAGIC_WITHOUT_EPOCHS
+    magic == MAGIC || magic == MAGIC_WITHOUT_EPOCHS || magic == MAGIC_WITH_OFFLOAD
 }
 const PAGE: usize = 128;
 const MAX_PAGES: usize = MAX_RETAINED_RECORDS / PAGE + 1;
@@ -161,7 +164,13 @@ pub(super) fn build(
         pages,
         legacy: dependencies.legacy.clone(),
     };
-    let (magic, root) = if with_epochs {
+    let offload = image.state.offload();
+    let (magic, root) = if offload != Offload::default() {
+        (
+            MAGIC_WITH_OFFLOAD,
+            encode(&(root, image.state.epoch_runs(), offload))?,
+        )
+    } else if with_epochs {
         (MAGIC, encode(&(root, image.state.epoch_runs()))?)
     } else {
         (MAGIC_WITHOUT_EPOCHS, encode(&root)?)
@@ -186,7 +195,7 @@ pub(super) fn open(
     if bytes.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("invalid indexed snapshot root"));
     }
-    let (mut root, epochs) = decode_root(&bytes)?;
+    let (mut root, epochs, offload) = decode_root(&bytes)?;
     root.image.stage_intent = root.meta.snapshot_id.starts_with(super::STAGED_IMAGE);
     if &root.genesis != genesis
         || root.meta.last_log_id != Some(selected.log_id)
@@ -254,17 +263,21 @@ pub(super) fn open(
         .state
         .restore_records(records, genesis.quota_bytes)?;
     root.image.state.restore_epochs(epochs)?;
+    root.image.state.restore_offload(offload)?;
     Ok((root.meta, root.image, dependencies))
 }
 
-fn decode_root(bytes: &[u8]) -> io::Result<(Root, EpochRuns)> {
+fn decode_root(bytes: &[u8]) -> io::Result<(Root, EpochRuns, Offload)> {
     if bytes.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("invalid indexed snapshot root"));
     }
     if let Some(body) = bytes.strip_prefix(MAGIC) {
+        let (root, epochs) = decode(body)?;
+        Ok((root, epochs, Offload::default()))
+    } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_OFFLOAD) {
         decode(body)
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITHOUT_EPOCHS) {
-        Ok((decode(body)?, EpochRuns::default()))
+        Ok((decode(body)?, EpochRuns::default(), Offload::default()))
     } else {
         Err(invalid("invalid indexed snapshot root"))
     }
@@ -276,7 +289,7 @@ pub(in crate::stream::consensus::storage) fn scrub_root(
     stream: StreamId,
     selected: Selected,
 ) -> io::Result<(VecDeque<Key>, VecDeque<[u8; 32]>)> {
-    let (root, _) = decode_root(bytes)?;
+    let (root, _, _) = decode_root(bytes)?;
     if root.genesis.stream != stream
         || root.meta.last_log_id != Some(selected.log_id)
         || root.pages.len() > MAX_PAGES

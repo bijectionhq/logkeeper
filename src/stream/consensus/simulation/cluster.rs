@@ -243,6 +243,7 @@ impl SimCluster {
                 timed_authority: None,
                 log_format: Default::default(),
                 admin: None,
+                offload: None,
                 sync_mode: crate::server::durability::SyncMode::Fsync,
                 retired: BTreeSet::new(),
             };

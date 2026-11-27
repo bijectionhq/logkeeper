@@ -21,6 +21,12 @@
 //! stream, which keeps it: the disk then holds mostly dead segments that
 //! cold records pin unless they are compacted.
 //!
+//! `--offload URL` turns on continuous offload to `URL` (`file:///dir`, or
+//! `s3://bucket/prefix` with `LOGKEEPER_OFFLOAD_ENDPOINT`, `AWS_ACCESS_KEY_ID`
+//! and `AWS_SECRET_ACCESS_KEY` for MinIO) with `--offload-interval-ms`
+//! batching, and reports the largest offload lag seen during the run and how
+//! long the leaders took to upload everything once the writers stopped.
+//!
 //! `--fill N` first writes N 64-byte records to stream 1 in 256-record
 //! batches and reports the process's resident memory with that stream open
 //! and, with `--park-after`, once it parked.
@@ -43,6 +49,8 @@ struct Args {
     sync_mode: SyncMode,
     fill: u64,
     cold: u64,
+    offload: Option<String>,
+    offload_interval_ms: u64,
 }
 
 fn args() -> Args {
@@ -56,6 +64,8 @@ fn args() -> Args {
         sync_mode: SyncMode::Full,
         fill: 0,
         cold: 0,
+        offload: None,
+        offload_interval_ms: 1000,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -74,6 +84,8 @@ fn args() -> Args {
             }
             "--fill" => args.fill = value.parse().unwrap(),
             "--cold" => args.cold = value.parse().unwrap(),
+            "--offload" => args.offload = Some(value),
+            "--offload-interval-ms" => args.offload_interval_ms = value.parse().unwrap(),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -167,6 +179,17 @@ async fn main() {
         None => LocalCluster::start(&[PRINCIPAL]).await,
     }
     .unwrap();
+    if let Some(url) = &args.offload {
+        let offload = serde_json::from_value(serde_json::json!({
+            "url": url,
+            "endpoint": std::env::var("LOGKEEPER_OFFLOAD_ENDPOINT").ok(),
+            "allow_http": true,
+            "batch_interval_ms": args.offload_interval_ms,
+            "max_lag_bytes": 1u64 << 40,
+        }))
+        .unwrap();
+        cluster.enable_offload(PRINCIPAL, offload).await.unwrap();
+    }
     let config = cluster.journal_config(1 << 30, args.record.max(4096));
     let journal = cluster.journal(PRINCIPAL, &config).unwrap();
     for id in 1..=args.streams {
@@ -269,6 +292,25 @@ async fn main() {
             latencies
         });
     }
+    let lag = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    if args.offload.is_some() {
+        let (journal, lag, active) = (journal.clone(), lag.clone(), args.active);
+        tokio::spawn(async move {
+            while Instant::now() < deadline {
+                for id in 1..=active {
+                    if let Ok(status) = journal
+                        .client()
+                        .offload_status(StreamId(u128::from(id)), false)
+                        .await
+                    {
+                        let behind = status.head.0.saturating_sub(status.offloaded_through.0);
+                        lag.fetch_max(behind, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+    }
     tokio::time::sleep_until(deadline.into()).await;
     let mut latencies = Vec::new();
     while let Some(result) = writers.join_next().await {
@@ -276,6 +318,26 @@ async fn main() {
     }
     let elapsed = started.elapsed().as_secs_f64();
     let cpu = cpu_seconds() - cpu;
+    if args.offload.is_some() {
+        let stopped = Instant::now();
+        for id in 1..=args.active {
+            loop {
+                let status = journal
+                    .client()
+                    .offload_status(StreamId(u128::from(id)), false)
+                    .await;
+                if status.is_ok_and(|status| status.offloaded_through >= status.head) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        memory += &format!(
+            ", \"offload_max_lag_records\": {}, \"offload_drain_ms\": {}",
+            lag.load(std::sync::atomic::Ordering::Relaxed),
+            stopped.elapsed().as_millis()
+        );
+    }
     latencies.sort();
     let percentile = |p: f64| {
         latencies

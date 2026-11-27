@@ -431,6 +431,49 @@ impl Client {
         )
     }
 
+    /// The leader's offload progress of `stream`. With `flush`, the leader
+    /// first uploads every record committed when it was asked, which an
+    /// online backup or export needs. Administrators only.
+    pub async fn offload_status(
+        &self,
+        stream: StreamId,
+        flush: bool,
+    ) -> Result<super::OffloadStatus> {
+        match self
+            .operation(Request::OffloadStatus { stream, flush })
+            .await?
+        {
+            Outcome::Offload(status) => Ok(status),
+            _ => Err(JournalError::Unavailable),
+        }
+    }
+
+    /// Points `stream`, freshly created and never sealed, at the records
+    /// `floor..=head` already in the offload store under its lineage 0,
+    /// and fences writers below `epoch`. `logkeeper admin import-stream`
+    /// and `restore-stream` put the records there first.
+    pub async fn restore_from_offload(
+        &self,
+        stream: StreamId,
+        floor: Lsn,
+        head: Lsn,
+        epoch: journal_contract::Epoch,
+    ) -> Result<Lsn> {
+        position(
+            self.operation(Request::Restore {
+                stream,
+                restore: super::state::Restore {
+                    lineage: 1,
+                    floor,
+                    head,
+                    epoch,
+                    replace: true,
+                },
+            })
+            .await?,
+        )
+    }
+
     /// Stages a timed original on one signing voter and returns its signed
     /// sync sample. Stage on the first two voters of the sorted roster.
     pub(super) async fn stage_original(

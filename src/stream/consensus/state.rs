@@ -88,6 +88,35 @@ pub enum Command {
         writer_session_id: WriterSessionId,
         owner: String,
     },
+    /// The leader uploaded the committed records through `through` under
+    /// `lineage` to the offload store. Every voter advances its
+    /// `offloaded_through` and drops its local copies of offloaded records
+    /// below `retain_from`. Ignored under any other lineage. Added after
+    /// `AcknowledgeRecovery` and proposed only once the cluster finalized
+    /// `CLUSTER_VERSION_OFFLOAD`, so older keepers never meet it.
+    Offloaded {
+        lineage: u64,
+        through: Lsn,
+        retain_from: Lsn,
+    },
+    /// Starts a new offload lineage, and with `replace` makes the store's
+    /// committed run the whole history: an operator recovery from object
+    /// store plus survivor, or a restore into a fresh stream.
+    Restore(Restore),
+}
+
+/// A new offload lineage: see `Command::Restore`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Restore {
+    pub lineage: u64,
+    /// The lowest LSN the restored history holds.
+    pub floor: Lsn,
+    /// The last LSN the store holds under the previous lineages.
+    pub head: Lsn,
+    /// The highest writer epoch the restored records were written under.
+    pub epoch: Epoch,
+    /// Drop every local record and serve `floor..=head` from the store.
+    pub replace: bool,
 }
 
 /// The most records one batch carries.
@@ -166,6 +195,12 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
             writer_session_id: WriterSessionId,
             owner: String,
         },
+        Offloaded {
+            lineage: u64,
+            through: Lsn,
+            retain_from: Lsn,
+        },
+        Restore(Restore),
     }
     Application::deserialize(decoder).map(Box::new)
 }
@@ -223,6 +258,10 @@ impl std::fmt::Display for Command {
             Self::AcknowledgeRecoveryWithMarker { fence, .. } => {
                 write!(f, "AcknowledgeRecoveryWithMarker({fence:?})")
             }
+            Self::Offloaded {
+                lineage, through, ..
+            } => write!(f, "Offloaded({lineage}, {through:?})"),
+            Self::Restore(restore) => write!(f, "Restore({}, {:?})", restore.lineage, restore.head),
         }
     }
 }
@@ -240,6 +279,9 @@ pub enum Outcome {
     /// The retained evidence of a timed original record.
     OriginalEvidence(Vec<u8>),
     RecoveryFence(Option<RecoveryFence>),
+    /// A stream's offload progress, answering `Request::OffloadStatus`.
+    /// Added last; never an applied command's outcome.
+    Offload(super::OffloadStatus),
 }
 
 impl From<Result<Outcome>> for Outcome {
@@ -272,6 +314,97 @@ pub(super) struct Live {
     /// store them beside the image.
     #[serde(skip)]
     epochs: EpochRuns,
+    /// Offload progress. Snapshots store it beside the image, like the
+    /// epochs, so images without offload keep their format.
+    #[serde(skip)]
+    offload: Offload,
+}
+
+/// One stream's offload progress.
+///
+/// `Live::floor` is the first record this keeper holds. The logical floor,
+/// below which the writer trimmed, is `floor` here when retention dropped
+/// offloaded records above it, and `Live::floor` otherwise. Records from
+/// the logical floor up to `Live::floor` are read from the store.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Offload {
+    /// The last LSN durably uploaded, or 0.
+    pub through: Lsn,
+    /// The logical floor, when below the local one.
+    pub floor: Option<Lsn>,
+    /// The current lineage. Lineage 0 starts at LSN 1.
+    pub lineage: u64,
+    /// The lineages after the first, each with the first LSN its objects
+    /// are authoritative for, ascending.
+    pub lineages: Vec<(u64, Lsn)>,
+}
+
+impl Default for Offload {
+    fn default() -> Self {
+        Self {
+            through: Lsn(0),
+            floor: None,
+            lineage: 0,
+            lineages: Vec::new(),
+        }
+    }
+}
+
+impl Offload {
+    /// Every lineage with the first LSN it is authoritative for.
+    pub fn map(&self) -> Vec<(u64, Lsn)> {
+        let mut map = vec![(0, Lsn(1))];
+        map.extend(self.lineages.iter().copied());
+        map
+    }
+
+    /// The lineage whose objects hold `at`, and the last LSN they are
+    /// authoritative for.
+    pub fn lineage_of(&self, at: Lsn) -> (u64, Lsn) {
+        let map = self.map();
+        let index = map
+            .partition_point(|(_, from)| *from <= at)
+            .saturating_sub(1);
+        let end = map
+            .get(index + 1)
+            .map_or(Lsn(u64::MAX), |(_, next)| Lsn(next.0 - 1));
+        (map[index].0, end)
+    }
+
+    fn valid(&self, floor: Lsn, head: Lsn) -> bool {
+        self.through <= head
+            && self
+                .floor
+                .is_none_or(|logical| logical >= Lsn(1) && logical < floor)
+            && self.lineages.last().map_or(0, |(lineage, _)| *lineage) == self.lineage
+            && self
+                .map()
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0 && pair[0].1 <= pair[1].1)
+    }
+}
+
+/// A read page of records this keeper no longer holds: they are read from
+/// the offload store's `lineage` objects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Remote {
+    pub lineage: u64,
+    pub from: Lsn,
+    /// The last LSN to read from the store: below the local floor and
+    /// within the lineage.
+    pub until: Lsn,
+    pub floor: Lsn,
+    pub head: Lsn,
+}
+
+/// What the uploader needs from a stream's applied state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct OffloadView {
+    pub offload: Offload,
+    pub logical_floor: Lsn,
+    pub local_floor: Lsn,
+    pub head: Lsn,
+    pub epoch: Epoch,
 }
 
 /// The most epoch runs a stream retains. A writer that seals more often
@@ -290,6 +423,22 @@ impl EpochRuns {
     pub fn epoch(&self, at: Lsn) -> Option<Epoch> {
         let runs = self.0.partition_point(|(first, _)| *first <= at);
         runs.checked_sub(1).map(|run| self.0[run].1)
+    }
+
+    /// The runs that cover `first..=last`, the first starting at `first`
+    /// when its epoch is known.
+    pub fn covering(&self, first: Lsn, last: Lsn) -> Vec<(Lsn, Epoch)> {
+        let mut runs = Vec::new();
+        if let Some(epoch) = self.epoch(first) {
+            runs.push((first, epoch));
+        }
+        runs.extend(
+            self.0
+                .iter()
+                .filter(|(start, _)| *start > first && *start <= last)
+                .copied(),
+        );
+        runs
     }
 
     /// Notes records written from `at` under `epoch`.
@@ -595,6 +744,7 @@ impl State {
                         bytes: 0,
                         records: VecDeque::new(),
                         epochs: EpochRuns::default(),
+                        offload: Offload::default(),
                     };
                     *self = if genesis.immutable {
                         Self::Immutable {
@@ -643,6 +793,13 @@ impl State {
             }
             Command::AcknowledgeRecovery if !genesis.immutable => live.acknowledge_recovery(),
             Command::AcknowledgeRecovery => Err(JournalError::Unsupported),
+            Command::Offloaded {
+                lineage,
+                through,
+                retain_from,
+            } => Ok(live.offloaded(lineage, through, retain_from)),
+            Command::Restore(_) if genesis.immutable => Err(JournalError::Unsupported),
+            Command::Restore(restore) => Ok(live.restore(restore)),
             Command::SealSession { .. }
             | Command::Create
             | Command::Append { .. }
@@ -732,6 +889,121 @@ impl State {
 
     pub fn read(&self, from: Lsn, limit: usize) -> Result<ReadPage> {
         self.live()?.read(from, limit)
+    }
+
+    /// Where a read from `from` must go when this keeper no longer holds
+    /// the record: the store's objects of its lineage. `None` when the
+    /// record is held locally, trimmed, or past the head.
+    pub fn remote(&self, from: Lsn) -> Option<Remote> {
+        let live = self.live().ok()?;
+        let logical = live.logical_floor();
+        if from < logical || from >= live.floor || from > live.head {
+            return None;
+        }
+        let (lineage, end) = live.offload.lineage_of(from);
+        Some(Remote {
+            lineage,
+            from,
+            until: Lsn((live.floor.0 - 1).min(end.0).min(live.head.0)),
+            floor: logical,
+            head: live.head,
+        })
+    }
+
+    /// The applied offload progress, for the uploader.
+    pub fn offload_view(&self) -> Option<OffloadView> {
+        let live = self.live().ok()?;
+        Some(OffloadView {
+            offload: live.offload.clone(),
+            logical_floor: live.logical_floor(),
+            local_floor: live.floor,
+            head: live.head,
+            epoch: live.epoch(),
+        })
+    }
+
+    /// The retained records from `from`, at most `max_bytes` of them (at
+    /// least one), with the epoch runs that cover them.
+    pub fn offload_records(
+        &self,
+        from: Lsn,
+        max_bytes: u64,
+    ) -> Result<(Vec<(Lsn, Payload)>, Vec<(Lsn, Epoch)>)> {
+        let live = self.live()?;
+        if from < live.floor {
+            return Err(JournalError::Trimmed { floor: live.floor });
+        }
+        let mut records = Vec::new();
+        let mut bytes = 0u64;
+        for (index, payload) in live
+            .records
+            .iter()
+            .enumerate()
+            .skip((from.0 - live.floor.0) as usize)
+        {
+            if !records.is_empty() && bytes + payload.len() as u64 > max_bytes {
+                break;
+            }
+            bytes += payload.len() as u64;
+            records.push((Lsn(live.floor.0 + index as u64), payload.clone()));
+        }
+        let epochs = match (records.first(), records.last()) {
+            (Some((first, _)), Some((last, _))) => live.epochs.covering(*first, *last),
+            _ => Vec::new(),
+        };
+        Ok((records, epochs))
+    }
+
+    /// About how many retained bytes lie from `from` through the head: the
+    /// record count times the stream's average retained charge, in constant
+    /// time, since the uploader asks every 100 ms for every stream it leads.
+    pub fn waiting_bytes(&self, from: Lsn) -> u64 {
+        self.live().ok().map_or(0, |live| {
+            let from = from.max(live.floor);
+            if from > live.head || live.records.is_empty() {
+                return 0;
+            }
+            let count = live.head.0 - from.0 + 1;
+            count.saturating_mul(live.bytes / live.records.len() as u64)
+        })
+    }
+
+    /// The local floor that keeps at least the newest `bytes` retained
+    /// bytes: the lowest LSN whose suffix through the head holds no more.
+    pub fn retention_floor(&self, bytes: u64) -> Lsn {
+        let Ok(live) = self.live() else {
+            return Lsn(0);
+        };
+        let mut kept = 0u64;
+        let mut floor = live.head.0 + 1;
+        for payload in live.records.iter().rev() {
+            kept += payload.len() as u64;
+            if kept > bytes {
+                break;
+            }
+            floor -= 1;
+        }
+        Lsn(floor)
+    }
+
+    /// The offload progress, for a snapshot.
+    pub fn offload(&self) -> Offload {
+        self.live()
+            .ok()
+            .map_or_else(Offload::default, |live| live.offload.clone())
+    }
+
+    /// Restores the offload progress a snapshot stored beside its image.
+    pub fn restore_offload(&mut self, offload: Offload) -> io::Result<()> {
+        if let Self::Live(live) = self {
+            if !offload.valid(live.floor, live.head) {
+                return Err(super::invalid("invalid offload progress"));
+            }
+            live.offload = offload;
+        } else if offload != Offload::default() {
+            return Err(super::invalid("offload progress without a live stream"));
+        }
+        Ok(())
     }
 
     /// The sealed writer fence and principal, when a writer holds the stream.
@@ -913,6 +1185,83 @@ impl State {
 }
 
 impl Live {
+    fn logical_floor(&self) -> Lsn {
+        self.offload.floor.unwrap_or(self.floor)
+    }
+
+    /// Drops local records below `target`, which offload already holds.
+    fn drop_local(&mut self, target: Lsn) {
+        if target <= self.floor {
+            return;
+        }
+        let logical = self.logical_floor();
+        let count = (target.0 - self.floor.0) as usize;
+        for payload in self.records.drain(..count) {
+            self.bytes -= record_charge(payload.len());
+        }
+        if self.records.capacity() > self.records.len().saturating_mul(2).max(1024) {
+            self.records.shrink_to_fit();
+        }
+        self.floor = target;
+        self.epochs.trim(self.floor);
+        self.offload.floor = Some(logical).filter(|logical| *logical < self.floor);
+    }
+
+    fn offloaded(&mut self, lineage: u64, through: Lsn, retain_from: Lsn) -> Outcome {
+        if lineage != self.offload.lineage {
+            return Outcome::Refused(JournalError::Conflict { head: self.head });
+        }
+        self.offload.through = Lsn(super::decisions::offloaded_through(
+            self.offload.through.0,
+            through.0,
+            self.head.0,
+        ));
+        self.drop_local(Lsn(super::decisions::local_floor(
+            self.floor.0,
+            retain_from.0,
+            self.offload.through.0,
+            self.head.0,
+        )));
+        Outcome::At(self.offload.through)
+    }
+
+    fn restore(&mut self, restore: Restore) -> Outcome {
+        if restore.lineage <= self.offload.lineage {
+            return Outcome::Refused(JournalError::Conflict { head: self.head });
+        }
+        if restore.replace {
+            let floor = restore.floor.max(Lsn(1)).min(Lsn(restore.head.0 + 1));
+            self.records.clear();
+            self.records.shrink_to_fit();
+            self.bytes = 0;
+            self.head = restore.head;
+            self.floor = Lsn(restore.head.0 + 1);
+            self.epochs = EpochRuns::default();
+            self.offload.floor = Some(floor).filter(|floor| *floor < self.floor);
+            self.offload.through = restore.head;
+            if restore.epoch > self.epoch() {
+                self.writer = Some((
+                    Fence {
+                        epoch: restore.epoch,
+                        writer: uuid::Uuid::nil(),
+                    },
+                    String::new(),
+                ));
+            }
+        } else {
+            self.offload.through = Lsn(super::decisions::offloaded_through(
+                self.offload.through.0,
+                restore.head.0,
+                self.head.0,
+            ));
+        }
+        self.offload.lineage = restore.lineage;
+        self.offload
+            .lineages
+            .push((restore.lineage, Lsn(self.offload.through.0 + 1)));
+        Outcome::At(self.head)
+    }
+
     fn epoch(&self) -> Epoch {
         self.writer
             .as_ref()
@@ -1153,13 +1502,22 @@ impl Live {
             }
             self.floor = Lsn(through.0 + 1);
             self.epochs.trim(self.floor);
+            self.offload.floor = None;
+        } else if through >= self.logical_floor() {
+            // Only offloaded records lie below the local floor.
+            self.offload.floor = Some(Lsn(through.0 + 1)).filter(|floor| *floor < self.floor);
         }
         Ok(Outcome::Unit)
     }
 
     fn read(&self, from: Lsn, limit: usize) -> Result<ReadPage> {
+        let logical = self.logical_floor();
+        if from < logical {
+            return Err(JournalError::Trimmed { floor: logical });
+        }
         if from < self.floor {
-            return Err(JournalError::Trimmed { floor: self.floor });
+            // Offloaded and dropped here: the caller reads the store.
+            return Err(JournalError::Unavailable);
         }
         let mut records = Vec::new();
         if from <= self.head {
@@ -1178,7 +1536,7 @@ impl Live {
             }
         }
         Ok(ReadPage {
-            floor: self.floor,
+            floor: logical,
             records,
             head: self.head,
         })

@@ -73,6 +73,16 @@ impl Config {
             "snapshot_send_bytes_per_second": self.snapshot_send_bytes_per_second,
             "timed_original": self.timed_original.is_some(),
             "log_format": self.log_format,
+            "offload": self.offload.as_ref().map(|offload| serde_json::json!({
+                "url": offload.url,
+                "endpoint": offload.endpoint,
+                "secret_access_key": offload.secret_access_key.as_ref().map(|_| REDACTED),
+                "batch_bytes": offload.batch_bytes,
+                "batch_interval_ms": offload.batch_interval_ms,
+                "max_lag_bytes": offload.max_lag_bytes,
+                "backpressure": offload.backpressure,
+                "retain_local_bytes": offload.retain_local_bytes,
+            })),
             "admin": self.admin.as_ref().map(|admin| serde_json::json!({
                 "listen": admin.listen,
                 "mtls": admin.mtls,

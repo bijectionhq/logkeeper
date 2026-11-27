@@ -80,6 +80,9 @@ pub struct RecoveryReport {
     pub term: u64,
     /// False when an earlier run already wrote this recovery.
     pub written: bool,
+    /// The offload store's part, when the keeper offloads: the exact loss
+    /// point and whether the store's longer run replaced the survivor's.
+    pub offload: Option<super::offload::OffloadRecovery>,
 }
 
 impl std::fmt::Display for RecoveryReport {
@@ -105,7 +108,11 @@ impl std::fmt::Display for RecoveryReport {
             self.epoch.0,
             self.lost[0],
             self.lost[1],
-        )
+        )?;
+        if let Some(offload) = &self.offload {
+            write!(f, " {offload}")?;
+        }
+        Ok(())
     }
 }
 
@@ -167,6 +174,7 @@ impl Config {
         let replayed = storage::replay(disk, genesis.clone(), placement.clone()).await?;
         let head = replayed
             .head
+            .clone()
             .map_err(|error| invalid(format!("the stream cannot be recovered: {error:?}")))?;
         let configuration = replayed
             .configuration
@@ -188,6 +196,7 @@ impl Config {
                 epoch: replayed.epoch,
                 term: point.vote_term,
                 written: false,
+                offload: None,
             };
             crate::stream::consensus::logging::audit_recovery(
                 self.keeper,
@@ -353,7 +362,12 @@ impl Config {
         let tip = point.tip;
         let term = decisions::recovery_term(point.vote_term, point.log_term)
             .ok_or_else(|| invalid("the stream's term is exhausted"))?;
-        let epoch = decisions::recovery_epoch(replayed.epoch.0)
+        // With offload, the history is the survivor plus the object store.
+        let offload = self.recovery_offload(stream, head, &replayed).await?;
+        let restored_epoch = offload.as_ref().map_or(replayed.epoch, |(restore, _)| {
+            restore.epoch.max(replayed.epoch)
+        });
+        let epoch = decisions::recovery_epoch(restored_epoch.0)
             .map(Epoch)
             .ok_or_else(|| invalid("the stream's epoch is exhausted"))?;
         if !decisions::allows_recovery(
@@ -437,16 +451,23 @@ impl Config {
             .collect::<io::Result<BTreeMap<_, _>>>()?;
         let membership = openraft::Membership::new(vec![nodes.keys().copied().collect()], nodes)
             .map_err(io::Error::other)?;
-        let entries = vec![
-            Entry {
-                log_id: log_id(next),
-                payload: EntryPayload::Normal(Command::Recover(stage.clone())),
-            },
-            Entry {
-                log_id: log_id(next + 1),
-                payload: EntryPayload::Membership(membership),
-            },
-        ];
+        let mut commands = Vec::new();
+        if let Some((restore, _)) = &offload {
+            commands.push(Command::Restore(restore.clone()));
+        }
+        commands.push(Command::Recover(stage.clone()));
+        let mut entries = commands
+            .into_iter()
+            .enumerate()
+            .map(|(offset, command)| Entry {
+                log_id: log_id(next + offset as u64),
+                payload: EntryPayload::Normal(command),
+            })
+            .collect::<Vec<_>>();
+        entries.push(Entry {
+            log_id: log_id(next + entries.len() as u64),
+            payload: EntryPayload::Membership(membership),
+        });
         #[cfg(test)]
         if let Some(cut) = recovery.interrupt {
             disk.interrupt_next(stream, cut);
@@ -469,6 +490,7 @@ impl Config {
             epoch,
             term,
             written: true,
+            offload: offload.map(|(_, report)| report),
         };
         crate::stream::consensus::logging::audit_recovery(
             self.keeper,
@@ -483,6 +505,32 @@ impl Config {
             "ok",
         );
         Ok(report)
+    }
+
+    /// The offload store's part of a recovery, when this keeper offloads.
+    async fn recovery_offload(
+        &self,
+        stream: StreamId,
+        head: Lsn,
+        replayed: &storage::Replayed,
+    ) -> io::Result<
+        Option<(
+            crate::stream::consensus::state::Restore,
+            super::offload::OffloadRecovery,
+        )>,
+    > {
+        let (Some(config), Some(view)) = (&self.offload, &replayed.offload) else {
+            return Ok(None);
+        };
+        let store = crate::stream::consensus::offload::Store::open(config)?;
+        super::offload::plan_recovery(&store, stream, head, replayed.epoch, view)
+            .await
+            .map(Some)
+            .map_err(|error| {
+                invalid(format!(
+                    "refused: the offload store must be readable to find the loss point: {error}"
+                ))
+            })
     }
 
     async fn stage_in_catalog(

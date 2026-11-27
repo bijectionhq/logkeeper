@@ -753,4 +753,43 @@ fn replay_detects_a_rolled_back_segment(
     true
 }
 
+
+// Offload.prefix: the replicated offloaded_through never moves back and
+// never passes the applied head, so the uploaded prefix stays a prefix of
+// the committed log.
+fn offloaded_prefix_stays_within_the_head(current: u64, proposed: u64, head: u64)
+    requires current <= head,
+{
+    let out = offloaded_through(current, proposed, head);
+    assert(out >= current);
+    assert(out <= head);
+}
+
+// Offload.retention: retention drops only offloaded records, never past the
+// head, and the local floor never moves back.
+fn retention_drops_only_offloaded_records(floor: u64, requested: u64, offloaded: u64, head: u64)
+    requires floor as int <= offloaded as int + 1, offloaded <= head,
+{
+    let out = local_floor(floor, requested, offloaded, head);
+    assert(out >= floor);
+    assert(out as int <= offloaded as int + 1);
+    assert(out as int <= head as int + 1);
+}
+
+// Offload.loss_point: a recovery keeps the survivor's head and the store's
+// committed run, whichever is longer.
+fn recovery_keeps_the_longer_history(survivor: u64, uploaded: u64) {
+    let out = recovered_head(survivor, uploaded);
+    assert(out >= survivor && out >= uploaded);
+}
+
+// Offload.backpressure: appends are refused only when enforced and the
+// waiting bytes exceed the limit.
+fn backpressure_only_past_the_limit(waiting: u64, limit: u64) {
+    let off = offload_backpressure(false, waiting, limit);
+    assert(!off);
+    let within = offload_backpressure(true, limit, limit);
+    assert(!within);
+}
+
 }

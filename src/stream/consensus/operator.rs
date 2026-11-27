@@ -71,6 +71,10 @@ pub struct OperatorConfig {
     /// Deadline for each client operation, in milliseconds.
     #[serde(default = "default_deadline_ms")]
     pub deadline_ms: u64,
+    /// The keepers' offload store, for `export-stream`, `import-stream`
+    /// and `restore-stream`.
+    #[serde(default)]
+    pub offload: Option<super::OffloadConfig>,
 }
 
 impl OperatorConfig {
@@ -194,6 +198,15 @@ impl Operator {
             .configuration(stream)
             .await
             .map_err(journal_error)
+    }
+
+    fn offload_store(&self) -> io::Result<super::offload::Store> {
+        let config = self.config.offload.as_ref().ok_or_else(|| {
+            invalid(
+                "name the keepers' offload store under \"offload\" in the operator configuration",
+            )
+        })?;
+        super::offload::Store::open(config)
     }
 
     /// A stream's configuration, leader, head, replicas and problems. Parts
@@ -585,7 +598,11 @@ Commands:
   drain --keeper KEEPER [--wait-secs N] | undrain --keeper KEEPER | drain-status --keeper KEEPER
   decommission --keeper KEEPER [--wait-secs N]
   clear-quarantine --keeper KEEPER --stream UUID
-  finalize-version";
+  finalize-version
+  offload-status --stream UUID
+  export-stream --stream UUID --to DIRECTORY
+  import-stream --from DIRECTORY --stream NEW_UUID --quota-bytes N [--voters A,B,C]
+  restore-stream --from-stream UUID --stream NEW_UUID --quota-bytes N [--voters A,B,C] [--floor LSN] --acknowledge-data-loss";
 
 /// The outcome of one `logkeeper admin` command: what to print, and
 /// whether the command succeeded.
@@ -606,6 +623,10 @@ pub async fn admin_command(args: &[String]) -> io::Result<AdminOutcome> {
     while let Some(flag) = iter.next() {
         if flag == "--json" {
             json_output = true;
+            continue;
+        }
+        if flag == "--acknowledge-data-loss" {
+            flags.insert("acknowledge-data-loss", "yes");
             continue;
         }
         let name = flag.strip_prefix("--").ok_or_else(usage)?;
@@ -671,6 +692,93 @@ impl Operator {
             json: false,
         };
         let outcome = match command {
+            "offload-status" => {
+                let stream = stream_flag(&mut flags)?;
+                let status = self
+                    .client
+                    .offload_status(stream, false)
+                    .await
+                    .map_err(journal_error)?;
+                done(serde_json::to_value(status)?)
+            }
+            "export-stream" => {
+                let stream = stream_flag(&mut flags)?;
+                let to = flags.remove("to").ok_or_else(|| invalid(ADMIN_USAGE))?;
+                let store = self.offload_store()?;
+                let manifest =
+                    super::offload::transfer::export(&self.client, &store, stream, Path::new(to))
+                        .await?;
+                done(json!({
+                    "stream": manifest.stream,
+                    "floor": manifest.floor.0,
+                    "head": manifest.head.0,
+                    "epoch": manifest.epoch.0,
+                    "objects": manifest.parts.len(),
+                    "directory": to,
+                }))
+            }
+            "import-stream" | "restore-stream" => {
+                let target = stream_flag(&mut flags)?;
+                let quota = flags
+                    .remove("quota-bytes")
+                    .ok_or_else(|| invalid(ADMIN_USAGE))?
+                    .parse::<u64>()
+                    .map_err(|error| invalid(format!("--quota-bytes: {error}")))?;
+                let voters = flags.remove("voters").map(parse_voters).transpose()?;
+                let store = self.offload_store()?;
+                let (loaded, source) = if command == "import-stream" {
+                    let from = flags.remove("from").ok_or_else(|| invalid(ADMIN_USAGE))?;
+                    (
+                        super::offload::transfer::read_export(Path::new(from))?,
+                        json!(from),
+                    )
+                } else {
+                    let source = parse_uuid(
+                        flags
+                            .remove("from-stream")
+                            .ok_or_else(|| invalid(ADMIN_USAGE))?,
+                    )?;
+                    if flags.remove("acknowledge-data-loss").is_none() {
+                        return Err(invalid(
+                            "restore-stream rebuilds a stream from the object store alone: \
+                             records acknowledged after the last upload are lost. Add \
+                             --acknowledge-data-loss to proceed",
+                        ));
+                    }
+                    let floor = flags
+                        .remove("floor")
+                        .map(str::parse::<u64>)
+                        .transpose()
+                        .map_err(|error| invalid(format!("--floor: {error}")))?
+                        .unwrap_or(1);
+                    (
+                        super::offload::transfer::read_store(
+                            &store,
+                            StreamId(source.as_u128()),
+                            journal_contract::Lsn(floor),
+                        )
+                        .await?,
+                        json!(source),
+                    )
+                };
+                no_remaining_flags(command, &flags)?;
+                super::offload::transfer::stage(&store, target, &loaded).await?;
+                let configuration = self.create(target, voters, quota).await?;
+                let head = self
+                    .client
+                    .restore_from_offload(target, loaded.floor, loaded.head, loaded.epoch)
+                    .await
+                    .map_err(journal_error)?;
+                done(json!({
+                    "stream": Uuid::from_u128(target.0),
+                    "source": source,
+                    "configuration": configuration,
+                    "floor": loaded.floor.0,
+                    "head": head.0,
+                    "epoch": loaded.epoch.0,
+                    "kept": format!("records {}..={}", loaded.floor.0, loaded.head.0),
+                }))
+            }
             "create" => {
                 let stream = stream_flag(&mut flags)?;
                 let quota = flags

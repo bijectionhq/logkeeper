@@ -17,6 +17,7 @@ pub(super) fn operator_config(
         admin_mtls: true,
         placement: None,
         deadline_ms: 10_000,
+        offload: None,
     }
 }
 

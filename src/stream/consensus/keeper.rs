@@ -8,6 +8,7 @@ mod drain;
 mod incarnation;
 mod ingress;
 mod liveness;
+mod offload;
 mod park;
 mod recovery;
 mod repair;
@@ -57,6 +58,7 @@ use super::{
 use crate::server::durability::SyncMode;
 use crate::stream::{transport, wire::KeeperId};
 use admission::ReplicationIngress;
+pub use offload::OffloadStatus;
 pub use recovery::{Recovery, RecoveryReport};
 pub use retirement::FenceProof;
 
@@ -203,6 +205,10 @@ pub struct Config {
     /// `/ready`, `/safe-to-stop`, and `/problems`.
     #[serde(default)]
     pub admin: Option<AdminConfig>,
+    /// Continuous offload of committed records to object storage. Every
+    /// keeper of a cluster names the same store.
+    #[serde(default)]
+    pub offload: Option<super::OffloadConfig>,
 }
 
 impl Config {
@@ -507,7 +513,12 @@ impl Config {
             }
             None => None,
         };
+        let offload = match &self.offload {
+            Some(config) => Some(Arc::new(offload::Offloader::open(config.clone())?)),
+            None => None,
+        };
         let engine = Arc::new(Engine {
+            offload,
             summary,
             tls,
             probe_listen: self.admin.as_ref().and_then(|admin| admin.probe_listen),
@@ -590,6 +601,8 @@ struct TimedState {
 }
 
 pub(super) struct Engine {
+    /// Continuous offload to object storage, when configured.
+    pub(super) offload: Option<Arc<offload::Offloader>>,
     /// This keeper's settings without secrets, which `/status` reports.
     summary: serde_json::Value,
     tls: tls::Tls,
@@ -830,6 +843,14 @@ impl Engine {
             let compacting = self.clone();
             sockets.spawn(async move {
                 compacting.compaction_loop().await;
+                Ok(())
+            });
+            let offloading = self.clone();
+            let stopping = self.stop.clone();
+            sockets.spawn(async move {
+                offloading.offload_loop().await;
+                // A keeper stops when any of its tasks ends.
+                stopping.cancelled().await;
                 Ok(())
             });
             let scrubbing = self.clone();
@@ -1761,9 +1782,38 @@ impl Engine {
                     });
                 }
                 group.require_healthy()?;
+                if matches!(
+                    request,
+                    Request::Append { .. }
+                        | Request::AppendBatch { .. }
+                        | Request::AppendOriginal { .. }
+                ) && let Some(offload) = &self.offload
+                    && offload.backpressured(stream)
+                {
+                    super::metrics::count(&offload.store.metrics.backpressured_appends);
+                    return Ok(failure(JournalError::Unavailable));
+                }
                 let reply = match request {
                     Request::Head(_) => Ok(group.head().await),
                     Request::RecoveryFence(_) => Ok(group.recovery_fence().await),
+                    Request::OffloadStatus { flush, .. } => {
+                        Ok(self.offload_status(&group, flush).await)
+                    }
+                    Request::Restore { restore, .. } => {
+                        let actor = owner.as_deref().unwrap_or("unknown");
+                        let reply = self.restore_fresh(&group, restore.clone()).await;
+                        tracing::info!(
+                            target: "logkeeper::audit",
+                            keeper = %self.id,
+                            stream = %format!("{:032x}", stream.0),
+                            actor = actor,
+                            head = restore.head.0,
+                            floor = restore.floor.0,
+                            outcome = %describe_audit_reply(&reply),
+                            "restore stream from offload store"
+                        );
+                        Ok(reply)
+                    }
                     Request::Written {
                         fence,
                         at,
@@ -1778,7 +1828,9 @@ impl Engine {
                         wait_ms,
                         ..
                     } => Ok(Reply::Decision(if self.certified(&group) {
-                        group.read(from, limit, wait_ms, Lsn(0)).await
+                        group
+                            .read(from, limit, wait_ms, Lsn(0), self.offload.as_deref())
+                            .await
                     } else {
                         Outcome::Refused(JournalError::Unavailable)
                     })),
@@ -1807,7 +1859,9 @@ impl Engine {
                         ) {
                             return Ok(failure(JournalError::Unavailable));
                         }
-                        let outcome = group.read(from, limit, wait_ms, minimum_head).await;
+                        let outcome = group
+                            .read(from, limit, wait_ms, minimum_head, self.offload.as_deref())
+                            .await;
                         Ok(Reply::ScopedPage {
                             genesis,
                             configuration: group.state.finalized(),
@@ -2533,7 +2587,14 @@ impl Group {
         )
     }
 
-    async fn read(&self, from: Lsn, limit: usize, wait_ms: u32, minimum_head: Lsn) -> Outcome {
+    async fn read(
+        &self,
+        from: Lsn,
+        limit: usize,
+        wait_ms: u32,
+        minimum_head: Lsn,
+        offload: Option<&offload::Offloader>,
+    ) -> Outcome {
         let mut changed = self.state.subscribe();
         let deadline =
             Instant::now() + Duration::from_millis(u64::from(wait_ms)).min(REQUEST_TIMEOUT);
@@ -2543,6 +2604,16 @@ impl Group {
                     return Outcome::Refused(JournalError::Unavailable);
                 }
                 continue;
+            }
+            if let Some(remote) = self.state.remote(from) {
+                return match offload {
+                    Some(offload) => offload
+                        .read(self.genesis.stream, remote, limit)
+                        .await
+                        .map(Outcome::Page)
+                        .into(),
+                    None => Outcome::Refused(JournalError::Unavailable),
+                };
             }
             let page = self.state.page(from, limit).await;
             if !page

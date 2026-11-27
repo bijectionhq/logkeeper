@@ -31,7 +31,7 @@ pub(super) use media::{Authority, Enrollment, Incarnations};
 #[cfg(any(test, feature = "consensus-testing"))]
 pub(super) use media::{Provision, hex, sha256};
 pub(super) use objects::Object;
-pub(super) use snapshot::{Pin, SnapshotFile, StateMachine, repair_snapshot, replay};
+pub(super) use snapshot::{Pin, Replayed, SnapshotFile, StateMachine, repair_snapshot, replay};
 pub(super) use space::{Admission, MAX_TRANSFER_FILE};
 #[cfg(test)]
 pub(super) use wal::ReplicaFault;

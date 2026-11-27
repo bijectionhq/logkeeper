@@ -61,7 +61,7 @@ fn legacy_acknowledged() -> Recovery {
     }
 }
 
-async fn remember_peers(cluster: &Cluster, keeper: Uuid, peers: [Uuid; 2]) {
+pub(super) async fn remember_peers(cluster: &Cluster, keeper: Uuid, peers: [Uuid; 2]) {
     timeout(WAIT, async {
         for peer in peers {
             while cluster.running[&keeper]
@@ -273,36 +273,56 @@ async fn a_survivor_recovers_only_after_retiring_the_partitioned_voters() {
     // together. An obsolete acknowledgement must leave that fence in place.
     let other = contract_journal(&cluster, &cluster.other, report.voters);
     let generic: &dyn journal_contract::Journal = &other;
-    let active = RecoveryFence { epoch: Epoch(2), head: Lsn(5) };
-    let stale = RecoveryFence { epoch: Epoch(1), ..active };
+    let active = RecoveryFence {
+        epoch: Epoch(2),
+        head: Lsn(5),
+    };
+    let stale = RecoveryFence {
+        epoch: Epoch(1),
+        ..active
+    };
     let marker = Bytes::from_static(b"recovery marker");
     assert_eq!(
-        generic.acknowledge_recovery_with_marker(stream, stale, marker.clone()).await,
+        generic
+            .acknowledge_recovery_with_marker(stream, stale, marker.clone())
+            .await,
         Err(JournalError::Conflict { head: Lsn(5) }),
     );
     assert_eq!(generic.recovery_fence(stream).await, Ok(Some(active)));
     assert_eq!(
-        generic.acknowledge_recovery_with_marker(stream, active, marker.clone()).await,
+        generic
+            .acknowledge_recovery_with_marker(stream, active, marker.clone())
+            .await,
         Ok(Lsn(6))
     );
     let concurrent = Bytes::from_static(b"different recovery marker");
     assert_eq!(
-        contract.acknowledge_recovery_with_marker(stream, active, concurrent).await,
+        contract
+            .acknowledge_recovery_with_marker(stream, active, concurrent)
+            .await,
         Err(JournalError::Conflict { head: Lsn(6) }),
     );
     assert_eq!(generic.recovery_fence(stream).await, Ok(None));
     assert_eq!(
-        generic.acknowledge_recovery_with_marker(stream, active, marker.clone()).await,
+        generic
+            .acknowledge_recovery_with_marker(stream, active, marker.clone())
+            .await,
         Ok(Lsn(6)),
     );
     assert_eq!(contract.seal(stream, Epoch(3)).await, Ok(Lsn(6)));
     assert_eq!(
-        contract.read(stream, Lsn(6), 1, Duration::ZERO).await.unwrap().records,
+        contract
+            .read(stream, Lsn(6), 1, Duration::ZERO)
+            .await
+            .unwrap()
+            .records,
         vec![(Lsn(6), marker.clone())],
     );
     contract.trim(stream, Epoch(3), Lsn(6)).await.unwrap();
     assert_eq!(
-        generic.acknowledge_recovery_with_marker(stream, active, marker).await,
+        generic
+            .acknowledge_recovery_with_marker(stream, active, marker)
+            .await,
         Err(JournalError::Trimmed { floor: Lsn(7) }),
     );
 

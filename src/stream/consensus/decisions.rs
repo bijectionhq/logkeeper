@@ -364,6 +364,69 @@ pub(super) fn recovery_epoch(current: u64) -> Option<u64> {
     }
 }
 
+/// The offloaded prefix after a leader reports an upload through
+/// `proposed`: it never moves back and never passes the applied head, so
+/// it stays a prefix of the committed log.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out >= current,
+        out <= head || out == current,
+        out == current || out == proposed,
+))]
+pub(super) fn offloaded_through(current: u64, proposed: u64, head: u64) -> u64 {
+    if proposed > current && proposed <= head {
+        proposed
+    } else {
+        current
+    }
+}
+
+/// The first record a keeper keeps after retention asks to drop records
+/// below `requested`: only offloaded records, never past the head, and
+/// the local floor never moves back.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out >= floor,
+        out == floor || out as int <= offloaded as int + 1,
+        out == floor || out as int <= head as int + 1,
+        out == floor || out <= requested,
+))]
+pub(super) fn local_floor(floor: u64, requested: u64, offloaded: u64, head: u64) -> u64 {
+    let mut cap = requested;
+    if offloaded < u64::MAX && cap > offloaded + 1 {
+        cap = offloaded + 1;
+    }
+    if head < u64::MAX && cap > head + 1 {
+        cap = head + 1;
+    }
+    if cap > floor { cap } else { floor }
+}
+
+/// The head an operator recovery keeps: everything at or below the larger
+/// of the survivor's head and the end of the committed run the offload
+/// store holds. Records above it that a writer was acknowledged are lost.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures
+        out >= survivor,
+        out >= uploaded,
+        out == survivor || out == uploaded,
+))]
+pub(super) fn recovered_head(survivor: u64, uploaded: u64) -> u64 {
+    if uploaded > survivor {
+        uploaded
+    } else {
+        survivor
+    }
+}
+
+/// Whether a leader refuses an append because offload fell too far behind.
+#[cfg_attr(verus_keep_ghost, verus_spec(out =>
+    ensures out == (enforced && waiting > limit)
+))]
+pub(super) fn offload_backpressure(enforced: bool, waiting: u64, limit: u64) -> bool {
+    enforced && waiting > limit
+}
+
 /// Whether a replica refuses a peer's vote or append without answering it:
 /// the sender is outside the replica's effective membership and campaigns
 /// or leads in a term below the replica's vote. It belongs to a history

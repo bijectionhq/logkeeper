@@ -1,5 +1,5 @@
 {
-  "summary": "Verify the shipped consensus admission, metering, classification, rotation, batch and restart, operator recovery, recovery restage and recovery fence, keeper incarnation, slow media, parking, repair queue, placement load, leader preference, retirement, stale-vote and WAL boundary decisions against the PeerBudget, Headroom, RestartRead, Parking, RetireOnProof and RecoveryFence laws.",
+  "summary": "Verify the shipped consensus admission, metering, classification, rotation, batch and restart, operator recovery, recovery restage and recovery fence, keeper incarnation, slow media, parking, repair queue, placement load, leader preference, retirement, stale-vote, WAL boundary and offload decisions against the PeerBudget, Headroom, RestartRead, Parking, RetireOnProof and RecoveryFence laws.",
   "flags": [
     "--no-external-by-default",
     "--verify-module",
@@ -7,7 +7,7 @@
     "--verify-module",
     "laws"
   ],
-  "min_verified_functions": 133,
+  "min_verified_functions": 141,
   "controls": {
     "hide-application-entry": {
       "defect": "classify a payload batch as metadata only",
@@ -1257,6 +1257,65 @@
         }
       ],
       "min_verified_functions": 132
+    },
+    "offload-rewind": {
+      "defect": "let offloaded_through move back or past the head",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    if proposed > current && proposed <= head {",
+          "replace": "    if proposed <= head || proposed > current {"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "offloaded_through",
+          "category": "postcondition not satisfied"
+        },
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "offloaded_through",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 140
+    },
+    "retain-unoffloaded": {
+      "defect": "let retention drop records that were never offloaded",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    if offloaded < u64::MAX && cap > offloaded + 1 {\n        cap = offloaded + 1;\n    }\n",
+          "replace": ""
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "local_floor",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 140
+    },
+    "backpressure-always": {
+      "defect": "refuse appends whenever offload is configured",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "    enforced && waiting > limit\n}",
+          "replace": "    enforced\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "offload_backpressure",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 140
     }
   }
 }

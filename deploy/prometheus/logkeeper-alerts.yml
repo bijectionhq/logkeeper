@@ -229,3 +229,41 @@ groups:
         annotations:
           summary: "{{ $value }} proposals on {{ $labels.instance }} have been in flight for over a second"
           description: "Writes are stuck. logkeeper_consensus_commit_stage_seconds shows which stage holds them."
+
+  - name: logkeeper-offload
+    rules:
+      - alert: LogkeeperOffloadLagging
+        expr: logkeeper_offload_lag_seconds > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Offload on {{ $labels.instance }} is {{ $value }} s behind"
+          description: "A stream this keeper leads has committed records that waited over five minutes for upload. Check logkeeper_offload_upload_failures_total and the object store; recovery after losing a quorum keeps only what was uploaded or survives on a voter."
+
+      - alert: LogkeeperOffloadUploadsFailing
+        expr: rate(logkeeper_offload_upload_failures_total[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Uploads to the offload store fail on {{ $labels.instance }}"
+          description: "Segment uploads have failed for ten minutes and back off up to 30 s. Check the store's reachability, credentials and bucket policy."
+
+      - alert: LogkeeperOffloadBackpressure
+        expr: increase(logkeeper_offload_backpressured_appends_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Writers on {{ $labels.instance }} are refused because offload fell behind"
+          description: "More than max_lag_bytes wait for upload, so the leader refuses appends with Unavailable. Restore the object store, or raise max_lag_bytes or set backpressure to false to accept the risk."
+
+      - alert: LogkeeperOffloadCorruptObject
+        expr: increase(logkeeper_offload_corrupt_objects_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A fetched offload object failed its checksum on {{ $labels.instance }}"
+          description: "A segment object did not match its checksums or its key. Reads fall back to another object covering the same records when one exists. Follow docs/runbooks/offload.md."

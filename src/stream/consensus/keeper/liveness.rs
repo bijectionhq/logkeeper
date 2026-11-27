@@ -347,7 +347,9 @@ impl Engine {
         if target > CLUSTER_VERSION_CURRENT {
             return Err(JournalError::Unsupported);
         }
-        let required_feature = if target >= super::super::CLUSTER_VERSION_V4 {
+        let required_feature = if target >= super::super::CLUSTER_VERSION_V5 {
+            features::OFFLOAD
+        } else if target >= super::super::CLUSTER_VERSION_V4 {
             features::IMMUTABLE_STREAMS
         } else if target > super::super::CLUSTER_VERSION_V2 {
             features::RECOVERY_MARKER
@@ -378,10 +380,7 @@ impl Engine {
                 .await;
                 match probed {
                     Ok(Ok(pong)) if pong.status.keeper == keeper => {
-                        return if decisions::peer_supports(
-                            pong.status.features,
-                            required_feature,
-                        ) {
+                        return if decisions::peer_supports(pong.status.features, required_feature) {
                             Ok(())
                         } else {
                             Err(JournalError::Unsupported)
