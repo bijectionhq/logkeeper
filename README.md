@@ -1591,8 +1591,10 @@ create, truncate and migrate nothing.
 
 ```sh
 # Per stream: vote, membership, log range, applied and snapshot index, fence,
-# head, retained records and bytes, ownership, and quarantine. Parking is not
-# persisted, so a stopped keeper reports no stream parked.
+# the recorded recovery (fence, configuration epoch, loss point, exact flag,
+# source, and whether its typed entry is written yet), head, retained records
+# and bytes, ownership, and quarantine. Parking is not persisted, so a stopped
+# keeper reports no stream parked.
 logkeeper keeper inspect --config keeper.json [--stream UUID] [--json]
 
 # Both boundary slots, the checkpoint digest and references, every WAL

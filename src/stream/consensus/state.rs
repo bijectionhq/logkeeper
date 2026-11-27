@@ -1427,6 +1427,25 @@ impl State {
         self.live().ok().map_or(Lsn(1), |live| live.floor)
     }
 
+    /// The last typed recovery entry this copy retains, with its position.
+    pub fn last_recovery_entry(&self) -> io::Result<Option<(Lsn, RecoveryEntry)>> {
+        let Ok(live) = self.live() else {
+            return Ok(None);
+        };
+        let Some((index, record)) = live
+            .records
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, record)| record.kind() == RecordKind::Recovery)
+        else {
+            return Ok(None);
+        };
+        let entry = RecoveryEntry::decode(&record.load()?)
+            .ok_or_else(|| super::invalid("retained recovery entry does not decode"))?;
+        Ok(Some((Lsn(live.floor.0 + index as u64), entry)))
+    }
+
     /// Retained record count and byte charge for a live stream, or `(0, 0)`.
     pub fn retained_stats(&self) -> (u64, u64) {
         self.live()

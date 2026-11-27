@@ -209,6 +209,12 @@ store), the time, and RTDB's marker inside it. Both RTDB's acknowledgement
 and the administrator's below write it, so the stream always records the
 recovery, and no client append can forge it. `head` stays the last record
 kept.
+On a stopped keeper, `logkeeper keeper inspect --config FILE --stream UUID`
+prints the recorded recovery as `recovery: fence=epoch:E head:H
+configuration_epoch=C loss_point=L exact=… source=… entry_at=H+1
+entry_written=false` while the fence waits for its entry, and the same
+line with `entry_written=true` once it is written (`--json`: the
+`recovery` object of the stream).
 
 With `multiJournal.holdWritesAfterRecovery: true`, an operator can
 explicitly clear the fence with an administrator principal. Record that

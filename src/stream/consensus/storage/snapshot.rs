@@ -1768,11 +1768,27 @@ pub(super) struct StreamStateView {
     pub configuration: Option<Configuration>,
     pub fence: Option<(super::super::Fence, String)>,
     pub recovering: bool,
+    /// The recorded recovery waiting for its typed entry, else the last
+    /// typed entry this copy retains.
+    pub recovery: Option<RecoveryView>,
     pub head: Option<Lsn>,
     pub floor: Option<Lsn>,
     pub stream_state: &'static str,
     pub retained_records: u64,
     pub retained_bytes: u64,
+}
+
+/// A recorded recovery, as `inspect` reports it.
+pub(super) struct RecoveryView {
+    pub fence: journal_contract::RecoveryFence,
+    pub configuration_epoch: u64,
+    pub loss_point: Lsn,
+    pub exact: bool,
+    pub source: journal_contract::RecoverySource,
+    pub time_unix_ms: u64,
+    /// Whether the typed entry is written: false while the fence waits for
+    /// it.
+    pub written: bool,
 }
 
 /// Inspects a single stream's snapshot and WAL suffix strictly read-only,
@@ -1934,6 +1950,29 @@ pub(super) fn inspect_stream_readonly(
         Err(_) => ("unknown", None, None),
     };
     let (retained_records, retained_bytes) = image.state.retained_stats();
+    let recovery = match image.state.recorded_recovery() {
+        Some((fence, recorded)) => Some(RecoveryView {
+            fence,
+            configuration_epoch: recorded.record.epoch,
+            loss_point: recorded.record.loss_point,
+            exact: recorded.exact,
+            source: recorded.record.source,
+            time_unix_ms: recorded.record.time_unix_ms,
+            written: false,
+        }),
+        None => image
+            .state
+            .last_recovery_entry()?
+            .map(|(_, entry)| RecoveryView {
+                fence: entry.fence,
+                configuration_epoch: entry.configuration_epoch,
+                loss_point: entry.loss_point,
+                exact: entry.exact,
+                source: entry.source,
+                time_unix_ms: entry.time_unix_ms,
+                written: true,
+            }),
+    };
     Ok(StreamStateView {
         snapshot_applied,
         applied: image.applied,
@@ -1946,6 +1985,7 @@ pub(super) fn inspect_stream_readonly(
             .writer()
             .map(|(fence, owner)| (fence, owner.to_owned())),
         recovering: image.state.recovering(),
+        recovery,
         head,
         floor,
         stream_state,

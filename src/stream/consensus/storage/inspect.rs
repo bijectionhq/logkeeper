@@ -90,6 +90,24 @@ pub struct OwnershipInfo {
     pub staged_target: Option<Vec<Uuid>>,
 }
 
+/// An operator recovery recorded by the catalog: pending while its fence
+/// waits for the typed entry, written once the entry is in the stream.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RecoveryInfo {
+    pub fence_epoch: u64,
+    /// The last record the recovery kept; the entry sits right after it.
+    pub fence_head: u64,
+    pub entry_at: u64,
+    /// The catalog's configuration epoch (revision) of the recovery.
+    pub configuration_epoch: u64,
+    pub loss_point: u64,
+    pub exact: bool,
+    /// `survivor` or `object_store`.
+    pub source: &'static str,
+    pub time_unix_ms: u64,
+    pub entry_written: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StreamInspection {
     pub stream: Uuid,
@@ -101,6 +119,9 @@ pub struct StreamInspection {
     pub snapshot_applied: Option<LogIdInfo>,
     pub applied: Option<LogIdInfo>,
     pub fence: Option<FenceInfo>,
+    /// The recorded recovery waiting for its typed entry, else the last
+    /// typed entry this copy retains.
+    pub recovery: Option<RecoveryInfo>,
     pub head: Option<u64>,
     pub floor: Option<u64>,
     pub stream_state: String,
@@ -180,6 +201,23 @@ impl fmt::Display for InspectReport {
                     fence.epoch, fence.writer, fence.owner, fence.recovery_fence
                 )?,
                 None => writeln!(f, "  fence: none")?,
+            }
+            match &s.recovery {
+                Some(recovery) => writeln!(
+                    f,
+                    "  recovery: fence=epoch:{} head:{} configuration_epoch={} loss_point={} \
+                     exact={} source={} time_unix_ms={} entry_at={} entry_written={}",
+                    recovery.fence_epoch,
+                    recovery.fence_head,
+                    recovery.configuration_epoch,
+                    recovery.loss_point,
+                    recovery.exact,
+                    recovery.source,
+                    recovery.time_unix_ms,
+                    recovery.entry_at,
+                    recovery.entry_written
+                )?,
+                None => writeln!(f, "  recovery: none")?,
             }
             writeln!(
                 f,
@@ -277,6 +315,7 @@ pub(in crate::stream::consensus) fn inspect(
                 snapshot_applied: None,
                 applied: None,
                 fence: None,
+                recovery: None,
                 head: None,
                 floor: None,
                 stream_state: "detached".into(),
@@ -314,6 +353,20 @@ pub(in crate::stream::consensus) fn inspect(
                         owner,
                         recovery_fence: view.recovering,
                     }),
+                    recovery: view.recovery.map(|recovery| RecoveryInfo {
+                        fence_epoch: recovery.fence.epoch.0,
+                        fence_head: recovery.fence.head.0,
+                        entry_at: recovery.fence.head.0.saturating_add(1),
+                        configuration_epoch: recovery.configuration_epoch,
+                        loss_point: recovery.loss_point.0,
+                        exact: recovery.exact,
+                        source: match recovery.source {
+                            journal_contract::RecoverySource::Survivor => "survivor",
+                            journal_contract::RecoverySource::ObjectStore => "object_store",
+                        },
+                        time_unix_ms: recovery.time_unix_ms,
+                        entry_written: recovery.written,
+                    }),
                     head: view.head.map(|lsn| lsn.0),
                     floor: view.floor.map(|lsn| lsn.0),
                     stream_state: view.stream_state.into(),
@@ -339,6 +392,7 @@ pub(in crate::stream::consensus) fn inspect(
                     snapshot_applied: None,
                     applied: None,
                     fence: None,
+                    recovery: None,
                     head: None,
                     floor: None,
                     stream_state: "quarantined".into(),

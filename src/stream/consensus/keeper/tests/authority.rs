@@ -1079,6 +1079,19 @@ async fn a_stream_at_its_quota_still_clears_its_recovery_fence() {
         .unwrap();
     assert!(report.written);
     assert_eq!(report.head, Lsn(4));
+    // Offline inspection shows the recorded recovery waiting for its entry.
+    let inspected = cluster.configs[&a].inspect(Some(stream)).unwrap();
+    let pending = inspected.streams[0].recovery.clone().unwrap();
+    assert_eq!(
+        (pending.fence_epoch, pending.fence_head, pending.entry_at),
+        (report.epoch.0, 4, 5)
+    );
+    assert_eq!(pending.configuration_epoch, report.revision);
+    assert_eq!(pending.loss_point, 4);
+    assert!(pending.exact);
+    assert_eq!(pending.source, "survivor");
+    assert!(!pending.entry_written);
+    assert!(inspected.to_string().contains("entry_written=false"));
     cluster.restart(a).await;
     configured(&journal, stream, report.voters).await;
 
@@ -1152,7 +1165,27 @@ async fn a_stream_at_its_quota_still_clears_its_recovery_fence() {
             .await,
         Ok(Lsn(6))
     );
+    let survivor = cluster.group(a, stream).await;
+    timeout(WAIT, async {
+        while survivor.state.head() != Ok(Lsn(6)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(survivor);
     cluster.stop_all().await;
+    // Offline inspection now shows the same recovery with its entry written.
+    let inspected = cluster.configs[&a].inspect(Some(stream)).unwrap();
+    let written = inspected.streams[0].recovery.clone().unwrap();
+    assert!(written.entry_written);
+    assert_eq!(
+        crate::stream::consensus::storage::inspect::RecoveryInfo {
+            entry_written: false,
+            ..written
+        },
+        pending
+    );
 }
 
 /// `records` without the typed recovery entry at `at`, the first entry of
