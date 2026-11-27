@@ -1201,45 +1201,16 @@ pub(super) async fn report(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
 
-    #[test]
-    fn only_changed_counters_are_reported() {
-        let before = vec![("a", 1), ("b", 2)];
-        let after = vec![("a", 1), ("b", 5)];
-        assert_eq!(changed(&before, &after), vec!["b=5(+3)".to_owned()]);
-    }
-
-    #[test]
-    fn histograms_and_prometheus_rendering_cover_all_families() {
-        let metrics = Metrics::new();
-        count(&metrics.write_pending);
-        count(&metrics.parked);
-        count(&metrics.unparked_by_client);
-        count(&metrics.elections_started);
-        count(&metrics.elections_won);
-        count(&metrics.snapshots_sent_ok);
-        add(&metrics.snapshot_bytes_sent, 4096);
-        count(&metrics.snapshots_received_ok);
-        add(&metrics.snapshot_bytes_received, 2048);
-        count(&metrics.repairs_voter_ok);
-        metrics.wal_round_records.observe(1);
-        metrics.wal_round_records.observe(12);
-        metrics.wal_round_bytes.observe(512);
-        metrics.wal_round_duration.observe(Duration::from_millis(3));
-        metrics
-            .wal_fsync_segment_duration
-            .observe(Duration::from_micros(600));
-        metrics
-            .wal_fsync_boundary_duration
-            .observe(Duration::from_micros(400));
-        metrics.commit_duration.observe(Duration::from_millis(8));
-
+    fn sample_scrape() -> ScrapeSnapshot {
         let k1 = Uuid::from_u128(1);
         let k2 = Uuid::from_u128(2);
         let mut problems = BTreeMap::new();
         problems.insert("leaderless", 1);
-        let scrape = ScrapeSnapshot {
+        ScrapeSnapshot {
             keeper: k1,
             domain: "zone-a".into(),
             wal_healthy: true,
@@ -1287,7 +1258,98 @@ mod tests {
             repair_pending: 1,
             repair_oldest_secs: 12.0,
             repair_backoff: 0,
-        };
+        }
+    }
+
+    /// Every `logkeeper_*` series name in `source`.
+    fn metric_names(source: &str) -> BTreeSet<&str> {
+        let mut names = BTreeSet::new();
+        let mut rest = source;
+        while let Some(at) = rest.find("logkeeper_") {
+            let tail = &rest[at..];
+            let end = tail
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .unwrap_or(tail.len());
+            names.insert(&tail[..end]);
+            rest = &tail[end..];
+        }
+        names
+    }
+
+    #[test]
+    fn alert_rules_and_dashboard_name_only_rendered_metrics() {
+        let text = Metrics::new().render_prometheus(&sample_scrape());
+        let rendered = text
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| line.split(['{', ' ']).next())
+            .collect::<BTreeSet<_>>();
+        let rules = include_str!("../../../deploy/prometheus/logkeeper-alerts.yml");
+        let dashboard = include_str!("../../../deploy/grafana/logkeeper.json");
+        for (file, source) in [("alert rules", rules), ("dashboard", dashboard)] {
+            let names = metric_names(source);
+            assert!(names.len() > 10, "{file} names too few metrics");
+            for name in names {
+                // A histogram's family name stands for its series.
+                assert!(
+                    rendered.contains(name) || rendered.contains(format!("{name}_bucket").as_str()),
+                    "{file} name {name}, which /metrics does not render"
+                );
+            }
+        }
+        // Each rule carries what the README's runbook and the pager need.
+        let alerts = rules.matches("- alert: ").count();
+        assert!(alerts >= 15);
+        for field in [
+            "expr: ",
+            "for: ",
+            "severity: ",
+            "summary: ",
+            "description: ",
+        ] {
+            assert_eq!(
+                rules.matches(field).count(),
+                alerts,
+                "every alert has {field}"
+            );
+        }
+        serde_json::from_str::<serde_json::Value>(dashboard).unwrap();
+    }
+
+    #[test]
+    fn only_changed_counters_are_reported() {
+        let before = vec![("a", 1), ("b", 2)];
+        let after = vec![("a", 1), ("b", 5)];
+        assert_eq!(changed(&before, &after), vec!["b=5(+3)".to_owned()]);
+    }
+
+    #[test]
+    fn histograms_and_prometheus_rendering_cover_all_families() {
+        let metrics = Metrics::new();
+        count(&metrics.write_pending);
+        count(&metrics.parked);
+        count(&metrics.unparked_by_client);
+        count(&metrics.elections_started);
+        count(&metrics.elections_won);
+        count(&metrics.snapshots_sent_ok);
+        add(&metrics.snapshot_bytes_sent, 4096);
+        count(&metrics.snapshots_received_ok);
+        add(&metrics.snapshot_bytes_received, 2048);
+        count(&metrics.repairs_voter_ok);
+        metrics.wal_round_records.observe(1);
+        metrics.wal_round_records.observe(12);
+        metrics.wal_round_bytes.observe(512);
+        metrics.wal_round_duration.observe(Duration::from_millis(3));
+        metrics
+            .wal_fsync_segment_duration
+            .observe(Duration::from_micros(600));
+        metrics
+            .wal_fsync_boundary_duration
+            .observe(Duration::from_micros(400));
+        metrics.commit_duration.observe(Duration::from_millis(8));
+
+        let k2 = Uuid::from_u128(2);
+        let scrape = sample_scrape();
 
         let text = metrics.render_prometheus(&scrape);
         assert!(text.contains("logkeeper_build_info{version=\""));

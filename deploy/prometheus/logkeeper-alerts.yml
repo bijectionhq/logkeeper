@@ -1,0 +1,230 @@
+# Prometheus alert rules for Logkeeper consensus keepers.
+#
+# Scrape each keeper's admin listener (`admin.listen` in the keeper config,
+# path /metrics) under job="logkeeper". Every keeper exports the same
+# families, so the rules group by `instance`; a stream that has a problem
+# shows on each keeper that hosts one of its replicas.
+#
+# Thresholds follow the keeper's own gates, which /metrics exports:
+# logkeeper_consensus_wal_slow_round_seconds (2.5 s: the media turns slow and
+# hands off leadership), logkeeper_consensus_wal_round_limit_seconds (20 s:
+# the watchdog ends the keeper), logkeeper_consensus_disk_ordinary_floor_bytes
+# (ordinary writes stop), and the 75% ceilings that /problems reports.
+# The README's "Operations" section describes each alert's runbook.
+
+groups:
+  - name: logkeeper-keepers
+    rules:
+      - alert: LogkeeperKeeperDown
+        expr: up{job="logkeeper"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Keeper admin endpoint {{ $labels.instance }} does not answer scrapes"
+          description: "Prometheus cannot scrape {{ $labels.instance }}. Check the process and its admin listener; the keeper's peers report it in logkeeper_consensus_keeper_liveness."
+
+      - alert: LogkeeperKeeperDead
+        expr: max by (keeper, domain) (logkeeper_consensus_keeper_liveness{state="dead"}) == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Keeper {{ $labels.keeper }} in {{ $labels.domain }} is dead to its peers"
+          description: "Its peers have not heard from the keeper for the repair delay. Leaders replace it in every stream it votes in; parked streams wake to repair."
+
+      - alert: LogkeeperWalUnhealthy
+        expr: logkeeper_consensus_wal_healthy == 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The WAL on {{ $labels.instance }} stopped"
+          description: "A failed or uncertain WAL write stopped the WAL thread. The keeper refuses every write until it restarts and verifies its media."
+
+      - alert: LogkeeperMediaSlow
+        expr: logkeeper_consensus_media_responsive == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The media on {{ $labels.instance }} is slow"
+          description: "A WAL round ran past logkeeper_consensus_wal_slow_round_seconds. The keeper hands off its leadership and refuses votes until its rounds are fast again."
+
+      - alert: LogkeeperNotAccepting
+        expr: logkeeper_consensus_accepting == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} accepts no new streams"
+          description: "The keeper's media is slow, its WAL stopped, or its volume is near the ordinary floor, so placement skips it."
+
+      - alert: LogkeeperCriticalInvariant
+        expr: increase(logkeeper_consensus_critical_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} logged a critical invariant violation"
+          description: "A state only a keeper bug can reach. Collect `logkeeper keeper debug-bundle` and the logkeeper::critical log lines."
+
+  - name: logkeeper-disk
+    rules:
+      - alert: LogkeeperFsyncSlow
+        expr: |
+          histogram_quantile(0.99, sum by (instance, job, le) (rate(logkeeper_consensus_wal_fsync_duration_seconds_bucket[5m])))
+            > on (instance, job) (0.4 * logkeeper_consensus_wal_slow_round_seconds)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WAL fsync p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }}"
+          description: "fsync p99 is above 40% of the slow-round gate. A round that crosses the gate hands off the keeper's leadership."
+
+      - alert: LogkeeperWalRoundNearSlowGate
+        expr: |
+          histogram_quantile(0.99, sum by (instance, job, le) (rate(logkeeper_consensus_wal_round_duration_seconds_bucket[5m])))
+            > on (instance, job) (0.5 * logkeeper_consensus_wal_slow_round_seconds)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WAL round p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }}"
+          description: "WAL rounds run at more than half the slow-round gate (logkeeper_consensus_wal_slow_round_seconds)."
+
+      - alert: LogkeeperWalRoundNearWatchdog
+        expr: |
+          histogram_quantile(0.99, sum by (instance, job, le) (rate(logkeeper_consensus_wal_round_duration_seconds_bucket[5m])))
+            > on (instance, job) (0.25 * logkeeper_consensus_wal_round_limit_seconds)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "WAL round p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }}"
+          description: "WAL rounds run at a quarter of the watchdog limit, past which the keeper exits."
+
+      - alert: LogkeeperDiskHeadroomLow
+        expr: |
+          (logkeeper_consensus_disk_available_bytes - logkeeper_consensus_disk_reserved_bytes)
+            < 4 * logkeeper_consensus_disk_ordinary_floor_bytes
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value | humanize1024 }}B free above its reservations"
+          description: "The volume is within four ordinary floors of refusing ordinary writes. Trim streams, raise quotas elsewhere, or grow the volume."
+
+      - alert: LogkeeperDiskHeadroomCritical
+        expr: |
+          (logkeeper_consensus_disk_available_bytes - logkeeper_consensus_disk_reserved_bytes)
+            < 1.5 * logkeeper_consensus_disk_ordinary_floor_bytes
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value | humanize1024 }}B free above its reservations"
+          description: "The volume is about to refuse ordinary writes; its leaders already shed streams."
+
+      - alert: LogkeeperDiskFillingUp
+        expr: |
+          predict_linear(logkeeper_consensus_disk_available_bytes[6h], 24 * 3600)
+            < logkeeper_consensus_disk_ordinary_floor_bytes
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }} reaches its ordinary floor within a day"
+          description: "At the last six hours' rate, free space falls below the ordinary floor within 24 hours."
+
+  - name: logkeeper-streams
+    rules:
+      - alert: LogkeeperStreamLeaderless
+        expr: max by (instance) (logkeeper_consensus_problem_streams{reason="leaderless"}) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} streams hosted on {{ $labels.instance }} have no leader"
+          description: "Open streams with no leader, or whose leader no quorum acknowledges. See /problems on the keeper."
+
+      - alert: LogkeeperStreamUnderReplicated
+        expr: max by (instance) (logkeeper_consensus_problem_streams{reason="under_replicated"}) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} streams hosted on {{ $labels.instance }} are under-replicated"
+          description: "A voter is unreachable, silent, or more than 64 entries behind. Repair replaces a voter that stays silent for the repair delay."
+
+      - alert: LogkeeperParkedStreamDeadVoter
+        expr: max by (instance) (logkeeper_consensus_problem_streams{reason="parked_with_dead_voter"}) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} parked streams on {{ $labels.instance }} have a dead voter"
+          description: "A parked stream wakes to repair a dead voter; one that stays parked with a dead voter has lost a copy without repair."
+
+      - alert: LogkeeperQuarantinedReplica
+        expr: max by (instance) (logkeeper_consensus_streams{state="quarantined"}) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} replicas on {{ $labels.instance }} are quarantined"
+          description: "The keeper found a replica it cannot trust and stopped serving it. Its leader repairs it from the other voters; run `logkeeper keeper verify` when the keeper is stopped."
+
+      - alert: LogkeeperJointConfigStuck
+        expr: max by (instance) (logkeeper_consensus_problem_streams{reason="joint_config"}) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} streams on {{ $labels.instance }} stay in a joint configuration"
+          description: "A membership change has not finished for 15 minutes."
+
+      - alert: LogkeeperStreamNearRecordCeiling
+        expr: max by (instance) (logkeeper_consensus_problem_streams{reason="near_record_ceiling"}) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} streams on {{ $labels.instance }} retain over 75% of their record ceiling"
+          description: "The stream refuses appends at its retained-record ceiling. Its writer should trim."
+
+      - alert: LogkeeperStreamNearSuffixCeiling
+        expr: max by (instance) (logkeeper_consensus_problem_streams{reason="near_suffix_ceiling"}) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} streams on {{ $labels.instance }} hold over 75% of their unpurged WAL suffix"
+          description: "Snapshots are not keeping up, so the stream nears the suffix ceiling where it refuses writes."
+
+      - alert: LogkeeperStreamNearQuota
+        expr: max by (instance) (logkeeper_consensus_problem_streams{reason="near_quota_ceiling"}) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} streams on {{ $labels.instance }} use over 75% of their byte quota"
+          description: "The stream refuses appends past its quota. Its writer should trim."
+
+      - alert: LogkeeperRepairQueueStuck
+        expr: logkeeper_consensus_repair_oldest_pending_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A repair on {{ $labels.instance }} has waited {{ $value | humanizeDuration }}"
+          description: "A stream this keeper leads has needed repair for over 15 minutes. logkeeper_consensus_repair_backoff_streams counts streams backing off after failed repairs."
+
+      - alert: LogkeeperSlowProposals
+        expr: logkeeper_consensus_slow_proposals > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} proposals on {{ $labels.instance }} have been in flight for over a second"
+          description: "Writes are stuck. logkeeper_consensus_commit_stage_seconds shows which stage holds them."
