@@ -424,6 +424,17 @@ impl SimCluster {
         }
     }
 
+    /// Simulates complete disk exhaustion (`0` bytes left, below `PROTOCOL_FLOOR`).
+    pub fn set_disk_zero(&self, id: Uuid, zero: bool) {
+        if let Some(server) = self.running.get(&id) {
+            server
+                .engine
+                .disk
+                .space
+                .set_available(if zero { 0 } else { u64::MAX });
+        }
+    }
+
     pub fn clear_disk_faults(&self) {
         for server in self.running.values() {
             server.engine.disk.set_wal_delay(Duration::ZERO);

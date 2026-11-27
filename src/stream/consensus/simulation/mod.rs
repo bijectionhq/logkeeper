@@ -18,6 +18,7 @@
 //! - delete permanence,
 //! - post-run cross-voter convergence.
 
+mod bugs;
 mod cluster;
 mod faults;
 mod history;
