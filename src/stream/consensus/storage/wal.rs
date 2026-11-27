@@ -418,6 +418,10 @@ struct Work {
     done: oneshot::Sender<io::Result<()>>,
     _space: Option<Reservation>,
     follower: bool,
+    /// A leader's own application append, whose queue wait and WAL time
+    /// feed the commit stage timers.
+    application: bool,
+    queued: std::time::Instant,
 }
 
 enum Message {
@@ -634,7 +638,10 @@ impl Disk {
 
     pub async fn application(&self, record: Record) -> io::Result<()> {
         allocation(&record)?;
-        self.enqueue(&self.work, record, None, false).await
+        self.submit_work(&self.work, record, None, false, true)
+            .await?
+            .await
+            .map_err(io::Error::other)?
     }
 
     /// Queues an application write and returns at once; the receiver
@@ -644,7 +651,8 @@ impl Disk {
         record: Record,
     ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
         allocation(&record)?;
-        self.submit(&self.work, record, None, false).await
+        self.submit_work(&self.work, record, None, false, true)
+            .await
     }
 
     /// The leader appends of `stream` still in flight.
@@ -720,6 +728,20 @@ impl Disk {
         space: Option<Reservation>,
         follower: bool,
     ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
+        self.submit_work(queue, record, space, follower, false)
+            .await
+    }
+
+    /// `application` marks a leader's own application append, which the
+    /// commit stage timers follow through its WAL round.
+    async fn submit_work(
+        &self,
+        queue: &mpsc::Sender<Message>,
+        record: Record,
+        space: Option<Reservation>,
+        follower: bool,
+        application: bool,
+    ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
         let (done, reply) = oneshot::channel();
         queue
             .send(Message::Write(Work {
@@ -727,6 +749,8 @@ impl Disk {
                 done,
                 _space: space,
                 follower,
+                application,
+                queued: std::time::Instant::now(),
             }))
             .await
             .map_err(io::Error::other)?;
@@ -1126,11 +1150,18 @@ fn rounds(
         let mut added = 0;
         let mut tickets = Vec::new();
         let mut moves = Vec::new();
+        let mut applications = 0u64;
         #[cfg(test)]
         let mut before_settlement = None;
         #[cfg(test)]
         let mut held = None;
         for mut work in round {
+            if work.application {
+                applications += 1;
+                metrics
+                    .commit_stage_queue
+                    .observe(round_start.saturating_duration_since(work.queued));
+            }
             let scope = work.record.stream();
             let new = !wal.contains_scope(scope) && !changed.contains(&scope);
             if new && wal.scope_count() + added >= segmented::MAX_SCOPES {
@@ -1224,7 +1255,11 @@ fn rounds(
             let round_bytes = wal.commit(objects, &changed, metrics)?;
             metrics.wal_round_records.observe(round_records);
             metrics.wal_round_bytes.observe(round_bytes);
-            metrics.wal_round_duration.observe(round_start.elapsed());
+            let round_duration = round_start.elapsed();
+            metrics.wal_round_duration.observe(round_duration);
+            metrics
+                .commit_stage_wal
+                .observe_n(round_duration, applications);
             // The copies are durable: every holder reads them from now on.
             // Their old segments stay for the checkpoint and the selected
             // snapshots that may still name them.

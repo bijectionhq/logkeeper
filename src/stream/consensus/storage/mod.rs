@@ -220,8 +220,16 @@ impl RaftLogStorage<RaftTypes> for LogStore {
             self.disk.replicate(record, reservation).await
         } else if has_application_entries(&entries) {
             if own {
-                self.write_log(Record::Append(self.stream, entries), Queue::Ordinary)
-                    .await
+                let last = entries.last().map(|entry| entry.log_id.index);
+                let written = self
+                    .write_log(Record::Append(self.stream, entries), Queue::Ordinary)
+                    .await;
+                if written.is_ok()
+                    && let Some(last) = last
+                {
+                    self.state.appended(last);
+                }
+                written
             } else {
                 Err(super::invalid(
                     "follower append lacks its exact destination ticket",
@@ -251,6 +259,7 @@ impl RaftLogStorage<RaftTypes> for LogStore {
         // A truncation applied before an append still in flight would make
         // that append land past a gap.
         self.inflight.drained().await;
+        self.state.truncated(start);
         self.write(Record::Truncate(self.stream, start)).await
     }
 
@@ -277,6 +286,7 @@ impl LogStore {
             return Err(error);
         }
         let id = self.inflight.begin(&entries);
+        let last = entries.last().map(|entry| entry.log_id.index);
         let record = Record::Owned(
             self.generation,
             Box::new(Record::Append(self.stream, entries)),
@@ -290,8 +300,14 @@ impl LogStore {
             }
         };
         let inflight = self.inflight.clone();
+        let state = self.state.clone();
         tokio::spawn(async move {
             let result = durable.await.map_err(io::Error::other).and_then(|r| r);
+            if result.is_ok()
+                && let Some(last) = last
+            {
+                state.appended(last);
+            }
             inflight.finish(id, result.is_ok());
             callback.io_completed(result);
         });

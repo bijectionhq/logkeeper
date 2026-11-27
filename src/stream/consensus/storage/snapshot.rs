@@ -247,9 +247,16 @@ struct Inner {
     stopped: AtomicBool,
     published: watch::Sender<Option<LogId>>,
     changed: watch::Sender<()>,
+    /// The last index and time of this leader's recent durable application
+    /// appends, oldest first, which time the replication commit stage.
+    durable: Mutex<VecDeque<(u64, std::time::Instant)>>,
     #[cfg(test)]
     snapshot_paused: watch::Sender<bool>,
 }
+
+/// Durable appends remembered for the replication stage timer. Older ones
+/// are forgotten, so a stream that never applies holds a bounded queue.
+const TIMED_APPENDS: usize = 256;
 
 #[derive(Clone)]
 struct ActiveSnapshot {
@@ -443,6 +450,21 @@ impl StateMachine {
         &self.inner.disk.metrics
     }
 
+    /// Notes that this leader's own application append through `index`
+    /// became durable now.
+    pub fn appended(&self, index: u64) {
+        let mut durable = self.inner.durable.lock();
+        if durable.len() >= TIMED_APPENDS {
+            durable.pop_front();
+        }
+        durable.push_back((index, std::time::Instant::now()));
+    }
+
+    /// Forgets timed appends from `index` on, which a truncation removed.
+    pub fn truncated(&self, index: u64) {
+        self.inner.durable.lock().retain(|(last, _)| *last < index);
+    }
+
     pub fn retained_stats(&self) -> (u64, u64) {
         self.inner.applied.read().state.retained_stats()
     }
@@ -539,6 +561,7 @@ impl StateMachine {
                     publishing: Default::default(),
                     published,
                     changed: watch::channel(()).0,
+                    durable: Mutex::default(),
                     #[cfg(test)]
                     snapshot_paused: watch::channel(false).0,
                 }),
@@ -905,6 +928,8 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
                 .durable_through(last.log_id.index)
                 .await?;
         }
+        let started = std::time::Instant::now();
+        let last = entries.last().map(|entry| entry.log_id.index);
         let may_read_snapshot = self.head().is_ok_and(|head| entries.iter().any(|entry| {
             matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } | Command::AppendOriginal { at, .. } if *at <= head))
         }));
@@ -918,6 +943,19 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
             self.inner.apply(entries)
         };
         let outcomes = outcomes.inspect_err(|_| self.inner.quarantine())?;
+        let metrics = &self.inner.disk.metrics;
+        metrics.commit_stage_apply.observe(started.elapsed());
+        if let Some(last) = last {
+            let mut durable = self.inner.durable.lock();
+            while let Some(&(index, at)) = durable.front()
+                && index <= last
+            {
+                durable.pop_front();
+                metrics
+                    .commit_stage_replication
+                    .observe(started.saturating_duration_since(at));
+            }
+        }
         let revision = self
             .inner
             .applied

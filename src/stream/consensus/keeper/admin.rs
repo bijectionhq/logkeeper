@@ -685,6 +685,8 @@ impl Engine {
         let mut suffix_entries_max = 0u64;
         let mut follower_lags: BTreeMap<Uuid, (u64, u64, u64)> = BTreeMap::new();
         let mut problems = Vec::new();
+        let mut slow_proposals = 0u64;
+        let mut oldest_proposal = Duration::ZERO;
         let mut problem_counts: BTreeMap<&'static str, u64> =
             PROBLEM_REASONS.iter().map(|reason| (*reason, 0)).collect();
 
@@ -726,6 +728,9 @@ impl Engine {
                 retained_bytes,
             ) = if let Some(group) = groups.get(&stream) {
                 streams_open += 1;
+                let (slow, oldest) = group.proposals.slow();
+                slow_proposals += slow;
+                oldest_proposal = oldest_proposal.max(oldest);
                 let metrics = group.raft.metrics().borrow_watched().clone();
                 let is_leader = metrics.state == ServerState::Leader;
                 if is_leader {
@@ -982,6 +987,8 @@ impl Engine {
             retained_bytes_max,
             suffix_entries_max,
             problem_streams: problem_counts,
+            slow_proposals,
+            oldest_proposal_secs: oldest_proposal.as_secs_f64(),
         };
         (report, scrape)
     }

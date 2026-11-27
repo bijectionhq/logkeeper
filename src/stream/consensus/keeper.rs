@@ -1215,6 +1215,7 @@ impl Engine {
             handoff: parking_lot::Mutex::new(None),
             heard: parking_lot::Mutex::new(Instant::now()),
             leader_matched: parking_lot::Mutex::new(None),
+            proposals: Arc::default(),
             excluded,
             stop: self.stop.child_token(),
         });
@@ -1851,6 +1852,8 @@ pub(super) struct Group {
     heard: parking_lot::Mutex<Instant>,
     /// The term and time when a leader's append last matched this follower's log.
     leader_matched: parking_lot::Mutex<Option<(u64, Instant)>>,
+    /// This stream's proposals in flight, for the slow-proposal gauges.
+    proposals: Arc<Proposals>,
     /// The last peer that refused this replica as outside its placement.
     excluded: Arc<parking_lot::Mutex<Option<uuid::Uuid>>>,
     stop: CancellationToken,
@@ -1994,10 +1997,11 @@ impl Group {
         };
         let raft = self.raft.clone();
         let proposal_metrics = metrics.clone();
+        let in_flight = InFlight::start(&self.proposals, ticket, started, metrics.clone());
         // The proposal owns its reservation even when the caller drops the
         // request or times out. The WAL settles it as it publishes the slot.
         let proposal = tokio::spawn(async move {
-            let (_permit, _space) = (permit, space);
+            let (_permit, _space, _in_flight) = (permit, space, in_flight);
             let (responder, response) = ProgressResponder::complete_only();
             if let Err(error) = raft
                 .client_write_ff(
@@ -2146,6 +2150,65 @@ impl Group {
 
 fn leader_reply(id: Option<NodeId>) -> Reply {
     Reply::Leader(id.map(uuid::Uuid::from_u128))
+}
+
+/// Proposals in flight for at least this long count as slow.
+pub(super) const SLOW_PROPOSAL: Duration = Duration::from_secs(1);
+
+/// One stream's proposals in flight and when each started. A stream holds
+/// at most its pending-write limit, so a scrape scans few entries.
+#[derive(Default)]
+struct Proposals(parking_lot::Mutex<HashMap<uuid::Uuid, std::time::Instant>>);
+
+impl Proposals {
+    /// The proposals in flight for at least `SLOW_PROPOSAL`, and the age of
+    /// the oldest one in flight.
+    fn slow(&self) -> (u64, Duration) {
+        let proposals = self.0.lock();
+        let mut slow = 0;
+        let mut oldest = Duration::ZERO;
+        for started in proposals.values() {
+            let age = started.elapsed();
+            slow += u64::from(age >= SLOW_PROPOSAL);
+            oldest = oldest.max(age);
+        }
+        (slow, oldest)
+    }
+}
+
+/// Registers a proposal while it runs; dropping it, however the proposal
+/// ends, removes it and counts it when it was slow.
+struct InFlight {
+    proposals: Arc<Proposals>,
+    ticket: uuid::Uuid,
+    started: std::time::Instant,
+    metrics: Arc<super::metrics::Metrics>,
+}
+
+impl InFlight {
+    fn start(
+        proposals: &Arc<Proposals>,
+        ticket: uuid::Uuid,
+        started: std::time::Instant,
+        metrics: Arc<super::metrics::Metrics>,
+    ) -> Self {
+        proposals.0.lock().insert(ticket, started);
+        Self {
+            proposals: proposals.clone(),
+            ticket,
+            started,
+            metrics,
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.proposals.0.lock().remove(&self.ticket);
+        if self.started.elapsed() >= SLOW_PROPOSAL {
+            super::metrics::count(&self.metrics.slow_proposals);
+        }
+    }
 }
 
 fn failure(error: JournalError) -> Reply {

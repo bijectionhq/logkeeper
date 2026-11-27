@@ -840,6 +840,8 @@ fn saturated_durable_lanes_rotate_without_overtaking_an_admitted_replica() {
                 done,
                 _space: None,
                 follower: lane == 2,
+                application: false,
+                queued: std::time::Instant::now(),
             }))
             .ok()
             .unwrap();

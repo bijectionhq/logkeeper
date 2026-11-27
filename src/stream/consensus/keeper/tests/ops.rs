@@ -169,26 +169,35 @@ async fn admin_plain_http_metrics_health_and_validation() {
     assert!(metrics.contains("logkeeper_consensus_keeper_liveness{"));
     assert!(metrics.contains("logkeeper_consensus_retained_records_total 5"));
     assert!(metrics.contains("logkeeper_consensus_retained_bytes_total "));
-    // At least one of the 3 voters led the stream and observed commit_duration_seconds_count > 0.
+    assert!(metrics.contains("logkeeper_consensus_slow_proposals 0"));
+    assert!(metrics.contains("logkeeper_consensus_critical_total "));
+    // At least one of the 3 voters led the stream and observed commit_duration_seconds_count > 0,
+    // and timed each of its writes through every commit stage.
+    let sample = |text: &str, series: &str| -> u64 {
+        text.lines()
+            .find_map(|line| line.strip_prefix(series))
+            .and_then(|rest| rest.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
     let mut leader_commits = 0u64;
+    let mut stages = BTreeMap::<&str, u64>::new();
     for &voter in &voters {
         let (_, _, text) = http_get(addrs[&voter], "/metrics").await;
-        if let Some(line) = text
-            .lines()
-            .find(|l| l.starts_with("logkeeper_consensus_commit_duration_seconds_count "))
-        {
-            leader_commits += line
-                .split_whitespace()
-                .nth(1)
-                .unwrap()
-                .parse::<u64>()
-                .unwrap();
+        leader_commits += sample(&text, "logkeeper_consensus_commit_duration_seconds_count ");
+        for stage in ["queue", "wal", "replication", "apply"] {
+            *stages.entry(stage).or_default() += sample(
+                &text,
+                &format!("logkeeper_consensus_commit_stage_seconds_count{{stage=\"{stage}\"}} "),
+            );
         }
     }
     assert!(
         leader_commits >= 6,
         "expected >= 6 committed writes, got {leader_commits}"
     );
+    for (stage, count) in &stages {
+        assert!(*count >= 6, "commit stage {stage} timed {count} writes");
+    }
 
     // HEAD, 404, 405 behavior.
     let (code, _, body) = http_request(admin_addr, "HEAD", "/live").await;
@@ -686,4 +695,25 @@ async fn offline_verify_checks_checkpoint_and_multi_segment_chain() {
 
     std::fs::write(&ckpt_path, &original_ckpt).unwrap();
     assert!(config.verify().unwrap().ok);
+}
+
+#[test]
+fn in_flight_proposals_turn_slow_after_a_second() {
+    let proposals = Arc::new(Proposals::default());
+    let metrics = Arc::new(crate::stream::consensus::metrics::Metrics::new());
+    let now = std::time::Instant::now();
+    let fresh = InFlight::start(&proposals, Uuid::new_v4(), now, metrics.clone());
+    let slow = InFlight::start(
+        &proposals,
+        Uuid::new_v4(),
+        now - SLOW_PROPOSAL,
+        metrics.clone(),
+    );
+    let (count, oldest) = proposals.slow();
+    assert_eq!(count, 1);
+    assert!(oldest >= SLOW_PROPOSAL);
+    drop(slow);
+    drop(fresh);
+    assert_eq!(proposals.slow(), (0, Duration::ZERO));
+    assert_eq!(metrics.slow_proposals.load(Ordering::Relaxed), 1);
 }

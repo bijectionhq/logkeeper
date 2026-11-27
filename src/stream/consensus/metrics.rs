@@ -124,11 +124,20 @@ impl DurationHistogram {
     }
 
     pub(super) fn observe(&self, duration: Duration) {
+        self.observe_n(duration, 1);
+    }
+
+    /// Records `times` observations of the same `duration`.
+    pub(super) fn observe_n(&self, duration: Duration, times: u64) {
+        if times == 0 {
+            return;
+        }
         let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
         let idx = self.bounds_ns.partition_point(|bound| *bound < nanos);
-        self.buckets[idx].fetch_add(1, Ordering::Relaxed);
-        self.sum_ns.fetch_add(nanos, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
+        self.buckets[idx].fetch_add(times, Ordering::Relaxed);
+        self.sum_ns
+            .fetch_add(nanos.saturating_mul(times), Ordering::Relaxed);
+        self.count.fetch_add(times, Ordering::Relaxed);
     }
 
     fn write_prometheus(&self, out: &mut String, name: &str, labels: Option<&str>) {
@@ -215,7 +224,22 @@ pub(super) struct Metrics {
     pub wal_fsync_segment_duration: DurationHistogram,
     pub wal_fsync_boundary_duration: DurationHistogram,
     pub commit_duration: DurationHistogram,
+    /// Leader application appends waiting for a WAL round.
+    pub commit_stage_queue: DurationHistogram,
+    /// The WAL round that made a leader application append durable.
+    pub commit_stage_wal: DurationHistogram,
+    /// From the leader's durable append to the start of its apply, which
+    /// covers follower replication, the quorum commit and the apply queue.
+    pub commit_stage_replication: DurationHistogram,
+    /// One state machine apply batch.
+    pub commit_stage_apply: DurationHistogram,
+    /// Proposals that took at least `SLOW_PROPOSAL` to commit or fail.
+    pub slow_proposals: AtomicU64,
 }
+
+/// Critical invariant violations this process logged (see `critical!`).
+/// Process-wide, since a violation site need not know its keeper.
+pub(crate) static CRITICAL: AtomicU64 = AtomicU64::new(0);
 
 impl Default for Metrics {
     fn default() -> Self {
@@ -269,6 +293,11 @@ impl Metrics {
             wal_fsync_segment_duration: DurationHistogram::new(LATENCY_BUCKETS_NS),
             wal_fsync_boundary_duration: DurationHistogram::new(LATENCY_BUCKETS_NS),
             commit_duration: DurationHistogram::new(LATENCY_BUCKETS_NS),
+            commit_stage_queue: DurationHistogram::new(LATENCY_BUCKETS_NS),
+            commit_stage_wal: DurationHistogram::new(LATENCY_BUCKETS_NS),
+            commit_stage_replication: DurationHistogram::new(LATENCY_BUCKETS_NS),
+            commit_stage_apply: DurationHistogram::new(LATENCY_BUCKETS_NS),
+            slow_proposals: AtomicU64::new(0),
         }
     }
 
@@ -653,6 +682,74 @@ impl Metrics {
             None,
         );
 
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_commit_stage_seconds Leader commit latency by stage: WAL queue wait, WAL round, replication to apply, and apply."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_commit_stage_seconds histogram"
+        );
+        for (stage, histogram) in [
+            ("queue", &self.commit_stage_queue),
+            ("wal", &self.commit_stage_wal),
+            ("replication", &self.commit_stage_replication),
+            ("apply", &self.commit_stage_apply),
+        ] {
+            histogram.write_prometheus(
+                &mut out,
+                "logkeeper_consensus_commit_stage_seconds",
+                Some(&format!("stage=\"{stage}\"")),
+            );
+        }
+
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_slow_proposals_total Proposals that took at least one second to commit or fail."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_slow_proposals_total counter"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_slow_proposals_total {}",
+            self.slow_proposals.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_slow_proposals Proposals in flight for at least one second."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_slow_proposals gauge");
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_slow_proposals {}",
+            scrape.slow_proposals
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_oldest_proposal_seconds Age of the oldest proposal in flight, or zero."
+        );
+        let _ = writeln!(
+            out,
+            "# TYPE logkeeper_consensus_oldest_proposal_seconds gauge"
+        );
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_oldest_proposal_seconds {:.3}",
+            scrape.oldest_proposal_secs
+        );
+        let _ = writeln!(
+            out,
+            "# HELP logkeeper_consensus_critical_total Critical invariant violations logged by this keeper."
+        );
+        let _ = writeln!(out, "# TYPE logkeeper_consensus_critical_total counter");
+        let _ = writeln!(
+            out,
+            "logkeeper_consensus_critical_total {}",
+            CRITICAL.load(Ordering::Relaxed)
+        );
+
         // Hosted stream counts & aggregated retention
         let _ = writeln!(
             out,
@@ -900,6 +997,8 @@ pub(super) struct ScrapeSnapshot {
     pub retained_bytes_max: u64,
     pub suffix_entries_max: u64,
     pub problem_streams: BTreeMap<&'static str, u64>,
+    pub slow_proposals: u64,
+    pub oldest_proposal_secs: f64,
 }
 
 fn escape_label(value: &str) -> String {
@@ -1057,6 +1156,8 @@ mod tests {
             retained_bytes_max: 500_000,
             suffix_entries_max: 42,
             problem_streams: problems,
+            slow_proposals: 0,
+            oldest_proposal_secs: 0.0,
         };
 
         let text = metrics.render_prometheus(&scrape);
