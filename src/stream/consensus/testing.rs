@@ -7,6 +7,9 @@
 //! client principals and can stop and restart individual keepers.
 //! [`LocalCluster::start_replicated_catalog`] instead hosts the catalog as a
 //! consensus stream on two voters and the catalog keeper.
+//!
+//! Its keepers flush with plain `fsync` unless the process installed a
+//! [`SyncMode`] before starting the cluster, so tests stay fast on macOS.
 
 use std::{
     collections::BTreeMap,
@@ -33,7 +36,8 @@ use crate::stream::{
 };
 
 use super::{
-    Config, ConsensusJournal, Credentials, Domains, JournalConfig, Keepers, TimedAuthority,
+    Config, ConsensusJournal, Credentials, Domains, JournalConfig, Keepers, SyncMode,
+    TimedAuthority,
     storage::{Authority, Provision, hex, sha256},
 };
 
@@ -188,6 +192,10 @@ impl LocalCluster {
                 park_after_secs,
                 snapshot_send_bytes_per_second: 0,
                 timed_original: None,
+                // Test keepers use plain `fsync` unless the process chose a
+                // mode: a full flush costs milliseconds on macOS, and many
+                // tests share one drive.
+                sync_mode: SyncMode::installed().unwrap_or(SyncMode::Fsync),
                 timed_authority: keys.get(&id).map(|key| TimedAuthority {
                     verifier: verifier.clone(),
                     clock: Some(Arc::new(LocalClock {

@@ -705,6 +705,18 @@ pooled connection, at most sixteen in flight to each keeper.
 A keeper paces the bytes it sends in snapshot transfers, across all its
 streams, to `snapshot_send_bytes_per_second` (64 MiB/s by default; zero
 disables pacing), so catch-up and repair do not saturate a cross-zone link.
+
+A keeper's `sync_mode` sets how its durable writes reach stable storage:
+`"full"` (the default) or `"fsync"`. On macOS `"full"` issues `F_FULLFSYNC`,
+which also drains the drive's write cache and so survives power loss;
+`"fsync"` leaves acknowledged records in that cache, a power cut can lose
+them, and it is meant only for benchmarks. On Linux both modes flush alike,
+because `fsync` and `fdatasync` already flush the device cache. The mode is
+process-wide; keepers in one process that ask for different modes all get
+`"full"`. The stream keeper takes the same option. A full flush costs
+milliseconds where `fsync` costs tens of microseconds, so the
+`consensus-testing` `LocalCluster` uses `"fsync"` unless the process
+installed a mode first.
 A `JournalConfig` with a `placement` may name the consumer's own `domain`;
 reads then go first to a voter in that domain, then to the keeper that
 answered last. After each seal such a journal also asks the stream's leader to hand

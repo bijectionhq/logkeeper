@@ -46,6 +46,7 @@ use super::{
 };
 
 mod timed_original;
+pub use crate::server::durability::SyncMode;
 pub use timed_original::TimedOriginalConfig;
 
 const ALPN: &[u8] = b"logkeeper-stream/2";
@@ -80,6 +81,11 @@ pub struct Config {
     pub writers: Vec<String>,
     pub limits: Limits,
     pub timed_original: Option<TimedOriginalConfig>,
+    /// How durable writes reach stable storage: `"full"` (the default) or
+    /// `"fsync"`. On Apple platforms only `"full"`, which issues
+    /// `F_FULLFSYNC`, survives power loss; elsewhere both flush alike.
+    #[serde(default)]
+    pub sync_mode: SyncMode,
 }
 
 impl Config {
@@ -106,6 +112,7 @@ impl Config {
         stop: CancellationToken,
         policy: Option<Arc<dyn SealPolicy>>,
     ) -> io::Result<()> {
+        self.sync_mode.install();
         let id = KeeperId(self.keeper.as_u128());
         let (acceptor, tls_public_key) = self.tls.server(id)?;
         if self.zone.is_empty()

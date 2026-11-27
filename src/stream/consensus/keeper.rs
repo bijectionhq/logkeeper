@@ -47,6 +47,7 @@ use super::{
     state::{Command, Outcome},
     storage::{self, Authority, Disk, Enrollment, FollowerAppend, LogStore, Record, StateMachine},
 };
+use crate::server::durability::SyncMode;
 use crate::stream::{transport, wire::KeeperId};
 use admission::ReplicationIngress;
 pub use recovery::{Recovery, RecoveryReport};
@@ -124,6 +125,11 @@ pub struct Config {
     /// and attestation key, in the stream keeper's mount format.
     #[serde(default)]
     pub timed_original: Option<crate::stream::transport::TimedOriginalConfig>,
+    /// How durable writes reach stable storage: `"full"` (the default) or
+    /// `"fsync"`. On Apple platforms only `"full"`, which issues
+    /// `F_FULLFSYNC`, survives power loss; elsewhere both flush alike.
+    #[serde(default)]
+    pub sync_mode: SyncMode,
     /// A timed authority supplied in process, which takes precedence over
     /// `timed_original`.
     #[serde(skip)]
@@ -158,7 +164,10 @@ impl Config {
         result.and(shutdown)
     }
 
+    /// Every path that writes this keeper's media opens its enrollment
+    /// first, so installing the sync mode here covers them all.
     fn enrollment(&self) -> io::Result<Enrollment> {
+        self.sync_mode.install();
         Enrollment::authorized(
             &self.enrollment,
             &self.data,

@@ -143,6 +143,7 @@ impl Cluster {
                 park_after_secs: 3600,
                 snapshot_send_bytes_per_second: 0,
                 timed_original: None,
+                sync_mode: SyncMode::Fsync,
                 timed_authority: None,
             };
             provision(&config);

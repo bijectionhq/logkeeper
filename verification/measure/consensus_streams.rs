@@ -5,7 +5,8 @@
 //! `--batch`-record batches for `--seconds`. Prints one JSON line with commits
 //! per second, batch latency percentiles, process CPU time, peak resident
 //! memory and the bytes the keepers hold on disk, so runs with more idle
-//! streams show the per-stream cost.
+//! streams show the per-stream cost. `--sync-mode fsync` measures the
+//! keepers with plain `fsync` instead of the default `full`.
 //!
 //! ```sh
 //! cargo run --release --features consensus-testing --example consensus-streams -- \
@@ -16,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use journal_contract::{Epoch, Journal as _, Lsn, StreamId};
-use logkeeper::stream::consensus::testing::LocalCluster;
+use logkeeper::stream::consensus::{SyncMode, testing::LocalCluster};
 
 const PRINCIPAL: &str = "urn:logkeeper:client:measure";
 
@@ -27,6 +28,7 @@ struct Args {
     record: usize,
     seconds: f64,
     park: Option<u64>,
+    sync_mode: SyncMode,
 }
 
 fn args() -> Args {
@@ -37,6 +39,7 @@ fn args() -> Args {
         record: 256,
         seconds: 10.0,
         park: None,
+        sync_mode: SyncMode::Full,
     };
     let mut input = std::env::args().skip(1);
     while let Some(flag) = input.next() {
@@ -50,6 +53,9 @@ fn args() -> Args {
             "--record" => args.record = value.parse().unwrap(),
             "--seconds" => args.seconds = value.parse().unwrap(),
             "--park-after" => args.park = Some(value.parse().unwrap()),
+            "--sync-mode" => {
+                args.sync_mode = serde_json::from_value(value.into()).unwrap();
+            }
             other => panic!("unknown flag {other}"),
         }
     }
@@ -98,6 +104,8 @@ fn cpu_seconds() -> f64 {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args = args();
+    // The local cluster's keepers take the process's mode.
+    args.sync_mode.install();
     let mut cluster = match args.park {
         Some(seconds) => LocalCluster::start_parking(&[PRINCIPAL], seconds).await,
         None => LocalCluster::start(&[PRINCIPAL]).await,
@@ -154,10 +162,15 @@ async fn main() {
             .map_or(0.0, |latency| latency.as_secs_f64() * 1e3)
     };
     println!(
-        "{{\"streams\": {}, \"active\": {}, \"batch\": {}, \"record\": {}, \"seconds\": {:.2}, \
+        "{{\"sync_mode\": \"{}\", \"streams\": {}, \"active\": {}, \"batch\": {}, \
+         \"record\": {}, \"seconds\": {:.2}, \
          \"batches_per_second\": {:.1}, \"records_per_second\": {:.1}, \"p50_ms\": {:.2}, \
          \"p99_ms\": {:.2}, \"cpu_cores\": {:.2}, \"peak_rss_mib\": {:.1}, \
          \"disk_mib\": {:.1}}}",
+        serde_json::to_value(args.sync_mode)
+            .unwrap()
+            .as_str()
+            .unwrap(),
         args.streams,
         args.active,
         args.batch,

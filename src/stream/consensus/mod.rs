@@ -24,6 +24,7 @@ use journal_contract::{Epoch, Lsn, StreamId};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub use super::transport::Credentials;
+pub use crate::server::durability::SyncMode;
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
 pub use keeper::{Config, Recovery, RecoveryReport};
