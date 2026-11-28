@@ -2,7 +2,6 @@
 
 2026-11-28. Branch `writer-driven/authenticated`, based on `writer-driven/repair`.
 This note extends `target-journal.md` section 3 and `writer-driven-repair.md`.
-Nothing here has been compiled or run yet.
 
 RTDB's lineage, portable backups, timed Store settlement and recovery cuts need a
 portable proof that a record is part of a stream's committed history. Today only
@@ -220,7 +219,15 @@ two members certify after trim and restart; a replacement keeper refuses forged
 and under-quorum seeds and signs after a two-page verified seed. `keeper::ledger`:
 leaf record framing. Codec round trips cover the new request and reply.
 
-Open work: writer-level tests through `MemoryJournal`-style transports,
-the repairer calling `seed_authenticated` after `Outcome::Repaired`, a ledger
+The repairer seeds moved streams: `repair::seed_repaired` binds each
+`Outcome::Repaired` stream to its new ensemble and calls `seed_authenticated`, and
+`logkeeper repair` runs it after every pass when its config sets `keys_file`.
+`keeper::tests::authenticated::the_repairer_seeds_the_spares_ledger_after_moving_a_trimmed_stream`
+covers it end to end. A repairer that crashes between the move and the seed leaves
+the spare unseeded; later passes no longer list the stream, so only
+`authenticated_head` (which seeds a `Missing` member once two others certify) or
+an explicit `seed_authenticated` repairs it.
+
+Open work: writer-level tests through `MemoryJournal`-style transports, a ledger
 cache bound and off-thread proof building, and TLA+/Verus coverage of the
 signing rule (sign only at or below the local head).

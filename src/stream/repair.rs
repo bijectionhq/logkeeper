@@ -101,8 +101,13 @@ impl Roster {
 /// What happened to one stream.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The stream's ensemble now names `learner` instead of the lost keeper.
-    Repaired { learner: KeeperId, epoch: Epoch },
+    /// The stream's ensemble is now `ensemble`, which names `learner` instead of the
+    /// lost keeper.
+    Repaired {
+        learner: KeeperId,
+        epoch: Epoch,
+        ensemble: [KeeperId; 3],
+    },
     /// A previous pass or another repairer already completed the move.
     AlreadyRepaired,
     /// No eligible spare exists.
@@ -244,7 +249,13 @@ pub async fn repair_stream(
         let plan = Sweep::new(stream, ensemble, survivors, learner, epoch);
         let operation = Replacement::new(plan, transport.identity().clone());
         match driver::run(transport, operation, Some(driver::RPC_TIMEOUT)).await {
-            Ok(()) => return Outcome::Repaired { learner, epoch },
+            Ok(()) => {
+                return Outcome::Repaired {
+                    learner,
+                    epoch,
+                    ensemble: ensemble.map(|id| if id == lost { learner } else { id }),
+                };
+            }
             Err(SweepError::Reply {
                 reply: Reply::Refused(Refusal::Fenced { promised }),
                 ..
@@ -257,6 +268,34 @@ pub async fn repair_stream(
         }
     }
     Outcome::Failed(last)
+}
+
+/// Seed the authenticated leaf ledger of each stream that `report` moved. The learner
+/// receives only the retained records, so it lacks the leaves below the stream's floor
+/// and cannot co-sign a head until a client copies them from the survivors under a
+/// head the survivors signed. Run it right after the repair, while both survivors still
+/// hold the full history. `writer` must mount the keeper key set
+/// (`Writer::with_authentication`) and list every keeper of the roster. Returns the
+/// streams that could not be seeded. A later pass, `Writer::seed_authenticated` or an
+/// `authenticated_head` read can retry them.
+#[cfg(feature = "stream")]
+pub async fn seed_repaired(
+    writer: &crate::stream::writer::Writer,
+    report: &Report,
+) -> Vec<(StreamId, journal_contract::JournalError)> {
+    let mut failed = Vec::new();
+    for (stream, outcome) in &report.outcomes {
+        let Outcome::Repaired { ensemble, .. } = outcome else {
+            continue;
+        };
+        // A writer that already knows the stream under another ensemble follows the
+        // move on its own, so a refused binding is not an error.
+        let _ = writer.bind_ensemble(*stream, *ensemble);
+        if let Err(error) = writer.seed_authenticated(*stream).await {
+            failed.push((*stream, error));
+        }
+    }
+    failed
 }
 
 async fn check(

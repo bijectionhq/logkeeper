@@ -10,11 +10,13 @@ use std::{
 
 use tokio_util::sync::CancellationToken;
 
-use super::{Member, Outcome, Report, Roster, repair_lost};
+use super::{Member, Outcome, Report, Roster, repair_lost, seed_repaired};
 use crate::stream::{
+    authenticated::KeeperKeys,
     proposer::driver::RPC_TIMEOUT,
     transport::{Credentials, TcpTransport},
     wire::*,
+    writer::Writer,
 };
 
 pub const USAGE: &str = "Usage: logkeeper repair --config FILE [--lost UUID]";
@@ -33,6 +35,11 @@ pub struct Config {
     /// The interval between probes and repair passes.
     #[serde(default = "default_probe")]
     pub probe_secs: u64,
+    /// The keeper key set (`KeeperKeys` JSON) of keepers that keep authenticated
+    /// history. When set, every repaired stream's new member is seeded with the
+    /// leaves below the stream's floor right after the move.
+    #[serde(default)]
+    pub keys_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -54,6 +61,9 @@ fn default_probe() -> u64 {
 impl Config {
     pub fn read(path: &Path) -> io::Result<Self> {
         let config: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        if let Some(keys) = &config.keys_file {
+            KeeperKeys::read(keys)?;
+        }
         if config.keepers.len() < 4
             || config.probe_secs == 0
             || config
@@ -86,16 +96,37 @@ impl Config {
         )
     }
 
+    /// A client that seeds repaired streams, if the keepers keep authenticated history.
+    fn seeder(&self, transport: Arc<TcpTransport>) -> io::Result<Option<Writer>> {
+        let Some(path) = &self.keys_file else {
+            return Ok(None);
+        };
+        let keys = KeeperKeys::read(path)?;
+        let ids = self
+            .keepers
+            .iter()
+            .map(|keeper| KeeperId(keeper.id.as_u128()));
+        Writer::new(transport, ids)
+            .and_then(|writer| writer.with_authentication(keys))
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
+    }
+
     /// Repair the streams of an operator-declared lost keeper once.
     pub async fn repair_once(&self, lost: KeeperId) -> io::Result<Report> {
-        let transport = self.transport()?;
-        Ok(repair_lost(&transport, &self.roster(), lost, &[]).await)
+        let transport = Arc::new(self.transport()?);
+        let report = repair_lost(&*transport, &self.roster(), lost, &[]).await;
+        if let Some(seeder) = self.seeder(transport)? {
+            seed(&seeder, &report).await;
+        }
+        Ok(report)
     }
 
     /// Probe every keeper, declare a keeper lost after `repair_after_secs` without a
     /// reply, and repair its streams on every pass until none remain.
     pub async fn run(&self, stop: CancellationToken) -> io::Result<()> {
         let transport = Arc::new(self.transport()?);
+        let seeder = self.seeder(transport.clone())?;
         let roster = self.roster();
         let repair_after = Duration::from_secs(self.repair_after_secs);
         let probe = Duration::from_secs(self.probe_secs);
@@ -121,6 +152,9 @@ impl Config {
                 if report.listed > 0 {
                     log(keeper, &report);
                 }
+                if let Some(seeder) = &seeder {
+                    seed(seeder, &report).await;
+                }
             }
             tokio::select! {
                 _ = stop.cancelled() => return Ok(()),
@@ -142,12 +176,23 @@ async fn reachable(transport: &TcpTransport, keeper: KeeperId) -> bool {
     )
 }
 
+/// Seed the repaired streams' new members. A failure leaves the stream certifiable
+/// by its survivors, and `authenticated_head` seeds the member later.
+async fn seed(seeder: &Writer, report: &Report) {
+    for (stream, error) in seed_repaired(seeder, report).await {
+        eprintln!(
+            "seeding authenticated history failed stream={}: {error}",
+            uuid::Uuid::from_u128(stream.0)
+        );
+    }
+}
+
 fn log(lost: KeeperId, report: &Report) {
     for (stream, outcome) in &report.outcomes {
         let stream = uuid::Uuid::from_u128(stream.0);
         let lost = uuid::Uuid::from_u128(lost.0);
         match outcome {
-            Outcome::Repaired { learner, epoch } => println!(
+            Outcome::Repaired { learner, epoch, .. } => println!(
                 "repaired stream={stream} lost={lost} learner={} epoch={}",
                 uuid::Uuid::from_u128(learner.0),
                 epoch.0
