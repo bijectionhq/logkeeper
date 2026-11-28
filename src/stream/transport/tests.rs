@@ -315,6 +315,7 @@ async fn writer_round_trips_through_three_tls_keepers() {
             limits: Limits::default(),
             timed_original: None,
             sync_mode: SyncMode::Fsync,
+            authenticated: None,
         };
         tasks.push(tokio::spawn(config.serve(listener, stop.clone())));
         routes.push(listen.to_string());
@@ -453,6 +454,7 @@ async fn concurrent_calls_share_one_connection_and_batches_authorize_each_reques
         limits,
         timed_original: None,
         sync_mode: SyncMode::Fsync,
+        authenticated: None,
     };
     let stop = CancellationToken::new();
     let task = tokio::spawn(config.serve(listener, stop.clone()));
@@ -604,6 +606,7 @@ async fn repair_moves_a_parked_stream_and_a_named_url_follows_it() {
             limits: Limits::default(),
             timed_original: None,
             sync_mode: SyncMode::Fsync,
+            authenticated: None,
         };
         let stop = CancellationToken::new();
         let task = tokio::spawn(config.serve(listener, stop.clone()));
@@ -652,7 +655,9 @@ async fn repair_moves_a_parked_stream_and_a_named_url_follows_it() {
     }));
     let report = repair_lost(&repairer, &roster, ids[2], &[]).await;
     let repaired = match report.outcomes[..] {
-        [(s, Outcome::Repaired { learner, epoch })] if s == stream && learner == ids[3] => epoch,
+        [(s, Outcome::Repaired { learner, epoch, .. })] if s == stream && learner == ids[3] => {
+            epoch
+        }
         _ => panic!("{report:?}"),
     };
 
