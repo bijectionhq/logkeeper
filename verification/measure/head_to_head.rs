@@ -1321,7 +1321,7 @@ async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning) -> Result<
                     .map(|node| (node.id(), node.app.to_string())),
                 Duration::from_secs(2),
             )?;
-            let ids = cluster.nodes.iter().map(Node::id).collect::<Vec<_>>();
+            let ids: [KeeperId; 4] = std::array::from_fn(|i| cluster.nodes[i].id());
             let ensemble = [ids[0], ids[1], ids[2]];
             let start = Instant::now();
             let killed = cluster.kill(0).await?;
