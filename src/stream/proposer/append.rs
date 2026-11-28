@@ -592,6 +592,22 @@ impl State {
                     }
                     return Some((at, JournalError::Unavailable));
                 }
+                if matches!(error, JournalError::Fenced { .. }) {
+                    // A fence is a definite refusal only while no keeper can hold this
+                    // record. A sealer adopts the highest history of its quorum, so a
+                    // copy on one lane, an unanswered send, or a send still in flight
+                    // can still commit it (for example a repair sealing past a lost
+                    // keeper adopts the surviving lane's copy).
+                    let held = self.lanes.iter().any(|lane| {
+                        lane.accepted.is_some_and(|tail| tail >= at)
+                            || !lane.failure.as_ref().is_some_and(|failure| {
+                                failure.revision == self.revision && failure.at <= at
+                            })
+                    });
+                    if held || at <= self.uncertain_through {
+                        return Some((at, JournalError::Unavailable));
+                    }
+                }
                 Some((at, error))
             })
             .collect();

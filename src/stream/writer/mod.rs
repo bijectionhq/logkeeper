@@ -263,28 +263,22 @@ impl Writer {
             {
                 continue;
             }
-            let promised = view.promised.map(|(epoch, ..)| epoch);
-            return Some(self.rebind(stream, ensemble, promised));
+            return Some(self.rebind(stream, ensemble));
         }
         None
     }
 
-    fn rebind(
-        &self,
-        stream: &Arc<Stream>,
-        ensemble: [KeeperId; 3],
-        promised: Option<Epoch>,
-    ) -> Arc<Stream> {
+    fn rebind(&self, stream: &Arc<Stream>, ensemble: [KeeperId; 3]) -> Arc<Stream> {
         let mut streams = self.streams.lock();
         let entry = streams.entry(stream.id).or_insert_with(|| stream.clone());
         if Arc::ptr_eq(entry, stream) {
             *entry = Arc::new(Stream::new(stream.id, ensemble));
-            // The replacement sealed a higher epoch, which fenced this writer.
+            // The replacement sealed a higher epoch, which fenced this writer. Pending
+            // appends may already be on a keeper whose history the replacement adopted,
+            // so they fail as `Unavailable`, not as a definite fence. The next append
+            // finds no active writer and reports the fence from the new ensemble.
             if let Some(active) = stream.active.lock().take() {
-                active.close(match promised {
-                    Some(current) if current > active.epoch => JournalError::Fenced { current },
-                    _ => JournalError::Unavailable,
-                });
+                active.close(JournalError::Unavailable);
             }
         }
         entry.clone()
