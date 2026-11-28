@@ -609,13 +609,11 @@ async fn repair_moves_a_parked_stream_and_a_named_url_follows_it() {
         let task = tokio::spawn(config.serve(listener, stop.clone()));
         keepers.push((keeper, listen, stop, task));
     }
-    let named = |range: std::ops::Range<usize>| {
-        let entries: Vec<_> = keepers[range]
-            .iter()
-            .map(|(keeper, listen, ..)| format!("{keeper}@{listen}"))
-            .collect();
-        format!("logkeeper+tls://{}", entries.join(","))
-    };
+    let entries: Vec<_> = keepers
+        .iter()
+        .map(|(keeper, listen, ..)| format!("{keeper}@{listen}"))
+        .collect();
+    let url = format!("logkeeper+tls://{}", entries.join(","));
     let ids: Vec<_> = keepers
         .iter()
         .map(|(keeper, ..)| KeeperId(keeper.as_u128()))
@@ -623,7 +621,7 @@ async fn repair_moves_a_parked_stream_and_a_named_url_follows_it() {
 
     // The application starts with three keepers and a spare in zone c.
     let (transport, ensemble) =
-        TcpTransport::discover(&named(0..4), &writer_credentials, Duration::from_secs(5))
+        TcpTransport::discover(&url, &writer_credentials, Duration::from_secs(5))
             .await
             .unwrap();
     assert_eq!(ensemble, [ids[0], ids[1], ids[2]]);
@@ -660,7 +658,7 @@ async fn repair_moves_a_parked_stream_and_a_named_url_follows_it() {
 
     // A fresh client still names the lost keeper first; discovery does not need it.
     let (transport, ensemble) =
-        TcpTransport::discover(&named(0..4), &writer_credentials, Duration::from_secs(5))
+        TcpTransport::discover(&url, &writer_credentials, Duration::from_secs(5))
             .await
             .unwrap();
     let successor = Writer::new(Arc::new(transport), ensemble).unwrap();

@@ -9,7 +9,7 @@ mod timed;
 
 pub use super::timed::{TimedOriginal, TimedOriginalProof};
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
