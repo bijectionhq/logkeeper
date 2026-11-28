@@ -58,7 +58,12 @@ reach a spare.
    containing itself, the writer rebinds the stream to that ensemble, closes the
    old lanes and retries, following up to three moves. An active writer at the old
    epoch is fenced by the repair epoch, so its next append returns `Fenced`. The
-   consumer re-seals at a higher epoch and the seal follows the move.
+   consumer re-seals at a higher epoch and the seal follows the move. An append in
+   flight when the repair seals returns `Unavailable` instead if a survivor already
+   accepted it, because the repair adopts that survivor's copy. An append reports a
+   definite `Fenced` only when a quorum of lanes was fenced and none accepted it;
+   with one keeper lost, it waits for the second survivor's reply to decide. Pending
+   appends that a follow closes also fail as `Unavailable`.
 7. **Journal URL.** `logkeeper+tls://` now accepts three or more entries. An
    entry is either `HOST:PORT`, whose identity comes from the certificate and which
    must be reachable at startup, or `UUID@HOST:PORT`, which connects lazily and is
