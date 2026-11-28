@@ -207,7 +207,7 @@ Keeper config gains:
 { "journal": "UUID", "keepers": [ { "identity": "UUID", "keys": [[32 bytes]] } ] }
 ```
 
-## Tests on this branch (unrun)
+## Tests on this branch
 
 `stream::authenticated::tests`: tree and frontier agree on every prefix; two or
 three ensemble signatures verify; under-quorum, duplicate, outsider, extra,
