@@ -1272,7 +1272,7 @@ async fn sweeper_restores_an_absent_survivor_from_one_durable_copy() {
 #[tokio::test]
 async fn sweeper_transfers_multiple_pages_across_successive_replacements() {
     use crate::stream::writer::Writer;
-    use journal_contract::{Journal, JournalError};
+    use journal_contract::Journal;
 
     let [source, lagging, lost] = MEMBERS;
     let learner = KeeperId(4);
