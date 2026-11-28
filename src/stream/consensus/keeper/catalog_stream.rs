@@ -25,7 +25,6 @@
 //! - The stream is never parked or deleted. Repair replaces its voters like
 //!   any stream's, and its own entry records the staged move.
 
-mod history_archive;
 
 use std::{
     collections::BTreeMap,
@@ -47,14 +46,14 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use self::history_archive::Reference as HistoryReference;
 use super::authenticated::{Authority as SigningAuthority, authentication_reply};
 use super::{AuthenticationPeerRequest, AuthenticationRequest};
 use super::{Engine, Group, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
 use crate::stream::consensus::CLUSTER_VERSION_AUTHENTICATED;
 use crate::stream::consensus::Voters;
 use crate::stream::consensus::authenticated::{
-    CatalogAuthority, CatalogHistory, QuorumSignature, SignedAuthority, VoterKeys,
+    CatalogAuthority, CatalogHistory, QuorumSignature, SignedAuthority, SignedStreamAuthority,
+    StreamAuthority, VoterKeys,
 };
 use crate::stream::consensus::{
     Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, authority, catalog, decisions, decode,
@@ -84,6 +83,30 @@ const TEND_INTERVAL: Duration = Duration::from_millis(100);
 const ATTEMPT: Duration = Duration::from_secs(2);
 /// Keeper records per checkpoint record.
 const KEEPERS_PER_RECORD: usize = 64;
+const STREAM_AUTHORITIES_PER_RECORD: usize = 256;
+
+/// The authentication state a compaction rewrites after its checkpoint.
+struct RetainedAuthentication {
+    history: CatalogHistory,
+    pending: Option<CatalogAuthority>,
+    streams: Vec<SignedStreamAuthority>,
+    pending_stream: Option<StreamAuthority>,
+}
+
+impl RetainedAuthentication {
+    fn records(self) -> Vec<CatalogRecord> {
+        let mut records = vec![CatalogRecord::AuthenticationGenesis(self.history.genesis)];
+        records.extend(self.history.transitions.into_iter().map(CatalogRecord::AuthenticationCertified));
+        records.extend(self.pending.map(CatalogRecord::AuthenticationPending));
+        records.extend(
+            self.streams
+                .chunks(STREAM_AUTHORITIES_PER_RECORD)
+                .map(|part| CatalogRecord::StreamAuthorities(part.to_vec())),
+        );
+        records.extend(self.pending_stream.map(CatalogRecord::StreamAuthorityPending));
+        records
+    }
+}
 
 #[cfg(test)]
 pub(in crate::stream::consensus) fn trace_catalog_change(
@@ -120,7 +143,10 @@ enum CatalogRecord {
     AuthenticationGenesis(CatalogAuthority),
     AuthenticationPending(CatalogAuthority),
     AuthenticationCertified(SignedAuthority),
-    AuthenticationRetained(HistoryReference),
+    /// A stream roster revision awaiting the catalog roster's signatures.
+    StreamAuthorityPending(StreamAuthority),
+    /// Certified stream roster revisions, in order within each stream.
+    StreamAuthorities(Vec<SignedStreamAuthority>),
 }
 
 struct Fold {
@@ -132,8 +158,10 @@ struct Fold {
     cluster_version: u32,
     authority: authority::Records,
     authentication: Option<CatalogHistory>,
-    archived_authentication: Option<HistoryReference>,
     pending_authentication: Option<CatalogAuthority>,
+    /// Each authenticated stream's certified roster chain.
+    stream_authorities: BTreeMap<StreamId, Vec<SignedStreamAuthority>>,
+    pending_stream_authority: Option<StreamAuthority>,
 }
 
 impl Fold {
@@ -152,8 +180,9 @@ impl Fold {
             cluster_version: crate::stream::consensus::CLUSTER_VERSION_V1,
             authority: authority::Records::default(),
             authentication: None,
-            archived_authentication: None,
             pending_authentication: None,
+            stream_authorities: BTreeMap::new(),
+            pending_stream_authority: None,
         }
     }
 
@@ -250,7 +279,6 @@ impl Fold {
                 }
                 self.pending_authentication = Some(pending);
             }
-            CatalogRecord::AuthenticationRetained(_) => return Err(JournalError::Corrupted),
             CatalogRecord::AuthenticationCertified(certified) => {
                 let history = self
                     .authentication
@@ -279,6 +307,47 @@ impl Fold {
                     }
                     self.pending_authentication = None;
                     history.transitions.push(certified);
+                }
+            }
+            CatalogRecord::StreamAuthorityPending(pending) => {
+                let history = self.authentication.as_ref().ok_or(JournalError::Corrupted)?;
+                let chain = self.stream_authorities.get(&pending.stream).map_or(&[][..], Vec::as_slice);
+                if !pending.valid()
+                    || pending.catalog != history.genesis.catalog
+                    || pending.revision != chain.len() as u64
+                    || pending.predecessor_sha256 != chain.last().map(|prior| prior.authority.digest())
+                    || pending.catalog_sha256 != history.latest().digest()
+                    || self.pending_stream_authority.as_ref().is_some_and(|prior| *prior != pending)
+                {
+                    return Err(JournalError::Corrupted);
+                }
+                self.pending_stream_authority = Some(pending);
+            }
+            CatalogRecord::StreamAuthorities(certified) => {
+                let history = self.authentication.as_ref().ok_or(JournalError::Corrupted)?;
+                for signed in certified {
+                    let stream = signed.authority.stream;
+                    let chain = self.stream_authorities.entry(stream).or_default();
+                    let revision = usize::try_from(signed.authority.revision)
+                        .map_err(|_| JournalError::Corrupted)?;
+                    if revision < chain.len() {
+                        if chain[revision] != signed {
+                            return Err(JournalError::Corrupted);
+                        }
+                        continue;
+                    }
+                    chain.push(signed);
+                    if history.verify_stream(stream, chain).is_err() {
+                        return Err(JournalError::Corrupted);
+                    }
+                    let signed = chain.last().unwrap();
+                    if self
+                        .pending_stream_authority
+                        .as_ref()
+                        .is_some_and(|pending| *pending == signed.authority)
+                    {
+                        self.pending_stream_authority = None;
+                    }
                 }
             }
         }
@@ -416,6 +485,10 @@ impl Engine {
                 request: AuthenticationRequest::History { from },
                 ..
             } => Ok(self.catalog_history_page(catalog, &group, from).await),
+            Request::Authentication {
+                request: AuthenticationRequest::StreamAuthority { stream },
+                ..
+            } => Ok(self.stream_authority_chain(catalog, &group, stream).await),
             Request::AuthenticationPeer(AuthenticationPeerRequest::Authority {
                 stream,
                 configuration,
@@ -551,12 +624,7 @@ impl Engine {
                             );
                             return Err(JournalError::Unavailable);
                         };
-                        match record {
-                            CatalogRecord::AuthenticationRetained(reference) => {
-                                self.restore_history(&mut fold, reference).await?;
-                            }
-                            record => fold.apply(record)?,
-                        }
+                        fold.apply(record)?;
                         fold.next = Lsn(at.0 + 1);
                     }
                 }
@@ -564,42 +632,6 @@ impl Engine {
                 Err(error) => return Err(error),
             }
         }
-    }
-
-    async fn restore_history(
-        &self,
-        fold: &mut Fold,
-        reference: HistoryReference,
-    ) -> Result<(), JournalError> {
-        let history = fold
-            .authentication
-            .as_ref()
-            .ok_or(JournalError::Corrupted)?;
-        if history.genesis.catalog != self.catalog_id {
-            return Err(JournalError::Corrupted);
-        }
-        if !reference.matches(history) {
-            if !history.transitions.is_empty() || fold.pending_authentication.is_some() {
-                return Err(JournalError::Corrupted);
-            }
-            let authentication = self
-                .authentication
-                .as_ref()
-                .ok_or(JournalError::Unavailable)?;
-            let root = authentication.archive_root().to_owned();
-            let genesis = history.genesis.clone();
-            let history = tokio::task::spawn_blocking(move || reference.load(&root, genesis))
-                .await
-                .map_err(|_| JournalError::Unavailable)?
-                .map_err(|error| match error.kind() {
-                    io::ErrorKind::InvalidData => JournalError::Corrupted,
-                    _ => JournalError::Unavailable,
-                })?;
-            fold.authentication = Some(history);
-        }
-        fold.archived_authentication = Some(reference);
-        fold.tail += 1;
-        Ok(())
     }
 
     /// The fold as of a read barrier on the leader. A writer first creates
@@ -828,16 +860,19 @@ impl Engine {
             return failure(JournalError::Unsupported);
         };
         let latest = history.latest();
-        let Some(voters) = history
-            .voters_at(digest, stream)
-            .filter(|voters| history.voters_at(latest.digest(), stream) == Some(*voters))
+        let Some(last) = fold
+            .stream_authorities
+            .get(&stream)
+            .and_then(|chain| chain.last())
+            .map(|signed| &signed.authority)
+            .filter(|last| last.digest() == digest && history.catalog_roster_current(last.catalog_sha256))
         else {
             return failure(JournalError::Unavailable);
         };
         authentication_reply(&SigningAuthority {
             catalog: latest.catalog,
             digest,
-            voters: voters.clone(),
+            voters: last.voters.clone(),
         })
     }
 
@@ -979,12 +1014,18 @@ impl Engine {
                     revision,
                     predecessor_sha256: Some(latest.digest()),
                     catalog_voters: settled,
-                    stream_voters: BTreeMap::new(),
-                };
+                    };
                 if let Err(reply) = self
                     .append_catalog(group, head, &CatalogRecord::AuthenticationPending(next))
                     .await
                 {
+                    return reply;
+                }
+                continue;
+            }
+            if let Some(proposed) = fold.pending_stream_authority.clone() {
+                drop(fold);
+                if let Err(reply) = self.certify_stream_authority(group, head, &latest, proposed).await {
                     return reply;
                 }
                 continue;
@@ -1003,7 +1044,12 @@ impl Engine {
             if !entry.genesis.authenticated || !admitted {
                 return failure(JournalError::Unsupported);
             }
-            let previous_stream = history.voters_at(latest.digest(), stream).cloned();
+            let chain = fold.stream_authorities.get(&stream);
+            let last = chain.and_then(|chain| chain.last()).map(|signed| signed.authority.clone());
+            let previous_stream = last.as_ref().map(|authority| authority.voters.clone());
+            let last_current = last
+                .as_ref()
+                .is_some_and(|authority| history.catalog_roster_current(authority.catalog_sha256));
             if let Some(prior) = &previous_stream
                 && prior.keepers().into_iter().ne(requester.into_iter())
                 && entry
@@ -1032,38 +1078,138 @@ impl Engine {
             if !catalog_voters.valid() || !stream_voters.valid() {
                 return failure(JournalError::Unavailable);
             }
-            let digest = latest.digest();
-            if catalog_voters == latest.catalog_voters
-                && previous_stream.as_ref() == Some(&stream_voters)
-            {
+            if catalog_voters != latest.catalog_voters {
+                let Some(revision) = latest.revision.checked_add(1) else {
+                    return failure(JournalError::Unavailable);
+                };
+                let next = CatalogAuthority {
+                    catalog: latest.catalog,
+                    revision,
+                    predecessor_sha256: Some(latest.digest()),
+                    catalog_voters,
+                };
+                if let Err(reply) = self
+                    .append_catalog(group, head, &CatalogRecord::AuthenticationPending(next))
+                    .await
+                {
+                    return reply;
+                }
+                continue;
+            }
+            if let Some(last) = last.as_ref().filter(|last| last_current && last.voters == stream_voters) {
                 return authentication_reply(&SigningAuthority {
                     catalog: latest.catalog,
-                    digest,
+                    digest: last.digest(),
                     voters: stream_voters,
                 });
             }
-            let Some(revision) = latest.revision.checked_add(1) else {
-                return failure(JournalError::Unavailable);
-            };
-            let stream_voters = if previous_stream.as_ref() == Some(&stream_voters) {
-                BTreeMap::new()
-            } else {
-                BTreeMap::from([(stream, stream_voters)])
-            };
-            let next = CatalogAuthority {
+            let next = StreamAuthority {
                 catalog: latest.catalog,
-                revision,
-                predecessor_sha256: Some(digest),
-                catalog_voters,
-                stream_voters,
+                stream,
+                revision: last.as_ref().map_or(0, |last| last.revision + 1),
+                predecessor_sha256: last.as_ref().map(StreamAuthority::digest),
+                catalog_sha256: latest.digest(),
+                voters: stream_voters,
             };
             if let Err(reply) = self
-                .append_catalog(group, head, &CatalogRecord::AuthenticationPending(next))
+                .append_catalog(group, head, &CatalogRecord::StreamAuthorityPending(next))
                 .await
             {
                 return reply;
             }
         }
+    }
+
+    /// Collects the catalog roster's signatures over a pending stream roster
+    /// revision and commits it.
+    async fn certify_stream_authority(
+        &self,
+        group: &Group,
+        head: Lsn,
+        catalog: &CatalogAuthority,
+        proposed: StreamAuthority,
+    ) -> Result<(), Reply> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let signers = &catalog.catalog_voters;
+        let request = AuthenticationPeerRequest::StreamAuthorityShare(proposed.clone());
+        let mut voters = FuturesUnordered::from_iter(signers.keepers().into_iter().map(|keeper| {
+            let request = request.clone();
+            let proposed = &proposed;
+            async move {
+                let reply = if keeper == self.id {
+                    self.stream_authority_share(proposed).await
+                } else {
+                    self.rpc
+                        .call_application(keeper, Request::AuthenticationPeer(request), REQUEST_TIMEOUT)
+                        .await
+                };
+                reply
+                    .ok()
+                    .and_then(|reply| super::authenticated::authentication_value::<QuorumSignature>(reply).ok())
+                    .filter(|signature| signature.keeper == keeper)
+            }
+        }));
+        let statement = proposed.statement();
+        let mut signatures = Vec::new();
+        while let Some(signature) = voters.next().await {
+            if let Some(signature) = signature {
+                signatures.push(signature);
+                signatures.sort_by_key(|signature| signature.keeper);
+                if signers.verify(&statement, &signatures).is_ok() {
+                    drop(voters);
+                    self.append_catalog(
+                        group,
+                        head,
+                        &CatalogRecord::StreamAuthorities(vec![SignedStreamAuthority {
+                            authority: proposed,
+                            signatures,
+                        }]),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(failure(JournalError::Unavailable))
+    }
+
+    /// Signs a pending stream roster revision as a member of the catalog
+    /// roster it names.
+    pub(super) async fn stream_authority_share(&self, proposed: &StreamAuthority) -> io::Result<Reply> {
+        let catalog = self.catalog_stream()?;
+        let Some(group) = self.catalog_group().await else {
+            return Ok(failure(JournalError::Unavailable));
+        };
+        let (fold, _) = match self.caught_up(catalog, &group).await {
+            Ok(view) => view,
+            Err(error) => return Ok(failure(error)),
+        };
+        let Some(authentication) = &self.authentication else {
+            return Ok(failure(JournalError::Unsupported));
+        };
+        let signer = fold.authentication.as_ref().and_then(|history| {
+            let latest = history.latest();
+            (latest.digest() == proposed.catalog_sha256).then(|| latest.catalog_voters.key(self.id).copied())
+        });
+        if fold.pending_stream_authority.as_ref() != Some(proposed)
+            || signer.flatten() != Some(authentication.public_key())
+        {
+            return Ok(failure(JournalError::Unavailable));
+        }
+        Ok(authentication_reply(
+            &authentication.sign(self.id, &proposed.statement()),
+        ))
+    }
+
+    async fn stream_authority_chain(&self, catalog: &CatalogStream, group: &Group, stream: StreamId) -> Reply {
+        let (fold, _) = match self.leading(catalog, group, false).await {
+            Ok(view) => view,
+            Err(reply) => return reply,
+        };
+        if fold.authentication.is_none() {
+            return failure(JournalError::Unsupported);
+        }
+        authentication_reply(&fold.stream_authorities.get(&stream).cloned().unwrap_or_default())
     }
 
     /// The stable catalog roster a joint one settles to once the catalog's
@@ -1120,7 +1266,6 @@ impl Engine {
                     .ok_or_else(|| failure(JournalError::Unavailable))?,
                 predecessor_sha256: Some(latest.digest()),
                 catalog_voters,
-                stream_voters: BTreeMap::new(),
             };
             self.append_catalog(group, head, &CatalogRecord::AuthenticationPending(next))
                 .await?;
@@ -1188,8 +1333,7 @@ impl Engine {
                     revision: 0,
                     predecessor_sha256: None,
                     catalog_voters,
-                    stream_voters: BTreeMap::new(),
-                };
+                    };
                 if !genesis.valid() {
                     return Ok(failure(JournalError::Unavailable));
                 }
@@ -1571,9 +1715,12 @@ impl Engine {
                 .map(|(keeper, record)| (*keeper, record.clone()))
                 .collect::<Vec<_>>();
             let recoveries = fold.authority.recoveries.values().copied().collect();
-            let authentication = fold.authentication.clone();
-            let archived_authentication = fold.archived_authentication;
-            let pending = fold.pending_authentication.clone();
+            let authentication = fold.authentication.clone().map(|history| RetainedAuthentication {
+                history,
+                pending: fold.pending_authentication.clone(),
+                streams: fold.stream_authorities.values().flatten().cloned().collect(),
+                pending_stream: fold.pending_stream_authority.clone(),
+            });
             drop(fold);
             self.compact(
                 &group,
@@ -1583,8 +1730,6 @@ impl Engine {
                 recoveries,
                 cluster_version,
                 authentication,
-                archived_authentication,
-                pending,
             )
             .await;
         }
@@ -1643,29 +1788,9 @@ impl Engine {
         keepers: Vec<(Uuid, authority::KeeperRecord)>,
         recoveries: Vec<authority::RecoveryRecord>,
         cluster_version: u32,
-        authentication: Option<CatalogHistory>,
-        archived_authentication: Option<HistoryReference>,
-        pending: Option<CatalogAuthority>,
+        authentication: Option<RetainedAuthentication>,
     ) {
         let compacted = async {
-            let authentication = if let Some(history) = authentication {
-                let authentication = self
-                    .authentication
-                    .as_ref()
-                    .ok_or_else(|| failure(JournalError::Unavailable))?;
-                let root = authentication.archive_root().to_owned();
-                let genesis = history.genesis.clone();
-                let reference = tokio::task::spawn_blocking(move || {
-                    HistoryReference::save(&root, &history, archived_authentication)
-                })
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .ok_or_else(|| failure(JournalError::Unavailable))?;
-                Some((genesis, reference))
-            } else {
-                None
-            };
             let (first, mut last) = self.checkpoint(group, head, entries).await?;
             // Keeper records exist only once leases are finalized.
             for part in keepers.chunks(KEEPERS_PER_RECORD) {
@@ -1678,24 +1803,9 @@ impl Engine {
                     .append_catalog(group, last, &CatalogRecord::Recoveries(part.to_vec()))
                     .await?;
             }
-            if let Some((genesis, reference)) = authentication {
-                last = self
-                    .append_catalog(group, last, &CatalogRecord::AuthenticationGenesis(genesis))
-                    .await?;
-                last = self
-                    .append_catalog(
-                        group,
-                        last,
-                        &CatalogRecord::AuthenticationRetained(reference),
-                    )
-                    .await?;
-                if let Some(pending) = pending {
-                    self.append_catalog(
-                        group,
-                        last,
-                        &CatalogRecord::AuthenticationPending(pending),
-                    )
-                    .await?;
+            if let Some(authentication) = authentication {
+                for record in authentication.records() {
+                    last = self.append_catalog(group, last, &record).await?;
                 }
             } else if cluster_version > crate::stream::consensus::CLUSTER_VERSION_V1 {
                 self.append_catalog(group, last, &CatalogRecord::ClusterVersion(cluster_version))
@@ -1772,6 +1882,88 @@ pub(super) fn internal(request: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ring::signature::{Ed25519KeyPair, KeyPair as _};
+
+    #[test]
+    fn compacted_authentication_folds_without_the_proof_mount() {
+        let key = |seed: u8| Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).unwrap();
+        let keeper = |seed: u8| Uuid::from_u128(seed.into());
+        let roster = |seeds: [u8; 3]| {
+            VoterKeys::Stable(
+                seeds
+                    .map(|seed| (keeper(seed), key(seed).public_key().as_ref().try_into().unwrap()))
+                    .into(),
+            )
+        };
+        let sign = |seeds: [u8; 2], statement: &[u8]| {
+            seeds
+                .map(|seed| QuorumSignature { keeper: keeper(seed), signature: key(seed).sign(statement).as_ref().to_vec() })
+                .to_vec()
+        };
+        let catalog = Uuid::from_u128(11);
+        let genesis = CatalogAuthority { catalog, revision: 0, predecessor_sha256: None, catalog_voters: roster([1, 2, 3]) };
+        let rotated = CatalogAuthority {
+            catalog,
+            revision: 1,
+            predecessor_sha256: Some(genesis.digest()),
+            catalog_voters: roster([1, 2, 4]),
+        };
+        let rotation = SignedAuthority { signatures: sign([1, 2], &rotated.statement()), authority: rotated.clone() };
+        let stream_authority = |stream: u128| StreamAuthority {
+            catalog,
+            stream: StreamId(stream),
+            revision: 0,
+            predecessor_sha256: None,
+            catalog_sha256: rotated.digest(),
+            voters: roster([5, 6, 7]),
+        };
+        let certified = |stream| {
+            let authority = stream_authority(stream);
+            SignedStreamAuthority { signatures: sign([1, 4], &authority.statement()), authority }
+        };
+        let own = Genesis {
+            stream: STREAM,
+            voters: Voters::from([1, 2, 3].map(Uuid::from_u128)),
+            quota_bytes: QUOTA_BYTES,
+            immutable: false,
+            authenticated: false,
+        };
+        let mut live = Fold::new(&own, Lsn(1));
+        for record in [
+            CatalogRecord::AuthenticationGenesis(genesis),
+            CatalogRecord::AuthenticationCertified(rotation),
+            CatalogRecord::StreamAuthorities(vec![certified(7)]),
+            CatalogRecord::StreamAuthorities(vec![certified(8)]),
+            CatalogRecord::StreamAuthorityPending(stream_authority(9)),
+        ] {
+            live.apply(decode(&encode(&record).unwrap()).unwrap()).unwrap();
+        }
+        let retained = || RetainedAuthentication {
+            history: live.authentication.clone().unwrap(),
+            pending: live.pending_authentication.clone(),
+            streams: live.stream_authorities.values().flatten().cloned().collect(),
+            pending_stream: live.pending_stream_authority.clone(),
+        };
+
+        let mut restarted = Fold::new(&own, Lsn(1));
+        restarted.apply(CatalogRecord::Checkpoint(Vec::new())).unwrap();
+        for record in retained().records() {
+            restarted.apply(decode(&encode(&record).unwrap()).unwrap()).unwrap();
+        }
+        assert_eq!(restarted.authentication, live.authentication);
+        assert_eq!(restarted.stream_authorities, live.stream_authorities);
+        assert_eq!(restarted.pending_stream_authority, live.pending_stream_authority);
+
+        let before = (live.authentication.clone(), live.stream_authorities.clone());
+        for record in retained().records() {
+            live.apply(record).unwrap();
+        }
+        assert_eq!((live.authentication.clone(), live.stream_authorities.clone()), before);
+
+        let forged = StreamAuthority { catalog_sha256: [9; 32], ..stream_authority(10) };
+        let forged = SignedStreamAuthority { signatures: sign([1, 4], &forged.statement()), authority: forged };
+        assert!(restarted.apply(CatalogRecord::StreamAuthorities(vec![forged])).is_err());
+    }
 
     #[test]
     fn the_fold_keeps_the_first_claim_and_restarts_from_a_checkpoint() {

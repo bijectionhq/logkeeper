@@ -350,7 +350,6 @@ impl LocalCluster {
             revision: 0,
             predecessor_sha256: None,
             catalog_voters: VoterKeys::Stable(keys),
-            stream_voters: BTreeMap::new(),
         }
         .root())
     }

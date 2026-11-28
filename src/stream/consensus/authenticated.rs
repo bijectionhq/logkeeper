@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub use authority::{
-    CatalogAuthority, CatalogHistory, CatalogRoot, QuorumSignature, SignedAuthority, VoterKeys,
+    CatalogAuthority, CatalogHistory, CatalogRoot, QuorumSignature, SignedAuthority,
+    SignedStreamAuthority, StreamAuthority, VoterKeys,
 };
 pub use tree::Tree;
 
@@ -117,9 +118,17 @@ pub struct SignedHead {
     pub signatures: Vec<QuorumSignature>,
 }
 
+/// The signing authority behind one stream's heads: the catalog history and
+/// the stream's own roster chain, empty for the catalog stream.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Certification {
+    pub history: CatalogHistory,
+    pub stream: Vec<SignedStreamAuthority>,
+}
+
 impl SignedHead {
-    pub fn verify(&self, root: CatalogRoot, history: &CatalogHistory) -> Result<(), ProofError> {
-        history.verify_head(root, self)
+    pub fn verify(&self, root: CatalogRoot, certification: &Certification) -> Result<(), ProofError> {
+        certification.history.verify_head(root, self, &certification.stream)
     }
 }
 
@@ -128,12 +137,12 @@ pub struct Inclusion {
     pub leaf: Leaf,
     pub path: Vec<Hash>,
     pub signed_head: SignedHead,
-    pub history: CatalogHistory,
+    pub certification: Certification,
 }
 
 impl Inclusion {
     pub fn verify(&self, root: CatalogRoot) -> Result<&Leaf, ProofError> {
-        self.signed_head.verify(root, &self.history)?;
+        self.signed_head.verify(root, &self.certification)?;
         let head = self.signed_head.head;
         if self.leaf.stream != head.stream || !self.leaf.valid() {
             return Err(ProofError::Leaf);
@@ -154,13 +163,15 @@ pub struct Consistency {
     pub earlier: SignedHead,
     pub later: SignedHead,
     pub path: Vec<Hash>,
-    pub history: CatalogHistory,
+    pub certification: Certification,
 }
 
 impl Consistency {
     pub fn verify(&self, root: CatalogRoot) -> Result<(), ProofError> {
-        self.history.verify_earlier_head(root, &self.earlier)?;
-        self.later.verify(root, &self.history)?;
+        self.certification
+            .history
+            .verify_earlier_head(root, &self.earlier, &self.certification.stream)?;
+        self.later.verify(root, &self.certification)?;
         let earlier = self.earlier.head;
         let later = self.later.head;
         if earlier.stream != later.stream || earlier.catalog != later.catalog {
@@ -181,12 +192,12 @@ impl Consistency {
 pub struct Archive {
     pub tree: Tree,
     pub signed_head: SignedHead,
-    pub history: CatalogHistory,
+    pub certification: Certification,
 }
 
 impl Archive {
     pub fn verify(&self, root: CatalogRoot) -> Result<(), ProofError> {
-        self.signed_head.verify(root, &self.history)?;
+        self.signed_head.verify(root, &self.certification)?;
         let head = self.signed_head.head;
         if self.tree.size() != head.size
             || self.tree.root() != head.root
@@ -206,7 +217,7 @@ impl Archive {
             leaf: *leaf,
             path: self.tree.inclusion(at, self.signed_head.head.size)?,
             signed_head: self.signed_head.clone(),
-            history: self.history.clone(),
+            certification: self.certification.clone(),
         })
     }
 }

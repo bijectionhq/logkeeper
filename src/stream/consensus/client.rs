@@ -28,7 +28,8 @@ use super::{
 use crate::stream::consensus::{
     CATALOG_STREAM, CLUSTER_VERSION_AUTHENTICATED, Voters,
     authenticated::{
-        Archive, CatalogHistory, CatalogRoot, Consistency, Inclusion, SignedHead, Tree,
+        Archive, CatalogHistory, CatalogRoot, Certification, Consistency, Inclusion,
+        SignedHead, SignedStreamAuthority, Tree,
     },
     decode,
     keeper::authenticated::{AuthenticationRequest, HistoryPage, Included, authentication_value},
@@ -317,21 +318,46 @@ impl Client {
         }
     }
 
+    /// The verified catalog history and `stream`'s roster chain, which
+    /// together certify the stream's heads.
+    pub async fn certification(&self, stream: StreamId) -> Result<Certification> {
+        let history = self.catalog_history().await?;
+        let chain: Vec<SignedStreamAuthority> = if stream == CATALOG_STREAM {
+            Vec::new()
+        } else {
+            let reply = self
+                .ask_catalog(
+                    Request::Authentication {
+                        stream: CATALOG_STREAM,
+                        request: AuthenticationRequest::StreamAuthority { stream },
+                    },
+                    Instant::now() + self.deadline,
+                    ATTEMPT,
+                )
+                .await?;
+            authentication_value(reply)?
+        };
+        history
+            .verify_stream(stream, &chain)
+            .map_err(|_| JournalError::Corrupted)?;
+        Ok(Certification { history, stream: chain })
+    }
+
     pub async fn authenticated_head(
         &self,
         stream: StreamId,
         size: Option<u64>,
-    ) -> Result<(SignedHead, CatalogHistory)> {
+    ) -> Result<(SignedHead, Certification)> {
         let head: SignedHead = self
             .authentication(stream, AuthenticationRequest::Head { size })
             .await?;
         if head.head.stream != stream || size.is_some_and(|size| size != head.head.size) {
             return Err(JournalError::Corrupted);
         }
-        let history = self.catalog_history().await?;
-        head.verify(self.pinned_root()?, &history)
+        let certification = self.certification(stream).await?;
+        head.verify(self.pinned_root()?, &certification)
             .map_err(|_| JournalError::Corrupted)?;
-        Ok((head, history))
+        Ok((head, certification))
     }
 
     pub async fn inclusion(
@@ -349,12 +375,11 @@ impl Client {
         {
             return Err(JournalError::Corrupted);
         }
-        let history = self.catalog_history().await?;
         let proof = Inclusion {
             leaf: included.leaf,
             path: included.path,
             signed_head: included.signed_head,
-            history,
+            certification: self.certification(stream).await?,
         };
         proof
             .verify(self.pinned_root()?)
@@ -378,12 +403,11 @@ impl Client {
                 },
             )
             .await?;
-        let history = self.catalog_history().await?;
         let proof = Consistency {
             earlier,
             later,
             path,
-            history,
+            certification: self.certification(stream).await?,
         };
         proof
             .verify(self.pinned_root()?)
@@ -396,7 +420,7 @@ impl Client {
         stream: StreamId,
         size: Option<u64>,
     ) -> Result<Archive> {
-        let (signed_head, history) = self.authenticated_head(stream, size).await?;
+        let (signed_head, certification) = self.authenticated_head(stream, size).await?;
         let through = signed_head.head.size;
         let mut tree = Tree::default();
         while tree.size() < through {
@@ -417,7 +441,7 @@ impl Client {
         let archive = Archive {
             tree,
             signed_head,
-            history,
+            certification,
         };
         archive
             .verify(self.pinned_root()?)

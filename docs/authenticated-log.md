@@ -14,7 +14,7 @@ Leaves are added on successful apply in position order, one leaf per position st
 The committed state preserves each leaf's metadata so replay and failover derive the same tree.
 
 Leaves use SHA-256 with distinct domains for leaf and inner node hashing.
-The head identifies the catalog, stream, leaf count, tree root, catalog history revision and head timestamp.
+The head identifies the catalog, stream, leaf count, tree root, stream authority revision and head timestamp.
 The stream leader certifies its applied prefix when the prefix grows and when a reader asks for it, with every signature covering the same head timestamp.
 One head can cover many leaves, and any later head for the same stream can prove inclusion in an earlier prefix.
 A certified head serves until its roster is replaced, so an idle stream costs no signing or catalog traffic.
@@ -35,15 +35,18 @@ Inclusion of a timed leaf therefore proves both that its bytes reached quorum be
 
 The verifier pins the catalog root and verifies the signed history of authorized configurations and keys from that root.
 The root is the digest of the canonical genesis statement binding the catalog identity and initial catalog signing authority.
-Each subsequent statement binds its predecessor, its revision and the catalog or stream membership and keys it authorizes for its effective range.
-The preceding catalog authority signs each change.
+Each subsequent statement binds its predecessor, its revision and the catalog membership and keys it authorizes.
+The preceding catalog authority signs each change, so the catalog history grows only with catalog membership and key changes.
 A joint configuration requires a quorum from each roster when it certifies a head.
 A catalog membership change is certified as a joint roster when it is staged.
 A change out of a joint catalog roster is signed by a quorum of the side it keeps, so the target settles a completed move and the origin settles an abandoned or retargeted one.
-Each stream's initial signing authority and subsequent changes are certified by the catalog.
-Keeper replacement and signing key rotation advance the signed history before the successor authority can certify heads.
-A head verifies only while its roster is current in the history presented with it.
-A roster replaced later in that history signs nothing, so retired keys cannot certify a head.
+Each stream has its own authority chain, independent of every other stream.
+Each revision binds its predecessor, the stream's membership and keys, and the catalog revision whose roster signs it.
+A revision names a catalog revision no earlier than the one its predecessor names.
+Keeper replacement and signing key rotation advance the stream's chain before the successor authority can certify heads.
+A catalog roster change requires a stream's next head to come from a chain revision signed under the new catalog roster.
+A head verifies only under the last revision of its stream's chain, while the catalog roster that signed that revision is current.
+A roster replaced later signs nothing, so retired keys cannot certify a head.
 A consistency proof to a current head carries an earlier head across a replacement.
 Each signature counts for one distinct authorized voter and is bound to its statement and signing domain.
 
@@ -69,18 +72,18 @@ The application authority publishes the last surviving position and the successo
 ## Export and verification
 
 Export an inclusion proof by stream and position.
-The export contains the leaf, its inclusion path, its signed head and the catalog history needed to verify that head.
-Export a consistency proof with both signed heads, the consistency path and the catalog history needed for both heads.
+The export contains the leaf, its inclusion path, its signed head and its certification: the catalog history and the stream's authority chain.
+Export a consistency proof with both signed heads, the consistency path and the certification for both heads.
+A proof's size grows with its catalog's membership changes and its own stream's roster changes, never with the number of streams.
 The verifier checks the signed history, quorum identities, signed head and the applicable Merkle path against the pinned catalog root.
 A client pins the root through the journal configuration's `catalog_root`, and refuses authenticated history without one.
 The exported data suffices to verify a proof after all the keepers shut down.
 
-An authenticated cut export carries the exact signed head, catalog history and proof material through its last surviving position.
+An authenticated cut export carries the exact signed head, certification and proof material through its last surviving position.
 An archive consumer checks that the proof material reconstructs the signed root before restoring the archive.
 The restored archive can produce and verify inclusion proofs within the retained prefix without contacting the original stream.
 Producing an inclusion proof requires a surviving copy of the corresponding leaf and path data or an export that already contains the proof.
-The shared proof mount retains the content-addressed catalog history pages referenced by catalog compaction so every keeper can reopen and verify the signed chain.
-Use a distinct retained directory for each catalog.
+Catalog compaction rewrites the catalog history and every stream's authority chain into the compacted catalog, so folding the catalog never needs the shared proof mount.
 
 ## Upgrade boundary
 

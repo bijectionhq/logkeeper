@@ -624,7 +624,7 @@ impl ConsensusJournal {
         size: Option<u64>,
     ) -> Result<(
         super::authenticated::SignedHead,
-        super::authenticated::CatalogHistory,
+        super::authenticated::Certification,
     )> {
         self.client.authenticated_head(stream, size).await
     }

@@ -162,28 +162,15 @@ pub struct CatalogAuthority {
     pub revision: u64,
     pub predecessor_sha256: Option<Hash>,
     pub catalog_voters: VoterKeys,
-    /// Stream roster updates at this revision. Unmentioned streams retain their rosters.
-    pub stream_voters: BTreeMap<StreamId, VoterKeys>,
 }
 
 impl CatalogAuthority {
     pub fn statement(&self) -> Vec<u8> {
-        let mut bytes = b"logkeeper/authenticated/catalog-authority/v1\0".to_vec();
+        let mut bytes = b"logkeeper/authenticated/catalog-authority/v2\0".to_vec();
         bytes.extend_from_slice(self.catalog.as_bytes());
         bytes.extend_from_slice(&self.revision.to_be_bytes());
-        match self.predecessor_sha256 {
-            None => bytes.push(0),
-            Some(predecessor) => {
-                bytes.push(1);
-                bytes.extend_from_slice(&predecessor);
-            }
-        }
+        encode_predecessor(&mut bytes, self.predecessor_sha256);
         self.catalog_voters.encode(&mut bytes);
-        bytes.extend_from_slice(&(self.stream_voters.len() as u64).to_be_bytes());
-        for (stream, keys) in &self.stream_voters {
-            bytes.extend_from_slice(&stream.0.to_be_bytes());
-            keys.encode(&mut bytes);
-        }
         bytes
     }
 
@@ -199,10 +186,6 @@ impl CatalogAuthority {
         !self.catalog.is_nil()
             && (self.revision == 0) == self.predecessor_sha256.is_none()
             && self.catalog_voters.valid()
-            && self
-                .stream_voters
-                .iter()
-                .all(|(stream, keys)| stream.0 != 0 && *stream != CATALOG_STREAM && keys.valid())
     }
 
     /// The roster whose quorum signs `next`. A transition out of a joint
@@ -218,12 +201,15 @@ impl CatalogAuthority {
             .find(|keys| *keys == kept)
             .map(|keys| VoterKeys::Stable(keys.clone()))
     }
+}
 
-    pub fn voters(&self, stream: StreamId) -> Option<&VoterKeys> {
-        if stream == CATALOG_STREAM {
-            return Some(&self.catalog_voters);
+fn encode_predecessor(bytes: &mut Vec<u8>, predecessor: Option<Hash>) {
+    match predecessor {
+        None => bytes.push(0),
+        Some(predecessor) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&predecessor);
         }
-        self.stream_voters.get(&stream)
     }
 }
 
@@ -248,6 +234,49 @@ impl SignedAuthority {
             .ok_or(ProofError::CatalogHistory)?
             .verify(&authority.statement(), &self.signatures)
     }
+}
+
+/// One revision of a stream's signing roster, certified by the catalog
+/// roster of the catalog revision it names.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StreamAuthority {
+    pub catalog: Uuid,
+    pub stream: StreamId,
+    pub revision: u64,
+    pub predecessor_sha256: Option<Hash>,
+    pub catalog_sha256: Hash,
+    pub voters: VoterKeys,
+}
+
+impl StreamAuthority {
+    pub fn statement(&self) -> Vec<u8> {
+        let mut bytes = b"logkeeper/authenticated/stream-authority/v1\0".to_vec();
+        bytes.extend_from_slice(self.catalog.as_bytes());
+        bytes.extend_from_slice(&self.stream.0.to_be_bytes());
+        bytes.extend_from_slice(&self.revision.to_be_bytes());
+        encode_predecessor(&mut bytes, self.predecessor_sha256);
+        bytes.extend_from_slice(&self.catalog_sha256);
+        self.voters.encode(&mut bytes);
+        bytes
+    }
+
+    pub fn digest(&self) -> Hash {
+        Sha256::digest(self.statement()).into()
+    }
+
+    pub fn valid(&self) -> bool {
+        !self.catalog.is_nil()
+            && self.stream.0 != 0
+            && self.stream != CATALOG_STREAM
+            && (self.revision == 0) == self.predecessor_sha256.is_none()
+            && self.voters.valid()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SignedStreamAuthority {
+    pub authority: StreamAuthority,
+    pub signatures: Vec<QuorumSignature>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -283,39 +312,72 @@ impl CatalogHistory {
         )
     }
 
-    /// The roster that signed under `authority_digest` in a verified history,
-    /// with whether a later revision of this history replaced it.
-    fn roster(&self, authority_digest: Hash, stream: StreamId) -> Option<(&VoterKeys, bool)> {
+    /// The position of the catalog revision with `digest` in this history.
+    fn position(&self, digest: Hash) -> Option<usize> {
+        self.authorities()
+            .collect::<Vec<_>>()
+            .iter()
+            .rposition(|authority| authority.digest() == digest)
+    }
+
+    fn catalog_roster(&self, digest: Hash) -> Option<(&VoterKeys, bool)> {
         let authorities = self.authorities().collect::<Vec<_>>();
-        let index = authorities
-            .iter()
-            .rposition(|authority| authority.digest() == authority_digest)?;
-        let voters = authorities[..=index]
-            .iter()
-            .rev()
-            .find_map(|authority| authority.voters(stream))?;
+        let index = self.position(digest)?;
+        let voters = &authorities[index].catalog_voters;
         let replaced = authorities[index + 1..]
             .iter()
-            .any(|authority| authority.voters(stream).is_some_and(|later| later != voters));
+            .any(|later| &later.catalog_voters != voters);
         Some((voters, replaced))
     }
 
-    /// Looks up the roster at a revision of a previously verified history.
-    pub fn voters_at(&self, authority_digest: Hash, stream: StreamId) -> Option<&VoterKeys> {
-        self.roster(authority_digest, stream).map(|(voters, _)| voters)
+    /// Whether the catalog roster of revision `digest` still signs.
+    pub fn catalog_roster_current(&self, digest: Hash) -> bool {
+        self.catalog_roster(digest).is_some_and(|(_, replaced)| !replaced)
     }
 
-    /// Whether the roster under `authority_digest` still signs for `stream`.
-    pub fn roster_current(&self, authority_digest: Hash, stream: StreamId) -> bool {
-        self.roster(authority_digest, stream)
-            .is_some_and(|(_, replaced)| !replaced)
+    /// Verifies `chain` as `stream`'s authority history: each revision links
+    /// to its predecessor and is signed by the roster of a catalog revision no
+    /// earlier than the one its predecessor names.
+    pub fn verify_stream(
+        &self,
+        stream: StreamId,
+        chain: &[SignedStreamAuthority],
+    ) -> Result<(), ProofError> {
+        let mut previous: Option<(&StreamAuthority, usize)> = None;
+        for (revision, signed) in chain.iter().enumerate() {
+            let authority = &signed.authority;
+            let index = self
+                .position(authority.catalog_sha256)
+                .ok_or(ProofError::CatalogHistory)?;
+            if !authority.valid()
+                || authority.catalog != self.genesis.catalog
+                || authority.stream != stream
+                || authority.revision != revision as u64
+                || authority.predecessor_sha256 != previous.map(|(prior, _)| prior.digest())
+                || previous.is_some_and(|(_, prior)| index < prior)
+            {
+                return Err(ProofError::CatalogHistory);
+            }
+            self.authorities()
+                .nth(index)
+                .ok_or(ProofError::CatalogHistory)?
+                .catalog_voters
+                .verify(&authority.statement(), &signed.signatures)?;
+            previous = Some((authority, index));
+        }
+        Ok(())
     }
 
     /// Verifies a head signed by its stream's current roster: a roster
-    /// replaced later in this history signs nothing, so retired keys cannot
-    /// certify a head.
-    pub fn verify_head(&self, root: CatalogRoot, signed: &SignedHead) -> Result<(), ProofError> {
-        self.verify_signed_head(root, signed, false)
+    /// replaced later in the presented authority signs nothing, so retired
+    /// keys cannot certify a head.
+    pub fn verify_head(
+        &self,
+        root: CatalogRoot,
+        signed: &SignedHead,
+        chain: &[SignedStreamAuthority],
+    ) -> Result<(), ProofError> {
+        self.verify_signed_head(root, signed, chain, false)
     }
 
     /// Verifies a head whose prefix a current head proves, so its roster may
@@ -324,14 +386,16 @@ impl CatalogHistory {
         &self,
         root: CatalogRoot,
         signed: &SignedHead,
+        chain: &[SignedStreamAuthority],
     ) -> Result<(), ProofError> {
-        self.verify_signed_head(root, signed, true)
+        self.verify_signed_head(root, signed, chain, true)
     }
 
     fn verify_signed_head(
         &self,
         root: CatalogRoot,
         signed: &SignedHead,
+        chain: &[SignedStreamAuthority],
         allow_replaced: bool,
     ) -> Result<(), ProofError> {
         let head = signed.head;
@@ -339,11 +403,24 @@ impl CatalogHistory {
             return Err(ProofError::Head);
         }
         self.verify(root)?;
-        match self.roster(head.authority_sha256, head.stream) {
-            Some((voters, replaced)) if allow_replaced || !replaced => {
-                voters.verify(&head.statement(), &signed.signatures)
+        let voters = if head.stream == CATALOG_STREAM {
+            match self.catalog_roster(head.authority_sha256) {
+                Some((voters, replaced)) if chain.is_empty() && (allow_replaced || !replaced) => voters,
+                _ => return Err(ProofError::CatalogHistory),
             }
-            _ => Err(ProofError::CatalogHistory),
-        }
+        } else {
+            self.verify_stream(head.stream, chain)?;
+            let index = chain
+                .iter()
+                .position(|signed| signed.authority.digest() == head.authority_sha256)
+                .ok_or(ProofError::CatalogHistory)?;
+            let authority = &chain[index].authority;
+            let current = index + 1 == chain.len() && self.catalog_roster_current(authority.catalog_sha256);
+            if !allow_replaced && !current {
+                return Err(ProofError::CatalogHistory);
+            }
+            &authority.voters
+        };
+        voters.verify(&head.statement(), &signed.signatures)
     }
 }

@@ -3,10 +3,10 @@ use std::io::{self, Read, Write};
 use bincode::Options;
 use serde::de::DeserializeOwned;
 
-use super::{Archive, CatalogHistory, Leaf, SignedHead, Tree};
+use super::{Archive, CatalogHistory, Certification, Leaf, SignedHead, Tree};
 use crate::stream::consensus::{MAX_MESSAGE, invalid, options};
 
-const MAGIC: &[u8; 8] = b"LKAARCH1";
+const MAGIC: &[u8; 8] = b"LKAARCH2";
 const MAX_LEAF_BYTES: u64 = 128;
 
 impl Archive {
@@ -21,14 +21,22 @@ impl Archive {
                 &mut *file,
                 &(
                     &self.signed_head,
-                    &self.history.genesis,
-                    self.history.transitions.len() as u64,
+                    &self.certification.history.genesis,
+                    self.certification.history.transitions.len() as u64,
                 ),
             )
             .map_err(io::Error::other)?;
-        for transition in &self.history.transitions {
+        for transition in &self.certification.history.transitions {
             options()
                 .serialize_into(&mut *file, transition)
+                .map_err(io::Error::other)?;
+        }
+        options()
+            .serialize_into(&mut *file, &(self.certification.stream.len() as u64))
+            .map_err(io::Error::other)?;
+        for authority in &self.certification.stream {
+            options()
+                .serialize_into(&mut *file, authority)
                 .map_err(io::Error::other)?;
         }
         for leaf in self.tree.leaves() {
@@ -61,6 +69,11 @@ impl Archive {
             genesis,
             transitions,
         };
+        let authority_count: u64 = read_item(file, 8)?;
+        let mut stream = Vec::new();
+        for _ in 0..authority_count {
+            stream.push(read_item(file, MAX_MESSAGE)?);
+        }
 
         let mut tree = Tree::default();
         for _ in 0..signed_head.head.size {
@@ -73,7 +86,7 @@ impl Archive {
         Ok(Self {
             tree,
             signed_head,
-            history,
+            certification: Certification { history, stream },
         })
     }
 }

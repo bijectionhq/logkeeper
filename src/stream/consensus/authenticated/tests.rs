@@ -65,22 +65,68 @@ fn signatures(entries: &[(u8, u8)], statement: &[u8]) -> Vec<QuorumSignature> {
 }
 
 fn genesis() -> CatalogAuthority {
-    let membership = roster(&[(1, 1), (2, 2), (3, 3)]);
     CatalogAuthority {
         catalog: CATALOG,
         revision: 0,
         predecessor_sha256: None,
-        catalog_voters: membership.clone(),
-        stream_voters: BTreeMap::from([(STREAM, membership)]),
+        catalog_voters: roster(&[(1, 1), (2, 2), (3, 3)]),
     }
 }
 
-fn sign_head(
-    size: u64,
-    root: Hash,
-    authority: &CatalogAuthority,
+fn history() -> CatalogHistory {
+    CatalogHistory {
+        genesis: genesis(),
+        transitions: Vec::new(),
+    }
+}
+
+/// Appends a catalog revision signed by `signers` of the latest roster.
+fn advance(history: &mut CatalogHistory, catalog_voters: VoterKeys, signers: &[(u8, u8)]) {
+    let previous = history.latest();
+    let authority = CatalogAuthority {
+        catalog: CATALOG,
+        revision: previous.revision + 1,
+        predecessor_sha256: Some(previous.digest()),
+        catalog_voters,
+    };
+    let signatures = signatures(signers, &authority.statement());
+    history.transitions.push(SignedAuthority {
+        authority,
+        signatures,
+    });
+}
+
+/// Appends a stream roster revision certified by `signers` of the latest
+/// catalog roster.
+fn certify(
+    history: &CatalogHistory,
+    chain: &mut Vec<SignedStreamAuthority>,
+    voters: VoterKeys,
     signers: &[(u8, u8)],
-) -> SignedHead {
+) {
+    let authority = StreamAuthority {
+        catalog: CATALOG,
+        stream: STREAM,
+        revision: chain.len() as u64,
+        predecessor_sha256: chain.last().map(|prior| prior.authority.digest()),
+        catalog_sha256: history.latest().digest(),
+        voters,
+    };
+    let signatures = signatures(signers, &authority.statement());
+    chain.push(SignedStreamAuthority {
+        authority,
+        signatures,
+    });
+}
+
+fn certification() -> Certification {
+    let history = history();
+    let mut stream = Vec::new();
+    certify(&history, &mut stream, roster(&[(1, 1), (2, 2), (3, 3)]), &[(1, 1), (2, 2)]);
+    Certification { history, stream }
+}
+
+fn sign_head(size: u64, root: Hash, authority: &StreamAuthority, signers: &[(u8, u8)]) -> SignedHead {
     let head = Head {
         catalog: CATALOG,
         stream: STREAM,
@@ -93,27 +139,6 @@ fn sign_head(
         head,
         signatures: signatures(signers, &head.statement()),
     }
-}
-
-fn advance(
-    history: &mut CatalogHistory,
-    catalog_voters: VoterKeys,
-    stream_voters: BTreeMap<StreamId, VoterKeys>,
-    signers: &[(u8, u8)],
-) {
-    let previous = history.latest();
-    let authority = CatalogAuthority {
-        catalog: CATALOG,
-        revision: previous.revision + 1,
-        predecessor_sha256: Some(previous.digest()),
-        catalog_voters,
-        stream_voters,
-    };
-    let signatures = signatures(signers, &authority.statement());
-    history.transitions.push(SignedAuthority {
-        authority,
-        signatures,
-    });
 }
 
 #[test]
@@ -160,17 +185,13 @@ fn authenticated_archive_produces_offline_proofs() {
         ..leaf(2)
     };
     tree.extend([leaf(1), timed, leaf(3)]).unwrap();
-    let genesis = genesis();
-    let root = genesis.root();
-    let signed_head = sign_head(tree.size(), tree.root(), &genesis, &[(1, 1), (3, 3)]);
-    let history = CatalogHistory {
-        genesis,
-        transitions: Vec::new(),
-    };
+    let root = genesis().root();
+    let certification = certification();
+    let signed_head = sign_head(tree.size(), tree.root(), &certification.stream[0].authority, &[(1, 1), (3, 3)]);
     let archive = Archive {
         tree,
         signed_head,
-        history,
+        certification,
     };
     let bytes = crate::stream::consensus::encode(&archive).unwrap();
     let mut framed = Vec::new();
@@ -203,67 +224,74 @@ fn authenticated_inclusion_refuses_cutoff_equality_even_with_a_signed_root() {
         ..leaf(1)
     };
     assert_eq!(Tree::default().append(late), Err(ProofError::Leaf));
-    let genesis = genesis();
-    let root = genesis.root();
-    let signed_head = sign_head(1, late.hash(), &genesis, &[(1, 1), (3, 3)]);
+    let certification = certification();
+    let signed_head = sign_head(1, late.hash(), &certification.stream[0].authority, &[(1, 1), (3, 3)]);
     let proof = Inclusion {
         leaf: late,
         path: Vec::new(),
         signed_head,
-        history: CatalogHistory {
-            genesis,
-            transitions: Vec::new(),
-        },
+        certification,
     };
-    assert_eq!(proof.verify(root), Err(ProofError::Leaf));
+    assert_eq!(proof.verify(genesis().root()), Err(ProofError::Leaf));
 }
 
 #[test]
-fn authenticated_history_verifies_replaced_and_rotated_quorums() {
-    let genesis = genesis();
-    let root = genesis.root();
-    let mut history = CatalogHistory {
-        genesis,
-        transitions: Vec::new(),
-    };
+fn authenticated_stream_chain_verifies_replaced_and_rotated_quorums() {
+    let root = genesis().root();
+    let mut certification = certification();
     let mut tree = Tree::default();
     tree.append(leaf(1)).unwrap();
-    let earlier = sign_head(1, tree.root(), history.latest(), &[(1, 1), (3, 3)]);
+    let earlier = sign_head(1, tree.root(), &certification.stream[0].authority, &[(1, 1), (3, 3)]);
 
-    let replacement = roster(&[(1, 1), (3, 3), (4, 4)]);
-    advance(
-        &mut history,
-        replacement.clone(),
-        BTreeMap::from([(STREAM, replacement)]),
-        &[(1, 1), (3, 3)],
-    );
-    let rotated = roster(&[(1, 1), (3, 3), (4, 5)]);
-    advance(
-        &mut history,
-        rotated.clone(),
-        BTreeMap::from([(STREAM, rotated)]),
-        &[(3, 3), (4, 4)],
-    );
-    let unchanged = history.latest().catalog_voters.clone();
-    advance(&mut history, unchanged, BTreeMap::new(), &[(3, 3), (4, 5)]);
-
+    let history = &certification.history;
+    certify(history, &mut certification.stream, roster(&[(1, 1), (3, 3), (4, 4)]), &[(1, 1), (3, 3)]);
+    certify(history, &mut certification.stream, roster(&[(1, 1), (3, 3), (4, 5)]), &[(2, 2), (3, 3)]);
     tree.append(leaf(2)).unwrap();
-    let later = sign_head(2, tree.root(), history.latest(), &[(3, 3), (4, 5)]);
+    let current = certification.stream[2].authority.clone();
+    let later = sign_head(2, tree.root(), &current, &[(3, 3), (4, 5)]);
     let mut proof = Consistency {
-        earlier,
+        earlier: earlier.clone(),
         later,
         path: tree.consistency(1, 2).unwrap(),
-        history,
+        certification: certification.clone(),
     };
     proof.verify(root).unwrap();
-    assert_eq!(
-        proof.verify(CatalogRoot([1; 32])),
-        Err(ProofError::CatalogHistory)
-    );
+    assert_eq!(earlier.verify(root, &certification), Err(ProofError::CatalogHistory));
+    assert_eq!(proof.verify(CatalogRoot([1; 32])), Err(ProofError::CatalogHistory));
     proof.later.signatures = signatures(&[(3, 3), (4, 4)], &proof.later.head.statement());
     assert_eq!(proof.verify(root), Err(ProofError::Signature));
-    proof.history.transitions.remove(0);
+    proof.certification.stream.remove(1);
     assert_eq!(proof.verify(root), Err(ProofError::CatalogHistory));
+}
+
+#[test]
+fn authenticated_stream_chain_needs_a_current_catalog_roster() {
+    let root = genesis().root();
+    let mut certification = certification();
+    let mut tree = Tree::default();
+    tree.append(leaf(1)).unwrap();
+    let retired = certification.stream[0].authority.clone();
+    advance(&mut certification.history, roster(&[(1, 1), (2, 2), (3, 6)]), &[(1, 1), (2, 2)]);
+
+    let head = sign_head(1, tree.root(), &retired, &[(1, 1), (2, 2)]);
+    assert_eq!(head.verify(root, &certification), Err(ProofError::CatalogHistory));
+
+    let mut forged = certification.clone();
+    let mut previous = forged.history.clone();
+    previous.transitions.clear();
+    certify(&previous, &mut forged.stream, roster(&[(7, 7), (8, 8), (9, 9)]), &[(1, 1), (3, 3)]);
+    let head = sign_head(1, tree.root(), &forged.stream[1].authority, &[(7, 7), (8, 8)]);
+    assert_eq!(head.verify(root, &forged), Err(ProofError::CatalogHistory));
+
+    certify(&certification.history.clone(), &mut certification.stream, retired.voters.clone(), &[(2, 2), (3, 6)]);
+    let head = sign_head(1, tree.root(), &certification.stream[1].authority, &[(1, 1), (2, 2)]);
+    head.verify(root, &certification).unwrap();
+
+    let other = Certification {
+        history: certification.history.clone(),
+        stream: Vec::new(),
+    };
+    assert_eq!(head.verify(root, &other), Err(ProofError::CatalogHistory));
 }
 
 #[test]
@@ -289,69 +317,23 @@ fn authenticated_joint_roster_requires_both_distinct_majorities() {
 }
 
 #[test]
-fn authenticated_replaced_roster_cannot_certify_a_head() {
-    let genesis = genesis();
-    let root = genesis.root();
-    let mut history = CatalogHistory {
-        genesis,
-        transitions: Vec::new(),
-    };
-    let mut tree = Tree::default();
-    tree.append(leaf(1)).unwrap();
-    let retired = history.latest().clone();
-    let rotated = roster(&[(1, 1), (2, 2), (3, 6)]);
-    advance(
-        &mut history,
-        rotated.clone(),
-        BTreeMap::from([(STREAM, rotated)]),
-        &[(1, 1), (2, 2)],
-    );
-
-    let mut forged = Tree::default();
-    forged.append(Leaf { writer_epoch: Epoch(9), ..leaf(1) }).unwrap();
-    let equivocation = sign_head(1, forged.root(), &retired, &[(1, 1), (3, 3)]);
-    assert_eq!(
-        equivocation.verify(root, &history),
-        Err(ProofError::CatalogHistory)
-    );
-    sign_head(1, tree.root(), history.latest(), &[(1, 1), (3, 6)])
-        .verify(root, &history)
-        .unwrap();
-
-    let unchanged = history.latest().catalog_voters.clone();
-    advance(&mut history, unchanged, BTreeMap::new(), &[(2, 2), (3, 6)]);
-    sign_head(1, tree.root(), &history.transitions[0].authority, &[(1, 1), (2, 2)])
-        .verify(root, &history)
-        .unwrap();
-}
-
-#[test]
 fn authenticated_abandoned_catalog_move_is_settled_by_the_side_it_keeps() {
-    let genesis = genesis();
-    let root = genesis.root();
-    let mut history = CatalogHistory {
-        genesis,
-        transitions: Vec::new(),
-    };
+    let root = genesis().root();
+    let mut history = history();
     let original = roster(&[(1, 1), (2, 2), (3, 3)]);
     let abandoned = original.joining(&roster(&[(4, 4), (5, 5), (6, 6)]));
-    advance(&mut history, abandoned, BTreeMap::new(), &[(1, 1), (2, 2)]);
+    advance(&mut history, abandoned, &[(1, 1), (2, 2)]);
     let retargeted = original.joining(&roster(&[(7, 7), (8, 8), (9, 9)]));
-    advance(&mut history, retargeted.clone(), BTreeMap::new(), &[(1, 1), (3, 3)]);
+    advance(&mut history, retargeted.clone(), &[(1, 1), (3, 3)]);
     history.verify(root).unwrap();
 
     let mut stranded = history.clone();
-    advance(
-        &mut stranded,
-        roster(&[(4, 4), (5, 5), (6, 6)]),
-        BTreeMap::new(),
-        &[(4, 4), (5, 5)],
-    );
+    advance(&mut stranded, roster(&[(4, 4), (5, 5), (6, 6)]), &[(4, 4), (5, 5)]);
     assert_eq!(stranded.verify(root), Err(ProofError::CatalogHistory));
 
     let target = retargeted
         .settles_to(&[keeper(7), keeper(8), keeper(9)])
         .unwrap();
-    advance(&mut history, target, BTreeMap::new(), &[(8, 8), (9, 9)]);
+    advance(&mut history, target, &[(8, 8), (9, 9)]);
     history.verify(root).unwrap();
 }

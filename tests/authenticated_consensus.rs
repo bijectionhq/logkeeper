@@ -149,38 +149,24 @@ async fn authenticated_consensus_survives_trim_replacement_rotation_and_shutdown
         .await
         .unwrap();
     let (_, after_move) = journal.authenticated_head(stream, Some(4)).await.unwrap();
-    let moved = after_move.latest().digest();
-    assert!(
-        after_move
-            .voters_at(moved, stream)
-            .unwrap()
-            .keepers()
-            .contains(&replacement_keeper)
-    );
-    assert!(
-        !after_move
-            .voters_at(moved, stream)
-            .unwrap()
-            .keepers()
-            .contains(&third)
-    );
+    let moved = after_move.stream.last().unwrap().authority.voters.clone();
+    assert!(moved.keepers().contains(&replacement_keeper));
+    assert!(!moved.keepers().contains(&third));
+    assert!(after_move.history.transitions.is_empty(), "a stream move leaves the catalog history alone");
 
     cluster.rotate_authentication_key(first).await.unwrap();
     journal
         .append_session_batch(replacement_writer.fence, Lsn(5), vec![ordinary.clone()])
         .await
         .unwrap();
-    let old_key = after_move.voters_at(moved, stream).unwrap().key(first);
+    let old_key = moved.key(first).copied();
     let (later, rotated) = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            if let Ok((head, history)) = journal.authenticated_head(stream, Some(5)).await
-                && history
-                    .voters_at(head.head.authority_sha256, stream)
-                    .unwrap()
-                    .key(first)
+            if let Ok((head, certification)) = journal.authenticated_head(stream, Some(5)).await
+                && certification.stream.last().unwrap().authority.voters.key(first).copied()
                     != old_key
             {
-                break (head, history);
+                break (head, certification);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }

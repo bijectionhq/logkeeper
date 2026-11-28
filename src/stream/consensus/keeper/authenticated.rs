@@ -21,8 +21,8 @@ use crate::server::durability::{sync_directory, sync_file};
 use crate::stream::consensus::{
     CATALOG_STREAM, CLUSTER_VERSION_AUTHENTICATED, Configuration, Voters,
     authenticated::{
-        Archive, CatalogAuthority, CatalogHistory, Hash, Head, Leaf, QuorumSignature, SignedHead,
-        Tree, VoterKeys,
+        Archive, CatalogAuthority, CatalogHistory, Certification, Hash, Head, Leaf, QuorumSignature,
+        SignedHead, SignedStreamAuthority, StreamAuthority, Tree, VoterKeys,
     },
     decode, encode,
 };
@@ -98,6 +98,9 @@ pub struct AuthenticatedConfig {
 #[derive(Clone)]
 struct CachedHead {
     configuration: Configuration,
+    /// The catalog history length when the head was certified; a catalog
+    /// roster change may retire its signers.
+    catalog_revisions: usize,
     signed: SignedHead,
 }
 
@@ -105,7 +108,6 @@ pub(super) struct Authentication {
     key: Ed25519KeyPair,
     stages: PathBuf,
     stage_locks: [parking_lot::Mutex<()>; STAGE_STRIPES],
-    archive_root: PathBuf,
     /// This catalog's stream archives within the shared mount.
     archive_directory: PathBuf,
     maximum_clock_error_micros: u32,
@@ -117,6 +119,7 @@ pub(super) struct Authentication {
 #[derive(Clone, Serialize, Deserialize)]
 pub(in crate::stream::consensus) enum AuthenticationRequest {
     History { from: usize },
+    StreamAuthority { stream: StreamId },
     Head { size: Option<u64> },
     Inclusion { at: Lsn, size: Option<u64> },
     Consistency { earlier: u64, later: u64 },
@@ -131,6 +134,7 @@ pub(in crate::stream::consensus) enum AuthenticationPeerRequest {
         configuration: Configuration,
     },
     AuthorityShare(CatalogAuthority),
+    StreamAuthorityShare(StreamAuthority),
     HeadAuthority {
         stream: StreamId,
         digest: Hash,
@@ -152,6 +156,7 @@ impl AuthenticationPeerRequest {
             Self::Key
             | Self::Authority { .. }
             | Self::AuthorityShare(_)
+            | Self::StreamAuthorityShare(_)
             | Self::HeadAuthority { .. } => CATALOG_STREAM,
             Self::HeadShare { head, .. } => head.stream,
             Self::StageDurability { stream, .. } => *stream,
@@ -230,7 +235,6 @@ impl Authentication {
             key,
             stages,
             stage_locks: std::array::from_fn(|_| parking_lot::Mutex::new(())),
-            archive_root: config.archive_directory,
             archive_directory,
             maximum_clock_error_micros: config.maximum_clock_error_micros,
             heads: parking_lot::Mutex::default(),
@@ -270,12 +274,13 @@ impl Authentication {
     ) -> Option<SignedHead> {
         let cached = self.heads.lock().get(&stream).cloned()?;
         let head = cached.signed.head;
-        let history = self.history.lock();
-        let current = history.as_ref().is_some_and(|history| {
-            history.roster_current(head.authority_sha256, stream)
-        });
+        let current = self.catalog_revisions() == Some(cached.catalog_revisions);
         (current && cached.configuration == configuration && head.size == size && head.root == root)
             .then_some(cached.signed)
+    }
+
+    fn catalog_revisions(&self) -> Option<usize> {
+        self.history.lock().as_ref().map(|history| history.transitions.len())
     }
 
     /// Whether a leader's head timestamp agrees with this keeper's clock:
@@ -291,10 +296,6 @@ impl Authentication {
             }
             _ => false,
         }
-    }
-
-    pub(super) fn archive_root(&self) -> &Path {
-        &self.archive_root
     }
 
     fn clock_nanos(&self) -> Option<u128> {
@@ -472,7 +473,7 @@ impl Authentication {
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     let existing = Archive::read_from(&mut File::open(&target)?)?;
                     existing
-                        .verify(archive.history.genesis.root())
+                        .verify(archive.certification.history.genesis.root())
                         .map_err(io::Error::other)?;
                     if existing.signed_head.head.stream != head.stream
                         || existing.signed_head.head.size != head.size
@@ -492,10 +493,7 @@ impl Authentication {
     }
 
     fn read_archive(&self, stream: StreamId, size: Option<u64>) -> io::Result<Archive> {
-        // Archives written before they were grouped by catalog.
-        let directory = Some(self.archive_directory(stream))
-            .filter(|directory| directory.exists())
-            .unwrap_or_else(|| self.archive_root.join(format!("{:032x}", stream.0)));
+        let directory = self.archive_directory(stream);
         let size = match size {
             Some(size) => size,
             None => {
@@ -518,7 +516,7 @@ impl Authentication {
             directory.join(format!("{size:016x}.archive")),
         )?)?;
         if archive.signed_head.head.stream != stream
-            || archive.verify(archive.history.genesis.root()).is_err()
+            || archive.verify(archive.certification.history.genesis.root()).is_err()
         {
             return Err(invalid("authenticated archive does not match its stream"));
         }
@@ -741,6 +739,9 @@ impl Engine {
             AuthenticationPeerRequest::AuthorityShare(proposed) => {
                 self.authority_share(&proposed).await
             }
+            AuthenticationPeerRequest::StreamAuthorityShare(proposed) => {
+                self.stream_authority_share(&proposed).await
+            }
             request @ AuthenticationPeerRequest::HeadAuthority { .. } => {
                 self.serve_catalog_stream(Request::AuthenticationPeer(request))
                     .await
@@ -911,6 +912,7 @@ impl Engine {
                         stream,
                         CachedHead {
                             configuration,
+                            catalog_revisions: authentication.catalog_revisions().unwrap_or(usize::MAX),
                             signed: signed.clone(),
                         },
                     );
@@ -1120,12 +1122,16 @@ impl Engine {
             Ok(history) => history,
             Err(error) => return failure(error),
         };
+        let stream = match self.fetch_stream_authorities(group.genesis.stream).await {
+            Ok(stream) => stream,
+            Err(error) => return failure(error),
+        };
         let archive = Archive {
             tree,
             signed_head,
-            history,
+            certification: Certification { history, stream },
         };
-        if archive.verify(archive.history.genesis.root()).is_err() {
+        if archive.verify(archive.certification.history.genesis.root()).is_err() {
             return failure(JournalError::Corrupted);
         }
         if !matches!(
@@ -1192,6 +1198,21 @@ impl Engine {
                 return Ok(());
             }
         }
+    }
+
+    async fn fetch_stream_authorities(
+        &self,
+        stream: StreamId,
+    ) -> journal_contract::Result<Vec<SignedStreamAuthority>> {
+        let request = Request::Authentication {
+            stream: CATALOG_STREAM,
+            request: AuthenticationRequest::StreamAuthority { stream },
+        };
+        authentication_value(
+            self.catalog_request(request)
+                .await
+                .map_err(|_| JournalError::Unavailable)?,
+        )
     }
 
     async fn authentication_history(&self) -> journal_contract::Result<CatalogHistory> {

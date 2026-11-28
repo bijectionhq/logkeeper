@@ -1721,7 +1721,9 @@ impl Engine {
                         | Request::PreferLeader { .. }
                         | Request::ClusterVersion
                         | Request::Authentication {
-                            request: AuthenticationRequest::History { .. },
+                            request:
+                                AuthenticationRequest::History { .. }
+                                | AuthenticationRequest::StreamAuthority { .. },
                             ..
                         }
                         | Request::AuthenticationPeer(_)
@@ -1849,7 +1851,8 @@ impl Engine {
         match request {
             Request::AuthenticationPeer(request) => self.authentication_peer(request).await,
             Request::Authentication {
-                request: AuthenticationRequest::History { .. },
+                request:
+                    AuthenticationRequest::History { .. } | AuthenticationRequest::StreamAuthority { .. },
                 ..
             } if stream == super::CATALOG_STREAM => {
                 if self.catalog_stream.is_some() {
