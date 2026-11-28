@@ -1133,9 +1133,12 @@ fn the_recovery_wait_dominates_each_grant(
     let first = include_recovery_wait(own, duration, margin);
     let wait = include_recovery_wait(first, other_duration, other_margin);
     assert(wait >= own);
-    assert(duration as int + margin as int <= u64::MAX ==>
-        wait as int >= old_duration as int + old_margin as int
-        && wait as int >= new_duration as int + new_margin as int);
+    // Each grant's own sum is bounded by the sum of the recorded maxima, and
+    // an unrepresentable sum saturates, so no representable grant is dropped.
+    assert(old_duration as int + old_margin as int <= u64::MAX ==>
+        wait as int >= old_duration as int + old_margin as int);
+    assert(new_duration as int + new_margin as int <= u64::MAX ==>
+        wait as int >= new_duration as int + new_margin as int);
     assert(other_duration as int + other_margin as int <= u64::MAX ==>
         wait as int >= other_duration as int + other_margin as int);
 }

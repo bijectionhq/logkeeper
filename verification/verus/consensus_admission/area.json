@@ -2050,6 +2050,24 @@
         }
       ],
       "min_verified_functions": 191
+    },
+    "skip-an-unrepresentable-wait": {
+      "defect": "leave a fenced keeper out of the wait when its recorded lease and margin overflow",
+      "mutate": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "find": "        None => u64::MAX,\n    }\n}",
+          "replace": "        None => accumulated,\n    }\n}"
+        }
+      ],
+      "expect": [
+        {
+          "file": "src/stream/consensus/decisions.rs",
+          "function": "include_recovery_wait",
+          "category": "postcondition not satisfied"
+        }
+      ],
+      "min_verified_functions": 196
     }
   }
 }

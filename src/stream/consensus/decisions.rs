@@ -1683,19 +1683,21 @@ pub(super) fn longest_grant(prior: u64, granted: u64) -> u64 {
 }
 
 /// Include one fenced keeper's persisted lease bound in the wait-out.
-/// The legacy reducer skips an unrepresentable sum.
+/// The record keeps the longest lease and the largest margin separately, so
+/// their sum can exceed every single grant and overflow; the wait then
+/// saturates rather than dropping the keeper.
 #[cfg_attr(verus_keep_ghost, verus_spec(out =>
     ensures out >= accumulated,
         (duration as int + margin as int <= u64::MAX) ==> (
             out as int >= duration as int + margin as int
             && (out == accumulated || out as int == duration as int + margin as int)
         ),
-        (duration as int + margin as int > u64::MAX) ==> out == accumulated,
+        (duration as int + margin as int > u64::MAX) ==> out == u64::MAX,
 ))]
 pub(super) fn include_recovery_wait(accumulated: u64, duration: u64, margin: u64) -> u64 {
     match recovery_wait(duration, margin) {
         Some(wait) => longest_grant(accumulated, wait),
-        None => accumulated,
+        None => u64::MAX,
     }
 }
 

@@ -575,7 +575,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "recovery drops a fenced keeper's lease bound when recorded maxima overflow"]
     fn recovery_wait_keeps_the_prior_bound_when_grant_maxima_overflow() {
         let keeper = ids()[0];
         let mut records = Records::default();
