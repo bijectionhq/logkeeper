@@ -268,7 +268,9 @@ impl Network {
             return Err(TransportError::Unreachable);
         };
         let stream = crate::stream::codec::stream(request);
-        let before = state.trace.as_mut().map(|trace| {
+        // A listing observes no single stream, so the per-stream replay omits it.
+        let traced = !matches!(request, Request::List { .. });
+        let before = state.trace.as_mut().filter(|_| traced).map(|trace| {
             let caller = trace.identity(identity);
             (caller, trace.images(engine))
         });
@@ -481,6 +483,7 @@ fn trace_row(
             "replace",
             format!("{} {} {}", epoch.0, ensemble(from), ensemble(to)),
         ),
+        Request::List { .. } => unreachable!("listings observe no stream and are not traced"),
         Request::StageOriginal { .. }
         | Request::AppendOriginal { .. }
         | Request::SyncOriginal { .. }
@@ -521,6 +524,7 @@ fn trace_row(
             }
             Reply::Deleted => row.push_str(" 8"),
             Reply::Replaced => row.push_str(" 9"),
+            Reply::Listed { .. } => unreachable!("listings are not traced"),
             Reply::OriginalSample(_)
             | Reply::OriginalRecord { .. }
             | Reply::OriginalEvidence(_) => {

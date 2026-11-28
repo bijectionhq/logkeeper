@@ -545,3 +545,177 @@ async fn concurrent_calls_share_one_connection_and_batches_authorize_each_reques
     stop.cancel();
     task.await.unwrap().unwrap();
 }
+
+/// A keeper is lost for good. The repairer moves the stream to the spare over mTLS,
+/// and a client that names the lost keeper in its URL still starts and follows the move.
+#[tokio::test]
+async fn repair_moves_a_parked_stream_and_a_named_url_follows_it() {
+    use journal_contract::Journal;
+
+    use crate::stream::{
+        repair::{Member, Outcome, Roster, repair_lost},
+        writer::Writer,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path();
+    let roots = dir.join("ca.pem");
+    let root = ca(&roots);
+    let repairer_uri = "urn:logkeeper:client:repair";
+    let writer_credentials = credentials(
+        dir,
+        "writer",
+        CLIENT,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &root,
+        &roots,
+    );
+    let repairer_credentials = credentials(
+        dir,
+        "repairer",
+        repairer_uri,
+        ExtendedKeyUsagePurpose::ClientAuth,
+        &root,
+        &roots,
+    );
+    let zones = ["a", "b", "c", "c"];
+    let mut keepers = Vec::new();
+    for (index, zone) in zones.into_iter().enumerate() {
+        let keeper = uuid::Uuid::from_u128(index as u128 + 1);
+        let name = format!("keeper-{index}");
+        let tls = credentials(
+            dir,
+            &name,
+            &format!("{KEEPER_URI}{keeper}"),
+            ExtendedKeyUsagePurpose::ServerAuth,
+            &root,
+            &roots,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listen = listener.local_addr().unwrap();
+        let config = Config {
+            keeper,
+            listen,
+            data: dir.join(name),
+            zone: zone.into(),
+            tls,
+            clients: vec![CLIENT.into(), repairer_uri.into()],
+            writers: vec![CLIENT.into(), repairer_uri.into()],
+            limits: Limits::default(),
+            timed_original: None,
+            sync_mode: SyncMode::Fsync,
+        };
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(config.serve(listener, stop.clone()));
+        keepers.push((keeper, listen, stop, task));
+    }
+    let named = |range: std::ops::Range<usize>| {
+        let entries: Vec<_> = keepers[range]
+            .iter()
+            .map(|(keeper, listen, ..)| format!("{keeper}@{listen}"))
+            .collect();
+        format!("logkeeper+tls://{}", entries.join(","))
+    };
+    let ids: Vec<_> = keepers
+        .iter()
+        .map(|(keeper, ..)| KeeperId(keeper.as_u128()))
+        .collect();
+
+    // The application starts with three keepers and a spare in zone c.
+    let (transport, ensemble) =
+        TcpTransport::discover(&named(0..4), &writer_credentials, Duration::from_secs(5))
+            .await
+            .unwrap();
+    assert_eq!(ensemble, [ids[0], ids[1], ids[2]]);
+    let writer = Writer::new(Arc::new(transport), ensemble).unwrap();
+    let stream = StreamId(31);
+    writer.create(stream).await.unwrap();
+    writer.seal(stream, Epoch(1)).await.unwrap();
+    let payload = Bytes::from_static(b"before the loss");
+    writer
+        .append(stream, Epoch(1), Lsn(1), payload.clone())
+        .await
+        .unwrap();
+    drop(writer);
+
+    // Zone c loses its keeper for good.
+    let (_, _, stop, task) = &mut keepers[2];
+    stop.cancel();
+    task.await.unwrap().unwrap();
+
+    let routes = keepers
+        .iter()
+        .map(|(keeper, listen, ..)| (KeeperId(keeper.as_u128()), listen.to_string()));
+    let repairer =
+        TcpTransport::new(&repairer_credentials, routes, Duration::from_secs(5)).unwrap();
+    let roster = Roster::new(ids.iter().zip(zones).map(|(&id, zone)| Member {
+        id,
+        zone: zone.into(),
+    }));
+    let report = repair_lost(&repairer, &roster, ids[2], &[]).await;
+    assert!(
+        matches!(report.outcomes[..], [(s, Outcome::Repaired { learner, .. })] if s == stream && learner == ids[3]),
+        "{report:?}"
+    );
+
+    // A fresh client still names the lost keeper first; discovery does not need it.
+    let (transport, ensemble) =
+        TcpTransport::discover(&named(0..4), &writer_credentials, Duration::from_secs(5))
+            .await
+            .unwrap();
+    let successor = Writer::new(Arc::new(transport), ensemble).unwrap();
+    assert_eq!(
+        successor
+            .seal(stream, Epoch(2))
+            .await
+            .map(|head| head >= Lsn(1)),
+        Ok(true)
+    );
+    let page = successor
+        .read(stream, Lsn(1), 1, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(page.records, [(Lsn(1), payload)]);
+    // An unnamed unreachable keeper still fails discovery, since its identity is unknown.
+    let unnamed = format!(
+        "logkeeper+tls://{},{},{}",
+        keepers[0].1, keepers[1].1, keepers[2].1
+    );
+    assert!(
+        TcpTransport::discover(&unnamed, &writer_credentials, Duration::from_secs(5))
+            .await
+            .is_err()
+    );
+    for (_, _, stop, task) in keepers {
+        stop.cancel();
+        if !task.is_finished() {
+            task.await.unwrap().unwrap();
+        }
+    }
+}
+
+#[test]
+fn journal_urls_accept_named_entries_and_spares() {
+    let id = uuid::Uuid::from_u128(7);
+    let url = format!("logkeeper+tls://a:1,{id}@b:2,c:3,d:4");
+    let entries = journal_url(&url).unwrap();
+    assert_eq!(
+        entries,
+        [
+            (None, "a:1"),
+            (Some(KeeperId(7)), "b:2"),
+            (None, "c:3"),
+            (None, "d:4")
+        ]
+    );
+    for invalid in [
+        "logkeeper+tls://a:1,b:2",
+        "logkeeper://a:1,b:2,c:3",
+        "logkeeper+tls://a:1,b:2,",
+        "logkeeper+tls://nope@a:1,b:2,c:3",
+        "logkeeper+tls://00000000-0000-0000-0000-000000000000@a:1,b:2,c:3",
+        "logkeeper+tls://a:1/x,b:2,c:3",
+    ] {
+        assert!(journal_url(invalid).is_err(), "accepted {invalid}");
+    }
+}

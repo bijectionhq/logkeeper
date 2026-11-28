@@ -1,4 +1,5 @@
 mod keeper;
+mod repair;
 
 use std::{sync::Arc, time::Duration};
 

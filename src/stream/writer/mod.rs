@@ -9,7 +9,7 @@ mod timed;
 
 pub use super::timed::{TimedOriginal, TimedOriginalProof};
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -51,6 +51,9 @@ struct Io {
 }
 
 type Heads = Vec<oneshot::Sender<Result<Lsn>>>;
+
+/// Ensemble moves one call follows, enough for a second replacement during the call.
+const FOLLOW_LIMIT: usize = 3;
 
 struct Stream {
     id: StreamId,
@@ -212,6 +215,81 @@ impl Writer {
         Ok(())
     }
 
+    /// Run `operation`, following the stream's ensemble after a replacement. An
+    /// `Unavailable` result can mean that the keepers moved the stream. Each keeper
+    /// enforces its own ensemble on Seal and Replace, so the ensemble this client
+    /// follows chooses only which keepers it asks, never what they accept.
+    async fn following<T, F>(&self, id: StreamId, operation: impl Fn(Arc<Stream>) -> F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        let mut stream = self.stream(id);
+        for _ in 0..FOLLOW_LIMIT {
+            match operation(stream.clone()).await {
+                Err(JournalError::Unavailable) => match self.follow(&stream).await {
+                    Some(next) => stream = next,
+                    None => return Err(JournalError::Unavailable),
+                },
+                result => return result,
+            }
+        }
+        operation(stream).await
+    }
+
+    /// Learn a newer ensemble from a voting member of the current one. A member's
+    /// ensemble contains itself and changes only through Replace, so the members of
+    /// the ensemble this client uses never report an older one.
+    async fn follow(&self, stream: &Arc<Stream>) -> Option<Arc<Stream>> {
+        let mut calls = FuturesUnordered::from_iter(stream.ensemble.map(|keeper| async move {
+            let check = Request::Check {
+                stream: stream.id,
+                epoch: Epoch(0),
+            };
+            (keeper, self.io.call(keeper, check).await)
+        }));
+        while let Some((keeper, reply)) = calls.next().await {
+            let Ok(Reply::Checked(view)) = reply else {
+                continue;
+            };
+            let ensemble = view.ensemble;
+            let distinct = ensemble
+                .iter()
+                .enumerate()
+                .all(|(i, id)| id.0 != 0 && !ensemble[..i].contains(id));
+            if view.learner
+                || ensemble == stream.ensemble
+                || !ensemble.contains(&keeper)
+                || !distinct
+            {
+                continue;
+            }
+            let promised = view.promised.map(|(epoch, ..)| epoch);
+            return Some(self.rebind(stream, ensemble, promised));
+        }
+        None
+    }
+
+    fn rebind(
+        &self,
+        stream: &Arc<Stream>,
+        ensemble: [KeeperId; 3],
+        promised: Option<Epoch>,
+    ) -> Arc<Stream> {
+        let mut streams = self.streams.lock();
+        let entry = streams.entry(stream.id).or_insert_with(|| stream.clone());
+        if Arc::ptr_eq(entry, stream) {
+            *entry = Arc::new(Stream::new(stream.id, ensemble));
+            // The replacement sealed a higher epoch, which fenced this writer.
+            if let Some(active) = stream.active.lock().take() {
+                active.close(match promised {
+                    Some(current) if current > active.epoch => JournalError::Fenced { current },
+                    _ => JournalError::Unavailable,
+                });
+            }
+        }
+        entry.clone()
+    }
+
     // A client without an active writer still reports a known remote fence or terminal state.
     async fn authority(
         &self,
@@ -294,7 +372,12 @@ impl Journal for Writer {
     }
 
     fn seal(&self, stream: StreamId, epoch: Epoch) -> BoxFuture<'_, Result<Lsn>> {
-        Box::pin(async move { self.seal_stream(&self.stream(stream), epoch).await })
+        Box::pin(async move {
+            self.following(stream, |stream| async move {
+                self.seal_stream(&stream, epoch).await
+            })
+            .await
+        })
     }
 
     fn append(
@@ -328,11 +411,19 @@ impl Journal for Writer {
         max: usize,
         wait: Duration,
     ) -> BoxFuture<'_, Result<Page>> {
-        Box::pin(async move { read::read(&self.io, &self.stream(stream), from, max, wait).await })
+        Box::pin(async move {
+            self.following(stream, |stream| async move {
+                read::read(&self.io, &stream, from, max, wait).await
+            })
+            .await
+        })
     }
 
     fn head(&self, stream: StreamId) -> BoxFuture<'_, Result<Lsn>> {
-        Box::pin(async move { head::head(self.io.clone(), self.stream(stream)).await })
+        Box::pin(async move {
+            self.following(stream, |stream| head::head(self.io.clone(), stream))
+                .await
+        })
     }
 
     fn trim(&self, stream: StreamId, epoch: Epoch, through: Lsn) -> BoxFuture<'_, Result<()>> {
@@ -341,19 +432,28 @@ impl Journal for Writer {
 
     fn delete(&self, stream: StreamId) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            let stream = self.stream(stream);
-            let mut recovery = stream.mutation.lock().await;
-            driver::run_detached(
-                self.io.transport.clone(),
-                Mutation::new(Kind::Delete, stream.id, stream.ensemble),
+            self.following(
+                stream,
+                |stream| async move { self.delete_stream(&stream).await },
             )
-            .await?;
-            if let Some(active) = stream.active.lock().take() {
-                active.close(JournalError::Deleted);
-            }
-            *recovery = None;
-            Ok(())
+            .await
         })
+    }
+}
+
+impl Writer {
+    async fn delete_stream(&self, stream: &Stream) -> Result<()> {
+        let mut recovery = stream.mutation.lock().await;
+        driver::run_detached(
+            self.io.transport.clone(),
+            Mutation::new(Kind::Delete, stream.id, stream.ensemble),
+        )
+        .await?;
+        if let Some(active) = stream.active.lock().take() {
+            active.close(JournalError::Deleted);
+        }
+        *recovery = None;
+        Ok(())
     }
 }
 

@@ -241,6 +241,8 @@ impl Access {
             Request::Read { .. } | Request::Check { .. } | Request::ProveOriginal { .. } => {
                 self.can_read
             }
+            // Listing exposes every stream ID on the keeper, so only writers may enumerate.
+            Request::List { .. } => self.can_write,
             Request::Batch(_) => false,
             _ => self.can_write,
         }
@@ -384,51 +386,47 @@ impl TcpTransport {
         Ok(transport)
     }
 
-    /// Resolve the initial ensemble in URL order from the keepers' authenticated URI SANs.
+    /// Resolve keeper routes in URL order. An entry `HOST:PORT` takes its identity
+    /// from the keeper's certificate, so it must be reachable now. An entry
+    /// `UUID@HOST:PORT` names the keeper and connects on first use, so a lost keeper
+    /// does not prevent startup; its certificate must still name that UUID. The first
+    /// three entries are the default ensemble. Further entries are the spares a
+    /// replacement can move a stream to, which the writer then follows.
     pub async fn discover(
         url: &str,
         credentials: &Credentials,
         deadline: Duration,
     ) -> io::Result<(Self, [KeeperId; 3])> {
-        let addresses: [&str; 3] = url
-            .strip_prefix("logkeeper+tls://")
-            .ok_or_else(|| invalid("invalid journal URL scheme"))?
-            .split(',')
-            .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|_| invalid("expected three keeper addresses"))?;
-        if addresses
-            .iter()
-            .any(|address| address.is_empty() || address.contains(['/', '?', '#', '@']))
-        {
-            return Err(invalid("invalid journal URL keeper address"));
-        }
+        let entries = journal_url(url)?;
         let mut transport = Self::new(credentials, [], deadline)?;
         let connections = timeout(
             deadline,
-            futures::future::try_join_all(addresses.iter().map(|address| {
+            futures::future::try_join_all(entries.iter().map(|(named, address)| {
                 let tls = &transport.tls;
                 async move {
+                    if let Some(id) = named {
+                        return Ok::<_, io::Error>((Duration::MAX, *id, None));
+                    }
                     let start = Instant::now();
                     let (id, channel) = connect(tls, address).await?;
-                    Ok::<_, io::Error>((start.elapsed(), id, channel))
+                    Ok((start.elapsed(), id, Some(channel)))
                 }
             })),
         )
         .await??;
-        let mut ensemble = [KeeperId(0); 3];
-        let mut proximity = Vec::with_capacity(ensemble.len());
-        for (index, (address, (elapsed, id, channel))) in
-            addresses.into_iter().zip(connections).enumerate()
-        {
+        let mut proximity = Vec::with_capacity(entries.len());
+        for ((_, address), (elapsed, id, channel)) in entries.into_iter().zip(connections) {
             let route = Route::new(id, address.into(), &transport.tls, deadline);
-            route.shared.adopt(channel);
+            if let Some(channel) = channel {
+                route.shared.adopt(channel);
+            }
             if transport.routes.insert(id, route).is_some() {
                 return Err(invalid("duplicate keeper identity"));
             }
             proximity.push((elapsed, id));
-            ensemble[index] = id;
         }
+        let ensemble = [proximity[0].1, proximity[1].1, proximity[2].1];
+        // Keepers that were not measured keep their URL order after the measured ones.
         proximity.sort_by_key(|(elapsed, _)| *elapsed);
         transport
             .read_order
@@ -896,6 +894,41 @@ pub(super) fn keeper_id(certificate: &CertificateDer<'_>) -> io::Result<KeeperId
         return Err(invalid("keeper URI requires a nonzero canonical UUID"));
     }
     Ok(KeeperId(id.as_u128()))
+}
+
+/// Most keepers a journal URL can list.
+const MAX_URL_KEEPERS: usize = 1024;
+
+/// Parse `logkeeper+tls://ENTRY,ENTRY,ENTRY[,ENTRY...]`, where each entry is
+/// `HOST:PORT` or `UUID@HOST:PORT`.
+fn journal_url(url: &str) -> io::Result<Vec<(Option<KeeperId>, &str)>> {
+    let entries = url
+        .strip_prefix("logkeeper+tls://")
+        .ok_or_else(|| invalid("invalid journal URL scheme"))?
+        .split(',')
+        .map(|entry| {
+            let (id, address) = match entry.split_once('@') {
+                Some((id, address)) => {
+                    let id = uuid::Uuid::parse_str(id)
+                        .map_err(|_| invalid("invalid journal URL keeper UUID"))?
+                        .as_u128();
+                    if id == 0 {
+                        return Err(invalid("invalid journal URL keeper UUID"));
+                    }
+                    (Some(KeeperId(id)), address)
+                }
+                None => (None, entry),
+            };
+            if address.is_empty() || address.contains(['/', '?', '#', '@']) {
+                return Err(invalid("invalid journal URL keeper address"));
+            }
+            Ok((id, address))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if !(3..=MAX_URL_KEEPERS).contains(&entries.len()) {
+        return Err(invalid("expected at least three keeper addresses"));
+    }
+    Ok(entries)
 }
 
 fn display_error(error: impl std::fmt::Display) -> io::Error {

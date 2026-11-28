@@ -25,6 +25,7 @@ pub(super) enum Kind {
     Poll,
     Read,
     Delete,
+    List,
 }
 
 impl Kind {
@@ -42,6 +43,7 @@ impl Kind {
             Request::Read { wait_ms, .. } if *wait_ms > 0 => Self::Poll,
             Request::Read { .. } => Self::Read,
             Request::Delete { .. } => Self::Delete,
+            Request::List { .. } => Self::List,
             Request::StageOriginal { .. }
             | Request::AppendOriginal { .. }
             | Request::SyncOriginal { .. }
@@ -92,7 +94,7 @@ pub(super) struct Network {
 
 struct State {
     keepers: Vec<Memory>,
-    down: [bool; 4],
+    down: Vec<bool>,
     faults: BTreeMap<(KeeperId, Kind), Fault>,
     calls: Vec<(KeeperId, Kind)>,
 }
@@ -113,7 +115,7 @@ impl Network {
         Self {
             state: Mutex::new(State {
                 keepers: (0..keepers).map(|_| Memory::default()).collect(),
-                down: [false; 4],
+                down: vec![false; keepers],
                 faults: BTreeMap::new(),
                 calls: Vec::new(),
             }),

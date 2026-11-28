@@ -20,6 +20,11 @@ async fn main() -> ExitCode {
         #[cfg(feature = "stream")]
         println!("       logkeeper keeper --config FILE [--log-format human|json]");
         #[cfg(feature = "stream")]
+        println!(
+            "       {}",
+            &logkeeper::stream::repair::USAGE["Usage: ".len()..]
+        );
+        #[cfg(feature = "stream")]
         println!("       {}", &FENCE_USAGE["Usage: ".len()..]);
         #[cfg(feature = "stream")]
         println!("       {}", &RECOVER_USAGE["Usage: ".len()..]);
@@ -67,6 +72,21 @@ async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + S
         }
         if !outcome.ok {
             return Err("the command did not fully succeed; see the report".into());
+        }
+        return Ok(());
+    }
+    #[cfg(feature = "stream")]
+    if args.first().is_some_and(|arg| arg == "repair") {
+        let stop = CancellationToken::new();
+        let repairing = logkeeper::stream::repair::command(&args[1..], stop.clone());
+        tokio::pin!(repairing);
+        tokio::select! {
+            result = &mut repairing => result?,
+            signal = shutdown_signal() => {
+                stop.cancel();
+                repairing.await?;
+                signal?;
+            }
         }
         return Ok(());
     }

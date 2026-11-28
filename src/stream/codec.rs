@@ -49,7 +49,8 @@ pub(super) fn stream(request: &Request) -> StreamId {
         | Request::StageOriginal { stream, .. }
         | Request::AppendOriginal { stream, .. }
         | Request::SyncOriginal { stream, .. }
-        | Request::ProveOriginal { stream, .. } => stream,
+        | Request::ProveOriginal { stream, .. }
+        | Request::List { stream, .. } => stream,
         // An envelope names no stream. The keeper splits it before any per-stream rule.
         Request::Batch(_) => StreamId(0),
     }
@@ -302,7 +303,7 @@ struct RequestFrame {
     stream: Bytes,
     #[prost(
         oneof = "RequestBody",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17"
     )]
     body: Option<RequestBody>,
     /// A `Request::Batch` envelope. Exclusive with `stream` and `body`.
@@ -408,6 +409,12 @@ macro_rules! request_field {
     };
     (encode id, $value:expr) => {
         encode_id(*$value)
+    };
+    (encode keeper, $value:expr) => {
+        encode_id($value.0)
+    };
+    (decode keeper, $value:expr) => {
+        KeeperId(decode_id(&$value)?)
     };
     (decode id, $value:expr) => {
         decode_id(&$value)?
@@ -542,13 +549,19 @@ request_messages! {
         #[prost(fixed64, tag = "1")]
         at: u64 => position,
     },
+    List = "17" {
+        #[prost(bytes = "bytes", tag = "1")]
+        member: Bytes => keeper,
+        #[prost(uint32, tag = "2")]
+        max: u32 => copy,
+    },
 }
 
 #[derive(Clone, Message)]
 struct ReplyFrame {
     #[prost(
         oneof = "ReplyBody",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15"
     )]
     body: Option<ReplyBody>,
     /// A `Reply::Batch` envelope. Exclusive with `body`.
@@ -584,6 +597,22 @@ enum ReplyBody {
     OriginalRecord(TimedReply),
     #[prost(message, tag = "14")]
     OriginalEvidence(TimedReply),
+    #[prost(message, tag = "15")]
+    Listed(Listing),
+}
+
+#[derive(Clone, Message)]
+struct Listing {
+    #[prost(message, repeated, tag = "1")]
+    streams: Vec<Listed>,
+}
+
+#[derive(Clone, Message)]
+struct Listed {
+    #[prost(bytes = "bytes", tag = "1")]
+    stream: Bytes,
+    #[prost(bytes = "bytes", repeated, tag = "2")]
+    ensemble: Vec<Bytes>,
 }
 
 #[derive(Clone, Message)]
@@ -694,6 +723,15 @@ impl From<&Reply> for ReplyFrame {
             }),
             Reply::Deleted => ReplyBody::Deleted(Empty {}),
             Reply::Replaced => ReplyBody::Replaced(Empty {}),
+            Reply::Listed { streams } => ReplyBody::Listed(Listing {
+                streams: streams
+                    .iter()
+                    .map(|(stream, ensemble)| Listed {
+                        stream: encode_id(stream.0),
+                        ensemble: encode_ensemble(ensemble),
+                    })
+                    .collect(),
+            }),
             Reply::Refused(refusal) => ReplyBody::Refused(RefusalFrame::from(refusal)),
             Reply::Batch(replies) => {
                 return Self {
@@ -772,6 +810,18 @@ impl TryFrom<ReplyFrame> for Reply {
                 }
                 ReplyBody::Deleted(_) => Self::Deleted,
                 ReplyBody::Replaced(_) => Self::Replaced,
+                ReplyBody::Listed(body) => Self::Listed {
+                    streams: body
+                        .streams
+                        .into_iter()
+                        .map(|listed| {
+                            Ok((
+                                StreamId(decode_id(&listed.stream)?),
+                                decode_ensemble(listed.ensemble)?,
+                            ))
+                        })
+                        .collect::<io::Result<_>>()?,
+                },
                 ReplyBody::Refused(body) => Self::Refused(Refusal::try_from(body)?),
             },
         )
@@ -907,6 +957,11 @@ mod tests {
                 from: ensemble,
                 to: [KeeperId(1), KeeperId(2), KeeperId(4)],
             },
+            Request::List {
+                stream,
+                member: KeeperId(3),
+                max: 64,
+            },
         ] {
             let body = encode_request(&request).unwrap();
             assert_eq!(decode_request(body.clone()).unwrap(), request);
@@ -951,6 +1006,9 @@ mod tests {
             },
             Reply::Deleted,
             Reply::Replaced,
+            Reply::Listed {
+                streams: vec![(stream, ensemble), (StreamId(9), ensemble)],
+            },
         ];
         for reply in replies
             .into_iter()

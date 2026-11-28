@@ -1,5 +1,6 @@
 mod guards;
 mod network;
+mod repair;
 
 use std::{
     env,
@@ -297,10 +298,16 @@ async fn seed_run(seed: u64, trace: Option<&mut BufWriter<File>>) -> Coverage {
             Reply::Refused(Refusal::WrongEnsemble { ensemble }),
             "replacement: a keeper promised an epoch on the stale ensemble (seed {seed})"
         );
-        assert_eq!(
-            history.call(&old, &OLD, Op::Seal(Epoch(9))).await,
-            Err(JournalError::Unavailable),
-            "replacement: old ensemble still admitted a seal (seed {seed})"
+        // The stale writer's lanes still target the old ensemble, so its append is
+        // refused. (A Writer that seals a higher epoch follows the new ensemble.)
+        assert!(
+            matches!(
+                history
+                    .call(&old, &OLD, Op::Append(E1, Lsn(2), payload(seed, 5)))
+                    .await,
+                Err(JournalError::Fenced { .. } | JournalError::Unavailable)
+            ),
+            "replacement: old ensemble still admitted an append (seed {seed})"
         );
     } else {
         if let Some(fault) = fault {

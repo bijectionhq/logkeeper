@@ -20,6 +20,9 @@ pub struct EpochRun {
     pub last: Lsn,
 }
 
+/// Most entries in one `Reply::Listed`.
+pub const LIST_MAX: u32 = 4096;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     Create {
@@ -114,6 +117,14 @@ pub enum Request {
         stream: StreamId,
         at: Lsn,
     },
+    /// Enumerate the keeper's live streams whose ensemble contains `member`,
+    /// in ascending stream order after the exclusive cursor `stream`. Repair uses it
+    /// to find the streams of a lost keeper on the survivors. It only observes state.
+    List {
+        stream: StreamId,
+        member: KeeperId,
+        max: u32,
+    },
     /// Node-level envelope: independent single-stream requests from one client process,
     /// decided in arrival order in one keeper round with one sync. Never nested or empty.
     Batch(Vec<Request>),
@@ -161,6 +172,10 @@ pub enum Reply {
     OriginalEvidence(Arc<TimedEvidence>),
     Deleted,
     Replaced,
+    /// Matching streams with their ensembles. Fewer than `max` entries ends the listing.
+    Listed {
+        streams: Vec<(StreamId, [KeeperId; 3])>,
+    },
     Refused(Refusal),
     /// One reply per request of a `Request::Batch`, in request order.
     Batch(Vec<Reply>),

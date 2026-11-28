@@ -636,8 +636,9 @@ mod implementation {
                     ReplaceDecision::Persist => Decision::Persist,
                 }
             }
-            // `Keeper::call` splits envelopes before any per-stream decision.
+            // `Keeper::call` splits envelopes and answers listings before any per-stream decision.
             Request::Batch(_)
+            | Request::List { .. }
             | Request::StageOriginal { .. }
             | Request::AppendOriginal { .. }
             | Request::SyncOriginal { .. }

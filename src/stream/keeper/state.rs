@@ -221,6 +221,34 @@ impl Staging {
     }
 }
 
+/// Answer `Request::List`: live streams whose ensemble contains `member`, in
+/// ascending order after the exclusive cursor. A learner lists the ensemble it was
+/// created with, so an interrupted replacement stays discoverable. Tombstones are
+/// omitted.
+pub(super) fn list<'a>(
+    streams: impl IntoIterator<Item = (&'a StreamId, &'a Stream)>,
+    after: StreamId,
+    member: KeeperId,
+    max: u32,
+) -> Reply {
+    let max = max.min(wire::LIST_MAX) as usize;
+    let mut found: Vec<_> = streams
+        .into_iter()
+        .filter(|(id, stream)| {
+            **id > after && !stream.deleted && stream.view.ensemble.contains(&member)
+        })
+        .map(|(id, stream)| (*id, stream.view.ensemble))
+        .collect();
+    if found.len() > max {
+        if max > 0 {
+            found.select_nth_unstable_by_key(max - 1, |(id, _)| *id);
+        }
+        found.truncate(max);
+    }
+    found.sort_unstable_by_key(|(id, _)| *id);
+    Reply::Listed { streams: found }
+}
+
 pub(super) struct Stream {
     pub view: wire::StreamView,
     pub deleted: bool,

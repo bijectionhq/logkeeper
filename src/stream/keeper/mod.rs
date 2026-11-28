@@ -237,6 +237,7 @@ impl Work {
                 | Request::Read { .. }
                 | Request::Recover { .. }
                 | Request::ProveOriginal { .. }
+                | Request::List { .. }
         )
     }
 }
@@ -426,6 +427,16 @@ impl Engine {
                 pending.push_back(work);
                 pending.append(&mut admitted);
                 break;
+            }
+            if let Request::List {
+                stream,
+                member,
+                max,
+            } = work.request
+            {
+                let reply = state::list(&self.streams, stream, member, max);
+                replies.push((work.done, (Ok(reply), None)));
+                continue;
             }
             let id = codec::stream(&work.request);
             if blocked.contains(&id) {

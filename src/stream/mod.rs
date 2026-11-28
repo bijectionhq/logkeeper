@@ -6,6 +6,7 @@ pub mod codec;
 pub mod consensus;
 pub mod keeper;
 mod proposer;
+pub mod repair;
 pub mod timed;
 #[cfg(feature = "stream")]
 pub mod transport;

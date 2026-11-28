@@ -26,6 +26,14 @@ impl Memory {
         request: Request,
         limits: &Limits,
     ) -> Reply {
+        if let Request::List {
+            stream,
+            member,
+            max,
+        } = request
+        {
+            return state::list(&self.streams, stream, member, max);
+        }
         let id = codec::stream(&request);
         let stream = self.streams.get(&id);
         let mut reader = ExtentReader::default();
