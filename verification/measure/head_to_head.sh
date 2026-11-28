@@ -42,5 +42,5 @@ for backend in writer consensus; do
     run --backend "$backend" takeover 1000 32
 done
 run --backend writer repair 100
-run --backend consensus --repair-after-secs 10 --park-after-secs 15 repair 100
+run --backend consensus --repair-after-secs 10 --park-after-secs 60 repair 100
 run --backend writer repair 1000
