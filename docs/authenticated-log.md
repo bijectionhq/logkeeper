@@ -118,6 +118,7 @@ An ordinary write quorum must have overlapping retention intervals that cover th
 Keepers reclaim stages that are fenced, superseded by committed positions, or past their promised retention.
 Timed batches keep the guarded receiver-clock admission path and record its quorum bound in the tree.
 Current authenticated streams export inclusion proofs, while pre-feature immutable streams retain their level 13 attestation protocol.
+The level 13 attestation protocol retires with the last pre-feature immutable stream, once each is retired or migrated into an authenticated stream.
 Provision the catalog voters and stream voters before creating authenticated streams.
 Finalize level 14 on the replicated catalog and pin the root through an independent trusted channel.
 The root is the digest of the genesis authority over the catalog voters' provisioned signing keys, so an operator computes it from those keys rather than reading it from a keeper.

@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 use super::*;
