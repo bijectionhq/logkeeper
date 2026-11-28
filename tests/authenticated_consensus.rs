@@ -8,7 +8,9 @@ use journal_contract::{
     StreamId, WriterSessionId,
 };
 use logkeeper::stream::consensus::{
-    CLUSTER_VERSION_AUTHENTICATED, Voters, authenticated::Archive, testing::LocalCluster,
+    CLUSTER_VERSION_AUTHENTICATED, JournalConfig, Voters,
+    authenticated::{Archive, CatalogRoot},
+    testing::LocalCluster,
 };
 use logkeeper::stream::timed::TimedOriginal;
 use sha2::{Digest, Sha256};
@@ -33,7 +35,7 @@ async fn authenticated_consensus_survives_trim_replacement_rotation_and_shutdown
         .finalize_version(principal, CLUSTER_VERSION_AUTHENTICATED)
         .await
         .unwrap();
-    let root = journal.catalog_history().await.unwrap().genesis.root();
+    let root = cluster.catalog_root().unwrap();
     journal.create_authenticated(stream).await.unwrap();
 
     let writer = journal
@@ -169,7 +171,7 @@ async fn authenticated_consensus_survives_trim_replacement_rotation_and_shutdown
         .await
         .unwrap();
     let old_key = after_move.voters_at(moved, stream).unwrap().key(first);
-    let later = tokio::time::timeout(Duration::from_secs(20), async {
+    let (later, rotated) = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if let Ok((head, history)) = journal.authenticated_head(stream, Some(5)).await
                 && history
@@ -178,13 +180,17 @@ async fn authenticated_consensus_survives_trim_replacement_rotation_and_shutdown
                     .key(first)
                     != old_key
             {
-                break head;
+                break (head, history);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
     .unwrap();
+    assert!(
+        earlier.verify(root, &rotated).is_err(),
+        "a replaced roster's head no longer verifies on its own"
+    );
     journal
         .consistency(earlier, later)
         .await
@@ -199,6 +205,7 @@ async fn authenticated_consensus_survives_trim_replacement_rotation_and_shutdown
     let path = cluster
         .directory()
         .join("stream-archives")
+        .join(format!("catalog-{:032x}", cluster.catalog().as_u128()))
         .join(format!("{:032x}", stream.0))
         .join("0000000000000005.archive");
     let archive = Archive::read_from(&mut File::open(path).unwrap()).unwrap();
@@ -216,10 +223,23 @@ async fn authenticated_refused_stage_does_not_reserve_the_position() {
         .finalize_version(principal, CLUSTER_VERSION_AUTHENTICATED)
         .await
         .unwrap();
-    let journal = cluster
-        .journal(principal, &cluster.journal_config(512, 1024))
+    let config = cluster.journal_config(512, 1024);
+    let journal = cluster.journal(principal, &config).unwrap();
+    let root = cluster.catalog_root().unwrap();
+    let unpinned = cluster
+        .journal(principal, &JournalConfig { catalog_root: None, ..config.clone() })
         .unwrap();
-    let root = journal.catalog_history().await.unwrap().genesis.root();
+    assert_eq!(unpinned.catalog_history().await, Err(JournalError::Unsupported));
+    let misled = cluster
+        .journal(
+            principal,
+            &JournalConfig {
+                catalog_root: Some(CatalogRoot([9; 32])),
+                ..config.clone()
+            },
+        )
+        .unwrap();
+    assert_eq!(misled.catalog_history().await, Err(JournalError::Corrupted));
     let stream = StreamId(74);
     journal.create_authenticated(stream).await.unwrap();
     let writer = journal

@@ -98,8 +98,6 @@ pub struct AuthenticatedConfig {
 #[derive(Clone)]
 struct CachedHead {
     configuration: Configuration,
-    voters: VoterKeys,
-    checked_at: Instant,
     signed: SignedHead,
 }
 
@@ -107,9 +105,13 @@ pub(super) struct Authentication {
     key: Ed25519KeyPair,
     stages: PathBuf,
     stage_locks: [parking_lot::Mutex<()>; STAGE_STRIPES],
+    archive_root: PathBuf,
+    /// This catalog's stream archives within the shared mount.
     archive_directory: PathBuf,
     maximum_clock_error_micros: u32,
     heads: parking_lot::Mutex<BTreeMap<StreamId, CachedHead>>,
+    /// The verified catalog history as last read, extended once per tend.
+    history: parking_lot::Mutex<Option<CatalogHistory>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -181,6 +183,7 @@ pub(in crate::stream::consensus) struct Included {
 impl Authentication {
     pub(super) fn open(
         config: AuthenticatedConfig,
+        catalog: Uuid,
         data: &Path,
         tls_key: &[u8],
     ) -> io::Result<Self> {
@@ -218,13 +221,20 @@ impl Authentication {
         fs::create_dir_all(&stages)?;
         sync_directory(data)?;
         fs::create_dir_all(&config.archive_directory)?;
+        let archive_directory = config
+            .archive_directory
+            .join(format!("catalog-{:032x}", catalog.as_u128()));
+        fs::create_dir_all(&archive_directory)?;
+        sync_directory(&config.archive_directory)?;
         Ok(Self {
             key,
             stages,
             stage_locks: std::array::from_fn(|_| parking_lot::Mutex::new(())),
-            archive_directory: config.archive_directory,
+            archive_root: config.archive_directory,
+            archive_directory,
             maximum_clock_error_micros: config.maximum_clock_error_micros,
             heads: parking_lot::Mutex::default(),
+            history: parking_lot::Mutex::default(),
         })
     }
 
@@ -249,8 +259,42 @@ impl Authentication {
         }
     }
 
+    /// The cached head of `stream` at this prefix, while its roster is the
+    /// one the last observed catalog history holds for the stream.
+    fn current_head(
+        &self,
+        stream: StreamId,
+        configuration: Configuration,
+        size: u64,
+        root: Hash,
+    ) -> Option<SignedHead> {
+        let cached = self.heads.lock().get(&stream).cloned()?;
+        let head = cached.signed.head;
+        let history = self.history.lock();
+        let current = history.as_ref().is_some_and(|history| {
+            history.roster_current(head.authority_sha256, stream)
+        });
+        (current && cached.configuration == configuration && head.size == size && head.root == root)
+            .then_some(cached.signed)
+    }
+
+    /// Whether a leader's head timestamp agrees with this keeper's clock:
+    /// both clocks lie within the configured error of true time, and the
+    /// request reached this voter within its timeout.
+    fn timely(&self, head: Head) -> bool {
+        let error = i64::from(self.maximum_clock_error_micros);
+        let transit = REQUEST_TIMEOUT.as_micros() as i64;
+        match (self.time_lower(), self.time_upper()) {
+            (Some(lower), Some(upper)) => {
+                lower.saturating_sub(error + transit) <= head.timestamp_micros
+                    && head.timestamp_micros <= upper.saturating_add(2 * error)
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn archive_root(&self) -> &Path {
-        &self.archive_directory
+        &self.archive_root
     }
 
     fn clock_nanos(&self) -> Option<u128> {
@@ -448,7 +492,10 @@ impl Authentication {
     }
 
     fn read_archive(&self, stream: StreamId, size: Option<u64>) -> io::Result<Archive> {
-        let directory = self.archive_directory(stream);
+        // Archives written before they were grouped by catalog.
+        let directory = Some(self.archive_directory(stream))
+            .filter(|directory| directory.exists())
+            .unwrap_or_else(|| self.archive_root.join(format!("{:032x}", stream.0)));
         let size = match size {
             Some(size) => size,
             None => {
@@ -767,10 +814,10 @@ impl Engine {
         {
             return Ok(failure(JournalError::Unavailable));
         }
-        let Some(tree) = group.state.authenticated_tree() else {
-            return Ok(failure(JournalError::Unavailable));
-        };
-        if !head.valid() || tree.root_at(head.size).ok() != Some(head.root) {
+        let applied = group
+            .state
+            .with_authenticated_tree(|tree| tree.root_at(head.size).ok());
+        if !head.valid() || applied.flatten() != Some(head.root) || !authentication.timely(head) {
             return Ok(failure(JournalError::Unavailable));
         }
         let request = Request::AuthenticationPeer(AuthenticationPeerRequest::HeadAuthority {
@@ -798,12 +845,10 @@ impl Engine {
         ))
     }
 
-    async fn certify_head(
-        &self,
-        group: &Group,
-        tree: &Tree,
-        size: u64,
-    ) -> Result<SignedHead, Reply> {
+    /// A quorum-signed head over the applied prefix of `size` leaves with
+    /// `root`. A cached head serves until its roster is replaced, so an idle
+    /// stream costs no catalog requests.
+    async fn certify_head(&self, group: &Group, size: u64, root: Hash) -> Result<SignedHead, Reply> {
         let failed = || failure(JournalError::Unavailable);
         let authentication = self.authentication.as_ref().ok_or_else(failed)?;
         let stream = group.genesis.stream;
@@ -811,21 +856,8 @@ impl Engine {
         if membership.membership().get_joint_config().len() != 1 {
             return Err(failed());
         }
-        let root = tree.root_at(size).map_err(|_| failed())?;
-        let cached = authentication
-            .heads
-            .lock()
-            .get(&stream)
-            .cloned()
-            .filter(|head| {
-                head.configuration == configuration
-                    && head.signed.head.size == size
-                    && head.signed.head.root == root
-            });
-        if let Some(cached) = &cached
-            && cached.checked_at.elapsed() < std::time::Duration::from_secs(1)
-        {
-            return Ok(cached.signed.clone());
+        if let Some(cached) = authentication.current_head(stream, configuration, size, root) {
+            return Ok(cached);
         }
         let request = Request::AuthenticationPeer(AuthenticationPeerRequest::Authority {
             stream: group.genesis.stream,
@@ -833,21 +865,12 @@ impl Engine {
         });
         let reply = self.catalog_request(request).await.map_err(|_| failed())?;
         let authority: Authority = authentication_value(reply).map_err(failure)?;
-        if let Some(mut cached) = cached
-            && cached.voters == authority.voters
-        {
-            cached.checked_at = Instant::now();
-            let signed = cached.signed.clone();
-            authentication.remember_head(stream, cached);
-            return Ok(signed);
-        }
         let head = Head {
             catalog: authority.catalog,
             stream: group.genesis.stream,
             size,
             root,
             timestamp_micros: authentication.time_upper().ok_or_else(failed)?,
-
             authority_sha256: authority.digest,
         };
         let statement = head.statement();
@@ -888,8 +911,6 @@ impl Engine {
                         stream,
                         CachedHead {
                             configuration,
-                            voters: authority.voters,
-                            checked_at: Instant::now(),
                             signed: signed.clone(),
                         },
                     );
@@ -911,6 +932,7 @@ impl Engine {
                 _ = self.stop.cancelled() => return Ok(()),
                 _ = schedule.tick() => (),
             }
+            let _ = self.extend_history(authentication).await;
             let groups = self
                 .groups
                 .lock()
@@ -948,8 +970,11 @@ impl Engine {
                     {
                         return;
                     }
-                    if let Some(tree) = group.state.authenticated_tree() {
-                        let _ = self.certify_head(&group, &tree, tree.size()).await;
+                    if let Some((size, root)) = group
+                        .state
+                        .with_authenticated_tree(|tree| (tree.size(), tree.root()))
+                    {
+                        let _ = self.certify_head(&group, size, root).await;
                     }
                 })
                 .await;
@@ -967,34 +992,45 @@ impl Engine {
         if let Err(reply) = group.barrier(Instant::now() + REQUEST_TIMEOUT).await {
             return reply;
         }
-        let Some(tree) = group.state.authenticated_tree() else {
-            return failure(JournalError::Unavailable);
-        };
-        match request {
+        enum Read {
+            Head(u64, Hash),
+            Inclusion(Leaf, Vec<Hash>, u64, Hash),
+            Reply(Reply),
+        }
+        let read = group.state.with_authenticated_tree(|tree| match request {
             AuthenticationRequest::Head { size } => {
-                match self
-                    .certify_head(group, &tree, size.unwrap_or_else(|| tree.size()))
-                    .await
-                {
-                    Ok(head) => authentication_reply(&head),
-                    Err(reply) => reply,
+                let size = size.unwrap_or_else(|| tree.size());
+                match tree.root_at(size) {
+                    Ok(root) => Read::Head(size, root),
+                    Err(_) => Read::Reply(failure(JournalError::NotFound)),
                 }
             }
             AuthenticationRequest::Inclusion { at, size } => {
                 let size = size.unwrap_or_else(|| tree.size());
-                let (Some(leaf), Ok(path)) = (tree.leaf(at), tree.inclusion(at, size)) else {
-                    return failure(JournalError::NotFound);
-                };
-                match self.certify_head(group, &tree, size).await {
+                match (tree.leaf(at), tree.inclusion(at, size), tree.root_at(size)) {
+                    (Some(leaf), Ok(path), Ok(root)) => Read::Inclusion(*leaf, path, size, root),
+                    _ => Read::Reply(failure(JournalError::NotFound)),
+                }
+            }
+            request => Read::Reply(Self::tree_read(tree, request)),
+        });
+        match read {
+            None => failure(JournalError::Unavailable),
+            Some(Read::Reply(reply)) => reply,
+            Some(Read::Head(size, root)) => match self.certify_head(group, size, root).await {
+                Ok(head) => authentication_reply(&head),
+                Err(reply) => reply,
+            },
+            Some(Read::Inclusion(leaf, path, size, root)) => {
+                match self.certify_head(group, size, root).await {
                     Ok(signed_head) => authentication_reply(&Included {
-                        leaf: leaf.clone(),
+                        leaf,
                         path,
                         signed_head,
                     }),
                     Err(reply) => reply,
                 }
             }
-            request => Self::tree_read(&tree, request),
         }
     }
 
@@ -1076,7 +1112,7 @@ impl Engine {
         };
         let size = tree.size();
         let root = tree.root();
-        let signed_head = match self.certify_head(group, &tree, size).await {
+        let signed_head = match self.certify_head(group, size, root).await {
             Ok(head) => head,
             Err(reply) => return reply,
         };
@@ -1101,6 +1137,61 @@ impl Engine {
         group
             .write(Command::DeleteAuthenticated { size, root })
             .await
+    }
+
+    /// Reads the catalog history's new transitions into this keeper's copy.
+    async fn extend_history(&self, authentication: &Authentication) -> journal_contract::Result<()> {
+        let (genesis, mut latest, from) = match &*authentication.history.lock() {
+            Some(history) => (
+                Some(history.genesis.clone()),
+                Some(history.latest().clone()),
+                history.transitions.len(),
+            ),
+            None => (None, None, 0),
+        };
+        let mut transitions = Vec::new();
+        loop {
+            let request = Request::Authentication {
+                stream: CATALOG_STREAM,
+                request: AuthenticationRequest::History {
+                    from: from + transitions.len(),
+                },
+            };
+            let page: HistoryPage = authentication_value(
+                self.catalog_request(request)
+                    .await
+                    .map_err(|_| JournalError::Unavailable)?,
+            )?;
+            if genesis.as_ref().is_some_and(|genesis| *genesis != page.genesis) {
+                return Err(JournalError::Corrupted);
+            }
+            let mut previous = latest.take().unwrap_or_else(|| page.genesis.clone());
+            for transition in &page.transitions {
+                transition
+                    .verify(&previous)
+                    .map_err(|_| JournalError::Corrupted)?;
+                previous = transition.authority.clone();
+            }
+            latest = Some(previous);
+            let empty = page.transitions.is_empty();
+            transitions.extend(page.transitions);
+            if !page.more || empty {
+                let mut known = authentication.history.lock();
+                match &mut *known {
+                    Some(history) if history.transitions.len() == from => {
+                        history.transitions.extend(transitions)
+                    }
+                    Some(_) => (),
+                    None => {
+                        *known = Some(CatalogHistory {
+                            genesis: page.genesis,
+                            transitions,
+                        })
+                    }
+                }
+                return Ok(());
+            }
+        }
     }
 
     async fn authentication_history(&self) -> journal_contract::Result<CatalogHistory> {

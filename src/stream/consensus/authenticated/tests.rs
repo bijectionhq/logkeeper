@@ -287,3 +287,71 @@ fn authenticated_joint_roster_requires_both_distinct_majorities() {
         );
     }
 }
+
+#[test]
+fn authenticated_replaced_roster_cannot_certify_a_head() {
+    let genesis = genesis();
+    let root = genesis.root();
+    let mut history = CatalogHistory {
+        genesis,
+        transitions: Vec::new(),
+    };
+    let mut tree = Tree::default();
+    tree.append(leaf(1)).unwrap();
+    let retired = history.latest().clone();
+    let rotated = roster(&[(1, 1), (2, 2), (3, 6)]);
+    advance(
+        &mut history,
+        rotated.clone(),
+        BTreeMap::from([(STREAM, rotated)]),
+        &[(1, 1), (2, 2)],
+    );
+
+    let mut forged = Tree::default();
+    forged.append(Leaf { writer_epoch: Epoch(9), ..leaf(1) }).unwrap();
+    let equivocation = sign_head(1, forged.root(), &retired, &[(1, 1), (3, 3)]);
+    assert_eq!(
+        equivocation.verify(root, &history),
+        Err(ProofError::CatalogHistory)
+    );
+    sign_head(1, tree.root(), history.latest(), &[(1, 1), (3, 6)])
+        .verify(root, &history)
+        .unwrap();
+
+    let unchanged = history.latest().catalog_voters.clone();
+    advance(&mut history, unchanged, BTreeMap::new(), &[(2, 2), (3, 6)]);
+    sign_head(1, tree.root(), &history.transitions[0].authority, &[(1, 1), (2, 2)])
+        .verify(root, &history)
+        .unwrap();
+}
+
+#[test]
+fn authenticated_abandoned_catalog_move_is_settled_by_the_side_it_keeps() {
+    let genesis = genesis();
+    let root = genesis.root();
+    let mut history = CatalogHistory {
+        genesis,
+        transitions: Vec::new(),
+    };
+    let original = roster(&[(1, 1), (2, 2), (3, 3)]);
+    let abandoned = original.joining(&roster(&[(4, 4), (5, 5), (6, 6)]));
+    advance(&mut history, abandoned, BTreeMap::new(), &[(1, 1), (2, 2)]);
+    let retargeted = original.joining(&roster(&[(7, 7), (8, 8), (9, 9)]));
+    advance(&mut history, retargeted.clone(), BTreeMap::new(), &[(1, 1), (3, 3)]);
+    history.verify(root).unwrap();
+
+    let mut stranded = history.clone();
+    advance(
+        &mut stranded,
+        roster(&[(4, 4), (5, 5), (6, 6)]),
+        BTreeMap::new(),
+        &[(4, 4), (5, 5)],
+    );
+    assert_eq!(stranded.verify(root), Err(ProofError::CatalogHistory));
+
+    let target = retargeted
+        .settles_to(&[keeper(7), keeper(8), keeper(9)])
+        .unwrap();
+    advance(&mut history, target, BTreeMap::new(), &[(8, 8), (9, 9)]);
+    history.verify(root).unwrap();
+}

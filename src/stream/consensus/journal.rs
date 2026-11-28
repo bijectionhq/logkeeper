@@ -23,7 +23,7 @@ use super::{
     Client, Configuration, Credentials, Domains, Fence, Keepers, MAX_RECORD, assignment, decisions,
     state::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS},
 };
-use crate::stream::consensus::Voters;
+use crate::stream::consensus::{Voters, authenticated::CatalogRoot};
 
 /// The writer UUID every contract seal uses. The contract identifies a
 /// writer by its authenticated principal, and the keeper checks that
@@ -79,6 +79,32 @@ pub struct JournalConfig {
     /// to a voter in this domain, which avoids a cross-zone round trip.
     #[serde(default)]
     pub domain: Option<String>,
+    /// The authenticated catalog root, as 64 hex digits obtained through a
+    /// channel independent of the keepers. Authenticated proofs need it.
+    #[serde(default, with = "catalog_root_hex")]
+    pub catalog_root: Option<CatalogRoot>,
+}
+
+mod catalog_root_hex {
+    use serde::{Deserialize, Deserializer, de::Error};
+
+    use crate::stream::consensus::authenticated::CatalogRoot;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<CatalogRoot>, D::Error> {
+        let Some(text) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        let invalid = || D::Error::custom("a catalog root is 64 hex digits");
+        if text.len() != 64 || !text.is_ascii() {
+            return Err(invalid());
+        }
+        let mut bytes = [0; 32];
+        for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).map_err(|_| invalid())?, 16)
+                .map_err(|_| invalid())?;
+        }
+        Ok(Some(CatalogRoot(bytes)))
+    }
 }
 
 fn default_replication_factor() -> usize {
@@ -245,6 +271,9 @@ impl ConsensusJournal {
         .with_retired(config.retired.clone());
         if let Some(voters) = config.catalog_voters {
             client = client.with_catalog_voters(voters);
+        }
+        if let Some(root) = config.catalog_root {
+            client = client.with_catalog_root(root);
         }
         Ok(Self {
             client,

@@ -22,6 +22,7 @@ async fn immutable_streams_keep_exact_seal_receipts_across_snapshots_and_restart
         max_record_bytes: 4096,
         deadline_ms: 10_000,
         domain: None,
+        catalog_root: None,
     };
     let journal = ConsensusJournal::new(&cluster.credentials, &config).unwrap();
     let other = cluster.client(&cluster.other);

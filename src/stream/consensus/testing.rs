@@ -44,7 +44,10 @@ use super::{
     RecoveryReport, SyncMode, TimedAuthority,
     storage::{Authority, Provision, hex, sha256},
 };
-use crate::stream::consensus::Voters;
+use crate::stream::consensus::{
+    Voters,
+    authenticated::{CatalogAuthority, CatalogRoot, VoterKeys},
+};
 
 struct Running {
     stop: CancellationToken,
@@ -66,6 +69,7 @@ pub struct LocalCluster {
     spares: Vec<Uuid>,
     catalog: Uuid,
     catalog_voters: Option<Voters>,
+    catalog_root: Option<CatalogRoot>,
     issued: Mutex<BTreeMap<String, Credentials>>,
 }
 
@@ -235,6 +239,7 @@ impl LocalCluster {
             spares,
             catalog,
             catalog_voters,
+            catalog_root: None,
             issued: Mutex::default(),
             dir,
         };
@@ -315,7 +320,44 @@ impl LocalCluster {
             cluster.configs.insert(id, config);
             cluster.restart(id).await?;
         }
+        if authenticated {
+            cluster.catalog_root = Some(cluster.provisioned_catalog_root()?);
+        }
         Ok(cluster)
+    }
+
+    /// The root an operator pins out of band: the genesis authority over the
+    /// catalog voters' provisioned signing keys.
+    fn provisioned_catalog_root(&self) -> io::Result<CatalogRoot> {
+        let voters = self
+            .catalog_voters
+            .ok_or_else(|| io::Error::other("an authenticated catalog is replicated"))?;
+        let keys = voters
+            .iter()
+            .map(|keeper| {
+                let file = &self.configs[keeper]
+                    .authenticated_log
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("keeper has no authenticated signing key"))?
+                    .signer_pkcs8_file;
+                let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&std::fs::read(file)?)
+                    .map_err(|_| io::Error::other("invalid authenticated signing key"))?;
+                Ok((*keeper, key.public_key().as_ref().try_into().unwrap()))
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(CatalogAuthority {
+            catalog: self.catalog,
+            revision: 0,
+            predecessor_sha256: None,
+            catalog_voters: VoterKeys::Stable(keys),
+            stream_voters: BTreeMap::new(),
+        }
+        .root())
+    }
+
+    /// The catalog root pinned by this cluster's journal configurations.
+    pub fn catalog_root(&self) -> Option<CatalogRoot> {
+        self.catalog_root
     }
 
     /// The installed keeper trust of a timed cluster.
@@ -389,6 +431,7 @@ impl LocalCluster {
             max_record_bytes,
             deadline_ms: 10_000,
             domain: None,
+            catalog_root: self.catalog_root,
         }
     }
 

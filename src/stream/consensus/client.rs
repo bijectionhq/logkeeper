@@ -27,7 +27,9 @@ use super::{
 };
 use crate::stream::consensus::{
     CATALOG_STREAM, CLUSTER_VERSION_AUTHENTICATED, Voters,
-    authenticated::{Archive, CatalogHistory, Consistency, Inclusion, SignedHead, Tree},
+    authenticated::{
+        Archive, CatalogHistory, CatalogRoot, Consistency, Inclusion, SignedHead, Tree,
+    },
     decode,
     keeper::authenticated::{AuthenticationRequest, HistoryPage, Included, authentication_value},
 };
@@ -54,6 +56,8 @@ pub struct Client {
     /// Retired keeper identities that may still appear in historical stream
     /// genesis or pre-repair configurations.
     retired: Arc<BTreeSet<uuid::Uuid>>,
+    /// The authenticated catalog root this client trusts, from outside the cluster.
+    catalog_root: Option<CatalogRoot>,
 }
 
 #[derive(Clone)]
@@ -84,7 +88,19 @@ impl Client {
             routes: Arc::default(),
             local: Arc::default(),
             retired: Arc::default(),
+            catalog_root: None,
         })
+    }
+
+    /// Verifies every authenticated head and proof against `root`. Without a
+    /// pinned root the client refuses authenticated history.
+    pub fn with_catalog_root(mut self, root: CatalogRoot) -> Self {
+        self.catalog_root = Some(root);
+        self
+    }
+
+    fn pinned_root(&self) -> Result<CatalogRoot> {
+        self.catalog_root.ok_or(JournalError::Unsupported)
     }
 
     /// Uses the replicated catalog on `voters` instead of the single catalog
@@ -259,6 +275,7 @@ impl Client {
     }
 
     pub async fn catalog_history(&self) -> Result<CatalogHistory> {
+        let root = self.pinned_root()?;
         if self.cluster_version().await? < CLUSTER_VERSION_AUTHENTICATED {
             return Err(JournalError::Unsupported);
         }
@@ -291,9 +308,7 @@ impl Client {
                     genesis: genesis.unwrap(),
                     transitions,
                 };
-                history
-                    .verify(history.genesis.root())
-                    .map_err(|_| JournalError::Corrupted)?;
+                history.verify(root).map_err(|_| JournalError::Corrupted)?;
                 return Ok(history);
             }
             if from == transitions.len() {
@@ -314,7 +329,7 @@ impl Client {
             return Err(JournalError::Corrupted);
         }
         let history = self.catalog_history().await?;
-        head.verify(history.genesis.root(), &history)
+        head.verify(self.pinned_root()?, &history)
             .map_err(|_| JournalError::Corrupted)?;
         Ok((head, history))
     }
@@ -342,7 +357,7 @@ impl Client {
             history,
         };
         proof
-            .verify(proof.history.genesis.root())
+            .verify(self.pinned_root()?)
             .map_err(|_| JournalError::Corrupted)?;
         Ok(proof)
     }
@@ -371,7 +386,7 @@ impl Client {
             history,
         };
         proof
-            .verify(proof.history.genesis.root())
+            .verify(self.pinned_root()?)
             .map_err(|_| JournalError::Corrupted)?;
         Ok(proof)
     }
@@ -405,7 +420,7 @@ impl Client {
             history,
         };
         archive
-            .verify(archive.history.genesis.root())
+            .verify(self.pinned_root()?)
             .map_err(|_| JournalError::Corrupted)?;
         Ok(archive)
     }

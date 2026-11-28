@@ -47,6 +47,39 @@ impl VoterKeys {
         }
     }
 
+    /// The roster that runs the stream once any joint change settles: the
+    /// stable roster, or the side a joint change departs from.
+    fn settled(&self) -> &Keys {
+        match self {
+            Self::Stable(keys) | Self::Joint { previous: keys, .. } => keys,
+        }
+    }
+
+    /// The settled side as a stable roster.
+    pub fn settled_roster(&self) -> VoterKeys {
+        Self::Stable(self.settled().clone())
+    }
+
+    /// A joint roster moving from this roster's settled side to `target`.
+    pub fn joining(&self, target: &VoterKeys) -> VoterKeys {
+        Self::Joint {
+            previous: self.settled().clone(),
+            next: target.settled().clone(),
+        }
+    }
+
+    /// The stable roster that completes this joint change, or abandons it,
+    /// once `keepers` alone run the stream.
+    pub fn settles_to(&self, keepers: &[Uuid]) -> Option<VoterKeys> {
+        let Self::Joint { previous, next } = self else {
+            return None;
+        };
+        [next, previous]
+            .into_iter()
+            .find(|keys| keys.keys().copied().eq(keepers.iter().copied()))
+            .map(|keys| Self::Stable(keys.clone()))
+    }
+
     pub fn valid(&self) -> bool {
         let unique_keys = |keys: &Keys| {
             keys.iter().all(|(id, key)| !id.is_nil() && *key != [0; 32])
@@ -172,6 +205,20 @@ impl CatalogAuthority {
                 .all(|(stream, keys)| stream.0 != 0 && *stream != CATALOG_STREAM && keys.valid())
     }
 
+    /// The roster whose quorum signs `next`. A transition out of a joint
+    /// catalog roster is signed by the side it keeps, so either side can
+    /// settle the change without the other.
+    pub fn successor_signers(&self, next: &CatalogAuthority) -> Option<VoterKeys> {
+        let VoterKeys::Joint { previous, next: target } = &self.catalog_voters else {
+            return Some(self.catalog_voters.clone());
+        };
+        let kept = next.catalog_voters.settled();
+        [target, previous]
+            .into_iter()
+            .find(|keys| *keys == kept)
+            .map(|keys| VoterKeys::Stable(keys.clone()))
+    }
+
     pub fn voters(&self, stream: StreamId) -> Option<&VoterKeys> {
         if stream == CATALOG_STREAM {
             return Some(&self.catalog_voters);
@@ -197,7 +244,8 @@ impl SignedAuthority {
             return Err(ProofError::CatalogHistory);
         }
         previous
-            .catalog_voters
+            .successor_signers(authority)
+            .ok_or(ProofError::CatalogHistory)?
             .verify(&authority.statement(), &self.signatures)
     }
 }
@@ -235,34 +283,67 @@ impl CatalogHistory {
         )
     }
 
-    pub fn authority(
-        &self,
-        root: CatalogRoot,
-        digest: Hash,
-    ) -> Result<&CatalogAuthority, ProofError> {
-        self.verify(root)?;
-        self.authorities()
+    /// The roster that signed under `authority_digest` in a verified history,
+    /// with whether a later revision of this history replaced it.
+    fn roster(&self, authority_digest: Hash, stream: StreamId) -> Option<(&VoterKeys, bool)> {
+        let authorities = self.authorities().collect::<Vec<_>>();
+        let index = authorities
+            .iter()
+            .rposition(|authority| authority.digest() == authority_digest)?;
+        let voters = authorities[..=index]
+            .iter()
             .rev()
-            .find(|authority| authority.digest() == digest)
-            .ok_or(ProofError::CatalogHistory)
+            .find_map(|authority| authority.voters(stream))?;
+        let replaced = authorities[index + 1..]
+            .iter()
+            .any(|authority| authority.voters(stream).is_some_and(|later| later != voters));
+        Some((voters, replaced))
     }
 
     /// Looks up the roster at a revision of a previously verified history.
     pub fn voters_at(&self, authority_digest: Hash, stream: StreamId) -> Option<&VoterKeys> {
-        self.authorities()
-            .rev()
-            .skip_while(|authority| authority.digest() != authority_digest)
-            .find_map(|authority| authority.voters(stream))
+        self.roster(authority_digest, stream).map(|(voters, _)| voters)
     }
 
+    /// Whether the roster under `authority_digest` still signs for `stream`.
+    pub fn roster_current(&self, authority_digest: Hash, stream: StreamId) -> bool {
+        self.roster(authority_digest, stream)
+            .is_some_and(|(_, replaced)| !replaced)
+    }
+
+    /// Verifies a head signed by its stream's current roster: a roster
+    /// replaced later in this history signs nothing, so retired keys cannot
+    /// certify a head.
     pub fn verify_head(&self, root: CatalogRoot, signed: &SignedHead) -> Result<(), ProofError> {
+        self.verify_signed_head(root, signed, false)
+    }
+
+    /// Verifies a head whose prefix a current head proves, so its roster may
+    /// have been replaced since.
+    pub(super) fn verify_earlier_head(
+        &self,
+        root: CatalogRoot,
+        signed: &SignedHead,
+    ) -> Result<(), ProofError> {
+        self.verify_signed_head(root, signed, true)
+    }
+
+    fn verify_signed_head(
+        &self,
+        root: CatalogRoot,
+        signed: &SignedHead,
+        allow_replaced: bool,
+    ) -> Result<(), ProofError> {
         let head = signed.head;
         if !head.valid() || head.catalog != self.genesis.catalog {
             return Err(ProofError::Head);
         }
         self.verify(root)?;
-        self.voters_at(head.authority_sha256, head.stream)
-            .ok_or(ProofError::CatalogHistory)?
-            .verify(&head.statement(), &signed.signatures)
+        match self.roster(head.authority_sha256, head.stream) {
+            Some((voters, replaced)) if allow_replaced || !replaced => {
+                voters.verify(&head.statement(), &signed.signatures)
+            }
+            _ => Err(ProofError::CatalogHistory),
+        }
     }
 }

@@ -99,6 +99,7 @@ pub(super) fn contract_journal(
             max_record_bytes: 1024,
             deadline_ms: 10_000,
             domain: None,
+            catalog_root: None,
         },
     )
     .unwrap()

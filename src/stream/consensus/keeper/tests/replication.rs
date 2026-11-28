@@ -303,6 +303,7 @@ async fn losing_three_of_five_recovers_from_the_more_advanced_survivor() {
             max_record_bytes: 1024,
             deadline_ms: 10_000,
             domain: None,
+            catalog_root: None,
         },
     )
     .unwrap();
@@ -394,6 +395,7 @@ async fn an_immutable_five_voter_stream_takes_scoped_sessions_without_two_voters
             max_record_bytes: 1024,
             deadline_ms: 10_000,
             domain: None,
+            catalog_root: None,
         },
     )
     .unwrap();

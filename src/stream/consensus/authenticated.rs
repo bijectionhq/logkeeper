@@ -159,7 +159,7 @@ pub struct Consistency {
 
 impl Consistency {
     pub fn verify(&self, root: CatalogRoot) -> Result<(), ProofError> {
-        self.earlier.verify(root, &self.history)?;
+        self.history.verify_earlier_head(root, &self.earlier)?;
         self.later.verify(root, &self.history)?;
         let earlier = self.earlier.head;
         let later = self.later.head;

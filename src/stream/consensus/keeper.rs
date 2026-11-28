@@ -649,7 +649,9 @@ impl Config {
         };
         let authentication = self
             .authenticated_log
-            .map(|config| authenticated::Authentication::open(config, &self.data, &public_key))
+            .map(|config| {
+                authenticated::Authentication::open(config, self.catalog, &self.data, &public_key)
+            })
             .transpose()?
             .map(Arc::new);
         let engine = Arc::new(Engine {

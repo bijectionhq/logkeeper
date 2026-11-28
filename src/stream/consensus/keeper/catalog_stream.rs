@@ -54,7 +54,7 @@ use super::{Engine, Group, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
 use crate::stream::consensus::CLUSTER_VERSION_AUTHENTICATED;
 use crate::stream::consensus::Voters;
 use crate::stream::consensus::authenticated::{
-    CatalogAuthority, CatalogHistory, QuorumSignature, SignedAuthority,
+    CatalogAuthority, CatalogHistory, QuorumSignature, SignedAuthority, VoterKeys,
 };
 use crate::stream::consensus::{
     Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, authority, catalog, decisions, decode,
@@ -890,9 +890,12 @@ impl Engine {
         proposed: CatalogAuthority,
     ) -> Result<(), Reply> {
         use futures::stream::{FuturesUnordered, StreamExt};
+        let signers = previous
+            .successor_signers(&proposed)
+            .ok_or_else(|| failure(JournalError::Unavailable))?;
         let request = AuthenticationPeerRequest::AuthorityShare(proposed.clone());
         let mut voters = FuturesUnordered::from_iter(
-            previous.catalog_voters.keepers().into_iter().map(|keeper| {
+            signers.keepers().into_iter().map(|keeper| {
                 let request = request.clone();
                 let proposed = &proposed;
                 async move {
@@ -923,11 +926,7 @@ impl Engine {
             if let Some(signature) = signature {
                 signatures.push(signature);
                 signatures.sort_by_key(|signature| signature.keeper);
-                if previous
-                    .catalog_voters
-                    .verify(&statement, &signatures)
-                    .is_ok()
-                {
+                if signers.verify(&statement, &signatures).is_ok() {
                     drop(voters);
                     self.append_catalog(
                         group,
@@ -970,6 +969,26 @@ impl Engine {
                 }
                 continue;
             }
+            if let Some(settled) = Self::settled_catalog_roster(group, &latest) {
+                drop(fold);
+                let Some(revision) = latest.revision.checked_add(1) else {
+                    return failure(JournalError::Unavailable);
+                };
+                let next = CatalogAuthority {
+                    catalog: latest.catalog,
+                    revision,
+                    predecessor_sha256: Some(latest.digest()),
+                    catalog_voters: settled,
+                    stream_voters: BTreeMap::new(),
+                };
+                if let Err(reply) = self
+                    .append_catalog(group, head, &CatalogRecord::AuthenticationPending(next))
+                    .await
+                {
+                    return reply;
+                }
+                continue;
+            }
             let Some(entry) = fold.entries.get(&stream) else {
                 return failure(JournalError::NotFound);
             };
@@ -995,11 +1014,16 @@ impl Engine {
                 return failure(JournalError::Unavailable);
             }
             drop(fold);
-            let Some(catalog_voters) = Voters::new(&latest.catalog_voters.keepers()) else {
-                return failure(JournalError::Unavailable);
+            let catalog_voters = async {
+                if matches!(latest.catalog_voters, VoterKeys::Joint { .. }) {
+                    return Ok(latest.catalog_voters.clone());
+                }
+                let voters = Voters::new(&latest.catalog_voters.keepers())
+                    .ok_or(JournalError::Unavailable)?;
+                self.roster_keys(voters, Some(&latest.catalog_voters)).await
             };
             let (catalog_voters, stream_voters) = match tokio::try_join!(
-                self.roster_keys(catalog_voters, Some(&latest.catalog_voters)),
+                catalog_voters,
                 self.roster_keys(requester, previous_stream.as_ref()),
             ) {
                 Ok(keys) => keys,
@@ -1042,6 +1066,18 @@ impl Engine {
         }
     }
 
+    /// The stable catalog roster a joint one settles to once the catalog's
+    /// own membership change completed or was abandoned.
+    fn settled_catalog_roster(group: &Group, latest: &CatalogAuthority) -> Option<VoterKeys> {
+        let (_, configuration, _, membership) = group.state.placement().ok()?;
+        if membership.membership().get_joint_config().len() != 1 {
+            return None;
+        }
+        latest
+            .catalog_voters
+            .settles_to(&configuration.voters.into_iter().collect::<Vec<_>>())
+    }
+
     async fn certify_catalog_roster(
         &self,
         catalog: &CatalogStream,
@@ -1068,6 +1104,11 @@ impl Engine {
             if !catalog_voters.valid() {
                 return Err(failure(JournalError::Unavailable));
             }
+            let catalog_voters = if catalog_voters == latest.catalog_voters.settled_roster() {
+                catalog_voters
+            } else {
+                latest.catalog_voters.joining(&catalog_voters)
+            };
             if catalog_voters == latest.catalog_voters {
                 return Ok(());
             }

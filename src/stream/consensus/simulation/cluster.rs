@@ -404,6 +404,7 @@ impl SimCluster {
             max_record_bytes: self.options.max_record_bytes,
             deadline_ms: self.options.client_deadline_ms,
             domain: domain.map(str::to_owned),
+            catalog_root: None,
         }
     }
 
