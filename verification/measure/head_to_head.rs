@@ -85,7 +85,9 @@ fn parse(args: &[String]) -> Result<(HashMap<String, String>, Vec<String>)> {
     let mut input = args.iter();
     while let Some(arg) = input.next() {
         if let Some(flag) = arg.strip_prefix("--") {
-            let value = input.next().ok_or_else(|| format!("--{flag} needs a value"))?;
+            let value = input
+                .next()
+                .ok_or_else(|| format!("--{flag} needs a value"))?;
             flags.insert(flag.to_owned(), value.clone());
         } else {
             positional.push(arg.clone());
@@ -351,25 +353,27 @@ fn cpu_seconds(text: &str) -> f64 {
         None => (0.0, text),
     };
     days * 86400.0
-        + rest
-            .split(':')
-            .fold(0.0, |total, part| total * 60.0 + part.parse::<f64>().unwrap_or(0.0))
+        + rest.split(':').fold(0.0, |total, part| {
+            total * 60.0 + part.parse::<f64>().unwrap_or(0.0)
+        })
 }
 
 /// Apparent and allocated bytes of every file under `path`.
 fn disk_bytes(path: &Path) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     std::fs::read_dir(path).map_or((0, 0), |entries| {
-        entries.flatten().fold((0, 0), |(apparent, allocated), entry| {
-            match entry.metadata() {
-                Ok(meta) if meta.is_dir() => {
-                    let (a, b) = disk_bytes(&entry.path());
-                    (apparent + a, allocated + b)
+        entries
+            .flatten()
+            .fold((0, 0), |(apparent, allocated), entry| {
+                match entry.metadata() {
+                    Ok(meta) if meta.is_dir() => {
+                        let (a, b) = disk_bytes(&entry.path());
+                        (apparent + a, allocated + b)
+                    }
+                    Ok(meta) => (apparent + meta.len(), allocated + meta.blocks() * 512),
+                    Err(_) => (apparent, allocated),
                 }
-                Ok(meta) => (apparent + meta.len(), allocated + meta.blocks() * 512),
-                Err(_) => (apparent, allocated),
-            }
-        })
+            })
     })
 }
 
@@ -429,9 +433,7 @@ impl Opts {
         request["token"] = self.token.clone().into();
         let agent = self.agent(host);
         let mut socket = TcpStream::connect(agent).await?;
-        socket
-            .write_all(format!("{request}\n").as_bytes())
-            .await?;
+        socket.write_all(format!("{request}\n").as_bytes()).await?;
         let mut line = String::new();
         BufReader::new(socket).read_line(&mut line).await?;
         let reply: Value = serde_json::from_str(&line)
@@ -446,7 +448,10 @@ impl Opts {
 async fn rtt(opts: &Opts) -> Result<()> {
     for (host, ip) in opts.hosts.iter().enumerate() {
         let row = echo_rtt(opts.agent(host), &opts.token, 1000).await?;
-        println!("{}", json!({"case": "rtt", "from": "client", "to": ip, "echo": row}));
+        println!(
+            "{}",
+            json!({"case": "rtt", "from": "client", "to": ip, "echo": row})
+        );
     }
     for from in 0..3 {
         for to in 0..3 {
@@ -486,6 +491,7 @@ impl Backend {
 struct Tuning {
     repair_after_secs: u64,
     park_after_secs: u64,
+    repair_limit_secs: u64,
 }
 
 struct Node {
@@ -613,7 +619,12 @@ impl Cluster {
         let mut roots = Vec::new();
         for host in 0..3 {
             let reply = opts.call(host, json!({"op": "root"})).await?;
-            roots.push(reply["root"].as_str().ok_or("agent has no root")?.to_owned());
+            roots.push(
+                reply["root"]
+                    .as_str()
+                    .ok_or("agent has no root")?
+                    .to_owned(),
+            );
         }
         std::fs::create_dir_all("verification/.results/h2h")?;
         let local = tempfile::Builder::new()
@@ -733,7 +744,10 @@ impl Cluster {
                     )
                     .await?;
                     let digest = Sha256::digest(certificate.as_bytes());
-                    let hex = digest.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    let hex = digest
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
                     opts.call(
                         node.host,
                         json!({"op": "write", "path": format!("{registry}/{}.provision.json", node.uuid),
@@ -1043,8 +1057,15 @@ async fn run(flags: &HashMap<String, String>, positional: &[String]) -> Result<(
     };
     let opts = Opts::new(flags)?;
     let tuning = Tuning {
-        repair_after_secs: flags.get("repair-after-secs").map_or(Ok(600), |v| v.parse())?,
-        park_after_secs: flags.get("park-after-secs").map_or(Ok(600), |v| v.parse())?,
+        repair_after_secs: flags
+            .get("repair-after-secs")
+            .map_or(Ok(600), |v| v.parse())?,
+        park_after_secs: flags
+            .get("park-after-secs")
+            .map_or(Ok(600), |v| v.parse())?,
+        repair_limit_secs: flags
+            .get("repair-limit-secs")
+            .map_or(Ok(1200), |v| v.parse())?,
     };
     let concurrent = flags.get("batch-mode").map(String::as_str) == Some("concurrent");
     let [case, rest @ ..] = positional else {
@@ -1061,7 +1082,15 @@ async fn run(flags: &HashMap<String, String>, positional: &[String]) -> Result<(
             let batch = number(1, 1)?;
             let records = number(2, 4000)?;
             let passes = records.div_ceil(streams * batch).max(2);
-            commit(&cluster, streams, batch, passes, number(3, 256)? as usize, concurrent).await
+            commit(
+                &cluster,
+                streams,
+                batch,
+                passes,
+                number(3, 256)? as usize,
+                concurrent,
+            )
+            .await
         }
         "head" => head(&cluster, number(0, 32)?).await,
         "kill" => kill(&mut cluster, number(0, 1000)?, number(1, 0)? as usize).await,
@@ -1131,12 +1160,14 @@ async fn commit(
     let elapsed = start.elapsed();
     let client = client_cpu() - cpu;
     let after = cluster.resources().await?;
-    Ok(json!({"case": "commit", "streams": streams, "batch": width, "passes": passes,
+    Ok(
+        json!({"case": "commit", "streams": streams, "batch": width, "passes": passes,
         "in_flight_streams": in_flight, "seconds": elapsed.as_secs_f64(),
         "records_per_sec": records.len() as f64 / elapsed.as_secs_f64(),
         "record": stats(records), "batch_ack": stats(batches), "producer_queue": stats(queue),
         "keeper_cpu_seconds": keeper_cpu(&before, &after), "client_cpu_seconds": client,
-        "resources_after": after}))
+        "resources_after": after}),
+    )
 }
 
 async fn head(cluster: &Cluster, streams: u64) -> Result<Value> {
@@ -1155,7 +1186,11 @@ async fn head(cluster: &Cluster, streams: u64) -> Result<Value> {
                 load.spawn(async move {
                     let mut acks = Vec::new();
                     while !stop.is_cancelled() {
-                        acks.extend(writer.batch(StreamId(id.into()), CURRENT, at, 1, false).await?);
+                        acks.extend(
+                            writer
+                                .batch(StreamId(id.into()), CURRENT, at, 1, false)
+                                .await?,
+                        );
                         at += 1;
                     }
                     Ok::<_, BenchError>((id, at, acks))
@@ -1185,8 +1220,10 @@ async fn head(cluster: &Cluster, streams: u64) -> Result<Value> {
                     Ok((all, n + failed))
                 })
                 .await?;
-            rows.push(json!({"loaded": loaded, "caller": caller, "head": stats(times),
-                "unavailable": unavailable, "seconds": start.elapsed().as_secs_f64()}));
+            rows.push(
+                json!({"loaded": loaded, "caller": caller, "head": stats(times),
+                "unavailable": unavailable, "seconds": start.elapsed().as_secs_f64()}),
+            );
         }
         stop.cancel();
         let mut load_acks = Vec::new();
@@ -1196,7 +1233,9 @@ async fn head(cluster: &Cluster, streams: u64) -> Result<Value> {
             load_acks.extend(acks);
         }
         if loaded {
-            rows.push(json!({"loaded": true, "caller": "background append", "append": stats(load_acks)}));
+            rows.push(
+                json!({"loaded": true, "caller": "background append", "append": stats(load_acks)}),
+            );
         }
     }
     Ok(json!({"case": "head", "streams": streams, "rows": rows}))
@@ -1220,24 +1259,48 @@ async fn kill(cluster: &mut Cluster, streams: u64, victim: usize) -> Result<Valu
     tokio::time::sleep(Duration::from_millis(500)).await;
     let start = Instant::now();
     let killed = cluster.kill(victim).await?;
-    let samples: Vec<(u64, Duration, Duration)> = stream::iter(warm)
+    // Every stream retries `Unavailable` until `KILL_LIMIT` after the event;
+    // a stream still unacknowledged then is counted, not fatal. A retry that
+    // finds its own earlier attempt committed (`Conflict` at head 2) counts
+    // as acknowledged at that moment.
+    const KILL_LIMIT: Duration = Duration::from_secs(300);
+    let outcomes: Vec<std::result::Result<(Duration, Duration), String>> = stream::iter(warm)
         .map(|(id, before)| {
-            let handle = &handle;
+            let journal = handle.journal();
             async move {
-                handle
-                    .batch(StreamId(id.into()), CURRENT, 2, 1, false)
-                    .await?;
-                let now = Instant::now();
-                Ok::<_, BenchError>((id, now - start, now - before))
+                let stream = StreamId(id.into());
+                loop {
+                    match journal.append(stream, CURRENT, Lsn(2), record()).await {
+                        Ok(_) | Err(JournalError::Conflict { head: Lsn(2) }) => {
+                            let now = Instant::now();
+                            return Ok((now - start, now - before));
+                        }
+                        Err(JournalError::Unavailable) if start.elapsed() < KILL_LIMIT => {
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                        Err(error) => return Err(format!("{error:?}")),
+                    }
+                }
             }
         })
         .buffer_unordered(streams as usize)
-        .try_collect()
-        .await?;
-    Ok(json!({"case": "kill", "streams": streams, "victim": cluster.nodes[victim].name,
+        .collect()
+        .await;
+    let samples = outcomes
+        .iter()
+        .filter_map(|o| o.as_ref().ok())
+        .collect::<Vec<_>>();
+    let mut errors = BTreeMap::<String, u64>::new();
+    for error in outcomes.iter().filter_map(|o| o.as_ref().err()) {
+        *errors.entry(error.clone()).or_default() += 1;
+    }
+    Ok(
+        json!({"case": "kill", "streams": streams, "victim": cluster.nodes[victim].name,
         "streams_led_by_victim": led_by_victim, "agent_kill": killed,
-        "event_to_ack": stats(samples.iter().map(|s| s.1).collect()),
-        "ack_gap": stats(samples.iter().map(|s| s.2).collect())}))
+        "limit_s": KILL_LIMIT.as_secs(), "acked": samples.len(), "not_acked": errors,
+        "event_to_ack": stats(samples.iter().map(|s| s.0).collect()),
+        "ack_gap": stats(samples.iter().map(|s| s.1).collect())}),
+    )
 }
 
 async fn takeover(cluster: &Cluster, streams: u64, records: u64) -> Result<Value> {
@@ -1292,13 +1355,15 @@ async fn takeover(cluster: &Cluster, streams: u64, records: u64) -> Result<Value
         .buffer_unordered(streams as usize)
         .try_collect()
         .await?;
-    Ok(json!({"case": "takeover", "streams": streams, "records_per_stream": records,
+    Ok(
+        json!({"case": "takeover", "streams": streams, "records_per_stream": records,
         "new_writer_construct_ms": ms(connected),
         "seal": stats(samples.iter().map(|s| s[0]).collect()),
         "seal_and_catch_up": stats(samples.iter().map(|s| s[1]).collect()),
         "seal_catch_up_first_append": stats(samples.iter().map(|s| s[2]).collect()),
         "from_takeover_start": stats(samples.iter().map(|s| s[3]).collect()),
-        "seconds": start.elapsed().as_secs_f64()}))
+        "seconds": start.elapsed().as_secs_f64()}),
+    )
 }
 
 async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning) -> Result<Value> {
@@ -1354,10 +1419,12 @@ async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning) -> Result<
                 .buffer_unordered(PARALLEL)
                 .try_collect()
                 .await?;
-            Ok(json!({"case": "repair", "streams": streams, "agent_kill": killed,
+            Ok(
+                json!({"case": "repair", "streams": streams, "agent_kill": killed,
                 "detection_wait_s": 0, "sweep_parallelism": PARALLEL,
                 "completion": stats(completion.clone()),
-                "seconds": completion.iter().max().unwrap().as_secs_f64()}))
+                "seconds": completion.iter().max().unwrap().as_secs_f64()}),
+            )
         }
         Backend::Consensus => {
             let Handle::Consensus(journal) = handle else {
@@ -1368,7 +1435,10 @@ async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning) -> Result<
             let parking = Instant::now();
             let deadline = parking + Duration::from_secs(tuning.park_after_secs + 240);
             loop {
-                let open = journal.keeper_status(b, StreamId(0)).await.map(|s| s.streams);
+                let open = journal
+                    .keeper_status(b, StreamId(0))
+                    .await
+                    .map(|s| s.streams);
                 if matches!(open, Ok(n) if n <= 1) {
                     break;
                 }
@@ -1377,16 +1447,17 @@ async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning) -> Result<
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            setup.insert("parked_after_s".into(), parking.elapsed().as_secs_f64().into());
+            setup.insert(
+                "parked_after_s".into(),
+                parking.elapsed().as_secs_f64().into(),
+            );
             let start = Instant::now();
             let killed = cluster.kill(0).await?;
             let mut pending = (1..=streams).collect::<Vec<_>>();
             let mut completion = Vec::new();
-            let deadline = start + Duration::from_secs(3600);
-            while !pending.is_empty() {
-                if Instant::now() > deadline {
-                    return Err(format!("{} streams not repaired in an hour", pending.len()).into());
-                }
+            // Streams still unrepaired after the limit are reported, not fatal.
+            let limit = Duration::from_secs(tuning.repair_limit_secs);
+            while !pending.is_empty() && start.elapsed() < limit {
                 let done: Vec<u64> = stream::iter(pending.clone())
                     .map(|id| {
                         let journal = &journal;
@@ -1422,13 +1493,16 @@ async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning) -> Result<
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             let wait = Duration::from_secs(tuning.repair_after_secs);
-            Ok(json!({"case": "repair", "streams": streams, "agent_kill": killed,
+            Ok(
+                json!({"case": "repair", "streams": streams, "agent_kill": killed,
                 "setup": setup, "repair_after_secs": tuning.repair_after_secs,
                 "park_after_secs": tuning.park_after_secs, "detection_wait_s": tuning.repair_after_secs,
-                "poll_interval_s": 1,
+                "poll_interval_s": 1, "limit_s": limit.as_secs(),
+                "repaired": completion.len(), "not_repaired": pending,
                 "completion": stats(completion.clone()),
                 "completion_minus_repair_after": stats(completion.iter().map(|d| d.saturating_sub(wait)).collect()),
-                "seconds": completion.iter().max().unwrap().as_secs_f64()}))
+                "seconds": completion.iter().max().map(Duration::as_secs_f64)}),
+            )
         }
     }
 }
