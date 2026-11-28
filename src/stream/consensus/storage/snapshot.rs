@@ -21,6 +21,7 @@ use openraft::{
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
 pub(in crate::stream::consensus) use file::SnapshotFile;
@@ -35,6 +36,7 @@ use crate::stream::{
     consensus::{
         Configuration, Entry, Genesis, LogId, MAX_MESSAGE, Membership, RaftTypes, SnapshotMeta,
         Stage,
+        authenticated::{Leaf, Timing, Tree},
         decisions::WrittenStep,
         invalid, options, ownership,
         placement::Placement,
@@ -56,6 +58,23 @@ pub(in crate::stream::consensus) struct TimedView {
     pub fits: bool,
 }
 
+fn ordinary_leaf(
+    genesis: &Genesis,
+    at: Lsn,
+    epoch: Epoch,
+    payload: &[u8],
+    upper_micros: i64,
+) -> Leaf {
+    Leaf {
+        stream: genesis.stream,
+        at,
+        writer_epoch: epoch,
+        payload_sha256: Sha256::digest(payload).into(),
+        quorum_durable_upper_micros: upper_micros,
+        timing: None,
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Image {
     applied: Option<LogId>,
@@ -66,9 +85,192 @@ struct Image {
     #[serde(skip)]
     stage_intent: bool,
     state: State,
+    #[serde(skip)]
+    authenticated: Option<Tree>,
 }
 
 impl Image {
+    fn new(genesis: &Genesis) -> Self {
+        Self {
+            authenticated: genesis.authenticated.then(Tree::default),
+            ..Self::default()
+        }
+    }
+
+    fn validate_authenticated(&self, genesis: &Genesis) -> io::Result<()> {
+        match &self.authenticated {
+            None if !genesis.authenticated => Ok(()),
+            Some(tree)
+                if genesis.authenticated
+                    && tree
+                        .leaf(Lsn(1))
+                        .is_none_or(|leaf| leaf.stream == genesis.stream)
+                    && self.state.head().is_ok_and(|head| head.0 == tree.size()) =>
+            {
+                Ok(())
+            }
+            Some(tree)
+                if genesis.authenticated
+                    && tree.size() == 0
+                    && matches!(self.state, State::Absent) =>
+            {
+                Ok(())
+            }
+            Some(tree)
+                if genesis.authenticated
+                    && self.state.is_deleted()
+                    && tree
+                        .leaf(Lsn(1))
+                        .is_none_or(|leaf| leaf.stream == genesis.stream) =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid(
+                "snapshot authentication does not match its stream and head",
+            )),
+        }
+    }
+
+    fn apply_application(
+        &mut self,
+        command: Command,
+        genesis: &Genesis,
+        segment: Arc<super::Object>,
+    ) -> io::Result<Outcome> {
+        let (command, durability) = command.into_durable_record();
+        let Some(tree) = &mut self.authenticated else {
+            return if durability.is_some() || matches!(command, Command::DeleteAuthenticated { .. })
+            {
+                Ok(Outcome::Refused(JournalError::Unsupported))
+            } else {
+                self.state.apply(command, genesis, segment)
+            };
+        };
+
+        let command = match command {
+            Command::DeleteAuthenticated { size, root }
+                if size == tree.size() && root == tree.root() =>
+            {
+                Command::Delete
+            }
+            Command::DeleteAuthenticated { .. } => {
+                return Ok(Outcome::Refused(JournalError::Conflict {
+                    head: Lsn(tree.size()),
+                }));
+            }
+            Command::Delete | Command::Restore(_) => {
+                return Ok(Outcome::Refused(JournalError::Unsupported));
+            }
+            command => command,
+        };
+        let before = tree.size();
+        let last = match &command {
+            Command::Append { at, .. } => Some(at.0),
+            Command::AppendBatch { at, payloads, .. } => {
+                Some(at.0.saturating_add(payloads.len().saturating_sub(1) as u64))
+            }
+            Command::InstallCheckpoint { checkpoint, .. } => Some(checkpoint.checkpoint_lsn.0),
+            _ => None,
+        };
+        let candidates = if last.is_some_and(|last| last > before) {
+            let Some((upper, revision)) = durability.filter(|(upper, _)| *upper > 0) else {
+                return Ok(Outcome::Refused(JournalError::Unavailable));
+            };
+            if self
+                .configuration
+                .is_none_or(|configuration| configuration.revision != revision)
+                || self.membership.membership().get_joint_config().len() != 1
+            {
+                return Ok(Outcome::Refused(JournalError::Unavailable));
+            }
+            match &command {
+                Command::Append {
+                    fence, at, payload, ..
+                } => {
+                    vec![ordinary_leaf(genesis, *at, fence.epoch, payload, upper)]
+                }
+                Command::AppendBatch {
+                    fence,
+                    at,
+                    payloads,
+                    ..
+                } => payloads
+                    .iter()
+                    .enumerate()
+                    .map(|(index, payload)| {
+                        ordinary_leaf(
+                            genesis,
+                            Lsn(at.0.saturating_add(index as u64)),
+                            fence.epoch,
+                            payload,
+                            upper,
+                        )
+                    })
+                    .collect(),
+                Command::InstallCheckpoint {
+                    fence, checkpoint, ..
+                } => {
+                    vec![ordinary_leaf(
+                        genesis,
+                        checkpoint.checkpoint_lsn,
+                        fence.epoch,
+                        &checkpoint.record,
+                        upper,
+                    )]
+                }
+                _ => unreachable!(),
+            }
+        } else if let Command::AppendOriginal { record, .. } = &command {
+            use crate::stream::timed::{EVIDENCE_BYTES, TimedEvidence};
+
+            let Some(evidence) = record.get(..EVIDENCE_BYTES).and_then(TimedEvidence::decode)
+            else {
+                return Ok(Outcome::Refused(JournalError::Unavailable));
+            };
+            let original = evidence.origin.original;
+            if original.at.0 > before
+                && (self.membership.membership().get_joint_config().len() != 1
+                    || self.configuration.and_then(|configuration| {
+                        super::super::timed::origin(
+                            original,
+                            configuration.voters,
+                            configuration.revision,
+                        )
+                    }) != Some(evidence.origin))
+            {
+                return Ok(Outcome::Refused(JournalError::Unavailable));
+            }
+            vec![Leaf {
+                stream: original.stream,
+                at: original.at,
+                writer_epoch: original.epoch,
+                payload_sha256: original.payload_sha256,
+                quorum_durable_upper_micros: evidence.samples[0]
+                    .upper_micros
+                    .max(evidence.samples[1].upper_micros),
+                timing: Some(Timing {
+                    exclusive_cutoff_micros: original.exclusive_journal_cutoff_micros,
+                    receiver_certificate_sha256: original.original_receiver_certificate_sha256,
+                }),
+            }]
+        } else {
+            Vec::new()
+        };
+
+        if candidates.iter().any(|leaf| !leaf.valid()) {
+            return Ok(Outcome::Refused(JournalError::Unavailable));
+        }
+        let outcome = self.state.apply(command, genesis, segment)?;
+        let after = self.state.head().map_or(before, |head| head.0);
+        if after > before {
+            tree.extend(candidates.into_iter().filter(|leaf| leaf.at.0 > before))
+                .map_err(|_| invalid("committed record has invalid authenticated metadata"))?;
+            if tree.size() != after {
+                return Err(invalid("committed record has no authentication leaf"));
+            }
+        }
+        Ok(outcome)
+    }
     fn stage(
         &mut self,
         stage: Stage,
@@ -585,7 +787,7 @@ impl StateMachine {
                     image,
                 )
             } else {
-                (None, Image::default())
+                (None, Image::new(&genesis))
             };
             if purged.is_some_and(|purged| {
                 applied.applied.is_none_or(|id| {
@@ -724,6 +926,20 @@ impl StateMachine {
                 == Some(self.inner.generation)
     }
 
+    pub(in crate::stream::consensus) fn with_authenticated_tree<R>(
+        &self,
+        read: impl FnOnce(&Tree) -> R,
+    ) -> Option<R> {
+        if !self.healthy() {
+            return None;
+        }
+        self.inner.applied.read().authenticated.as_ref().map(read)
+    }
+
+    pub(in crate::stream::consensus) fn authenticated_tree(&self) -> Option<Tree> {
+        self.with_authenticated_tree(Clone::clone)
+    }
+
     pub fn head(&self) -> journal_contract::Result<Lsn> {
         if !self.healthy() {
             return Err(if self.is_quarantined() {
@@ -850,6 +1066,7 @@ impl StateMachine {
             &self.inner.directory,
             &self.inner.disk.space,
             self.inner.lifetime.clone(),
+            self.inner.genesis.authenticated,
             digest,
             meta,
         )
@@ -1164,7 +1381,12 @@ impl StateMachine {
     #[cfg(test)]
     pub fn occupy_transfers(&self) -> Box<dyn std::any::Any + Send> {
         let mut transfers = Vec::new();
-        while let Ok(mut transfer) = self.inner.disk.space.transfer() {
+        while let Ok(mut transfer) = self
+            .inner
+            .disk
+            .space
+            .transfer(self.inner.genesis.authenticated)
+        {
             transfer.grow(64 * 1024).unwrap();
             transfers.push(transfer);
         }
@@ -1211,7 +1433,7 @@ impl RaftStateMachine<RaftTypes> for StateMachine {
         let started = std::time::Instant::now();
         let last = entries.last().map(|entry| entry.log_id.index);
         let may_read_snapshot = self.head().is_ok_and(|head| entries.iter().any(|entry| {
-            matches!(&entry.payload, EntryPayload::Normal(command) if matches!(command.body(), Command::Append { at, .. } | Command::AppendBatch { at, .. } | Command::AppendOriginal { at, .. } | Command::AcknowledgeRecoveryWithMarker { at, .. } if *at <= head))
+            matches!(&entry.payload, EntryPayload::Normal(command) if command.record_position().is_some_and(|at| at <= head))
         }));
         let outcomes = if may_read_snapshot {
             let inner = self.inner.clone();
@@ -1414,7 +1636,7 @@ impl Inner {
         let meta = active.meta.clone();
         let inner = self.clone();
         let snapshot = SnapshotFile::send(meta.clone(), move || {
-            let mut transfer = inner.disk.space.transfer()?;
+            let mut transfer = inner.disk.space.transfer(inner.genesis.authenticated)?;
             // An N-1 receiver reads only `LKRIMG03`: carry the epoch runs
             // once the cluster version is finalized.
             let with_epochs = inner
@@ -1437,7 +1659,8 @@ impl Inner {
                         + options().serialized_size(
                             &active.image.state.checkpoint_custody().ok().flatten(),
                         )?
-                        + options().serialized_size(&active.image.state.recoveries())?)
+                        + options().serialized_size(&active.image.state.recoveries())?
+                        + options().serialized_size(&active.image.authenticated)?)
                 })
                 .map_err(io::Error::other)?;
             transfer.grow(
@@ -1611,7 +1834,7 @@ impl Inner {
                                 log.segments.get(&stored.log_id.index).cloned()
                             })
                             .ok_or_else(|| invalid("applied command has no durable WAL segment"))?;
-                        image.state.apply(command, &self.genesis, segment)?
+                        image.apply_application(command, &self.genesis, segment)?
                     }
                 },
                 EntryPayload::Membership(membership) => {
@@ -1736,6 +1959,10 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
             .disk
             .write_version_allows(crate::stream::consensus::CLUSTER_VERSION_RETRY_RECOVERY);
         let scratch = inner.disk.space.scratch(index::SCRATCH).await?;
+        let authentication = index::authentication_reservation(&image, &previous);
+        let authentication_reservation = (authentication > 0)
+            .then(|| inner.disk.space.reserve_authentication(authentication))
+            .transpose()?;
         let temporary = inner
             .directory
             .join(format!("building-{}", meta.snapshot_id));
@@ -1771,7 +1998,7 @@ impl RaftSnapshotBuilder<RaftTypes> for Builder {
         let (reserved, _worker) = scratch;
         // Synced objects are now accounted by the filesystem. Keep the
         // serialized worker until selection, but do not book them twice.
-        drop(reserved);
+        drop((reserved, authentication_reservation));
         inner.select(&temporary, active.selected, false).await?;
         #[cfg(test)]
         if let Some(trace) = &inner.disk.trace {
@@ -1921,7 +2148,7 @@ pub(super) fn inspect_stream_readonly(
         image.verify_placement(placement, genesis)?;
         image
     } else {
-        Image::default()
+        Image::new(genesis)
     };
     let snapshot_applied = image.applied;
     if log.purged.is_some_and(|purged| {
@@ -1966,7 +2193,7 @@ pub(super) fn inspect_stream_readonly(
                         .get(&entry.log_id.index)
                         .cloned()
                         .ok_or_else(|| invalid("applied command has no durable WAL segment"))?;
-                    image.state.apply(command, genesis, segment)?;
+                    image.apply_application(command, genesis, segment)?;
                 }
             },
             EntryPayload::Membership(membership) => {
@@ -2218,6 +2445,7 @@ const MAGIC_WITH_CUSTODY: &[u8; 8] = b"LKRIMG07";
 /// option, then the summary. Written only for a stream that had an operator
 /// recovery once the cluster finalized `CLUSTER_VERSION_RETRY_RECOVERY`.
 const MAGIC_WITH_RECOVERIES: &[u8; 8] = b"LKRIMG08";
+const MAGIC_WITH_AUTHENTICATION: &[u8; 8] = b"LKRIMG09";
 const STAGED_IMAGE: &str = "lk-stage-";
 const HEADER_BYTES: u64 = 12;
 
@@ -2243,11 +2471,14 @@ fn write_image(
     let recoveries = image.state.recoveries().filter(|_| with_recoveries);
     let with_recovery = recorded.is_some();
     let with_offload = with_recovery
+        || image.authenticated.is_some()
         || custody.is_some()
         || recoveries.is_some()
         || offload != crate::stream::consensus::state::Offload::default();
     let with_epochs = with_epochs || with_offload;
-    file.write_all(if recoveries.is_some() {
+    file.write_all(if image.authenticated.is_some() {
+        MAGIC_WITH_AUTHENTICATION
+    } else if recoveries.is_some() {
         MAGIC_WITH_RECOVERIES
     } else if custody.is_some() {
         MAGIC_WITH_CUSTODY
@@ -2282,7 +2513,11 @@ fn write_image(
                 .serialize_into(&mut writer, &offload)
                 .map_err(io::Error::other)?;
         }
-        if let Some(recoveries) = &recoveries {
+        if let Some(tree) = &image.authenticated {
+            options()
+                .serialize_into(&mut writer, &(&custody, tree))
+                .map_err(io::Error::other)?;
+        } else if let Some(recoveries) = &recoveries {
             options()
                 .serialize_into(&mut writer, &(&recorded, &custody, recoveries))
                 .map_err(io::Error::other)?;
@@ -2327,6 +2562,7 @@ fn read_image(
     let mut file = BufReader::new(file);
     let mut header = [0; 12];
     file.read_exact(&mut header)?;
+    let with_authentication = &header[..8] == MAGIC_WITH_AUTHENTICATION;
     let (with_epochs, with_offload, with_recovery, with_custody, with_recoveries) =
         match &header[..8] {
             magic if magic == MAGIC => (false, false, false, false, false),
@@ -2335,6 +2571,7 @@ fn read_image(
             magic if magic == MAGIC_WITH_RECOVERY => (true, true, true, false, false),
             magic if magic == MAGIC_WITH_CUSTODY => (true, true, false, true, false),
             magic if magic == MAGIC_WITH_RECOVERIES => (true, true, false, false, true),
+            magic if magic == MAGIC_WITH_AUTHENTICATION => (true, true, false, false, false),
             _ => return Err(invalid("invalid snapshot format")),
         };
     let mut crc = crc32fast::Hasher::new();
@@ -2398,6 +2635,16 @@ fn read_image(
     } else {
         None
     };
+    let custody = if with_authentication {
+        let (custody, tree): (Option<journal_contract::CheckpointCustody>, Tree) = options()
+            .with_limit(size.saturating_sub(reader.position))
+            .deserialize_from(&mut reader)
+            .map_err(io::Error::other)?;
+        image.authenticated = Some(tree);
+        custody
+    } else {
+        custody
+    };
     let (recorded, custody, recoveries) = match summarized {
         Some((recorded, custody, recoveries)) => (recorded, custody, Some(recoveries)),
         None => (recorded, custody, None),
@@ -2457,6 +2704,7 @@ fn read_image(
         image.state.restore_checkpoint_custody(custody)?;
     }
     image.state.restore_recoveries(recoveries)?;
+    image.validate_authenticated(genesis)?;
     Ok((meta, image))
 }
 

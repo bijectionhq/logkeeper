@@ -720,10 +720,9 @@ impl Engine {
                         .saturating_mul(9)
                         .saturating_add(MAX_MESSAGE);
                 if data > SNAPSHOT_CHUNK_BYTES
-                    || request
-                        .offset
-                        .checked_add(data)
-                        .is_none_or(|end| end > capacity.min(MAX_TRANSFER_FILE))
+                    || request.offset.checked_add(data).is_none_or(|end| {
+                        !group.genesis.authenticated && end > capacity.min(MAX_TRANSFER_FILE)
+                    })
                 {
                     return Err(invalid("invalid consensus snapshot chunk range"));
                 }
@@ -796,6 +795,28 @@ impl Engine {
                     Command::AppendBatch { payloads, .. } => {
                         crate::stream::consensus::state::valid_batch(payloads)
                     }
+                    Command::Durable {
+                        upper_micros,
+                        append,
+                        ..
+                    } => {
+                        use crate::stream::consensus::state::DurableAppend;
+
+                        group.genesis.authenticated
+                            && *upper_micros > 0
+                            && match append {
+                                DurableAppend::Record { payload, .. } => {
+                                    payload.len() <= MAX_RECORD
+                                }
+                                DurableAppend::Batch { payloads, .. } => {
+                                    crate::stream::consensus::state::valid_batch(payloads)
+                                }
+                                DurableAppend::Checkpoint { checkpoint, .. } => {
+                                    checkpoint.record.len() <= MAX_RECORD
+                                }
+                            }
+                    }
+                    Command::DeleteAuthenticated { .. } => group.genesis.authenticated,
                     Command::Admitted(..) => false,
                     _ => true,
                 },

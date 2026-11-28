@@ -35,6 +35,7 @@ struct Scan {
     selected: Option<Selected>,
     root_pending: bool,
     pages: VecDeque<Key>,
+    authenticated: Option<index::AuthenticatedPageRef>,
     legacy: VecDeque<[u8; 32]>,
     references: VecDeque<Reference>,
     last_reference: Option<Reference>,
@@ -133,6 +134,7 @@ impl Scan {
                 selected,
                 root_pending: selected.is_some(),
                 pages: VecDeque::new(),
+                authenticated: None,
                 legacy: VecDeque::new(),
                 references: VecDeque::new(),
                 last_reference: None,
@@ -158,10 +160,14 @@ impl Scan {
                 let check = self.check.take().unwrap();
                 match check.kind {
                     Kind::Root(Some(bytes)) => {
-                        (self.pages, self.legacy) =
+                        (self.pages, self.legacy, self.authenticated) =
                             index::scrub_root(&bytes, self.scope, self.selected.unwrap())?;
                     }
                     Kind::Page(bytes) => self.references = index::scrub_page(&bytes, self.scope)?,
+                    Kind::AuthenticatedPage(reference, bytes) => {
+                        self.authenticated =
+                            index::scrub_authenticated_page(&bytes, self.scope, reference)?;
+                    }
                     _ => {}
                 }
             }
@@ -200,6 +206,13 @@ impl Scan {
                 disk,
                 Reference::Object(key),
                 Kind::Page(Vec::new()),
+            )?);
+        } else if let Some(reference) = self.authenticated.take() {
+            index::validate_authentication_reference(reference, self.scope)?;
+            self.check = Some(Check::extent(
+                disk,
+                Reference::Object(reference.key),
+                Kind::AuthenticatedPage(reference, Vec::new()),
             )?);
         } else if let Some(end) = self
             .wal_end
@@ -251,6 +264,7 @@ enum Kind {
     // Includes the root's bytes only for bounded indexed roots.
     Root(Option<Vec<u8>>),
     Page(Vec<u8>),
+    AuthenticatedPage(index::AuthenticatedPageRef, Vec<u8>),
     Extent,
 }
 
@@ -330,7 +344,9 @@ impl Check {
                 }
                 *root = Some(bytes.to_vec());
             }
-            Kind::Root(Some(body)) | Kind::Page(body) => body.extend_from_slice(bytes),
+            Kind::Root(Some(body)) | Kind::Page(body) | Kind::AuthenticatedPage(_, body) => {
+                body.extend_from_slice(bytes)
+            }
             _ => {}
         }
         self.left -= bytes.len() as u64;

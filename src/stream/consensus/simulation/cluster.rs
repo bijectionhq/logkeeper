@@ -333,6 +333,7 @@ impl SimCluster {
                 async_append: std::env::var("LOGKEEPER_ASYNC_APPEND")
                     .map_or(true, |value| value != "0"),
                 timed_original: None,
+                authenticated_log: None,
                 timed_authority: None,
                 log_format: Default::default(),
                 admin: None,

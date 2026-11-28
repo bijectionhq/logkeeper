@@ -577,14 +577,79 @@ impl ConsensusJournal {
         &self.client
     }
 
+    pub async fn create_authenticated(&self, stream: StreamId) -> Result<()> {
+        self.create_stream_mode(stream, true, true).await
+    }
+
+    pub async fn require_authenticated(&self, stream: StreamId) -> Result<()> {
+        self.client.require_authenticated(stream).await
+    }
+
+    pub async fn catalog_history(&self) -> Result<super::authenticated::CatalogHistory> {
+        self.client.catalog_history().await
+    }
+
+    pub async fn authenticated_head(
+        &self,
+        stream: StreamId,
+        size: Option<u64>,
+    ) -> Result<(
+        super::authenticated::SignedHead,
+        super::authenticated::CatalogHistory,
+    )> {
+        self.client.authenticated_head(stream, size).await
+    }
+
+    pub async fn inclusion(
+        &self,
+        stream: StreamId,
+        at: Lsn,
+        size: Option<u64>,
+    ) -> Result<super::authenticated::Inclusion> {
+        self.client.inclusion(stream, at, size).await
+    }
+
+    pub async fn consistency(
+        &self,
+        earlier: super::authenticated::SignedHead,
+        later: super::authenticated::SignedHead,
+    ) -> Result<super::authenticated::Consistency> {
+        self.client.consistency(earlier, later).await
+    }
+
+    pub async fn authenticated_archive(
+        &self,
+        stream: StreamId,
+        size: Option<u64>,
+    ) -> Result<super::authenticated::Archive> {
+        self.client.authenticated_archive(stream, size).await
+    }
+
     async fn create_stream(&self, stream: StreamId, immutable: bool) -> Result<()> {
+        self.create_stream_mode(stream, immutable, false).await
+    }
+
+    async fn create_stream_mode(
+        &self,
+        stream: StreamId,
+        immutable: bool,
+        authenticated: bool,
+    ) -> Result<()> {
+        let create = |voters| async move {
+            if authenticated {
+                self.client
+                    .create_authenticated(stream, voters, self.quota_bytes)
+                    .await
+            } else {
+                self.client
+                    .create_stream(stream, voters, self.quota_bytes, immutable)
+                    .await
+            }
+        };
         let placement = self.placement.read().clone();
         let Placement::Ranked { eligible, factor } = placement else {
             let voters = placement.voters(stream)?;
-            return self
-                .client
-                .create_stream(stream, voters, self.quota_bytes, immutable)
-                .await;
+            return create(voters).await;
         };
         // A retried or concurrent create reuses the catalog's genesis, so
         // a changed keeper view never proposes a second one.
@@ -603,20 +668,14 @@ impl ConsensusJournal {
                 .ok_or(JournalError::Unavailable)?
             }
         };
-        match self
-            .client
-            .create_stream(stream, voters, self.quota_bytes, immutable)
-            .await
-        {
+        match create(voters).await {
             Err(JournalError::Conflict { .. }) => {
                 let voters = self
                     .client
                     .claimed_voters(stream)
                     .await?
                     .ok_or(JournalError::Unavailable)?;
-                self.client
-                    .create_stream(stream, voters, self.quota_bytes, immutable)
-                    .await
+                create(voters).await
             }
             result => result,
         }

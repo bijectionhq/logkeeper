@@ -3,6 +3,7 @@
 
 mod address;
 mod assignment;
+pub mod authenticated;
 mod authority;
 mod catalog;
 mod client;
@@ -43,7 +44,9 @@ pub use address::Address;
 pub use authority::{Grant, Recovered, RecoveryRecord, RecoverySource};
 pub use client::Client;
 pub use journal::{ConsensusJournal, JournalConfig};
-pub use keeper::{AdminConfig, Config, FenceProof, OffloadStatus, Recovery, RecoveryReport};
+pub use keeper::{
+    AdminConfig, AuthenticatedConfig, Config, FenceProof, OffloadStatus, Recovery, RecoveryReport,
+};
 pub use logging::LogFormat;
 pub use offload::OffloadConfig;
 pub use operator::{
@@ -122,7 +125,9 @@ pub const CLUSTER_VERSION_RETRY_RECOVERY: u32 = CLUSTER_VERSION_V12;
 /// Enables committed timed-original attestations on immutable streams.
 pub const CLUSTER_VERSION_TIMED_COMMITMENT: u32 = 13;
 /// Cluster feature level enabled once all active keepers support it and an operator finalizes it.
-pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_TIMED_COMMITMENT;
+pub const CLUSTER_VERSION_CURRENT: u32 = CLUSTER_VERSION_AUTHENTICATED;
+/// Enables immutable authenticated streams and signed catalog history.
+pub const CLUSTER_VERSION_AUTHENTICATED: u32 = 14;
 
 /// Feature bits advertised in liveness pings and [`KeeperStatus`].
 pub mod features {
@@ -166,6 +171,7 @@ pub mod features {
     pub const RETRY_RECOVERY: u64 = 1 << 14;
     /// Exports a signed commitment after reading an immutable timed original.
     pub const TIMED_COMMITMENT: u64 = 1 << 15;
+    pub const AUTHENTICATED: u64 = 1 << 16;
 
     /// All features supported by this build.
     pub const SUPPORTED: u64 = VERSION_NEGOTIATION
@@ -182,7 +188,8 @@ pub mod features {
         | RECOVERY_ENTRY
         | CHECKPOINT_CUSTODY
         | RETRY_RECOVERY
-        | TIMED_COMMITMENT;
+        | TIMED_COMMITMENT
+        | AUTHENTICATED;
 }
 const MAX_MESSAGE: u64 = 32 * 1024 * 1024;
 const MAX_RECORD: usize = 4 * 1024 * 1024;
@@ -316,6 +323,7 @@ pub struct Configuration {
 
 const IMMUTABLE_GENESIS_PREFIX: StreamId = StreamId(0);
 const IMMUTABLE_GENESIS_FORMAT: u64 = 4;
+const AUTHENTICATED_GENESIS_FORMAT: u64 = 14;
 const IMMUTABLE_GENESIS_PREFIX_BYTES: usize = size_of::<u128>() + size_of::<u64>();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -324,6 +332,7 @@ struct Genesis {
     voters: Voters,
     quota_bytes: u64,
     immutable: bool,
+    authenticated: bool,
 }
 
 // Stream zero was never a valid genesis. The prefixed layout makes a new
@@ -335,7 +344,12 @@ impl Serialize for Genesis {
         let mut tuple = serializer.serialize_tuple(if self.immutable { 5 } else { 3 })?;
         if self.immutable {
             tuple.serialize_element(&IMMUTABLE_GENESIS_PREFIX)?;
-            tuple.serialize_element(&IMMUTABLE_GENESIS_FORMAT)?;
+            let format = if self.authenticated {
+                AUTHENTICATED_GENESIS_FORMAT
+            } else {
+                IMMUTABLE_GENESIS_FORMAT
+            };
+            tuple.serialize_element(&format)?;
         }
         tuple.serialize_element(&self.stream)?;
         tuple.serialize_element(&self.voters)?;
@@ -366,15 +380,20 @@ impl<'de> Deserialize<'de> for Genesis {
 
                 let first = next(&mut elements)?;
                 let immutable = first == IMMUTABLE_GENESIS_PREFIX;
-                let stream = if immutable {
-                    if next::<u64, _>(&mut elements)? != IMMUTABLE_GENESIS_FORMAT {
-                        return Err(serde::de::Error::custom(
-                            "unsupported stream genesis format",
-                        ));
-                    }
-                    next(&mut elements)?
+                let (stream, authenticated) = if immutable {
+                    let format = next::<u64, _>(&mut elements)?;
+                    let authenticated = match format {
+                        IMMUTABLE_GENESIS_FORMAT => false,
+                        AUTHENTICATED_GENESIS_FORMAT => true,
+                        _ => {
+                            return Err(serde::de::Error::custom(
+                                "unsupported stream genesis format",
+                            ));
+                        }
+                    };
+                    (next(&mut elements)?, authenticated)
                 } else {
-                    first
+                    (first, false)
                 };
                 if stream == IMMUTABLE_GENESIS_PREFIX {
                     return Err(serde::de::Error::custom("stream zero is reserved"));
@@ -384,6 +403,7 @@ impl<'de> Deserialize<'de> for Genesis {
                     voters: next(&mut elements)?,
                     quota_bytes: next(&mut elements)?,
                     immutable,
+                    authenticated,
                 })
             }
         }
@@ -454,6 +474,7 @@ impl Genesis {
 
     fn valid(&self, keepers: &Keepers) -> bool {
         self.stream.0 != 0
+            && (!self.authenticated || self.immutable)
             && self.quota_bytes > 0
             && self.voters.iter().all(|id| keepers.contains_key(id))
             && self.voters.ascending()
@@ -465,6 +486,7 @@ impl Genesis {
         retired: &std::collections::BTreeSet<uuid::Uuid>,
     ) -> bool {
         self.stream.0 != 0
+            && (!self.authenticated || self.immutable)
             && self.quota_bytes > 0
             && self
                 .voters
@@ -522,6 +544,7 @@ mod tests {
             voters: Voters::from(previous.voters),
             quota_bytes: previous.quota_bytes,
             immutable: false,
+            authenticated: false,
         };
         let bytes = encode(&previous).unwrap();
         assert_eq!(encode(&genesis).unwrap(), bytes);

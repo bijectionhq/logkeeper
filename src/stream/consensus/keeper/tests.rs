@@ -230,6 +230,7 @@ impl Cluster {
                 async_append: std::env::var("LOGKEEPER_ASYNC_APPEND")
                     .map_or(true, |value| value != "0"),
                 timed_original: None,
+                authenticated_log: None,
                 sync_mode: SyncMode::Fsync,
                 timed_authority: None,
                 log_format: Default::default(),

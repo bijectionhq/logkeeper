@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Genesis, Image, Payload, Selected, SnapshotMeta, invalid, sha256};
 use crate::stream::consensus::{
+    authenticated::{Leaf, Tree},
     decode, encode,
     state::{EpochRuns, MAX_RETAINED_WITH_HEADROOM, Offload, RecordKind, Recorded, Recoveries},
     storage::objects::{Key, Location, Object, Objects, Reference},
@@ -39,6 +40,9 @@ const MAGIC_WITH_CUSTODY: &[u8; 8] = b"LKRIDX05";
 /// stream that had an operator recovery once the cluster finalized
 /// `CLUSTER_VERSION_RETRY_RECOVERY`.
 const MAGIC_WITH_RECOVERIES: &[u8; 8] = b"LKRIDX06";
+const MAGIC_WITH_AUTHENTICATION: &[u8; 8] = b"LKRIDX07";
+const AUTHENTICATED_PAGE: usize = 256;
+const MAX_AUTHENTICATED_PAGE_BYTES: u64 = 48 * 1024;
 
 /// Whether a selected snapshot starts with an index root.
 pub(in crate::stream::consensus::storage) fn indexed(magic: &[u8; 8]) -> bool {
@@ -48,6 +52,7 @@ pub(in crate::stream::consensus::storage) fn indexed(magic: &[u8; 8]) -> bool {
         || magic == MAGIC_WITH_RECOVERY
         || magic == MAGIC_WITH_CUSTODY
         || magic == MAGIC_WITH_RECOVERIES
+        || magic == MAGIC_WITH_AUTHENTICATION
 }
 const PAGE: usize = 128;
 // A partial first page and the recovery headroom each add at most a page.
@@ -72,6 +77,7 @@ const _: () = assert!(SCRATCH <= crate::stream::consensus::decisions::SCRATCH_BY
 pub(super) struct Dependencies {
     pages: BTreeMap<u64, (usize, Arc<Object>)>,
     legacy: BTreeSet<[u8; 32]>,
+    authenticated: Vec<(AuthenticatedPageRef, Arc<Object>)>,
 }
 
 impl Dependencies {
@@ -101,6 +107,137 @@ struct PageRef {
     first: u64,
     count: u32,
     object: Key,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(in crate::stream::consensus::storage) struct AuthenticatedPageRef {
+    pub key: Key,
+    pub through: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AuthenticatedPage {
+    previous: Option<AuthenticatedPageRef>,
+    leaves: Vec<Leaf>,
+}
+
+pub(super) fn authentication_reservation(image: &Image, previous: &Dependencies) -> u64 {
+    let Some(tree) = &image.authenticated else {
+        return 0;
+    };
+    let new_pages = tree.size().div_ceil(AUTHENTICATED_PAGE as u64);
+    let retained_pages = previous.authenticated.last().map_or(0, |(last, _)| {
+        if last.through == tree.size() {
+            new_pages
+        } else {
+            last.through / AUTHENTICATED_PAGE as u64
+        }
+    });
+    new_pages
+        .saturating_sub(retained_pages)
+        .saturating_mul(MAX_AUTHENTICATED_PAGE_BYTES)
+}
+
+fn write_authentication(
+    objects: &Objects,
+    scope: StreamId,
+    tree: &Tree,
+    previous: &Dependencies,
+    dependencies: &mut Dependencies,
+) -> io::Result<Option<AuthenticatedPageRef>> {
+    let mut tail = None;
+    for (index, leaves) in tree.leaves().chunks(AUTHENTICATED_PAGE).enumerate() {
+        let through = (index * AUTHENTICATED_PAGE + leaves.len()) as u64;
+        let (reference, page) = if let Some((reference, page)) = previous
+            .authenticated
+            .get(index)
+            .filter(|(reference, _)| reference.through == through)
+        {
+            (*reference, page.clone())
+        } else {
+            let body = encode(&AuthenticatedPage {
+                previous: tail,
+                leaves: leaves.to_vec(),
+            })?;
+            if body.len() as u64 > MAX_AUTHENTICATED_PAGE_BYTES {
+                return Err(invalid("authenticated page exceeds its bound"));
+            }
+            let page = objects.put(scope, &body)?;
+            let key = page
+                .key()
+                .ok_or_else(|| invalid("authenticated page is not a standalone object"))?;
+            (AuthenticatedPageRef { key, through }, page)
+        };
+        dependencies.authenticated.push((reference, page));
+        tail = Some(reference);
+    }
+    Ok(tail)
+}
+
+pub(in crate::stream::consensus::storage) fn validate_authentication_reference(
+    reference: AuthenticatedPageRef,
+    scope: StreamId,
+) -> io::Result<()> {
+    if reference.key.scope != scope
+        || reference.key.len > MAX_AUTHENTICATED_PAGE_BYTES
+        || reference.through == 0
+    {
+        return Err(invalid("invalid authenticated page reference"));
+    }
+    Ok(())
+}
+
+fn decode_authentication_page(
+    bytes: &[u8],
+    scope: StreamId,
+    reference: AuthenticatedPageRef,
+) -> io::Result<AuthenticatedPage> {
+    validate_authentication_reference(reference, scope)?;
+    let page: AuthenticatedPage = decode(bytes)?;
+    let previous = page.previous.map_or(0, |previous| previous.through);
+    if page.leaves.is_empty()
+        || page.leaves.len() > AUTHENTICATED_PAGE
+        || previous % AUTHENTICATED_PAGE as u64 != 0
+        || previous.checked_add(page.leaves.len() as u64) != Some(reference.through)
+        || page
+            .leaves
+            .iter()
+            .enumerate()
+            .any(|(i, leaf)| leaf.stream != scope || leaf.at.0 != previous + i as u64 + 1)
+    {
+        return Err(invalid("invalid authenticated page"));
+    }
+    Ok(page)
+}
+
+pub(in crate::stream::consensus::storage) fn scrub_authenticated_page(
+    bytes: &[u8],
+    scope: StreamId,
+    reference: AuthenticatedPageRef,
+) -> io::Result<Option<AuthenticatedPageRef>> {
+    Ok(decode_authentication_page(bytes, scope, reference)?.previous)
+}
+
+fn read_authentication(
+    objects: &Objects,
+    scope: StreamId,
+    mut tail: Option<AuthenticatedPageRef>,
+    dependencies: &mut Dependencies,
+) -> io::Result<Tree> {
+    let mut pages = Vec::new();
+    while let Some(reference) = tail {
+        validate_authentication_reference(reference, scope)?;
+        let object = objects.pin(reference.key)?;
+        let page = decode_authentication_page(&object.read()?, scope, reference)?;
+        tail = page.previous;
+        pages.push(page.leaves);
+        dependencies.authenticated.push((reference, object));
+    }
+    dependencies.authenticated.reverse();
+    let mut tree = Tree::default();
+    tree.extend(pages.into_iter().rev().flatten())
+        .map_err(|_| invalid("invalid authenticated snapshot tree"))?;
+    Ok(tree)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -173,6 +310,13 @@ pub(super) fn build(
     if pages.len() > MAX_PAGES || dependencies.legacy.len() > 1 {
         return Err(invalid("snapshot dependency geometry exceeded"));
     }
+    let authenticated = image
+        .authenticated
+        .as_ref()
+        .map(|tree| {
+            write_authentication(objects, genesis.stream, tree, previous, &mut dependencies)
+        })
+        .transpose()?;
     objects.publish_files()?;
     let root = Root {
         genesis: genesis.clone(),
@@ -189,7 +333,18 @@ pub(super) fn build(
         ));
     }
     let recoveries = image.state.recoveries().filter(|_| with_recoveries);
-    let (magic, root) = if let Some(recoveries) = recoveries {
+    let (magic, root) = if let Some(authenticated) = authenticated {
+        (
+            MAGIC_WITH_AUTHENTICATION,
+            encode(&(
+                root,
+                image.state.epoch_runs(),
+                offload,
+                custody,
+                authenticated,
+            ))?,
+        )
+    } else if let Some(recoveries) = recoveries {
         (
             MAGIC_WITH_RECOVERIES,
             encode(&(
@@ -241,7 +396,8 @@ pub(super) fn open(
     if bytes.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("invalid indexed snapshot root"));
     }
-    let (mut root, epochs, offload, recorded, custody, recoveries) = decode_root(&bytes)?;
+    let (mut root, epochs, offload, recorded, custody, recoveries, authenticated) =
+        decode_root(&bytes)?;
     root.image.stage_intent = root.meta.snapshot_id.starts_with(super::STAGED_IMAGE);
     if &root.genesis != genesis
         || root.meta.last_log_id != Some(selected.log_id)
@@ -315,6 +471,23 @@ pub(super) fn open(
         root.image.state.restore_checkpoint_custody(custody)?;
     }
     root.image.state.restore_recoveries(recoveries)?;
+    if let Some(tail) = authenticated {
+        if root
+            .image
+            .state
+            .head()
+            .is_ok_and(|head| tail.map_or(0, |tail| tail.through) != head.0)
+        {
+            return Err(invalid("authenticated pages differ from the snapshot head"));
+        }
+        root.image.authenticated = Some(read_authentication(
+            objects,
+            genesis.stream,
+            tail,
+            &mut dependencies,
+        )?);
+    }
+    root.image.validate_authenticated(genesis)?;
     Ok((root.meta, root.image, dependencies))
 }
 
@@ -325,32 +498,53 @@ type DecodedRoot = (
     Option<Recorded>,
     Option<journal_contract::CheckpointCustody>,
     Option<Recoveries>,
+    Option<Option<AuthenticatedPageRef>>,
 );
 
 fn decode_root(bytes: &[u8]) -> io::Result<DecodedRoot> {
     if bytes.len() as u64 > MAX_ROOT_BYTES {
         return Err(invalid("invalid indexed snapshot root"));
     }
-    if let Some(body) = bytes.strip_prefix(MAGIC) {
+    if let Some(body) = bytes.strip_prefix(MAGIC_WITH_AUTHENTICATION) {
+        let (root, epochs, offload, custody, authenticated) = decode(body)?;
+        Ok((
+            root,
+            epochs,
+            offload,
+            None,
+            custody,
+            None,
+            Some(authenticated),
+        ))
+    } else if let Some(body) = bytes.strip_prefix(MAGIC) {
         let (root, epochs) = decode(body)?;
-        Ok((root, epochs, Offload::default(), None, None, None))
+        Ok((root, epochs, Offload::default(), None, None, None, None))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_OFFLOAD) {
         let (root, epochs, offload) = decode(body)?;
-        Ok((root, epochs, offload, None, None, None))
+        Ok((root, epochs, offload, None, None, None, None))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_RECOVERY) {
         let (root, epochs, offload, recorded) = decode(body)?;
-        Ok((root, epochs, offload, Some(recorded), None, None))
+        Ok((root, epochs, offload, Some(recorded), None, None, None))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_CUSTODY) {
         let (root, epochs, offload, custody) = decode(body)?;
-        Ok((root, epochs, offload, None, Some(custody), None))
+        Ok((root, epochs, offload, None, Some(custody), None, None))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITH_RECOVERIES) {
         let (root, epochs, offload, recorded, custody, recoveries) = decode(body)?;
-        Ok((root, epochs, offload, recorded, custody, Some(recoveries)))
+        Ok((
+            root,
+            epochs,
+            offload,
+            recorded,
+            custody,
+            Some(recoveries),
+            None,
+        ))
     } else if let Some(body) = bytes.strip_prefix(MAGIC_WITHOUT_EPOCHS) {
         Ok((
             decode(body)?,
             EpochRuns::default(),
             Offload::default(),
+            None,
             None,
             None,
             None,
@@ -365,8 +559,12 @@ pub(in crate::stream::consensus::storage) fn scrub_root(
     bytes: &[u8],
     stream: StreamId,
     selected: Selected,
-) -> io::Result<(VecDeque<Key>, VecDeque<[u8; 32]>)> {
-    let (root, ..) = decode_root(bytes)?;
+) -> io::Result<(
+    VecDeque<Key>,
+    VecDeque<[u8; 32]>,
+    Option<AuthenticatedPageRef>,
+)> {
+    let (root, _, _, _, _, _, authenticated) = decode_root(bytes)?;
     if root.genesis.stream != stream
         || root.meta.last_log_id != Some(selected.log_id)
         || root.pages.len() > MAX_PAGES
@@ -385,6 +583,7 @@ pub(in crate::stream::consensus::storage) fn scrub_root(
     Ok((
         pages.collect::<io::Result<_>>()?,
         root.legacy.into_iter().collect(),
+        authenticated.flatten(),
     ))
 }
 
@@ -503,6 +702,76 @@ impl Span {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_snapshot_retains_leaf_pages_without_payloads() {
+        use journal_contract::{Epoch, Lsn};
+        use openraft::vote::leader_id_std::CommittedLeaderId;
+        use uuid::Uuid;
+
+        let dir = tempfile::tempdir().unwrap();
+        let objects = Objects::open(dir.path()).unwrap();
+        let genesis = Genesis {
+            stream: StreamId(125),
+            voters: crate::stream::consensus::Voters::from([1, 2, 3].map(Uuid::from_u128)),
+            quota_bytes: 1024 * 1024,
+            immutable: true,
+            authenticated: true,
+        };
+        let log_id = crate::stream::consensus::LogId::new(CommittedLeaderId::new(1), 120);
+        let meta = SnapshotMeta {
+            last_log_id: Some(log_id),
+            last_membership: Default::default(),
+            snapshot_id: "authenticated".into(),
+        };
+        let leaves = (1..=700).map(|position| Leaf {
+            stream: genesis.stream,
+            at: Lsn(position),
+            writer_epoch: Epoch(1),
+            payload_sha256: [((position % 256) as u8); 32],
+            quorum_durable_upper_micros: 10,
+            timing: None,
+        });
+        let mut image = Image::new(&genesis);
+        image.applied = meta.last_log_id;
+        image.state = super::super::State::Deleted;
+        image
+            .authenticated
+            .as_mut()
+            .unwrap()
+            .extend(leaves)
+            .unwrap();
+
+        let mut index = tempfile::tempfile().unwrap();
+        let dependencies = build(
+            &mut index,
+            &objects,
+            &genesis,
+            &meta,
+            &image,
+            &Dependencies::default(),
+            true,
+            true,
+        )
+        .unwrap();
+        std::io::Seek::rewind(&mut index).unwrap();
+        let selected = Selected {
+            digest: [0; 32],
+            log_id,
+        };
+        let (_, recovered, retained) =
+            open(index, dir.path(), selected, &genesis, &objects).unwrap();
+        assert_eq!(recovered.authenticated, image.authenticated);
+        assert_eq!(
+            retained.authenticated.len(),
+            dependencies.authenticated.len()
+        );
+
+        let mut wire = tempfile::tempfile().unwrap();
+        super::super::write_image(&mut wire, &genesis, &meta, &image, true, true, |_| {}).unwrap();
+        let (_, received) = super::super::read_image(wire, &genesis, [0; 32], 0).unwrap();
+        assert_eq!(received.authenticated, image.authenticated);
+    }
 
     #[test]
     fn a_full_stream_of_page_references_fits_its_share_of_the_root() {

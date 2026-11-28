@@ -23,6 +23,7 @@ fn genesis(stream: u128) -> Genesis {
         voters: Voters::from([1, 2, 3].map(Uuid::from_u128)),
         quota_bytes: 64 * 1024 * 1024,
         immutable: false,
+        authenticated: false,
     }
 }
 

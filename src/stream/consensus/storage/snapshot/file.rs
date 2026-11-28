@@ -57,10 +57,11 @@ impl SnapshotFile {
         path: &Path,
         space: &Space,
         lifetime: Arc<()>,
+        authenticated: bool,
         digest: [u8; 32],
         meta: SnapshotMeta,
     ) -> io::Result<Self> {
-        let transfer = space.transfer()?;
+        let transfer = space.transfer(authenticated)?;
         let path = path.join(format!("incoming-{}", uuid::Uuid::new_v4()));
         let file = tokio::fs::OpenOptions::new()
             .read(true)

@@ -102,6 +102,7 @@ fn genesis() -> Genesis {
         voters: Voters::from([1, 2, 3].map(uuid::Uuid::from_u128)),
         quota_bytes: 4096,
         immutable: false,
+        authenticated: false,
     }
 }
 
@@ -358,6 +359,13 @@ fn request(tag: usize) -> Option<Request> {
             stream: STREAM,
             at: Lsn(1),
         },
+        52 => Request::Authentication {
+            stream: STREAM,
+            request: crate::stream::consensus::keeper::AuthenticationRequest::Head { size: None },
+        },
+        53 => Request::AuthenticationPeer(
+            crate::stream::consensus::keeper::AuthenticationPeerRequest::Key,
+        ),
         _ => return None,
     })
 }
@@ -527,6 +535,7 @@ fn outcome(tag: usize) -> Option<Outcome> {
         11 => Outcome::RecoveryPage(recovery_page()),
         12 => Outcome::CheckpointCustody(Some(custody())),
         13 => Outcome::TimedCommitment(Vec::new()),
+        14 => Outcome::Authentication(Vec::new()),
         _ => return None,
     })
 }

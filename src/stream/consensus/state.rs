@@ -158,6 +158,36 @@ pub enum Command {
         entry: Bytes,
     },
     CheckpointCustody(CheckpointCustody),
+    Durable {
+        upper_micros: i64,
+        revision: u64,
+        append: DurableAppend,
+    },
+    DeleteAuthenticated {
+        size: u64,
+        root: super::authenticated::Hash,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DurableAppend {
+    Record {
+        fence: Fence,
+        owner: String,
+        at: Lsn,
+        payload: Bytes,
+    },
+    Batch {
+        fence: Fence,
+        owner: String,
+        at: Lsn,
+        payloads: Vec<Bytes>,
+    },
+    Checkpoint {
+        fence: Fence,
+        owner: String,
+        checkpoint: CheckpointInstallation,
+    },
 }
 
 /// A new offload lineage: see `Command::Restore`.
@@ -277,6 +307,15 @@ fn unticketed_command<'de, D: serde::Deserializer<'de>>(
             entry: Bytes,
         },
         CheckpointCustody(CheckpointCustody),
+        Durable {
+            upper_micros: i64,
+            revision: u64,
+            append: DurableAppend,
+        },
+        DeleteAuthenticated {
+            size: u64,
+            root: super::authenticated::Hash,
+        },
     }
     Application::deserialize(decoder).map(Box::new)
 }
@@ -288,6 +327,108 @@ fn refuse_nested<'de, D: serde::Deserializer<'de>>(
 }
 
 impl Command {
+    pub(super) fn with_quorum_durability(self, upper_micros: i64, revision: u64) -> Self {
+        let append = match self {
+            Self::Append {
+                fence,
+                owner,
+                at,
+                payload,
+            } => DurableAppend::Record {
+                fence,
+                owner,
+                at,
+                payload,
+            },
+            Self::AppendBatch {
+                fence,
+                owner,
+                at,
+                payloads,
+            } => DurableAppend::Batch {
+                fence,
+                owner,
+                at,
+                payloads,
+            },
+            Self::InstallCheckpoint {
+                fence,
+                owner,
+                checkpoint,
+            } => DurableAppend::Checkpoint {
+                fence,
+                owner,
+                checkpoint,
+            },
+            command => return command,
+        };
+        Self::Durable {
+            upper_micros,
+            revision,
+            append,
+        }
+    }
+
+    pub(super) fn into_durable_record(self) -> (Self, Option<(i64, u64)>) {
+        let Self::Durable {
+            upper_micros,
+            revision,
+            append,
+        } = self
+        else {
+            return (self, None);
+        };
+        let command = match append {
+            DurableAppend::Record {
+                fence,
+                owner,
+                at,
+                payload,
+            } => Self::Append {
+                fence,
+                owner,
+                at,
+                payload,
+            },
+            DurableAppend::Batch {
+                fence,
+                owner,
+                at,
+                payloads,
+            } => Self::AppendBatch {
+                fence,
+                owner,
+                at,
+                payloads,
+            },
+            DurableAppend::Checkpoint {
+                fence,
+                owner,
+                checkpoint,
+            } => Self::InstallCheckpoint {
+                fence,
+                owner,
+                checkpoint,
+            },
+        };
+        (command, Some((upper_micros, revision)))
+    }
+
+    pub(super) fn record_position(&self) -> Option<Lsn> {
+        let at = match self.body() {
+            Self::Append { at, .. }
+            | Self::AppendBatch { at, .. }
+            | Self::AppendOriginal { at, .. }
+            | Self::AcknowledgeRecoveryWithMarker { at, .. } => *at,
+            Self::Durable {
+                append: DurableAppend::Record { at, .. } | DurableAppend::Batch { at, .. },
+                ..
+            } => *at,
+            _ => return None,
+        };
+        Some(at)
+    }
+
     pub fn body(&self) -> &Self {
         match self {
             Self::Admitted(_, command) => command,
@@ -346,6 +487,26 @@ impl std::fmt::Display for Command {
             }
             Self::RecoverRecorded { stage, .. } => write!(f, "RecoverRecorded({})", stage.source),
             Self::RecoveryEntry { fence, .. } => write!(f, "RecoveryEntry({fence:?})"),
+            Self::Durable {
+                upper_micros,
+                append,
+                ..
+            } => match append {
+                DurableAppend::Record { at, .. } => {
+                    write!(f, "DurableAppend({at:?}, {upper_micros})")
+                }
+                DurableAppend::Batch { at, .. } => {
+                    write!(f, "DurableBatch({at:?}, {upper_micros})")
+                }
+                DurableAppend::Checkpoint { checkpoint, .. } => {
+                    write!(
+                        f,
+                        "DurableCheckpoint({:?}, {upper_micros})",
+                        checkpoint.checkpoint_lsn
+                    )
+                }
+            },
+            Self::DeleteAuthenticated { size, .. } => write!(f, "DeleteAuthenticated({size})"),
             Self::CheckpointCustody(custody) => write!(
                 f,
                 "CheckpointCustody({}, {})",
@@ -379,6 +540,7 @@ pub enum Outcome {
     RecoveryPage(Page),
     CheckpointCustody(Option<CheckpointCustody>),
     TimedCommitment(Vec<u8>),
+    Authentication(Vec<u8>),
 }
 
 impl Outcome {
@@ -1165,6 +1327,8 @@ impl State {
             | Command::StageOwned(_)
             | Command::Recover(_)
             | Command::Admitted(..)
+            | Command::Durable { .. }
+            | Command::DeleteAuthenticated { .. }
             | Command::AppendBatch { .. }
             | Command::AppendOriginal { .. }
             | Command::AcknowledgeRecoveryWithMarker { .. }

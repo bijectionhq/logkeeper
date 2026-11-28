@@ -73,32 +73,49 @@ impl LocalCluster {
     /// Starts the keepers. Every listed principal may read, write and
     /// administer streams.
     pub async fn start(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false, 600, false, false, 0).await
+        Self::start_with(principals, false, 600, false, false, false, 0).await
     }
 
     /// Starts the keepers with a replicated catalog on voters 1 and 2 and
     /// the catalog keeper, which seeds it.
     pub async fn start_replicated_catalog(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false, 600, true, false, 0).await
+        Self::start_with(principals, false, 600, true, false, false, 0).await
     }
 
     /// Starts a replicated catalog with keeper identities disjoint from other fixtures.
     pub async fn start_independent_catalog(principals: &[&str]) -> io::Result<Self> {
         let identity_prefix = Uuid::new_v4().as_u128() & !0xff;
-        Self::start_with(principals, false, 600, true, false, identity_prefix).await
+        Self::start_with(principals, false, 600, true, false, false, identity_prefix).await
     }
 
     /// Starts the keepers so that a stream idle for `park_after_secs` is
     /// parked on every voter.
     pub async fn start_parking(principals: &[&str], park_after_secs: u64) -> io::Result<Self> {
-        Self::start_with(principals, false, park_after_secs, false, false, 0).await
+        Self::start_with(principals, false, park_after_secs, false, false, false, 0).await
     }
 
     /// Starts the keepers with timed-original authority: each keeper signs
     /// with its own Ed25519 key and samples a wall clock shifted by
     /// [`LocalCluster::shift_timed_clock`].
     pub async fn start_timed(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, true, 600, false, false, 0).await
+        Self::start_with(principals, true, 600, false, false, false, 0).await
+    }
+
+    pub async fn start_authenticated(principals: &[&str]) -> io::Result<Self> {
+        let identity_prefix = Uuid::new_v4().as_u128() & !0xff;
+        Self::start_with(principals, true, 600, true, true, true, identity_prefix).await
+    }
+
+    pub async fn rotate_authentication_key(&mut self, keeper: Uuid) -> io::Result<()> {
+        self.stop(keeper).await?;
+        let key = &self.configs[&keeper]
+            .authenticated_log
+            .as_ref()
+            .ok_or_else(|| io::Error::other("keeper has no authenticated signing key"))?
+            .signer_pkcs8_file;
+        std::fs::remove_file(key)?;
+        generate_authentication_key(key)?;
+        self.restart(keeper).await
     }
 
     /// Starts the keepers and two spares: keepers 5 and 6, in the domains of
@@ -106,7 +123,7 @@ impl LocalCluster {
     /// keeper, are enough to recover a stream that lost voters 2 and 3 onto
     /// voter 1 and the spares.
     pub async fn start_spared(principals: &[&str]) -> io::Result<Self> {
-        Self::start_with(principals, false, 600, false, true, 0).await
+        Self::start_with(principals, false, 600, false, true, false, 0).await
     }
 
     /// Starts the keepers of [`LocalCluster::start_spared`] with streams on
@@ -114,7 +131,7 @@ impl LocalCluster {
     /// one in zone a, the spread placement allows over three domains. The
     /// cluster version is finalized, which five-voter streams need.
     pub async fn start_five_voters(principals: &[&str]) -> io::Result<Self> {
-        let mut cluster = Self::start_with(principals, false, 600, false, true, 0).await?;
+        let mut cluster = Self::start_with(principals, false, 600, false, true, false, 0).await?;
         let mut five = cluster.voters.to_vec();
         five.append(&mut cluster.spares);
         cluster.voters = Voters::sorted(&five).expect("five voters");
@@ -130,6 +147,7 @@ impl LocalCluster {
         park_after_secs: u64,
         replicated: bool,
         spared: bool,
+        authenticated: bool,
         identity_prefix: u128,
     ) -> io::Result<Self> {
         let dir = tempfile::tempdir()?;
@@ -258,6 +276,17 @@ impl LocalCluster {
                 async_append: std::env::var("LOGKEEPER_ASYNC_APPEND")
                     .map_or(true, |value| value != "0"),
                 timed_original: None,
+                authenticated_log: if authenticated {
+                    let signer_pkcs8_file = cluster.dir.path().join(format!("auth-{id}.pkcs8"));
+                    generate_authentication_key(&signer_pkcs8_file)?;
+                    Some(super::keeper::AuthenticatedConfig {
+                        signer_pkcs8_file,
+                        archive_directory: cluster.dir.path().join("stream-archives"),
+                        maximum_clock_error_micros: 5_000,
+                    })
+                } else {
+                    None
+                },
                 // Test keepers use plain `fsync` unless the process chose a
                 // mode: a full flush costs milliseconds on macOS, and many
                 // tests share one drive.
@@ -433,6 +462,7 @@ impl LocalCluster {
             "park_after_secs": config.park_after_secs,
             "snapshot_send_bytes_per_second": config.snapshot_send_bytes_per_second,
             "sync_mode": config.sync_mode,
+            "authenticated_log": config.authenticated_log,
         });
         let path = self.dir.path().join(format!("keeper-{keeper}.json"));
         std::fs::write(&path, serde_json::to_vec_pretty(&json)?)?;
@@ -606,6 +636,21 @@ impl LocalCluster {
 
 /// Installed trust: each keeper's Ed25519 verification key.
 struct LocalVerifier(BTreeMap<u128, [u8; 32]>);
+
+fn generate_authentication_key(path: &Path) -> io::Result<()> {
+    use std::io::Write as _;
+    let random = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&random)
+        .map_err(|_| io::Error::other("head signing key generation failed"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(pkcs8.as_ref())
+}
 
 impl TimedOriginalVerifier for LocalVerifier {
     fn verify(&self, keeper: KeeperId, statement: &[u8], signature: &[u8; 64]) -> bool {

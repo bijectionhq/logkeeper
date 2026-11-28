@@ -96,13 +96,15 @@ impl Engine {
         }
         match self.checkpoint_install_enabled().await {
             Ok(true) => {
-                group
-                    .write(Command::InstallCheckpoint {
+                self.write_with_durability(
+                    group,
+                    Command::InstallCheckpoint {
                         fence,
                         owner,
                         checkpoint,
-                    })
-                    .await
+                    },
+                )
+                .await
             }
             Ok(false) => failure(JournalError::Unsupported),
             Err(error) => failure(error),

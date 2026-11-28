@@ -72,6 +72,8 @@ An authenticated cut export carries the exact signed head, catalog history and p
 An archive consumer checks that the proof material reconstructs the signed root before restoring the archive.
 The restored archive can produce and verify inclusion proofs within the retained prefix without contacting the original stream.
 Producing an inclusion proof requires a surviving copy of the corresponding leaf and path data or an export that already contains the proof.
+The shared proof mount retains the content-addressed catalog history pages referenced by catalog compaction so every keeper can reopen and verify the signed chain.
+Use a distinct retained directory for each catalog.
 
 ## Upgrade boundary
 
@@ -83,3 +85,27 @@ Existing mutable and immutable streams retain their original protocol and retent
 Migration to an authenticated stream restores a verified application cut under a fresh stream identity.
 The cut's legacy provenance is preserved because earlier quorum durability times, trimmed records and unsigned membership changes cannot be reconstructed.
 Keepers below the finalized level use the legacy protocol and durable formats.
+
+## Keeper provisioning
+
+Mount an independent Ed25519 PKCS#8 signing key for every authenticated keeper using the keeper configuration's `authenticated_log.signer_pkcs8_file`.
+Keep that file readable only by the daemon and its designated group.
+Configure every keeper with the same independently retained filesystem mount for `authenticated_log.archive_directory`, outside all keeper data directories.
+The mount must provide durable file and directory sync plus atomic hard-link creation.
+Keep the mount available to current and replacement keepers and retain its contents through stream and keeper retirement.
+Before deleting an authenticated stream, the leader saves its exact certified tree there and the stream checks that the archived head still matches its last applied head.
+Retrying an interrupted retirement reuses a verified archive at the same head.
+
+Set `authenticated_log.maximum_clock_error_micros` to an operating bound on the keeper's synchronized UTC clock error.
+Ordinary batches bind the maximum conservative clock bound from the voters that synced the exact operation before it entered Raft.
+A keeper reserves temporary capacity per stream and stages each exact operation under its content digest, so a refused operation leaves the position open to different bytes.
+An exact retry reuses its original staged bound while that stage is retained.
+An ordinary write quorum must have overlapping retention intervals that cover the selected upper bound.
+Keepers reclaim stages that are fenced, superseded by committed positions, or past their promised retention.
+Timed batches keep the guarded receiver-clock admission path and record its quorum bound in the tree.
+Current authenticated streams export inclusion proofs, while pre-feature immutable streams retain their level 13 attestation protocol.
+Provision the catalog voters and stream voters before creating authenticated streams.
+Finalize level 14 on the replicated catalog and pin the root through an independent trusted channel.
+A catalog whose format level was finalized without signing mounts can establish its authenticated root by finalizing level 14 again after provisioning.
+Rotate a keeper key by installing a new signer and restarting one keeper at a time while preserving a quorum of the preceding catalog authority.
+The catalog certifies the new key before it can contribute to a new head.

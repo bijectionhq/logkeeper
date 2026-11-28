@@ -50,6 +50,7 @@ pub(super) struct Transfer {
     inner: Arc<Inner>,
     bytes: u64,
     allocated: u64,
+    authenticated: bool,
 }
 
 #[derive(Debug)]
@@ -257,7 +258,11 @@ impl Space {
             })
     }
 
-    pub(super) fn transfer(&self) -> io::Result<Transfer> {
+    pub(super) fn reserve_authentication(&self, bytes: u64) -> io::Result<Reservation> {
+        self.book(bytes, ORDINARY_FLOOR, None)
+    }
+
+    pub(super) fn transfer(&self, authenticated: bool) -> io::Result<Transfer> {
         let mut state = self.0.state.lock();
         if state.sessions >= 4 {
             return Err(exhausted());
@@ -267,6 +272,7 @@ impl Space {
             inner: self.0.clone(),
             bytes: 0,
             allocated: 0,
+            authenticated,
         })
     }
     pub fn settle(&self, tickets: &[(StreamId, Uuid)], install: impl FnOnce()) {
@@ -282,7 +288,7 @@ impl Transfer {
     pub fn grow(&mut self, end: u64) -> io::Result<()> {
         let block = self.inner.block;
         let end = end.checked_add(block - 1).ok_or_else(exhausted)? / block * block;
-        if end > MAX_TRANSFER_FILE {
+        if !self.authenticated && end > MAX_TRANSFER_FILE {
             return Err(exhausted());
         }
         let extra = end.saturating_sub(self.bytes);
@@ -290,7 +296,7 @@ impl Transfer {
             return Ok(());
         }
         let mut state = self.inner.state.lock();
-        if state.transfers.saturating_add(extra) > MAX_TRANSFER_TOTAL {
+        if !self.authenticated && state.transfers.saturating_add(extra) > MAX_TRANSFER_TOTAL {
             return Err(exhausted());
         }
         let floor = ORDINARY_FLOOR;
@@ -385,13 +391,13 @@ mod tests {
         let measured = 704 * MIB;
         space.set_available(measured);
 
-        let mut incoming = space.transfer().unwrap();
-        let mut outgoing = space.transfer().unwrap();
+        let mut incoming = space.transfer(false).unwrap();
+        let mut outgoing = space.transfer(false).unwrap();
         incoming.grow(MAX_TRANSFER_FILE).unwrap();
         outgoing.grow(MAX_TRANSFER_FILE).unwrap();
         assert!(
             space
-                .transfer()
+                .transfer(false)
                 .unwrap()
                 .grow(space.allocation_unit())
                 .is_err()

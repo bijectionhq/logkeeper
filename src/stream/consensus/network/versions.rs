@@ -86,6 +86,8 @@ impl Request {
             | Self::SelectedCheckpoint(_)
             | Self::CheckpointCustody { .. }
             | Self::AttestOriginal { .. }
+            | Self::Authentication { .. }
+            | Self::AuthenticationPeer(_)
             | Self::LocalProgress(_) => WireVersion::Current,
         }
     }
@@ -167,6 +169,7 @@ pub(in crate::stream::consensus) fn outcome_introduced(outcome: &Outcome) -> Wir
         | Outcome::Checkpoint(_)
         | Outcome::CheckpointCustody(_)
         | Outcome::TimedCommitment(_)
+        | Outcome::Authentication(_)
         | Outcome::RecoveryPage(_) => WireVersion::Current,
         Outcome::Refused(error) => error_introduced(error),
     }

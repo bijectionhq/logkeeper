@@ -384,6 +384,11 @@ pub(super) enum Request {
         stream: StreamId,
         at: Lsn,
     },
+    Authentication {
+        stream: StreamId,
+        request: super::keeper::AuthenticationRequest,
+    },
+    AuthenticationPeer(super::keeper::AuthenticationPeerRequest),
 }
 
 impl Request {
@@ -391,6 +396,7 @@ impl Request {
         match *self {
             Self::Claim(ref genesis) => genesis.stream,
             Self::StageSessionOriginal { fence, .. } => fence.stream,
+            Self::AuthenticationPeer(ref request) => request.stream(),
             Self::ReadAt { ref genesis, .. } => genesis.stream,
             Self::StageReplica { ref genesis, .. }
             | Self::InstallReplica { ref genesis, .. }
@@ -421,7 +427,8 @@ impl Request {
             | Self::RenewLease { .. }
             | Self::FenceKeeper(_)
             | Self::NamedStreams(_) => StreamId(0),
-            Self::Seal { stream, .. }
+            Self::Authentication { stream, .. }
+            | Self::Seal { stream, .. }
             | Self::SealSession { stream, .. }
             | Self::AcknowledgeRecoveryWithMarker { stream, .. }
             | Self::Append { stream, .. }
@@ -2323,6 +2330,7 @@ mod tests {
             voters,
             quota_bytes: 1 << 20,
             immutable: false,
+            authenticated: false,
         }
     }
 

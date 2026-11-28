@@ -20,8 +20,12 @@
 //!   leader appends a checkpoint of every entry and trims what precedes it.
 //!   A replica whose next record was trimmed folds again from the floor,
 //!   which is always the first record of a complete checkpoint.
+//! - Catalog signing history is archived on the shared proof mount before
+//!   the leader trims it. A checkpoint retains the genesis and archive head.
 //! - The stream is never parked or deleted. Repair replaces its voters like
 //!   any stream's, and its own entry records the staged move.
+
+mod history_archive;
 
 use std::{
     collections::BTreeMap,
@@ -43,8 +47,15 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use self::history_archive::Reference as HistoryReference;
+use super::authenticated::{Authority as SigningAuthority, authentication_reply};
+use super::{AuthenticationPeerRequest, AuthenticationRequest};
 use super::{Engine, Group, REQUEST_TIMEOUT, Reply, Request, failure, invalid};
+use crate::stream::consensus::CLUSTER_VERSION_AUTHENTICATED;
 use crate::stream::consensus::Voters;
+use crate::stream::consensus::authenticated::{
+    CatalogAuthority, CatalogHistory, QuorumSignature, SignedAuthority,
+};
 use crate::stream::consensus::{
     Fence, Genesis, MAX_RECORD, MAX_RECORDS_PER_PAGE, Stage, authority, catalog, decisions, decode,
     encode,
@@ -106,6 +117,10 @@ enum CatalogRecord {
     Keepers(Vec<(Uuid, authority::KeeperRecord)>),
     /// The latest recovery of each stream, as a checkpoint held them.
     Recoveries(Vec<authority::RecoveryRecord>),
+    AuthenticationGenesis(CatalogAuthority),
+    AuthenticationPending(CatalogAuthority),
+    AuthenticationCertified(SignedAuthority),
+    AuthenticationRetained(HistoryReference),
 }
 
 struct Fold {
@@ -116,6 +131,9 @@ struct Fold {
     seeded: bool,
     cluster_version: u32,
     authority: authority::Records,
+    authentication: Option<CatalogHistory>,
+    archived_authentication: Option<HistoryReference>,
+    pending_authentication: Option<CatalogAuthority>,
 }
 
 impl Fold {
@@ -133,6 +151,9 @@ impl Fold {
             seeded: next > Lsn(1),
             cluster_version: crate::stream::consensus::CLUSTER_VERSION_V1,
             authority: authority::Records::default(),
+            authentication: None,
+            archived_authentication: None,
+            pending_authentication: None,
         }
     }
 
@@ -142,7 +163,7 @@ impl Fold {
 
     /// Applies one record by the single-keeper catalog's rules: the first
     /// claim wins, and a stage or contacts need an entry.
-    fn apply(&mut self, record: CatalogRecord) {
+    fn apply(&mut self, record: CatalogRecord) -> Result<(), JournalError> {
         self.tail += 1;
         match record {
             CatalogRecord::Claim(genesis) => {
@@ -194,7 +215,74 @@ impl Fold {
                     .recoveries
                     .extend(records.into_iter().map(|record| (record.stream, record)));
             }
+            CatalogRecord::AuthenticationGenesis(genesis) => {
+                self.cluster_version = self.cluster_version.max(CLUSTER_VERSION_AUTHENTICATED);
+                match &self.authentication {
+                    Some(history) if history.genesis == genesis => (),
+                    None if genesis.valid()
+                        && genesis.revision == 0
+                        && genesis.predecessor_sha256.is_none() =>
+                    {
+                        self.authentication = Some(CatalogHistory {
+                            genesis,
+                            transitions: Vec::new(),
+                        });
+                    }
+                    _ => return Err(JournalError::Corrupted),
+                }
+            }
+            CatalogRecord::AuthenticationPending(pending) => {
+                let previous = self
+                    .authentication
+                    .as_ref()
+                    .ok_or(JournalError::Corrupted)?
+                    .latest();
+                if !pending.valid()
+                    || pending.revision != previous.revision.saturating_add(1)
+                    || pending.predecessor_sha256 != Some(previous.digest())
+                    || pending.catalog != previous.catalog
+                    || self
+                        .pending_authentication
+                        .as_ref()
+                        .is_some_and(|prior| *prior != pending)
+                {
+                    return Err(JournalError::Corrupted);
+                }
+                self.pending_authentication = Some(pending);
+            }
+            CatalogRecord::AuthenticationRetained(_) => return Err(JournalError::Corrupted),
+            CatalogRecord::AuthenticationCertified(certified) => {
+                let history = self
+                    .authentication
+                    .as_mut()
+                    .ok_or(JournalError::Corrupted)?;
+                if certified.authority.revision <= history.latest().revision {
+                    let index = certified
+                        .authority
+                        .revision
+                        .checked_sub(1)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .ok_or(JournalError::Corrupted)?;
+                    if history.transitions.get(index) != Some(&certified) {
+                        return Err(JournalError::Corrupted);
+                    }
+                } else {
+                    if certified.verify(history.latest()).is_err() {
+                        return Err(JournalError::Corrupted);
+                    }
+                    if self
+                        .pending_authentication
+                        .as_ref()
+                        .is_some_and(|pending| *pending != certified.authority)
+                    {
+                        return Err(JournalError::Corrupted);
+                    }
+                    self.pending_authentication = None;
+                    history.transitions.push(certified);
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -221,6 +309,7 @@ impl CatalogStream {
             voters,
             quota_bytes: QUOTA_BYTES,
             immutable: false,
+            authenticated: false,
         };
         Self {
             fold: Mutex::new(Fold::new(&genesis, Lsn(1))),
@@ -323,6 +412,20 @@ impl Engine {
                 self.finalize_version_replicated(catalog, &group, target)
                     .await
             }
+            Request::Authentication {
+                request: AuthenticationRequest::History { from },
+                ..
+            } => Ok(self.catalog_history_page(catalog, &group, from).await),
+            Request::AuthenticationPeer(AuthenticationPeerRequest::Authority {
+                stream,
+                configuration,
+            }) => Ok(self
+                .ensure_stream_authority(catalog, &group, stream, configuration)
+                .await),
+            Request::AuthenticationPeer(AuthenticationPeerRequest::HeadAuthority {
+                stream,
+                digest,
+            }) => Ok(self.head_authority(catalog, &group, stream, digest).await),
             Request::RenewLease { .. } => {
                 self.renew_replicated(catalog, &group, request, true).await
             }
@@ -448,7 +551,12 @@ impl Engine {
                             );
                             return Err(JournalError::Unavailable);
                         };
-                        fold.apply(record);
+                        match record {
+                            CatalogRecord::AuthenticationRetained(reference) => {
+                                self.restore_history(&mut fold, reference).await?;
+                            }
+                            record => fold.apply(record)?,
+                        }
                         fold.next = Lsn(at.0 + 1);
                     }
                 }
@@ -456,6 +564,42 @@ impl Engine {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    async fn restore_history(
+        &self,
+        fold: &mut Fold,
+        reference: HistoryReference,
+    ) -> Result<(), JournalError> {
+        let history = fold
+            .authentication
+            .as_ref()
+            .ok_or(JournalError::Corrupted)?;
+        if history.genesis.catalog != self.catalog_id {
+            return Err(JournalError::Corrupted);
+        }
+        if !reference.matches(history) {
+            if !history.transitions.is_empty() || fold.pending_authentication.is_some() {
+                return Err(JournalError::Corrupted);
+            }
+            let authentication = self
+                .authentication
+                .as_ref()
+                .ok_or(JournalError::Unavailable)?;
+            let root = authentication.archive_root().to_owned();
+            let genesis = history.genesis.clone();
+            let history = tokio::task::spawn_blocking(move || reference.load(&root, genesis))
+                .await
+                .map_err(|_| JournalError::Unavailable)?
+                .map_err(|error| match error.kind() {
+                    io::ErrorKind::InvalidData => JournalError::Corrupted,
+                    _ => JournalError::Unavailable,
+                })?;
+            fold.authentication = Some(history);
+        }
+        fold.archived_authentication = Some(reference);
+        fold.tail += 1;
+        Ok(())
     }
 
     /// The fold as of a read barrier on the leader. A writer first creates
@@ -544,6 +688,9 @@ impl Engine {
             if !fold.seeded {
                 return Ok(failure(JournalError::Unavailable));
             }
+            if genesis.authenticated && fold.authentication.is_none() {
+                return Ok(failure(JournalError::Unsupported));
+            }
             // Five voters need every keeper to read their roster.
             if !crate::stream::consensus::decisions::creates_replication(
                 genesis.voters.len(),
@@ -607,6 +754,14 @@ impl Engine {
                 return Ok(catalog::stage_conflict());
             }
             if entry.staged.as_ref() == Some(&stage) {
+                drop(fold);
+                if stage.stream == STREAM
+                    && let Err(reply) = self
+                        .certify_catalog_roster(catalog, group, stage.target)
+                        .await
+                {
+                    return Ok(reply);
+                }
                 return Ok(Reply::Staged(stage));
             }
             drop(fold);
@@ -614,12 +769,321 @@ impl Engine {
                 .append_catalog(group, head, &CatalogRecord::Stage(stage.clone()))
                 .await
             {
-                Ok(_) => return Ok(Reply::Staged(stage)),
+                Ok(_) => {
+                    if stage.stream == STREAM
+                        && let Err(reply) = self
+                            .certify_catalog_roster(catalog, group, stage.target)
+                            .await
+                    {
+                        return Ok(reply);
+                    }
+                    return Ok(Reply::Staged(stage));
+                }
                 Err(reply) if is_conflict(&reply) => continue,
                 Err(reply) => return Ok(reply),
             }
         }
         Ok(failure(JournalError::Unavailable))
+    }
+
+    async fn catalog_history_page(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+        from: usize,
+    ) -> Reply {
+        let (fold, _) = match self.leading(catalog, group, false).await {
+            Ok(view) => view,
+            Err(reply) => return reply,
+        };
+        let Some(history) = &fold.authentication else {
+            return failure(JournalError::Unsupported);
+        };
+        if from > history.transitions.len() {
+            return failure(JournalError::NotFound);
+        }
+        let to = history
+            .transitions
+            .len()
+            .min(from.saturating_add(super::authenticated::HISTORY_PAGE));
+        authentication_reply(&super::authenticated::HistoryPage {
+            genesis: history.genesis.clone(),
+            transitions: history.transitions[from..to].to_vec(),
+            more: to < history.transitions.len(),
+        })
+    }
+
+    async fn head_authority(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+        stream: StreamId,
+        digest: super::super::authenticated::Hash,
+    ) -> Reply {
+        let (fold, _) = match self.leading(catalog, group, false).await {
+            Ok(view) => view,
+            Err(reply) => return reply,
+        };
+        let Some(history) = &fold.authentication else {
+            return failure(JournalError::Unsupported);
+        };
+        let latest = history.latest();
+        let Some(voters) = history
+            .voters_at(digest, stream)
+            .filter(|voters| history.voters_at(latest.digest(), stream) == Some(*voters))
+        else {
+            return failure(JournalError::Unavailable);
+        };
+        authentication_reply(&SigningAuthority {
+            catalog: latest.catalog,
+            digest,
+            voters: voters.clone(),
+        })
+    }
+
+    pub(super) async fn stream_authority(
+        &self,
+        stream: StreamId,
+        configuration: super::super::Configuration,
+    ) -> io::Result<Reply> {
+        self.serve_catalog_stream(Request::AuthenticationPeer(
+            AuthenticationPeerRequest::Authority {
+                stream,
+                configuration,
+            },
+        ))
+        .await
+    }
+
+    pub(super) async fn authority_share(&self, proposed: &CatalogAuthority) -> io::Result<Reply> {
+        let catalog = self.catalog_stream()?;
+        let Some(group) = self.catalog_group().await else {
+            return Ok(failure(JournalError::Unavailable));
+        };
+        let (fold, _) = match self.caught_up(catalog, &group).await {
+            Ok(view) => view,
+            Err(error) => return Ok(failure(error)),
+        };
+        let Some(authentication) = &self.authentication else {
+            return Ok(failure(JournalError::Unsupported));
+        };
+        if fold.pending_authentication.as_ref() != Some(proposed)
+            || fold
+                .authentication
+                .as_ref()
+                .and_then(|history| history.latest().catalog_voters.key(self.id))
+                .copied()
+                != Some(authentication.public_key())
+        {
+            return Ok(failure(JournalError::Unavailable));
+        }
+        Ok(authentication_reply(
+            &authentication.sign(self.id, &proposed.statement()),
+        ))
+    }
+
+    async fn certify_authority(
+        &self,
+        group: &Group,
+        head: Lsn,
+        previous: &CatalogAuthority,
+        proposed: CatalogAuthority,
+    ) -> Result<(), Reply> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+        let request = AuthenticationPeerRequest::AuthorityShare(proposed.clone());
+        let mut voters = FuturesUnordered::from_iter(
+            previous.catalog_voters.keepers().into_iter().map(|keeper| {
+                let request = request.clone();
+                let proposed = &proposed;
+                async move {
+                    let reply = if keeper == self.id {
+                        self.authority_share(proposed).await
+                    } else {
+                        self.rpc
+                            .call_application(
+                                keeper,
+                                Request::AuthenticationPeer(request),
+                                REQUEST_TIMEOUT,
+                            )
+                            .await
+                    };
+                    reply
+                        .ok()
+                        .and_then(|reply| {
+                            super::authenticated::authentication_value::<QuorumSignature>(reply)
+                                .ok()
+                        })
+                        .filter(|signature| signature.keeper == keeper)
+                }
+            }),
+        );
+        let mut signatures = Vec::new();
+        let statement = proposed.statement();
+        while let Some(signature) = voters.next().await {
+            if let Some(signature) = signature {
+                signatures.push(signature);
+                signatures.sort_by_key(|signature| signature.keeper);
+                if previous
+                    .catalog_voters
+                    .verify(&statement, &signatures)
+                    .is_ok()
+                {
+                    drop(voters);
+                    self.append_catalog(
+                        group,
+                        head,
+                        &CatalogRecord::AuthenticationCertified(SignedAuthority {
+                            authority: proposed,
+                            signatures,
+                        }),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+        Err(failure(JournalError::Unavailable))
+    }
+
+    async fn ensure_stream_authority(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+        stream: StreamId,
+        configuration: super::super::Configuration,
+    ) -> Reply {
+        let requester = configuration.voters;
+        let _writing = catalog.writing.lock().await;
+        loop {
+            let (fold, head) = match self.leading(catalog, group, true).await {
+                Ok(view) => view,
+                Err(reply) => return reply,
+            };
+            let Some(history) = &fold.authentication else {
+                return failure(JournalError::Unsupported);
+            };
+            let latest = history.latest().clone();
+            if let Some(proposed) = fold.pending_authentication.clone() {
+                drop(fold);
+                if let Err(reply) = self.certify_authority(group, head, &latest, proposed).await {
+                    return reply;
+                }
+                continue;
+            }
+            let Some(entry) = fold.entries.get(&stream) else {
+                return failure(JournalError::NotFound);
+            };
+            let admitted = match &entry.staged {
+                Some(stage) => {
+                    (requester == stage.old && configuration.revision == stage.source)
+                        || (requester == stage.target
+                            && stage.source.checked_add(1) == Some(configuration.revision))
+                }
+                None => requester == entry.genesis.voters,
+            };
+            if !entry.genesis.authenticated || !admitted {
+                return failure(JournalError::Unsupported);
+            }
+            let previous_stream = history.voters_at(latest.digest(), stream).cloned();
+            if let Some(prior) = &previous_stream
+                && prior.keepers().into_iter().ne(requester.into_iter())
+                && entry
+                    .staged
+                    .as_ref()
+                    .is_some_and(|stage| requester == stage.old)
+            {
+                return failure(JournalError::Unavailable);
+            }
+            drop(fold);
+            let Some(catalog_voters) = Voters::new(&latest.catalog_voters.keepers()) else {
+                return failure(JournalError::Unavailable);
+            };
+            let (catalog_voters, stream_voters) = match tokio::try_join!(
+                self.roster_keys(catalog_voters, Some(&latest.catalog_voters)),
+                self.roster_keys(requester, previous_stream.as_ref()),
+            ) {
+                Ok(keys) => keys,
+                Err(error) => return failure(error),
+            };
+            if !catalog_voters.valid() || !stream_voters.valid() {
+                return failure(JournalError::Unavailable);
+            }
+            let digest = latest.digest();
+            if catalog_voters == latest.catalog_voters
+                && previous_stream.as_ref() == Some(&stream_voters)
+            {
+                return authentication_reply(&SigningAuthority {
+                    catalog: latest.catalog,
+                    digest,
+                    voters: stream_voters,
+                });
+            }
+            let Some(revision) = latest.revision.checked_add(1) else {
+                return failure(JournalError::Unavailable);
+            };
+            let stream_voters = if previous_stream.as_ref() == Some(&stream_voters) {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(stream, stream_voters)])
+            };
+            let next = CatalogAuthority {
+                catalog: latest.catalog,
+                revision,
+                predecessor_sha256: Some(digest),
+                catalog_voters,
+                stream_voters,
+            };
+            if let Err(reply) = self
+                .append_catalog(group, head, &CatalogRecord::AuthenticationPending(next))
+                .await
+            {
+                return reply;
+            }
+        }
+    }
+
+    async fn certify_catalog_roster(
+        &self,
+        catalog: &CatalogStream,
+        group: &Group,
+        target: Voters,
+    ) -> Result<(), Reply> {
+        loop {
+            let (fold, head) = self.leading(catalog, group, true).await?;
+            let Some(history) = &fold.authentication else {
+                return Ok(());
+            };
+            let latest = history.latest().clone();
+            if let Some(proposed) = fold.pending_authentication.clone() {
+                drop(fold);
+                self.certify_authority(group, head, &latest, proposed)
+                    .await?;
+                continue;
+            }
+            drop(fold);
+            let catalog_voters = self
+                .roster_keys(target, Some(&latest.catalog_voters))
+                .await
+                .map_err(failure)?;
+            if !catalog_voters.valid() {
+                return Err(failure(JournalError::Unavailable));
+            }
+            if catalog_voters == latest.catalog_voters {
+                return Ok(());
+            }
+            let next = CatalogAuthority {
+                catalog: latest.catalog,
+                revision: latest
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| failure(JournalError::Unavailable))?,
+                predecessor_sha256: Some(latest.digest()),
+                catalog_voters,
+                stream_voters: BTreeMap::new(),
+            };
+            self.append_catalog(group, head, &CatalogRecord::AuthenticationPending(next))
+                .await?;
+        }
     }
 
     async fn cluster_version_replicated(
@@ -662,15 +1126,37 @@ impl Engine {
             if target < fold.cluster_version {
                 return Ok(conflict());
             }
-            if target == fold.cluster_version {
+            let establish_root = target == CLUSTER_VERSION_AUTHENTICATED
+                && fold.authentication.is_none()
+                && self.authentication.is_some();
+            if target == fold.cluster_version && !establish_root {
                 self.disk.set_write_version(target);
                 return Ok(Reply::ClusterVersion(target));
             }
             drop(fold);
-            match self
-                .append_catalog(group, head, &CatalogRecord::ClusterVersion(target))
-                .await
-            {
+            let record = if establish_root {
+                let Some(configuration) = group.state.finalized() else {
+                    return Ok(failure(JournalError::Unavailable));
+                };
+                let catalog_voters = match self.roster_keys(configuration.voters, None).await {
+                    Ok(keys) => keys,
+                    Err(error) => return Ok(failure(error)),
+                };
+                let genesis = CatalogAuthority {
+                    catalog: self.catalog_id,
+                    revision: 0,
+                    predecessor_sha256: None,
+                    catalog_voters,
+                    stream_voters: BTreeMap::new(),
+                };
+                if !genesis.valid() {
+                    return Ok(failure(JournalError::Unavailable));
+                }
+                CatalogRecord::AuthenticationGenesis(genesis)
+            } else {
+                CatalogRecord::ClusterVersion(target)
+            };
+            match self.append_catalog(group, head, &record).await {
                 Ok(_) => {
                     let _ = self.caught_up(catalog, group).await;
                     self.disk.set_write_version(target);
@@ -1044,9 +1530,22 @@ impl Engine {
                 .map(|(keeper, record)| (*keeper, record.clone()))
                 .collect::<Vec<_>>();
             let recoveries = fold.authority.recoveries.values().copied().collect();
+            let authentication = fold.authentication.clone();
+            let archived_authentication = fold.archived_authentication;
+            let pending = fold.pending_authentication.clone();
             drop(fold);
-            self.compact(&group, head, entries, keepers, recoveries, cluster_version)
-                .await;
+            self.compact(
+                &group,
+                head,
+                entries,
+                keepers,
+                recoveries,
+                cluster_version,
+                authentication,
+                archived_authentication,
+                pending,
+            )
+            .await;
         }
     }
 
@@ -1103,8 +1602,29 @@ impl Engine {
         keepers: Vec<(Uuid, authority::KeeperRecord)>,
         recoveries: Vec<authority::RecoveryRecord>,
         cluster_version: u32,
+        authentication: Option<CatalogHistory>,
+        archived_authentication: Option<HistoryReference>,
+        pending: Option<CatalogAuthority>,
     ) {
         let compacted = async {
+            let authentication = if let Some(history) = authentication {
+                let authentication = self
+                    .authentication
+                    .as_ref()
+                    .ok_or_else(|| failure(JournalError::Unavailable))?;
+                let root = authentication.archive_root().to_owned();
+                let genesis = history.genesis.clone();
+                let reference = tokio::task::spawn_blocking(move || {
+                    HistoryReference::save(&root, &history, archived_authentication)
+                })
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .ok_or_else(|| failure(JournalError::Unavailable))?;
+                Some((genesis, reference))
+            } else {
+                None
+            };
             let (first, mut last) = self.checkpoint(group, head, entries).await?;
             // Keeper records exist only once leases are finalized.
             for part in keepers.chunks(KEEPERS_PER_RECORD) {
@@ -1117,7 +1637,26 @@ impl Engine {
                     .append_catalog(group, last, &CatalogRecord::Recoveries(part.to_vec()))
                     .await?;
             }
-            if cluster_version > crate::stream::consensus::CLUSTER_VERSION_V1 {
+            if let Some((genesis, reference)) = authentication {
+                last = self
+                    .append_catalog(group, last, &CatalogRecord::AuthenticationGenesis(genesis))
+                    .await?;
+                last = self
+                    .append_catalog(
+                        group,
+                        last,
+                        &CatalogRecord::AuthenticationRetained(reference),
+                    )
+                    .await?;
+                if let Some(pending) = pending {
+                    self.append_catalog(
+                        group,
+                        last,
+                        &CatalogRecord::AuthenticationPending(pending),
+                    )
+                    .await?;
+                }
+            } else if cluster_version > crate::stream::consensus::CLUSTER_VERSION_V1 {
                 self.append_catalog(group, last, &CatalogRecord::ClusterVersion(cluster_version))
                     .await?;
             }
@@ -1201,12 +1740,14 @@ mod tests {
             voters: Voters::from([ids[0], ids[1], ids[2]]),
             quota_bytes: QUOTA_BYTES,
             immutable: false,
+            authenticated: false,
         };
         let genesis = |voters| Genesis {
             stream: StreamId(7),
             voters,
             quota_bytes: 4096,
             immutable: false,
+            authenticated: false,
         };
         let first = genesis(Voters::from([ids[0], ids[1], ids[2]]));
         let stage = Stage {
@@ -1224,7 +1765,8 @@ mod tests {
             CatalogRecord::Stage(stage.clone()),
             CatalogRecord::Contacts(StreamId(8), vec![ids[3]]),
         ] {
-            fold.apply(decode(&encode(&record).unwrap()).unwrap());
+            fold.apply(decode(&encode(&record).unwrap()).unwrap())
+                .unwrap();
         }
         assert!(fold.seeded);
         // Every record after the checkpoint counts toward compaction.
@@ -1238,7 +1780,9 @@ mod tests {
         let checkpoint = fold.entries.values().cloned().collect();
         let mut restarted = Fold::new(&own, Lsn(9));
         assert!(restarted.seeded);
-        restarted.apply(CatalogRecord::Checkpoint(checkpoint));
+        restarted
+            .apply(CatalogRecord::Checkpoint(checkpoint))
+            .unwrap();
         assert_eq!(restarted.tail, 0);
         assert_eq!(
             restarted.entries[&StreamId(7)].ordered_contacts(),

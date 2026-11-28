@@ -1,5 +1,6 @@
 mod admin;
 mod admission;
+pub(super) mod authenticated;
 mod bundle;
 mod catalog_stream;
 #[cfg(test)]
@@ -63,6 +64,8 @@ use crate::server::durability::SyncMode;
 use crate::stream::consensus::Voters;
 use crate::stream::{transport, wire::KeeperId};
 use admission::ReplicationIngress;
+pub use authenticated::AuthenticatedConfig;
+pub(super) use authenticated::{AuthenticationPeerRequest, AuthenticationRequest};
 pub use offload::OffloadStatus;
 pub use recovery::{Recovery, RecoveryReport};
 pub use retirement::FenceProof;
@@ -252,6 +255,8 @@ pub struct Config {
     /// and attestation key, in the stream keeper's mount format.
     #[serde(default)]
     pub timed_original: Option<crate::stream::transport::TimedOriginalConfig>,
+    #[serde(default)]
+    pub authenticated_log: Option<AuthenticatedConfig>,
     /// How durable writes reach stable storage: `"full"` (the default) or
     /// `"fsync"`. On Apple platforms only `"full"`, which issues
     /// `F_FULLFSYNC`, survives power loss; elsewhere both flush alike.
@@ -642,8 +647,14 @@ impl Config {
             Some(config) => Some(Arc::new(offload::Offloader::open(config.clone())?)),
             None => None,
         };
+        let authentication = self
+            .authenticated_log
+            .map(|config| authenticated::Authentication::open(config, &self.data, &public_key))
+            .transpose()?
+            .map(Arc::new);
         let engine = Arc::new(Engine {
             offload,
+            authentication,
             summary,
             tls,
             probe_listen: self.admin.as_ref().and_then(|admin| admin.probe_listen),
@@ -733,6 +744,7 @@ pub(super) struct Engine {
     probe_listen: Option<SocketAddr>,
     metrics_readers: HashSet<String>,
     timed: Option<Arc<TimedState>>,
+    authentication: Option<Arc<authenticated::Authentication>>,
     pub(super) id: uuid::Uuid,
     catalog_id: uuid::Uuid,
     catalog: Option<Catalog>,
@@ -1015,6 +1027,10 @@ impl Engine {
                 });
             }
             let gauges = self.disk.clone();
+            if self.authentication.is_some() {
+                let engine = self.clone();
+                sockets.spawn(async move { engine.tend_authenticated().await });
+            }
             tokio::spawn(super::metrics::report(
                 self.id,
                 self.disk.metrics.clone(),
@@ -1702,6 +1718,11 @@ impl Engine {
                         | Request::StageRecovered { .. }
                         | Request::PreferLeader { .. }
                         | Request::ClusterVersion
+                        | Request::Authentication {
+                            request: AuthenticationRequest::History { .. },
+                            ..
+                        }
+                        | Request::AuthenticationPeer(_)
                 ) =>
             {
                 Ok(None)
@@ -1748,7 +1769,8 @@ impl Engine {
                     | Request::Read { .. }
                     | Request::ReadAt { .. }
                     | Request::ProveOriginal { .. }
-                    | Request::AttestOriginal { .. } => admin || writer || reader,
+                    | Request::AttestOriginal { .. }
+                    | Request::Authentication { .. } => admin || writer || reader,
                     Request::Seal { .. }
                     | Request::SealSession { .. }
                     | Request::Append { .. }
@@ -1773,7 +1795,8 @@ impl Engine {
                     | Request::RenewLease { .. }
                     | Request::RecoverStream { .. }
                     | Request::RecoverStreamFrom { .. }
-                    | Request::LocalProgressFencing { .. } => false,
+                    | Request::LocalProgressFencing { .. }
+                    | Request::AuthenticationPeer(_) => false,
                     _ => admin,
                 };
                 if allowed {
@@ -1797,6 +1820,21 @@ impl Engine {
                 return Ok(failure(JournalError::Unsupported));
             }
         }
+        if matches!(&request, Request::Claim(genesis) if genesis.authenticated) {
+            if !self
+                .disk
+                .write_version_allows(super::CLUSTER_VERSION_AUTHENTICATED)
+            {
+                self.sync_cluster_version().await;
+            }
+            if !self
+                .disk
+                .write_version_allows(super::CLUSTER_VERSION_AUTHENTICATED)
+                || self.catalog_stream.is_none()
+            {
+                return Ok(failure(JournalError::Unsupported));
+            }
+        }
         if self.catalog_stream.is_some()
             && matches!(identity, Identity::Client(_))
             && catalog_stream::internal(&request)
@@ -1807,6 +1845,17 @@ impl Engine {
             ));
         }
         match request {
+            Request::AuthenticationPeer(request) => self.authentication_peer(request).await,
+            Request::Authentication {
+                request: AuthenticationRequest::History { .. },
+                ..
+            } if stream == super::CATALOG_STREAM => {
+                if self.catalog_stream.is_some() {
+                    self.serve_catalog_stream(request).await
+                } else {
+                    Ok(failure(JournalError::Unsupported))
+                }
+            }
             Request::KeeperStatus(stream) => {
                 #[cfg(test)]
                 tokio::time::sleep(Duration::from_millis(
@@ -2062,6 +2111,14 @@ impl Engine {
                     return Ok(Reply::Leader(None));
                 }
                 let Some(group) = group else {
+                    if self.deleted.read().contains(&stream)
+                        && let Request::Authentication { request, .. } = &request
+                        && let Some(reply) = self
+                            .read_authentication_archive(stream, request.clone())
+                            .await
+                    {
+                        return Ok(reply);
+                    }
                     if self.deleted.read().contains(&stream) {
                         let refused = Outcome::Refused(JournalError::Deleted);
                         return Ok(match (&request, self.disk.genesis(stream)) {
@@ -2117,6 +2174,16 @@ impl Engine {
                     return Ok(failure(JournalError::Unavailable));
                 }
                 let reply = match request {
+                    Request::Authentication { request, .. } => {
+                        if matches!(group.state.head(), Err(JournalError::Deleted))
+                            && let Some(reply) = self
+                                .read_authentication_archive(stream, request.clone())
+                                .await
+                        {
+                            return Ok(reply);
+                        }
+                        Ok(self.authenticated_read(&group, request).await)
+                    }
                     Request::Head(_) => Ok(group.head().await),
                     Request::SelectedCheckpoint(_) => Ok(group.selected_checkpoint().await),
                     Request::CheckpointCustody { change, .. } => {
@@ -2257,13 +2324,16 @@ impl Engine {
                                 max: super::MAX_RECORD,
                             }));
                         }
-                        Ok(group
-                            .write(Command::Append {
-                                fence,
-                                owner: owner.unwrap(),
-                                at,
-                                payload,
-                            })
+                        Ok(self
+                            .write_with_durability(
+                                &group,
+                                Command::Append {
+                                    fence,
+                                    owner: owner.unwrap(),
+                                    at,
+                                    payload,
+                                },
+                            )
                             .await)
                     }
                     Request::AppendBatch {
@@ -2277,13 +2347,16 @@ impl Engine {
                                 max: super::MAX_RECORD,
                             }));
                         }
-                        Ok(group
-                            .write(Command::AppendBatch {
-                                fence,
-                                owner: owner.unwrap(),
-                                at,
-                                payloads,
-                            })
+                        Ok(self
+                            .write_with_durability(
+                                &group,
+                                Command::AppendBatch {
+                                    fence,
+                                    owner: owner.unwrap(),
+                                    at,
+                                    payloads,
+                                },
+                            )
                             .await)
                     }
                     Request::StageOriginal {
@@ -2333,7 +2406,7 @@ impl Engine {
                         let attest = matches!(request, Request::AttestOriginal { .. });
                         if attest {
                             let version = super::CLUSTER_VERSION_TIMED_COMMITMENT;
-                            if !group.genesis.immutable {
+                            if !group.genesis.immutable || group.genesis.authenticated {
                                 return Ok(failure(JournalError::Unsupported));
                             }
                             if !self.disk.write_version_allows(version) {
@@ -2369,6 +2442,9 @@ impl Engine {
                     } => Ok(self
                         .install_checkpoint(&group, fence, owner.unwrap(), checkpoint)
                         .await),
+                    Request::Delete(_) if group.genesis.authenticated => {
+                        Ok(self.archive_and_delete(&group).await)
+                    }
                     Request::Delete(_) => Ok(group.write(Command::Delete).await),
                     Request::AcknowledgeRecovery(_) => {
                         let actor = owner.as_deref().unwrap_or("unknown");

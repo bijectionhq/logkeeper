@@ -357,7 +357,13 @@ impl Engine {
         } else {
             0
         };
-        let required_feature = recovery_features
+        let authentication_feature = if target >= super::super::CLUSTER_VERSION_AUTHENTICATED {
+            features::AUTHENTICATED
+        } else {
+            0
+        };
+        let required_feature = authentication_feature
+            | recovery_features
             | if target >= super::super::CLUSTER_VERSION_RECOVERY_ENTRY {
                 features::RECOVERY_ENTRY
                     | features::RECOVERY_EXCLUSION

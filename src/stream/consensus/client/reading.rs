@@ -439,6 +439,7 @@ mod tests {
             voters: Voters::from([1, 2, 3].map(Uuid::from_u128)),
             quota_bytes: 128,
             immutable: false,
+            authenticated: false,
         };
         let page = |scope: Genesis, head| Reply::ScopedPage {
             genesis: scope,

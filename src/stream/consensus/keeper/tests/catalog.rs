@@ -373,6 +373,7 @@ async fn compaction_keeps_lookups_across_a_checkpoint_trim_and_restart() {
             voters: Voters::from(rosters[index as usize % 4]),
             quota_bytes: 4096,
             immutable: false,
+            authenticated: false,
         })
         .collect::<Vec<_>>();
     for genesis in &claimed {

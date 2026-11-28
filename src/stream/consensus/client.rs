@@ -25,7 +25,12 @@ use super::{
     network::{Lane, Reply, Request, Rpc},
     state::Outcome,
 };
-use crate::stream::consensus::Voters;
+use crate::stream::consensus::{
+    CATALOG_STREAM, CLUSTER_VERSION_AUTHENTICATED, Voters,
+    authenticated::{Archive, CatalogHistory, Consistency, Inclusion, SignedHead, Tree},
+    decode,
+    keeper::authenticated::{AuthenticationRequest, HistoryPage, Included, authentication_value},
+};
 
 const ATTEMPT: Duration = Duration::from_millis(1200);
 const ROUTE_FANOUT: usize = 16;
@@ -129,12 +134,38 @@ impl Client {
         self.create_stream(stream, voters, quota_bytes, true).await
     }
 
+    /// Creates a stream with a fresh authenticated immutable genesis.
+    pub async fn create_authenticated(
+        &self,
+        stream: StreamId,
+        voters: Voters,
+        quota_bytes: u64,
+    ) -> Result<()> {
+        if self.cluster_version().await? < CLUSTER_VERSION_AUTHENTICATED {
+            return Err(JournalError::Unsupported);
+        }
+        self.create_mode(stream, voters, quota_bytes, true, true)
+            .await
+    }
+
     pub(super) async fn create_stream(
+        &self,
+        stream: StreamId,
+        voters: Voters,
+        quota_bytes: u64,
+        immutable: bool,
+    ) -> Result<()> {
+        self.create_mode(stream, voters, quota_bytes, immutable, false)
+            .await
+    }
+
+    async fn create_mode(
         &self,
         stream: StreamId,
         mut voters: Voters,
         quota_bytes: u64,
         immutable: bool,
+        authenticated: bool,
     ) -> Result<()> {
         voters.sort_unstable();
         let genesis = Genesis {
@@ -142,6 +173,7 @@ impl Client {
             voters,
             quota_bytes,
             immutable,
+            authenticated,
         };
         if !genesis.valid(self.rpc.keepers()) || voters.iter().any(|id| self.retired.contains(id)) {
             return Err(JournalError::Unavailable);
@@ -214,6 +246,182 @@ impl Client {
             Some(genesis) if genesis.immutable => Ok(()),
             Some(_) => Err(JournalError::Unsupported),
             None => Err(JournalError::Unavailable),
+        }
+    }
+
+    pub async fn require_authenticated(&self, stream: StreamId) -> Result<()> {
+        let route = self.route(stream, Instant::now() + self.deadline).await?;
+        match route.genesis {
+            Some(genesis) if genesis.authenticated => Ok(()),
+            Some(_) => Err(JournalError::Unsupported),
+            None => Err(JournalError::Unavailable),
+        }
+    }
+
+    pub async fn catalog_history(&self) -> Result<CatalogHistory> {
+        if self.cluster_version().await? < CLUSTER_VERSION_AUTHENTICATED {
+            return Err(JournalError::Unsupported);
+        }
+        let end = Instant::now() + self.deadline;
+        let mut transitions = Vec::new();
+        let mut genesis = None;
+        loop {
+            let from = transitions.len();
+            let reply = self
+                .ask_catalog(
+                    Request::Authentication {
+                        stream: CATALOG_STREAM,
+                        request: AuthenticationRequest::History { from },
+                    },
+                    end,
+                    ATTEMPT,
+                )
+                .await?;
+            let page: HistoryPage = authentication_value(reply)?;
+            if genesis
+                .as_ref()
+                .is_some_and(|genesis| *genesis != page.genesis)
+            {
+                return Err(JournalError::Corrupted);
+            }
+            genesis = Some(page.genesis);
+            transitions.extend(page.transitions);
+            if !page.more {
+                let history = CatalogHistory {
+                    genesis: genesis.unwrap(),
+                    transitions,
+                };
+                history
+                    .verify(history.genesis.root())
+                    .map_err(|_| JournalError::Corrupted)?;
+                return Ok(history);
+            }
+            if from == transitions.len() {
+                return Err(JournalError::Corrupted);
+            }
+        }
+    }
+
+    pub async fn authenticated_head(
+        &self,
+        stream: StreamId,
+        size: Option<u64>,
+    ) -> Result<(SignedHead, CatalogHistory)> {
+        let head: SignedHead = self
+            .authentication(stream, AuthenticationRequest::Head { size })
+            .await?;
+        if head.head.stream != stream || size.is_some_and(|size| size != head.head.size) {
+            return Err(JournalError::Corrupted);
+        }
+        let history = self.catalog_history().await?;
+        head.verify(history.genesis.root(), &history)
+            .map_err(|_| JournalError::Corrupted)?;
+        Ok((head, history))
+    }
+
+    pub async fn inclusion(
+        &self,
+        stream: StreamId,
+        at: Lsn,
+        size: Option<u64>,
+    ) -> Result<Inclusion> {
+        let included: Included = self
+            .authentication(stream, AuthenticationRequest::Inclusion { at, size })
+            .await?;
+        if included.leaf.stream != stream
+            || included.leaf.at != at
+            || size.is_some_and(|size| size != included.signed_head.head.size)
+        {
+            return Err(JournalError::Corrupted);
+        }
+        let history = self.catalog_history().await?;
+        let proof = Inclusion {
+            leaf: included.leaf,
+            path: included.path,
+            signed_head: included.signed_head,
+            history,
+        };
+        proof
+            .verify(proof.history.genesis.root())
+            .map_err(|_| JournalError::Corrupted)?;
+        Ok(proof)
+    }
+
+    pub async fn consistency(&self, earlier: SignedHead, later: SignedHead) -> Result<Consistency> {
+        let stream = earlier.head.stream;
+        if later.head.stream != stream || earlier.head.size > later.head.size {
+            return Err(JournalError::Conflict {
+                head: Lsn(later.head.size),
+            });
+        }
+        let path = self
+            .authentication(
+                stream,
+                AuthenticationRequest::Consistency {
+                    earlier: earlier.head.size,
+                    later: later.head.size,
+                },
+            )
+            .await?;
+        let history = self.catalog_history().await?;
+        let proof = Consistency {
+            earlier,
+            later,
+            path,
+            history,
+        };
+        proof
+            .verify(proof.history.genesis.root())
+            .map_err(|_| JournalError::Corrupted)?;
+        Ok(proof)
+    }
+
+    pub async fn authenticated_archive(
+        &self,
+        stream: StreamId,
+        size: Option<u64>,
+    ) -> Result<Archive> {
+        let (signed_head, history) = self.authenticated_head(stream, size).await?;
+        let through = signed_head.head.size;
+        let mut tree = Tree::default();
+        while tree.size() < through {
+            let page: Vec<crate::stream::consensus::authenticated::Leaf> = self
+                .authentication(
+                    stream,
+                    AuthenticationRequest::ArchivePage {
+                        from: Lsn(tree.size() + 1),
+                        through,
+                    },
+                )
+                .await?;
+            if page.is_empty() {
+                return Err(JournalError::Corrupted);
+            }
+            tree.extend(page).map_err(|_| JournalError::Corrupted)?;
+        }
+        let archive = Archive {
+            tree,
+            signed_head,
+            history,
+        };
+        archive
+            .verify(archive.history.genesis.root())
+            .map_err(|_| JournalError::Corrupted)?;
+        Ok(archive)
+    }
+
+    async fn authentication<T: serde::de::DeserializeOwned>(
+        &self,
+        stream: StreamId,
+        request: AuthenticationRequest,
+    ) -> Result<T> {
+        self.require_authenticated(stream).await?;
+        match self
+            .operation(Request::Authentication { stream, request })
+            .await?
+        {
+            Outcome::Authentication(bytes) => decode(&bytes).map_err(|_| JournalError::Corrupted),
+            _ => Err(JournalError::Unavailable),
         }
     }
 
