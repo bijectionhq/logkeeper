@@ -13,7 +13,7 @@ pub use authority::{
     CatalogAuthority, CatalogHistory, CatalogRoot, QuorumSignature, SignedAuthority,
     SignedStreamAuthority, StreamAuthority, VoterKeys,
 };
-pub use tree::Tree;
+pub use tree::{PAGE, Tree};
 
 pub type Hash = [u8; 32];
 

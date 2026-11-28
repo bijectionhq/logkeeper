@@ -147,7 +147,7 @@ fn authenticated_tree_proves_every_prefix() {
     tree.extend((1..=17).map(leaf)).unwrap();
     for size in 0..=tree.size() {
         let root = tree.root_at(size).unwrap();
-        assert_eq!(root, reference_root(&tree.leaves()[..size as usize]));
+        assert_eq!(root, reference_root(&tree.leaf_range(0, size)));
         for at in 1..=size {
             let path = tree.inclusion(Lsn(at), size).unwrap();
             tree::verify_inclusion(Lsn(at), leaf(at).hash(), size, root, &path).unwrap();
@@ -336,4 +336,27 @@ fn authenticated_abandoned_catalog_move_is_settled_by_the_side_it_keeps() {
         .unwrap();
     advance(&mut history, target, &[(8, 8), (9, 9)]);
     history.verify(root).unwrap();
+}
+
+#[test]
+fn authenticated_tree_proves_across_pages() {
+    let count = 3 * PAGE as u64 + 17;
+    let mut tree = Tree::default();
+    tree.extend((1..=count).map(leaf)).unwrap();
+    let decoded: Tree = crate::stream::consensus::decode(&crate::stream::consensus::encode(&tree).unwrap()).unwrap();
+    assert_eq!(decoded, tree);
+    for size in [1, PAGE as u64 - 1, PAGE as u64, PAGE as u64 + 1, 2 * PAGE as u64, count - 1, count] {
+        let root = tree.root_at(size).unwrap();
+        assert_eq!(root, reference_root(&tree.leaf_range(0, size)));
+        for at in [1, size / 2, size].into_iter().filter(|at| *at > 0) {
+            let path = tree.inclusion(Lsn(at), size).unwrap();
+            tree::verify_inclusion(Lsn(at), leaf(at).hash(), size, root, &path).unwrap();
+        }
+        for prior in [1, PAGE as u64, size / 3, size].into_iter().filter(|prior| *prior <= size) {
+            let path = tree.consistency(prior, size).unwrap();
+            tree::verify_consistency(prior, size, tree.root_at(prior).unwrap(), root, &path).unwrap();
+        }
+    }
+    assert_eq!(tree.pages().count(), 4);
+    assert_eq!(tree.leaf(Lsn(count)), Some(&leaf(count)));
 }

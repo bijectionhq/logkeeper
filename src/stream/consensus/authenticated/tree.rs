@@ -1,15 +1,30 @@
+use std::sync::Arc;
+
 use journal_contract::{Lsn, StreamId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use super::{Hash, Leaf, ProofError};
 
+/// Leaves per page. A tree and its snapshot share pages of this size.
+pub const PAGE: usize = 256;
+
 /// Append-only Merkle tree indexed by one-based journal positions.
+///
+/// Leaves live in immutable pages shared between clones, each with its
+/// subtree root, so a clone copies page pointers and a proof hashes at most
+/// one page's leaves.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Tree {
-    leaves: Vec<Leaf>,
-    // Level h holds every complete, aligned subtree of 2^h leaves.
+    pages: Vec<Page>,
+    // Level h holds the root of every complete, aligned run of 2^h pages.
     levels: Vec<Vec<Hash>>,
+    tail: Vec<Leaf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Page {
+    leaves: Arc<[Leaf]>,
 }
 
 impl Tree {
@@ -45,9 +60,14 @@ impl Tree {
     }
 
     fn insert(&mut self, leaf: Leaf) {
-        let mut hash = leaf.hash();
-        self.leaves.push(leaf);
-        let mut nodes = self.leaves.len();
+        self.tail.push(leaf);
+        if self.tail.len() < PAGE {
+            return;
+        }
+        let leaves: Arc<[Leaf]> = std::mem::take(&mut self.tail).into();
+        let mut hash = leaves_root(&leaves);
+        self.pages.push(Page { leaves });
+        let mut nodes = self.pages.len();
         let mut height = 0;
         loop {
             if height == self.levels.len() {
@@ -64,21 +84,46 @@ impl Tree {
         }
     }
 
-    pub fn leaves(&self) -> &[Leaf] {
-        &self.leaves
+    /// Every leaf in position order.
+    pub fn leaves(&self) -> impl Iterator<Item = &Leaf> {
+        self.pages().flatten()
+    }
+
+    /// Leaves in pages of [`PAGE`], the last possibly partial.
+    pub fn pages(&self) -> impl Iterator<Item = &[Leaf]> {
+        self.pages
+            .iter()
+            .map(|page| &page.leaves[..])
+            .chain(Some(&self.tail[..]).filter(|tail| !tail.is_empty()))
+    }
+
+    /// The leaves at zero-based indexes `start..end`.
+    pub fn leaf_range(&self, start: u64, end: u64) -> Vec<Leaf> {
+        (start..end.min(self.size()))
+            .filter_map(|index| self.leaf_at(index).copied())
+            .collect()
+    }
+
+    fn leaf_at(&self, index: u64) -> Option<&Leaf> {
+        let page = usize::try_from(index / PAGE as u64).ok()?;
+        let offset = (index % PAGE as u64) as usize;
+        match self.pages.get(page) {
+            Some(page) => page.leaves.get(offset),
+            None if page == self.pages.len() => self.tail.get(offset),
+            None => None,
+        }
     }
 
     pub fn leaf(&self, at: Lsn) -> Option<&Leaf> {
-        let index = usize::try_from(at.0.checked_sub(1)?).ok()?;
-        self.leaves.get(index)
+        self.leaf_at(at.0.checked_sub(1)?)
     }
 
     pub fn stream(&self) -> Option<StreamId> {
-        self.leaves.first().map(|leaf| leaf.stream)
+        self.leaf_at(0).map(|leaf| leaf.stream)
     }
 
     pub fn size(&self) -> u64 {
-        self.leaves.len() as u64
+        (self.pages.len() * PAGE + self.tail.len()) as u64
     }
 
     pub fn empty_root() -> Hash {
@@ -101,7 +146,7 @@ impl Tree {
             return Err(ProofError::Position);
         }
         let mut prefix = Self::default();
-        prefix.extend(self.leaves[..size as usize].iter().copied())?;
+        prefix.extend(self.leaves().take(size as usize).copied())?;
         Ok(prefix)
     }
 
@@ -109,9 +154,14 @@ impl Tree {
         if size == 0 {
             return Self::empty_root();
         }
-        if size.is_power_of_two() {
-            let height = size.trailing_zeros();
-            return self.levels[height as usize][(start >> height) as usize];
+        let page = PAGE as u64;
+        if size.is_power_of_two() && size >= page && start % size == 0 {
+            let height = (size / page).trailing_zeros() as usize;
+            return self.levels[height][(start / size) as usize];
+        }
+        if size <= page && start / page == (start + size - 1) / page {
+            let leaves = self.leaf_range(start, start + size);
+            return leaves_root(&leaves);
         }
         let split = split(size);
         parent(
@@ -181,7 +231,12 @@ impl Tree {
 
 impl Serialize for Tree {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.leaves.serialize(serializer)
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.size() as usize))?;
+        for leaf in self.leaves() {
+            sequence.serialize_element(leaf)?;
+        }
+        sequence.end()
     }
 }
 
@@ -191,6 +246,18 @@ impl<'de> Deserialize<'de> for Tree {
         let mut tree = Self::default();
         tree.extend(leaves).map_err(serde::de::Error::custom)?;
         Ok(tree)
+    }
+}
+
+/// The Merkle root of a contiguous run of leaves.
+fn leaves_root(leaves: &[Leaf]) -> Hash {
+    match leaves {
+        [] => Tree::empty_root(),
+        [leaf] => leaf.hash(),
+        _ => {
+            let (left, right) = leaves.split_at(split(leaves.len() as u64) as usize);
+            parent(leaves_root(left), leaves_root(right))
+        }
     }
 }
 

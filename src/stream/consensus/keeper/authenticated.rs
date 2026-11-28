@@ -1051,10 +1051,10 @@ impl Engine {
                 let Ok(through) = usize::try_from(through) else {
                     return failure(JournalError::NotFound);
                 };
-                if from.0 == 0 || start > through || through > tree.leaves().len() {
+                if from.0 == 0 || start > through || through as u64 > tree.size() {
                     return failure(JournalError::NotFound);
                 }
-                let leaves = &tree.leaves()[start..through.min(start.saturating_add(ARCHIVE_PAGE))];
+                let leaves = tree.leaf_range(start as u64, through.min(start.saturating_add(ARCHIVE_PAGE)) as u64);
                 authentication_reply(&leaves)
             }
             _ => failure(JournalError::Unsupported),

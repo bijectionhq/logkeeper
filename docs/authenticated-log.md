@@ -12,6 +12,7 @@ A timed leaf also binds its exclusive cutoff and receiver certificate digest.
 An exact retry leaves the original leaf and durability bound intact.
 Leaves are added on successful apply in position order, one leaf per position starting at one.
 The committed state preserves each leaf's metadata so replay and failover derive the same tree.
+Leaves are kept in shared pages of 256, each with its subtree root, and a snapshot persists the same pages, so cloning a tree copies page pointers and a proof hashes at most one page's leaves.
 
 Leaves use SHA-256 with distinct domains for leaf and inner node hashing.
 The head identifies the catalog, stream, leaf count, tree root, stream authority revision and head timestamp.
@@ -24,6 +25,9 @@ Leader transfer preserves the prefix and requires no change to its signing autho
 
 ## Timeliness
 
+Authentication inherits Logkeeper's crash-fault model.
+A quorum signature certifies what the quorum committed and applied, including the durability bound the leader collected from the voters' stage stamps.
+A leader that lies can commit arbitrary records that honest voters apply and certify, so signing each voter's stamp would not strengthen a bound beyond that model.
 A timed append uses a receiver certificate scoped to the source stream and its guarded journal clock.
 Each durability sample binds the exact staged bytes to the stream, position, writer epoch, cutoff, receiver certificate and applicable quorum.
 The timed leaf uses the largest conservative post-sync bound among the members of a verified write quorum.

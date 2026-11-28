@@ -41,7 +41,7 @@ const MAGIC_WITH_CUSTODY: &[u8; 8] = b"LKRIDX05";
 /// `CLUSTER_VERSION_RETRY_RECOVERY`.
 const MAGIC_WITH_RECOVERIES: &[u8; 8] = b"LKRIDX06";
 const MAGIC_WITH_AUTHENTICATION: &[u8; 8] = b"LKRIDX07";
-const AUTHENTICATED_PAGE: usize = 256;
+const AUTHENTICATED_PAGE: usize = crate::stream::consensus::authenticated::PAGE;
 const MAX_AUTHENTICATED_PAGE_BYTES: u64 = 48 * 1024;
 
 /// Whether a selected snapshot starts with an index root.
@@ -146,7 +146,7 @@ fn write_authentication(
     dependencies: &mut Dependencies,
 ) -> io::Result<Option<AuthenticatedPageRef>> {
     let mut tail = None;
-    for (index, leaves) in tree.leaves().chunks(AUTHENTICATED_PAGE).enumerate() {
+    for (index, leaves) in tree.pages().enumerate() {
         let through = (index * AUTHENTICATED_PAGE + leaves.len()) as u64;
         let (reference, page) = if let Some((reference, page)) = previous
             .authenticated
