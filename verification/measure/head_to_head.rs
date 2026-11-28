@@ -35,6 +35,7 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use journal_contract::{Epoch, Journal, JournalError, Lsn, StreamId};
 use logkeeper::stream::{
+    authenticated::{KeeperKeys, TrustedKeeper},
     consensus::{CLUSTER_VERSION_CURRENT, ConsensusJournal, JournalConfig},
     keeper::{Sweep, SweepError, sweep_idle},
     transport::{Credentials, TcpTransport},
@@ -212,7 +213,19 @@ async fn agent_op(state: &AgentState, request: &Value) -> Result<Value> {
         "write" => {
             let path = below(&state.root, &text("path")?)?;
             std::fs::create_dir_all(path.parent().unwrap())?;
-            std::fs::write(&path, text("data")?)?;
+            // Binary files (signing keys) travel hex-encoded.
+            let data = match request["hex"].as_str() {
+                Some(hex) => (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                    .collect::<std::result::Result<Vec<u8>, _>>()?,
+                None => text("data")?.into_bytes(),
+            };
+            std::fs::write(&path, data)?;
+            if let Some(mode) = request["mode"].as_u64() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode as u32))?;
+            }
             Ok(json!({"written": path}))
         }
         "mkdir" => {
@@ -530,6 +543,9 @@ struct Cluster {
     url: String,
     journal_config: Option<JournalConfig>,
     credentials: BTreeMap<&'static str, Credentials>,
+    /// The generated keeper key set when the writer-driven keepers keep
+    /// authenticated (signed) history; `None` otherwise.
+    keys: Option<KeeperKeys>,
     _local: tempfile::TempDir,
 }
 
@@ -619,7 +635,11 @@ impl Cluster {
         spare: bool,
         tuning: &Tuning,
         max_streams: usize,
+        authenticated: bool,
     ) -> Result<Self> {
+        if authenticated && backend != Backend::Writer {
+            return Err("--authenticated applies to the writer backend only".into());
+        }
         for host in 0..3 {
             opts.call(host, json!({"op": "wipe"})).await?;
         }
@@ -683,6 +703,36 @@ impl Cluster {
                 running: false,
             });
         }
+        // One fresh Ed25519 history key per keeper, spare included, and the
+        // key set that installs them all, generated for this run only.
+        let mut signing = BTreeMap::new();
+        let keys = if authenticated {
+            let random = ring::rand::SystemRandom::new();
+            let mut keepers = Vec::new();
+            for node in &nodes {
+                let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&random)
+                    .map_err(|_| "Ed25519 key generation failed")?;
+                let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
+                    .map_err(|_| "Ed25519 key parse failed")?;
+                use ring::signature::KeyPair as _;
+                let public: [u8; 32] = pair.public_key().as_ref().try_into()?;
+                keepers.push(TrustedKeeper {
+                    identity: node.uuid,
+                    keys: vec![public],
+                });
+                signing.insert(node.name, pkcs8.as_ref().to_vec());
+            }
+            let keys = KeeperKeys {
+                journal: Uuid::new_v4(),
+                keepers,
+            };
+            if !keys.valid() {
+                return Err("generated keeper key set is invalid".into());
+            }
+            Some(keys)
+        } else {
+            None
+        };
         let primaries = &nodes[..3];
         let url = format!(
             "logkeeper+tls://{}",
@@ -735,13 +785,38 @@ impl Cluster {
                 "ca": format!("{}/tls/ca.pem", node.path)});
             let data = format!("{}/data", node.path);
             let config = match backend {
-                Backend::Writer => json!({
-                    "keeper": node.uuid, "listen": node.app, "data": data, "zone": node.zone,
-                    "tls": tls, "clients": [WRITER, SUCCESSOR, OBSERVER], "writers": [WRITER, SUCCESSOR],
-                    "limits": {"stream_quota_bytes": 8589934592_u64, "max_record_bytes": 33554432,
-                               "round_bytes_per_stream": 4194304, "round_requests": 64},
-                    "sync_mode": "full",
-                }),
+                Backend::Writer => {
+                    let mut config = json!({
+                        "keeper": node.uuid, "listen": node.app, "data": data, "zone": node.zone,
+                        "tls": tls, "clients": [WRITER, SUCCESSOR, OBSERVER], "writers": [WRITER, SUCCESSOR],
+                        "limits": {"stream_quota_bytes": 8589934592_u64, "max_record_bytes": 33554432,
+                                   "round_bytes_per_stream": 4194304, "round_requests": 64},
+                        "sync_mode": "full",
+                    });
+                    if let Some(keys) = &keys {
+                        let hex = signing[node.name]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>();
+                        opts.call(
+                            node.host,
+                            json!({"op": "write", "path": format!("{}/auth/history.pk8", node.dir),
+                                "hex": hex, "mode": 0o600}),
+                        )
+                        .await?;
+                        opts.call(
+                            node.host,
+                            json!({"op": "write", "path": format!("{}/auth/keeper-keys.json", node.dir),
+                                "data": serde_json::to_string(keys)?}),
+                        )
+                        .await?;
+                        config["authenticated"] = json!({
+                            "signer_pkcs8_file": format!("{}/auth/history.pk8", node.path),
+                            "keys_file": format!("{}/auth/keeper-keys.json", node.path),
+                        });
+                    }
+                    config
+                }
                 Backend::Consensus => {
                     let registry = format!("{}/registry", node.dir);
                     opts.call(
@@ -804,6 +879,7 @@ impl Cluster {
             url,
             journal_config,
             credentials,
+            keys,
             _local: local,
         };
         let started = Instant::now();
@@ -920,7 +996,11 @@ impl Cluster {
             Backend::Writer => {
                 let (transport, ensemble) =
                     TcpTransport::discover(&self.url, credentials, Duration::from_secs(5)).await?;
-                Handle::Writer(Writer::new(Arc::new(transport), ensemble)?)
+                let writer = Writer::new(Arc::new(transport), ensemble)?;
+                Handle::Writer(match &self.keys {
+                    Some(keys) => writer.with_authentication(keys.clone())?,
+                    None => writer,
+                })
             }
             Backend::Consensus => Handle::Consensus(ConsensusJournal::new(
                 credentials,
@@ -1067,6 +1147,43 @@ async fn seed(handle: &Handle, ids: impl IntoIterator<Item = u64>) -> Result<Vec
         .await
 }
 
+/// Certifies every stream's head (at `size`, or the current head) when the
+/// handle has a key set; `Null` otherwise. Returns latency stats and failures.
+async fn certify_all(
+    handle: &Handle,
+    ids: impl IntoIterator<Item = u64>,
+    size: Option<u64>,
+) -> Result<Value> {
+    let Handle::Writer(writer) = handle else {
+        return Ok(Value::Null);
+    };
+    if writer.keeper_keys().is_none() {
+        return Ok(Value::Null);
+    }
+    let outcomes: Vec<std::result::Result<Duration, String>> = stream::iter(ids)
+        .map(|id| async move {
+            let start = Instant::now();
+            retry(|| writer.authenticated_head(StreamId(id.into()), size))
+                .await
+                .map(|signed| {
+                    debug_assert!(signed.head.size == size.unwrap_or(signed.head.size));
+                    start.elapsed()
+                })
+                .map_err(|error| format!("{error}"))
+        })
+        .buffer_unordered(PARALLEL)
+        .collect()
+        .await;
+    let mut failed = BTreeMap::<String, u64>::new();
+    for error in outcomes.iter().filter_map(|o| o.as_ref().err()) {
+        *failed.entry(error.clone()).or_default() += 1;
+    }
+    Ok(
+        json!({"latency": stats(outcomes.iter().filter_map(|o| o.as_ref().ok().copied()).collect()),
+        "failed": failed}),
+    )
+}
+
 async fn run(flags: &HashMap<String, String>, positional: &[String]) -> Result<()> {
     let backend = match flags.get("backend").map(String::as_str) {
         Some("writer") => Backend::Writer,
@@ -1086,6 +1203,13 @@ async fn run(flags: &HashMap<String, String>, positional: &[String]) -> Result<(
             .map_or(Ok(1200), |v| v.parse())?,
     };
     let concurrent = flags.get("batch-mode").map(String::as_str) == Some("concurrent");
+    // `--authenticated 1`: writer-driven keepers keep signed history, with
+    // keys generated for the run, and the writer mounts the key set.
+    let authenticated = flags.get("authenticated").is_some_and(|v| v != "0");
+    // `--repair-trim 1`: each repair stream gets two records and is trimmed
+    // through the first before the loss, so the spare receives only the
+    // retained record and must be seeded with the trimmed leaf.
+    let repair_trim = flags.get("repair-trim").is_some_and(|v| v != "0");
     let [case, rest @ ..] = positional else {
         return Err("usage: head-to-head run ... CASE [ARGS]".into());
     };
@@ -1093,7 +1217,7 @@ async fn run(flags: &HashMap<String, String>, positional: &[String]) -> Result<(
         Ok(rest.get(index).map_or(Ok(default), |v| v.parse())?)
     };
     let spare = case == "repair";
-    let mut cluster = Cluster::start(backend, opts, spare, &tuning, 4096).await?;
+    let mut cluster = Cluster::start(backend, opts, spare, &tuning, 4096, authenticated).await?;
     let result = match case.as_str() {
         "commit" => {
             let streams = number(0, 1)?;
@@ -1113,13 +1237,14 @@ async fn run(flags: &HashMap<String, String>, positional: &[String]) -> Result<(
         "head" => head(&cluster, number(0, 32)?).await,
         "kill" => kill(&mut cluster, number(0, 1000)?, number(1, 0)? as usize).await,
         "takeover" => takeover(&cluster, number(0, 1000)?, number(1, 32)?).await,
-        "repair" => repair(&mut cluster, number(0, 100)?, &tuning).await,
+        "repair" => repair(&mut cluster, number(0, 100)?, &tuning, repair_trim).await,
         other => Err(format!("unknown case {other}").into()),
     };
     let wiped = cluster.wipe().await;
     let mut row = result?;
     row["backend"] = backend.name().into();
     row["batch_mode"] = if concurrent { "concurrent" } else { "native" }.into();
+    row["authenticated"] = authenticated.into();
     println!("{row}");
     wiped
 }
@@ -1178,8 +1303,12 @@ async fn commit(
     let elapsed = start.elapsed();
     let client = client_cpu() - cpu;
     let after = cluster.resources().await?;
+    // Outside the measured interval: every stream's final head must certify,
+    // which shows the keepers ingested every committed leaf.
+    let certified = certify_all(&handle, 1..=streams, Some(passes * width)).await?;
     Ok(
         json!({"case": "commit", "streams": streams, "batch": width, "passes": passes,
+        "certify_final_head": certified,
         "in_flight_streams": in_flight, "seconds": elapsed.as_secs_f64(),
         "records_per_sec": records.len() as f64 / elapsed.as_secs_f64(),
         "record": stats(records), "batch_ack": stats(batches), "producer_queue": stats(queue),
@@ -1216,7 +1345,13 @@ async fn head(cluster: &Cluster, streams: u64) -> Result<Value> {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        for (caller, handle) in [("writer", &writer), ("observer", &observer)] {
+        let signed = matches!(&writer, Handle::Writer(w) if w.keeper_keys().is_some());
+        let mut callers = vec![("writer", &writer, false), ("observer", &observer, false)];
+        if signed {
+            callers.push(("writer signed", &writer, true));
+            callers.push(("observer signed", &observer, true));
+        }
+        for (caller, handle, certify) in callers {
             let start = Instant::now();
             let (times, unavailable) = stream::iter(1..=streams)
                 .map(|id| async move {
@@ -1224,8 +1359,18 @@ async fn head(cluster: &Cluster, streams: u64) -> Result<Value> {
                     let mut unavailable = 0u64;
                     for _ in 0..2000u64.div_ceil(streams).max(32) {
                         let start = Instant::now();
-                        match handle.journal().head(StreamId(id.into())).await {
-                            Ok(_) => times.push(start.elapsed()),
+                        let stream = StreamId(id.into());
+                        // A signed head is a linearizable head read plus two
+                        // keeper signatures over its Merkle root, verified
+                        // against the key set by the writer.
+                        let result = match handle {
+                            Handle::Writer(writer) if certify => {
+                                writer.authenticated_head(stream, None).await.map(|_| ())
+                            }
+                            _ => handle.journal().head(stream).await.map(|_| ()),
+                        };
+                        match result {
+                            Ok(()) => times.push(start.elapsed()),
                             Err(JournalError::Unavailable) => unavailable += 1,
                             Err(error) => return Err(error),
                         }
@@ -1384,33 +1529,65 @@ async fn takeover(cluster: &Cluster, streams: u64, records: u64) -> Result<Value
     )
 }
 
-async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning) -> Result<Value> {
+async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning, trim: bool) -> Result<Value> {
     let handle = cluster.handle(WRITER).await?;
     prepare(&handle, 1..=streams).await?;
     seed(&handle, 1..=streams).await?;
+    if trim {
+        if cluster.backend != Backend::Writer {
+            return Err("--repair-trim applies to the writer backend only".into());
+        }
+        stream::iter(1..=streams)
+            .map(|id| {
+                let handle = &handle;
+                async move {
+                    let stream = StreamId(id.into());
+                    handle.batch(stream, CURRENT, 2, 1, false).await?;
+                    retry(|| handle.journal().trim(stream, CURRENT, Lsn(1))).await?;
+                    Ok::<_, BenchError>(())
+                }
+            })
+            .buffer_unordered(PARALLEL)
+            .try_collect::<Vec<_>>()
+            .await?;
+        // Let every keeper apply the trim before the loss.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
     let mut setup = serde_json::Map::new();
     match cluster.backend {
         Backend::Writer => {
+            let before_loss = certify_all(&handle, 1..=streams, None).await?;
             drop(handle);
             // The learner is an idle keeper started before the loss, as the
             // consensus spare runs from the start.
             cluster.start_node(3).await?;
             cluster.wait_ready(3).await?;
-            let transport = TcpTransport::new(
+            let transport = Arc::new(TcpTransport::new(
                 &cluster.credentials[SUCCESSOR],
                 cluster
                     .nodes
                     .iter()
                     .map(|node| (node.id(), node.app.to_string())),
                 Duration::from_secs(2),
-            )?;
+            )?);
             let ids: [KeeperId; 4] = std::array::from_fn(|i| cluster.nodes[i].id());
             let ensemble = [ids[0], ids[1], ids[2]];
+            // The sweep puts the learner in the lost keeper's slot.
+            let moved = [ids[3], ids[1], ids[2]];
+            // With authentication, the repairer seeds each moved stream's
+            // ledger right after its sweep, as `repair::seed_repaired` does.
+            let seeder = match &cluster.keys {
+                Some(keys) => {
+                    Some(Writer::new(transport.clone(), ids)?.with_authentication(keys.clone())?)
+                }
+                None => None,
+            };
             let start = Instant::now();
             let killed = cluster.kill(0).await?;
-            let completion: Vec<Duration> = stream::iter(1..=streams)
+            let completion: Vec<(Duration, Duration)> = stream::iter(1..=streams)
                 .map(|id| {
-                    let transport = &transport;
+                    let transport = &*transport;
+                    let seeder = &seeder;
                     async move {
                         let plan = Sweep::new(
                             StreamId(id.into()),
@@ -1428,7 +1605,15 @@ async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning) -> Result<
                                 }
                                 result => {
                                     result.map_err(|error| format!("stream {id}: {error}"))?;
-                                    return Ok::<_, BenchError>(start.elapsed());
+                                    let swept = start.elapsed();
+                                    if let Some(seeder) = seeder {
+                                        let stream = StreamId(id.into());
+                                        seeder.bind_ensemble(stream, moved)?;
+                                        retry(|| seeder.seed_authenticated(stream))
+                                            .await
+                                            .map_err(|error| format!("seed {id}: {error}"))?;
+                                    }
+                                    return Ok::<_, BenchError>((swept, start.elapsed()));
                                 }
                             }
                         }
@@ -1437,11 +1622,29 @@ async fn repair(cluster: &mut Cluster, streams: u64, tuning: &Tuning) -> Result<
                 .buffer_unordered(PARALLEL)
                 .try_collect()
                 .await?;
+            let swept = completion.iter().map(|c| c.0).collect::<Vec<_>>();
+            let done = completion.iter().map(|c| c.1).collect::<Vec<_>>();
+            let seed_only = completion.iter().map(|c| c.1 - c.0).collect::<Vec<_>>();
+            // Proof that the spare's ledger is complete: with keeper `b` also
+            // down, only the spare and `c` remain, and both must sign.
+            let mut check = Value::Null;
+            if let Some(seeder) = &seeder {
+                let after_repair =
+                    certify_all(&Handle::Writer(seeder.clone()), 1..=streams, None).await?;
+                let killed_b = cluster.kill(1).await?;
+                let without_b =
+                    certify_all(&Handle::Writer(seeder.clone()), 1..=streams, None).await?;
+                check = json!({"after_repair": after_repair, "kill_b": killed_b,
+                    "spare_and_c_only": without_b});
+            }
             Ok(
                 json!({"case": "repair", "streams": streams, "agent_kill": killed,
+                "trimmed_before_loss": trim, "certify_before_loss": before_loss,
                 "detection_wait_s": 0, "sweep_parallelism": PARALLEL,
-                "completion": stats(completion.clone()),
-                "seconds": completion.iter().max().unwrap().as_secs_f64()}),
+                "sweep": stats(swept), "seed_only": stats(seed_only),
+                "completion": stats(done.clone()),
+                "seed_check": check,
+                "seconds": done.iter().max().unwrap().as_secs_f64()}),
             )
         }
         Backend::Consensus => {
