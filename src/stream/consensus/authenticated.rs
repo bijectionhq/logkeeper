@@ -1,36 +1,24 @@
 //! Portable proofs for authenticated consensus streams.
+//!
+//! The Merkle tree, its proof checks and the archive framing are shared with the
+//! writer-driven journal in `stream::authenticated`.
 
 mod archive;
 mod authority;
-mod tree;
 
 use journal_contract::{Epoch, Lsn, StreamId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::stream::authenticated::merkle::{self, MerkleLeaf};
+pub use crate::stream::authenticated::{Hash, ProofError};
 pub use authority::{
     CatalogAuthority, CatalogHistory, CatalogRoot, QuorumSignature, SignedAuthority, VoterKeys,
 };
-pub use tree::Tree;
 
-pub type Hash = [u8; 32];
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum ProofError {
-    #[error("invalid authenticated leaf")]
-    Leaf,
-    #[error("invalid authenticated stream position or size")]
-    Position,
-    #[error("invalid authenticated catalog history")]
-    CatalogHistory,
-    #[error("invalid authenticated quorum signature")]
-    Signature,
-    #[error("invalid authenticated tree head")]
-    Head,
-    #[error("invalid authenticated Merkle path")]
-    Path,
-}
+/// The consensus Merkle tree over consensus leaves.
+pub type Tree = merkle::Tree<Leaf>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Timing {
@@ -78,6 +66,24 @@ impl Leaf {
             }
         }
         digest.finalize().into()
+    }
+}
+
+impl MerkleLeaf for Leaf {
+    fn stream(&self) -> StreamId {
+        self.stream
+    }
+
+    fn at(&self) -> Lsn {
+        self.at
+    }
+
+    fn valid(&self) -> bool {
+        Leaf::valid(self)
+    }
+
+    fn hash(&self) -> Hash {
+        Leaf::hash(self)
     }
 }
 
@@ -138,7 +144,7 @@ impl Inclusion {
         if self.leaf.stream != head.stream || !self.leaf.valid() {
             return Err(ProofError::Leaf);
         }
-        tree::verify_inclusion(
+        merkle::verify_inclusion(
             self.leaf.at,
             self.leaf.hash(),
             head.size,
@@ -166,7 +172,7 @@ impl Consistency {
         if earlier.stream != later.stream || earlier.catalog != later.catalog {
             return Err(ProofError::Head);
         }
-        tree::verify_consistency(
+        merkle::verify_consistency(
             earlier.size,
             later.size,
             earlier.root,

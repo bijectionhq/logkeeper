@@ -1,29 +1,53 @@
+//! Append-only Merkle trees over one stream's committed records.
+//!
+//! The tree shape and hashing follow RFC 6962: a leaf hash is domain separated by
+//! its leaf type and a parent hash is `SHA-256(1 || left || right)`, splitting at
+//! the largest power of two strictly below the size. Both the consensus keeper
+//! and the writer-driven keepers use this module with their own leaf types.
+
 use journal_contract::{Lsn, StreamId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use super::{Hash, Leaf, ProofError};
+use super::{Hash, ProofError};
+
+/// One committed record's authenticated metadata.
+pub trait MerkleLeaf: Copy {
+    fn stream(&self) -> StreamId;
+    fn at(&self) -> Lsn;
+    fn valid(&self) -> bool;
+    fn hash(&self) -> Hash;
+}
 
 /// Append-only Merkle tree indexed by one-based journal positions.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct Tree {
-    leaves: Vec<Leaf>,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Tree<L> {
+    leaves: Vec<L>,
     // Level h holds every complete, aligned subtree of 2^h leaves.
     levels: Vec<Vec<Hash>>,
 }
 
-impl Tree {
-    pub fn append(&mut self, leaf: Leaf) -> Result<(), ProofError> {
+impl<L> Default for Tree<L> {
+    fn default() -> Self {
+        Self {
+            leaves: Vec::new(),
+            levels: Vec::new(),
+        }
+    }
+}
+
+impl<L: MerkleLeaf> Tree<L> {
+    pub fn append(&mut self, leaf: L) -> Result<(), ProofError> {
         Self::check_append(&leaf, self.size() + 1, self.stream())?;
         self.insert(leaf);
         Ok(())
     }
 
-    pub fn extend(&mut self, leaves: impl IntoIterator<Item = Leaf>) -> Result<(), ProofError> {
+    pub fn extend(&mut self, leaves: impl IntoIterator<Item = L>) -> Result<(), ProofError> {
         let leaves: Vec<_> = leaves.into_iter().collect();
         let stream = self
             .stream()
-            .or_else(|| leaves.first().map(|leaf| leaf.stream));
+            .or_else(|| leaves.first().map(|leaf| leaf.stream()));
         for (index, leaf) in leaves.iter().enumerate() {
             let at = self.size() + index as u64 + 1;
             Self::check_append(leaf, at, stream)?;
@@ -34,17 +58,17 @@ impl Tree {
         Ok(())
     }
 
-    fn check_append(leaf: &Leaf, at: u64, stream: Option<StreamId>) -> Result<(), ProofError> {
-        if !leaf.valid() || stream.is_some_and(|expected| expected != leaf.stream) {
+    fn check_append(leaf: &L, at: u64, stream: Option<StreamId>) -> Result<(), ProofError> {
+        if !leaf.valid() || stream.is_some_and(|expected| expected != leaf.stream()) {
             return Err(ProofError::Leaf);
         }
-        if leaf.at.0 != at {
+        if leaf.at().0 != at {
             return Err(ProofError::Position);
         }
         Ok(())
     }
 
-    fn insert(&mut self, leaf: Leaf) {
+    fn insert(&mut self, leaf: L) {
         let mut hash = leaf.hash();
         self.leaves.push(leaf);
         let mut nodes = self.leaves.len();
@@ -64,17 +88,17 @@ impl Tree {
         }
     }
 
-    pub fn leaves(&self) -> &[Leaf] {
+    pub fn leaves(&self) -> &[L] {
         &self.leaves
     }
 
-    pub fn leaf(&self, at: Lsn) -> Option<&Leaf> {
+    pub fn leaf(&self, at: Lsn) -> Option<&L> {
         let index = usize::try_from(at.0.checked_sub(1)?).ok()?;
         self.leaves.get(index)
     }
 
     pub fn stream(&self) -> Option<StreamId> {
-        self.leaves.first().map(|leaf| leaf.stream)
+        self.leaves.first().map(|leaf| leaf.stream())
     }
 
     pub fn size(&self) -> u64 {
@@ -82,7 +106,7 @@ impl Tree {
     }
 
     pub fn empty_root() -> Hash {
-        Sha256::digest([]).into()
+        empty_root()
     }
 
     pub fn root(&self) -> Hash {
@@ -107,7 +131,7 @@ impl Tree {
 
     fn root_range(&self, start: u64, size: u64) -> Hash {
         if size == 0 {
-            return Self::empty_root();
+            return empty_root();
         }
         if size.is_power_of_two() {
             let height = size.trailing_zeros();
@@ -179,19 +203,64 @@ impl Tree {
     }
 }
 
-impl Serialize for Tree {
+impl<L: MerkleLeaf + Serialize> Serialize for Tree<L> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.leaves.serialize(serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for Tree {
+impl<'de, L: MerkleLeaf + Deserialize<'de>> Deserialize<'de> for Tree<L> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let leaves = Vec::<Leaf>::deserialize(deserializer)?;
+        let leaves = Vec::<L>::deserialize(deserializer)?;
         let mut tree = Self::default();
         tree.extend(leaves).map_err(serde::de::Error::custom)?;
         Ok(tree)
     }
+}
+
+/// The right edge of a tree: the roots of its maximal complete subtrees, largest
+/// first. It extends the tree and computes its root without the leaves.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Frontier {
+    size: u64,
+    // (height, root) of each maximal aligned subtree, in decreasing height.
+    peaks: Vec<(u32, Hash)>,
+}
+
+impl Frontier {
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn push(&mut self, leaf: Hash) {
+        let mut node = (0, leaf);
+        while let Some(&(height, left)) = self.peaks.last() {
+            if height != node.0 {
+                break;
+            }
+            self.peaks.pop();
+            node = (height + 1, parent(left, node.1));
+        }
+        self.peaks.push(node);
+        self.size += 1;
+    }
+
+    /// The tree root, `parent(p0, parent(p1, ... pn))` over the peaks, which is
+    /// the same split rule as `Tree::root`.
+    pub fn root(&self) -> Hash {
+        let mut peaks = self.peaks.iter().rev();
+        let Some(&(_, mut root)) = peaks.next() else {
+            return empty_root();
+        };
+        for &(_, left) in peaks {
+            root = parent(left, root);
+        }
+        root
+    }
+}
+
+pub fn empty_root() -> Hash {
+    Sha256::digest([]).into()
 }
 
 fn parent(left: Hash, right: Hash) -> Hash {
@@ -207,7 +276,7 @@ fn split(size: u64) -> u64 {
     1 << (size - 1).ilog2()
 }
 
-pub(super) fn verify_inclusion(
+pub fn verify_inclusion(
     at: Lsn,
     leaf: Hash,
     size: u64,
@@ -244,7 +313,7 @@ fn inclusion_root(
     }
 }
 
-pub(super) fn verify_consistency(
+pub fn verify_consistency(
     earlier_size: u64,
     later_size: u64,
     earlier: Hash,
@@ -255,7 +324,7 @@ pub(super) fn verify_consistency(
         return Err(ProofError::Position);
     }
     if earlier_size == 0 {
-        return if earlier == Tree::empty_root() && path.is_empty() {
+        return if earlier == empty_root() && path.is_empty() {
             Ok(())
         } else {
             Err(ProofError::Path)

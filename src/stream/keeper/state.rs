@@ -180,7 +180,7 @@ impl Record {
         self.payload.read().len()
     }
 
-    fn read(&self, reader: &mut ExtentReader) -> io::Result<Bytes> {
+    pub(super) fn read(&self, reader: &mut ExtentReader) -> io::Result<Bytes> {
         self.payload.read().read(reader)
     }
 

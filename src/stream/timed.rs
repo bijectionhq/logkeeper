@@ -249,16 +249,26 @@ impl TimedEvidence {
                 return None;
             }
         }
+        Some(TimedOriginalProof {
+            original: self.origin.original,
+            original_quorum_sync_upper_micros: self.quorum_upper_micros(),
+            verified_evidence_sha256: self.digest(),
+        })
+    }
+
+    /// The later of the two original-quorum stage sync bounds.
+    pub(crate) fn quorum_upper_micros(&self) -> i64 {
+        self.samples[0]
+            .upper_micros
+            .max(self.samples[1].upper_micros)
+    }
+
+    /// The evidence digest a verified proof reports.
+    pub(crate) fn digest(&self) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update(b"logkeeper/stream/timed-original-evidence/v1\0");
         digest.update(self.encode());
-        Some(TimedOriginalProof {
-            original: self.origin.original,
-            original_quorum_sync_upper_micros: self.samples[0]
-                .upper_micros
-                .max(self.samples[1].upper_micros),
-            verified_evidence_sha256: digest.finalize().into(),
-        })
+        digest.finalize().into()
     }
 }
 

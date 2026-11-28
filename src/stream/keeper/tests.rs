@@ -9,6 +9,8 @@ use tokio::sync::Notify;
 use super::*;
 
 #[cfg(feature = "stream")]
+mod authenticated;
+#[cfg(feature = "stream")]
 mod timed_original;
 
 const A: StreamId = StreamId(10);

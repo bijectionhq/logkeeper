@@ -125,12 +125,12 @@ fn authenticated_tree_proves_every_prefix() {
         assert_eq!(root, reference_root(&tree.leaves()[..size as usize]));
         for at in 1..=size {
             let path = tree.inclusion(Lsn(at), size).unwrap();
-            tree::verify_inclusion(Lsn(at), leaf(at).hash(), size, root, &path).unwrap();
+            merkle::verify_inclusion(Lsn(at), leaf(at).hash(), size, root, &path).unwrap();
         }
         for prior in 0..=size {
             let path = tree.consistency(prior, size).unwrap();
             let old_root = tree.root_at(prior).unwrap();
-            tree::verify_consistency(prior, size, old_root, root, &path).unwrap();
+            merkle::verify_consistency(prior, size, old_root, root, &path).unwrap();
         }
     }
 }

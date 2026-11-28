@@ -2,6 +2,8 @@
 mod checkpoint;
 mod checkpoint_bytes;
 pub(super) mod durability;
+#[cfg(feature = "stream")]
+mod ledger;
 #[cfg(test)]
 pub(super) mod memory;
 mod rules;
@@ -13,6 +15,8 @@ mod wal;
 mod wal_bytes;
 mod wal_layout;
 
+#[cfg(feature = "stream")]
+pub use ledger::Authentication;
 pub use rules::Limits;
 #[cfg(feature = "stream")]
 pub(super) use rules::record_charge;
@@ -95,6 +99,34 @@ impl Keeper {
     ) -> io::Result<Self> {
         let authority = timed::Authority { verifier, clock };
         let engine = Engine::open_with_authority(path, keeper, limits, policy, Some(authority))?;
+        Self::start(engine, limits)
+    }
+
+    /// Open a keeper that keeps authenticated history for its streams and signs
+    /// their heads. `timed_original` optionally mounts timed-original authority as in
+    /// `open_with_timed_original`.
+    #[cfg(feature = "stream")]
+    pub fn open_authenticated(
+        path: &Path,
+        keeper: KeeperId,
+        limits: Limits,
+        policy: Arc<dyn SealPolicy>,
+        timed_original: Option<(
+            Arc<dyn TimedOriginalVerifier>,
+            Option<Arc<dyn TimedOriginalClock>>,
+        )>,
+        authentication: Authentication,
+    ) -> io::Result<Self> {
+        if authentication.signer.keeper() != keeper {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the history signer belongs to another keeper",
+            ));
+        }
+        let authority =
+            timed_original.map(|(verifier, clock)| timed::Authority { verifier, clock });
+        let mut engine = Engine::open_with_authority(path, keeper, limits, policy, authority)?;
+        engine.ledger = Some(ledger::Ledger::open(path, authentication)?);
         Self::start(engine, limits)
     }
 
@@ -238,6 +270,7 @@ impl Work {
                 | Request::Recover { .. }
                 | Request::ProveOriginal { .. }
                 | Request::List { .. }
+                | Request::Authenticated { .. }
         )
     }
 }
@@ -253,6 +286,8 @@ struct Engine {
     recovering: bool,
     timed_authority: Option<timed::Authority>,
     stages: timed::Stages,
+    #[cfg(feature = "stream")]
+    ledger: Option<ledger::Ledger>,
 }
 
 impl Engine {
@@ -302,6 +337,8 @@ impl Engine {
             recovering: false,
             timed_authority,
             stages,
+            #[cfg(feature = "stream")]
+            ledger: None,
         })
     }
 
@@ -438,6 +475,11 @@ impl Engine {
                 replies.push((work.done, (Ok(reply), None)));
                 continue;
             }
+            if let Request::Authenticated { stream, request } = &work.request {
+                let reply = self.authenticated(*stream, request);
+                replies.push((work.done, (reply, None)));
+                continue;
+            }
             let id = codec::stream(&work.request);
             if blocked.contains(&id) {
                 pending.push_back(work);
@@ -513,7 +555,19 @@ impl Engine {
                         replies.push((work.done, (Err(TransportError::TimedOut), None)));
                         continue;
                     }
-                    Decision::Persist => {}
+                    Decision::Persist => {
+                        // The leaves a trim discards are durable before the trim is.
+                        #[cfg(feature = "stream")]
+                        if let (Request::Trim { through, .. }, Some(ledger), Some(state)) =
+                            (&work.request, self.ledger.as_mut(), state)
+                            && ledger
+                                .prepare_trim(id, state, *through, &mut self.wal.reader)
+                                .is_err()
+                        {
+                            replies.push((work.done, (Err(TransportError::TimedOut), None)));
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -568,12 +622,44 @@ impl Engine {
         for id in changed {
             let state = &self.streams[&id];
             self.stages.retire(id, Some(state))?;
+            // Leaves of retained records can be recomputed, so a failure here only
+            // defers ingestion to the next round, trim or authenticated request.
+            // A durable tombstone retires the stream's ledger.
+            #[cfg(feature = "stream")]
+            if let Some(ledger) = self.ledger.as_mut() {
+                if state.deleted {
+                    ledger.remove(id);
+                } else {
+                    let _ = ledger.ingest(id, state, &mut self.wal.reader, u64::MAX);
+                }
+            }
             state.changed.send_replace(());
         }
         for (done, reply) in replies {
             let _ = done.send(reply);
         }
         Ok(())
+    }
+}
+
+impl Engine {
+    /// Answer an authenticated-history request without touching the WAL.
+    #[cfg(feature = "stream")]
+    fn authenticated(&mut self, id: StreamId, body: &Bytes) -> CallResult {
+        let Some(ledger) = self.ledger.as_mut() else {
+            use crate::stream::authenticated::protocol::{AuthReply, encode};
+            return encode(&AuthReply::Unsupported)
+                .map(Reply::Authenticated)
+                .map_err(|error| TransportError::Protocol(error.to_string()));
+        };
+        ledger
+            .answer(id, self.streams.get(&id), body, &mut self.wal.reader)
+            .map_err(|_| TransportError::TimedOut)
+    }
+
+    #[cfg(not(feature = "stream"))]
+    fn authenticated(&mut self, _: StreamId, _: &Bytes) -> CallResult {
+        Ok(Reply::Refused(Refusal::Unauthorized))
     }
 }
 

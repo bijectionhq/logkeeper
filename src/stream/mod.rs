@@ -1,6 +1,8 @@
 //! The stream journal: a writer-driven quorum per stream over one shared write-ahead log per keeper.
 //! Specification: `verification/target-journal.md`. Contract: the `journal-contract` crate.
 
+#[cfg(feature = "stream")]
+pub mod authenticated;
 pub mod codec;
 #[cfg(feature = "stream")]
 pub mod consensus;

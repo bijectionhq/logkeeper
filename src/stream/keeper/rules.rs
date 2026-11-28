@@ -639,6 +639,7 @@ mod implementation {
             // `Keeper::call` splits envelopes and answers listings before any per-stream decision.
             Request::Batch(_)
             | Request::List { .. }
+            | Request::Authenticated { .. }
             | Request::StageOriginal { .. }
             | Request::AppendOriginal { .. }
             | Request::SyncOriginal { .. }

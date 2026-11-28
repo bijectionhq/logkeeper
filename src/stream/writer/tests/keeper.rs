@@ -47,7 +47,8 @@ impl Kind {
             Request::StageOriginal { .. }
             | Request::AppendOriginal { .. }
             | Request::SyncOriginal { .. }
-            | Request::ProveOriginal { .. } => {
+            | Request::ProveOriginal { .. }
+            | Request::Authenticated { .. } => {
                 unreachable!("this fixture exercises ordinary operations")
             }
             Request::Batch(_) => unreachable!("the writer issues single requests"),

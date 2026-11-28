@@ -487,7 +487,8 @@ fn trace_row(
         Request::StageOriginal { .. }
         | Request::AppendOriginal { .. }
         | Request::SyncOriginal { .. }
-        | Request::ProveOriginal { .. } => {
+        | Request::ProveOriginal { .. }
+        | Request::Authenticated { .. } => {
             unreachable!("the trace schema covers ordinary operations")
         }
         Request::Batch(_) => unreachable!("the simulator delivers single requests"),
@@ -527,7 +528,8 @@ fn trace_row(
             Reply::Listed { .. } => unreachable!("listings are not traced"),
             Reply::OriginalSample(_)
             | Reply::OriginalRecord { .. }
-            | Reply::OriginalEvidence(_) => {
+            | Reply::OriginalEvidence(_)
+            | Reply::Authenticated(_) => {
                 unreachable!("the trace schema covers ordinary operations")
             }
             Reply::Batch(_) => unreachable!("the simulator delivers single requests"),

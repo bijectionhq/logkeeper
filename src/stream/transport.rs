@@ -81,11 +81,45 @@ pub struct Config {
     pub writers: Vec<String>,
     pub limits: Limits,
     pub timed_original: Option<TimedOriginalConfig>,
+    /// Keep authenticated history and sign stream heads. See
+    /// `verification/writer-driven-authenticated.md`.
+    #[serde(default)]
+    pub authenticated: Option<AuthenticatedConfig>,
     /// How durable writes reach stable storage: `"full"` (the default) or
     /// `"fsync"`. On Apple platforms only `"full"`, which issues
     /// `F_FULLFSYNC`, survives power loss; elsewhere both flush alike.
     #[serde(default)]
     pub sync_mode: SyncMode,
+}
+
+/// The keeper's history signing key and the fleet's installed key set.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedConfig {
+    /// PKCS#8 Ed25519 key, independent of the TLS and timed-original keys.
+    pub signer_pkcs8_file: PathBuf,
+    /// `KeeperKeys` JSON: the journal UUID and every keeper's public keys.
+    pub keys_file: PathBuf,
+}
+
+impl AuthenticatedConfig {
+    fn load(
+        &self,
+        keeper: KeeperId,
+        tls_public_key: &[u8],
+    ) -> io::Result<super::keeper::Authentication> {
+        let keys = super::authenticated::KeeperKeys::read(&self.keys_file)?;
+        let signer = super::authenticated::Signer::load(
+            keeper,
+            &self.signer_pkcs8_file,
+            &keys,
+            tls_public_key,
+        )?;
+        Ok(super::keeper::Authentication {
+            signer,
+            keys: Arc::new(keys),
+        })
+    }
 }
 
 impl Config {
@@ -128,6 +162,24 @@ impl Config {
         let writers: Arc<HashSet<String>> = Arc::new(self.writers.into_iter().collect());
         let runtime = tokio::runtime::Handle::current();
         let keeper = tokio::task::spawn_blocking(move || {
+            if let Some(authenticated) = &self.authenticated {
+                let authentication = authenticated.load(id, &tls_public_key)?;
+                let timed = self
+                    .timed_original
+                    .map(|timed| timed.authority(id, &tls_public_key, runtime))
+                    .transpose()?
+                    .map(|authority| (authority.verifier, authority.clock));
+                let policy =
+                    policy.unwrap_or_else(|| Arc::new(|_: &Identity, _: StreamId, _: Epoch| true));
+                return Keeper::open_authenticated(
+                    &self.data,
+                    id,
+                    self.limits,
+                    policy,
+                    timed,
+                    authentication,
+                );
+            }
             if let Some(timed) = self.timed_original {
                 return timed.open(
                     &self.data,
@@ -240,6 +292,15 @@ impl Access {
         match request {
             Request::Read { .. } | Request::Check { .. } | Request::ProveOriginal { .. } => {
                 self.can_read
+            }
+            // Proof reads only observe; a seed writes the keeper's leaf ledger.
+            Request::Authenticated { request, .. } => {
+                use super::authenticated::protocol::{AuthRequest, decode};
+                match decode::<AuthRequest>(request) {
+                    Ok(request) if request.mutates() => self.can_write,
+                    Ok(_) => self.can_read,
+                    Err(_) => false,
+                }
             }
             // Listing exposes every stream ID on the keeper, so only writers may enumerate.
             Request::List { .. } => self.can_write,

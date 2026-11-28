@@ -10,6 +10,7 @@ pub use journal_contract::{Epoch, Identity, Lsn, StreamId};
 
 /// A keeper's identity. A replacement keeper always gets a new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "stream", derive(serde::Serialize, serde::Deserialize))]
 pub struct KeeperId(pub u128);
 
 /// One contiguous run of records written under one epoch, used to rank histories at seal.
@@ -125,6 +126,12 @@ pub enum Request {
         member: KeeperId,
         max: u32,
     },
+    /// Authenticated-history request, a `stream::authenticated::protocol::AuthRequest`
+    /// body. It only observes stream state; a seed writes the keeper's leaf ledger.
+    Authenticated {
+        stream: StreamId,
+        request: Bytes,
+    },
     /// Node-level envelope: independent single-stream requests from one client process,
     /// decided in arrival order in one keeper round with one sync. Never nested or empty.
     Batch(Vec<Request>),
@@ -176,6 +183,8 @@ pub enum Reply {
     Listed {
         streams: Vec<(StreamId, [KeeperId; 3])>,
     },
+    /// An `AuthReply` body answering `Request::Authenticated`.
+    Authenticated(Bytes),
     Refused(Refusal),
     /// One reply per request of a `Request::Batch`, in request order.
     Batch(Vec<Reply>),

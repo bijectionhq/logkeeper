@@ -50,7 +50,8 @@ pub(super) fn stream(request: &Request) -> StreamId {
         | Request::AppendOriginal { stream, .. }
         | Request::SyncOriginal { stream, .. }
         | Request::ProveOriginal { stream, .. }
-        | Request::List { stream, .. } => stream,
+        | Request::List { stream, .. }
+        | Request::Authenticated { stream, .. } => stream,
         // An envelope names no stream. The keeper splits it before any per-stream rule.
         Request::Batch(_) => StreamId(0),
     }
@@ -303,7 +304,7 @@ struct RequestFrame {
     stream: Bytes,
     #[prost(
         oneof = "RequestBody",
-        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17"
+        tags = "2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18"
     )]
     body: Option<RequestBody>,
     /// A `Request::Batch` envelope. Exclusive with `stream` and `body`.
@@ -555,13 +556,17 @@ request_messages! {
         #[prost(uint32, tag = "2")]
         max: u32 => copy,
     },
+    Authenticated = "18" {
+        #[prost(bytes = "bytes", tag = "1")]
+        request: Bytes => clone,
+    },
 }
 
 #[derive(Clone, Message)]
 struct ReplyFrame {
     #[prost(
         oneof = "ReplyBody",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16"
     )]
     body: Option<ReplyBody>,
     /// A `Reply::Batch` envelope. Exclusive with `body`.
@@ -599,6 +604,14 @@ enum ReplyBody {
     OriginalEvidence(TimedReply),
     #[prost(message, tag = "15")]
     Listed(Listing),
+    #[prost(message, tag = "16")]
+    Authenticated(Opaque),
+}
+
+#[derive(Clone, Message)]
+struct Opaque {
+    #[prost(bytes = "bytes", tag = "1")]
+    body: Bytes,
 }
 
 #[derive(Clone, Message)]
@@ -732,6 +745,7 @@ impl From<&Reply> for ReplyFrame {
                     })
                     .collect(),
             }),
+            Reply::Authenticated(body) => ReplyBody::Authenticated(Opaque { body: body.clone() }),
             Reply::Refused(refusal) => ReplyBody::Refused(RefusalFrame::from(refusal)),
             Reply::Batch(replies) => {
                 return Self {
@@ -822,6 +836,7 @@ impl TryFrom<ReplyFrame> for Reply {
                         })
                         .collect::<io::Result<_>>()?,
                 },
+                ReplyBody::Authenticated(body) => Self::Authenticated(body.body),
                 ReplyBody::Refused(body) => Self::Refused(Refusal::try_from(body)?),
             },
         )
@@ -962,6 +977,10 @@ mod tests {
                 member: KeeperId(3),
                 max: 64,
             },
+            Request::Authenticated {
+                stream,
+                request: Bytes::from_static(b"\x01\x02"),
+            },
         ] {
             let body = encode_request(&request).unwrap();
             assert_eq!(decode_request(body.clone()).unwrap(), request);
@@ -1009,6 +1028,7 @@ mod tests {
             Reply::Listed {
                 streams: vec![(stream, ensemble), (StreamId(9), ensemble)],
             },
+            Reply::Authenticated(Bytes::from_static(b"\x03")),
         ];
         for reply in replies
             .into_iter()

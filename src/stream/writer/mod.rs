@@ -1,6 +1,8 @@
 //! Writer-driven stream journal over an authenticated keeper transport.
 
 mod append;
+#[cfg(feature = "stream")]
+mod authenticated;
 pub(super) mod decision;
 mod head;
 mod read;
@@ -41,6 +43,9 @@ pub struct Writer {
     streams: Arc<Mutex<HashMap<StreamId, Arc<Stream>>>>,
     seal_policy: Option<Arc<dyn SealPolicy>>,
     timed_authority: Option<Arc<timed::Authority>>,
+    /// The installed keeper key set for authenticated history proofs.
+    #[cfg(feature = "stream")]
+    authentication: Option<Arc<super::authenticated::KeeperKeys>>,
 }
 
 struct Io {
@@ -89,6 +94,8 @@ impl Writer {
             streams: Arc::default(),
             seal_policy: None,
             timed_authority: None,
+            #[cfg(feature = "stream")]
+            authentication: None,
         })
     }
 

@@ -246,6 +246,10 @@ A staged record without a verified timely sample keeps its exact reservation unt
 
 Operators commission the keeper roster, individual attestation keys, receiver certificate and clock authority before enabling timed appends. The proof-only mount can verify records without an original signing clock. [Deployment and clock service](../deploy/README.md)
 
+### Authenticated history
+
+A keeper with an `authenticated` configuration keeps a ledger of the Merkle leaves of its committed records beside the WAL and signs `Head { journal, stream, size, root, ensemble }` for any size at or below its head. A head is valid with signatures from two members of the ensemble it names, verified against the operator-installed `KeeperKeys`. Leaves are durable before a Trim discards their records. A replacement keeper is seeded with the trimmed leaves under a quorum-signed head. [Design](writer-driven-authenticated.md)
+
 ### Keeper storage
 
 One append-only segmented WAL per keeper carries all streams. A frame records
