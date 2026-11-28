@@ -613,7 +613,19 @@ impl State {
                         .lanes
                         .iter()
                         .any(|lane| lane.accepted.is_some_and(|tail| tail >= at));
-                    if fences < QUORUM || held {
+                    if held {
+                        return Some((at, JournalError::Unavailable));
+                    }
+                    if fences < QUORUM {
+                        // A third reply can still make the fence a quorum.
+                        let outstanding = self.lanes.iter().any(|lane| {
+                            !lane.failure.as_ref().is_some_and(|failure| {
+                                failure.revision == self.revision && failure.at <= at
+                            })
+                        });
+                        if outstanding {
+                            return None;
+                        }
                         return Some((at, JournalError::Unavailable));
                     }
                 }
