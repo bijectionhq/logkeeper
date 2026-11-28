@@ -72,6 +72,11 @@ path = "verification/measure/delay_proxy.rs"
 required-features = ["stream"]
 
 [[example]]
+name = "head-to-head"
+path = "verification/measure/head_to_head.rs"
+required-features = ["consensus-testing"]
+
+[[example]]
 name = "consensus-crash"
 path = "verification/measure/consensus_crash.rs"
 required-features = ["consensus-testing"]
