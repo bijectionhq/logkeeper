@@ -63,6 +63,39 @@ impl Transport for Crashing {
     }
 }
 
+/// Records each seal of the history's stream in the history before sending it.
+struct Recording<'a> {
+    inner: Arc<dyn Transport>,
+    history: &'a History<'a>,
+}
+
+impl Recording<'_> {
+    fn record(&self, request: &Request) {
+        match request {
+            Request::Seal { stream, epoch, .. } if *stream == STREAM => {
+                self.history.external_seal(&REPAIRER, *epoch)
+            }
+            Request::Batch(requests) => requests.iter().for_each(|request| self.record(request)),
+            _ => {}
+        }
+    }
+}
+
+impl Transport for Recording<'_> {
+    fn identity(&self) -> &Identity {
+        self.inner.identity()
+    }
+
+    fn call(
+        &self,
+        keeper: KeeperId,
+        request: Request,
+    ) -> BoxFuture<'_, Result<Reply, TransportError>> {
+        self.record(&request);
+        self.inner.call(keeper, request)
+    }
+}
+
 async fn seed_run(seed: u64) -> Vec<&'static str> {
     let mut rng = seed;
     let mut hits = Vec::new();
@@ -163,12 +196,22 @@ async fn seed_run(seed: u64) -> Vec<&'static str> {
         raced
     };
 
+    // The repairer's seals of the live stream enter the history as unacknowledged
+    // seals, so the writer's `Fenced` replies name epochs the history knows.
+    let repairer = Recording {
+        inner: network.client(&REPAIRER),
+        history: &history,
+    };
     // Repair passes, the first cut off after a seeded number of calls.
     let repairing = async {
         sleep(outage % 40).await;
         let crashing = Crashing {
             inner: network.client(&REPAIRER),
             budget: AtomicUsize::new(crash),
+        };
+        let crashing = Recording {
+            inner: Arc::new(crashing),
+            history: &history,
         };
         let first = repair_lost(&crashing, &roster, target, &[]).await;
         if first.pending() > 0 {
@@ -179,7 +222,7 @@ async fn seed_run(seed: u64) -> Vec<&'static str> {
             if done {
                 break;
             }
-            let report = repair_lost(&*network.client(&REPAIRER), &roster, target, &[]).await;
+            let report = repair_lost(&repairer, &roster, target, &[]).await;
             done = report.pending() == 0;
             sleep(25).await;
         }
@@ -207,13 +250,13 @@ async fn seed_run(seed: u64) -> Vec<&'static str> {
     }
     network.isolate(None);
     // Converge: passes after the faults end must finish every stream.
-    let mut report = repair_lost(&*network.client(&REPAIRER), &roster, target, &[]).await;
+    let mut report = repair_lost(&repairer, &roster, target, &[]).await;
     for _ in 0..4 {
         if report.pending() == 0 {
             break;
         }
         sleep(30).await;
-        report = repair_lost(&*network.client(&REPAIRER), &roster, target, &[]).await;
+        report = repair_lost(&repairer, &roster, target, &[]).await;
     }
     assert_eq!(report.pending(), 0, "seed {seed}: {report:?}");
     hits.push("keeper loss repaired");

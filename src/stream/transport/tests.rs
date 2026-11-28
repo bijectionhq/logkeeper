@@ -651,10 +651,10 @@ async fn repair_moves_a_parked_stream_and_a_named_url_follows_it() {
         zone: zone.into(),
     }));
     let report = repair_lost(&repairer, &roster, ids[2], &[]).await;
-    assert!(
-        matches!(report.outcomes[..], [(s, Outcome::Repaired { learner, .. })] if s == stream && learner == ids[3]),
-        "{report:?}"
-    );
+    let repaired = match report.outcomes[..] {
+        [(s, Outcome::Repaired { learner, epoch })] if s == stream && learner == ids[3] => epoch,
+        _ => panic!("{report:?}"),
+    };
 
     // A fresh client still names the lost keeper first; discovery does not need it.
     let (transport, ensemble) =
@@ -664,7 +664,8 @@ async fn repair_moves_a_parked_stream_and_a_named_url_follows_it() {
     let successor = Writer::new(Arc::new(transport), ensemble).unwrap();
     assert_eq!(
         successor
-            .seal(stream, Epoch(2))
+            // The repairer sealed `repaired`, so the successor seals above it.
+            .seal(stream, Epoch(repaired.0 + 1))
             .await
             .map(|head| head >= Lsn(1)),
         Ok(true)

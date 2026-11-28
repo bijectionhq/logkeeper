@@ -124,6 +124,30 @@ impl<'a> History<'a> {
         result
     }
 
+    /// Record a seal of `STREAM` sent by a proposer outside the history, such as the
+    /// repairer. It is unacknowledged: it may take effect at any point after it was
+    /// sent, or never. Without it, a writer fenced by that proposer would report an
+    /// epoch that no call in the history sealed.
+    fn external_seal(&self, caller: &Identity, epoch: Epoch) {
+        let mut inner = self.inner.lock();
+        if inner
+            .1
+            .iter()
+            .any(|call| call.identity == *caller && matches!(call.op, Op::Seal(e) if e == epoch))
+        {
+            return;
+        }
+        let tick = inner.0;
+        inner.0 += 1;
+        inner.1.push(Call {
+            identity: caller.clone(),
+            op: Op::Seal(epoch),
+            invocation: tick,
+            response: tick,
+            result: Err(JournalError::Unavailable),
+        });
+    }
+
     fn tick(&self) -> usize {
         let mut inner = self.inner.lock();
         let tick = inner.0;
@@ -299,11 +323,12 @@ async fn seed_run(seed: u64, trace: Option<&mut BufWriter<File>>) -> Coverage {
             "replacement: a keeper promised an epoch on the stale ensemble (seed {seed})"
         );
         // The stale writer's lanes still target the old ensemble, so its append is
-        // refused. (A Writer that seals a higher epoch follows the new ensemble.)
+        // refused. (A Writer that seals a higher epoch follows the new ensemble.) The
+        // sweep's E2 seal is outside the history, so this probe stays out of it too.
         assert!(
             matches!(
-                history
-                    .call(&old, &OLD, Op::Append(E1, Lsn(2), payload(seed, 5)))
+                Op::Append(E1, Lsn(2), payload(seed, 5))
+                    .call(&old, STREAM)
                     .await,
                 Err(JournalError::Fenced { .. } | JournalError::Unavailable)
             ),

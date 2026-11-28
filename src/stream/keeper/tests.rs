@@ -1314,10 +1314,12 @@ async fn sweeper_transfers_multiple_pages_across_successive_replacements() {
     let middle = [source, lagging, learner];
     let writer = Writer::new(transport.clone(), middle).unwrap();
     assert_eq!(writer.head(A).await, Ok(end));
+    // A writer bound to the old ensemble follows the move on `Unavailable`: a voting
+    // member reports the new ensemble, so the stale roster still reads the fresh head.
     assert_eq!(
         stale.head(A).await,
-        Err(JournalError::Unavailable),
-        "stale roster supplied a fresh head"
+        Ok(end),
+        "stale roster did not follow the replacement"
     );
 
     let epoch = Epoch(3);
