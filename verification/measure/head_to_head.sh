@@ -3,13 +3,21 @@
 # backends case by case. Start `head-to-head agent` on the three keeper hosts
 # first (see HEAD-TO-HEAD.md).
 #
-#   head_to_head.sh HEAD-TO-HEAD-BIN TOKEN IP_A,IP_B,IP_C OUT.jsonl
+#   head_to_head.sh HEAD-TO-HEAD-BIN TOKEN IP_A,IP_B,IP_C OUT.jsonl [CLIENT_ZONE [LOCAL_KEEPER]]
+#
+# CLIENT_ZONE is the consensus client's domain (default zone-a). LOCAL_KEEPER
+# is the index of the keeper that shares the client's host, or of the keeper
+# the consensus client's streams are led by (default 0); the kill case loses
+# it and then another keeper.
 set -u
-bin=${1:?usage: head_to_head.sh BIN TOKEN KEEPERS OUT}
+bin=${1:?usage: head_to_head.sh BIN TOKEN KEEPERS OUT [CLIENT_ZONE [LOCAL_KEEPER]]}
 token=${2:?}
 keepers=${3:?}
 out=${4:?}
-common="--token $token --keepers $keepers"
+zone=${5:-zone-a}
+local=${6:-0}
+other=$(( (local + 1) % 3 ))
+common="--token $token --keepers $keepers --client-zone $zone"
 
 run() {
     echo "== $*" >&2
@@ -34,13 +42,15 @@ run --backend consensus --batch-mode concurrent commit 32 32
 for backend in writer consensus; do
     run --backend "$backend" head 32
 done
-for backend in writer consensus; do
-    run --backend "$backend" kill 1000 0
+for victim in "$local" "$other"; do
+    for backend in writer consensus; do
+        run --backend "$backend" kill 1000 "$victim"
+    done
 done
-run --backend consensus kill 1000 1
 for backend in writer consensus; do
     run --backend "$backend" takeover 1000 32
 done
 run --backend writer repair 100
-run --backend consensus --repair-after-secs 10 --park-after-secs 60 repair 100
+run --backend consensus --repair-after-secs 10 --park-after-secs 60 \
+    --repair-limit-secs 1200 repair 100
 run --backend writer repair 1000

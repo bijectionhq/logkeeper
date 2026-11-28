@@ -404,6 +404,9 @@ struct Opts {
     hosts: Vec<IpAddr>,
     agent_port: u16,
     spare_host: usize,
+    /// The consensus client's own domain, for leader preference and local
+    /// reads, as RTDB sets it: the zone of the keeper it shares a host with.
+    client_zone: String,
 }
 
 impl Opts {
@@ -422,6 +425,10 @@ impl Opts {
             hosts,
             agent_port: flags.get("agent-port").map_or(Ok(7400), |v| v.parse())?,
             spare_host: flags.get("spare-host").map_or(Ok(0), |v| v.parse())?,
+            client_zone: flags
+                .get("client-zone")
+                .cloned()
+                .unwrap_or_else(|| "zone-a".into()),
         })
     }
 
@@ -787,7 +794,7 @@ impl Cluster {
                     .map(|node| (node.uuid.to_string(), Value::from(node.zone)))
                     .collect::<serde_json::Map<_, _>>(),
                 "quota_bytes": 1u64 << 30, "max_record_bytes": 1 << 20, "deadline_ms": 10000,
-                "domain": "zone-a",
+                "domain": opts.client_zone,
             }))?),
         };
         let mut cluster = Self {
@@ -986,6 +993,17 @@ fn client_cpu() -> f64 {
     seconds(usage.ru_utime) + seconds(usage.ru_stime)
 }
 
+/// How long a case waits after creating and sealing its streams before it
+/// measures: 500 ms unless `H2H_SETTLE_MS` says otherwise.
+fn settle() -> Duration {
+    Duration::from_millis(
+        std::env::var("H2H_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500),
+    )
+}
+
 fn record() -> Bytes {
     Bytes::from_static(&[7; RECORD_BYTES])
 }
@@ -1117,7 +1135,7 @@ async fn commit(
     let in_flight = in_flight.min(streams as usize);
     let handle = cluster.handle(WRITER).await?;
     prepare(&handle, 1..=streams).await?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(settle()).await;
     let gate = Arc::new(tokio::sync::Barrier::new(streams as usize + 1));
     let admission = Arc::new(tokio::sync::Semaphore::new(in_flight));
     let mut tasks = JoinSet::new();
