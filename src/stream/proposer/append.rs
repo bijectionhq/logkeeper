@@ -593,18 +593,27 @@ impl State {
                     return Some((at, JournalError::Unavailable));
                 }
                 if matches!(error, JournalError::Fenced { .. }) {
-                    // A fence is a definite refusal only while no keeper can hold this
-                    // record. A sealer adopts the highest history of its quorum, so a
-                    // copy on one lane, an unanswered send, or a send still in flight
-                    // can still commit it (for example a repair sealing past a lost
-                    // keeper adopts the surviving lane's copy).
-                    let held = self.lanes.iter().any(|lane| {
-                        lane.accepted.is_some_and(|tail| tail >= at)
-                            || !lane.failure.as_ref().is_some_and(|failure| {
-                                failure.revision == self.revision && failure.at <= at
+                    // A fence is a definite refusal only when a quorum of lanes was
+                    // fenced and none accepted the record. One fence beside an
+                    // unanswered lane is no quorum, and a sealer adopts the highest
+                    // history of its quorum, so a lane's copy can still commit: a
+                    // repair sealing past a lost keeper adopts the survivor's copy.
+                    let fences = self
+                        .lanes
+                        .iter()
+                        .filter(|lane| {
+                            lane.failure.as_ref().is_some_and(|failure| {
+                                failure.revision == self.revision
+                                    && failure.at <= at
+                                    && matches!(failure.error, JournalError::Fenced { .. })
                             })
-                    });
-                    if held || at <= self.uncertain_through {
+                        })
+                        .count();
+                    let held = self
+                        .lanes
+                        .iter()
+                        .any(|lane| lane.accepted.is_some_and(|tail| tail >= at));
+                    if fences < QUORUM || held {
                         return Some((at, JournalError::Unavailable));
                     }
                 }
